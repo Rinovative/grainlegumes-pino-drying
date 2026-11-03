@@ -1,11 +1,14 @@
-# ruff: noqa: S101
-"""
-Protect the immutable registered task and its derived semantic contract.
+"""Protect the immutable registered task and its derived semantic contract.
 
-The tests exercise task-owned physical groups and metric meaning, stable
-serialization, registry immutability, ordered declaration rejection, and public
-domain exports. Dataset content identity and resolved experiment projection are
-covered by their broader pipeline suites.
+Responsibilities:
+  - Check registered fields, metric groups, immutable registry, serialization, and declaration
+    rejection
+
+Design principles:
+  - Task-owned ordered declarations fail closed on schema or semantic drift
+
+This module does NOT:
+  - Compute Dataset content identity or resolve whole experiments
 """
 
 from dataclasses import replace
@@ -75,16 +78,11 @@ def test_ordered_contract_validator_rejects_drift() -> None:
             domain.field_sets.validate_ordered_fields(actual, expected, label="inputs")
 
 
-def test_public_domain_exports_resolve_and_noncanonical_fields_fail() -> None:
-    """Resolve canonical public names and reject unknown task or field names."""
+def test_public_domain_exports_resolve_and_unknown_tasks_fail() -> None:
+    """Resolve canonical public names and reject unknown task names."""
     assert domain.tasks.registry.get_task("steady_flow").id == "steady_flow"
-    assert domain.fields.require_known_field("eps_bed") == "eps_bed"
     with pytest.raises(ValueError, match="Unknown task"):
         domain.tasks.registry.get_task("unregistered_task")
-    with pytest.raises(ValueError, match="Unknown field"):
-        domain.fields.require_known_field("unknown_field")
-    with pytest.raises(ValueError, match="Unknown field"):
-        domain.fields.require_known_field("pbc")
 
 
 def test_task_declarations_fail_closed_on_runtime_literals_and_layout(

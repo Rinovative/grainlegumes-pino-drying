@@ -1,9 +1,20 @@
-# ruff: noqa: S101, SLF001, PLR2004
-"""Protect transient continuous curriculum and matched-compute contracts."""
+"""Protect transient continuous curriculum and stage-budget contracts.
+
+Responsibilities:
+  - Check horizon draws, exact resumed RNG, clock semantics, overflow, and budget completion
+  - Check that origin strata reach the late part of a window for every batch size
+
+Design principles:
+  - Committed optimizer groups define budget crossing and terminal evaluation admission
+
+This module does NOT:
+  - Infer compute budgets from another clock or sample unavailable short windows
+"""
 
 from __future__ import annotations
 
 import hashlib
+from typing import Any
 
 import pytest
 import torch
@@ -52,76 +63,102 @@ def test_curriculum_retains_shorter_horizons_and_resumes_exact_draws() -> None:
     assert 2 in curriculum.eligible_lengths(0.85)
 
 
-def test_controller_uses_seconds_or_steps_without_cross_clock_labels() -> None:
-    """Derive exact remaining quantities from the admitted measurement clock."""
+def _work(**overrides: Any) -> dict[str, Any]:
+    """Return one completed optimizer group with test-owned defaults."""
+    work: dict[str, Any] = {
+        "successful": True,
+        "optimizer_device_seconds": None,
+        "microbatches": 1,
+        "processed_target_transitions": 2,
+        "forward_transitions": 2,
+        "wall_seconds": 0.1,
+        "epoch_index": 0,
+        "microbatch_index": 0,
+    }
+    work.update(overrides)
+    return work
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_origin_strata_rotate_so_small_batches_reach_every_third_of_the_window(batch_size: int) -> None:
+    """
+    Draw origins for batches smaller than the three temporal strata.
+
+    Single-trajectory batches of a rare length and the maintained batch size 2
+    must still start rollouts in the early, middle and late third of a window,
+    in equal numbers over three consecutive draws.
+    """
+    state = RolloutCurriculumState.create(RolloutCurriculum(), seed=5)
+    available_length = 32
+    horizon = 2
+    maximum = available_length - horizon
+    strata = ((0, maximum // 3), (maximum // 3 + 1, (2 * maximum) // 3), ((2 * maximum) // 3 + 1, maximum))
+    counts = [0, 0, 0]
+    for _draw in range(3):
+        # The first curriculum stage admits only the shortest horizon.
+        drawn_horizon, origins = state.select(progress=0.0, available_length=available_length, batch_size=batch_size)
+        assert drawn_horizon == horizon
+        for origin in origins.tolist():
+            counts[next(index for index, (low, high) in enumerate(strata) if low <= origin <= high)] += 1
+
+    assert counts == [batch_size] * 3
+
+
+def test_controller_accounts_device_seconds_only_on_the_cuda_clock() -> None:
+    """Accumulate CUDA device time and reject device time on the CPU step clock."""
     cuda = MatchedComputeController(
-        arm="B",
-        stage="stage_b_self_fed",
+        arm="A0",
+        stage="stage_a_teacher_forcing",
         clock_kind="cuda_device_seconds",
         config_digest=_digest("cuda"),
-        teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_seconds=10.0,
-        rollout_reference_compute_seconds=12.0,
+        planned_stage_epochs=2,
     )
-    cuda.record_completed_work(
-        successful=True,
-        optimizer_device_seconds=4.0,
-        microbatches=2,
-        processed_target_transitions=16,
-        forward_transitions=16,
-        wall_seconds=5.0,
-        epoch_index=0,
-        microbatch_index=0,
-    )
-    assert cuda.remaining_to_planned_teacher_forcing_budget_seconds == pytest.approx(6.0)
-    assert cuda.remaining_teacher_forcing_compute_to_match_rollout_seconds is None
+    cuda.record_completed_work(**_work(optimizer_device_seconds=4.0, microbatches=2))
+    assert cuda.post_handoff_optimizer_device_seconds == pytest.approx(4.0)
     cpu = MatchedComputeController(
-        arm="A+",
+        arm="A0",
         stage="stage_a_teacher_forcing",
         clock_kind="optimizer_steps",
         config_digest=_digest("cpu"),
-        teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_steps=3,
+        planned_stage_epochs=2,
     )
-    cpu.record_completed_work(
-        successful=True,
-        optimizer_device_seconds=None,
-        microbatches=1,
-        processed_target_transitions=2,
-        forward_transitions=2,
-        wall_seconds=0.1,
-        epoch_index=0,
-        microbatch_index=0,
-    )
-    assert cpu.remaining_steps == 2
-    assert cpu.remaining_to_planned_teacher_forcing_budget_seconds is None
     with pytest.raises(ValueError, match="must not report optimizer device seconds"):
-        cpu.record_completed_work(
-            successful=True,
-            optimizer_device_seconds=0.1,
-            microbatches=1,
-            processed_target_transitions=2,
-            forward_transitions=2,
-            wall_seconds=0.1,
-            epoch_index=0,
-            microbatch_index=1,
-        )
+        cpu.record_completed_work(**_work(optimizer_device_seconds=0.1))
 
 
-def test_controller_state_rejects_semantic_drift() -> None:
-    """Require immutable controller identity during exact continuation."""
+def test_controller_state_rejects_semantic_drift_and_superseded_schemas() -> None:
+    """Require immutable controller identity and the current schema during continuation."""
     controller = MatchedComputeController(
-        arm="A+",
+        arm="A1",
         stage="stage_a_teacher_forcing",
-        clock_kind="optimizer_steps",
+        clock_kind="train_seconds",
         config_digest=_digest("state"),
+        budget_control="train_seconds",
         teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_steps=2,
+        planned_train_seconds=5.0,
+        matched_receipt_sha256=_digest("receipt"),
     )
     saved = controller.state_dict()
-    saved["config_digest"] = _digest("other")
+    drifted = dict(saved, config_digest=_digest("other"))
     with pytest.raises(ValueError, match="conflicts"):
-        controller.load_state_dict(saved)
+        controller.load_state_dict(drifted)
+    superseded = dict(saved, schema_version=2)
+    with pytest.raises(ValueError, match="strict schema"):
+        controller.load_state_dict(superseded)
+
+
+def test_controller_rejects_mismatched_budget_and_clock() -> None:
+    """Pair the measured train_seconds budget exclusively with the train_seconds clock."""
+    with pytest.raises(ValueError, match="train_seconds clock"):
+        MatchedComputeController(
+            arm="B",
+            stage="stage_b_self_fed",
+            clock_kind="cuda_device_seconds",
+            config_digest=_digest("mismatch"),
+            budget_control="train_seconds",
+            teacher_handoff=_handoff(),
+            planned_train_seconds=5.0,
+        )
 
 
 def test_active_horizon_shortage_fails_without_sampling_shorter_windows() -> None:
@@ -135,92 +172,92 @@ def test_active_horizon_shortage_fails_without_sampling_shorter_windows() -> Non
 def test_overflow_keeps_completed_compute_evidence_but_not_step_counters() -> None:
     """Preserve measured CUDA work for AMP overflow without claiming an update."""
     controller = MatchedComputeController(
-        arm="A+",
+        arm="A0",
         stage="stage_a_teacher_forcing",
         clock_kind="cuda_device_seconds",
         config_digest=_digest("overflow"),
-        teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_seconds=10.0,
+        planned_stage_epochs=1,
     )
-    controller.record_completed_work(
+    overflow = _work(
         successful=False,
         optimizer_device_seconds=2.5,
         microbatches=2,
         processed_target_transitions=8,
         forward_transitions=8,
         wall_seconds=3.0,
-        epoch_index=0,
-        microbatch_index=0,
-        peak_cuda_memory_bytes=32,
     )
+    controller.record_completed_work(**overflow, peak_cuda_memory_bytes=32)
     assert controller.post_handoff_optimizer_device_seconds == pytest.approx(2.5)
     assert controller.microbatches == 2
     assert controller.processed_target_transitions == 8
     assert controller.forward_transitions == 8
     assert controller.successful_optimizer_steps == 0
-    assert controller.teacher_forcing_optimizer_steps == 0
     assert controller.post_handoff_optimizer_steps == 1
 
 
-def test_successful_stage_a_and_cpu_remaining_steps_are_explicit() -> None:
-    """Advance Stage-A successful counters and expose both CPU remaining formulas."""
-    controller = MatchedComputeController(
-        arm="A+",
-        stage="stage_a_teacher_forcing",
-        clock_kind="optimizer_steps",
-        config_digest=_digest("cpu-remaining"),
-        teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_steps=5,
-        rollout_reference_compute_steps=7,
-    )
-    controller.record_completed_work(
-        successful=True,
-        optimizer_device_seconds=None,
-        microbatches=1,
-        processed_target_transitions=2,
-        forward_transitions=2,
-        wall_seconds=0.1,
-        epoch_index=0,
-        microbatch_index=0,
-    )
-    assert controller.post_handoff_optimizer_steps == 1
-    assert controller.teacher_forcing_optimizer_steps == 1
-    assert controller.remaining_to_planned_teacher_forcing_budget_steps == 4
-    assert controller.remaining_teacher_forcing_compute_to_match_rollout_steps == 6
-    assert controller.remaining_to_planned_teacher_forcing_budget_seconds is None
-    assert controller.remaining_teacher_forcing_compute_to_match_rollout_seconds is None
-
-
-def test_budget_crossing_group_is_selectable_and_no_later_work_is_admitted() -> None:
+def test_train_seconds_crossing_group_is_selectable_and_no_later_work_is_admitted() -> None:
     """Treat the first crossing group as the discrete boundary and make completion sticky."""
     controller = MatchedComputeController(
         arm="B",
         stage="stage_b_self_fed",
-        clock_kind="optimizer_steps",
+        clock_kind="train_seconds",
         config_digest=_digest("sticky-boundary"),
+        budget_control="train_seconds",
         teacher_handoff=_handoff(),
-        planned_teacher_forcing_budget_steps=1,
+        planned_train_seconds=1.0,
     )
-    work = {
-        "successful": True,
-        "optimizer_device_seconds": None,
-        "microbatches": 1,
-        "processed_target_transitions": 2,
-        "forward_transitions": 2,
-        "wall_seconds": 0.1,
-        "epoch_index": 0,
-        "microbatch_index": 0,
-    }
-
-    controller.record_completed_work(**work)
+    controller.record_completed_work(**_work(train_seconds=0.6, batch_cursor=1))
+    assert controller.budget_complete is False
+    controller.record_completed_work(**_work(train_seconds=0.6, batch_cursor=2, microbatch_index=1))
     controller.record_within_budget_evaluation(0.25, epoch_index=0)
 
     assert controller.budget_complete is True
-    assert controller.successful_optimizer_steps == 1
+    assert controller.crossing_microbatch == 1
+    assert controller.train_seconds == pytest.approx(1.2)
     assert controller.best_within_budget_metric == pytest.approx(0.25)
     assert controller.best_within_budget_epoch == 0
     with pytest.raises(RuntimeError, match="cannot continue"):
-        controller.record_completed_work(**work)
+        controller.record_completed_work(**_work(train_seconds=0.1, batch_cursor=3))
+
+
+def test_budget_points_fall_due_once_per_crossed_fraction_and_validate_their_owner() -> None:
+    """Mark k/N points of the measured budget; several crossed points share one evaluation."""
+    controller = MatchedComputeController(
+        arm="B",
+        stage="stage_b_self_fed",
+        clock_kind="train_seconds",
+        config_digest=_digest("points"),
+        budget_control="train_seconds",
+        teacher_handoff=_handoff(),
+        planned_train_seconds=10.0,
+        evaluation_points=4,
+    )
+    controller.record_completed_work(**_work(train_seconds=2.0, batch_cursor=1))
+    assert controller.budget_evaluation_due is False
+    controller.record_completed_work(**_work(train_seconds=3.0, batch_cursor=2, microbatch_index=1))
+    assert controller.budget_evaluation_due is True
+    controller.record_budget_evaluation()
+    assert (controller.evaluated_points, controller.budget_evaluation_due) == (2, False)
+    controller.record_completed_work(**_work(train_seconds=5.5, batch_cursor=3, microbatch_index=2))
+    assert controller.budget_complete is True
+    assert controller.budget_evaluation_due is True
+    controller.record_budget_evaluation()
+    assert controller.evaluated_points == 4
+    restored = MatchedComputeController(**{name: getattr(controller, name) for name in controller.__dataclass_fields__})
+    restored.load_state_dict(controller.state_dict())
+    assert restored.evaluated_points == 4
+
+    with pytest.raises(ValueError, match="only to measured train_seconds"):
+        MatchedComputeController(
+            arm="A0",
+            stage="stage_a_teacher_forcing",
+            clock_kind="optimizer_steps",
+            config_digest=_digest("epochs"),
+            planned_stage_epochs=2,
+            evaluation_points=4,
+        )
+    with pytest.raises(ValueError, match="exceeds evaluation_points"):
+        MatchedComputeController(**{**{name: getattr(controller, name) for name in controller.__dataclass_fields__}, "evaluated_points": 5})
 
 
 def test_stage_epoch_budget_completes_only_after_the_terminal_evaluation() -> None:

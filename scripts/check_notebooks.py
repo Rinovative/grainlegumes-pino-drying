@@ -1,4 +1,17 @@
-"""Validate every discovered maintained notebook without executing or rewriting it."""
+"""Validate maintained notebook structure and cleared execution state.
+
+Responsibilities:
+  - Discover every notebook directly beneath the maintained notebook directory
+  - Require nbformat-4 cells, runnable code, null execution counts, and empty outputs
+
+Design principles:
+  - Validation reads persisted JSON without executing notebook cells
+  - Empty inventories and malformed cell structures fail explicitly
+
+This module does NOT:
+  - Rewrite notebooks or clear their saved outputs
+  - Validate scientific results or resolve notebook runtime dependencies
+"""
 
 from __future__ import annotations
 

@@ -1,16 +1,16 @@
-"""
-generation_input_panel.py
+"""Compose the compact input-generated EDA panel.
 
-Compose the compact input-generated EDA panel.
 Responsibilities:
   - Bind the four-section registry to A/B comparison and dataset views
   - Construct local Dataset A/Case A and Dataset B/Case B controls
   - Preserve automatic first rendering, lazy tabs, and current-figure PDF export
   - Keep transient capability filtering and notebook output ownership explicit
+
 Design principles:
   - Every case-level view uses one common comparison selection model
   - Discovery occurs once when the notebook executes
   - Scientific data loads only through the active view's local controls
+
 This module does NOT:
   - Refresh or generate inputs, implement plot mathematics, or inspect outputs
   - Modify completed-output EDA or evaluation behavior
@@ -18,7 +18,8 @@ This module does NOT:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -34,6 +35,7 @@ from src.analysis.generation_inputs import generation_input_presentation as pres
 from src.analysis.generation_inputs import generation_input_selection as selection_service
 from src.analysis.generation_inputs import generation_input_sources as source_service
 from src.analysis.generation_inputs import plots
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import registry as shared_presentation
 
 if TYPE_CHECKING:
@@ -76,9 +78,13 @@ def _live_view(
 ) -> tuple[widgets.VBox, Callable[[], None]]:
     """Build one active-aware automatically updating local-controls view."""
     output = widgets.Output(layout=widgets.Layout(width="100%", overflow="visible"))
+    generation = 0
 
     def update(*, force: bool = False) -> None:
         """Render active local state and synchronize its export target."""
+        nonlocal generation
+        generation += 1
+        request = generation
         if not force and export_state is not None and export_state.get("plot_name") != export_plot_name:
             return
         if export_state is not None:
@@ -95,9 +101,16 @@ def _live_view(
         with output:
             output.clear_output(wait=True)
             try:
-                items = _result_items(render())
+                with ui.plot_layout.eda_typography():
+                    items = _result_items(render())
             except _HANDLED_VIEW_ERRORS as error:
-                display(widgets.HTML(f"<p><b>View unavailable for the current selection.</b> {escape(str(error))}</p>"))
+                if request == generation and (export_state is None or export_state.get("plot_name") == export_plot_name):
+                    display(widgets.HTML(f"<p><b>View unavailable for the current selection.</b> {escape(str(error))}</p>"))
+                return
+            if request != generation or (export_state is not None and export_state.get("plot_name") != export_plot_name):
+                for item in items:
+                    if isinstance(item, Figure):
+                        plt.close(item)
                 return
             figure: Figure | None = None
             for item in items:
@@ -211,6 +224,7 @@ def _dataset_factory(
 def _view_factories(
     catalog: source_service.GenerationInputDatasetCatalog,
     selection_state: selection_service.GenerationInputSelectionState,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Mapping[str, Callable[..., widgets.Widget]]:
     """Bind every compact presentation key to one cached local factory."""
 
@@ -276,6 +290,7 @@ def _view_factories(
             selection.case_b,
             selection.mean_b,
             lock_scale=selection.lock_scale,
+            display_spatial_stride=display_spatial_stride,
         )
 
     def permeability_tensor(
@@ -288,6 +303,7 @@ def _view_factories(
             selection.case_b,
             selection.mean_b,
             lock_scale=selection.lock_scale,
+            display_spatial_stride=display_spatial_stride,
         )
 
     def derived_permeability(
@@ -300,6 +316,7 @@ def _view_factories(
             selection.case_b,
             selection.mean_b,
             lock_scale=selection.lock_scale,
+            display_spatial_stride=display_spatial_stride,
         )
 
     def moisture_sorption(
@@ -312,9 +329,12 @@ def _view_factories(
             selection.case_b,
             selection.mean_b,
             lock_scale=selection.lock_scale,
+            display_spatial_stride=display_spatial_stride,
         )
 
     return {
+        "campaign_outcomes": _outcome_factory(catalog.outcomes),
+        "field_atlas": _atlas_factory(catalog, selection_state, display_spatial_stride=display_spatial_stride),
         "case_context": _pair_factory(catalog, selection_state, case_context),
         "parameters": _pair_factory(catalog, selection_state, parameters),
         "field_summaries": _pair_factory(catalog, selection_state, field_summaries),
@@ -363,6 +383,52 @@ def _view_factories(
     }
 
 
+def _atlas_factory(
+    catalog: source_service.GenerationInputDatasetCatalog,
+    selection_state: selection_service.GenerationInputSelectionState,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
+) -> Callable[..., widgets.VBox]:
+    """Keep one single-case atlas and its field choices through lazy activation."""
+    cached: widgets.VBox | None = None
+    activate: Callable[[], None] | None = None
+
+    def invoke(
+        *,
+        export_state: dict[str, Any] | None = None,
+        export_plot_name: str | None = None,
+        export_title: str | None = None,
+    ) -> widgets.VBox:
+        """Bind active rendering and current-figure export once."""
+        nonlocal cached, activate
+        if export_state is not None:
+            export_state.update({"plot_name": export_plot_name, "title": export_title})
+        if cached is None:
+            local = controls.FieldAtlasControls(catalog, selection_state)
+
+            def render() -> tuple[Figure | None, widgets.HTML]:
+                """Reuse admitted arrays and scales while toggling visible fields."""
+                atlas = local.selected_atlas()
+                notes = " ".join(atlas.notes)
+                if not local.fields.selected:
+                    notes = "Select a spatial field. " + notes
+                return plots.atlas.field_atlas(atlas, local.fields.selected, display_spatial_stride=display_spatial_stride), widgets.HTML(
+                    f"<p>{escape(notes)}</p>"
+                )
+
+            cached, activate = _live_view(
+                local,
+                render,
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
+            )
+        elif activate is not None:
+            activate()
+        return cached
+
+    return invoke
+
+
 class _GenerationInputPanelShell:
     """Own the sole outer panel, lazy tabs, and current export state."""
 
@@ -373,8 +439,10 @@ class _GenerationInputPanelShell:
         title: str,
         export_dir: Path | str,
         selection_state: selection_service.GenerationInputSelectionState | None,
+        display_spatial_stride: display_grid.DisplayStride,
     ) -> None:
         """Initialize one collapsed panel without eager figures."""
+        self._display_spatial_stride: display_grid.DisplayStride = display_spatial_stride
         self._catalog = catalog
         self._selection_state = selection_state
         self._export_dir = Path(export_dir)
@@ -477,7 +545,11 @@ class _GenerationInputPanelShell:
         if self._selection_state is None:
             message = "A non-empty generation-input panel requires shared selection state."
             raise RuntimeError(message)
-        factories = _view_factories(self._catalog, self._selection_state)
+        factories = _view_factories(
+            self._catalog,
+            self._selection_state,
+            display_spatial_stride=self._display_spatial_stride,
+        )
         sections: list[widgets.Widget] = []
         titles: list[str] = []
         keys: list[str] = []
@@ -523,7 +595,7 @@ class _GenerationInputPanelShell:
                 print("[Export] The current view has no rendered figure.")
                 return
             self._export_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             stem = str(self._export_state.get("plot_name") or "generation_input_view")
             destination = self._export_dir / f"{stem}_{timestamp}.pdf"
             figure.savefig(destination, bbox_inches="tight")
@@ -560,6 +632,7 @@ def build_generation_input_eda_panel(
     selection_state: selection_service.GenerationInputSelectionState | None = None,
     title: str = "Generation-input EDA",
     export_dir: Path | str = "",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> widgets.Output:
     """Build one collapsible panel with session-scoped shared A/B state."""
     if not isinstance(datasets, source_service.GenerationInputDatasetCatalog):
@@ -583,4 +656,74 @@ def build_generation_input_eda_panel(
         title=title,
         export_dir=export_dir,
         selection_state=resolved_state,
+        display_spatial_stride=display_spatial_stride,
     ).output
+
+
+def _outcome_factory(catalog: source_service.CampaignOutcomeCatalog) -> Callable[..., widgets.Widget]:
+    """Bind one cached candidate outcome table, evidence record, and optional plot."""
+    cached: widgets.Widget | None = None
+    activate: Callable[[], None] | None = None
+
+    def invoke(*, export_state: dict[str, Any] | None = None, export_plot_name: str | None = None, export_title: str | None = None) -> widgets.Widget:
+        nonlocal cached, activate
+        if not catalog.rows:
+            if export_state is not None:
+                export_state.update({"fig": None, "plot_name": export_plot_name, "title": export_title})
+            issues = " ".join(catalog.issues)
+            return widgets.HTML(f"<p>No canonical campaign candidate records at this discovery checkpoint. {escape(issues)}</p>")
+        if cached is None:
+            local = controls.CampaignOutcomeControls(catalog)
+
+            def render() -> tuple[object, ...]:
+                rows = local.rows()
+                scope = local.rows(all_outcomes=True)
+                table = source_service.campaign_outcome_table(rows)
+                rates = source_service.campaign_outcome_rates(scope)
+                failure_rates = source_service.campaign_failure_rates(scope)
+                message = widgets.HTML(
+                    f"<p>{len(rows)} matching candidates; showing the first 200 rows. "
+                    "Rates use all terminal outcomes in the selected campaign/material/origin scope. "
+                    "Pending and technical attempts remain separate. Failed candidates never satisfy supervised success counts. "
+                    "Parameter plots include admitted finite scalar values with the chosen unit; n reports actual support.</p>"
+                )
+                result: list[object] = [
+                    message,
+                    ui.tables.styled_dataframe(table.head(200), title="Candidate outcomes", shade_constant=False),
+                    ui.tables.styled_dataframe(rates, title="Rates by material / role / origin / design", shade_constant=False),
+                ]
+                if not failure_rates.empty:
+                    result.append(
+                        ui.tables.styled_dataframe(failure_rates, title="Terminal failure reasons / all terminal candidates", shade_constant=False)
+                    )
+                selected = next((row for row in rows if (row["material_family"], row["case_id"]) == local.case.value), None)
+                if selected is not None:
+                    evidence = escape(json.dumps(selected, indent=2, default=str, ensure_ascii=False))
+                    result.append(
+                        widgets.HTML(
+                            "<details><summary>Exact selected candidate evidence, input locators, attempts and diagnostics</summary>"
+                            f"<pre>{evidence}</pre></details>"
+                        )
+                    )
+                if local.parameter.value is not None:
+                    name, unit = local.parameter.value
+                    values = source_service.outcome_parameter_values(scope, name, unit)
+                    result.append(plots.overview.outcome_parameter_distribution(values, name=name, unit=unit))
+                return tuple(result)
+
+            cached, activate = _live_view(local, render, export_state=export_state, export_plot_name=export_plot_name, export_title=export_title)
+        elif activate is not None:
+            if export_state is not None:
+                export_state.update({"plot_name": export_plot_name, "title": export_title})
+            activate()
+        return cached
+
+    return invoke
+
+
+def build_campaign_outcome_panel(catalog: source_service.CampaignOutcomeCatalog) -> widgets.Output:
+    """Keep pending/failed candidate evidence visible even before input admission."""
+    output = widgets.Output()
+    with output:
+        display(_outcome_factory(catalog)())
+    return output

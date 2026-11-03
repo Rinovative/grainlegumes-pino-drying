@@ -1,7 +1,4 @@
-"""
-domain_task_transient_drying.py
-
-Declare the authoritative two-dimensional transient grain-drying task contract.
+"""Declare the authoritative two-dimensional transient grain-drying task contract.
 
 Responsibilities:
   - Define ordered transient input profiles and reconstructed-state metrics
@@ -23,7 +20,6 @@ from __future__ import annotations
 
 from .domain_task_spec import (
     TASK_SCHEMA_VERSION,
-    DatasetDefaults,
     FieldSpec,
     InputProfileSpec,
     MetricSpec,
@@ -90,10 +86,6 @@ TRANSIENT_DRYING = TaskSpec(
     tensor_layout=("batch", "channel", "y", "x"),
     operator_axes=(2, 3),
     normalization_axes=(0, 2, 3),
-    default_datasets=DatasetDefaults(
-        train="transient_drying__lentil+chickpea__id",
-        ood=("transient_drying__kidney_bean__near_family_ood",),
-    ),
     preprocessing=PreprocessingSpec(
         input_normalization="train_only_group_specific_scaling_with_unique_state_deduplication",
         output_normalization="train_only_zero_preserving_per_channel_increment_scaling",
@@ -147,7 +139,6 @@ TRANSIENT_DRYING = TaskSpec(
         kind="none",
         equation_set="data_only",
         continuity="none",
-        allowed_continuities=("none",),
         boundary="none",
     ),
     input_profiles=(InputProfileSpec("canonical_physics_complete_v1", _COMPLETE_FIELDS, "explicit_x_y"),),

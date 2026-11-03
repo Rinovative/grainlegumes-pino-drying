@@ -1,11 +1,13 @@
-# ruff: noqa: S101, PLR2004
-"""
-Verify reusable physical and spectral derivative operators on analytic fields.
+"""Verify reusable physical and spectral derivative operators on analytic fields.
 
-Linear and periodic manufactured solutions cover gradients, divergence, crop,
-spacing inference, extension semantics, and invalid grids/identifiers. Brinkman
-equation assembly is covered separately. These tests do not claim accuracy on
-production COMSOL fields.
+Responsibilities:
+  - Check physical/spectral derivatives, crop, spacing, and extension admission
+
+Design principles:
+  - Manufactured linear and periodic fields isolate derivative behavior
+
+This module does NOT:
+  - Assemble Brinkman equations or claim production-field accuracy
 """
 
 from __future__ import annotations
@@ -125,21 +127,33 @@ def test_uniform_spacing_accepts_float32_quantized_cartesian_grid() -> None:
     assert spacing_y.item() == pytest.approx(0.003, rel=1e-6)
 
 
-def test_reflect_extension_uses_validated_unpadded_spacing() -> None:
-    """Differentiate on reflected fields without treating reflected coordinates as one axis."""
-    x_values = torch.linspace(0.0, 1.2, 401, dtype=torch.float32)
-    y_values = torch.linspace(0.0, 0.75, 251, dtype=torch.float32)
+def test_fourier_continuation_differentiates_non_periodic_fields() -> None:
+    """
+    Differentiate fields whose boundary values differ on a non-periodic rectangle.
+
+    A linear field and a cosine mode with non-zero boundary slope must both be
+    resolved to high accuracy up to the boundary rows, which neither a periodic
+    wrap (jump) nor an even reflection (slope kink) can achieve.
+    """
+    length_x, length_y = 1.2, 0.75
+    x_values = torch.linspace(0.0, length_x, 41, dtype=torch.float64)
+    y_values = torch.linspace(0.0, length_y, 25, dtype=torch.float64)
     y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
     spacing_x, spacing_y = domain.physics.derivatives.infer_uniform_spacing(x_grid, y_grid)
-    field = (torch.cos(torch.pi * x_grid / 1.2) + torch.cos(torch.pi * y_grid / 0.75)).unsqueeze(0)
-    operator = domain.physics.derivatives.SpectralDerivatives(extension="reflect")
+    operator = domain.physics.derivatives.SpectralDerivatives(extension="fourier_continuation")
 
-    derivative_x, derivative_y = operator.gradient(field, spacing_x, spacing_y)
+    linear = (2.0 * x_grid - 3.0 * y_grid).unsqueeze(0)
+    linear_x, linear_y = operator.gradient(linear, spacing_x, spacing_y)
+    assert torch.allclose(linear_x, torch.full_like(linear_x, 2.0), rtol=1e-3)
+    assert torch.allclose(linear_y, torch.full_like(linear_y, -3.0), rtol=1e-3)
 
-    assert derivative_x.shape == field.shape
-    assert derivative_y.shape == field.shape
-    assert torch.isfinite(derivative_x).all()
-    assert torch.isfinite(derivative_y).all()
+    field = torch.sin(0.5 * torch.pi * y_grid / length_y).unsqueeze(0)
+    _, derivative_y = operator.gradient(field, spacing_x, spacing_y)
+    expected_y = (0.5 * torch.pi / length_y * torch.cos(0.5 * torch.pi * y_grid / length_y)).unsqueeze(0)
+    assert torch.allclose(derivative_y, expected_y, atol=1e-3 * expected_y.abs().max().item())
+
+    with pytest.raises(ValueError, match="at least 10 points"):
+        operator.gradient(linear[..., :9, :], spacing_x, spacing_y)
 
 
 def test_derivative_semantics_fail_clearly() -> None:
@@ -152,4 +166,4 @@ def test_derivative_semantics_fail_clearly() -> None:
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
         domain.physics.derivatives.build_derivative_operator("unsupported", extension="none")
     with pytest.raises(ValueError, match="require extension 'none'"):
-        domain.physics.derivatives.build_derivative_operator("physical", extension="reflect")
+        domain.physics.derivatives.build_derivative_operator("physical", extension="fourier_continuation")

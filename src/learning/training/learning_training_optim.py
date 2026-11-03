@@ -1,12 +1,10 @@
-"""
-learning_training_optim.py
-
-Construct optimizers and schedulers for training.
+"""Construct optimizers and schedulers for training.
 
 Responsibilities:
   - Build AdamW optimizers from resolved configs
   - Build ReduceLROnPlateau schedulers from resolved configs
   - Return no scheduler when scheduler config is absent
+  - Scale a restored continuation learning-rate schedule (rates and plateau floors) by one factor
 
 Design principles:
   - YAML semantics map directly to optimizer arguments
@@ -20,6 +18,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -149,3 +148,55 @@ def build_scheduler(
         )
     msg = f"Only 'reduce_on_plateau' scheduler is supported, got: {sched_type}"
     raise ValueError(msg)
+
+
+def scale_restored_learning_rates(
+    optimizer: Optimizer,
+    scheduler: ReduceLROnPlateau | None,
+    *,
+    scale: float,
+) -> list[float]:
+    """
+    Scale the restored continuation learning-rate schedule by one factor.
+
+    Parameters
+    ----------
+    optimizer : Optimizer
+        Optimizer whose state was just restored from a teacher handoff checkpoint.
+    scheduler : ReduceLROnPlateau | None
+        Restored scheduler; its floors are scaled with the rates.
+    scale : float
+        Positive finite continuation factor; ``1`` keeps the inherited state exactly.
+
+    Returns
+    -------
+    list[float]
+        Effective per-group starting learning rates.
+
+    Raises
+    ------
+    ValueError
+        If the factor is not positive and finite.
+
+    Notes
+    -----
+    Rates and plateau floors are multiplied together, so the continuation follows the
+    inherited schedule shape at a different level: a rate already at its floor stays at
+    the scaled floor and later reductions remain possible. AdamW moments, step counters
+    and the scheduler's best value, bad-epoch counter and cooldown stay as restored; its
+    last-rate bookkeeping follows the scaled rates so saved checkpoints stay consistent.
+
+    """
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+        msg = f"Continuation lr_scale must be positive and finite, got {scale!r}."
+        raise ValueError(msg)
+    current = [float(group["lr"]) for group in optimizer.param_groups]
+    if scale == 1:
+        return current
+    scaled = [rate * float(scale) for rate in current]
+    for group, rate in zip(optimizer.param_groups, scaled, strict=True):
+        group["lr"] = rate
+    if scheduler is not None:
+        scheduler.min_lrs = [float(floor) * float(scale) for floor in scheduler.min_lrs]
+        scheduler._last_lr = list(scaled)  # noqa: SLF001 -- keep PyTorch's saved last-rate evidence aligned with the scaled groups
+    return scaled

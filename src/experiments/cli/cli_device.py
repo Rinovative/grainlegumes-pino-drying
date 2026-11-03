@@ -1,7 +1,4 @@
-"""
-cli_device.py
-
-Define the shared semantic runtime-device option used by command modules.
+"""Define the shared semantic runtime-device option used by command modules.
 
 Responsibilities:
   - Expose the exact auto, cuda, and cpu CLI vocabulary

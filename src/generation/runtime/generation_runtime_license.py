@@ -1,15 +1,17 @@
-"""
-generation_runtime_license.py
+"""Classify and persist retry evidence for temporary COMSOL license capacity.
 
-Classify and persist retry evidence for temporary COMSOL license capacity.
 Responsibilities:
   - Recognize conservative floating-license capacity signatures in captured logs
   - Derive capped exponential retry delays from resolved execution policy
-  - Persist and validate one mutable compact wait record per blocked work unit
+  - Persist and validate compact controller wait records and immutable in-allocation window receipts
+  - Record exact checkout status-artifact recovery evidence before and after cleanup
+
 Design principles:
   - License exit codes never replace captured-text classification
   - Retry history is operational provenance and preserves scientific case identity
-  - Scheduler allocations end before controller-side backoff begins
+  - Controller backoff and worker-owned bounded checkout windows retain distinct evidence
+  - Per-case evidence is keyed by dispatch key, so several dispatches in one allocation stay distinct
+
 This module does NOT:
   - Submit scheduler jobs, sleep inside allocations, or classify other failures
   - Change COMSOL models, scientific inputs, or case-publication admission
@@ -24,11 +26,13 @@ import re
 import socket
 import stat
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
+
+from . import generation_runtime_dispatch_identity as dispatch_identity
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -37,7 +41,6 @@ if TYPE_CHECKING:
     from src.generation.cases import generation_cases_config as config_contract
 
 TEMPORARY_LICENSE_CAPACITY: Final = "temporary_license_capacity"
-EXHAUSTED_REASON: Final = "temporary COMSOL license capacity remained unavailable for the configured maximum wait"
 _FEATURE_PATTERN: Final = re.compile(
     r"Could\s+not\s+obtain\s+license\s+for\s+['\"](?P<feature>[^'\"\r\n]+)['\"]",
     flags=re.IGNORECASE,
@@ -59,16 +62,15 @@ _NON_CAPACITY_LICENSE_PATTERN: Final = re.compile(
     r"product\s+is\s+not\s+licensed|license\s+server\s+configuration)",
     flags=re.IGNORECASE,
 )
-_JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _SOLVER_PROGRESS_PATTERN: Final = re.compile(
     r"(?:Time-Dependent Solver|Stationary Solver|Solution time|^\s*Step\s+Time(?:\s|$))",
     flags=re.IGNORECASE | re.MULTILINE,
 )
 _WAIT_SCHEMA_KIND: Final = "generation_temporary_license_wait"
 _WAIT_SCHEMA_VERSION: Final = 1
-_WAIT_FILENAME: Final = "license_wait.json"
+_WAIT_FILENAME: Final = "wait.json"
 _MAX_RAW_EXCERPT_CHARACTERS: Final = 4096
-_MAX_RECENT_JOB_IDS: Final = 16
+_MAX_RECENT_DISPATCH_KEYS: Final = 16
 _WAIT_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -88,8 +90,8 @@ _WAIT_KEYS: Final = frozenset(
         "first_blocked_at",
         "last_blocked_at",
         "retry_count",
-        "latest_job_id",
-        "recent_job_ids",
+        "latest_dispatch_key",
+        "recent_dispatch_keys",
         "hostname",
         "raw_excerpt",
         "delay_before_next_attempt_seconds",
@@ -237,19 +239,17 @@ def bounded_retry_delay_seconds(
 
 def temporary_license_wait_directory(
     campaign_run_id: str,
-    batch_id: str,
+    batch_storage_name: str,
     case_id: str,
     *,
     storage_root: Path | str | None,
 ) -> Path:
-    """Return the canonical per-case operational retry-evidence directory."""
-    run_directory = campaign_evidence.campaign_run_directory(
-        campaign_run_id,
-        storage_root=storage_root,
+    """Return the canonical per-case license directory holding the wait receipt, checkout windows and status recoveries."""
+    return common.paths.resolve_generation_license_case_directory(
+        campaign_evidence.campaign_execution_directory(campaign_run_id, storage_root=storage_root),
+        common.paths.generation_execution_key(batch_storage_name),
+        case_id,
     )
-    safe_batch = common.paths.validate_logical_name(batch_id, label="batch_id")
-    safe_case = common.paths.validate_logical_name(case_id, label="case_id")
-    return run_directory / "license_retries" / safe_batch / safe_case
 
 
 def _parse_timestamp(value: Any, *, label: str) -> datetime:
@@ -265,7 +265,7 @@ def _parse_timestamp(value: Any, *, label: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         message = f"{label} must be a timezone-aware timestamp."
         raise ValueError(message)
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _validate_wait_record(
@@ -313,19 +313,19 @@ def _validate_wait_record(
     if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 1:
         message = f"Temporary-license retry count is malformed for {case_id}."
         raise ValueError(message)
-    latest_job_id = payload.get("latest_job_id")
-    recent_job_ids = payload.get("recent_job_ids")
+    latest_dispatch_key = payload.get("latest_dispatch_key")
+    recent_dispatch_keys = payload.get("recent_dispatch_keys")
     if (
-        not isinstance(latest_job_id, str)
-        or _JOB_ID_PATTERN.fullmatch(latest_job_id) is None
-        or not isinstance(recent_job_ids, list)
-        or not recent_job_ids
-        or len(recent_job_ids) > _MAX_RECENT_JOB_IDS
-        or len(recent_job_ids) != len(set(recent_job_ids))
-        or not all(isinstance(value, str) and _JOB_ID_PATTERN.fullmatch(value) is not None for value in recent_job_ids)
-        or recent_job_ids[-1] != latest_job_id
+        not isinstance(latest_dispatch_key, str)
+        or dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(latest_dispatch_key) is None
+        or not isinstance(recent_dispatch_keys, list)
+        or not recent_dispatch_keys
+        or len(recent_dispatch_keys) > _MAX_RECENT_DISPATCH_KEYS
+        or len(recent_dispatch_keys) != len(set(recent_dispatch_keys))
+        or not all(isinstance(value, str) and dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(value) is not None for value in recent_dispatch_keys)
+        or recent_dispatch_keys[-1] != latest_dispatch_key
     ):
-        message = f"Temporary-license job history is malformed for {case_id}."
+        message = f"Temporary-license dispatch history is malformed for {case_id}."
         raise ValueError(message)
     first = _parse_timestamp(payload.get("first_blocked_at"), label="temporary-license first blocked timestamp")
     last = _parse_timestamp(payload.get("last_blocked_at"), label="temporary-license last blocked timestamp")
@@ -345,7 +345,7 @@ def _validate_wait_record(
         message = f"Temporary-license retry delays are malformed for {case_id}."
         raise ValueError(message)
     prior_cumulative = float(cumulative) - float(delay)
-    policy = config.execution_values["runtime"]["temporary_license_retry"]
+    policy = config.execution_values["runtime"]["license_wait"]
     expected_delay = bounded_retry_delay_seconds(
         policy,
         attempt_index=retry_count,
@@ -378,6 +378,18 @@ def _owned_atomic_temporary_entry(path: Path, *, destination: Path) -> bool:
     return stat.S_ISREG(entry_status.st_mode)
 
 
+def _window_receipt_temporary(entry: Path, directory: Path) -> bool:
+    """Return whether one window-directory entry is an owned atomic temporary of a dispatch-keyed window receipt."""
+    destination = common.serialization.atomic_write_temporary_destination(entry)
+    return (
+        destination is not None
+        and destination.parent == directory
+        and destination.suffix == ".json"
+        and dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(destination.stem) is not None
+        and _owned_atomic_temporary_entry(entry, destination=destination)
+    )
+
+
 def load_temporary_license_wait(
     config: config_contract.GenerationConfig,
     case_index: int,
@@ -388,7 +400,7 @@ def load_temporary_license_wait(
     """Load the optional compact wait record for one blocked work unit."""
     directory = temporary_license_wait_directory(
         campaign_run_id,
-        config.batch_id,
+        config.batch_storage_name,
         config.case_id(case_index),
         storage_root=storage_root,
     )
@@ -404,6 +416,8 @@ def load_temporary_license_wait(
             if entry.is_symlink() or not entry.is_file():
                 message = f"Temporary-license retry evidence directory contains unexpected entries: {directory}"
                 raise ValueError(message)
+            continue
+        if entry.name in _CASE_RECORD_DIRECTORIES and entry.is_dir() and not entry.is_symlink():
             continue
         if _owned_atomic_temporary_entry(entry, destination=wait_path):
             continue
@@ -439,9 +453,9 @@ def record_temporary_license_wait(
         os.environ.get("GENERATION_CAMPAIGN_RUN_ID"),
         label="campaign_run_id",
     )
-    job_id = os.environ.get("SLURM_JOB_ID")
-    if job_id is None or _JOB_ID_PATTERN.fullmatch(job_id) is None:
-        message = "Temporary-license retry evidence requires one numeric SLURM_JOB_ID."
+    dispatch = dispatch_identity.current_case_dispatch()
+    if dispatch is None:
+        message = "Temporary-license retry evidence requires one campaign case dispatch identity."
         raise RuntimeError(message)
     current = load_temporary_license_wait(
         config,
@@ -452,26 +466,26 @@ def record_temporary_license_wait(
     if current is None:
         retry_count = 1
         prior_cumulative = 0.0
-        first_blocked_at = datetime.now(timezone.utc).isoformat()
-        recent_job_ids: list[str] = []
+        first_blocked_at = datetime.now(UTC).isoformat()
+        recent_dispatch_keys: list[str] = []
     else:
         retry_count = int(current["retry_count"]) + 1
         prior_cumulative = float(current["cumulative_wait_seconds"])
         first_blocked_at = str(current["first_blocked_at"])
-        recent_job_ids = [str(value) for value in current["recent_job_ids"]]
-    if job_id in recent_job_ids:
-        message = f"Temporary-license retry evidence already includes Slurm job {job_id}."
+        recent_dispatch_keys = [str(value) for value in current["recent_dispatch_keys"]]
+    if dispatch.dispatch_key in recent_dispatch_keys:
+        message = f"Temporary-license retry evidence already includes dispatch {dispatch.dispatch_key}."
         raise FileExistsError(message)
-    recent_job_ids.append(job_id)
-    recent_job_ids = recent_job_ids[-_MAX_RECENT_JOB_IDS:]
-    policy = config.execution_values["runtime"]["temporary_license_retry"]
+    recent_dispatch_keys.append(dispatch.dispatch_key)
+    recent_dispatch_keys = recent_dispatch_keys[-_MAX_RECENT_DISPATCH_KEYS:]
+    policy = config.execution_values["runtime"]["license_wait"]
     delay = bounded_retry_delay_seconds(
         policy,
         attempt_index=retry_count,
         cumulative_wait_seconds=prior_cumulative,
     )
     cumulative = prior_cumulative + delay
-    timestamp = datetime.now(timezone.utc)
+    timestamp = datetime.now(UTC)
     retry_remaining = delay > 0.0
     case_id = config.case_id(case_index)
     payload = {
@@ -492,8 +506,8 @@ def record_temporary_license_wait(
         "first_blocked_at": first_blocked_at,
         "last_blocked_at": timestamp.isoformat(),
         "retry_count": retry_count,
-        "latest_job_id": job_id,
-        "recent_job_ids": recent_job_ids,
+        "latest_dispatch_key": dispatch.dispatch_key,
+        "recent_dispatch_keys": recent_dispatch_keys,
         "hostname": socket.gethostname(),
         "raw_excerpt": error.evidence.raw_excerpt,
         "delay_before_next_attempt_seconds": delay,
@@ -503,7 +517,7 @@ def record_temporary_license_wait(
     }
     directory = temporary_license_wait_directory(
         campaign_run_id,
-        config.batch_id,
+        config.batch_storage_name,
         case_id,
         storage_root=storage_root,
     )
@@ -522,15 +536,15 @@ def record_temporary_license_wait(
     return path
 
 
-def latest_wait_for_job(
+def latest_wait_for_dispatch(
     config: config_contract.GenerationConfig,
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     storage_root: Path | str | None,
 ) -> dict[str, Any] | None:
-    """Return canonical wait evidence only when it belongs to the latest job."""
+    """Return canonical wait evidence only when it belongs to the latest dispatch."""
     wait = load_temporary_license_wait(
         config,
         case_index,
@@ -539,7 +553,7 @@ def latest_wait_for_job(
     )
     if wait is None:
         return None
-    return wait if wait["latest_job_id"] == job_id else None
+    return wait if wait["latest_dispatch_key"] == dispatch_key else None
 
 
 def wait_record_is_eligible(
@@ -555,16 +569,16 @@ def wait_record_is_eligible(
         next_retry_at,
         label="temporary-license next retry eligibility",
     )
-    current = datetime.now(timezone.utc) if at is None else at
+    current = datetime.now(UTC) if at is None else at
     if current.tzinfo is None or current.utcoffset() is None:
         message = "Retry eligibility comparison requires a timezone-aware time."
         raise ValueError(message)
-    return current.astimezone(timezone.utc) >= eligible
+    return current.astimezone(UTC) >= eligible
 
 
 _WINDOW_SCHEMA_KIND: Final = "generation_in_allocation_license_window"
 _WINDOW_SCHEMA_VERSION: Final = 1
-_WINDOW_DIRECTORY_NAME: Final = "license_retry_windows"
+_WINDOW_DIRECTORY_NAME: Final = "windows"
 _MAX_RECENT_CHECKOUT_SUMMARIES: Final = 8
 _MAX_CHECKOUT_EXCERPT_CHARACTERS: Final = 512
 _WINDOW_OUTCOMES: Final = frozenset({"solver_progress_started", "window_exhausted"})
@@ -628,7 +642,7 @@ class InAllocationLicenseWindowResult:
     case_id: str
     work_unit_id: str
     scientific_config_digest: str
-    job_id: str
+    dispatch_key: str
     hostname: str
     window_started_at: datetime
     window_ended_at: datetime
@@ -643,8 +657,8 @@ class InAllocationLicenseWindowResult:
 
     def __post_init__(self) -> None:
         """Validate the immutable operational result before persistence."""
-        if _JOB_ID_PATTERN.fullmatch(self.job_id) is None:
-            message = "In-allocation license window requires one numeric Slurm job ID."
+        if dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(self.dispatch_key) is None:
+            message = "In-allocation license window requires one dispatch key."
             raise ValueError(message)
         for label, text_value in (
             ("campaign_run_id", self.campaign_run_id),
@@ -706,16 +720,13 @@ class InAllocationLicenseWindowResult:
 
 def in_allocation_license_window_directory(
     campaign_run_id: str,
-    batch_id: str,
+    batch_storage_name: str,
     case_id: str,
     *,
     storage_root: Path | str | None,
 ) -> Path:
     """Return the strict append-only receipt directory for one logical case."""
-    run_directory = campaign_evidence.campaign_run_directory(campaign_run_id, storage_root=storage_root)
-    safe_batch = common.paths.validate_logical_name(batch_id, label="batch_id")
-    safe_case = common.paths.validate_logical_name(case_id, label="case_id")
-    return run_directory / _WINDOW_DIRECTORY_NAME / safe_batch / safe_case
+    return temporary_license_wait_directory(campaign_run_id, batch_storage_name, case_id, storage_root=storage_root) / _WINDOW_DIRECTORY_NAME
 
 
 def _checkout_summary_payload(summary: InAllocationLicenseCheckoutSummary) -> dict[str, Any]:
@@ -724,8 +735,8 @@ def _checkout_summary_payload(summary: InAllocationLicenseCheckoutSummary) -> di
     excerpt = None if classification is None else _bounded_raw_excerpt(classification.raw_excerpt)[-_MAX_CHECKOUT_EXCERPT_CHARACTERS:]
     return {
         "checkout_index": summary.checkout_index,
-        "started_at": summary.started_at.astimezone(timezone.utc).isoformat(),
-        "ended_at": summary.ended_at.astimezone(timezone.utc).isoformat(),
+        "started_at": summary.started_at.astimezone(UTC).isoformat(),
+        "ended_at": summary.ended_at.astimezone(UTC).isoformat(),
         "duration_seconds": summary.duration_seconds,
         "process_exit_code": summary.process_exit_code,
         "classification": None if classification is None else classification.classification,
@@ -742,7 +753,7 @@ def in_allocation_license_window_result(
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     hostname: str,
     window_started_at: datetime,
     window_ended_at: datetime,
@@ -753,7 +764,7 @@ def in_allocation_license_window_result(
     outcome: str,
 ) -> InAllocationLicenseWindowResult:
     """Build one validated final result from injected worker lifecycle evidence."""
-    policy = config.execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"]
+    policy = config.execution_values["runtime"]["license_wait"]["in_allocation_retry"]
     case_id = config.case_id(case_index)
     exhausted = outcome == "window_exhausted"
     return InAllocationLicenseWindowResult(
@@ -762,7 +773,7 @@ def in_allocation_license_window_result(
         case_id=case_id,
         work_unit_id=f"{config.batch_id}/{case_id}",
         scientific_config_digest=config.scientific_config_digest,
-        job_id=job_id,
+        dispatch_key=dispatch_key,
         hostname=hostname,
         window_started_at=window_started_at,
         window_ended_at=window_ended_at,
@@ -796,22 +807,18 @@ def _window_payload(result: InAllocationLicenseWindowResult) -> dict[str, Any]:
         "case_id": result.case_id,
         "work_unit_id": result.work_unit_id,
         "scientific_config_digest": result.scientific_config_digest,
-        "slurm_job_id": result.job_id,
+        "dispatch_key": result.dispatch_key,
         "hostname": result.hostname,
-        "window_started_at": result.window_started_at.astimezone(timezone.utc).isoformat(),
-        "window_ended_at": result.window_ended_at.astimezone(timezone.utc).isoformat(),
+        "window_started_at": result.window_started_at.astimezone(UTC).isoformat(),
+        "window_ended_at": result.window_ended_at.astimezone(UTC).isoformat(),
         "configured_window_seconds": result.configured_window_seconds,
         "realised_window_seconds": result.realised_window_seconds,
         "checkout_attempt_count": len(result.checkout_summaries),
         "checkout_capacity_failure_count": sum(summary.classification is not None for summary in result.checkout_summaries),
         "observed_features": features,
         "observed_error_codes": error_codes,
-        "first_checkout_started_at": None
-        if not result.checkout_summaries
-        else result.checkout_summaries[0].started_at.astimezone(timezone.utc).isoformat(),
-        "last_checkout_ended_at": None
-        if not result.checkout_summaries
-        else result.checkout_summaries[-1].ended_at.astimezone(timezone.utc).isoformat(),
+        "first_checkout_started_at": None if not result.checkout_summaries else result.checkout_summaries[0].started_at.astimezone(UTC).isoformat(),
+        "last_checkout_ended_at": None if not result.checkout_summaries else result.checkout_summaries[-1].ended_at.astimezone(UTC).isoformat(),
         "solver_progress_started": result.solver_progress_started,
         "outcome": result.outcome,
         "reason": result.reason,
@@ -889,17 +896,17 @@ def load_in_allocation_license_window(
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     storage_root: Path | str | None,
 ) -> dict[str, Any] | None:
-    """Load one immutable allocation-window receipt for its exact Slurm job."""
-    if _JOB_ID_PATTERN.fullmatch(job_id) is None:
-        message = "In-allocation license window lookup requires one numeric Slurm job ID."
+    """Load one immutable allocation-window receipt for its exact dispatch."""
+    if dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(dispatch_key) is None:
+        message = "In-allocation license window lookup requires one dispatch key."
         raise ValueError(message)
     case_id = config.case_id(case_index)
     directory = in_allocation_license_window_directory(
         campaign_run_id,
-        config.batch_id,
+        config.batch_storage_name,
         case_id,
         storage_root=storage_root,
     )
@@ -908,10 +915,11 @@ def load_in_allocation_license_window(
     if directory.is_symlink() or not directory.is_dir():
         message = f"In-allocation license window directory is unsafe: {directory}"
         raise ValueError(message)
-    path = directory / f"{job_id}.json"
-    entries = tuple(directory.iterdir())
+    path = directory / f"{dispatch_key}.json"
+    entries = tuple(entry for entry in directory.iterdir() if not _window_receipt_temporary(entry, directory))
     if any(
-        entry.is_symlink() or not entry.is_file() or _JOB_ID_PATTERN.fullmatch(entry.stem) is None or entry.suffix != ".json" for entry in entries
+        entry.is_symlink() or not entry.is_file() or dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(entry.stem) is None or entry.suffix != ".json"
+        for entry in entries
     ):
         message = f"In-allocation license window directory contains unexpected entries: {directory}"
         raise ValueError(message)
@@ -930,7 +938,7 @@ def load_in_allocation_license_window(
         "case_id",
         "work_unit_id",
         "scientific_config_digest",
-        "slurm_job_id",
+        "dispatch_key",
         "hostname",
         "window_started_at",
         "window_ended_at",
@@ -960,7 +968,7 @@ def load_in_allocation_license_window(
         or payload["case_id"] != case_id
         or payload["work_unit_id"] != f"{config.batch_id}/{case_id}"
         or payload["scientific_config_digest"] != config.scientific_config_digest
-        or payload["slurm_job_id"] != job_id
+        or payload["dispatch_key"] != dispatch_key
         or not isinstance(payload["hostname"], str)
         or not payload["hostname"]
         or payload["outcome"] not in _WINDOW_OUTCOMES
@@ -978,7 +986,7 @@ def load_in_allocation_license_window(
     if any(isinstance(payload[key], bool) or not isinstance(payload[key], (int, float)) or float(payload[key]) < 0.0 for key in numeric_keys):
         message = f"In-allocation license window durations are malformed for {case_id}."
         raise ValueError(message)
-    expected_window = config.execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"]["maximum_window_seconds"]
+    expected_window = config.execution_values["runtime"]["license_wait"]["in_allocation_retry"]["maximum_window_seconds"]
     if float(payload["configured_window_seconds"]) != float(expected_window):
         message = f"In-allocation license window policy is inconsistent for {case_id}."
         raise ValueError(message)
@@ -1051,14 +1059,14 @@ def record_in_allocation_license_window(
     *,
     storage_root: Path | str | None,
 ) -> Path:
-    """Append one immutable per-numeric-job allocation-window receipt."""
+    """Append one immutable per-dispatch allocation-window receipt."""
     case_id = config.case_id(case_index)
     if result.batch_id != config.batch_id or result.case_id != case_id or result.scientific_config_digest != config.scientific_config_digest:
         message = "In-allocation license window result does not bind the configured case."
         raise ValueError(message)
     directory = in_allocation_license_window_directory(
         result.campaign_run_id,
-        result.batch_id,
+        config.batch_storage_name,
         result.case_id,
         storage_root=storage_root,
     )
@@ -1066,28 +1074,21 @@ def record_in_allocation_license_window(
     if directory.is_symlink() or not directory.is_dir():
         message = f"In-allocation license window directory is unsafe: {directory}"
         raise ValueError(message)
-    path = directory / f"{result.job_id}.json"
+    path = directory / f"{result.dispatch_key}.json"
     payload = _window_payload(result)
     serialized = json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        message = f"In-allocation license window receipt already exists for Slurm job {result.job_id}."
-        raise FileExistsError(message) from None
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(serialized)
-            stream.flush()
-            os.fsync(stream.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    return path
+    # One case process owns each dispatch key, so an existence check plus an atomic sibling publication is exclusive
+    # enough; readers never see a partial receipt, and a killed writer leaves only an owned atomic temporary.
+    if path.exists():
+        message = f"In-allocation license window receipt already exists for dispatch {result.dispatch_key}."
+        raise FileExistsError(message)
+    return common.serialization.atomic_write_text(path, serialized)
 
 
 _STATUS_RECOVERY_SCHEMA_KIND: Final = "generation_in_allocation_status_artifact_recovery"
 _STATUS_RECOVERY_SCHEMA_VERSION: Final = 1
-_STATUS_RECOVERY_DIRECTORY_NAME: Final = "license_status_recoveries"
+_STATUS_RECOVERY_DIRECTORY_NAME: Final = "status_recoveries"
+_CASE_RECORD_DIRECTORIES: Final = frozenset({_WINDOW_DIRECTORY_NAME, _STATUS_RECOVERY_DIRECTORY_NAME})
 _STATUS_RECOVERY_FILENAME_PATTERN: Final = re.compile(r"checkout_(?P<index>[0-9]{4,})[.]json")
 _STATUS_RECOVERY_STATES: Final = frozenset({"pending", "complete"})
 _MAX_STATUS_RECOVERY_EXCERPT_BYTES: Final = 160
@@ -1100,7 +1101,7 @@ _STATUS_RECOVERY_KEYS: Final = frozenset(
         "case_id",
         "work_unit_id",
         "scientific_config_digest",
-        "slurm_job_id",
+        "dispatch_key",
         "checkout_index",
         "hostname",
         "process_id",
@@ -1136,23 +1137,18 @@ _STATUS_RECOVERY_KEYS: Final = frozenset(
 
 def in_allocation_status_recovery_directory(
     campaign_run_id: str,
-    batch_id: str,
+    batch_storage_name: str,
     case_id: str,
-    job_id: str,
+    dispatch_key: str,
     *,
     storage_root: Path | str | None,
 ) -> Path:
-    """Return one exact per-job status-artifact recovery directory."""
-    if _JOB_ID_PATTERN.fullmatch(job_id) is None:
-        message = "Status-artifact recovery requires one numeric Slurm job ID."
+    """Return one exact per-dispatch status-artifact recovery directory."""
+    if dispatch_identity.DISPATCH_KEY_PATTERN.fullmatch(dispatch_key) is None:
+        message = "Status-artifact recovery requires one dispatch key."
         raise ValueError(message)
-    run_directory = campaign_evidence.campaign_run_directory(
-        campaign_run_id,
-        storage_root=storage_root,
-    )
-    safe_batch = common.paths.validate_logical_name(batch_id, label="batch_id")
-    safe_case = common.paths.validate_logical_name(case_id, label="case_id")
-    return run_directory / _STATUS_RECOVERY_DIRECTORY_NAME / safe_batch / safe_case / job_id
+    case_directory = temporary_license_wait_directory(campaign_run_id, batch_storage_name, case_id, storage_root=storage_root)
+    return case_directory / _STATUS_RECOVERY_DIRECTORY_NAME / dispatch_key
 
 
 def _status_recovery_payload(
@@ -1160,7 +1156,7 @@ def _status_recovery_payload(
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     checkout_started_at: datetime,
     checkout_ended_at: datetime,
     hostname: str,
@@ -1186,13 +1182,13 @@ def _status_recovery_payload(
         "case_id": case_id,
         "work_unit_id": f"{config.batch_id}/{case_id}",
         "scientific_config_digest": config.scientific_config_digest,
-        "slurm_job_id": job_id,
+        "dispatch_key": dispatch_key,
         "checkout_index": artifact.prelaunch.checkout_index,
         "hostname": hostname,
         "process_id": artifact.process_id,
         "process_exit_code": artifact.process_exit_code,
-        "checkout_started_at": checkout_started_at.astimezone(timezone.utc).isoformat(),
-        "checkout_ended_at": checkout_ended_at.astimezone(timezone.utc).isoformat(),
+        "checkout_started_at": checkout_started_at.astimezone(UTC).isoformat(),
+        "checkout_ended_at": checkout_ended_at.astimezone(UTC).isoformat(),
         "prelaunch_checked_at": artifact.prelaunch.checked_at,
         "prelaunch_path_existed": False,
         "status_relative_path": "solved.mph.status",
@@ -1225,7 +1221,7 @@ def _validate_status_recovery_payload(
     config: config_contract.GenerationConfig,
     case_index: int,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     path: Path,
 ) -> dict[str, Any]:
     """Validate one exact schema-version-1 status-artifact recovery receipt."""
@@ -1251,7 +1247,7 @@ def _validate_status_recovery_payload(
         or payload.get("case_id") != case_id
         or payload.get("work_unit_id") != f"{config.batch_id}/{case_id}"
         or payload.get("scientific_config_digest") != config.scientific_config_digest
-        or payload.get("slurm_job_id") != job_id
+        or payload.get("dispatch_key") != dispatch_key
         or isinstance(index, bool)
         or not isinstance(index, int)
         or index < 1
@@ -1307,7 +1303,7 @@ def record_in_allocation_status_artifact_recovery(
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     checkout_started_at: datetime,
     checkout_ended_at: datetime,
     hostname: str,
@@ -1329,9 +1325,9 @@ def record_in_allocation_status_artifact_recovery(
         raise ValueError(message)
     directory = in_allocation_status_recovery_directory(
         campaign_run_id,
-        config.batch_id,
+        config.batch_storage_name,
         config.case_id(case_index),
-        job_id,
+        dispatch_key,
         storage_root=storage_root,
     )
     directory.mkdir(parents=True, exist_ok=True)
@@ -1354,18 +1350,18 @@ def record_in_allocation_status_artifact_recovery(
             config=config,
             case_index=case_index,
             campaign_run_id=campaign_run_id,
-            job_id=job_id,
+            dispatch_key=dispatch_key,
             path=path,
         )
     if existing is None and cleanup_state == "complete":
         message = "Status-artifact cleanup completion requires its prior pending receipt."
         raise RuntimeError(message)
-    recorded_at = datetime.now(timezone.utc).isoformat() if existing is None else str(existing["recorded_at"])
+    recorded_at = datetime.now(UTC).isoformat() if existing is None else str(existing["recorded_at"])
     payload = _status_recovery_payload(
         config,
         case_index,
         campaign_run_id=campaign_run_id,
-        job_id=job_id,
+        dispatch_key=dispatch_key,
         checkout_started_at=checkout_started_at,
         checkout_ended_at=checkout_ended_at,
         hostname=hostname,
@@ -1373,7 +1369,7 @@ def record_in_allocation_status_artifact_recovery(
         classification=classification,
         cleanup_state=cleanup_state,
         recorded_at=recorded_at,
-        cleanup_completed_at=(datetime.now(timezone.utc).isoformat() if cleanup_state == "complete" else None),
+        cleanup_completed_at=(datetime.now(UTC).isoformat() if cleanup_state == "complete" else None),
     )
     if existing is not None:
         comparable = dict(payload)
@@ -1390,7 +1386,7 @@ def record_in_allocation_status_artifact_recovery(
         config=config,
         case_index=case_index,
         campaign_run_id=campaign_run_id,
-        job_id=job_id,
+        dispatch_key=dispatch_key,
         path=path,
     )
     return path
@@ -1401,15 +1397,15 @@ def load_in_allocation_status_artifact_recoveries(
     case_index: int,
     *,
     campaign_run_id: str,
-    job_id: str,
+    dispatch_key: str,
     storage_root: Path | str | None,
 ) -> tuple[dict[str, Any], ...]:
-    """Load every exact status-artifact recovery receipt for one Slurm job."""
+    """Load every exact status-artifact recovery receipt for one dispatch."""
     directory = in_allocation_status_recovery_directory(
         campaign_run_id,
-        config.batch_id,
+        config.batch_storage_name,
         config.case_id(case_index),
-        job_id,
+        dispatch_key,
         storage_root=storage_root,
     )
     if not directory.exists():
@@ -1440,7 +1436,7 @@ def load_in_allocation_status_artifact_recoveries(
             config=config,
             case_index=case_index,
             campaign_run_id=campaign_run_id,
-            job_id=job_id,
+            dispatch_key=dispatch_key,
             path=path,
         )
         if int(match.group("index")) != int(record["checkout_index"]):

@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Disposable workspace ownership, containment, and cleanup contracts."""
+"""Disposable workspace ownership, containment, and cleanup contracts.
+
+Responsibilities:
+  - Check sibling storage, unique marked workspaces, cleanup guards, and interrupted attempts
+
+Design principles:
+  - Cleanup requires contained owned inactive targets and retained recovery evidence
+
+This module does NOT:
+  - Delete production storage or silently restart interrupted cases
+"""
 
 from __future__ import annotations
 
@@ -10,6 +19,7 @@ from typing import Any
 import pytest
 
 from src import common, generation
+from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_preparation as preparation
@@ -23,6 +33,18 @@ def _steady_natural_batch_name() -> str:
         "lentil",
         "natural",
     )
+
+
+def _prepare_source_inputs(config: Any, count: int, storage: Path) -> None:
+    """Establish the full frozen source plan before candidate input admission."""
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    generation.cases.input_generation.generate_input_cases(config, count, storage_root=storage)
+
+
+def _source_run_id(config: Any) -> str:
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    return generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
 
 
 def test_default_storage_is_the_canonical_repository_sibling(
@@ -57,11 +79,7 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
     )
     storage = tmp_path / "storage root"
     work = tmp_path / "scratch root with spaces"
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        2,
-        storage_root=storage,
-    )
+    _prepare_source_inputs(config, 2, storage)
     first = runtime_service.prepare_case_work_directory(
         config,
         1,
@@ -111,11 +129,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
     )
     storage = (tmp_path / "storage").resolve()
     work = (tmp_path / "work").resolve()
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        1,
-        storage_root=storage,
-    )
+    _prepare_source_inputs(config, 1, storage)
     prepared = runtime_service.prepare_case_work_directory(
         config,
         1,
@@ -128,7 +142,7 @@ def test_cleanup_guard_rejects_broad_unowned_and_active_targets(
         str(Path.home().resolve()),
         str(common.paths.get_project_root().resolve()),
         str(storage),
-        str(common.paths.get_generation_processed_root(storage_root=storage)),
+        str(common.paths.get_generation_root(storage_root=storage)),
         str(common.paths.get_datasets_root(storage_root=storage)),
         str(work),
         str(tmp_path / "outside"),
@@ -212,11 +226,12 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
         only_batch=_steady_natural_batch_name(),
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        1,
-        storage_root=storage,
-    )
+    _prepare_source_inputs(config, 1, storage)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", _source_run_id(config))
+    monkeypatch.setenv("SLURM_JOB_ID", "4242")
+    monkeypatch.setenv("SLURM_STEP_ID", "0")
+    monkeypatch.setenv("GENERATION_SUBMISSION_INDEX", "1")
+    monkeypatch.setenv("GENERATION_DISPATCH_KEY", "4242-1")
     observed: dict[str, Path] = {}
 
     def interrupt(
@@ -241,12 +256,7 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
             work_root=tmp_path / "work",
         )
     assert not observed["work"].exists()
-    first = attempt_service.latest_case_attempt(
-        config,
-        1,
-        config.batch_id,
-        storage_root=storage,
-    )
+    first = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
     assert first is not None
     assert first.payload["case_state"] == "interrupted"
     assert first.payload["attempt_index"] == 1
@@ -270,12 +280,7 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
             storage_root=storage,
             work_root=tmp_path / "work",
         )
-    second = attempt_service.latest_case_attempt(
-        config,
-        1,
-        config.batch_id,
-        storage_root=storage,
-    )
+    second = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
     assert second is not None
     assert second.payload["case_state"] == "interrupted"
     assert second.payload["attempt_index"] == first.payload["attempt_index"] + 1

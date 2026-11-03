@@ -1,18 +1,24 @@
-"""
-generation_contracts_scalar_handoff.py
+"""Admit the exact transient scalar handoff and its immutable source identity.
 
-Admit the exact transient scalar handoff and its immutable source identity.
 Responsibilities:
   - Define the ordered 12-field runtime handoff and numeric serialization
   - Validate names, units, ownership, values, and exact source-byte identity
   - Expose one immutable admission for case, runtime, and HDF5 consumers
+
 Design principles:
   - Only case-dependent values actually supplied at runtime enter the handoff
   - One canonical order is reused without fixed-value or derived aliases
   - Portable contract identity excludes machine-specific source paths
+
 This module does NOT:
   - Sample scientific values, generate schedules, or execute COMSOL
   - Define learned Dataset scalar views or mutable production inventories
+
+Notes:
+  Schema ownership:
+    - Ordered field names and units come from `generation_contracts_profiles`; this module adds case-dependent ownership labels and admits runtime
+      bytes against that profile contract.
+
 """
 
 from __future__ import annotations

@@ -1,15 +1,15 @@
-"""
-generation_cases_case.py
+"""Create deterministic scientific inputs and isolated COMSOL work directories.
 
-Create deterministic scientific inputs and isolated COMSOL work directories.
 Responsibilities:
   - Resolve one typed sample into spatial, scalar, and schedule adapter tables
   - Derive exact adapter-input and profile-bound simulation identities
   - Copy one immutable template into a fresh disposable work directory
+
 Design principles:
   - Adapter bytes are deterministic, case-local, and identity-bound
   - Every stochastic stream and block row is explicit in case provenance
   - Source templates are read and copied but never opened as output targets
+
 This module does NOT:
   - Run COMSOL, infer template mappings, or publish canonical HDF5 results
   - Treat CSV as a canonical learning-view artifact
@@ -38,7 +38,7 @@ from . import generation_cases_sampling as sampling_service
 from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
-CASE_SCHEMA_KIND = "simulation_case"
+CASE_SCHEMA_KIND = "generation_source_case"
 CASE_SCHEMA_VERSION = 1
 _TABLE_RANK = 2
 
@@ -57,8 +57,7 @@ _CASE_PAYLOAD_REQUIRED_KEYS: Final = frozenset(
         "generator_version",
         "git_commit",
         "material_family",
-        "material_role",
-        "evaluation_regime",
+        "domain_profile",
         "sampling_regime",
         "natural_support_state",
         "ood",
@@ -83,7 +82,7 @@ _CASE_PAYLOAD_REQUIRED_KEYS: Final = frozenset(
     }
 )
 
-_CASE_PAYLOAD_OPTIONAL_KEYS: Final = frozenset({"schedule_diagnostics", "pilot_check", "scalar_handoff", "scalars"})
+_CASE_PAYLOAD_OPTIONAL_KEYS: Final = frozenset({"schedule_diagnostics", "scalar_handoff", "scalars"})
 CASE_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(
     {
         "schema_kind": CASE_SCHEMA_KIND,
@@ -259,7 +258,7 @@ def _subseeds(
     config: config_contract.GenerationConfig,
     case_index: int,
 ) -> dict[str, int]:
-    """Return profile substreams, sharing paired-smoke airflow only."""
+    """Return profile substreams, with recorded case seed domains."""
     case_seed = config.case_seed(case_index)
     labels = ["bed", "pressure_bc", "packing_scatter"]
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
@@ -270,7 +269,7 @@ def _subseeds(
                 "schedule_independent",
             )
         )
-    result = {
+    return {
         label: seeding.derive_seed(
             case_seed,
             "case_substream",
@@ -278,24 +277,6 @@ def _subseeds(
         )
         for label in labels
     }
-    paired_seed = config.scientific_values.get("paired_equivalence_seed")
-    if paired_seed is not None:
-        assignment = config.case_assignment(case_index)
-        paired_case_seed = seeding.derive_seed(
-            int(paired_seed),
-            "paired_equivalence_case",
-            config.material_family,
-            config.sampling_regime,
-            str(assignment["assignment_role"]),
-            str(case_index),
-        )
-        for label in ("bed", "pressure_bc", "packing_scatter"):
-            result[label] = seeding.derive_seed(
-                paired_case_seed,
-                "paired_airflow_substream",
-                label,
-            )
-    return result
 
 
 def generate_case_input_bundle(
@@ -347,7 +328,7 @@ def generate_case_input_bundle(
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         schedule = schedule_service.generate_schedule(
             values,
-            config.scientific_values["time"],
+            config.scientific_values.get("schedule_time", config.scientific_values["time"]),
             fixed,
             seeds={name: subseeds[name] for name in ("schedule_shared", "schedule_independent")},
         )
@@ -378,7 +359,7 @@ def generate_case_input_bundle(
         schedule_seed_names = ("schedule_shared", "schedule_independent")
         schedule = schedule_service.generate_schedule(
             values,
-            config.scientific_values["time"],
+            config.scientific_values.get("schedule_time", config.scientific_values["time"]),
             fixed,
             seeds={
                 name: seeding.derive_seed(
@@ -400,11 +381,11 @@ def generate_case_input_bundle(
             initial_dry_basis_moisture=fields.columns["X_0_db_field"],
             oswin_parameters={name: values[name] for name in ("A_osw", "B_osw", "C_osw")},
             pressure=float(fixed["p_ref"]),
+            output_time_contract=config.scientific_values["time"] if "schedule_time" in config.scientific_values else None,
         )
 
     input_contract = config.scientific_values["input_contract"]
-    input_directory = bundle_dir / "inputs"
-    input_directory.mkdir()
+    input_directory = bundle_dir
     spatial_path = _write_spatial_file(input_directory, fields, input_contract["spatial"])
     input_paths_list = [spatial_path]
     scalar_path: Path | None = None
@@ -430,7 +411,6 @@ def generate_case_input_bundle(
     export_contract_sha256 = common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
     steady_flow_conditioning = config.scientific_values["steady_flow_conditioning"]
     steady_flow_conditioning_digest = common.serialization.canonical_json_sha256(steady_flow_conditioning)
-    paired_seed = config.scientific_values.get("paired_equivalence_seed")
     seed_evidence = {
         "campaign_seed": config.scientific_values["campaign_seed"],
         "batch_seed": config.seed_base,
@@ -442,11 +422,7 @@ def generate_case_input_bundle(
             "assignment_role": assignment["assignment_role"],
             "case_ordinal": case_index,
         },
-        "paired_equivalence_seed": paired_seed,
-        "subseed_origins": {
-            name: ("paired_equivalence" if paired_seed is not None and name in {"bed", "pressure_bc", "packing_scatter"} else "profile_case")
-            for name in subseeds
-        },
+        "subseed_origins": dict.fromkeys(subseeds, "profile_case"),
         "derivation": ("sha256(generator_version|seed_namespace|semantic_labels)"),
         "subseeds": subseeds,
     }
@@ -463,8 +439,7 @@ def generate_case_input_bundle(
         "generator_version": seeding.GENERATOR_VERSION,
         "git_commit": source_service.required_git_commit(),
         "material_family": assignment["material_family"],
-        "material_role": config.material_role,
-        "evaluation_regime": config.evaluation_regime,
+        "domain_profile": config.scientific_values["domain_profile"],
         "sampling_regime": assignment["sampling_regime"],
         "natural_support_state": sample.ood_provenance["natural_support_state"],
         "ood": sample.ood_provenance,
@@ -489,16 +464,6 @@ def generate_case_input_bundle(
         "export_contract_sha256": export_contract_sha256,
         "input_files": input_files,
     }
-    pilot_case_kind = assignment.get("pilot_case_kind")
-    if pilot_case_kind is not None:
-        if pilot_case_kind not in config_contract.PILOT_CASE_KINDS:
-            message = f"Unsupported pilot case kind {pilot_case_kind!r}."
-            raise ValueError(message)
-        case_payload["pilot_check"] = {
-            "purpose": config_contract.PILOT_CAMPAIGN_PURPOSE,
-            "case_kind": pilot_case_kind,
-            "dataset_membership": "none",
-        }
     if scalar_path is not None and scalar_entries is not None:
         scalar_entries_payload = [entry.as_dict() for entry in scalar_entries]
         case_payload["scalar_handoff"] = {

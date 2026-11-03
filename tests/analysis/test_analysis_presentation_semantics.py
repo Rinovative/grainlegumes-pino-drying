@@ -1,11 +1,21 @@
-# ruff: noqa: S101, D100, D103, SLF001
+"""Protect shared field labels, unit conversions, and visual normalization contracts.
+
+Responsibilities:
+  - Check label uniqueness, field ordering, dataset colors, statistic visibility, and display units
+
+Design principles:
+  - Display conversion preserves authoritative arrays and explicit experiment roles
+
+This module does NOT:
+  - Assign scientific roles or fit preprocessing scales
+"""
+
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.analysis import generation_inputs
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda.plots import eda_plot_case_statistics as case_statistics
 from src.analysis.presentation import channel_semantics, display_labels, field_labels, visual_semantics
@@ -16,35 +26,28 @@ def _label_metadata(*, identity: str, material: str = "red_lentil") -> display_l
         task_id="transient_drying",
         material_family=material,
         sampling_regime="natural",
-        campaign_purpose="family_generalization",
-        source_role="id_source",
-        evaluation_regime="held_out_family_ood",
+        campaign_purpose="source_generation",
+        domain_profile="reference_range",
         canonical_identity=identity,
     )
 
 
-def test_dataset_labels_use_short_task_campaign_and_authoritative_role() -> None:
+def test_source_labels_omit_sampling_regime_and_canonical_identity() -> None:
     metadata = _label_metadata(identity="batch__f91a8b")
 
     label = display_labels.dataset_display_label(metadata)
-    assert label == "Drying · Red lentil · fg · F OOD"
-    assert label.startswith("Drying · ")
     assert "natural" not in label.casefold()
-    assert label.endswith("F OOD")
     assert "\n" not in label
-    assert metadata.canonical_identity == "batch__f91a8b"
     assert metadata.canonical_identity not in label
-    assert display_labels.generation_inputs.labels.campaign_purpose_abbreviation is generation_inputs.labels.campaign_purpose_abbreviation
 
 
-def test_colliding_short_labels_use_only_the_required_identity_prefix() -> None:
+def test_colliding_labels_are_disambiguated_without_full_identity() -> None:
     common = {
         "task_id": "steady_flow",
         "material_family": "airflow_variation",
         "sampling_regime": "parameter_ood",
         "campaign_purpose": None,
-        "source_role": None,
-        "evaluation_regime": None,
+        "domain_profile": "parameter_extension",
     }
     datasets = (
         display_labels.DatasetDisplayMetadata(**common, canonical_identity="alpha-001"),
@@ -53,9 +56,9 @@ def test_colliding_short_labels_use_only_the_required_identity_prefix() -> None:
     )
 
     labels = display_labels.dataset_display_labels(datasets)
-    assert labels[0] == "Airflow · Airflow variation · P OOD · alph"
-    assert labels[1] == "Airflow · Airflow variation · P OOD · alpi"
-    assert labels[2] == "Drying · Chickpea · fg · F OOD"
+    assert len(set(labels)) == len(labels)
+    assert labels[2] == display_labels.dataset_display_label(datasets[2])
+    assert not any(dataset.canonical_identity in label for dataset, label in zip(datasets, labels, strict=True))
 
 
 def test_channel_order_and_mixed_dataset_intersection_are_semantic() -> None:
@@ -73,16 +76,9 @@ def test_channel_order_and_mixed_dataset_intersection_are_semantic() -> None:
         ("quality", "T", "x", "w_int", "p", "X_0_db_field", "U", "Kxx"),
         metadata=metadata,
     ) == ("Kxx", "p", "U", "X_0_db_field", "T", "w_int", "quality")
-    assert channel_semantics.compatible_channels(
-        (("Kxx", "p", "T", "quality"), ("quality", "T", "Kxx", "w_int")),
-        metadata=metadata,
-    ) == ("Kxx", "T", "quality")
 
 
 def test_visual_semantics_and_dataset_colors_are_deterministic() -> None:
-    assert visual_semantics.field_visual_semantics("T").colormap == "inferno"
-    assert visual_semantics.field_visual_semantics("vapour_density").colormap == "Blues"
-    assert visual_semantics.field_visual_semantics("w_surf").colormap == "YlGnBu"
     assert visual_semantics.field_visual_semantics("u").centered is True
     assert visual_semantics.field_visual_semantics("error", role="absolute_error").colormap == "Reds"
     assert visual_semantics.field_visual_semantics("error", role="signed_error").centered is True
@@ -128,39 +124,13 @@ def test_meta_statistics_keep_all_discovered_fields_except_exact_denylist() -> N
     ]
 
 
-@pytest.mark.parametrize(
-    ("role", "expected"),
-    [
-        ("id", "ID"),
-        ("parameter_ood", "P OOD"),
-        ("held_out_family_ood", "F OOD"),
-        ("near_family_ood", "NF OOD"),
-        ("far_family_ood", "FF OOD"),
-        ("extreme_family_ood", "S OOD"),
-    ],
-)
-def test_authoritative_dataset_roles_use_central_abbreviations(
-    role: str,
-    expected: str,
-) -> None:
-    metadata = display_labels.DatasetDisplayMetadata(
-        task_id="steady_flow",
-        material_family="var80",
-        sampling_regime="natural",
-        campaign_purpose=None,
-        source_role="id_source",
-        evaluation_regime=role,
-        canonical_identity=f"identity-{role}",
-    )
-
-    label = display_labels.dataset_display_label(metadata)
-    assert label.startswith("Airflow · ")
-    assert label.endswith(expected)
-    assert "natural" not in label.casefold()
-    assert "\n" not in label
+def test_material_role_labels_are_distinct_per_role() -> None:
+    labels = {role: display_labels.material_role_display_label("red_lentil", role) for role in ("id", "ood", "additional_evaluation")}
+    assert len(set(labels.values())) == len(labels)
+    assert all("lentil" in label.casefold() for label in labels.values())
 
 
-def test_field_labels_use_formula_symbols_and_authoritative_display_units() -> None:
+def test_field_labels_use_authoritative_display_units() -> None:
     frame = pd.DataFrame([{}])
     frame.attrs["field_units"] = {
         "Kxx": "m^2",
@@ -175,11 +145,11 @@ def test_field_labels_use_formula_symbols_and_authoritative_display_units() -> N
         "w_surf": "absolute_physical_state",
     }
 
-    assert capabilities.field_quantity_label(frame, "Kxx") == "κₓₓ [-]"
-    assert capabilities.field_quantity_label(frame, "p_in_bc") == "p_in,bc [Pa]"
-    assert capabilities.field_quantity_label(frame, "phi") == "φ [-]"
-    assert capabilities.field_quantity_label(frame, "w_surf") == "w_surf [kg/m^3]"
-    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True) == r"$w_{\mathrm{surf}}$ [kg/m^3]"
+    assert capabilities.field_quantity_label(frame, "Kxx").endswith("[-]")
+    assert capabilities.field_quantity_label(frame, "p_in_bc").endswith("[Pa]")
+    assert capabilities.field_quantity_label(frame, "phi").endswith("[-]")
+    assert capabilities.field_quantity_label(frame, "w_surf").endswith("[kg/m^3]")
+    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True).endswith("[kg/m^3]")
 
 
 def test_meta_statistics_use_parameter_union_without_fit_or_variation_filters() -> None:

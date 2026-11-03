@@ -1,10 +1,7 @@
-"""
-evaluation_plot_spectral_fidelity.py
-
-Render output-spectrum views from current bounded reducers.
+"""Render output-spectrum views from current bounded reducers.
 
 Responsibilities:
-  - Compute Hann-windowed radial spectra from physical coordinate spacing
+  - Render session-reduced Hann-windowed radial spectra from physical coordinate spacing
   - Compare reference, prediction, and error spectra for p, u, v, and |u|
   - Plot prediction-to-reference transfer ratios with casewise uncertainty
   - Apply explicit channel selection and optional per-case normalization
@@ -46,17 +43,6 @@ if TYPE_CHECKING:
 _DEFAULT_CASE_LIMIT = 50
 _REFERENCE_ENERGY_FLOOR = 1e-12
 _SPECTRAL_DIMENSIONS = 2
-
-
-def radial_power_spectrum(
-    field: np.ndarray,
-    *,
-    dx: float,
-    dy: float,
-    n_bins: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the maintained Hann-windowed radial physical-frequency spectrum."""
-    return sessions.radial_power_spectrum(field, dx=dx, dy=dy, n_bins=n_bins)
 
 
 def _quantiles(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

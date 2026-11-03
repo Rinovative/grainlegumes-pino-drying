@@ -9,6 +9,7 @@ Provides:
 - admission: fail-closed raw-input admission for inspection
 - sampling: case-level parameter sampling and OOD allocation
 - schedule: deterministic transient boundary schedules
+- selection: deterministic selected-success and replacement-deficit accounting
 - seeding: stable seed derivation
 """
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from . import generation_cases_sampling as sampling
     from . import generation_cases_schedule as schedule
     from . import generation_cases_seeding as seeding
+    from . import generation_cases_selection as selection
 
 _MODULES = {
     "case": "generation_cases_case",
@@ -35,6 +37,7 @@ _MODULES = {
     "admission": "generation_cases_admission",
     "sampling": "generation_cases_sampling",
     "schedule": "generation_cases_schedule",
+    "selection": "generation_cases_selection",
     "seeding": "generation_cases_seeding",
 }
 __all__ = [
@@ -46,6 +49,7 @@ __all__ = [
     "sampling",
     "schedule",
     "seeding",
+    "selection",
 ]
 
 

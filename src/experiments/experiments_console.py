@@ -1,9 +1,18 @@
-"""
-Persistent line-oriented console reporting for experiment lifecycles.
+"""Render bounded line-oriented reporting for experiment lifecycles.
 
-The reporter consumes the same resolved config and completed-epoch payloads as
-checkpointing and W&B. It never recomputes scientific values and emits no
-batch-level progress by default.
+Responsibilities:
+  - Report the run start block, one startup line, one line per epoch, and one end line
+  - Report one line per finished Optuna trial plus the study start and end
+  - Redact secrets from messages and complete traceback chains
+
+Design principles:
+  - Scientific values are consumed from lifecycle payloads without recomputation
+  - Reporting uses genuine completed epochs and emits no default batch progress
+  - Credential-bearing values are redacted and paths are shown relative to the storage root
+
+This module does NOT:
+  - Train models, persist checkpoints, or initialize W&B
+  - Decide experiment success or reconstruct missing scientific observations
 """
 
 from __future__ import annotations
@@ -15,14 +24,12 @@ import time
 import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
-from src import common, learning
+from src import common
 
 from .config import experiments_config_loader as config_loader
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _SECRET_PATTERN = re.compile(r"(?i)(api[_-]?key|password|secret|token)(\s*[:=]\s*)([^\s,;]+)")
 _STARTUP_PHASE_EVENTS = frozenset(
@@ -39,6 +46,8 @@ _STARTUP_PHASE_EVENTS = frozenset(
         "training_start",
     }
 )
+_SECONDS_PER_MINUTE = 60
+_MINUTES_PER_HOUR = 60
 
 
 def _redact_secrets(value: object) -> str:
@@ -52,36 +61,48 @@ def _clean(value: object) -> str:
     return text[:600]
 
 
-def _value(value: object) -> str:
-    """Format one scalar without changing its stored authoritative value."""
+def display_path(value: object) -> str:
+    """Return an absolute path relative to the storage root, else the project root; any other value unchanged."""
+    text = str(value)
+    path = Path(text)
+    if not path.is_absolute():
+        return text
+    for root in (common.paths.get_storage_root(), common.paths.get_project_root()):
+        if path.is_relative_to(root):
+            return path.relative_to(root).as_posix()
+    return text
+
+
+def format_duration(seconds: float) -> str:
+    """Format one non-negative wall duration as ``12s``, ``3m05s`` or ``1h02m05s``."""
+    minutes, remainder = divmod(max(0, round(seconds)), _SECONDS_PER_MINUTE)
+    hours, minutes = divmod(minutes, _MINUTES_PER_HOUR)
+    if hours:
+        return f"{hours}h{minutes:02d}m{remainder:02d}s"
+    return f"{minutes}m{remainder:02d}s" if minutes else f"{remainder}s"
+
+
+def _num(value: object, *, digits: int = 3) -> str:
+    """Format one scalar in scientific notation with ``digits + 1`` significant digits; ``-`` when absent."""
+    if value is None:
+        return "-"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return f"{value:.{digits}e}"
+    return str(value)
+
+
+def _text(value: object) -> str:
+    """Format one display value: four significant digits, relative paths, sorted mappings, bounded redacted text."""
     if isinstance(value, float):
-        if math.isfinite(value):
-            return f"{value:.8g}"
-        return str(value)
-    if isinstance(value, (list, tuple)):
-        return ",".join(_clean(item) for item in value)
-    return _clean(value)
+        return f"{value:.4g}"
+    if isinstance(value, Mapping):
+        return " ".join(f"{key}={_text(item)}" for key, item in sorted(value.items()))
+    return display_path(_clean(value))
 
 
-def _emit(event: str, /, **fields: object) -> None:
-    """Emit and promptly flush one persistent lifecycle line."""
-    raw_to_stderr = fields.pop("_to_stderr", False)
-    if type(raw_to_stderr) is not bool:
-        msg = "Console destination flag must be a boolean."
-        raise TypeError(msg)
-    parts = [f"event={event}"]
-    parts.extend(f"{key}={_value(value)}" for key, value in fields.items() if value is not None)
-    print(" ".join(parts), file=sys.stderr if raw_to_stderr else sys.stdout, flush=True)
-
-
-def _metric_summary(
-    metrics: Mapping[str, float],
-    *,
-    prefix: str,
-    metric_ids: tuple[str, ...],
-) -> str:
-    """Format resolved evaluation metrics from an already computed payload."""
-    return ",".join(f"{metric_id}:{_value(metrics[f'{prefix}{metric_id}'])}" for metric_id in metric_ids if f"{prefix}{metric_id}" in metrics)
+def _line(text: str, *, to_stderr: bool = False) -> None:
+    """Print and promptly flush one secret-redacted lifecycle line."""
+    print(_redact_secrets(text), file=sys.stderr if to_stderr else sys.stdout, flush=True)
 
 
 def _loss_composition(config: Mapping[str, Any]) -> str:
@@ -91,20 +112,30 @@ def _loss_composition(config: Mapping[str, Any]) -> str:
     terms = [f"{data['weight']}*{data['kind']}[{data['space']}]"]
     physics = loss["physics"]
     if bool(physics["enabled"]):
-        residual = physics["residual_weight"]
-        boundary = physics["boundary_weight"]
-        terms.extend(
-            (
-                f"residual_weight(epoch,target={residual['target']},warmup={residual['warmup']['epochs']})*momentum_and_{physics['continuity']}",
-                f"boundary_weight(epoch,target={boundary['target']},warmup={boundary['warmup']['epochs']})*pressure_boundary",
-            )
-        )
+        for term, residual in (("momentum", "momentum"), ("continuity", "flux_balance"), ("boundary", "pressure_boundary")):
+            weight = physics[f"{term}_weight"]
+            terms.append(f"{term}_weight(epoch,target={weight['target']},warmup={weight['warmup']['epochs']})*{residual}")
     return "+".join(terms)
+
+
+def _loss_components(metrics: Mapping[str, float]) -> str:
+    """Return compact loss components, shown only when more than one remains besides the total."""
+    total = metrics.get("train/loss_total")
+    components = {
+        key.removeprefix("physics/train/").removeprefix("train/").removeprefix("loss_").removeprefix("data_"): value
+        for key, value in metrics.items()
+        if key.startswith(("train/", "physics/train/")) and key != "train/loss_total"
+    }
+    if components.get("data") == total:
+        del components["data"]
+    if len(components) < 2:  # noqa: PLR2004 -- a single remaining component repeats the total
+        return ""
+    return " [" + " ".join(f"{name} {_num(value, digits=2)}" for name, value in components.items()) + "]"
 
 
 @dataclass(slots=True)
 class ConsoleReporter:
-    """Render startup, completed-epoch, final, and failure lifecycle events."""
+    """Render the start block, one line per epoch, the end line, and failures of one run."""
 
     config: Mapping[str, Any]
     run_dir: Path
@@ -112,224 +143,110 @@ class ConsoleReporter:
     study_name: str | None = None
     trial_number: int | None = None
     _started: float = field(default_factory=time.perf_counter)
+    _phases: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False)
 
     @property
     def objective_id(self) -> str:
         """Return the explicitly resolved selection metric ID."""
         return str(self.config["evaluation"]["objective"]["id"])
 
-    @property
-    def metric_ids(self) -> tuple[str, ...]:
-        """Return the objective first, followed by resolved diagnostic metrics."""
-        declared = tuple(str(metric["id"]) for metric in self.config["evaluation"]["metrics"])
-        return (self.objective_id, *(metric_id for metric_id in declared if metric_id != self.objective_id))
-
     def startup_phase(self, event: str, fields: Mapping[str, Any] | None = None) -> None:
-        """Emit one maintained bounded startup phase with total elapsed time."""
+        """Collect one startup phase and print the single startup line when training starts."""
         if event not in _STARTUP_PHASE_EVENTS:
             message = f"Unsupported startup phase event: {event!r}."
             raise ValueError(message)
-        values = dict(fields or {})
-        _emit(
-            event,
-            elapsed_seconds=time.perf_counter() - self._started,
-            **values,
-        )
+        self._phases.pop(event, None)
+        self._phases[event] = {**(fields or {}), "elapsed_seconds": time.perf_counter() - self._started}
+        if event == "training_start":
+            _line(self._startup_summary())
+
+    def _startup_summary(self) -> str:
+        """Summarize the collected startup phases in one line."""
+        data = self._phases.get("dataset_resolved", {})
+        scaler = self._phases.get("scaler_cache", {})
+        fit = self._phases.get("scaler_fit_complete")
+        parts = [f"startup {self._phases['training_start']['elapsed_seconds']:.1f} s"]
+        if data:
+            parts.append(f"data {data.get('backend')} {data.get('transitions')} transitions grid {data.get('effective_grid')}")
+        if scaler:
+            parts.append(f"scaler {scaler.get('state')}" + (f" (fit {fit['seconds']:.1f} s)" if fit else ""))
+        if "model_cuda_ready" in self._phases:
+            parts.append(f"model {self._phases['model_cuda_ready'].get('seconds', 0.0):.1f} s")
+        parts.append(f"{self._phases['training_start'].get('batches_per_epoch')} batches/epoch")
+        return "  ".join(parts)
 
     def startup(self, *, resolved_device: str) -> None:
-        """Emit one resolved-run line and one active-loss-composition line."""
+        """Print the four-line run start block: identity, data, model and optimization, loss and selection."""
         run = self.config["run"]
         data = self.config["data"]
         training = self.config["training"]
-        wandb = self.config["tracking"]["wandb"]
-        monitor = wandb["monitor"]
-        physics = self.config["loss"]["physics"]
+        optimizer = self.config["optimizer"]
         objective = self.config["evaluation"]["objective"]
-        model_variant = config_loader.resolved_model_variant(self.config)
-        id_interval = int(training["evaluation_interval"])
-        ood_interval = int(training["ood_evaluation_interval"])
-        physics_interval = int(monitor["interval"])
-        target = int(training["epochs"])
-        _emit(
-            "startup",
-            run_name=run["name"],
-            project=wandb["project"],
-            task=self.config["task"],
-            model_kind=self.config["model"]["kind"],
-            architecture=model_variant,
-            suffix=run.get("suffix"),
-            device=resolved_device,
-            seed=run["seed"],
-            deterministic=run["deterministic"],
-            train_dataset=data["train_dataset"],
-            id_membership="saved_eval_split",
-            id_interpretation="validation",
-            ood_datasets=data["ood_datasets"],
-            batch_size=data["batch_size"],
-            workers=data["num_workers"],
-            epochs=target,
-            mixed_precision=training["mixed_precision"],
-            optimizer=self.config["optimizer"]["kind"],
-            initial_lr=self.config["optimizer"]["lr"],
-            scheduler=None if self.config.get("scheduler") is None else self.config["scheduler"]["kind"],
-            training_loss=self.config["loss"]["data"]["kind"],
-            pi_enabled=physics["enabled"],
-            continuity=physics["continuity"] if physics["enabled"] else None,
-            derivatives=physics["derivatives"]["kind"] if physics["enabled"] else None,
-            objective=self.objective_id,
-            direction=objective["direction"],
-            id_interval=id_interval,
-            id_first=learning.training.events.first_completed_epoch_event(interval=id_interval, target_epoch=target),
-            ood_interval=ood_interval,
-            ood_first=learning.training.events.first_completed_epoch_event(interval=ood_interval, target_epoch=target),
-            physics_interval=physics_interval,
-            physics_first=learning.training.events.first_completed_epoch_event(interval=physics_interval, target_epoch=target),
-            wandb_mode=wandb["mode"],
-            workflow=wandb["workflow"],
-            state="resume" if self.resume else "fresh",
-            run_dir=self.run_dir,
-            study=self.study_name,
-            trial=self.trial_number,
+        scheduler = "no scheduler" if self.config.get("scheduler") is None else self.config["scheduler"]["kind"]
+        origin = f" | study {self.study_name} trial {self.trial_number}" if self.study_name is not None else ""
+        model = f"{self.config['model']['kind']} {config_loader.resolved_model_variant(self.config)}"
+        _line(
+            f"run {_text(run['name'])} | {self.config['task']} | {run['layout']['family']} | {resolved_device} | seed {run['seed']}"
+            f" | {'resume' if self.resume else 'fresh'}{origin}"
         )
-        _emit(
-            "loss_composition",
-            run_name=run["name"],
-            formula=_loss_composition(self.config),
-            continuity=physics["continuity"] if physics["enabled"] else None,
-            derivative_kind=physics["derivatives"]["kind"] if physics["enabled"] else None,
-            derivative_extension=physics["derivatives"]["extension"] if physics["enabled"] else None,
+        _line(f"data {_text(data['train_dataset'])} | batch {data['batch_size']} | workers {data['num_workers']}")
+        _line(
+            f"model {model} | {optimizer['kind']} lr {_num(optimizer['lr'], digits=2)} {scheduler}"
+            f" | {training['epochs']} epochs | amp {'on' if training['mixed_precision'] else 'off'}"
+        )
+        _line(
+            f"loss {_loss_composition(self.config)} | select {self.objective_id} ({objective['direction']})"
+            f" | val every {training['evaluation_interval']}"
         )
 
     def epoch(self, epoch: int, metrics: dict[str, float]) -> None:
-        """Emit one training line and each due evaluation/checkpoint event."""
+        """Print one line per completed epoch with the evaluation results that fell due."""
         target = int(self.config["training"]["epochs"])
-        train_components = ",".join(
-            f"{key.removeprefix('train/').removeprefix('physics/train/')}:{_value(value)}"
-            for key, value in metrics.items()
-            if key.startswith(("train/", "physics/train/"))
-        )
-        _emit(
-            "training_epoch",
-            run_name=self.config["run"]["name"],
-            epoch=f"{epoch}/{target}",
-            total_loss=metrics.get("train/loss_total"),
-            components=train_components or None,
-            learning_rate=metrics.get("optimization/learning_rate"),
-            train_seconds=metrics.get("system/train_duration_seconds"),
-            samples_per_second=metrics.get("system/train_samples_per_second"),
-            epoch_seconds=metrics.get("system/epoch_duration_seconds"),
-            elapsed_seconds=metrics.get("system/session_elapsed_seconds"),
-            eta_seconds=metrics.get("system/estimated_remaining_seconds"),
-            last_checkpoint="published" if metrics.get("checkpoint/last_published") == 1.0 else None,
-        )
-
         id_key = f"id/{self.objective_id}"
+        parts = [f"epoch {epoch:>{len(str(target))}}/{target}", f"loss {_num(metrics.get('train/loss_total'))}{_loss_components(metrics)}"]
         if id_key in metrics:
-            _emit(
-                "id_evaluation",
-                run_name=self.config["run"]["name"],
-                epoch=epoch,
-                membership="id",
-                interpretation="validation",
-                cases=int(metrics.get("system/id_evaluation_case_count", 0.0)),
-                objective_id=self.objective_id,
-                objective=metrics[id_key],
-                metrics=_metric_summary(metrics, prefix="id/", metric_ids=self.metric_ids),
-                duration_seconds=metrics.get("system/id_evaluation_duration_seconds"),
-                new_best=bool(metrics.get("checkpoint/new_best", 0.0)),
-            )
-        ood_key = f"ood/{self.objective_id}"
-        if ood_key in metrics:
-            _emit(
-                "ood_evaluation",
-                run_name=self.config["run"]["name"],
-                epoch=epoch,
-                membership="ood",
-                dataset="+".join(self.config["data"]["ood_datasets"]),
-                cases=int(metrics.get("system/ood_evaluation_case_count", 0.0)),
-                objective_id=self.objective_id,
-                objective=metrics[ood_key],
-                metrics=_metric_summary(metrics, prefix="ood/", metric_ids=self.metric_ids),
-                duration_seconds=metrics.get("system/ood_evaluation_duration_seconds"),
-            )
-        physics_key = "physics/id/momentum_residual_mse"
-        if physics_key in metrics:
-            physics = self.config["loss"]["physics"]
-            _emit(
-                "physics_monitor",
-                run_name=self.config["run"]["name"],
-                epoch=epoch,
-                membership="bounded_saved_id_prefix",
-                cases=int(metrics.get("system/physics_monitor_case_count", 0.0)),
-                derivative_kind=physics["derivatives"]["kind"],
-                momentum_residual_mse=metrics[physics_key],
-                continuity_div_velocity_mse=metrics["physics/id/continuity_div_velocity_mse"],
-                continuity_div_epsilon_velocity_mse=metrics["physics/id/continuity_div_eps_velocity_mse"],
-                pressure_boundary_mse=metrics["physics/id/pressure_boundary_mse"],
-                duration_seconds=metrics.get("system/physics_monitor_duration_seconds"),
-            )
-        if metrics.get("checkpoint/new_best") == 1.0:
-            _emit(
-                "best_checkpoint",
-                run_name=self.config["run"]["name"],
-                epoch=epoch,
-                objective_id=self.objective_id,
-                objective=metrics[id_key],
-                previous_best=metrics.get("checkpoint/previous_best_objective"),
-                direction=self.config["evaluation"]["objective"]["direction"],
-                path=common.paths.resolve_best_checkpoint_file(self.run_dir),
-            )
+            parts.append(f"val {_num(metrics[id_key])}{' *best' if metrics.get('checkpoint/new_best') == 1.0 else ''}")
+        additional_key = f"additional_evaluation/{self.objective_id}"
+        if additional_key in metrics:
+            parts.append(f"add-val {_num(metrics[additional_key])}")
+        if "physics/id/momentum_residual_mse" in metrics:
+            residuals = (metrics[f"physics/id/{name}"] for name in ("momentum_residual_mse", "flux_balance_mse", "pressure_boundary_mse"))
+            parts.append("phys mom/flux/bnd " + "/".join(_num(value, digits=2) for value in residuals))
+        learning_rate = f"lr {_num(metrics.get('optimization/learning_rate'), digits=2)}"
         if "optimization/scheduler_new_learning_rate" in metrics:
-            _emit(
-                "scheduler_update",
-                run_name=self.config["run"]["name"],
-                epoch=epoch,
-                scheduler=self.config["scheduler"]["kind"],
-                objective_id=self.objective_id,
-                objective=metrics.get(id_key),
-                old_learning_rate=metrics["optimization/scheduler_old_learning_rate"],
-                new_learning_rate=metrics["optimization/scheduler_new_learning_rate"],
-            )
+            learning_rate += f"->{_num(metrics['optimization/scheduler_new_learning_rate'], digits=2)}"
+        parts.append(learning_rate)
+        if "system/epoch_duration_seconds" in metrics:
+            parts.append(f"{metrics['system/epoch_duration_seconds']:.1f} s")
+        if "system/train_samples_per_second" in metrics:
+            parts.append(f"{metrics['system/train_samples_per_second']:.1f} samples/s")
+        _line("  ".join(parts))
 
     def final(self, result: Mapping[str, Any], *, total_wall_seconds: float) -> None:
-        """Emit final ownership from the reloaded selected best checkpoint."""
-        selected = result["selected_metrics"]
-        physics = ",".join(
-            f"{key.removeprefix('selected/physics/')}:{_value(value)}" for key, value in selected.items() if key.startswith("selected/physics/")
-        )
-        _emit(
-            "completed",
-            run_name=self.config["run"]["name"],
-            completed_epoch=result["completed_epoch"],
-            selected_best_epoch=result["best_epoch"],
-            selected_objective=result["best_metric"],
-            selected_source="reloaded_best_checkpoint.pt",
-            best_checkpoint=result["best_checkpoint_path"],
-            last_checkpoint=result["last_checkpoint_path"],
-            final_id_objective=selected[f"selected/id/{self.objective_id}"],
-            final_ood_objective=selected[f"selected/ood/{self.objective_id}"],
-            final_physics=physics,
-            total_wall_seconds=total_wall_seconds,
-            run_dir=self.run_dir,
+        """Print the end line from the reloaded selected best checkpoint."""
+        _line(
+            f"{result.get('status', 'completed')}  best epoch {result['best_epoch']} of {result['completed_epoch']}"
+            f"  {self.objective_id} {_num(result['best_metric'])}  {format_duration(total_wall_seconds)}  run {display_path(self.run_dir)}"
         )
 
     def failure(self, error: BaseException, *, status: str, phase: str | None = None) -> None:
-        """Emit sanitized phase context and retain the complete traceback."""
-        active_phase = phase or getattr(error, "training_phase", "run_lifecycle")
+        """Print the sanitized failure, the last reached startup phase, and how to continue; the caller owns any traceback."""
         epoch = getattr(error, "completed_epoch", None)
-        _emit(
-            "failure",
-            _to_stderr=True,
-            run_name=self.config["run"]["name"],
-            phase=active_phase,
-            epoch=epoch,
-            exception_type=type(error).__name__,
-            message=_clean(error),
-            last_checkpoint_exists=common.paths.resolve_last_checkpoint_file(self.run_dir).is_file(),
-            run_dir=self.run_dir,
-            wandb_status=status,
+        checkpoint = common.paths.resolve_last_checkpoint_file(self.run_dir).is_file()
+        _line(
+            f"{'interrupted' if isinstance(error, KeyboardInterrupt) else 'FAILED'} {_text(self.config['run']['name'])}"
+            f" in {phase or getattr(error, 'training_phase', 'run_lifecycle')}"
+            f"{'' if epoch is None else f' after epoch {epoch}'}: {type(error).__name__}: {_clean(error)}",
+            to_stderr=True,
         )
-        print_sanitized_traceback(error)
+        if self._phases and "training_start" not in self._phases:
+            _line(f"  startup stopped after {next(reversed(self._phases))}: {_text(list(self._phases.values())[-1])}", to_stderr=True)
+        _line(
+            "  next: "
+            + ("rerun the same command to continue from the last checkpoint" if checkpoint else "rerun the same command, no checkpoint saved yet")
+            + f" | W&B {status} | run {display_path(self.run_dir)}",
+            to_stderr=True,
+        )
 
 
 def sanitized_exception_message(error: BaseException) -> str:
@@ -344,76 +261,42 @@ def print_sanitized_traceback(error: BaseException) -> None:
     sys.stderr.flush()
 
 
-def optuna_study_event(status: str, **fields: object) -> None:
-    """Emit one bounded, stable, secret-safe Optuna study lifecycle line."""
-    normalized = dict(fields)
-    parameters = normalized.get("best_parameters")
-    if isinstance(parameters, Mapping):
-        normalized["best_parameters"] = ",".join(f"{key}:{_value(value)}" for key, value in sorted(parameters.items()))
-    _emit("optuna_study", status=status, **normalized)
+def run_admission_event(status: str, **fields: object) -> None:
+    """Print one stable line about how a start that names an existing run proceeds."""
+    _line(f"run {status}: " + "  ".join(f"{key} {_text(value)}" for key, value in fields.items() if value is not None))
+
+
+def optuna_study_event(status: str, **fields: Any) -> None:
+    """Print the Optuna study start line or end line."""
+    if status == "started":
+        _line(
+            f"study {_text(fields['study'])} started | {fields['task']} {fields['model_family']} | {fields['sampler']}/{fields['pruner']}"
+            f" | {fields['invocation_trials']} of {fields['configured_trials']} trials, max {fields['maximum_epochs']} epochs"
+            f" | {fields['continuation']} | storage {_text(fields['storage'])}"
+        )
+        return
+    best = "no completed trial" if fields["best_trial"] is None else f"best trial {fields['best_trial']} {_num(fields['best_objective'])}"
+    _line(
+        f"study {_text(fields['study'])} {status} | {fields['attempted_trials']} trials ({fields['completed_trials']} completed,"
+        f" {fields['pruned_trials']} pruned, {fields['failed_trials']} failed) | {best} | {format_duration(fields['duration_seconds'])}"
+        f" | {_text(fields['best_parameters'])} | storage {_text(fields['storage'])}"
+        + ("" if fields.get("summary_file") is None else f" | summary {fields['summary_file']}"),
+        to_stderr=status == "failed",
+    )
 
 
 def optuna_trial_event(
     status: str,
     *,
-    study: str,
     trial: int,
-    run_name: str,
     sampled: Mapping[str, Any],
-    study_role: str | None = None,
-    objective_id: str | None = None,
+    duration_seconds: float,
     objective: float | None = None,
-    best_trial_objective: float | None = None,
-    best_study_objective: float | None = None,
     step: int | None = None,
-    pruning: str | None = None,
-    pruner: str | None = None,
-    pruning_eligible: bool | None = None,
-    report_duration_seconds: float | None = None,
-    training_seed: int | None = None,
-    sampler_seed: int | None = None,
-    device: str | None = None,
-    run_dir: object | None = None,
-    max_epochs: int | None = None,
-    selected_best_epoch: int | None = None,
-    final_state: str | None = None,
-    duration_seconds: float | None = None,
-    checkpoint_state: str | None = None,
-    wandb_url: str | None = None,
-    phase: str | None = None,
-    exception_type: str | None = None,
-    error_message: str | None = None,
 ) -> None:
-    """Emit one bounded Optuna trial lifecycle or genuine ID-report line."""
-    sampled_text = ",".join(f"{key}:{_value(value)}" for key, value in sorted(sampled.items()))
-    _emit(
-        "optuna_trial",
-        status=status,
-        study=study,
-        study_role=study_role,
-        trial=trial,
-        run_name=run_name,
-        sampled=sampled_text,
-        objective_id=objective_id,
-        objective=objective,
-        best_trial_objective=best_trial_objective,
-        best_study_objective=best_study_objective,
-        step=step,
-        pruning=pruning,
-        pruner=pruner,
-        pruning_eligible=pruning_eligible,
-        report_duration_seconds=report_duration_seconds,
-        training_seed=training_seed,
-        sampler_seed=sampler_seed,
-        device=device,
-        run_dir=run_dir,
-        max_epochs=max_epochs,
-        selected_best_epoch=selected_best_epoch,
-        final_state=final_state,
-        duration_seconds=duration_seconds,
-        checkpoint_state=checkpoint_state,
-        wandb_url=wandb_url,
-        phase=phase,
-        exception_type=exception_type,
-        error_message=_clean(error_message) if error_message is not None else None,
+    """Print one line for a finished Optuna trial; pruning is a normal outcome, any other non-completed state goes to stderr."""
+    state = status if step is None or status == "completed" else f"{status}@{step}"
+    _line(
+        f"trial {trial:>3}  {state}  val {_num(objective)}  {format_duration(duration_seconds)}  {_text(sampled)}",
+        to_stderr=status != "completed" and not status.endswith("pruned"),
     )

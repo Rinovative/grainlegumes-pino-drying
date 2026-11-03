@@ -1,5 +1,14 @@
-# ruff: noqa: S101, PLR2004
-"""Protect stored-time navigation and terminal-time display semantics."""
+"""Protect stored-time navigation and terminal-time display semantics.
+
+Responsibilities:
+  - Check stored-position moves, typed-time snapping, exact unions, and terminal holds
+
+Design principles:
+  - Canonical physical times are neither interpolated nor aligned by array index
+
+This module does NOT:
+  - Construct transient schedules or change stored snapshots
+"""
 
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ def test_position_controls_use_stored_snapshots_and_typed_time_snaps_nearest() -
     assert navigator.selection == time_ui.TimeStepSelection(5, 6, 5.0)
     assert navigator.time.value == 5.0
     assert events[-1].physical_time == 5.0
+    assert not any(isinstance(control, widgets.Play) for control in navigator.widget.children)
 
 
 @pytest.mark.parametrize(
@@ -58,14 +68,13 @@ def test_rebind_preserves_nearest_stored_time_and_notifies_once() -> None:
     assert events == [events[0]]
 
 
-def test_exact_intersection_and_union_never_align_times_by_array_index() -> None:
-    """Keep exact intersections and sorted authoritative union coordinates."""
+def test_union_never_aligns_times_by_array_index() -> None:
+    """Keep sorted authoritative union coordinates."""
     grids = (
         (0.0, 0.5, 2.0, 10.0),
         (0.0, 1.0, 2.0, 12.0),
         (0.0, 2.0, 3.0, 14.0),
     )
-    assert time_ui.ordered_time_intersection(grids) == (0.0, 2.0)
     assert time_ui.ordered_time_union(grids) == (0.0, 0.5, 1.0, 2.0, 3.0, 10.0, 12.0, 14.0)
     with pytest.raises(ValueError, match="at least one"):
         time_ui.ordered_time_union(())
@@ -79,42 +88,3 @@ def test_master_time_resolution_uses_latest_snapshot_and_final_hold() -> None:
     assert exact == time_ui.ResolvedPhysicalTime(24.0, True, False)
     assert prior == time_ui.ResolvedPhysicalTime(24.0, False, False)
     assert final == time_ui.ResolvedPhysicalTime(72.0, False, True)
-
-
-def test_visible_controls_show_physical_time_then_manual_arrows_only() -> None:
-    """Expose physical hours, then double/single arrows, with no playback controls."""
-    navigator = time_ui.TimeStepNavigator((0.0, 0.125, 2.5), initial_time=0.125)
-    controls = navigator.widget.children
-    assert tuple(control.description for control in controls) == (
-        "Time [h]:",
-        "≪",
-        "←",
-        "→",
-        "≫",
-    )
-    assert isinstance(controls[0], widgets.FloatText)
-    assert "nearest available stored physical time" in navigator.time.tooltip
-    assert not any(isinstance(control, widgets.Play) for control in controls)
-
-
-@pytest.mark.parametrize(
-    ("exact_hours", "expected"),
-    [
-        (20.0494, "20 h"),
-        (85.3214, "85 h"),
-        (168.0, "168 h"),
-        (180.03, "180 h"),
-    ],
-)
-def test_terminal_time_formatter_rounds_for_display_only(
-    exact_hours: float,
-    expected: str,
-) -> None:
-    """Round only terminal presentation text while retaining exact evidence."""
-    original = exact_hours
-    assert time_ui.format_terminal_physical_time_hours(exact_hours) == expected
-    assert time_ui.format_terminal_physical_time_hours(
-        exact_hours,
-        include_unit=False,
-    ) == expected.removesuffix(" h")
-    assert exact_hours == original

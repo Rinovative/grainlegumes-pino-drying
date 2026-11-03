@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Exercise semantic registry lookup and model construction boundaries."""
+"""Exercise semantic registry lookup and model construction boundaries.
+
+Responsibilities:
+  - Check semantic lookup, constructors, axis/depth limits, and cross-resolution admission
+
+Design principles:
+  - Supplied devices and explicit architecture capabilities govern construction
+
+This module does NOT:
+  - Train models or select scientific architecture defaults
+"""
 
 import sys
 import types
@@ -85,7 +94,7 @@ def test_model_factory_uses_only_supplied_concrete_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Build on explicit CPU without querying CUDA or resolving a policy token."""
-    config = experiments.config.loader.resolve_config(configs.direct_config())
+    config = configs.resolve(configs.direct_config())
     config["model"]["params"].update(
         {"n_modes": [2, 2], "hidden_channels": 2, "n_layers": 1},
     )
@@ -130,9 +139,19 @@ def test_rno_requires_official_constructor_and_single_step_sequences(
     )
     assert isinstance(model, FakeRNO)
     assert captured["return_sequences"] is False
+    assert captured["rno_skip"] is False
     assert captured["positional_embedding"] is None
     with pytest.raises(ValueError, match="return_sequences=False"):
         learning.models.factory.build_rno(in_channels=3, out_channels=4, n_modes=[2, 2], hidden_channels=5, return_sequences=True)
+    with pytest.raises(ValueError, match="rno_skip=False"):
+        learning.models.factory.build_rno(in_channels=3, out_channels=4, n_modes=[2, 2], hidden_channels=5, rno_skip=True)
+    with pytest.raises(ValueError, match="rno_skip must be false"):
+        learning.models.factory.validate_model_params(
+            "rno",
+            {"n_modes": [2, 2], "hidden_channels": 5, "rno_skip": True},
+            require_channels=False,
+            operator_dimensionality=2,
+        )
     with pytest.raises(ValueError, match="Unknown model identifier"):
         learning.models.factory.resolve_model_kind("uno-rno")
 
@@ -267,3 +286,20 @@ def test_transient_architecture_capability_rejects_requested_grid_before_inferen
     assert evidence["decision"] == "UNSUPPORTED"
     assert evidence["model_kind"] == "rno"
     assert "modes" in evidence["reason"]
+
+
+@pytest.mark.parametrize("kind", ["fno", "uno"])
+def test_one_architecture_label_is_reused_across_config_run_and_display(kind: str) -> None:
+    """Stage, physics, seed and optimizer remain distinct from architecture display."""
+    raw = configs.direct_config(model_kind=kind)
+    config = configs.resolve(raw)
+    label = learning.models.naming.architecture_label(config)
+    core = learning.models.naming.core_architecture_label(config)
+    assert label == core  # The synthetic model carries no non-default switches.
+    assert config["run"]["layout"]["model_label"] == core
+    assert core in config["run"]["name"]
+    assert experiments.config.loader.resolved_model_variant(config) == label
+    config["run"]["seed"] += 1
+    config["optimizer"]["lr"] *= 2
+    config["loss"]["physics"]["enabled"] = True
+    assert learning.models.naming.architecture_label(config) == label

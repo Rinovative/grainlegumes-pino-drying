@@ -1,7 +1,4 @@
-"""
-learning_device_policy.py
-
-Define the dependency-free runtime-device policy vocabulary.
+"""Define the dependency-free runtime-device policy vocabulary.
 
 Responsibilities:
   - Publish the exact auto, cuda, and cpu policy literals

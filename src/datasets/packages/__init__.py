@@ -3,27 +3,22 @@ Dataset source admission, package planning, and immutable publication services.
 
 Provides:
 - builder: provenance-bound Dataset package construction and publication
-- generated_batch: generated-simulation batch admission
+- generated_batch: physical source-case view conversion
 - manifest: package-manifest publication and admission
-- planning: deterministic source and membership planning
-- references: immutable task-local Dataset-reference publication and resolution
+- reproduction: producing source capture and researcher-facing reconstruction evidence
+- planning: deterministic exact source-case admission
 - trajectory: transient source admission and compact trajectory indexes
 - transient_shards: Dataset-bound derived PT shard publication and admission
 - DATASET_PACKAGE_SCHEMA_KIND: canonical package-manifest schema kind
 - DATASET_PACKAGE_SCHEMA_VERSION: canonical package-manifest schema version
 - DEFAULT_TRANSIENT_PT_SHARD_BYTES: default soft PT-shard packing target
-- build_dataset_package: build one declared campaign package
-- build_campaign_packages: build every declared campaign package
+- build_dataset_selection: publish one independent immutable ordered Dataset
+- discover_source_collections: inspect successful and failed source outcomes
+- select_exact_cases and select_ranked_cases: author exact case references
 - load_package_manifest: load one canonical package manifest
-- load_dataset_package_manifest: bind a manifest to a steady payload identity
 - load_package_manifest_evidence: admit manifest metadata without payload rehashing
+- declared_evaluation_assignments: project declared Dataset OOD membership
 - inspect_dataset_package: inspect one package and runtime sample
-- publish_dataset_reference: publish one immutable task-local package binding
-- resolve_dataset_reference: resolve one immutable task-local package binding
-- list_dataset_references: list immutable task-local package bindings
-- inspect_dataset_reference: inspect one bounded resolved package binding
-- smoke_dataset_package: run one bounded package loader smoke
-- storage_schema_version: return the canonical source-storage schema version
 """
 
 from __future__ import annotations
@@ -32,86 +27,62 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from src.datasets.dataset_packages import (
-        build_campaign_packages,
-        build_dataset_package,
-        inspect_dataset_package,
-        inspect_dataset_reference,
-        list_dataset_references,
-        load_dataset_package_manifest,
-        load_package_manifest,
-        load_package_manifest_evidence,
-        publish_dataset_reference,
-        resolve_dataset_reference,
-        smoke_dataset_package,
-        storage_schema_version,
-    )
+    from src.datasets.dataset_packages import build_dataset_selection, inspect_dataset_package
 
     from . import dataset_packages_builder as builder
     from . import dataset_packages_generated_batch as generated_batch
     from . import dataset_packages_manifest as manifest
     from . import dataset_packages_planning as planning
-    from . import dataset_packages_references as references
+    from . import dataset_packages_reproduction as reproduction
     from . import dataset_packages_trajectory as trajectory
     from . import dataset_packages_transient_shards as transient_shards
     from .dataset_packages_manifest import (
         DATASET_PACKAGE_SCHEMA_KIND,
         DATASET_PACKAGE_SCHEMA_VERSION,
+        declared_evaluation_assignments,
+        load_package_manifest,
+        load_package_manifest_evidence,
     )
+    from .dataset_packages_selection import discover_source_collections, select_exact_cases, select_ranked_cases
 
 _MODULES = {
     "builder": "dataset_packages_builder",
     "generated_batch": "dataset_packages_generated_batch",
     "manifest": "dataset_packages_manifest",
+    "reproduction": "dataset_packages_reproduction",
     "planning": "dataset_packages_planning",
-    "references": "dataset_packages_references",
     "trajectory": "dataset_packages_trajectory",
     "transient_shards": "dataset_packages_transient_shards",
 }
 DEFAULT_TRANSIENT_PT_SHARD_BYTES: Final = int(1.5 * 1024**3)
-_FACADE_EXPORTS = frozenset(
-    {
-        "build_campaign_packages",
-        "build_dataset_package",
-        "inspect_dataset_package",
-        "load_dataset_package_manifest",
-        "load_package_manifest",
-        "load_package_manifest_evidence",
-        "smoke_dataset_package",
-        "storage_schema_version",
-        "publish_dataset_reference",
-        "resolve_dataset_reference",
-        "list_dataset_references",
-        "inspect_dataset_reference",
-    }
-)
-_MANIFEST_EXPORTS = frozenset(
-    {
-        "DATASET_PACKAGE_SCHEMA_KIND",
-        "DATASET_PACKAGE_SCHEMA_VERSION",
-    }
-)
+_FACADE_EXPORTS = frozenset({"build_dataset_selection", "inspect_dataset_package"})
+_EXPORTS = {
+    "DATASET_PACKAGE_SCHEMA_KIND": "dataset_packages_manifest",
+    "DATASET_PACKAGE_SCHEMA_VERSION": "dataset_packages_manifest",
+    "declared_evaluation_assignments": "dataset_packages_manifest",
+    "load_package_manifest": "dataset_packages_manifest",
+    "load_package_manifest_evidence": "dataset_packages_manifest",
+    "discover_source_collections": "dataset_packages_selection",
+    "select_exact_cases": "dataset_packages_selection",
+    "select_ranked_cases": "dataset_packages_selection",
+}
 __all__ = [
     "DATASET_PACKAGE_SCHEMA_KIND",
     "DATASET_PACKAGE_SCHEMA_VERSION",
     "DEFAULT_TRANSIENT_PT_SHARD_BYTES",
-    "build_campaign_packages",
-    "build_dataset_package",
+    "build_dataset_selection",
     "builder",
+    "declared_evaluation_assignments",
+    "discover_source_collections",
     "generated_batch",
     "inspect_dataset_package",
-    "inspect_dataset_reference",
-    "list_dataset_references",
-    "load_dataset_package_manifest",
     "load_package_manifest",
     "load_package_manifest_evidence",
     "manifest",
     "planning",
-    "publish_dataset_reference",
-    "references",
-    "resolve_dataset_reference",
-    "smoke_dataset_package",
-    "storage_schema_version",
+    "reproduction",
+    "select_exact_cases",
+    "select_ranked_cases",
     "trajectory",
     "transient_shards",
 ]
@@ -124,8 +95,8 @@ def __getattr__(name: str) -> object:
         value = import_module(f"{__name__}.{module_name}")
     elif name in _FACADE_EXPORTS:
         value = getattr(import_module("src.datasets.dataset_packages"), name)
-    elif name in _MANIFEST_EXPORTS:
-        value = getattr(import_module(f"{__name__}.dataset_packages_manifest"), name)
+    elif name in _EXPORTS:
+        value = getattr(import_module(f"{__name__}.{_EXPORTS[name]}"), name)
     else:
         message = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(message)

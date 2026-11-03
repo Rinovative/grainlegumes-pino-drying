@@ -1,7 +1,4 @@
-"""
-analysis_field_labels.py
-
-Resolve concise formula symbols and unit-bearing scientific field labels.
+"""Resolve concise formula symbols and unit-bearing scientific field labels.
 
 Responsibilities:
   - Map canonical field keys to robust plain-text and Matplotlib symbols

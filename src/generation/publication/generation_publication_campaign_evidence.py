@@ -1,53 +1,92 @@
-"""
-generation_publication_campaign_evidence.py
+"""Own current campaign-run identity and persisted scheduler evidence.
 
-Own cross-purpose campaign-run identity and immutable transfer evidence.
 Responsibilities:
-  - Resolve canonical campaign-run paths and validate persisted run manifests
+  - Resolve canonical campaign, execution-record, and node-job directory paths, invert a node directory to its campaign, and validate run manifests
   - Reconstruct the exact resolved campaign bound to a launched run
-  - Build and validate symlink-free transfer inventories and receipts
+  - Admit exact node-job and case-dispatch ownership without loading scientific payloads
+  - Refuse run manifests that predate node mode
+
 Design principles:
   - Campaign state is independent of purpose-specific terminal evidence
-  - Transfer validation consumes explicit terminal and directory-plan evidence
-  - Persisted identities fail closed against repository configuration changes
+  - Frozen scientific plans own continuation while authored locators are validated separately
+  - Node jobs own the allocations and dispatch records own the cases, so both validate against each other
+
 This module does NOT:
-  - Submit scheduler jobs or classify pilot case outcomes
-  - Publish transferred files or build dataset packages
+  - Submit scheduler jobs, publish tickets, or classify scientific case outcomes
+  - Publish Dataset membership or execute solver work
+
+Notes:
+  Persisted contract (run.json schema version 2):
+    - ``node_jobs`` records one Slurm node job each; ``slurm_job_ids`` lists their allocation ids in record order.
+    - ``submissions`` records one dispatch (one ticket for one case step) each and references a node job by token.
+    - ``node_job_intent`` names the single unresolved ``submitting`` node job; ``submission_intent`` the single ``dispatching`` record.
+
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import re
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
-from src.generation.contracts import generation_contracts_paths as path_contract
 from src.generation.contracts import generation_contracts_source as source_service
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Mapping, Sequence
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
-_FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS: Final = (
-    "--array",
-    "--exclusive",
-    "--nodelist",
-    "--reservation",
+RUN_MANIFEST_SCHEMA_VERSION: Final = 2
+NODE_JOBS_DIRNAME: Final = "node_jobs"
+NODE_JOB_TOKEN_PATTERN: Final = re.compile(r"[a-z0-9]{16}")
+_NODE_SEATS: Final = tuple(range(1, config_service.MAXIMUM_NODE_JOBS + 1))
+_NODE_JOB_STATUSES: Final = frozenset({"submitting", "submitted", "submission_failed"})
+_NODE_JOB_LEASES: Final = frozenset({"pending", "ok", "failed"})
+_NODE_JOB_KEYS: Final = frozenset(
+    {
+        "token",
+        "seat",
+        "node_directory",
+        "job_id",
+        "status",
+        "lease",
+        "draining",
+        "stop_ticket_seq",
+        "next_ticket_seq",
+        "cancel_published",
+        "recorded_at",
+        "terminal_observed_at",
+        "error",
+    }
 )
-_RUN_MANIFEST_SCHEMA_VERSION: Final = 1
-TECHNICAL_SMOKE_EVIDENCE_FILENAME: Final = "technical_smoke_evidence.json"
-RUNTIME_PROGRESS_DIRECTORY_NAME: Final = "progress"
+_DISPATCH_KEYS: Final = frozenset(
+    {
+        "submission_index",
+        "mode",
+        "recorded_at",
+        "case",
+        "node_job_token",
+        "job_id",
+        "ticket_seq",
+        "step_name",
+        "attempt_index",
+        "status",
+        "error",
+    }
+)
+_DISPATCH_MODES: Final = frozenset({"initial", "resume", "license_retry", "restart"})
+_DISPATCH_STATUSES: Final = frozenset({"dispatching", "dispatched", "not_started"})
+STEP_NAME_PATTERN: Final = re.compile(r"[a-z]{2}-[a-z0-9]+-c[0-9]{4,}-s[1-9][0-9]*")
+MAX_STEP_NAME_LENGTH: Final = 48
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
         "schema_version",
         "campaign_run_id",
         "campaign_name",
+        "source_name",
         "campaign_id",
         "campaign_digest",
         "campaign_config",
@@ -56,7 +95,8 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "git_commit",
         "execution_config_digest",
         "slurm_job_ids",
-        "scheduler_job_name",
+        "node_jobs",
+        "node_job_intent",
         "scheduler_log_directory",
         "submission_config",
         "submissions",
@@ -65,28 +105,10 @@ _RUN_MANIFEST_KEYS: Final = frozenset(
         "remote_storage_root",
         "campaign_meta_directory",
         "batches",
-        "dataset_packages",
         "state",
     }
 )
-_RUN_MANIFEST_OPTIONAL_KEYS: Final = frozenset({"synthetic_completion"})
-POST_TRANSFER_OPERATIONAL_PATHS: Final = frozenset(
-    {
-        "all_workflow.json",
-        "cpu_source_cleanup.json",
-        "dataset_package_extensions",
-        "dataset_packages_complete.json",
-        "dataset_packages_complete.lock",
-        "campaign_partial.json",
-        "dataset_packages_incomplete.json",
-        "partial_completion.json",
-        "transfer_partial.json",
-        "transfer_complete.json",
-        TECHNICAL_SMOKE_EVIDENCE_FILENAME,
-        RUNTIME_PROGRESS_DIRECTORY_NAME,
-        "workflow_failures",
-    }
-)
+_RUN_MANIFEST_OPTIONAL_KEYS: Final = frozenset({"source_snapshot"})
 
 
 def campaign_run_directory(
@@ -96,7 +118,22 @@ def campaign_run_directory(
 ) -> Path:
     """Return one persistent campaign-run metadata directory."""
     safe_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    return common.paths.get_generation_meta_root(storage_root=storage_root) / "campaigns" / safe_id
+    if (parts := common.paths.campaign_run_parts(safe_id)) is not None:
+        task, campaign_name = parts
+        return common.paths.resolve_generation_campaign_directory(task, campaign_name, storage_root=storage_root)
+    message = "Campaign-run identity must be one canonical Source handle."
+    raise ValueError(message)
+
+
+def campaign_execution_directory(
+    run_id: str,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return the directory that holds every operational record of one campaign run, below its admitted ``_record/``."""
+    campaign_directory = campaign_run_directory(run_id, storage_root=storage_root)
+    common.paths.admit_generation_campaign_record_directory(campaign_directory)
+    return common.paths.resolve_generation_execution_directory(campaign_directory)
 
 
 def campaign_run_manifest_path(
@@ -105,7 +142,35 @@ def campaign_run_manifest_path(
     storage_root: Path | str | None,
 ) -> Path:
     """Return the persistent campaign-run manifest path."""
-    return campaign_run_directory(run_id, storage_root=storage_root) / "campaign_run.json"
+    return common.paths.resolve_generation_run_manifest_path(campaign_execution_directory(run_id, storage_root=storage_root))
+
+
+def node_job_relative_directory(token: str) -> str:
+    """Return the run-directory-relative node directory persisted for one node-job token."""
+    if not isinstance(token, str) or NODE_JOB_TOKEN_PATTERN.fullmatch(token) is None:
+        message = f"Node-job token must match {NODE_JOB_TOKEN_PATTERN.pattern!r}, got {token!r}."
+        raise ValueError(message)
+    return (common.paths.resolve_generation_execution_directory(Path()) / NODE_JOBS_DIRNAME / token).as_posix()
+
+
+def node_job_campaign_directory(node_directory: Path | str) -> Path | None:
+    """Invert one campaign node directory to its campaign directory, or return ``None`` for any other node directory (a benchmark's)."""
+    directory = Path(node_directory)
+    if NODE_JOB_TOKEN_PATTERN.fullmatch(directory.name) is None:
+        return None
+    relative = Path(node_job_relative_directory(directory.name))
+    campaign = Path(*directory.parts[: -len(relative.parts)])
+    return campaign if len(directory.parts) > len(relative.parts) and campaign / relative == directory else None
+
+
+def campaign_node_job_directory(
+    run_id: str,
+    token: str,
+    *,
+    storage_root: Path | str | None,
+) -> Path:
+    """Return the node directory (tickets, receipts, control, worker records) of one node job."""
+    return campaign_run_directory(run_id, storage_root=storage_root) / node_job_relative_directory(token)
 
 
 def load_json_object(path: Path, *, label: str) -> dict[str, Any]:
@@ -127,11 +192,15 @@ def resolve_campaign_config_path(value: Any) -> Path:
         message = "Campaign-run campaign_config must be non-empty repository-relative text."
         raise TypeError(message)
     relative = Path(value)
-    if relative.is_absolute() or ".." in relative.parts or relative.parts[:3] != ("configs", "generation", "campaigns"):
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("configs",) or relative.suffix != ".yaml":
         message = f"Campaign-run campaign_config is not a canonical generation campaign path: {value!r}."
         raise ValueError(message)
     repository = common.paths.get_project_root().resolve()
-    resolved = (repository / relative).resolve()
+    candidate = repository / relative
+    resolved = candidate.resolve()
+    if resolved != candidate:
+        message = f"Campaign-run campaign_config contains a symlink: {value!r}."
+        raise ValueError(message)
     try:
         resolved.relative_to(repository)
     except ValueError as error:
@@ -141,6 +210,23 @@ def resolve_campaign_config_path(value: Any) -> Path:
         message = f"Campaign-run campaign_config is missing or unsafe: {resolved}."
         raise FileNotFoundError(message)
     return resolved
+
+
+def resolve_frozen_campaign_config_locator(value: Any) -> Path:
+    """Validate a v2 authored locator while reading its durable frozen plan."""
+    if not isinstance(value, str) or not value:
+        message = "Canonical campaign configuration locator must be non-empty text."
+        raise TypeError(message)
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:1] != ("configs",) or relative.suffix != ".yaml":
+        message = "Canonical campaign configuration locator is unsafe."
+        raise ValueError(message)
+    repository = common.paths.get_project_root().resolve()
+    candidate = repository / relative
+    if candidate.resolve(strict=False) != candidate:
+        message = "Canonical campaign configuration locator escapes its repository."
+        raise ValueError(message)
+    return candidate
 
 
 def _validate_campaign_scheduler_job_ids(
@@ -159,25 +245,33 @@ def _validate_campaign_scheduler_job_ids(
     return value
 
 
+def _require_node_mode_manifest(manifest: Mapping[str, Any], *, run_id: str) -> None:
+    """Refuse a run manifest written before node mode: it is neither executed, resumed, nor admitted."""
+    version = manifest.get("schema_version")
+    if manifest.get("schema_kind") == "generation_campaign_run" and type(version) is int and version < RUN_MANIFEST_SCHEMA_VERSION:
+        message = (
+            f"Campaign run {run_id} predates node mode (run.json schema version {version}); "
+            f"only schema version {RUN_MANIFEST_SCHEMA_VERSION} is executed, resumed, or admitted. Start a new campaign."
+        )
+        raise ValueError(message)
+
+
 def _validate_campaign_run_header(
     manifest: Mapping[str, Any],
     *,
     run_id: str,
 ) -> list[str]:
     """Validate top-level campaign, source, and scheduler identity."""
+    _require_node_mode_manifest(manifest, run_id=run_id)
     if (
         not set(manifest) >= _RUN_MANIFEST_KEYS
         or bool(set(manifest).difference(_RUN_MANIFEST_KEYS | _RUN_MANIFEST_OPTIONAL_KEYS))
         or manifest.get("schema_kind") != "generation_campaign_run"
-        or manifest.get("schema_version") != _RUN_MANIFEST_SCHEMA_VERSION
+        or manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
         raise ValueError(message)
-    if "synthetic_completion" in manifest:
-        from src.generation import generation_campaign_completion as completion_service  # noqa: PLC0415 -- break the completion/evidence import cycle
-
-        completion_service.validate_synthetic_manifest_extension(manifest["synthetic_completion"])
     source_service.validate_git_commit(manifest.get("git_commit"))
     for key in ("campaign_digest", "execution_config_digest"):
         value = manifest.get(key)
@@ -203,7 +297,10 @@ def _validate_campaign_run_header(
         "failure_threshold_reached",
         "license_blocked",
         "completed_with_failures",
+        "staged",
+        "blocked",
         "complete",
+        "license_wait_exhausted",
         "cancel_requested",
         "force_cancel_requested",
     }
@@ -213,10 +310,6 @@ def _validate_campaign_run_header(
     job_ids = _validate_campaign_scheduler_job_ids(
         manifest.get("slurm_job_ids"),
         run_id=run_id,
-    )
-    common.paths.validate_logical_name(
-        manifest.get("scheduler_job_name"),
-        label="scheduler_job_name",
     )
     log_directory = manifest.get("scheduler_log_directory")
     if not isinstance(log_directory, str) or not Path(log_directory).is_absolute():
@@ -230,7 +323,7 @@ def _validate_submission_configuration(
     *,
     run_id: str,
 ) -> None:
-    """Validate the persisted feeder and one-case allocation contract."""
+    """Validate the persisted feeder and node-job allocation contract."""
     submission = manifest.get("submission_config")
     if not isinstance(submission, dict):
         message = f"Campaign-run submission configuration is malformed: {run_id}."
@@ -238,30 +331,40 @@ def _validate_submission_configuration(
     if set(submission) != {
         "max_admission_cases",
         "poll_interval_seconds",
-        "max_running_cases",
+        "node_jobs",
         "cores_per_case",
+        "concurrent_cases_per_node",
+        "memory_per_case",
+        "node_job_memory",
+        "node_job_wall_time",
         "maximum_failed_cases",
-        "temporary_license_retry",
+        "license_wait",
         "partition",
-        "wall_time",
         "scheduler_options",
     }:
         message = f"Campaign-run submission configuration is malformed: {run_id}."
         raise ValueError(message)
-    for key in ("max_admission_cases", "poll_interval_seconds", "cores_per_case"):
+    for key in ("max_admission_cases", "poll_interval_seconds", "cores_per_case", "node_jobs", "concurrent_cases_per_node"):
         value = submission[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."
             raise ValueError(message)
+    try:
+        for key in ("memory_per_case", "node_job_memory"):
+            config_service.parse_slurm_memory_mib(submission[key], label=key)
+        config_service.parse_wall_time_seconds(submission["node_job_wall_time"], label="node_job_wall_time")
+    except config_service.GenerationConfigError as error:
+        message = f"Campaign-run submission configuration node-job resources are malformed: {run_id}."
+        raise ValueError(message) from error
     maximum_failed_cases = submission["maximum_failed_cases"]
     if isinstance(maximum_failed_cases, bool) or not isinstance(maximum_failed_cases, int) or maximum_failed_cases < 0:
         message = f"Campaign-run submission configuration 'maximum_failed_cases' is malformed: {run_id}."
         raise ValueError(message)
-    retry = submission["temporary_license_retry"]
-    in_allocation = retry.get("in_allocation_retry") if isinstance(retry, dict) else None
+    wait = submission["license_wait"]
+    in_allocation = wait.get("in_allocation_retry") if isinstance(wait, dict) else None
     if (
-        not isinstance(retry, dict)
-        or set(retry)
+        not isinstance(wait, dict)
+        or set(wait)
         != {
             "enabled",
             "initial_delay_seconds",
@@ -269,24 +372,17 @@ def _validate_submission_configuration(
             "maximum_wait_seconds",
             "in_allocation_retry",
         }
-        or not isinstance(retry.get("enabled"), bool)
+        or not isinstance(wait.get("enabled"), bool)
         or any(
-            isinstance(retry.get(key), bool) or not isinstance(retry.get(key), (int, float)) or not 0.0 < float(retry[key]) < float("inf")
+            isinstance(wait.get(key), bool) or not isinstance(wait.get(key), (int, float)) or not 0.0 < float(wait[key]) < float("inf")
             for key in (
                 "initial_delay_seconds",
                 "maximum_delay_seconds",
+                "maximum_wait_seconds",
             )
         )
-        or (
-            retry.get("maximum_wait_seconds") is not None
-            and (
-                isinstance(retry["maximum_wait_seconds"], bool)
-                or not isinstance(retry["maximum_wait_seconds"], (int, float))
-                or not 0.0 < float(retry["maximum_wait_seconds"]) < float("inf")
-            )
-        )
-        or retry["maximum_delay_seconds"] < retry["initial_delay_seconds"]
-        or (retry["maximum_wait_seconds"] is not None and retry["maximum_wait_seconds"] < retry["initial_delay_seconds"])
+        or wait["maximum_delay_seconds"] < wait["initial_delay_seconds"]
+        or wait["maximum_wait_seconds"] < wait["initial_delay_seconds"]
         or not isinstance(in_allocation, dict)
         or set(in_allocation) != {"enabled", "maximum_window_seconds", "pause_after_capacity_failure_seconds"}
         or not isinstance(in_allocation.get("enabled"), bool)
@@ -297,11 +393,7 @@ def _validate_submission_configuration(
             for key in ("maximum_window_seconds", "pause_after_capacity_failure_seconds")
         )
     ):
-        message = f"Campaign-run temporary-license retry configuration is malformed: {run_id}."
-        raise ValueError(message)
-    max_running = submission["max_running_cases"]
-    if max_running is not None and (isinstance(max_running, bool) or not isinstance(max_running, int) or max_running < 1):
-        message = f"Campaign-run max_running_cases is malformed: {run_id}."
+        message = f"Campaign-run license-wait configuration is malformed: {run_id}."
         raise ValueError(message)
     options = submission["scheduler_options"]
     if not isinstance(options, list) or not all(isinstance(option, str) and option.startswith("--") for option in options):
@@ -309,72 +401,137 @@ def _validate_submission_configuration(
         raise ValueError(message)
 
 
-def _validate_submission_record(
+def _optional_text(value: object) -> bool:
+    """Return whether one persisted field is None or a non-empty string."""
+    return value is None or (isinstance(value, str) and bool(value))
+
+
+def _positive_int(value: object) -> bool:
+    """Return whether one persisted field is a positive non-boolean integer."""
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 1
+
+
+def _validate_node_job_record(record: object, *, index: int, run_id: str) -> dict[str, Any]:
+    """Validate one persisted node-job record and return it."""
+    if (
+        not isinstance(record, dict)
+        or set(record) != _NODE_JOB_KEYS
+        or not isinstance(record.get("token"), str)
+        or NODE_JOB_TOKEN_PATTERN.fullmatch(record["token"]) is None
+        or isinstance(record.get("seat"), bool)
+        or record.get("seat") not in _NODE_SEATS
+        or record.get("node_directory") != node_job_relative_directory(record["token"])
+        or record.get("status") not in _NODE_JOB_STATUSES
+        or record.get("lease") not in _NODE_JOB_LEASES
+        or not isinstance(record.get("draining"), bool)
+        or not (record.get("stop_ticket_seq") is None or _positive_int(record["stop_ticket_seq"]))
+        or not _positive_int(record.get("next_ticket_seq"))
+        or not isinstance(record.get("cancel_published"), bool)
+        or not isinstance(record.get("recorded_at"), str)
+        or not _optional_text(record.get("terminal_observed_at"))
+        or not _optional_text(record.get("error"))
+    ):
+        message = f"Campaign-run node-job record {index} is malformed: {run_id}."
+        raise ValueError(message)
+    job_id = record["job_id"]
+    submitted = record["status"] == "submitted"
+    unsubmitted_shape = not submitted and (
+        job_id is not None
+        or record["lease"] != "pending"
+        or record["draining"]
+        or record["cancel_published"]
+        or record["terminal_observed_at"] is not None
+    )
+    if (
+        (submitted and (not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None))
+        or unsubmitted_shape
+        or (record["status"] == "submission_failed") != (record["error"] is not None and not submitted)
+        or (submitted and record["error"] is not None and record["lease"] != "failed")
+        or (record["stop_ticket_seq"] is not None and (not record["draining"] or record["stop_ticket_seq"] >= record["next_ticket_seq"]))
+    ):
+        message = f"Campaign-run node-job record {index} is inconsistent: {run_id}."
+        raise ValueError(message)
+    return record
+
+
+def _validate_node_job_records(
+    manifest: Mapping[str, Any],
+    *,
+    run_id: str,
+    job_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Validate every node-job record and the node-job intent; return the records by token."""
+    records = manifest.get("node_jobs")
+    if not isinstance(records, list):
+        message = f"Campaign-run node jobs are malformed: {run_id}."
+        raise TypeError(message)
+    by_token: dict[str, dict[str, Any]] = {}
+    known: list[str] = []
+    unresolved: list[str] = []
+    for index, raw in enumerate(records, start=1):
+        record = _validate_node_job_record(raw, index=index, run_id=run_id)
+        if record["token"] in by_token:
+            message = f"Campaign-run node-job token is duplicated: {run_id}."
+            raise ValueError(message)
+        by_token[record["token"]] = record
+        if record["job_id"] is not None:
+            known.append(record["job_id"])
+        if record["status"] == "submitting":
+            unresolved.append(record["token"])
+    if known != list(job_ids):
+        message = f"Campaign-run job IDs disagree with node-job records: {run_id}."
+        raise ValueError(message)
+    intent = manifest.get("node_job_intent")
+    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
+        message = f"Campaign-run durable node-job intent is inconsistent: {run_id}."
+        raise ValueError(message)
+    return by_token
+
+
+def _validate_dispatch_record(
     record: object,
     *,
     index: int,
     run_id: str,
-) -> tuple[str | None, bool]:
-    """Validate one atomic submission attempt and return its state summary."""
+    node_jobs: Mapping[str, Mapping[str, Any]],
+) -> str:
+    """Validate one persisted dispatch record against its node job and return its status."""
+    case = record.get("case") if isinstance(record, dict) else None
     if (
         not isinstance(record, dict)
-        or set(record)
-        != {
-            "submission_index",
-            "mode",
-            "recorded_at",
-            "case",
-            "job_name",
-            "command",
-            "job_id",
-            "status",
-            "error",
-        }
+        or set(record) != _DISPATCH_KEYS
         or record.get("submission_index") != index
-        or record.get("mode") not in {"initial", "resume", "license_retry"}
+        or record.get("mode") not in _DISPATCH_MODES
         or not isinstance(record.get("recorded_at"), str)
-        or not isinstance(record.get("case"), dict)
-        or set(record["case"]) != {"batch_name", "batch_id", "case_index", "case_id"}
-        or isinstance(record["case"].get("case_index"), bool)
-        or not isinstance(record["case"].get("case_index"), int)
-        or not isinstance(record.get("command"), list)
-        or not record["command"]
-        or not all(isinstance(argument, str) for argument in record["command"])
-        or record.get("status") not in {"submitting", "submitted", "submission_failed"}
+        or not isinstance(case, dict)
+        or set(case) != {"batch_name", "batch_id", "case_index", "case_id"}
+        or not _positive_int(case.get("case_index"))
+        or not isinstance(record.get("node_job_token"), str)
+        or not isinstance(record.get("job_id"), str)
+        or _JOB_ID_PATTERN.fullmatch(record["job_id"]) is None
+        or not _positive_int(record.get("ticket_seq"))
+        or not isinstance(record.get("step_name"), str)
+        or len(record["step_name"]) > MAX_STEP_NAME_LENGTH
+        or STEP_NAME_PATTERN.fullmatch(record["step_name"]) is None
+        or not record["step_name"].endswith(f"-c{case['case_index']:04d}-s{index}")
+        or not _positive_int(record.get("attempt_index"))
+        or record.get("status") not in _DISPATCH_STATUSES
+        or (record["status"] == "not_started") != isinstance(record.get("error"), str)
+        or record.get("error") == ""
     ):
-        message = f"Campaign-run submission record {index} is malformed: {run_id}."
+        message = f"Campaign-run dispatch record {index} is malformed: {run_id}."
         raise ValueError(message)
     for key in ("batch_name", "batch_id", "case_id"):
-        common.paths.validate_logical_name(
-            record["case"].get(key),
-            label=f"submission case {key}",
-        )
-    common.paths.validate_logical_name(
-        record.get("job_name"),
-        label="submission job_name",
-    )
-    if any(
-        argument == forbidden or argument.startswith(f"{forbidden}=")
-        for argument in record["command"]
-        for forbidden in _FORBIDDEN_NONORDINARY_SCHEDULER_OPTIONS
-    ):
-        message = f"Campaign-run submission {index} uses forbidden packing, exclusivity, or reservation: {run_id}."
+        common.paths.validate_logical_name(case.get(key), label=f"dispatch case {key}")
+    node_job = node_jobs.get(record["node_job_token"])
+    if node_job is None or node_job["status"] != "submitted" or node_job["job_id"] != record["job_id"]:
+        message = f"Campaign-run dispatch record {index} references no submitted node job of its allocation: {run_id}."
         raise ValueError(message)
-    job_id = record.get("job_id")
-    if record["status"] == "submitted":
-        if not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None or record["error"] is not None:
-            message = f"Campaign-run submitted record {index} is malformed: {run_id}."
-            raise ValueError(message)
-        return job_id, False
-    if job_id is not None:
-        message = f"Campaign-run unresolved record {index} has a job ID: {run_id}."
+    sequence, cursor = record["ticket_seq"], node_job["next_ticket_seq"]
+    if (record["status"] == "dispatching" and sequence != cursor) or (record["status"] == "dispatched" and sequence >= cursor) or sequence > cursor:
+        message = f"Campaign-run dispatch record {index} disagrees with its node job's ticket cursor: {run_id}."
         raise ValueError(message)
-    if record["status"] == "submitting":
-        return None, True
-    if not isinstance(record["error"], str) or not record["error"]:
-        message = f"Campaign-run failed submission {index} has no error: {run_id}."
-        raise ValueError(message)
-    return None, False
+    return str(record["status"])
 
 
 def _validate_admission_reservations(manifest: Mapping[str, Any], *, run_id: str) -> None:
@@ -408,25 +565,65 @@ def _validate_submission_records(
     manifest: Mapping[str, Any],
     *,
     run_id: str,
-) -> tuple[list[str], list[int]]:
-    """Validate every submission record and summarize persisted intent."""
+    node_jobs: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Validate every dispatch record against the node jobs, the ticket and step-name uniqueness rules, and the dispatch intent."""
     submissions = manifest.get("submissions")
     if not isinstance(submissions, list):
         message = f"Campaign-run submissions are malformed: {run_id}."
         raise TypeError(message)
-    persisted_ids: list[str] = []
     unresolved: list[int] = []
+    tickets: set[tuple[str, int]] = set()
+    steps: set[str] = set()
     for index, record in enumerate(submissions, start=1):
-        job_id, is_unresolved = _validate_submission_record(
-            record,
-            index=index,
-            run_id=run_id,
-        )
-        if job_id is not None:
-            persisted_ids.append(job_id)
-        if is_unresolved:
+        status = _validate_dispatch_record(record, index=index, run_id=run_id, node_jobs=node_jobs)
+        if status != "not_started":
+            ticket = (record["node_job_token"], record["ticket_seq"])
+            if ticket in tickets:
+                message = f"Campaign-run dispatch ticket is duplicated: {run_id}."
+                raise ValueError(message)
+            tickets.add(ticket)
+        if record["step_name"] in steps:
+            message = f"Campaign-run dispatch step name is duplicated: {run_id}."
+            raise ValueError(message)
+        steps.add(record["step_name"])
+        if status == "dispatching":
             unresolved.append(index)
-    return persisted_ids, unresolved
+    for token, node_job in node_jobs.items():
+        if node_job["stop_ticket_seq"] is not None and (token, node_job["stop_ticket_seq"]) in tickets:
+            message = f"Campaign-run stop ticket collides with a dispatch ticket: {run_id}."
+            raise ValueError(message)
+    intent = manifest.get("submission_intent")
+    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
+        message = f"Campaign-run durable submission intent is inconsistent: {run_id}."
+        raise ValueError(message)
+
+
+def _snapshot_path_for_storage(
+    snapshot: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    storage: Path,
+) -> Path:
+    """Map one frozen storage locator into an explicit read root without rewriting it."""
+    stored_root = manifest.get("remote_storage_root")
+    stored_path = snapshot.get("path")
+    if not isinstance(stored_root, str) or not isinstance(stored_path, str):
+        message = "Canonical campaign source snapshot locator is malformed."
+        raise ValueError(message)  # noqa: TRY004 -- persisted JSON evidence retains the ValueError admission contract
+    origin = Path(stored_root)
+    path = Path(stored_path)
+    if (
+        not origin.is_absolute()
+        or origin.parent == origin
+        or ".." in origin.parts
+        or not path.is_absolute()
+        or ".." in path.parts
+        or not path.is_relative_to(common.paths.get_source_snapshots_root(storage_root=origin))
+    ):
+        message = "Canonical campaign source snapshot locator escapes its persisted storage root."
+        raise ValueError(message)
+    return storage / path.relative_to(origin)
 
 
 def load_campaign_run(
@@ -443,18 +640,36 @@ def load_campaign_run(
     job_ids = _validate_campaign_run_header(manifest, run_id=run_id)
     _validate_submission_configuration(manifest, run_id=run_id)
     _validate_admission_reservations(manifest, run_id=run_id)
-    persisted_ids, unresolved = _validate_submission_records(
-        manifest,
-        run_id=run_id,
-    )
-    if persisted_ids != job_ids:
-        message = f"Campaign-run job IDs disagree with submission records: {run_id}."
-        raise ValueError(message)
-    intent = manifest.get("submission_intent")
-    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
-        message = f"Campaign-run durable submission intent is inconsistent: {run_id}."
-        raise ValueError(message)
-    resolve_campaign_config_path(manifest.get("campaign_config"))
+    node_jobs = _validate_node_job_records(manifest, run_id=run_id, job_ids=job_ids)
+    _validate_submission_records(manifest, run_id=run_id, node_jobs=node_jobs)
+    parts = common.paths.campaign_run_parts(run_id)
+    if parts is None:
+        if "source_snapshot" in manifest:
+            message = "Historical campaign run cannot claim a canonical dirty-source snapshot."
+            raise ValueError(message)
+        resolve_campaign_config_path(manifest.get("campaign_config"))
+    else:
+        resolve_frozen_campaign_config_locator(manifest.get("campaign_config"))
+        if "source_snapshot" in manifest:
+            snapshot = manifest["source_snapshot"]
+            storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+            root = common.paths.get_source_snapshots_root(storage_root=storage)
+            if not isinstance(snapshot, dict) or set(snapshot) != {"path", "sha256", "source_fingerprint_sha256"}:
+                message = "Canonical campaign source snapshot binding is malformed."
+                raise ValueError(message)
+            path = _snapshot_path_for_storage(snapshot, manifest, storage=storage)
+            if (
+                not path.is_absolute()
+                or not path.is_relative_to(root)
+                or not path.resolve(strict=False).is_relative_to(root)
+                or path.is_symlink()
+                or not path.is_file()
+                or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["sha256"])) is None
+                or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["source_fingerprint_sha256"])) is None
+                or common.serialization.file_sha256(path) != snapshot["sha256"]
+            ):
+                message = "Canonical campaign source snapshot is missing, unsafe, or changed."
+                raise ValueError(message)
     return manifest
 
 
@@ -463,15 +678,26 @@ def load_campaign_scheduler_job_ids(
     *,
     storage_root: Path | str | None = None,
 ) -> tuple[str, ...]:
-    """Load only exact persisted scheduler ownership for one campaign run."""
+    """
+    Load only the exact persisted node-job allocations of one campaign run.
+
+    Raises
+    ------
+    RuntimeError
+        If a node-job submission is unresolved: its allocation may exist without being recorded.
+    ValueError
+        If the manifest is malformed, inconsistent, or predates node mode.
+
+    """
     path = campaign_run_manifest_path(run_id, storage_root=storage_root)
     if not path.is_file() or path.is_symlink():
         message = f"Campaign-run manifest is missing or unsafe: {path}"
         raise FileNotFoundError(message)
     manifest = load_json_object(path, label="campaign-run manifest")
+    _require_node_mode_manifest(manifest, run_id=run_id)
     if (
         manifest.get("schema_kind") != "generation_campaign_run"
-        or manifest.get("schema_version") != _RUN_MANIFEST_SCHEMA_VERSION
+        or manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
@@ -480,17 +706,11 @@ def load_campaign_scheduler_job_ids(
         manifest.get("slurm_job_ids"),
         run_id=run_id,
     )
-    persisted_ids, unresolved = _validate_submission_records(
-        manifest,
-        run_id=run_id,
-    )
-    if persisted_ids != job_ids:
-        message = f"Campaign-run job IDs disagree with submission records: {run_id}."
-        raise ValueError(message)
-    intent = manifest.get("submission_intent")
-    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
-        message = f"Campaign-run durable submission intent is inconsistent: {run_id}."
-        raise ValueError(message)
+    node_jobs = _validate_node_job_records(manifest, run_id=run_id, job_ids=job_ids)
+    _validate_submission_records(manifest, run_id=run_id, node_jobs=node_jobs)
+    if manifest["node_job_intent"] is not None:
+        message = f"Campaign-run node-job submission is unresolved, so its allocations are not fully known: {run_id}."
+        raise RuntimeError(message)
     return tuple(job_ids)
 
 
@@ -521,30 +741,13 @@ def current_campaign_from_manifest(
     *,
     require_executable: bool = True,
 ) -> config_service.CampaignConfig:
-    """Resolve current package requests over one unchanged simulation plan."""
-    if "synthetic_completion" in manifest:
-        from src.generation import generation_campaign_completion as completion_service  # noqa: PLC0415 -- break the completion/evidence import cycle
+    """Reconstruct the executable campaign from its immutable frozen source plan."""
+    if common.paths.campaign_run_parts(str(manifest.get("campaign_run_id", ""))) is None:
+        message = "Campaign execution requires a canonical source campaign execution handle."
+        raise ValueError(message)
+    from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- frozen source plan owner
 
-        campaign = completion_service.campaign_from_synthetic_manifest(
-            manifest,
-            require_executable=require_executable,
-        )
-        _validate_admission_reservations_for_campaign(manifest, campaign)
-        return campaign
-    config_path = resolve_campaign_config_path(manifest["campaign_config"])
-    campaign = config_service.load_campaign_config(
-        config_path,
-        require_executable=require_executable,
-    )
-    campaign = campaign.select_batches(tuple(manifest["selected_batch_names"]))
-    if (
-        campaign.campaign_id != manifest["campaign_id"]
-        or campaign.campaign_digest != manifest["campaign_digest"]
-        or common.serialization.canonical_json_sha256(campaign.execution_values) != manifest["execution_config_digest"]
-        or [batch.batch_name for batch in campaign.batches] != manifest["selected_batch_names"]
-    ):
-        message = "Campaign simulation configuration or execution-view identity changed after launch."
-        raise RuntimeError(message)
+    campaign = lifecycle.campaign_from_frozen_run(manifest, require_executable=require_executable)
     _validate_admission_reservations_for_campaign(manifest, campaign)
     return campaign
 
@@ -554,426 +757,5 @@ def campaign_from_manifest(
     *,
     require_executable: bool = True,
 ) -> config_service.CampaignConfig:
-    """Resolve the launch-time package snapshot for run continuation or inspection."""
-    campaign = current_campaign_from_manifest(
-        manifest,
-        require_executable=require_executable,
-    )
-    snapshot = manifest.get("dataset_packages")
-    if not isinstance(snapshot, list) or not all(isinstance(package, dict) for package in snapshot):
-        message = "Campaign-run Dataset package snapshot is malformed."
-        raise TypeError(message)
-    current_by_name = {str(package["dataset_name"]): package for package in campaign.dataset_packages}
-    snapshot_names = [str(package.get("dataset_name")) for package in snapshot]
-    if len(snapshot_names) != len(set(snapshot_names)) or any(
-        current_by_name.get(name) is None
-        or config_service.dataset_package_scientific_plan(current_by_name[name]) != config_service.dataset_package_scientific_plan(package)
-        for name, package in zip(snapshot_names, snapshot, strict=True)
-    ):
-        message = "Campaign launch-time Dataset package declarations were removed or changed."
-        raise RuntimeError(message)
-    packages = tuple(copy.deepcopy(snapshot))
-    return replace(
-        campaign,
-        evaluation_regimes=tuple(dict.fromkeys(str(package["evaluation_regime"]) for package in packages)),
-        dataset_packages=packages,
-        package_request_digest=common.serialization.canonical_json_sha256(list(packages)),
-    )
-
-
-def current_campaign_for_run(
-    run_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> config_service.CampaignConfig:
-    """Return current additive package requests for a persisted simulation run."""
-    return current_campaign_from_manifest(
-        load_campaign_run(run_id, storage_root=storage_root),
-    )
-
-
-def campaign_for_run(
-    run_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> config_service.CampaignConfig:
-    """Return the exact repository campaign and batch selection bound to a run."""
-    return campaign_from_manifest(
-        load_campaign_run(run_id, storage_root=storage_root),
-    )
-
-
-def directory_identity(
-    directory: Path,
-    *,
-    ignored_relative_paths: frozenset[str] = frozenset(),
-) -> str:
-    """Return a symlink-free exact tree identity for transfer comparison."""
-    if not directory.is_dir() or directory.is_symlink():
-        message = f"Transfer directory is missing or unsafe: {directory}"
-        raise FileNotFoundError(message)
-    records: dict[str, dict[str, Any]] = {}
-    for path in sorted(directory.rglob("*")):
-        if path.is_symlink():
-            message = f"Transfer directory contains a symbolic link: {path}"
-            raise ValueError(message)
-        relative = path.relative_to(directory).as_posix()
-        if not path.is_file() or _relative_path_is_ignored(relative, ignored_relative_paths):
-            continue
-        records[relative] = {
-            "sha256": common.serialization.file_sha256(path),
-            "size_bytes": path.stat().st_size,
-        }
-    return common.serialization.canonical_json_sha256(records)
-
-
-def _relative_path_is_ignored(
-    relative_path: str,
-    ignored_relative_paths: frozenset[str],
-) -> bool:
-    """Return whether one file is below an ignored operational path."""
-    return any(relative_path == ignored or relative_path.startswith(f"{ignored}/") for ignored in ignored_relative_paths)
-
-
-def _planned_transfer_files(
-    plan: Mapping[str, Any],
-    *,
-    storage_root: Path,
-) -> list[tuple[str, Path, int]]:
-    """Enumerate exact planned files once without reading their payload bytes."""
-    relative_directories = [
-        directory
-        for batch in plan["batches"]
-        for directory in (
-            batch["meta_directory"],
-            batch["raw_directory"],
-            batch["processed_directory"],
-            *batch["attempt_directories"],
-        )
-    ]
-    relative_directories.append(plan["campaign_directory"])
-    files: list[tuple[str, Path, int]] = []
-    seen: set[str] = set()
-    for relative_value in relative_directories:
-        relative = Path(relative_value)
-        if relative.is_absolute() or ".." in relative.parts:
-            message = f"Transfer plan contains an unsafe directory: {relative_value!r}"
-            raise ValueError(message)
-        directory = (storage_root / relative).resolve()
-        if not directory.is_relative_to(storage_root) or not directory.is_dir() or directory.is_symlink():
-            message = f"Transfer source is missing or unsafe: {directory}"
-            raise FileNotFoundError(message)
-        ignored = POST_TRANSFER_OPERATIONAL_PATHS if relative_value == plan["campaign_directory"] else frozenset()
-        for candidate in sorted(directory.rglob("*")):
-            if candidate.is_symlink():
-                message = f"Transfer source contains a symbolic link: {candidate}"
-                raise ValueError(message)
-            child = candidate.relative_to(directory).as_posix()
-            if not candidate.is_file() or _relative_path_is_ignored(child, ignored):
-                continue
-            relative_path = candidate.relative_to(storage_root).as_posix()
-            if relative_path in seen:
-                message = f"Transfer inventory contains a duplicate path: {relative_path!r}"
-                raise RuntimeError(message)
-            seen.add(relative_path)
-            files.append(
-                (
-                    relative_path,
-                    candidate,
-                    candidate.stat().st_size,
-                )
-            )
-    return sorted(files, key=lambda item: item[0])
-
-
-def _emit_inventory_progress(
-    callback: Callable[[Mapping[str, Any]], None] | None,
-    *,
-    files_validated: int,
-    files_total: int,
-    bytes_validated: int,
-    bytes_total: int,
-) -> None:
-    """Emit bounded factual progress without another inventory traversal."""
-    if callback is None:
-        return
-    interval = max(1, (files_total + 19) // 20)
-    if files_validated not in {0, files_total} and files_validated % interval != 0:
-        return
-    callback(
-        {
-            "operation": "transfer_content_validation",
-            "files_validated": files_validated,
-            "files_total": files_total,
-            "bytes_validated": bytes_validated,
-            "bytes_total": bytes_total,
-            "eta": "unavailable",
-        }
-    )
-
-
-def transfer_inventory_from_plan(
-    plan: Mapping[str, Any],
-    *,
-    storage_root: Path,
-    progress: Callable[[Mapping[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    """Hash each exact campaign transfer file once with bounded progress."""
-    planned = _planned_transfer_files(plan, storage_root=storage_root)
-    files_total = len(planned)
-    bytes_total = sum(size_bytes for _, _, size_bytes in planned)
-    bytes_validated = 0
-    records: list[dict[str, Any]] = []
-    _emit_inventory_progress(
-        progress,
-        files_validated=0,
-        files_total=files_total,
-        bytes_validated=0,
-        bytes_total=bytes_total,
-    )
-    for index, (relative_path, candidate, size_bytes) in enumerate(
-        planned,
-        start=1,
-    ):
-        records.append(
-            {
-                "relative_path": relative_path,
-                "size_bytes": size_bytes,
-                "sha256": common.serialization.file_sha256(candidate),
-            }
-        )
-        bytes_validated += size_bytes
-        _emit_inventory_progress(
-            progress,
-            files_validated=index,
-            files_total=files_total,
-            bytes_validated=bytes_validated,
-            bytes_total=bytes_total,
-        )
-    return {
-        "file_count": files_total,
-        "size_bytes": bytes_total,
-        "files": records,
-        "inventory_sha256": common.serialization.canonical_json_sha256(records),
-    }
-
-
-def admit_transfer_inventory(
-    inventory: Mapping[str, Any],
-    *,
-    storage_root: Path,
-    plan: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Admit a persisted transfer inventory with metadata-only file checks.
-
-    This path proves receipt shape, safe regular-file membership, persisted
-    sizes, and the aggregate identity.  It intentionally does not hash payload
-    bytes; callers requiring fresh content validation must reconstruct the
-    inventory through :func:`transfer_inventory_from_plan`.
-    """
-    required = {"file_count", "size_bytes", "files", "inventory_sha256"}
-    if set(inventory) != required:
-        message = "Transfer inventory has an unsupported schema."
-        raise ValueError(message)
-    records = inventory.get("files")
-    if not isinstance(records, list):
-        message = "Transfer inventory files must be a list."
-        raise TypeError(message)
-    planned = (
-        None
-        if plan is None
-        else {
-            relative_path: size_bytes
-            for relative_path, _path, size_bytes in _planned_transfer_files(
-                plan,
-                storage_root=storage_root,
-            )
-        }
-    )
-    seen: set[str] = set()
-    previous = ""
-    for record in records:
-        if not isinstance(record, dict) or set(record) != {"relative_path", "size_bytes", "sha256"}:
-            message = "Transfer inventory file record is malformed."
-            raise ValueError(message)
-        relative_value = record["relative_path"]
-        size_bytes = record["size_bytes"]
-        digest = record["sha256"]
-        relative = Path(relative_value) if isinstance(relative_value, str) else None
-        if (
-            relative is None
-            or not relative_value
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or relative_value in seen
-            or relative_value <= previous
-            or isinstance(size_bytes, bool)
-            or not isinstance(size_bytes, int)
-            or size_bytes < 0
-            or not isinstance(digest, str)
-            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
-        ):
-            message = "Transfer inventory file record is malformed."
-            raise ValueError(message)
-        if planned is None:
-            candidate = storage_root
-            for part in relative.parts:
-                candidate = candidate / part
-                if candidate.is_symlink():
-                    message = f"Transferred file is missing, unsafe, or has a changed size: {relative_value!r}."
-                    raise FileNotFoundError(message)
-            resolved = candidate.resolve()
-            if not resolved.is_relative_to(storage_root) or not resolved.is_file() or resolved.stat().st_size != size_bytes:
-                message = f"Transferred file is missing, unsafe, or has a changed size: {relative_value!r}."
-                raise FileNotFoundError(message)
-        elif planned.get(relative_value) != size_bytes:
-            message = f"Transferred file is missing, unsafe, extra, or has a changed size: {relative_value!r}."
-            raise FileNotFoundError(message)
-        seen.add(relative_value)
-        previous = relative_value
-    if planned is not None and set(planned) != seen:
-        message = "Transferred file membership differs from its inventory."
-        raise FileNotFoundError(message)
-    if (
-        inventory.get("file_count") != len(records)
-        or inventory.get("size_bytes") != sum(int(record["size_bytes"]) for record in records)
-        or inventory.get("inventory_sha256") != common.serialization.canonical_json_sha256(records)
-    ):
-        message = "Transfer inventory aggregate evidence is malformed."
-        raise ValueError(message)
-    return dict(inventory)
-
-
-def _validate_transfer_receipt_against_inventory(
-    run_id: str,
-    *,
-    terminal: Mapping[str, Any],
-    plan: Mapping[str, Any],
-    storage_root: Path,
-    inventory: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Validate one receipt against either fresh or admitted inventory evidence."""
-    admitted_inventory = admit_transfer_inventory(
-        inventory,
-        storage_root=storage_root,
-        plan=plan,
-    )
-    run_directory = campaign_run_directory(run_id, storage_root=storage_root)
-    terminal_path = run_directory / "campaign_terminal.json"
-    receipt_path = run_directory / "transfer_complete.json"
-    receipt = load_json_object(receipt_path, label="transfer completion receipt")
-    required = {
-        "schema_kind",
-        "schema_version",
-        "status",
-        "recorded_at",
-        "campaign_run_id",
-        "campaign_id",
-        "git_commit",
-        "source_host",
-        "source_storage_root",
-        "destination_storage_root",
-        "campaign_terminal_sha256",
-        "transferred_file_count",
-        "transferred_bytes",
-        "transfer_inventory_sha256",
-        "files",
-        "directories",
-        "terminal_validation",
-        "source_removed",
-    }
-    expected_directories = {
-        plan["campaign_directory"],
-        *(
-            directory
-            for batch in plan["batches"]
-            for directory in (
-                batch["meta_directory"],
-                batch["raw_directory"],
-                batch["processed_directory"],
-                *batch["attempt_directories"],
-            )
-        ),
-    }
-    directory_records = receipt.get("directories")
-    observed_directories = (
-        {record.get("directory") for record in directory_records if isinstance(record, dict)} if isinstance(directory_records, list) else set()
-    )
-    if (
-        set(receipt) != required
-        or receipt.get("schema_kind") != "generation_campaign_transfer"
-        or receipt.get("schema_version") != 1
-        or receipt.get("status") != "transfer_complete"
-        or receipt.get("campaign_run_id") != run_id
-        or receipt.get("campaign_id") != terminal["campaign_id"]
-        or receipt.get("git_commit") != terminal["git_commit"]
-        or receipt.get("destination_storage_root") != str(storage_root)
-        or receipt.get("campaign_terminal_sha256") != common.serialization.file_sha256(terminal_path)
-        or receipt.get("transferred_file_count") != admitted_inventory["file_count"]
-        or receipt.get("transferred_bytes") != admitted_inventory["size_bytes"]
-        or receipt.get("transfer_inventory_sha256") != admitted_inventory["inventory_sha256"]
-        or receipt.get("files") != admitted_inventory["files"]
-        or observed_directories != expected_directories
-        or receipt.get("terminal_validation") != {"status": "pass", "batch_count": len(terminal["batches"])}
-        or receipt.get("source_removed") is not False
-    ):
-        message = f"Transfer completion receipt or GPU publication is invalid: {receipt_path}"
-        raise ValueError(message)
-    source_host = receipt.get("source_host")
-    source_root = receipt.get("source_storage_root")
-    if (
-        not isinstance(source_host, str)
-        or not source_host
-        or not isinstance(source_root, str)
-        or not Path(source_root).is_absolute()
-        or Path(source_root) == Path("/")
-    ):
-        message = f"Transfer source identity is invalid: {receipt_path}"
-        raise ValueError(message)
-    return receipt
-
-
-def validate_transfer_receipt(
-    run_id: str,
-    *,
-    terminal: Mapping[str, Any],
-    plan: Mapping[str, Any],
-    storage_root: Path | str | None = None,
-) -> dict[str, Any]:
-    """Fully rehash immutable GPU publication against terminal evidence."""
-    destination = path_contract.resolve_storage_root(storage_root, create=False)
-    inventory = transfer_inventory_from_plan(plan, storage_root=destination)
-    return _validate_transfer_receipt_against_inventory(
-        run_id,
-        terminal=terminal,
-        plan=plan,
-        storage_root=destination,
-        inventory=inventory,
-    )
-
-
-def admit_transfer_receipt(
-    run_id: str,
-    *,
-    terminal: Mapping[str, Any],
-    plan: Mapping[str, Any],
-    storage_root: Path | str | None = None,
-) -> dict[str, Any]:
-    """Admit immutable transfer evidence without rehashing campaign payloads."""
-    destination = path_contract.resolve_storage_root(storage_root, create=False)
-    receipt_path = campaign_run_directory(run_id, storage_root=destination) / "transfer_complete.json"
-    receipt = load_json_object(receipt_path, label="transfer completion receipt")
-    inventory = {
-        "file_count": receipt.get("transferred_file_count"),
-        "size_bytes": receipt.get("transferred_bytes"),
-        "files": receipt.get("files"),
-        "inventory_sha256": receipt.get("transfer_inventory_sha256"),
-    }
-    return _validate_transfer_receipt_against_inventory(
-        run_id,
-        terminal=terminal,
-        plan=plan,
-        storage_root=destination,
-        inventory=inventory,
-    )
+    """Resolve the frozen source campaign for continuation or inspection."""
+    return current_campaign_from_manifest(manifest, require_executable=require_executable)

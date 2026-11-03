@@ -1,15 +1,15 @@
-"""
-dataset_preprocessing_normalization.py
+"""Own task-aware normalizer fitting, reconstruction, and persisted identity binding.
 
-Own task-aware normalizer fitting, reconstruction, and persisted identity binding.
 Responsibilities:
   - Fit per-channel preprocessing from training membership only
   - Reconstruct processors from isolated persisted tensors
   - Build and admit dataset-bound normalizer artifacts
+
 Design principles:
   - Preprocessing identity binds task, dataset fingerprint, and train membership
   - Saved tensors are validated on CPU before use
   - Zero-variance channels retain the established denominator floor
+
 This module does NOT:
   - Choose split membership or construct training DataLoaders
   - Persist normalizer artifacts or resolve experiment paths

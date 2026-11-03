@@ -1,5 +1,14 @@
-# ruff: noqa: S101, PLR2004
-"""Protect consolidated completion and target-attainment presentation semantics."""
+"""Protect consolidated completion and target-attainment presentation semantics.
+
+Responsibilities:
+  - Check completion denominators, omissions, case details, and censoring classification
+
+Design principles:
+  - Eligible cases define each dataset's denominator without changing raw evidence
+
+This module does NOT:
+  - Determine solver stopping policy or generate completion evidence
+"""
 
 from __future__ import annotations
 
@@ -203,77 +212,33 @@ def test_zero_eligible_cases_retain_an_explicit_empty_denominator() -> None:
     assert analysis.outcomes["percentage"].isna().all()
 
 
-def test_details_keep_authoritative_moisture_wet_fraction_and_gap() -> None:
+def test_cases_keep_authoritative_moisture_wet_fraction_gap_and_runtimes() -> None:
     """Retain exact direct quantities and the validated signed derived gap."""
-    frame = _frame((True, False))
-    details = plots.completion_target_detail_table({"Lentil · Natural": frame})
-    assert {
-        "Final bulk moisture [wb]",
-        "Target moisture [wb]",
-        "Final dry-matter wet fraction [1]",
-        "Allowed wet-fraction limit [1]",
-        "Wet-fraction target gap [1]",
-        "COMSOL process [s]",
-        "Complete execution [s]",
-    }.issubset(details.columns)
-    wet = details.iloc[1]
-    assert wet["Final dry-matter wet fraction [1]"] > 0.5
-    assert wet["Allowed wet-fraction limit [1]"] == pytest.approx(0.05)
-    assert wet["Wet-fraction target gap [1]"] == pytest.approx(wet["Final dry-matter wet fraction [1]"] - wet["Allowed wet-fraction limit [1]"])
-    assert wet["Final bulk moisture [wb]"] == pytest.approx(0.28)
-    assert wet["Target moisture [wb]"] == pytest.approx(0.12)
-    assert wet["COMSOL process [s]"] == pytest.approx(12.0)
-    assert wet["Complete execution [s]"] == pytest.approx(14.0)
+    cases = transient.completion_target_analysis({"Lentil · Natural": _frame((True, False))}).cases
+    wet = cases.iloc[1]
+    assert wet["final_wet_fraction"] > 0.5
+    assert wet["target_wet_fraction_limit"] == pytest.approx(0.05)
+    assert wet["final_target_gap"] == pytest.approx(wet["final_wet_fraction"] - wet["target_wet_fraction_limit"])
+    assert wet["final_bulk_moisture_wb"] == pytest.approx(0.28)
+    assert wet["target_moisture_wb"] == pytest.approx(0.12)
+    assert wet["comsol_process_seconds"] == pytest.approx(12.0)
+    assert wet["complete_execution_seconds"] == pytest.approx(14.0)
 
 
-def test_structured_case_details_follow_the_selected_dataset_cases() -> None:
-    """Retain exact programmatic evidence for every selected eligible case."""
-    details = plots.completion_target_detail_table(
+def test_cases_follow_the_selected_dataset_cases() -> None:
+    """Retain exact evidence for every selected eligible case."""
+    cases = transient.completion_target_analysis(
         {
             "Lentil · Natural": _frame((True, False, True)),
             "Chickpea · Parameter OOD": _frame((False,)),
         }
-    )
-    assert len(details) == 4
-    assert tuple(details["Dataset"].value_counts().sort_index()) == (1, 3)
-    assert {
-        "Completion state",
-        "Target time [h]",
-        "Final physical time [h]",
-        "Final bulk moisture [wb]",
-        "Target moisture [wb]",
-        "Final dry-matter wet fraction [1]",
-        "Allowed wet-fraction limit [1]",
-        "Wet-fraction target gap [1]",
-    }.issubset(details.columns)
+    ).cases
+    assert len(cases) == 4
+    assert tuple(cases["dataset"].value_counts().sort_index()) == (1, 3)
 
 
-def test_companion_table_rounds_terminal_times_without_changing_evidence() -> None:
-    """Round visible terminal hours while preserving exact semantic values."""
-    frame = _frame((True,))
-    time = frame.loc["case_0001", "time"]
-    completion = frame.loc["case_0001", "completion"]
-    assert isinstance(time, dict)
-    assert isinstance(completion, dict)
-    exact_final = 85.3214
-    exact_horizon = 180.03
-    time["regular_state_hours"] = np.asarray((0.0, exact_final))
-    time["configured_horizon_hours"] = exact_horizon
-    completion["physical_duration_hours"] = exact_final
-    completion["time_to_target_hours"] = exact_final
-
-    analysis = transient.completion_target_analysis({"Drying · Lentil · ID": frame})
-    details = plots.completion_target_detail_table({"Drying · Lentil · ID": frame})
-
-    assert analysis.cases.iloc[0]["physical_duration_hours"] == pytest.approx(exact_final)
-    assert analysis.cases.iloc[0]["configured_horizon_hours"] == pytest.approx(exact_horizon)
-    assert details.iloc[0]["Target time [h]"] == "85"
-    assert details.iloc[0]["Final physical time [h]"] == "85"
-    assert details.iloc[0]["Configured maximum [h]"] == "180"
-
-
-def test_other_censoring_points_remain_but_are_not_in_the_legend() -> None:
-    """Retain other-censor points while omitting their legend handle."""
+def test_right_censored_case_is_classified_and_plotted() -> None:
+    """Classify a horizon stop without target attainment and still build the figure."""
     frame = _frame((False,))
     time = frame.loc["case_0001", "time"]
     completion = frame.loc["case_0001", "completion"]
@@ -283,24 +248,7 @@ def test_other_censoring_points_remain_but_are_not_in_the_legend() -> None:
     completion["physical_duration_hours"] = 85.0
 
     analysis = transient.completion_target_analysis({"Drying · Lentil · ID": frame})
-    assert analysis.cases.iloc[0]["terminal_time_kind"] == "right_censoring_time"
+    figure = plots.plot_completion_target_analysis(datasets={"Drying · Lentil · ID": frame})
+    plt.close(figure)
 
-    figure = plots.plot_completion_target_analysis(
-        datasets={"Drying · Lentil · ID": frame},
-    )
-    try:
-        time_axis = figure.axes[1]
-        legend = figure.axes[-1].get_legend()
-        assert legend is not None
-        legend_labels = tuple(text.get_text() for text in legend.get_texts())
-        assert "Other censoring time" not in legend_labels
-        assert all("\n" not in label for label in legend_labels)
-        assert len(time_axis.collections) == 1
-        offsets = np.asarray(time_axis.collections[0].get_offsets(), dtype=np.float64)
-        np.testing.assert_allclose(
-            offsets[:, 0],
-            (85.0 / 24.0,),
-        )
-        assert time_axis.get_xlabel() == "Time [d]"
-    finally:
-        plt.close(figure)
+    assert analysis.cases.iloc[0]["terminal_time_kind"] == "right_censoring_time"

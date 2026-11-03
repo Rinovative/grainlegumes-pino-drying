@@ -1,13 +1,13 @@
-"""
-analysis_artifact_contracts.py
-
-Define lightweight persisted contracts for generated analysis artifacts.
+"""Define lightweight persisted contracts for generated analysis artifacts.
 
 Responsibilities:
   - Declare artifact, provenance, residual, and derivative schema constants
+  - Own the steady-Brinkman residual diagnostic provenance contract
   - Name physical and normalized sufficient-statistic columns
   - Finalize the equal physical-output-group selection objective
   - Build ordered membership digests, completion paths, and payload manifests
+  - Hash each file identity at most once per process
+  - Recognize Optuna trial leaves from the validated layout recorded in a saved run config
 
 Design principles:
   - Persisted names and schema values have one authoritative owner
@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from src import common, domain
 from src.domain.tasks.domain_task_spec import OutputGroupSpec
 from src.learning.metrics.learning_metrics import finalize_group_rmse_statistics
 
@@ -40,16 +41,20 @@ if TYPE_CHECKING:
 
     import pandas as pd
 
+    from src.domain.tasks.domain_task_spec import TaskSpec
 
-ARTIFACT_SCHEMA_VERSION = 1
+
+ARTIFACT_SCHEMA_VERSION = 2
 ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
-RESIDUAL_SCHEMA_VERSION = 1
+RESIDUAL_SCHEMA_VERSION = 3
 ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
 NORMALIZED_OBJECTIVE_TOLERANCE = {"rtol": 1e-12, "atol": 1e-12}
 NORMALIZED_DIAGNOSTIC_TOLERANCE = {"rtol": 2e-5, "atol": 1e-12}
 EVAL_PAD = 2
-ARTIFACT_DERIVATIVE_KIND = "spectral"
-ARTIFACT_DERIVATIVE_EXTENSION = "reflect"
+# Artifact residuals use one fixed, most accurate reference operator for every
+# run, independent of the derivative a run was trained with.
+ARTIFACT_DERIVATIVE_KIND = "physical"
+ARTIFACT_DERIVATIVE_EXTENSION = "none"
 _ARTIFACT_IDENTITY_CONTRACT = {
     "schema_kind": "evaluation_artifact_semantic_identity",
     "schema_version": 1,
@@ -194,11 +199,11 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
                 "task_contract_digest",
                 "equation_kind",
                 "equation_set",
+                "continuity_kind",
                 "boundary_condition_kind",
-                "selected_training_continuity",
-                "evaluated_continuity_formulations",
                 "constants",
                 "permeability_representation",
+                "scales",
                 "derivatives",
                 "interior_crop",
                 "residual_evaluation_region",
@@ -260,13 +265,37 @@ def resolve_case_payload_path(
     return candidate
 
 
-def _file_sha256(path: Path) -> str:
-    """Return the lowercase SHA-256 digest of one artifact payload file."""
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
+_FILE_DIGESTS: dict[str, tuple[tuple[int, int, int], str]] = {}
+
+
+def cached_file_sha256(path: Path | str) -> str:
+    """Return a file's SHA-256 digest, hashing each file identity at most once per process.
+
+    The digest is reused while the path, size, modification time and inode are unchanged.
+    A same-size in-place edit that restores the modification time would evade this; no writer does that.
+    """
+    file = Path(path)
+    status = file.stat()
+    identity = (status.st_size, status.st_mtime_ns, status.st_ino)
+    cached = _FILE_DIGESTS.get(str(file))
+    if cached is not None and cached[0] == identity:
+        return cached[1]
+    digest = common.serialization.file_sha256(file)
+    _FILE_DIGESTS[str(file)] = (identity, digest)
+    return digest
+
+
+def is_optuna_trial_config(config: object) -> bool:
+    """Return whether a saved run config records a valid Optuna trial layout (identity, not directory name).
+
+    A layout that names a trial but is malformed raises ``ValueError`` instead of counting as a trial.
+    """
+    run = config.get("run") if isinstance(config, Mapping) else None
+    layout = run.get("layout") if isinstance(run, Mapping) else None
+    if not isinstance(layout, Mapping) or layout.get("trial") is None:
+        return False
+    common.paths.resolve_config_run_dir({"run": {"layout": layout}, "paths": {"output_root": "."}})
+    return True
 
 
 def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:
@@ -683,6 +712,80 @@ def aggregate_normalized_group_macro_rmse(
     }
 
 
+def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:
+    """
+    Return the exact steady-Brinkman residual diagnostic contract of one task.
+
+    Parameters
+    ----------
+    task : TaskSpec
+        Validated steady-flow task owning equation, continuity, and boundary.
+
+    Returns
+    -------
+    dict[str, Any]
+        JSON-safe provenance written by artifact generation and required
+        verbatim by artifact readers.
+
+    """
+    brinkman = domain.physics.brinkman
+    return {
+        "residual_schema_version": RESIDUAL_SCHEMA_VERSION,
+        "task_id": task.id,
+        "task_contract_digest": task.contract_digest,
+        "equation_kind": task.physics.kind,
+        "equation_set": task.physics.equation_set,
+        "continuity_kind": task.physics.continuity,
+        "boundary_condition_kind": task.physics.boundary,
+        "constants": {
+            "dynamic_viscosity_pa_s": brinkman.AIR_DYNAMIC_VISCOSITY,
+            "porosity_floor": brinkman.POROSITY_FLOOR,
+            "permeability_scale_floor_m2": brinkman.PERMEABILITY_SCALE_FLOOR,
+            "permeability_determinant_floor": brinkman.PERMEABILITY_DETERMINANT_FLOOR,
+            "permeability_cross_ratio_clip": brinkman.PERMEABILITY_CROSS_RATIO_CLIP,
+        },
+        "permeability_representation": {
+            "Kxx": "10**stored_log10_ratio_to_1_m2",
+            "Kxy": "stored_dimensionless_ratio_times_sqrt(Kxx*Kyy)",
+            "Kyy": "10**stored_log10_ratio_to_1_m2",
+            "inverse": "normalized_symmetric_2x2_inverse_with_declared_floors",
+        },
+        "scales": {
+            "pressure": {"formula": "mean_inlet(p_in_bc)", "unit": "Pa"},
+            "pressure_gradient": {"formula": "pressure / (max(y) - min(y))", "unit": "Pa/m"},
+            "velocity": {"formula": "exp(mean(0.5*(ln(Kxx) + ln(Kyy)))) * pressure_gradient / mu", "unit": "m/s"},
+            "flux": {"formula": "velocity * (max(x) - min(x))", "unit": "m^2/s"},
+        },
+        "derivatives": {
+            "kind": ARTIFACT_DERIVATIVE_KIND,
+            "extension": ARTIFACT_DERIVATIVE_EXTENSION,
+            "operator_axes": list(task.operator_axes),
+            "grid_axes": ["y", "x"],
+        },
+        "interior_crop": EVAL_PAD,
+        "residual_evaluation_region": {
+            "momentum_residual_mse": "interior grid after symmetric cell crop",
+            "flux_balance_mse": "every full-grid row",
+            "pressure_boundary_mse": "full-grid inlet and outlet masks",
+            "pressure_inlet_mse": "full-grid y-min inlet mask",
+            "pressure_outlet_mean_square": "square of the sample mean on the full-grid y-max outlet mask",
+            "residual_arrays": "full grid",
+        },
+        "scalar_definitions": {
+            "momentum_residual_mse": {"formula": "mean(Rx**2 + Ry**2)", "unit": "1"},
+            "flux_balance_mse": {"formula": "mean(flux_balance**2)", "unit": "1"},
+            "pressure_boundary_mse": {"formula": "pressure_inlet_mse + pressure_outlet_mean_square", "unit": "1"},
+            "pressure_inlet_mse": {"formula": "mean_inlet((p-p_in_bc)**2) / pressure**2", "unit": "1"},
+            "pressure_outlet_mean_square": {"formula": "(mean_outlet(p) / pressure)**2", "unit": "1"},
+        },
+        "array_definitions": {
+            "Rx": {"formula": "(-dp/dx + div(tau)_x - mu*(K^-1*u)_x) / pressure_gradient", "unit": "1"},
+            "Ry": {"formula": "(-dp/dy + div(tau)_y - mu*(K^-1*u)_y) / pressure_gradient", "unit": "1"},
+            "flux_balance": {"formula": "(q(y) - mean_y(q)) / flux with q(y) = trapezoid_x(v)", "unit": "1"},
+        },
+    }
+
+
 def ordered_indices_sha256(indices: Iterable[int]) -> str:
     """
     Return the canonical digest for an ordered integer membership.
@@ -743,7 +846,7 @@ def artifact_output_manifest(save_root: str | Path) -> dict[str, Any]:
         """Bind one artifact-relative payload path to its complete-file digest."""
         return {
             "path": payload_path.relative_to(root).as_posix(),
-            "sha256": _file_sha256(payload_path),
+            "sha256": cached_file_sha256(payload_path),
         }
 
     return {

@@ -1,24 +1,30 @@
-# ruff: noqa: RUF043, S101, TC003
-"""
-Protect completed-run admission and strict inference versus resume checkpoint roles.
+"""Protect completed-run admission and strict inference versus resume checkpoint roles.
 
-Temporary saved-run fixtures show that status, required files, digests, normalizer
-identity, and ``best``/``last`` roles fail before model forward or redundant loads.
-Detailed checkpoint-state restoration and artifact payload generation are covered
-elsewhere. This module performs no production inference.
+Responsibilities:
+  - Check completed-run admission, required files, checkpoint roles, and exact normalizer reuse
+  - Check that inference batches steady items with absent metadata exactly as training does
+
+Design principles:
+  - Incomplete bundles fail before reconstruction or redundant loading
+
+This module does NOT:
+  - Restore full resume state or perform production inference
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 import torch
+from support import configs, run_state
 from torch import nn
 from torch.utils.data import Dataset
 
-from src import analysis, datasets, experiments, learning
+from src import analysis, common, datasets, experiments, learning
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _REQUIRED_PAYLOAD_FILES = (
     "config.yaml",
@@ -62,75 +68,81 @@ def _status_run(tmp_path: Path, status: str, *, touch_payloads: bool) -> Path:
     """
     run_dir = experiments.run.allocate_run_directory(tmp_path / status)
     experiments.run.transition_run_status(run_dir, "initializing")
-    if status == "running":
+    if status != "initializing":
         experiments.run.transition_run_status(run_dir, "running")
-    elif status == "failed":
-        experiments.run.transition_run_status(run_dir, "failed")
+    if status not in {"initializing", "running"}:
+        experiments.run.transition_run_status(run_dir, status)
     if touch_payloads:
         for filename in _REQUIRED_PAYLOAD_FILES:
             (run_dir / filename).touch()
     return run_dir
 
 
-def test_inference_and_artifacts_reject_running_status(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status", ["running", "interrupted", "budget_unmet"])
+def test_inference_and_artifacts_reject_non_completed_status(tmp_path: Path, status: str) -> None:
     """
-    Create a running run leaf containing every required payload filename.
+    Create a non-completed run leaf containing every required payload filename.
 
-    Inference and artifact planning must both reject it by lifecycle status,
-    proving apparent file completeness cannot bypass completion admission.
+    Inference and artifact planning must both reject it by lifecycle status and
+    tell the user to resume the run to completion, proving apparent file
+    completeness cannot bypass completion admission.
     """
-    run_dir = _status_run(tmp_path, "running", touch_payloads=True)
+    run_dir = _status_run(tmp_path, status, touch_payloads=True)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="terminal and inactive"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
-    with pytest.raises(experiments.run.RunLifecycleError, match="terminal and inactive"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
         analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
-def test_incomplete_run_is_rejected_before_reconstruction(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status", ["initializing", "interrupted"])
+def test_non_completed_run_without_payload_files_gets_the_status_diagnostic(tmp_path: Path, status: str) -> None:
     """
-    Create an initializing run leaf without any required payload files.
+    Create a non-completed run leaf without any required payload files.
 
-    Both inference and artifact planning must reject it at run admission before
-    reconstruction, keeping partial allocation distinct from a loadable run.
+    Every admission entry point must name the lifecycle status and the resume
+    hint before it requires payload files, so a run interrupted before its
+    first best checkpoint is not reported as merely missing a checkpoint.
     """
-    run_dir = _status_run(tmp_path, "initializing", touch_payloads=False)
+    run_dir = _status_run(tmp_path, status, touch_payloads=False)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="evaluation evidence|best checkpoint"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
-    with pytest.raises(experiments.run.RunLifecycleError, match="evaluation evidence|best checkpoint"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
+        analysis.artifacts.service.load_run_artifact_plan(run_dir)
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
+        experiments.run.validate_completed_run(run_dir)
+
+
+def test_completed_run_without_payload_files_is_rejected_before_reconstruction(tmp_path: Path) -> None:
+    """Reject a completed summary whose evaluation payload files are absent at run admission."""
+    run_dir = _status_run(tmp_path, "completed", touch_payloads=False)
+
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
+        learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
         analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
-def test_resume_requires_last_checkpoint_even_when_other_files_exist(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_continuation_requires_last_checkpoint_even_when_other_files_exist(tmp_path: Path) -> None:
     """
     Remove ``last_checkpoint.pt`` from an otherwise populated running run.
 
-    Resume must fail on the continuation artifact instead of substituting the
-    selection-only best checkpoint, preserving exact optimizer/RNG continuation.
+    Rerunning the request must be refused on the continuation artifact instead of
+    substituting the selection-only best checkpoint, preserving exact optimizer/RNG
+    continuation.
     """
-    run_dir = _status_run(tmp_path, "running", touch_payloads=True)
-    (run_dir / "last_checkpoint.pt").unlink()
-    monkeypatch.setattr(experiments.run.config_loader, "load_yaml", lambda _path: {})
-    monkeypatch.setattr(
-        experiments.run,
-        "_resume_resolution_context",
-        lambda _resume: (experiments.config.loader.RUN_NAMING_SCHEMA_VERSION, None),
-    )
-    monkeypatch.setattr(
-        experiments.run.config_loader,
-        "resolve_config",
-        lambda _raw, **_kwargs: {
-            "run": {"device": "cpu"},
-            "training": {"mixed_precision": False},
-        },
-    )
+    output_root = tmp_path / "outputs"
+    config = configs.resolve(configs.direct_config(), output_root=output_root)
+    run_dir = common.paths.resolve_config_run_dir(config)
+    run_state.write_lightweight_run_state(run_dir, config, status="running", completed_epoch=1)
+    common.paths.resolve_last_checkpoint_file(run_dir).unlink()
+    request = configs.write_config(tmp_path, configs.direct_config(), canonical_root=tmp_path)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match="last_checkpoint.pt"):
-        experiments.run.run_experiment("unused.yaml", resume=run_dir)
+    with pytest.raises(experiments.run.ExistingRunAdmissionError, match=r"last_checkpoint\.pt"):
+        experiments.run.run_experiment(request, output_root=output_root)
+
+    assert common.paths.resolve_best_checkpoint_file(run_dir).is_file()
 
 
 def test_inference_uses_exact_normalizer_state_returned_by_validation(
@@ -167,17 +179,15 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         spatial_shape=(1, 1),
     )
     evidence = datasets.preprocessing.splits.SplitRoleEvidence(
-        name="eval",
+        name="id_test",
         source=source_identity,
         index_values=(0,),
         count=1,
         full_count=1,
         membership_digest="e" * 64,
-        ratio=0.5,
-        seed=9,
     )
     selection = context.SplitSelection(
-        role="eval",
+        role="id_test",
         dataset_paths=(tmp_path / "unused.pt",),
         evidence=evidence,
     )
@@ -233,3 +243,23 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     assert out_normalizer is not None
     assert torch.equal(in_normalizer.mean, normalizer_state["in_normalizer.mean"])
     assert torch.equal(out_normalizer.std, normalizer_state["out_normalizer.std"])
+
+
+def test_inference_loader_batches_steady_items_whose_metadata_holds_absent_values() -> None:
+    """Evaluation artifacts must accept the same steady metadata that the training loader accepts."""
+    items = [
+        {
+            "x": torch.zeros(2, 3, 3),
+            "y": torch.ones(1, 3, 3),
+            "meta": {"case": index, "inlet_profile": None},
+            "source_index": index,
+            "split_local_index": index,
+        }
+        for index in range(3)
+    ]
+
+    batch = next(iter(learning.inference.context._build_eval_loader(items, batch_size=2)))  # type: ignore[arg-type]
+
+    assert batch["x"].shape == (2, 2, 3, 3)
+    assert batch["meta"]["inlet_profile"] == [None, None]
+    assert batch["source_index"].tolist() == [0, 1]

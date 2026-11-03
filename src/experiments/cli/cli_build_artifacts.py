@@ -1,7 +1,4 @@
-"""
-cli_build_artifacts.py
-
-Parse artifact-build arguments and delegate evaluable-run orchestration.
+"""Parse artifact-build arguments and delegate evaluable-run orchestration.
 
 Responsibilities:
   - Validate task, run selection, paths, rebuild intent, and device policy
@@ -49,7 +46,7 @@ def _build_parser() -> argparse.ArgumentParser:
     selection.add_argument(
         "--task",
         default=None,
-        help="Registered task used to resolve the default run discovery root.",
+        help="Registered task whose folder below the experiments root is the run discovery root.",
     )
     selection.add_argument(
         "--runs-root",
@@ -70,12 +67,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Current dataset root, independent from output/run paths.",
-    )
-    parser.add_argument(
-        "--metadata-root",
-        type=Path,
-        default=None,
-        help="Validated dataset metadata root. Defaults below STORAGE_ROOT/02_datasets.",
     )
     parser.add_argument(
         "--run-name",
@@ -111,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split",
-        choices=("id", "ood"),
+        choices=("id", "additional_evaluation"),
         default=None,
         help="Selected transient role for bounded generation; requires --one-case or --case-id.",
     )
@@ -154,11 +145,10 @@ def main(argv: list[str] | None = None) -> int:
 
         if task is not None:
             domain.tasks.registry.get_task(task)
-            runs_root = common.paths.resolve_runs_root(task)
+            runs_root = common.paths.get_experiments_root() / task
         if runs_root is None and args.run_dirs is None:
             parser.error("exactly one of --task, --runs-root, or --run-dir is required")
-        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_dataset_packages_root()
-        metadata_root = args.metadata_root if args.metadata_root is not None else common.paths.get_dataset_metadata_root()
+        dataset_root = args.dataset_root if args.dataset_root is not None else common.paths.get_datasets_root()
         if args.run_dirs is not None and args.run_names is not None:
             parser.error("--run-name selects storage aliases below --task/--runs-root and cannot accompany --run-dir")
         if args.run_dirs is not None:
@@ -185,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
                 device_policy=args.device,
                 evaluation_spatial_stride=args.evaluation_spatial_stride,
             )
-            print(f"[DONE] Validated scoped transient artifact for {len(scoped.case_ids)} case(s): {scoped.root}")
+            print(f"artifacts done: scoped transient artifact for {len(scoped.case_ids)} case(s) in {scoped.root}")
             return 0
         if args.split is not None or args.output_root is not None:
             parser.error("--split and --output-root require --one-case or --case-id")
@@ -195,7 +185,6 @@ def main(argv: list[str] | None = None) -> int:
             results = analysis.artifacts.service.build_artifacts(
                 runs_root=selected_root,
                 dataset_root=dataset_root,
-                metadata_root=metadata_root,
                 run_names=args.run_names,
                 device_policy=args.device,
                 rebuild=args.rebuild,
@@ -205,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         print(f"Artifact generation failed: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
-    print(f"[DONE] Validated artifacts for {result_count} run(s).")
+    print(f"artifacts done: {result_count} run(s) validated")
     return 0
 
 

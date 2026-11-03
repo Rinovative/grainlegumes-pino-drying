@@ -1,15 +1,15 @@
-"""
-generation_input_presentation.py
+"""Declare the compact generation-input EDA sections and views.
 
-Declare the compact generation-input EDA sections and views.
 Responsibilities:
   - Keep view keys, labels, and order explicit in one immutable registry
   - Omit transient schedules and moisture views when unavailable
   - Delegate display numbering to the shared presentation contract
+
 Design principles:
   - Every case-level view uses the common A/B selector model
   - Presentation order never participates in scientific or persisted identity
   - Dataset overview remains separate from case-level comparison
+
 This module does NOT:
   - Construct widgets, discover datasets, or implement calculations
   - Modify completed-output EDA or evaluation registries
@@ -70,6 +70,10 @@ GENERATION_INPUT_SECTIONS: Final = (
         name="Spatial comparison",
         plots=(
             shared_registry.PlotPresentation(
+                "field_atlas",
+                "Single-case field atlas",
+            ),
+            shared_registry.PlotPresentation(
                 "basic_spatial_inputs",
                 "Basic spatial inputs",
             ),
@@ -91,6 +95,7 @@ GENERATION_INPUT_SECTIONS: Final = (
         key="dataset_overview",
         name="Dataset overview",
         plots=(
+            shared_registry.PlotPresentation("campaign_outcomes", "Campaign candidate outcomes"),
             shared_registry.PlotPresentation(
                 "dataset_cases_parameters",
                 "Dataset cases and parameters",

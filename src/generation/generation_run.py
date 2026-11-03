@@ -1,12 +1,8 @@
-"""
-generation_run.py
-
-Resolve immutable Generation run plans and declared lifecycle stages.
+"""Resolve immutable Generation run plans.
 
 Responsibilities:
   - Dispatch validated run configuration schemas to their authoritative loaders
-  - Describe campaign, benchmark, and paired technical-smoke execution units
-  - Bind workflow identities to authored bytes, child identities, and source commits
+  - Describe campaign and benchmark execution units
 
 Design principles:
   - Scientific campaign and benchmark identities remain owned by their existing loaders
@@ -15,7 +11,7 @@ Design principles:
 
 This module does NOT:
   - Submit jobs, materialize inputs, transfer artifacts, or execute solvers
-  - Replace campaign, benchmark, publication, or cleanup persistence authorities
+  - Replace campaign, benchmark, or publication persistence authorities
 """
 
 from __future__ import annotations
@@ -36,36 +32,9 @@ from src.generation.contracts import generation_contracts_source as source_servi
 from . import generation_benchmark_config as benchmark_config
 from . import generation_campaign as campaign_service
 
-WORKFLOW_SCHEMA_KIND: Final = "generation_workflow"
-WORKFLOW_SCHEMA_VERSION: Final = 1
-CAMPAIGN_SCHEMA_KIND: Final = "generation_campaign"
+CAMPAIGN_SCHEMA_KIND: Final = "generation_source_campaign"
 BENCHMARK_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_suite"
-PAIRED_TECHNICAL_SMOKE_FINALIZER: Final = "paired_technical_smoke"
 CORE_BENCHMARK_SUMMARY_FINALIZER: Final = "core_benchmark_summary"
-MATERIAL_PILOT_FINALIZER: Final = "material_pilot"
-_PAIRED_TECHNICAL_SMOKE_CHILD_COUNT: Final = 2
-
-LIFECYCLE_STAGES: Final = (
-    "resolve_config",
-    "preflight",
-    "prepare_inputs",
-    "plan",
-    "submit",
-    "feed_scheduler",
-    "monitor_scheduler",
-    "terminalize",
-    "validate_terminal",
-    "transfer",
-    "publish",
-    "build_packages",
-    "finalize",
-    "record_workflow",
-    "authorize_cleanup",
-    "cleanup_source",
-    "record_cleanup",
-    "validate",
-    "complete",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,7 +107,7 @@ class GenerationRunPlan:
     Parameters
     ----------
     run_kind : str
-        ``campaign``, ``benchmark``, or ``workflow``.
+        ``campaign`` or ``benchmark``.
     identity : str
         Run-level immutable identity, distinct from display names and paths.
     source_commit : str
@@ -157,8 +126,6 @@ class GenerationRunPlan:
         Declared source-attempt retention policy.
     collection_policy : str
         Declared collection continuation policy.
-    dataset_packages : tuple[str, ...]
-        Declared dataset package identities.
     finalizers : tuple[GenerationRunFinalizer, ...]
         Continuations that follow workflow child completion.
     lifecycle_stages : tuple[str, ...]
@@ -176,9 +143,12 @@ class GenerationRunPlan:
     units: tuple[GenerationRunUnit, ...]
     retention_policy: str
     collection_policy: str
-    dataset_packages: tuple[str, ...]
     finalizers: tuple[GenerationRunFinalizer, ...]
     lifecycle_stages: tuple[str, ...]
+    scientific_overrides: tuple[tuple[str, Any], ...] = ()
+    execution_overrides: tuple[tuple[str, Any], ...] = ()
+    execution_values: Mapping[str, Any] | None = None
+    authored_value: Mapping[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Return a deterministic JSON-serializable plan payload."""
@@ -191,11 +161,14 @@ class GenerationRunPlan:
             "input_identity": self.input_identity,
             "config_identity": self.config_identity,
             "config_path": self.config_path,
+            "scientific_overrides": dict(self.scientific_overrides),
+            "execution_overrides": dict(self.execution_overrides),
+            "execution_values": dict(self.execution_values or {}),
+            "authored_value": None if self.authored_value is None else dict(self.authored_value),
             "children": [child.to_payload() for child in self.children],
             "units": [unit.to_payload() for unit in self.units],
             "retention_policy": self.retention_policy,
             "collection_policy": self.collection_policy,
-            "dataset_packages": list(self.dataset_packages),
             "finalizers": [item.to_payload() for item in self.finalizers],
             "lifecycle_stages": list(self.lifecycle_stages),
         }
@@ -207,6 +180,9 @@ def resolve_generation_run(
     source_commit: str,
     repository_root: Path | str | None = None,
     require_executable: bool = True,
+    scientific_overrides: Mapping[str, Any] | None = None,
+    execution_overrides: Mapping[str, Any] | None = None,
+    authored_value: Mapping[str, Any] | None = None,
 ) -> GenerationRunPlan:
     """
     Resolve one supported configuration into an immutable run plan.
@@ -221,6 +197,13 @@ def resolve_generation_run(
         Repository root used for containment validation and relative workflow children.
     require_executable : bool, optional
         Forwarded to the authoritative campaign and benchmark loaders.
+
+    scientific_overrides : Mapping[str, Any] | None, optional
+        Explicit campaign material, design-size, physical-duration and Source-revision overrides.
+    execution_overrides : Mapping[str, Any] | None, optional
+        Explicit normal concurrency, CPU, timeout and retry choices.
+    authored_value : Mapping[str, Any] | None, optional
+        In-memory campaign configuration with ``path`` retained as authored plan evidence.
 
     Returns
     -------
@@ -239,17 +222,31 @@ def resolve_generation_run(
     source_path = _repository_file(path, root=root, label="Generation run configuration")
     commit = source_service.validate_git_commit(source_commit)
     raw, config_identity = _load_top_level(source_path)
+    if authored_value is not None:
+        raw = MappingProxyType(dict(authored_value))
     schema_kind = raw.get("schema_kind")
     if schema_kind == CAMPAIGN_SCHEMA_KIND:
-        _validate_schema_version(raw, schema_kind=CAMPAIGN_SCHEMA_KIND, version=1)
+        _validate_schema_version(
+            raw,
+            schema_kind=CAMPAIGN_SCHEMA_KIND,
+            version=config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
+            if raw.get("schema_version") == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
+            else 1,
+        )
         return _campaign_plan(
             source_path,
             config_identity=config_identity,
             source_commit=commit,
             root=root,
             require_executable=require_executable,
+            scientific_overrides=scientific_overrides,
+            execution_overrides=execution_overrides,
+            authored_value=authored_value,
         )
     if schema_kind == BENCHMARK_SCHEMA_KIND:
+        if authored_value is not None or scientific_overrides or execution_overrides:
+            message = "Scientific run overrides apply to source campaigns only."
+            raise ValueError(message)
         _validate_schema_version(
             raw,
             schema_kind=BENCHMARK_SCHEMA_KIND,
@@ -262,18 +259,8 @@ def resolve_generation_run(
             root=root,
             require_executable=require_executable,
         )
-    if schema_kind == WORKFLOW_SCHEMA_KIND:
-        return _workflow_plan(
-            raw=raw,
-            source_path=source_path,
-            config_identity=config_identity,
-            source_commit=commit,
-            root=root,
-            require_executable=require_executable,
-        )
     message = (
-        f"Unsupported Generation run schema_kind {schema_kind!r} in {source_path}; "
-        f"expected {CAMPAIGN_SCHEMA_KIND!r}, {BENCHMARK_SCHEMA_KIND!r}, or {WORKFLOW_SCHEMA_KIND!r}."
+        f"Unsupported Generation run schema_kind {schema_kind!r} in {source_path}; expected {CAMPAIGN_SCHEMA_KIND!r} or {BENCHMARK_SCHEMA_KIND!r}."
     )
     raise ValueError(message)
 
@@ -285,9 +272,18 @@ def _campaign_plan(
     source_commit: str,
     root: Path,
     require_executable: bool,
+    scientific_overrides: Mapping[str, Any] | None = None,
+    execution_overrides: Mapping[str, Any] | None = None,
+    authored_value: Mapping[str, Any] | None = None,
 ) -> GenerationRunPlan:
     """Build one leaf plan from the authoritative campaign resolver."""
-    campaign = config_service.load_campaign_config(source_path, require_executable=require_executable)
+    campaign = config_service.load_campaign_config(
+        source_path,
+        require_executable=require_executable,
+        scientific_overrides=scientific_overrides,
+        execution_overrides=execution_overrides,
+        authored_value=authored_value,
+    )
     units: list[GenerationRunUnit] = []
     for batch in campaign.batches:
         for case_index in batch.case_indices:
@@ -309,26 +305,10 @@ def _campaign_plan(
                     ),
                 )
             )
-    package_names = tuple(str(package["dataset_name"]) for package in campaign.dataset_packages)
-    if len(package_names) != len(set(package_names)):
-        message = "Campaign plan resolved duplicate declared Dataset package names."
-        raise ValueError(message)
     retention = str(campaign.execution_values["retention_policy"])
     collection = "deferred_allowed"
-    finalizers = (
-        (
-            GenerationRunFinalizer(
-                finalizer_kind=MATERIAL_PILOT_FINALIZER,
-                required_child_identities=(),
-            ),
-        )
-        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE
-        else ()
-    )
-    lifecycle = _campaign_lifecycle(
-        has_packages=bool(package_names),
-        has_finalizer=bool(finalizers),
-    )
+    finalizers: tuple[GenerationRunFinalizer, ...] = ()
+    lifecycle = _campaign_lifecycle()
     return GenerationRunPlan(
         run_kind="campaign",
         identity=campaign_service.campaign_run_id(campaign, git_commit=source_commit),
@@ -340,9 +320,12 @@ def _campaign_plan(
         units=tuple(units),
         retention_policy=retention,
         collection_policy=collection,
-        dataset_packages=package_names,
         finalizers=finalizers,
         lifecycle_stages=lifecycle,
+        scientific_overrides=tuple((campaign.scientific_overrides or {}).items()),
+        execution_overrides=tuple((campaign.execution_overrides or {}).items()),
+        execution_values=campaign.execution_values,
+        authored_value=campaign.authored_value,
     )
 
 
@@ -354,43 +337,45 @@ def _benchmark_plan(
     root: Path,
     require_executable: bool,
 ) -> GenerationRunPlan:
-    """Build two-case work units in production-first sequential waves."""
+    """Build first-attempt work units per sweep: one group per variant in sweep order, each group after the previous one."""
     suite = benchmark_config.load_core_benchmark_suite(
         source_path,
         require_executable=require_executable,
     )
     units: list[GenerationRunUnit] = []
-    previous_wave: tuple[str, ...] = ()
-    for wave_position, variant in enumerate(suite.variant_wave_order(), start=1):
-        current_wave: list[str] = []
-        for case_position in range(1, suite.representative_case_count + 1):
-            representative = suite.representative_case(case_position)
-            case_index = representative.case_index
-            unit_id = suite.work_unit_id(variant, case_position)
-            current_wave.append(unit_id)
-            units.append(
-                GenerationRunUnit(
-                    unit_id=unit_id,
-                    unit_kind="benchmark_case",
-                    input_identity=_case_input_identity(
-                        suite.case_config,
-                        case_index,
-                    ),
-                    metadata=(
-                        ("variant_id", variant.variant_id),
-                        ("cores_per_case", variant.cores_per_case),
-                        ("wave_position", wave_position),
-                        ("case_position", case_position),
-                        ("case_role", representative.case_role),
-                        ("case_index", case_index),
-                        ("case_id", suite.case_config.case_id(case_index)),
-                        ("canary", wave_position == 1),
-                        ("included_in_final_measurements", True),
-                    ),
-                    depends_on=previous_wave,
+    for sweep in suite.sweeps:
+        previous_group: tuple[str, ...] = ()
+        for group, variant in enumerate(suite.sweep_variants(sweep)):
+            current_group: list[str] = []
+            for case_position in range(1, suite.representative_case_count + 1):
+                representative = suite.representative_case(case_position)
+                case_index = representative.case_index
+                unit_id = suite.work_unit_id(sweep, variant, 1, case_position)
+                current_group.append(unit_id)
+                units.append(
+                    GenerationRunUnit(
+                        unit_id=unit_id,
+                        unit_kind="benchmark_case",
+                        input_identity=_case_input_identity(
+                            suite.case_config,
+                            case_index,
+                        ),
+                        metadata=(
+                            ("sweep_id", sweep.sweep_id),
+                            ("variant_id", variant.variant_id),
+                            ("cores_per_case", variant.cores_per_case),
+                            ("concurrent_cases", suite.resources(variant).concurrent_cases),
+                            ("group", group),
+                            ("case_position", case_position),
+                            ("case_role", representative.case_role),
+                            ("case_index", case_index),
+                            ("case_id", suite.case_config.case_id(case_index)),
+                            ("success_target", suite.target_successful_cases),
+                        ),
+                        depends_on=previous_group,
+                    )
                 )
-            )
-        previous_wave = tuple(current_wave)
+            previous_group = tuple(current_group)
     return GenerationRunPlan(
         run_kind="benchmark",
         identity=(
@@ -410,7 +395,6 @@ def _benchmark_plan(
         units=tuple(units),
         retention_policy="compact",
         collection_policy="deferred_allowed",
-        dataset_packages=(),
         finalizers=(
             GenerationRunFinalizer(
                 finalizer_kind=CORE_BENCHMARK_SUMMARY_FINALIZER,
@@ -421,137 +405,19 @@ def _benchmark_plan(
     )
 
 
-def _workflow_plan(
-    *,
-    raw: Mapping[str, Any],
-    source_path: Path,
-    config_identity: str,
-    source_commit: str,
-    root: Path,
-    require_executable: bool,
-) -> GenerationRunPlan:
-    """Resolve the sole supported paired technical-smoke workflow contract."""
-    _exact_keys(
-        raw,
-        {"schema_kind", "schema_version", "workflow_name", "children", "finalizers"},
-        label="Generation workflow",
-    )
-    if raw["schema_version"] != WORKFLOW_SCHEMA_VERSION:
-        message = f"Unsupported Generation workflow schema version {raw['schema_version']!r}."
-        raise ValueError(message)
-    workflow_name = _logical_name(raw["workflow_name"], label="workflow_name")
-    children_raw = raw["children"]
-    if not isinstance(children_raw, list) or len(children_raw) != _PAIRED_TECHNICAL_SMOKE_CHILD_COUNT:
-        message = "paired technical-smoke workflow requires exactly two ordered campaign children."
-        raise ValueError(message)
-    references = tuple(_workflow_reference(value, root=root, index=index) for index, value in enumerate(children_raw))
-    if len(references) != len(set(references)):
-        message = "Generation workflow children must be duplicate-free."
-        raise ValueError(message)
-    children = tuple(
-        resolve_generation_run(
-            reference,
-            source_commit=source_commit,
-            repository_root=root,
-            require_executable=require_executable,
-        )
-        for reference in references
-    )
-    if any(child.run_kind != "campaign" for child in children):
-        message = "paired technical-smoke workflow children must resolve generation_campaign configurations."
-        raise ValueError(message)
-    if any(child.children or child.finalizers for child in children):
-        message = "Generation workflow nesting is unsupported."
-        raise ValueError(message)
-    if any(_unit_metadata(unit, "campaign_purpose") != "technical_runtime_smoke" for child in children for unit in child.units):
-        message = "paired technical-smoke workflow children must have technical_runtime_smoke purpose."
-        raise ValueError(message)
-    identities = tuple(child.identity for child in children)
-    if len(identities) != len(set(identities)):
-        message = "Generation workflow children resolve duplicate campaign identities."
-        raise ValueError(message)
-    finalizers = _workflow_finalizers(raw["finalizers"], child_identities=identities)
-    profiles = tuple(_unit_metadata(child.units[0], "simulation_profile") for child in children)
-    if profiles != ("steady_flow", "transient_drying"):
-        message = "paired technical-smoke workflow children must be ordered steady_flow then transient_drying."
-        raise ValueError(message)
-    if any(_unit_metadata(unit, "simulation_profile") != profile for child, profile in zip(children, profiles, strict=True) for unit in child.units):
-        message = "paired technical-smoke workflow child units must use exactly one simulation profile."
-        raise ValueError(message)
-    payload = {
-        "schema_kind": WORKFLOW_SCHEMA_KIND,
-        "schema_version": WORKFLOW_SCHEMA_VERSION,
-        "workflow_name": workflow_name,
-        "config_identity": config_identity,
-        "children": [child.identity for child in children],
-        "source_commit": source_commit,
-        "finalizers": [item.to_payload() for item in finalizers],
-    }
-    identity = f"workflow__{common.serialization.canonical_json_sha256(payload)}"
-    return GenerationRunPlan(
-        run_kind="workflow",
-        identity=identity,
-        source_commit=source_commit,
-        input_identity=common.serialization.canonical_json_sha256({"children": [child.input_identity for child in children]}),
-        config_identity=config_identity,
-        config_path=source_path.relative_to(root).as_posix(),
-        children=children,
-        units=(),
-        retention_policy="full",
-        collection_policy="deferred_allowed",
-        dataset_packages=tuple(package for child in children for package in child.dataset_packages),
-        finalizers=finalizers,
-        lifecycle_stages=_workflow_lifecycle(),
-    )
-
-
-def _workflow_finalizers(value: Any, *, child_identities: tuple[str, ...]) -> tuple[GenerationRunFinalizer, ...]:
-    """Validate and resolve the only supported workflow finalizer."""
-    if value != [PAIRED_TECHNICAL_SMOKE_FINALIZER]:
-        message = "Generation workflow finalizers must be exactly ['paired_technical_smoke']."
-        raise ValueError(message)
+def _campaign_lifecycle() -> tuple[str, ...]:
+    """Return the ordinary source-campaign stages actually executed."""
     return (
-        GenerationRunFinalizer(
-            finalizer_kind=PAIRED_TECHNICAL_SMOKE_FINALIZER,
-            required_child_identities=child_identities,
-        ),
-    )
-
-
-def _campaign_lifecycle(
-    *,
-    has_packages: bool,
-    has_finalizer: bool,
-) -> tuple[str, ...]:
-    """Return campaign stages, omitting undeclared package and finalizer work."""
-    stages = [
         "resolve_config",
         "preflight",
         "prepare_inputs",
-        "plan",
         "submit",
         "feed_scheduler",
         "monitor_scheduler",
         "terminalize",
         "validate_terminal",
-        "transfer",
-        "publish",
-    ]
-    if has_packages:
-        stages.append("build_packages")
-    if has_finalizer:
-        stages.append("finalize")
-    stages.extend(
-        (
-            "record_workflow",
-            "authorize_cleanup",
-            "cleanup_source",
-            "record_cleanup",
-            "validate",
-            "complete",
-        )
+        "complete",
     )
-    return tuple(stages)
 
 
 def _benchmark_lifecycle() -> tuple[str, ...]:
@@ -573,16 +439,6 @@ def _benchmark_lifecycle() -> tuple[str, ...]:
         "authorize_cleanup",
         "cleanup_source",
         "record_cleanup",
-        "validate",
-        "complete",
-    )
-
-
-def _workflow_lifecycle() -> tuple[str, ...]:
-    """Return the parent continuation after child-owned stages."""
-    return (
-        "resolve_config",
-        "finalize",
         "validate",
         "complete",
     )
@@ -641,45 +497,8 @@ def _repository_file(value: Path | str, *, root: Path, label: str) -> Path:
     return resolved
 
 
-def _workflow_reference(value: Any, *, root: Path, index: int) -> Path:
-    """Resolve a repository-root-relative workflow child reference safely."""
-    if not isinstance(value, str) or not value:
-        message = f"Generation workflow children[{index}] must be a non-empty relative path."
-        raise TypeError(message)
-    reference = Path(value)
-    if reference.is_absolute():
-        message = f"Generation workflow children[{index}] must not use an absolute path."
-        raise ValueError(message)
-    return _repository_file(root / reference, root=root, label=f"Generation workflow children[{index}]")
-
-
 def _validate_schema_version(raw: Mapping[str, Any], *, schema_kind: str, version: int) -> None:
     """Require the supported version before dispatching to an authoritative loader."""
     if raw.get("schema_version") != version:
         message = f"Unsupported {schema_kind} schema version {raw.get('schema_version')!r}."
         raise ValueError(message)
-
-
-def _exact_keys(value: Mapping[str, Any], expected: set[str], *, label: str) -> None:
-    """Require one exact YAML mapping key set."""
-    actual = set(value)
-    if actual != expected:
-        message = f"{label} keys must be exactly {sorted(expected)}, got {sorted(actual)}."
-        raise ValueError(message)
-
-
-def _logical_name(value: Any, *, label: str) -> str:
-    """Validate one stable workflow display identifier."""
-    if not isinstance(value, str):
-        message = f"{label} must be text."
-        raise TypeError(message)
-    return common.paths.validate_logical_name(value, label=label)
-
-
-def _unit_metadata(unit: GenerationRunUnit, key: str) -> Any:
-    """Return one required immutable metadata value."""
-    for item_key, value in unit.metadata:
-        if item_key == key:
-            return value
-    message = f"Generation run unit {unit.unit_id!r} lacks required metadata {key!r}."
-    raise RuntimeError(message)

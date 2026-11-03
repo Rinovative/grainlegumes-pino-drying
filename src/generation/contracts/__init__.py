@@ -2,10 +2,11 @@
 Immutable Generation vocabularies, scientific registries, and source contracts.
 
 Provides:
+- campaign_identity: canonical campaign role/material/count/seed naming
 - comsol_spreadsheet: canonical COMSOL Spreadsheet export parsing
 - descriptors: stable cross-package profile and vocabulary descriptors
-- mapping: semantic Generation export-mapping identities
 - materials: resolved material-science contracts
+- material_registry: stable material identifier, slug, and order mapping
 - paths: persistent storage-root safety contracts
 - porosity: calibrated porosity support and response contracts
 - profiles: canonical simulation-profile schemas
@@ -19,13 +20,10 @@ Provides:
 - FieldContract: immutable named physical-field descriptor
 - IdMembership: canonical learned-membership type
 - ProfileContract: immutable profile-level field contract
-- available_material_families: supported material-family vocabulary
 - available_profile_ids: supported simulation-profile vocabulary
 - evaluation_regimes: canonical package evaluation regimes
 - get_profile_contract: immutable profile-contract resolution
 - id_memberships: canonical learned-membership vocabulary
-- material_roles: canonical campaign material roles
-- validate_git_commit: source-commit identity validation
 """
 
 from __future__ import annotations
@@ -34,9 +32,10 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from . import generation_contracts_campaign_identity as campaign_identity
     from . import generation_contracts_comsol_spreadsheet as comsol_spreadsheet
     from . import generation_contracts_descriptors as descriptors
-    from . import generation_contracts_mapping as mapping
+    from . import generation_contracts_material_registry as material_registry
     from . import generation_contracts_materials as materials
     from . import generation_contracts_paths as paths
     from . import generation_contracts_porosity as porosity
@@ -52,20 +51,18 @@ if TYPE_CHECKING:
         FieldContract,
         IdMembership,
         ProfileContract,
-        available_material_families,
         available_profile_ids,
         evaluation_regimes,
         get_profile_contract,
         id_memberships,
-        material_roles,
-        validate_git_commit,
     )
 
 _MODULES = {
+    "campaign_identity": "generation_contracts_campaign_identity",
     "comsol_spreadsheet": "generation_contracts_comsol_spreadsheet",
     "descriptors": "generation_contracts_descriptors",
-    "mapping": "generation_contracts_mapping",
     "materials": "generation_contracts_materials",
+    "material_registry": "generation_contracts_material_registry",
     "paths": "generation_contracts_paths",
     "porosity": "generation_contracts_porosity",
     "profiles": "generation_contracts_profiles",
@@ -82,13 +79,10 @@ _DESCRIPTOR_EXPORTS = frozenset(
         "FieldContract",
         "IdMembership",
         "ProfileContract",
-        "available_material_families",
         "available_profile_ids",
         "evaluation_regimes",
         "get_profile_contract",
         "id_memberships",
-        "material_roles",
-        "validate_git_commit",
     }
 )
 __all__ = [
@@ -96,15 +90,14 @@ __all__ = [
     "FieldContract",
     "IdMembership",
     "ProfileContract",
-    "available_material_families",
     "available_profile_ids",
+    "campaign_identity",
     "comsol_spreadsheet",
     "descriptors",
     "evaluation_regimes",
     "get_profile_contract",
     "id_memberships",
-    "mapping",
-    "material_roles",
+    "material_registry",
     "materials",
     "paths",
     "porosity",
@@ -114,7 +107,6 @@ __all__ = [
     "scalar_handoff",
     "source",
     "templates",
-    "validate_git_commit",
     "vocabulary",
 ]
 

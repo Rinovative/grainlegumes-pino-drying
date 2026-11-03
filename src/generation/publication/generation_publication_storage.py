@@ -1,18 +1,26 @@
-"""
-generation_publication_storage.py
+"""Convert validated COMSOL tables into one canonical HDF5 case payload.
 
-Convert validated COMSOL tables into one canonical HDF5 case payload.
 Responsibilities:
   - Map explicit profile-config headers to stable logical fields
   - Validate Cartesian static/transient data, schedules, globals, and final status
   - Validate float32 conversion before atomic compressed HDF5 publication
+
 Design principles:
   - CSV is a temporary adapter; case.h5 is the sole canonical case payload
   - No COMSOL tag, expression, sign convention, or filename is inferred
   - HDF5 field ordering, units, hashes, and identities are explicit metadata
+
 This module does NOT:
   - Execute COMSOL, define scientific ranges, or register learning tasks
   - Preserve a parallel canonical CSV learning view
+
+Notes:
+  Profile-dependent HDF5 layout:
+    - Required root groups are `coords` (`x`, `y`), `static` (`fields`), and `provenance` (scalar JSON datasets) for both profiles.
+    - Steady flow adds `stationary_fixed/values`. Transient drying adds `scalar/values`, `time`, `transient/fields`, `schedule/values`,
+      `global/values`, and `final_status/values`.
+    - Optional `exact_stop/{time,fields}` is marked diagnostic-only and remains separate from the regular `time` and `transient/fields` trajectory.
+
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ from src import common, domain
 from src.generation.cases import generation_cases_admission as input_admission
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_fields as fields_service
+from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet_contract
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
@@ -43,7 +52,7 @@ if TYPE_CHECKING:
 
     from src.generation.cases.generation_cases_config import GenerationConfig
 
-HDF5_SCHEMA_KIND = "vp2_canonical_case"
+HDF5_SCHEMA_KIND = "generation_source_case_hdf5"
 HDF5_SCHEMA_VERSION = config_contract.CANONICAL_HDF5_SCHEMA_VERSION
 HDF5_CONVERTER_VERSION = config_contract.CANONICAL_HDF5_CONVERTER_VERSION
 _MINIMUM_AXIS_POINTS = 2
@@ -51,7 +60,6 @@ _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
 _STATIONARITY_RTOL = profiles.STATIONARITY_TOLERANCE
 _TIME_CLASSIFICATION_FACTOR = 16.0
-_THERMODYNAMIC_ROUNDTRIP_ATOL = 64.0 * np.finfo(np.float64).eps
 _UNIT_INTERVAL_ROUNDOFF_ATOL = 64.0 * np.finfo(np.float64).eps
 _MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE = 1.0e-6
 _FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
@@ -591,34 +599,6 @@ def evaluate_transient_bulk_moisture_consistency(
     )
 
 
-def _validate_global_bulk_moisture(
-    config: GenerationConfig,
-    static_fields: np.ndarray,
-    state_time: np.ndarray,
-    regular_fields: np.ndarray,
-    exact_stop_fields: np.ndarray | None,
-    global_values: np.ndarray,
-    *,
-    f_surf: float,
-    time_tolerance: float,
-) -> None:
-    """Validate exported bulk moisture against integrated dry and water mass."""
-    result = evaluate_transient_bulk_moisture_consistency(
-        config,
-        static_fields,
-        state_time,
-        regular_fields,
-        exact_stop_fields,
-        global_values,
-        f_surf=f_surf,
-        time_tolerance=time_tolerance,
-    )
-    if not result.matches:
-        maximum = float(np.max(np.abs(result.exported - result.reconstructed)))
-        message = f"Exported X_wb_bulk disagrees with weighted integrated dry and water mass; maximum error={maximum}."
-        raise ValueError(message)
-
-
 def _stationary_fixed_values(
     case_payload: Mapping[str, Any],
     fixed_values: Mapping[str, Any],
@@ -975,7 +955,7 @@ def _transient_output_diagnostics(
                 message="Solved initial moisture fields differ from the canonical reconstructed initial state.",
                 metrics=initial_metrics,
                 thresholds={"rtol": initial_rtol, "atol": initial_atol},
-                source_artifacts=("source_export:transient_states.csv", "raw/case.json"),
+                source_artifacts=("source_export:transient_states.csv", "inputs/case.json"),
             )
         )
 
@@ -1275,8 +1255,7 @@ def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, An
         "case_input_id",
         "simulation_case_id",
         "material_family",
-        "material_role",
-        "evaluation_regime",
+        "domain_profile",
         "sampling_regime",
         "natural_support_state",
         "seed_evidence",
@@ -1296,7 +1275,7 @@ def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, An
         "schema_version": _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION,
         **{name: case_payload[name] for name in required},
     }
-    for name in ("schedule_diagnostics", "pilot_check"):
+    for name in ("schedule_diagnostics",):
         if name in case_payload:
             result[name] = case_payload[name]
     return result
@@ -1381,8 +1360,7 @@ def _write_hdf5(
             "simulation_profile",
             "case_id",
             "material_family",
-            "material_role",
-            "evaluation_regime",
+            "domain_profile",
             "sampling_regime",
             "natural_support_state",
             "case_input_id",
@@ -1505,6 +1483,13 @@ def _write_hdf5(
             schedule_dataset.attrs["conversion_pressure"] = _json_attribute(case_payload["schedule_diagnostics"]["conversion_pressure"])
             schedule_dataset.attrs["humidity_conversion_owner"] = "generation_schedule"
             schedule_dataset.attrs["boundary_handoff"] = _json_attribute(case_payload["schedule_diagnostics"]["boundary_handoff"])
+            if "schedule_time" in config.scientific_values:
+                schedule_dataset.attrs["temporal_provenance"] = _json_attribute(
+                    {
+                        "output_time": config.scientific_values["time_provenance"],
+                        "schedule_time": config.scientific_values["schedule_time_provenance"],
+                    }
+                )
             global_group = handle.create_group("global")
             global_dataset = global_group.create_dataset("values", data=np.asarray(global_values, dtype=np.float64), **compression)
             global_dataset.attrs["field_names"] = _json_attribute(list(profiles.GLOBAL_FIELD_NAMES))
@@ -1737,8 +1722,7 @@ def _validate_hdf5_provenance(
         "case_input_id",
         "simulation_case_id",
         "material_family",
-        "material_role",
-        "evaluation_regime",
+        "domain_profile",
         "sampling_regime",
         "natural_support_state",
         "seed_evidence",
@@ -1749,7 +1733,7 @@ def _validate_hdf5_provenance(
         "ood",
         "spatial_diagnostics",
     }
-    optional_case_keys = {"schedule_diagnostics", "pilot_check"}
+    optional_case_keys = {"schedule_diagnostics"}
     if (
         not isinstance(case_scientific, dict)
         or not required_case_keys.issubset(case_scientific)
@@ -1764,8 +1748,7 @@ def _validate_hdf5_provenance(
         "case_input_id",
         "simulation_case_id",
         "material_family",
-        "material_role",
-        "evaluation_regime",
+        "domain_profile",
         "sampling_regime",
         "natural_support_state",
     )
@@ -2138,6 +2121,61 @@ def _validate_hdf5_schedule(
     if scientific.get("boundary_schedule") != {"startup_ramp": scientific_ramp}:
         msg = "COMSOL boundary handoff disagrees with active scientific startup identity."
         raise ValueError(msg)
+    if "schedule_time" in scientific:
+        temporal_provenance = json.loads(_hdf5_text_attribute(schedule.attrs.get("temporal_provenance", ""), label="schedule.temporal_provenance"))
+        time_fields = {"start", "stop", "interval", "internal_steps", "irregular_stop_state"}
+        if (
+            not isinstance(temporal_provenance, Mapping)
+            or set(temporal_provenance) != {"output_time", "schedule_time"}
+            or any(
+                not isinstance(records, Mapping)
+                or set(records) != time_fields
+                or any(not isinstance(record, Mapping) or not record.get("evidence") for record in records.values())
+                for records in temporal_provenance.values()
+            )
+        ):
+            msg = "Canonical separate output and schedule horizons require complete temporal provenance."
+            raise ValueError(msg)
+        schedule_time = scientific["schedule_time"]
+        output_time = scientific["time"]
+        if (
+            schedule_time["start"] != output_time["start"]
+            or schedule_time["interval"] != output_time["interval"]
+            or schedule_time["stop"] < output_time["stop"]
+        ):
+            msg = "Canonical schedule horizon must contain the configured output horizon on the same grid."
+            raise ValueError(msg)
+        expected_grid = {
+            "start_h": schedule_time["start"],
+            "stop_h": schedule_time["stop"],
+            "interval_h": schedule_time["interval"],
+            "node_count": len(schedule_time["regular_times"]),
+        }
+        if boundary_handoff.get("canonical_regular_grid") != expected_grid:
+            msg = "Canonical boundary handoff disagrees with the configured schedule_time grid."
+            raise ValueError(msg)
+        expected_output_grid = {
+            "start_h": output_time["start"],
+            "stop_h": output_time["regular_times"][-1],
+            "interval_h": output_time["interval"],
+            "node_count": len(output_time["regular_times"]),
+        }
+        if boundary_handoff.get("regular_output_grid") != expected_output_grid:
+            msg = "Canonical boundary handoff disagrees with the actual regular output grid."
+            raise ValueError(msg)
+        expected_times = np.asarray(schedule_time["regular_times"], dtype=np.float64)
+        requested_times = schedule_service.regular_output_times(boundary_handoff, expected_times)
+        if not np.array_equal(requested_times, np.asarray(output_time["regular_times"], dtype=np.float64)):
+            msg = "Canonical boundary handoff does not retain the actual requested regular output times."
+            raise ValueError(msg)
+        if enabled is True:
+            if isinstance(duration_h, bool) or not isinstance(duration_h, (int, float)) or not np.isfinite(float(duration_h)):
+                msg = "Canonical schedule startup support must have a finite duration."
+                raise ValueError(msg)
+            expected_times = np.sort(np.append(expected_times, float(duration_h)))
+        if not np.array_equal(values[:, 0], expected_times):
+            msg = "Canonical boundary table does not contain the complete configured schedule_time grid and startup support."
+            raise ValueError(msg)
 
 
 def _complete_hdf5_time(

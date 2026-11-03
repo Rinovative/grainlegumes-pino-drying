@@ -1,18 +1,13 @@
-"""
-analysis_ui_components.py
-
-Provide reusable widget constructors and UI helpers for analysis notebooks.
+"""Provide reusable widget constructors and UI helpers for analysis notebooks.
 
 Responsibilities:
   - Define checkbox group protocols and constructors
   - Build dropdown, radio and step-control widgets
-  - Provide output containers and stable colorbar formatters
-  - Compute display-only contour levels, axis labels, and streamline overlays
+  - Provide output containers
 
 Design principles:
   - Components are small and reusable
   - Widget state is explicit in returned objects
-  - Plotting helpers stay independent of analysis data models
 
 This module does NOT:
   - Compose complete notebook panels or manage figure-export lifecycle
@@ -21,19 +16,14 @@ This module does NOT:
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Protocol
 
 import ipywidgets as widgets
-import matplotlib.ticker as mticker
-import numpy as np
 
 from src.analysis.presentation.analysis_field_labels import field_label
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
-
-    from matplotlib.axes import Axes
 
 COMPACT_CONTROL_WIDTH_PX = 230
 COMPACT_CASE_STEP_WIDTH_PX = 40
@@ -701,39 +691,6 @@ def ui_dropdown_channel(
     )
 
 
-def ui_dropdown_input_parameter(
-    *,
-    parameters: list[str],
-    default: str | None = None,
-) -> widgets.Dropdown:
-    """
-    Dropdown selector for input parameters (par_*).
-
-    Parameters
-    ----------
-    parameters : list[str]
-        Available input parameters.
-    default : str | None, optional
-        Default selected parameter. If None, first entry is used.
-
-    Returns
-    -------
-    widgets.Dropdown
-        Configured input-parameter dropdown.
-
-    """
-    if not parameters:
-        msg = "No input parameters available for dropdown."
-        raise ValueError(msg)
-
-    return _build_dropdown(
-        options=parameters,
-        value=default or parameters[0],
-        description="Parameter:",
-        width="auto",
-    )
-
-
 # =============================================================================
 # SEMANTIC RADIO SELECTORS
 # =============================================================================
@@ -741,7 +698,7 @@ def ui_dropdown_input_parameter(
 
 def ui_radio_error_mode() -> widgets.RadioButtons:
     """
-    Radio button selector for error mode (MAE vs. Relative).
+    Radio button selector for the existing field-error location.
 
     Returns
     -------
@@ -750,12 +707,34 @@ def ui_radio_error_mode() -> widgets.RadioButtons:
 
     """
     return _build_radio(
-        options=["MAE", "Relative [%]"],
-        value="MAE",
+        options=["MAE", "Relative [%]", "Normalized absolute error"],
+        value="Normalized absolute error",
         width="90px",
         margin="0 0 0 12px",
         description="Error mode:",
         description_width="initial",
+    )
+
+
+def ui_radio_transient_error_mode() -> widgets.RadioButtons:
+    """Select the one error map in the transient reference/prediction viewer."""
+    return _build_radio(
+        options=["Signed error", "Absolute error", "Normalized absolute error"],
+        value="Normalized absolute error",
+        width="auto",
+        margin="0 0 0 12px",
+        description="Error mode:",
+        description_width="initial",
+    )
+
+
+def ui_dropdown_display_spatial_stride() -> widgets.Dropdown:
+    """Choose presentation-only map sampling while retaining the full grid."""
+    return widgets.Dropdown(
+        options=(("Auto", "auto"), ("Full", 1), ("Stride 2", 2), ("Stride 4", 4)),
+        value="auto",
+        description="Display stride:",
+        style={"description_width": "initial"},
     )
 
 
@@ -793,23 +772,6 @@ def ui_checkbox_map_scale_lock(*, value: bool = False) -> widgets.Checkbox:
         value=value,
         description="Lock color scale",
         indent=False,
-        style={"description_width": "initial"},
-        layout=widgets.Layout(width="auto"),
-    )
-
-
-def ui_toggle_map_scale_mode(
-    *,
-    value: str = "shared",
-) -> widgets.ToggleButtons:
-    """Build the shared compact map color-scale selector."""
-    if value not in {"shared", "individual"}:
-        message = "Map scale mode must be 'shared' or 'individual'."
-        raise ValueError(message)
-    return widgets.ToggleButtons(
-        options=(("Shared", "shared"), ("Individual", "individual")),
-        value=value,
-        description="Color scale:",
         style={"description_width": "initial"},
         layout=widgets.Layout(width="auto"),
     )
@@ -929,33 +891,6 @@ def ui_checkbox_datasets(
     )
 
 
-def ui_checkbox_log_scale(
-    *,
-    description: str = "log10 for scale parameters",
-    default: bool = False,
-) -> widgets.Checkbox:
-    """
-    Checkbox selector for enabling log10 scaling.
-
-    Parameters
-    ----------
-    description : str, optional
-        Checkbox label.
-    default : bool, optional
-        Default checkbox state.
-
-    Returns
-    -------
-    widgets.Checkbox
-        Configured log-scale checkbox.
-
-    """
-    return widgets.Checkbox(
-        value=default,
-        description=description,
-    )
-
-
 def ui_checkbox_normalise(
     *,
     description: str = "Normalise",
@@ -1004,223 +939,3 @@ def ui_output_plot() -> widgets.Output:
 
     """
     return widgets.Output()
-
-
-# =============================================================================
-# PLOTTING UTILITIES
-# =============================================================================
-
-# COLORBAR FORMATTERS
-
-
-def choose_colorbar_formatter(
-    vmin: float,
-    vmax: float,
-    *,
-    ticks: np.ndarray | None = None,
-) -> mticker.Formatter:
-    """
-    Show consistent tick labels with trailing zeros kept.
-
-    - If scientific notation is used (very small/large magnitude), use "%.2e".
-    - Otherwise, choose a fixed number of decimals.
-      If `ticks` is provided, decimals are derived from the smallest tick step so that
-      labels like 0.20 are shown when 0.18 exists (same decimals across all ticks).
-
-    Parameters
-    ----------
-    vmin : float
-        Minimum colorbar value.
-    vmax : float
-        Maximum colorbar value.
-    ticks : np.ndarray | None
-        Optional tick values to derive a stable decimal count.
-
-    Returns
-    -------
-    matplotlib.ticker.Formatter
-        Formatter instance.
-
-    """
-    sig = 3
-    sci_low, sci_high = -3, 3  # scientific if exponent <= -3 or >= 3
-
-    vr = max(abs(vmin), abs(vmax))
-
-    # Handle all-zero (or invalid) ranges
-    if vr == 0 or not math.isfinite(vr):
-        return mticker.FormatStrFormatter("%.2f")
-
-    exp = math.floor(math.log10(vr))
-
-    # Scientific notation
-    if exp <= sci_low or exp >= sci_high:
-        return mticker.FormatStrFormatter(f"%.{sig - 1}e")
-
-    # Fixed decimals
-    decimals_default = max(0, (sig - 1) - exp)
-    decimals = decimals_default
-
-    if ticks is not None:
-        t = np.asarray(ticks, dtype=float)
-        t = t[np.isfinite(t)]
-        t = np.unique(np.sort(t))
-
-        if t.size >= 2:  # noqa: PLR2004
-            diffs = np.diff(t)
-            diffs = diffs[diffs > 0]
-
-            if diffs.size > 0:
-                step = float(np.min(diffs))
-                # decimals so that step is representable (keep trailing zeros)
-                # e.g. step=0.05 -> 2 decimals, step=0.1 -> 1 decimal
-                decimals_from_step = int(max(0, math.ceil(-math.log10(step) - 1e-12)))
-                decimals = max(decimals_default, decimals_from_step)
-
-    def _fmt(x: float, _pos: int | None = None) -> str:
-        s = f"{x:.{decimals}f}"
-
-        # Avoid "-0.00"
-        if float(s) == 0.0:
-            s = s.lstrip("-")
-
-        return s
-
-    return mticker.FuncFormatter(_fmt)
-
-
-# CONTOUR LEVELS
-
-
-_MIN_LEVEL_COUNT = 2
-
-
-def compute_levels(arr: np.ndarray, n: int = 10) -> np.ndarray:
-    """
-    Compute contour levels for given data array.
-
-    Parameters
-    ----------
-    arr : np.ndarray
-        Input data array.
-    n : int, optional
-        Desired number of levels (default: 10).
-
-    Returns
-    -------
-    np.ndarray
-        Computed contour levels.
-
-    """
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # Use 1st and 99th percentiles to avoid outliers
-    q_lo, q_hi = np.quantile(arr, [0.01, 0.99])
-    vmin, vmax = float(q_lo), float(q_hi)
-
-    if vmin == vmax:
-        range_padding = 1e-12
-        return np.linspace(vmin - range_padding, vmax + range_padding, n)
-
-    # Use MaxNLocator to get "nice" levels
-    locator = mticker.MaxNLocator(nbins=n)
-
-    levels = np.asarray(locator.tick_values(vmin, vmax), dtype=np.float64)
-    levels = np.unique(levels).astype(np.float64, copy=False)
-
-    if len(levels) < _MIN_LEVEL_COUNT or not np.all(np.diff(levels) > 0):
-        levels = np.linspace(vmin, vmax, n, dtype=np.float64)
-
-    return levels
-
-
-# AXIS LABEL HELPERS
-
-
-def apply_axis_labels(
-    ax: Axes,
-    col: int,
-    Lx: float,
-    Ly: float,
-    *,
-    is_last_row: bool,
-) -> None:
-    """
-    Apply consistent axis labels and ticks to subplot axes.
-
-    Parameters
-    ----------
-    ax : Axes
-        Matplotlib Axes to modify.
-    col : int
-        Column index of the subplot.
-    Lx : float
-        Length of the domain in x-direction.
-    Ly : float
-        Length of the domain in y-direction.
-    is_last_row : bool
-        Whether the subplot is in the last row.
-
-    Returns
-    -------
-    None
-        Modifies the Axes in place.
-
-    """
-    ax.set_xlim(0, Lx)
-    ax.set_ylim(0, Ly)
-
-    yticks = [0.0, 0.25, 0.5, 0.75]
-    ax.set_yticks(yticks)
-
-    if col == 0:
-        ax.set_ylabel("y [m]")
-        ax.tick_params(axis="y", labelleft=True)
-    else:
-        ax.tick_params(axis="y", labelleft=False)
-
-    if is_last_row:
-        ax.set_xlabel("x [m]")
-        ax.tick_params(axis="x", labelbottom=True)
-    else:
-        ax.tick_params(axis="x", labelbottom=False)
-
-
-# FLOW OVERLAYS
-
-
-def overlay_streamlines(ax: Axes, X: np.ndarray, Y: np.ndarray, u: np.ndarray, v: np.ndarray) -> None:
-    """
-    Overlay streamlines on the given Axes.
-
-    Parameters
-    ----------
-    ax : Axes
-        Matplotlib Axes to modify.
-    X : np.ndarray
-        X-coordinates meshgrid.
-    Y : np.ndarray
-        Y-coordinates meshgrid.
-    u : np.ndarray
-        Velocity component in x-direction.
-    v : np.ndarray
-        Velocity component in y-direction.
-
-    Returns
-    -------
-    None
-        Modifies the Axes in place.
-
-    """
-    ax.streamplot(
-        X,
-        Y,
-        u,
-        v,
-        color=(0, 0, 0, 0.6),
-        density=1.0,
-        linewidth=0.6,
-        arrowsize=0.6,
-        minlength=0.1,
-        integration_direction="both",
-    )

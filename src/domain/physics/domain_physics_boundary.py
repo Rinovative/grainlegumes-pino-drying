@@ -1,12 +1,9 @@
-"""
-domain_physics_boundary.py
-
-Provide reusable pressure-boundary masks, residuals, and diagnostics.
+"""Provide reusable pressure-boundary masks, residuals, and diagnostics.
 
 Responsibilities:
   - Identify inlet and outlet cells from explicit coordinates and grid spacing
   - Compute inlet pressure mismatch and zero-gauge outlet residuals
-  - Expose boundary values and cancellation-safe per-sample diagnostics
+  - Expose cancellation-safe per-sample boundary diagnostics
 
 Design principles:
   - Boundary masks use coordinate extrema within half a positive grid spacing
@@ -27,10 +24,10 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
+from .domain_physics_derivatives import normalize_spatial_axes
+
 if TYPE_CHECKING:
     from .domain_physics_derivatives import SpatialAxes
-
-_SPATIAL_AXIS_COUNT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,17 +54,13 @@ class PressureBoundaryMasks:
 @dataclass(frozen=True, slots=True)
 class PressureBoundaryResiduals:
     """
-    Hold unreduced pressure-boundary values and per-sample diagnostics.
+    Hold per-sample pressure-boundary diagnostics.
 
-    ``inlet_error`` is ``p-p_in_bc`` flattened over selected inlet cells and
-    ``outlet_pressure`` retains flattened outlet gauge values, both in Pa.
     Spatial inlet MSE and outlet mean are retained per sample before batch
     aggregation so opposite outlet gauges cannot cancel each other.
 
     Attributes
     ----------
-    inlet_error, outlet_pressure : torch.Tensor
-        One-dimensional selected physical boundary values in Pa.
     inlet_sample_mse : torch.Tensor
         Spatially reduced inlet pressure MSE per leading sample, in Pa².
     outlet_sample_mean : torch.Tensor
@@ -77,47 +70,9 @@ class PressureBoundaryResiduals:
 
     """
 
-    inlet_error: Tensor
-    outlet_pressure: Tensor
     inlet_sample_mse: Tensor
     outlet_sample_mean: Tensor
     masks: PressureBoundaryMasks
-
-    @property
-    def inlet_mse(self) -> Tensor:
-        """Return the batch mean of per-sample inlet pressure MSE in Pa²."""
-        return self.inlet_sample_mse.mean()
-
-    @property
-    def outlet_mean_square(self) -> Tensor:
-        """Return the batch mean of squared per-sample outlet gauges in Pa²."""
-        return self.outlet_sample_mean.square().mean()
-
-    @property
-    def mse(self) -> Tensor:
-        """Return the inlet-plus-outlet pressure diagnostic in Pa²."""
-        return self.inlet_mse + self.outlet_mean_square
-
-
-def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
-    """
-    Normalize exactly two distinct spatial axes for a tensor rank.
-
-    Negative axes are translated relative to ``ndim``. The returned order is
-    preserved for downstream reductions. Duplicates and out-of-range axes fail
-    before any boundary mask is constructed.
-
-    Raises
-    ------
-    ValueError
-        If ``axes`` does not identify two distinct axes within the tensor rank.
-
-    """
-    normalized = tuple(axis if axis >= 0 else ndim + axis for axis in axes)
-    if len(set(normalized)) != _SPATIAL_AXIS_COUNT or any(axis < 0 or axis >= ndim for axis in normalized):
-        msg = f"Spatial axes {axes!r} are invalid for tensor rank {ndim}."
-        raise ValueError(msg)
-    return normalized[0], normalized[1]
 
 
 def pressure_boundary_masks(
@@ -156,7 +111,7 @@ def pressure_boundary_masks(
     if not y_coordinate.is_floating_point():
         msg = f"y_coordinate must use a floating dtype, got {y_coordinate.dtype}."
         raise TypeError(msg)
-    axes = _normalized_axes(y_coordinate.ndim, spatial_axes)
+    axes = normalize_spatial_axes(y_coordinate.ndim, spatial_axes)
     dy = torch.as_tensor(spacing_y, dtype=y_coordinate.dtype, device=y_coordinate.device)
     if dy.numel() != 1 or not bool(torch.isfinite(dy).item()) or not bool((dy > 0).item()):
         msg = "spacing_y must be a finite positive scalar."
@@ -180,7 +135,7 @@ def pressure_boundary_residuals(
     spatial_axes: SpatialAxes = (-2, -1),
 ) -> PressureBoundaryResiduals:
     """
-    Compute pressure inlet and outlet-gauge residual values.
+    Compute per-sample pressure inlet and outlet-gauge residual diagnostics.
 
     Parameters
     ----------
@@ -198,9 +153,8 @@ def pressure_boundary_residuals(
     Returns
     -------
     PressureBoundaryResiduals
-        Selected boundary values, per-sample reductions, and scalar batch-mean
-        properties. ``mse`` is inlet MSE plus the mean squared per-sample outlet
-        gauge. Outlet means are squared before batch aggregation.
+        Per-sample inlet MSE and outlet gauge mean with the boundary masks.
+        Callers square outlet means before batch aggregation.
 
     Raises
     ------
@@ -222,7 +176,7 @@ def pressure_boundary_residuals(
         spacing_y,
         spatial_axes=spatial_axes,
     )
-    axes = _normalized_axes(pressure.ndim, spatial_axes)
+    axes = normalize_spatial_axes(pressure.ndim, spatial_axes)
     inlet_difference = pressure - prescribed_pressure
     inlet_count = masks.inlet.sum(dim=axes)
     outlet_count = masks.outlet.sum(dim=axes)
@@ -232,8 +186,6 @@ def pressure_boundary_residuals(
     inlet_sample_mse = (inlet_difference.square() * masks.inlet).sum(dim=axes) / inlet_count
     outlet_sample_mean = (pressure * masks.outlet).sum(dim=axes) / outlet_count
     return PressureBoundaryResiduals(
-        inlet_error=inlet_difference[masks.inlet],
-        outlet_pressure=pressure[masks.outlet],
         inlet_sample_mse=inlet_sample_mse,
         outlet_sample_mean=outlet_sample_mean,
         masks=masks,

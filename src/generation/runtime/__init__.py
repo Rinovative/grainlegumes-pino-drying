@@ -8,6 +8,7 @@ Provides:
 - license: bounded temporary floating-license retry evidence
 - comsol: fixed COMSOL command and workspace-name conventions
 - comsol_timing: structural COMSOL scientific solver timing
+- dispatch_identity: campaign case dispatch-key syntax and step-environment identity
 - preflight: executable runtime preflight validation
 - preparation: isolated model and case-workspace preparation
 - progress: non-authoritative case runtime progress parsing and persistence
@@ -33,12 +34,9 @@ Provides:
 - runtime_cancellation_requested: inspect worker cancellation state
 - runtime_force_cancellation_requested: inspect forced worker cancellation state
 - request_runtime_cancellation: gracefully stop active worker solvers
-- request_runtime_force_cancellation: force-stop active worker solvers
-- replay_case_postprocessing: conversion/publication replay without COMSOL
-- repair_completed_case_hdf5_from_retained_exports: hash-bound completed-HDF5 repair
 - case_lock_path: persistent case-lock path resolution
-- raw_case_directory: canonical raw case-directory resolution
-- processed_case_directory: canonical processed case-directory resolution
+- raw_case_directory: canonical input directory of a case (the raw publication stage)
+- processed_case_directory: canonical result directory of a case (the processed publication stage)
 - batch_meta_directory: canonical batch-metadata directory resolution
 - initialize_batch_metadata: immutable batch-metadata publication
 - resolve_comsol_executable: configured COMSOL executable resolution
@@ -68,6 +66,7 @@ if TYPE_CHECKING:
     from . import generation_runtime_cluster as cluster
     from . import generation_runtime_comsol as comsol
     from . import generation_runtime_comsol_timing as comsol_timing
+    from . import generation_runtime_dispatch_identity as dispatch_identity
     from . import generation_runtime_host as host
     from . import generation_runtime_license as license  # noqa: A004 -- public service name
     from . import generation_runtime_preflight as preflight
@@ -104,10 +103,7 @@ if TYPE_CHECKING:
         publish_completed_case,
         raw_case_directory,
         record_case_failure,
-        repair_completed_case_hdf5_from_retained_exports,
-        replay_case_postprocessing,
         request_runtime_cancellation,
-        request_runtime_force_cancellation,
         reset_runtime_cancellation,
         run_case,
         runtime_cancellation_requested,
@@ -127,6 +123,7 @@ _MODULES = {
     "cluster": "generation_runtime_cluster",
     "comsol": "generation_runtime_comsol",
     "comsol_timing": "generation_runtime_comsol_timing",
+    "dispatch_identity": "generation_runtime_dispatch_identity",
     "host": "generation_runtime_host",
     "license": "generation_runtime_license",
     "preflight": "generation_runtime_preflight",
@@ -165,10 +162,7 @@ _BATCH_EXPORTS = frozenset(
         "publish_completed_case",
         "raw_case_directory",
         "record_case_failure",
-        "repair_completed_case_hdf5_from_retained_exports",
-        "replay_case_postprocessing",
         "request_runtime_cancellation",
-        "request_runtime_force_cancellation",
         "reset_runtime_cancellation",
         "run_case",
         "runtime_cancellation_requested",
@@ -213,6 +207,7 @@ __all__ = [
     "completed_case_is_valid",
     "comsol",
     "comsol_timing",
+    "dispatch_identity",
     "execute_prepared_case",
     "finalize_batch",
     "host",
@@ -226,10 +221,7 @@ __all__ = [
     "publish_completed_case",
     "raw_case_directory",
     "record_case_failure",
-    "repair_completed_case_hdf5_from_retained_exports",
-    "replay_case_postprocessing",
     "request_runtime_cancellation",
-    "request_runtime_force_cancellation",
     "reset_runtime_cancellation",
     "resolve_comsol_executable",
     "run_case",

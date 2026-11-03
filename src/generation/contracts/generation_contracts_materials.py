@@ -1,15 +1,15 @@
-"""
-generation_contracts_materials.py
+"""Resolve compact role-neutral material records into typed scientific registries.
 
-Resolve compact role-neutral material records into typed scientific registries.
 Responsibilities:
   - Discover material identifiers and resolve profile-specific coordinate contracts
   - Merge disjoint common, operation, and family-specific scientific owners
   - Resolve atomic density, Oswin, and kinetics records with effective provenance
+
 Design principles:
   - Material files contain family science and no campaign roles or shared controls
   - Density calibration is always sampled-rho/fixed-reference-epsilon in natural data
   - Every effective parameter exposes its scientific source and interpretation
+
 This module does NOT:
   - Assign campaign roles, counts, seeds, dataset membership, or runtime mappings
   - Invent scientific values, derivations, sources, or compatibility modes
@@ -23,7 +23,7 @@ import re
 from collections.abc import Mapping
 from decimal import ROUND_HALF_UP, Decimal
 from types import MappingProxyType
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import yaml
 
@@ -33,7 +33,11 @@ from . import generation_contracts_porosity as porosity_service
 from . import generation_contracts_provenance as provenance_service
 from . import generation_contracts_registry as registry_service
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
+_MATERIAL_CONFIG_PARTS: Final = ("configs", "01_generation", "physical_model", "materials")
 _PARAMETER_REGISTRY_SCHEMA_VERSION: Final = 1
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.smooth_len_rel",
@@ -70,9 +74,14 @@ def validate_material_family(value: object) -> str:
     return value
 
 
+def material_config_directory() -> Path:
+    """Return the maintained directory holding one YAML file per material family."""
+    return common.paths.get_project_root().joinpath(*_MATERIAL_CONFIG_PARTS)
+
+
 def available_material_families() -> tuple[str, ...]:
     """Discover validated role-neutral material identifiers from configuration files."""
-    root = common.paths.get_project_root() / "configs" / "generation" / "materials"
+    root = material_config_directory()
     paths = tuple(sorted(root.glob("*.yaml")))
     if not paths:
         message = f"Generation material configuration directory contains no YAML files: {root}."
@@ -167,11 +176,6 @@ def active_ood_groups(
         if group not in groups:
             groups.append(group)
     return tuple(groups)
-
-
-def derived_parameter_names(registry: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
-    """Return parameters whose values are derived by the typed registry."""
-    return tuple(name for name, entry in registry.items() if entry.get("kind") == "derived")
 
 
 def _mapping(value: Any, *, label: str) -> dict[str, Any]:
@@ -464,15 +468,15 @@ def _validate_density_record(
         message = f"{label}.selection_rule must be complete_record_atomic."
         raise ValueError(message)
     reference = _mapping(density["reference"], label=f"{label}.reference")
-    _exact_keys(reference, {"rho_bu_dry_ref", "eps_bed_cal_ref"}, label=f"{label}.reference")
+    _exact_keys(reference, {"rho_bu_dry_ref", "eps_bed_ref"}, label=f"{label}.reference")
     rho = _finite(reference["rho_bu_dry_ref"], label=f"{label}.reference.rho_bu_dry_ref")
-    eps = _finite(reference["eps_bed_cal_ref"], label=f"{label}.reference.eps_bed_cal_ref")
+    eps = _finite(reference["eps_bed_ref"], label=f"{label}.reference.eps_bed_ref")
     if rho <= 0 or not 0 < eps < 1:
         message = f"{label}.reference is internally inconsistent."
         raise ValueError(message)
     particle = round(rho / (1.0 - eps), 6)
     if not float(packing_support["lower"]) <= eps <= float(packing_support["upper"]):
-        message = f"{label}.reference.eps_bed_cal_ref must lie inside the material packing support."
+        message = f"{label}.reference.eps_bed_ref must lie inside the material packing support."
         raise ValueError(message)
     support = _mapping(density["rho_bu_dry_ref_support"], label=f"{label}.rho_bu_dry_ref_support")
     _exact_keys(support, {"lower", "upper", "transform"}, label=f"{label}.rho_bu_dry_ref_support")
@@ -494,7 +498,7 @@ def _validate_density_record(
     for index, raw in enumerate(raw_ood):
         item_label = f"{label}.ood_records[{index}]"
         item = _mapping(raw, label=item_label)
-        _exact_keys(item, {"record_id", "rho_bu_dry_ref", "eps_bed_cal_ref"}, optional={"basis"}, label=item_label)
+        _exact_keys(item, {"record_id", "rho_bu_dry_ref", "eps_bed_ref"}, optional={"basis"}, label=item_label)
         if item["record_id"] != expected_ids[index]:
             message = f"{item_label}.record_id must be {expected_ids[index]!r}."
             raise ValueError(message)
@@ -505,9 +509,9 @@ def _validate_density_record(
         identities.add(identity)
         values = {
             "rho_bu_dry_ref": _finite(item["rho_bu_dry_ref"], label=f"{item_label}.rho_bu_dry_ref"),
-            "eps_bed_cal_ref": _finite(item["eps_bed_cal_ref"], label=f"{item_label}.eps_bed_cal_ref"),
+            "eps_bed_ref": _finite(item["eps_bed_ref"], label=f"{item_label}.eps_bed_ref"),
         }
-        if values["rho_bu_dry_ref"] <= 0 or not 0 < values["eps_bed_cal_ref"] < 1:
+        if values["rho_bu_dry_ref"] <= 0 or not 0 < values["eps_bed_ref"] < 1:
             message = f"{item_label} has invalid density-calibration values."
             raise ValueError(message)
         if lower <= values["rho_bu_dry_ref"] <= upper:
@@ -515,20 +519,20 @@ def _validate_density_record(
             raise ValueError(message)
         expected_loose = index == 0
         directional = (
-            values["rho_bu_dry_ref"] < lower and values["eps_bed_cal_ref"] > float(packing_support["upper"])
+            values["rho_bu_dry_ref"] < lower and values["eps_bed_ref"] > float(packing_support["upper"])
             if expected_loose
-            else values["rho_bu_dry_ref"] > upper and values["eps_bed_cal_ref"] < float(packing_support["lower"])
+            else values["rho_bu_dry_ref"] > upper and values["eps_bed_ref"] < float(packing_support["lower"])
         )
         if not directional:
             message = f"{item_label} does not retain its required density/porosity OOD direction."
             raise ValueError(message)
-        inferred_particle = values["rho_bu_dry_ref"] / (1.0 - values["eps_bed_cal_ref"])
+        inferred_particle = values["rho_bu_dry_ref"] / (1.0 - values["eps_bed_ref"])
         if not math.isclose(inferred_particle, particle, rel_tol=0.0, abs_tol=2e-5):
             message = f"{item_label} must preserve the reference inferred dry particle density."
             raise ValueError(message)
         metadata = {"basis": copy.deepcopy(item["basis"])} if "basis" in item else {}
         ood_records.append({"id": identity, "values": values, "metadata": metadata})
-    density["reference"] = {"rho_bu_dry_ref": rho, "eps_bed_cal_ref": eps, "inferred_rho_particle_dry": particle}
+    density["reference"] = {"rho_bu_dry_ref": rho, "eps_bed_ref": eps, "inferred_rho_particle_dry": particle}
     density["rho_bu_dry_ref_support"] = {"lower": lower, "upper": upper, "transform": "log"}
     density["ood_records"] = ood_records
     rho_owner = {
@@ -539,7 +543,7 @@ def _validate_density_record(
         "provenance": copy.deepcopy(density["provenance"]),
     }
     eps_owner = {"value": eps, "nominal": eps, "provenance": copy.deepcopy(density["provenance"])}
-    components = ("rho_bu_dry_ref", "eps_bed_cal_ref")
+    components = ("rho_bu_dry_ref", "eps_bed_ref")
     ood_group, block = _atomic_ood_location(
         definitions,
         components,
@@ -549,7 +553,7 @@ def _validate_density_record(
         "ood_group": ood_group,
         "block": block,
         "components": list(components),
-        "units": {"rho_bu_dry_ref": "kg/m^3", "eps_bed_cal_ref": "1"},
+        "units": {"rho_bu_dry_ref": "kg/m^3", "eps_bed_ref": "1"},
         "records": ood_records,
         "selection_rule": "complete_record_atomic",
         "provenance": copy.deepcopy(density["provenance"]),
@@ -806,7 +810,7 @@ def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
     }
     required = {
         "rho_bu_dry_ref",
-        "eps_bed_cal_ref",
+        "eps_bed_ref",
         "schedule.component_weights",
         "oswin",
         *expected_derived,
@@ -815,12 +819,12 @@ def validate_vp2_registry(registry: Mapping[str, Mapping[str, Any]]) -> str:
     if missing:
         message = f"Registry is missing algorithm-bound parameters {missing}."
         raise ValueError(message)
-    if registry["rho_bu_dry_ref"]["kind"] != "interval" or registry["eps_bed_cal_ref"]["kind"] != "fixed":
-        message = "Natural density must sample rho_bu_dry_ref while eps_bed_cal_ref remains fixed."
+    if registry["rho_bu_dry_ref"]["kind"] != "interval" or registry["eps_bed_ref"]["kind"] != "fixed":
+        message = "Natural density must sample rho_bu_dry_ref while eps_bed_ref remains fixed."
         raise ValueError(message)
     if (
         registry["rho_bu_dry_ref"].get("atomic_record") != "density_calibration"
-        or registry["eps_bed_cal_ref"].get("atomic_record") != "density_calibration"
+        or registry["eps_bed_ref"].get("atomic_record") != "density_calibration"
     ):
         message = "Density components must declare one density_calibration atomic record."
         raise ValueError(message)
@@ -1056,7 +1060,7 @@ def resolve_material_definition(
         label=f"material {family}.density_calibration",
     )
     owners["rho_bu_dry_ref"] = rho_owner
-    owners["eps_bed_cal_ref"] = density_parts["eps_owner"]
+    owners["eps_bed_ref"] = density_parts["eps_owner"]
     oswin, oswin_owner = _validate_oswin_record(material["oswin"], sources=sources, label=f"material {family}.oswin")
     owners["oswin"] = oswin_owner
     kinetics, kinetics_owners, kinetics_contract = _validate_kinetics_record(
@@ -1115,7 +1119,7 @@ def resolve_material_definition(
     coupling = porosity_service.resolve_porosity_coupling(
         material_family=family,
         material_kappa_nominal=float(kappa_entry["nominal"]),
-        eps_bed_cal_ref=float(registry["eps_bed_cal_ref"]["value"]),
+        eps_bed_ref=float(registry["eps_bed_ref"]["value"]),
         authored_permeability_support=kappa_entry,
         packing_porosity_mean_support=packing,
         eps_min_global=float(registry["eps_min_global"]["value"]),

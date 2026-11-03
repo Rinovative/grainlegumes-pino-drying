@@ -1,7 +1,4 @@
-"""
-analysis_ui_viewers.py
-
-Build interactive viewers for case-level and aggregate analysis plots.
+"""Build interactive viewers for case-level and aggregate analysis plots.
 
 Responsibilities:
   - Render case-by-case Matplotlib figures inside widgets
@@ -20,8 +17,9 @@ This module does NOT:
 
 from __future__ import annotations
 
-from html import escape
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
@@ -31,7 +29,7 @@ from matplotlib.figure import Figure
 from . import analysis_ui_components as components
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Mapping
 
     import pandas as pd
 
@@ -39,6 +37,36 @@ if TYPE_CHECKING:
 # =============================================================================
 # INTERNAL HELPERS (viewer-agnostic, no semantics)
 # =============================================================================
+
+_RENDER_LOCK = Lock()
+_RENDER_GENERATIONS: WeakKeyDictionary[widgets.Output, int] = WeakKeyDictionary()
+
+
+def clear_rendered_figure(
+    *,
+    out: widgets.Output,
+    message: str,
+    export_state: dict[str, Any] | None = None,
+    export_plot_name: str | None = None,
+    export_title: str | None = None,
+) -> None:
+    """Supersede in-flight rendering before clearing a legitimate empty view."""
+    with _RENDER_LOCK:
+        _RENDER_GENERATIONS[out] = _RENDER_GENERATIONS.get(out, 0) + 1
+        if export_state is not None:
+            previous = export_state.get("fig")
+            if isinstance(previous, Figure):
+                plt.close(previous)
+            export_state.update(
+                fig=None,
+                figures=(),
+                plot_name=export_plot_name,
+                title=export_title,
+                filename_stem=None,
+            )
+        with out:
+            out.clear_output(wait=True)
+            print(message)
 
 
 def render_figure(
@@ -57,7 +85,7 @@ def render_figure(
     Parameters
     ----------
     out : ipywidgets.Output
-        Output area cleared immediately before invocation.
+        Output area updated only after the latest requested render finishes.
     plot_func : Callable[..., Any]
         Callable returning a Matplotlib figure, a tuple whose first item is a
         figure, another displayable value, or ``None``.
@@ -73,45 +101,49 @@ def render_figure(
     Notes
     -----
     Recognized figures update only the explicitly supplied panel state, are
-    displayed, and are then closed to release GUI resources. Every invocation
-    clears a prior figure first, so failures and non-figure results cannot leave a
-    stale export target.
+    displayed, and are then closed to release GUI resources. A newer request
+    supersedes an older result before either display or export publication.
 
     """
-    kwargs = kwargs or {}
-    if export_state is not None:
-        previous = export_state.get("fig")
-        if isinstance(previous, Figure):
-            plt.close(previous)
-        export_state["fig"] = None
-        export_state["figures"] = ()
-        export_state["plot_name"] = export_plot_name
-        export_state["title"] = export_title
+    with _RENDER_LOCK:
+        generation = _RENDER_GENERATIONS.get(out, 0) + 1
+        _RENDER_GENERATIONS[out] = generation
+    try:
+        result = plot_func(*args, **(kwargs or {}))
+    except Exception:
+        with _RENDER_LOCK:
+            if _RENDER_GENERATIONS.get(out) == generation:
+                if export_state is not None:
+                    previous = export_state.get("fig")
+                    if isinstance(previous, Figure):
+                        plt.close(previous)
+                    export_state.update(fig=None, figures=(), plot_name=export_plot_name, title=export_title)
+                with out:
+                    out.clear_output(wait=True)
+        raise
 
-    with out:
-        out.clear_output(wait=True)
-
-        result = plot_func(*args, **kwargs)
-
-        # Accept (fig, ...) as well
-        fig: Figure | None = None
-        if isinstance(result, Figure):
-            fig = result
-        elif isinstance(result, tuple) and len(result) > 0 and isinstance(result[0], Figure):
-            fig = result[0]
-
-        if fig is not None:
-            if export_state is not None:
-                export_state["fig"] = fig
-                export_state["figures"] = (fig,)
-
-            display(fig)
-            plt.close(fig)
+    fig: Figure | None = None
+    if isinstance(result, Figure):
+        fig = result
+    elif isinstance(result, tuple) and result and isinstance(result[0], Figure):
+        fig = result[0]
+    with _RENDER_LOCK:
+        if _RENDER_GENERATIONS.get(out) != generation:
+            if fig is not None:
+                plt.close(fig)
             return
-
-        # Non-figure results (rare): still display them
-        if result is not None:
-            display(result)
+        if export_state is not None:
+            previous = export_state.get("fig")
+            if isinstance(previous, Figure) and previous is not fig:
+                plt.close(previous)
+            export_state.update(fig=fig, figures=(fig,) if fig is not None else (), plot_name=export_plot_name, title=export_title)
+        with out:
+            out.clear_output(wait=True)
+            if fig is not None:
+                display(fig)
+                plt.close(fig)
+            elif result is not None:
+                display(result)
 
 
 def _attach_widget_rerender(
@@ -155,280 +187,7 @@ def _control_value(widget: widgets.Widget) -> Any:
 
 
 # =============================================================================
-# CONTROLLED COMPARISON VIEWER
-# =============================================================================
-
-
-def make_controlled_viewer(
-    plot_func: Callable[..., Any],
-    *,
-    datasets: dict[str, pd.DataFrame],
-    controls: Mapping[str, widgets.ValueWidget] | None = None,
-    plot_kwargs: Mapping[str, Any] | None = None,
-    allow_dataset_selection: bool = True,
-    dataset_selection: str | None = None,
-    selector_title: str = "Models / datasets",
-    export_state: dict[str, Any] | None = None,
-    export_plot_name: str | None = None,
-    export_title: str | None = None,
-) -> widgets.VBox:
-    """Build an immediately rendered view with optional selectors."""
-    if not datasets:
-        msg = "Controlled analysis viewers require at least one labelled dataset."
-        raise ValueError(msg)
-    if not isinstance(selector_title, str):
-        msg = "selector_title must be a string."
-        raise TypeError(msg)
-    if not selector_title.strip():
-        msg = "selector_title must not be blank."
-        raise ValueError(msg)
-    selection = ("checkbox" if allow_dataset_selection else "all") if dataset_selection is None else dataset_selection
-    if selection not in {"all", "checkbox", "dropdown"}:
-        msg = "dataset_selection must be 'all', 'checkbox', or 'dropdown'."
-        raise ValueError(msg)
-
-    semantic_controls = dict(controls or {})
-    fixed_kwargs = dict(plot_kwargs or {})
-    checkbox_selector = (
-        cast("components.CheckboxGroup", components.ui_checkbox_datasets(dataset_names=list(datasets)))
-        if selection == "checkbox" and len(datasets) > 1
-        else None
-    )
-    dropdown_selector = components.ui_dropdown_dataset(list(datasets)) if selection == "dropdown" and len(datasets) > 1 else None
-    output = components.ui_output_plot()
-
-    def _selected_datasets() -> dict[str, pd.DataFrame]:
-        """Return the current model selection in caller-supplied order."""
-        if checkbox_selector is not None:
-            return {name: datasets[name] for name, checkbox in checkbox_selector.boxes.items() if checkbox.value}
-        if dropdown_selector is not None:
-            selected = dropdown_selector.value
-            if not isinstance(selected, str):
-                msg = "Dataset dropdown must contain string values."
-                raise TypeError(msg)
-            return {selected: datasets[selected]}
-        return dict(datasets)
-
-    def _render(_: object = None) -> None:
-        """Render immediately from current controls, disclosing empty selections."""
-        selected = _selected_datasets()
-        if not selected:
-            if export_state is not None:
-                export_state["fig"] = None
-                export_state["plot_name"] = export_plot_name
-                export_state["title"] = export_title
-            with output:
-                output.clear_output(wait=True)
-                print(f"Select at least one {selector_title.strip().lower()}.")
-            return
-        kwargs = {name: widget.value for name, widget in semantic_controls.items()}
-        render_figure(
-            out=output,
-            plot_func=plot_func,
-            kwargs={"datasets": selected, **fixed_kwargs, **kwargs},
-            export_state=export_state,
-            export_plot_name=export_plot_name,
-            export_title=export_title,
-        )
-
-    for widget in semantic_controls.values():
-        widget.observe(_render, names="value")
-    if checkbox_selector is not None:
-        for checkbox in checkbox_selector.boxes.values():
-            checkbox.observe(_render, names="value")
-    if dropdown_selector is not None:
-        dropdown_selector.observe(_render, names="value")
-
-    _render()
-
-    children: list[widgets.Widget] = []
-    if checkbox_selector is not None:
-        children.append(widgets.VBox([widgets.HTML(f"<b>{escape(selector_title.strip())}</b>"), checkbox_selector]))
-    controls_row = [*semantic_controls.values()]
-    if dropdown_selector is not None:
-        controls_row.append(dropdown_selector)
-    if controls_row:
-        children.append(widgets.HBox(controls_row))
-    children.append(output)
-    return widgets.VBox(children)
-
-
-# =============================================================================
-# 1) CASE VIEWER (single-case visualisations)
-# =============================================================================
-
-
-def make_interactive_case_viewer(
-    plot_func: Callable[..., Any],
-    *,
-    datasets: dict[str, pd.DataFrame],
-    start_idx: int = 0,
-    enable_dataset_dropdown: bool = True,
-    extra_widgets: list[widgets.Widget] | None = None,
-    n_cases_fn: Callable[[str, pd.DataFrame], int] | None = None,
-    export_state: dict[str, Any] | None = None,
-    export_plot_name: str | None = None,
-    export_title: str | None = None,
-    **plot_kwargs: Any,
-) -> widgets.VBox:
-    """
-    Build and immediately render a case-indexed notebook viewer.
-
-    Parameters
-    ----------
-    plot_func : Callable[..., Any]
-        Called as ``plot_func(case_idx, df=..., dataset_name=..., **plot_kwargs)``.
-        the internal index is zero-based although the control displays one-based.
-    datasets : dict[str, pandas.DataFrame]
-        Labelled frames available to the viewer. The first insertion order is initial.
-    start_idx : int, optional
-        Initial zero-based case position.
-    enable_dataset_dropdown : bool, optional
-        Show a dataset selector when more than one frame is available.
-    extra_widgets : list[ipywidgets.Widget] | None, optional
-        Additional controls whose changes trigger rerendering.
-    n_cases_fn : Callable[[str, pandas.DataFrame], int] | None, optional
-        Per-frame case-count resolver. The default is ``len(frame)``.
-    export_state : dict[str, Any] | None, optional
-        Panel-local selected-figure state, or ``None`` to disable export capture.
-    export_plot_name, export_title : str | None, optional
-        Export identity supplied by the active dropdown entry.
-    **plot_kwargs : Any
-        Fixed plot arguments forwarded on every render.
-
-    Returns
-    -------
-    ipywidgets.VBox
-        Navigation controls and output containing the initial rendered result.
-
-    Notes
-    -----
-    Dataset changes rebind the case maximum and preserve the nearest valid
-    one-based control value. Rendering updates only explicit panel-local export state.
-
-    """
-    dataset_names = list(datasets.keys())
-    active_dataset = dataset_names[0]
-
-    # ------------------------------------------------------------------
-    # Dataset selector
-    # ------------------------------------------------------------------
-    dataset_dropdown = components.ui_dropdown_dataset(dataset_names) if enable_dataset_dropdown and len(dataset_names) > 1 else None
-
-    # ------------------------------------------------------------------
-    # Case index step control
-    # ------------------------------------------------------------------
-    df_active = datasets[active_dataset]
-
-    n_cases_active = n_cases_fn(active_dataset, df_active) if n_cases_fn is not None else len(df_active)
-
-    case_index, prev_btn, next_btn = components.ui_step_case_index(
-        n_cases=n_cases_active,
-        start_idx=start_idx,
-    )
-    if not isinstance(case_index, widgets.BoundedIntText):
-        msg = "Contiguous case navigation must provide a bounded integer text control."
-        raise TypeError(msg)
-
-    # ------------------------------------------------------------------
-    # Output container
-    # ------------------------------------------------------------------
-    out = components.ui_output_plot()
-    extra_widgets = extra_widgets or []
-
-    # ------------------------------------------------------------------
-    # Render logic
-    # ------------------------------------------------------------------
-    def _render() -> None:
-        """
-        Clamp and render the current dataset/case selection.
-
-        The display control is one-based. The plotting callable receives a
-        zero-based index plus the selected frame and label.
-        """
-        if dataset_dropdown is not None:
-            selected_name = dataset_dropdown.value
-            if not isinstance(selected_name, str):
-                msg = "Dataset dropdown must contain string values."
-                raise TypeError(msg)
-            name = selected_name
-        else:
-            name = active_dataset
-
-        df = datasets[name]
-
-        n_cases = n_cases_fn(name, df) if n_cases_fn is not None else len(df)
-
-        case_idx = case_index.value - 1
-        case_idx = max(0, min(n_cases - 1, case_idx))
-
-        render_figure(
-            out=out,
-            plot_func=plot_func,
-            args=(case_idx,),
-            kwargs={
-                "df": df,
-                "dataset_name": name,
-                **plot_kwargs,
-            },
-            export_state=export_state,
-            export_plot_name=export_plot_name,
-            export_title=export_title,
-        )
-
-    def _step(delta: int) -> None:
-        """Move the one-based case control without crossing dataset bounds."""
-        case_index.value = max(
-            1,
-            min(case_index.max, case_index.value + delta),
-        )
-
-    # ------------------------------------------------------------------
-    # Wiring
-    # ------------------------------------------------------------------
-    prev_btn.on_click(lambda _: _step(-1))
-    next_btn.on_click(lambda _: _step(1))
-    case_index.observe(lambda _: _render(), names="value")
-
-    if dataset_dropdown is not None:
-
-        def _on_dataset_change(change: dict) -> None:
-            """Rebind case bounds and rerender after a dataset selection change."""
-            df_new = datasets[change["new"]]
-
-            n_cases_new = n_cases_fn(change["new"], df_new) if n_cases_fn is not None else len(df_new)
-
-            case_index.max = n_cases_new
-            case_index.value = min(case_index.value, n_cases_new)
-            _render()
-
-        dataset_dropdown.observe(_on_dataset_change, names="value")
-
-    _attach_widget_rerender(extra_widgets, _render)
-
-    # Initial render
-    _render()
-
-    # ------------------------------------------------------------------
-    # Layout
-    # ------------------------------------------------------------------
-    header_items: list[widgets.Widget] = [
-        case_index,
-        prev_btn,
-        next_btn,
-        *extra_widgets,
-    ]
-
-    if dataset_dropdown is not None:
-        header_items.append(dataset_dropdown)
-
-    header = widgets.HBox(header_items)
-
-    return widgets.VBox([header, out])
-
-
-# =============================================================================
-# 2) CASECOUNT VIEWER (multi-case aggregations)
+# CASECOUNT VIEWER (multi-case aggregations)
 # =============================================================================
 
 
@@ -454,9 +213,10 @@ def make_casecount_viewer(
     if not isinstance(step_size, int) or isinstance(step_size, bool) or step_size <= 0:
         msg = "step_size must be a positive integer."
         raise ValueError(msg)
-    max_cases_global = min(len(df) for df in datasets.values())
+    default_cases = min(len(df) for df in datasets.values())
+    max_cases_global = max(len(df) for df in datasets.values())
     case_count, prev_btn, next_btn = components.ui_step_case_count(
-        start_cases=min(start_cases, max_cases_global),
+        start_cases=min(start_cases, default_cases),
         min_cases=0,
         max_cases=max_cases_global,
         step_size=step_size,
@@ -480,13 +240,13 @@ def make_casecount_viewer(
         """Render the selected saved-membership prefix without a confirmation step."""
         selected = _selected_datasets()
         if not selected:
-            if export_state is not None:
-                export_state["fig"] = None
-                export_state["plot_name"] = export_plot_name
-                export_state["title"] = export_title
-            with output:
-                output.clear_output(wait=True)
-                print(f"Select at least one {selector_title.strip().lower()}.")
+            clear_rendered_figure(
+                out=output,
+                message=f"Select at least one {selector_title.strip().lower()}.",
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
+            )
             return
         render_figure(
             out=output,
@@ -614,234 +374,3 @@ def make_indexed_viewer(
     if dataset_dropdown is not None:
         header_items.append(dataset_dropdown)
     return widgets.VBox([widgets.HBox(header_items), output])
-
-
-# =============================================================================
-# 3) DATASET CASE-SCOPE VIEWER (aggregate and synchronized single cases)
-# =============================================================================
-
-
-def make_dataset_case_scope_viewer(  # noqa: C901, PLR0915
-    *,
-    datasets: dict[str, pd.DataFrame],
-    case_numbers_by_dataset: Mapping[str, Sequence[int]],
-    single_plot_func: Callable[..., Any],
-    aggregate_plot_func: Callable[..., Any] | None = None,
-    controls: Mapping[str, widgets.ValueWidget] | None = None,
-    start_cases: int = 100,
-    step_size: int = 50,
-    export_state: dict[str, Any] | None = None,
-    export_plot_name: str | None = None,
-    export_title: str | None = None,
-) -> widgets.VBox:
-    """Render selected datasets in aggregate or synchronized case-number scope."""
-    if not datasets or any(frame.empty for frame in datasets.values()):
-        msg = "Dataset case viewers require non-empty labelled frames."
-        raise ValueError(msg)
-    if tuple(case_numbers_by_dataset) != tuple(datasets):
-        msg = "Case-number metadata must match dataset labels and order."
-        raise ValueError(msg)
-    normalized_numbers = {name: tuple(case_numbers_by_dataset[name]) for name in datasets}
-    semantic_controls = dict(controls or {})
-    if any(not numbers for numbers in normalized_numbers.values()):
-        msg = "Every dataset must expose at least one navigable case number."
-        raise ValueError(msg)
-
-    selector = cast("components.CheckboxGroup", components.ui_checkbox_datasets(dataset_names=list(datasets)))
-    selected_names = list(datasets)
-
-    def _shared_numbers(names: Sequence[str]) -> tuple[int, ...]:
-        """Preserve the first selected manifest order while intersecting IDs."""
-        if not names:
-            return ()
-        shared = set(normalized_numbers[names[0]])
-        for name in names[1:]:
-            shared.intersection_update(normalized_numbers[name])
-        return tuple(number for number in normalized_numbers[names[0]] if number in shared)
-
-    shared_numbers = _shared_numbers(selected_names)
-    if not shared_numbers:
-        msg = "Initially selected datasets have no shared case numbers."
-        raise ValueError(msg)
-    case_number, previous_case, next_case = components.ui_step_case_index(case_numbers=shared_numbers)
-    max_cases = min(len(datasets[name]) for name in selected_names)
-    case_count, fewer_cases, more_cases = components.ui_step_case_count(
-        start_cases=min(start_cases, max_cases),
-        min_cases=1,
-        max_cases=max_cases,
-        step_size=step_size,
-    )
-    scope = None
-    if aggregate_plot_func is not None:
-        scope = widgets.ToggleButtons(
-            options=(("Aggregate", "aggregate"), ("Single case", "single")),
-            value="aggregate",
-        )
-    control_bar = widgets.HBox(layout=widgets.Layout(align_items="center"))
-    output = components.ui_output_plot()
-    state = {"updating": False}
-    case_state = {"options": shared_numbers, "last_valid": case_number.value}
-
-    def _active_names() -> list[str]:
-        """Return checked dataset labels in stable input order."""
-        return [name for name, checkbox in selector.boxes.items() if checkbox.value]
-
-    def _show_message(message: str) -> None:
-        """Replace the current result with one actionable selection message."""
-        if export_state is not None:
-            export_state["fig"] = None
-            export_state["plot_name"] = export_plot_name
-            export_state["title"] = export_title
-        with output:
-            output.clear_output(wait=True)
-            print(message)
-
-    def _single_scope() -> bool:
-        """Return whether the current viewer renders individual cases."""
-        return scope is None or scope.value == "single"
-
-    def _sync_case_buttons() -> None:
-        """Disable case arrows exactly at the current sparse-option bounds."""
-        options = case_state["options"]
-        if not options or case_number.value not in options:
-            previous_case.disabled = True
-            next_case.disabled = True
-            return
-        position = options.index(case_number.value)
-        previous_case.disabled = position == 0
-        next_case.disabled = position == len(options) - 1
-
-    def _update_controls() -> None:
-        """Expose only controls relevant to the active scientific scope."""
-        prefix: list[widgets.Widget] = [] if scope is None else [scope]
-        local_controls = tuple(semantic_controls.values())
-        if _single_scope():
-            control_bar.children = (*prefix, *local_controls, case_number, previous_case, next_case, selector)
-        else:
-            control_bar.children = (*prefix, *local_controls, case_count, fewer_cases, more_cases, selector)
-
-    def _render() -> None:
-        """Render once from the current validated selection state."""
-        if state["updating"]:
-            return
-        names = _active_names()
-        if not names:
-            _show_message("Select at least one dataset.")
-            return
-        selected = {name: datasets[name] for name in names}
-        if _single_scope():
-            shared = _shared_numbers(names)
-            if not shared:
-                _show_message("Selected datasets have no shared case numbers. Choose a different dataset combination.")
-                return
-            if case_number.value not in shared:
-                _show_message("Enter a case number shared by every selected dataset, or use the arrows.")
-                return
-            render_figure(
-                out=output,
-                plot_func=single_plot_func,
-                kwargs={
-                    "datasets": selected,
-                    "case_number": int(case_number.value),
-                    **{name: widget.value for name, widget in semantic_controls.items()},
-                },
-                export_state=export_state,
-                export_plot_name=export_plot_name,
-                export_title=export_title,
-            )
-            return
-        if aggregate_plot_func is None:
-            msg = "Aggregate rendering is unavailable for this view."
-            raise RuntimeError(msg)
-        render_figure(
-            out=output,
-            plot_func=aggregate_plot_func,
-            kwargs={
-                "datasets": selected,
-                "max_cases": int(case_count.value),
-                **{name: widget.value for name, widget in semantic_controls.items()},
-            },
-            export_state=export_state,
-            export_plot_name=export_plot_name,
-            export_title=export_title,
-        )
-
-    def _rebind_dataset_state(_: object = None) -> None:
-        """Recompute valid common IDs and aggregate bounds, then render once."""
-        names = _active_names()
-        if not names:
-            case_state["options"] = ()
-            previous_case.disabled = True
-            next_case.disabled = True
-            _render()
-            return
-        state["updating"] = True
-        try:
-            shared = _shared_numbers(names)
-            case_state["options"] = shared
-            old_number = case_number.value
-            if shared:
-                selected_number = old_number if old_number in shared else shared[0]
-                case_state["last_valid"] = selected_number
-                case_number.value = selected_number
-            _sync_case_buttons()
-            maximum = min(len(datasets[name]) for name in names)
-            case_count.max = maximum
-            case_count.value = min(case_count.value, maximum)
-        finally:
-            state["updating"] = False
-        _render()
-
-    def _step_case(delta: int) -> None:
-        """Move through the current sparse shared-number options."""
-        options = case_state["options"]
-        if not options or case_number.value not in options:
-            return
-        current = options.index(case_number.value)
-        case_number.value = options[max(0, min(len(options) - 1, current + delta))]
-
-    def _step_count(delta: int) -> None:
-        """Move the aggregate prefix count within the selected-frame bound."""
-        case_count.value = max(case_count.min, min(case_count.max, case_count.value + delta * step_size))
-
-    def _on_case_change(_: object = None) -> None:
-        """Validate a typed case number, then update navigation and render once."""
-        if state["updating"]:
-            return
-        requested_number = case_number.value
-        if requested_number not in case_state["options"]:
-            state["updating"] = True
-            try:
-                case_number.value = case_state["last_valid"]
-            finally:
-                state["updating"] = False
-            _sync_case_buttons()
-            _show_message(f"Case {requested_number} is unavailable for the selected datasets. Enter a shared case number or use the arrows.")
-            return
-        case_state["last_valid"] = requested_number
-        _sync_case_buttons()
-        _render()
-
-    previous_case.on_click(lambda _: _step_case(-1))
-    next_case.on_click(lambda _: _step_case(1))
-    fewer_cases.on_click(lambda _: _step_count(-1))
-    more_cases.on_click(lambda _: _step_count(1))
-    case_number.observe(_on_case_change, names="value")
-    case_count.observe(lambda _: _render(), names="value")
-    for widget in semantic_controls.values():
-        widget.observe(lambda _: _render(), names="value")
-    for checkbox in selector.boxes.values():
-        checkbox.observe(_rebind_dataset_state, names="value")
-    if scope is not None:
-
-        def _on_scope_change(_: object = None) -> None:
-            """Update the active control surface and render the new scope once."""
-            _update_controls()
-            _render()
-
-        scope.observe(_on_scope_change, names="value")
-
-    _sync_case_buttons()
-    _update_controls()
-    _render()
-    return widgets.VBox([control_bar, output])

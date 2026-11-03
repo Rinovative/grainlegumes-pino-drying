@@ -1,7 +1,4 @@
-"""
-eda_viewers.py
-
-Build shared-state live viewers for adaptive generated-output EDA.
+"""Build shared-state live viewers for adaptive generated-output EDA.
 
 Responsibilities:
   - Bind shared dataset, case, channel, and time state to scientific plots
@@ -25,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
+import numpy as np
 from IPython.display import display
 from matplotlib.figure import Figure
 
@@ -32,6 +30,7 @@ from src.analysis import ui
 
 from . import eda_capabilities as capabilities
 from . import eda_controls as controls
+from . import eda_dataframe as dataframe
 from . import eda_selection as selection
 from . import eda_transient as transient
 from . import plots
@@ -40,6 +39,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     import pandas as pd
+
+    from src.analysis.presentation import analysis_display_grid as display_grid
 
 _TransientCaseKind = Literal["snapshot", "trajectory"]
 _MINIMUM_COMPARABLE_MAP_COUNT = 2
@@ -275,9 +276,10 @@ def make_spectral_view(
         include_case=True,
     )
     selected_views = local.selected_views()
-    initial_maximum = min(view.case_count for view in selected_views)
+    initial_count = min(view.case_count for view in selected_views)
+    initial_maximum = max(view.case_count for view in selected_views)
     case_count, fewer, more = ui.components.ui_step_case_count(
-        start_cases=min(100, initial_maximum),
+        start_cases=min(100, initial_count),
         min_cases=1,
         max_cases=initial_maximum,
         step_size=50,
@@ -378,7 +380,7 @@ def make_spectral_view(
         frames = local.selected_frames()
         selected = local.selected_views()
         if selected:
-            maximum = min(view.case_count for view in selected)
+            maximum = max(view.case_count for view in selected)
             state["updating"] = True
             try:
                 case_count.max = maximum
@@ -510,6 +512,7 @@ def make_spatial_case_view(
     export_state: dict[str, Any] | None,
     export_plot_name: str | None,
     export_title: str | None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> ActivatableView:
     """Build the common steady/transient single-case spatial-field view."""
     local = controls.GeneratedOutputControls(
@@ -564,6 +567,7 @@ def make_spatial_case_view(
             plot_func=plots.transient.plot_spatial_field_comparison,
             kwargs={
                 "datasets": frames,
+                "display_spatial_stride": display_spatial_stride,
                 "case_ids": case_ids,
                 "fields": selected_fields,
                 "lock_scale": bool(scale_lock.value),
@@ -700,6 +704,7 @@ def _make_transient_snapshot_view(
     export_state: dict[str, Any] | None,
     export_plot_name: str | None,
     export_title: str | None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> ActivatableView:
     """Build the single-case schedule-and-state snapshot comparison."""
     required = ("transient_state", "physical_time")
@@ -758,6 +763,7 @@ def _make_transient_snapshot_view(
             plot_func=plots.transient.plot_state_snapshot_comparison,
             kwargs={
                 "datasets": frames,
+                "display_spatial_stride": display_spatial_stride,
                 "case_ids": case_ids,
                 "physical_time_hours": navigator.selection.physical_time,
                 "channels": channels,
@@ -900,9 +906,10 @@ def _make_transient_trajectory_view(
         include_case=True,
     )
     selected_views = local.selected_views()
-    initial_maximum = min(view.case_count for view in selected_views)
+    initial_count = min(view.case_count for view in selected_views)
+    initial_maximum = max(view.case_count for view in selected_views)
     case_count, fewer, more = ui.components.ui_step_case_count(
-        start_cases=min(100, initial_maximum),
+        start_cases=min(100, initial_count),
         min_cases=1,
         max_cases=initial_maximum,
         step_size=50,
@@ -989,7 +996,7 @@ def _make_transient_trajectory_view(
         frames = local.selected_frames()
         selected = local.selected_views()
         if selected:
-            maximum = min(view.case_count for view in selected)
+            maximum = max(view.case_count for view in selected)
             updating["value"] = True
             try:
                 case_count.max = maximum
@@ -1056,10 +1063,12 @@ def make_transient_case_view(
     export_state: dict[str, Any] | None,
     export_plot_name: str | None,
     export_title: str | None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> ActivatableView:
     """Build one maintained transient snapshot or trajectory view."""
     if kind == "snapshot":
         return _make_transient_snapshot_view(
+            display_spatial_stride=display_spatial_stride,
             catalog=catalog,
             selection_state=selection_state,
             export_state=export_state,
@@ -1139,5 +1148,112 @@ def make_completion_target_view(
         (local.status, output),
         activate=activate,
     )
+    view.activate()
+    return view
+
+
+def make_published_tensor_view(
+    *,
+    catalog: selection.GeneratedOutputEDACatalog,
+    selection_state: selection.GeneratedOutputSelectionState,
+    export_state: dict[str, Any] | None,
+    export_plot_name: str | None,
+    export_title: str | None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
+) -> ActivatableView:
+    """Inspect one actual package case and retain its selected tensor for export."""
+    local = controls.GeneratedOutputControls(catalog, selection_state=selection_state, include_case=True)
+    field = widgets.Dropdown(description="Tensor:", style={"description_width": "initial"})
+    step = widgets.BoundedIntText(value=0, min=0, max=0, description="Transition:")
+    output = ui.components.ui_output_plot()
+    updating = False
+    binding_controls = False
+    generation = 0
+    pending = False
+
+    def update() -> None:
+        """Use the admitted cached case; selection changes never fit a normalizer."""
+        nonlocal updating, binding_controls, generation, pending
+        if binding_controls:
+            return
+        generation += 1
+        request = generation
+        if updating:
+            pending = True
+            return
+        if not _is_active(export_state, export_plot_name):
+            return
+        pending = False
+        views = local.selected_views()
+        if len(views) != 1 or not isinstance(views[0], selection.PublishedDatasetEDAView):
+            _show_message(
+                output,
+                "Select exactly one published Dataset for tensor inspection.",
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
+            )
+            return
+        case_id = local.selected_case_ids().get(views[0].label)
+        if case_id is None:
+            return
+        updating = True
+        figure: Figure | None = None
+        try:
+            frame = views[0].load()
+            if request != generation or not _is_active(export_state, export_plot_name):
+                return
+            row = frame.loc[case_id]
+            is_transient = views[0].task_id == "transient_drying"
+            binding_controls = True
+            try:
+                step.disabled = not is_transient
+                step.max = len(row["time"]["transition_t_n_hours"]) - 1 if is_transient else 0
+                values = dataframe.published_tensor_values(frame, case_id, transition=int(step.value))
+                options = tuple((f"{value.group}: {value.name} [{value.unit}]", (value.group, value.name)) for value in values)
+                if field.options != options:
+                    previous = field.value
+                    field.options = options
+                    if previous in tuple(key for _label, key in options):
+                        field.value = previous
+            finally:
+                binding_controls = False
+            selected = next(value for value in values if (value.group, value.name) == field.value)
+            coordinates = row["static_fields"] if is_transient else row
+            _set_export_identity(export_state, export_plot_name=export_plot_name, export_title=export_title, clear_figure=True)
+            figure = plots.case_statistics.plot_published_tensor(
+                selected, display_spatial_stride=display_spatial_stride, x=np.asarray(coordinates["x"]), y=np.asarray(coordinates["y"])
+            )
+            if request != generation or not _is_active(export_state, export_plot_name):
+                return
+            if export_state is not None:
+                export_state["fig"] = figure
+                export_state["figures"] = (figure,)
+            with output:
+                output.clear_output(wait=True)
+                print(f"Case {case_id}: {selected.purpose}; {selected.support}.")
+                print(frame.attrs["normalization"])
+                if is_transient:
+                    time = row["time"]
+                    index = int(step.value)
+                    print(f"Stored interval: {time['transition_t_n_hours'][index]:g} to {time['transition_t_n_plus_1_hours'][index]:g} h.")
+                display(figure)
+        finally:
+            if figure is not None:
+                plt.close(figure)
+            updating = False
+            if pending:
+                pending = False
+                update()
+
+    def activate() -> None:
+        """Activate existing controls without replacing selected tensor state."""
+        _set_export_identity(export_state, export_plot_name=export_plot_name, export_title=export_title)
+        local.activate()
+
+    field.observe(lambda _change: update(), names="value")
+    step.observe(lambda _change: update(), names="value")
+    local.set_callback(update)
+    view = ActivatableView((local.widget, widgets.HBox((field, step)), output), activate=activate)
     view.activate()
     return view

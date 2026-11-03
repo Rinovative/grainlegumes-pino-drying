@@ -1,0 +1,33 @@
+# Role: Dataset plan: materials, case counts and split of one Dataset. Edit: whenever you define a Dataset.
+# One ordinary Dataset plan: physical Sources carry no Dataset roles.
+schema_kind: dataset_plan
+schema_version: 2
+task: steady_flow  # Learning task this Dataset is built for.
+generation:
+  sources_config: configs/01_generation/physical_model/sources.yaml  # Literature/evidence catalogue used by the referenced physical parameters.
+  registry_config: configs/01_generation/physical_model/registry.yaml  # Registered material/parameter definitions, units and sampling categories.
+  common_config: configs/01_generation/physical_model/common.yaml  # Shared physical constants, grid and physical output schedule defaults.
+  operations_config: configs/01_generation/physical_model/fixed_bed.yaml  # Bed geometry and operating assumptions; this plan does not duplicate them.
+  profile_config: configs/01_generation/physical_model/profiles/steady_flow.yaml  # Steady-flow task/model, exported fields and stationary-solution contract.
+  execution_config: configs/01_generation/execution.yaml  # Slurm resources, concurrency, timeouts and existing retry policy (not physics).
+  sampling:
+    method: lhs  # Existing full-design LHS. Changing N creates a different design, not a prefix.
+    seed_base: 9300  # Nominal Generation root; material/block/candidate seeds derive unchanged. Independent of Dataset case ranking, Dataset split and network training seeds.
+  replacement_capacity: 5  # Pre-registered Sobol replacements per material for terminally failed originals (N for all, or MATERIAL: N); 0 disables replacement.
+  domain_profile: reference_range  # Natural/reference physical sampling branches from the maintained configs; this is a physical domain label, not a train/test or OOD assignment.
+materials:
+  lentil:
+    count: 50  # Original physical design size and selected-success target; failed cases are never silently replaced.
+    role: id  # id splits this material into Train/validation/ID-test below; ood holds the whole material out.
+  chickpea:
+    count: 50  # Original physical design size and selected-success target; failed cases are never silently replaced.
+    role: id  # id splits this material into Train/validation/ID-test below; ood holds the whole material out.
+selection_seed: 9301  # Ranks/orders successful Source cases before freezing membership; no new points, physical seed change or LHS repair. Exact selected identities are retained.
+split:
+  seed: 9  # Dataset-only nominal seed, independent of the network/training seed. Existing derive_subseed(9, 'split') gives 1028622135437308793, recorded once.
+  # Fractions apply separately per ID material.
+  # Existing floors: int(N*train), int(N*validation), remainder to ID-test.
+  # N=50 gives 40/5/5; small N needs explicit valid fraction/count overrides.
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  id_test_fraction: 0.1

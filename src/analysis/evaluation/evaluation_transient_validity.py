@@ -1,10 +1,19 @@
-"""
-Classify transient artifact predictions without altering model output values.
+"""Classify transient artifact predictions without altering model output values.
 
-This module owns analysis-only validity evidence for the raw scaled model
-output, decoded physical increment, and reconstructed physical state. Source
-Dataset, reference, scaling, and grid admission remain strict in their existing
-owners.
+Responsibilities:
+  - Classify raw scaled outputs, physical increments and reconstructed states
+  - Apply the phi range [0, 1.10] and exclude the 2x2 spatial corner blocks from physical invalidity
+  - Locate invalid predictions and retain stage and channel denominators
+  - Validate persisted record diagnostics and aggregate unique prediction chains
+
+Design principles:
+  - Computed-prefix availability remains separate from raw numerical validity
+  - Nonfinite and physical-domain violations remain explicit analysis evidence
+  - Diagnostics are recomputed against arrays without repairing their values
+
+This module does NOT:
+  - Relax Source, Dataset, reference, scaling or grid admission
+  - Clamp predictions, run models or publish sequence payloads
 """
 
 from __future__ import annotations
@@ -18,9 +27,7 @@ import numpy as np
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
-# ruff: noqa: EM101, PLR2004, TRY003
-
-PREDICTION_VALIDITY_SCHEMA_VERSION: Final = 1
+PREDICTION_VALIDITY_SCHEMA_VERSION: Final = 2
 VALID: Final = "VALID"
 FINITE_BUT_PHYSICALLY_INVALID: Final = "FINITE_BUT_PHYSICALLY_INVALID"
 NONFINITE: Final = "NONFINITE"
@@ -36,6 +43,8 @@ PREDICTION_VALIDITY_STATUSES: Final[tuple[PredictionValidityStatus, ...]] = (
 )
 STATE_ORDER: Final = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
 TEMPERATURE_RANGE_K: Final = (0.0, 2_000.0)
+PHI_RANGE: Final = (0.0, 1.10)
+EXCLUDED_CORNER_BLOCK: Final = 2
 _STATUS_PRECEDENCE: Final = {
     VALID: 0,
     FINITE_BUT_PHYSICALLY_INVALID: 1,
@@ -47,6 +56,8 @@ _STAGE_NAMES: Final = (
     "reconstructed_state",
 )
 _MINIMUM_PREDICTION_RANK: Final = 3
+
+_SPATIAL_INDEX_AXES = ("x", "y")
 
 
 def _prediction_array(value: Any, *, label: str) -> np.ndarray:
@@ -93,9 +104,24 @@ def prediction_physical_invalid_mask(states: Any) -> np.ndarray:
     invalid = np.zeros(array.shape, dtype=bool)
     lower, upper = TEMPERATURE_RANGE_K
     invalid[:, 0] = finite[:, 0] & ((array[:, 0] < lower) | (array[:, 0] > upper))
-    invalid[:, 1] = finite[:, 1] & ((array[:, 1] < 0.0) | (array[:, 1] > 1.0))
+    invalid[:, 1] = finite[:, 1] & ((array[:, 1] < PHI_RANGE[0]) | (array[:, 1] > PHI_RANGE[1]))
     invalid[:, 2:] = finite[:, 2:] & (array[:, 2:] < 0.0)
+    block = EXCLUDED_CORNER_BLOCK
+    for rows in (slice(None, block), slice(-block, None)):
+        for columns in (slice(None, block), slice(-block, None)):
+            invalid[..., rows, columns] = False
     return invalid
+
+
+def _physical_contract() -> dict[str, Any]:
+    """Return the persisted physical-validity rule."""
+    return {
+        "T_kelvin_inclusive": list(TEMPERATURE_RANGE_K),
+        "phi_inclusive": list(PHI_RANGE),
+        "w_surf_minimum_inclusive": 0.0,
+        "w_int_minimum_inclusive": 0.0,
+        "excluded_corner_block": EXCLUDED_CORNER_BLOCK,
+    }
 
 
 def _channel_counts(
@@ -182,9 +208,11 @@ def build_prediction_validity(
 ) -> dict[str, Any]:
     """Build exact JSON-safe prediction diagnostics for one sequence record."""
     if not isinstance(mode, str) or not mode:
-        raise TypeError("Prediction validity mode must be non-empty text.")
+        msg = "Prediction validity mode must be non-empty text."
+        raise TypeError(msg)
     if isinstance(origin_index, bool) or not isinstance(origin_index, Integral) or origin_index < 0:
-        raise ValueError("Prediction validity origin_index must be non-negative.")
+        msg = "Prediction validity origin_index must be non-negative."
+        raise ValueError(msg)
     scaled = _prediction_array(
         scaled_model_outputs,
         label="scaled_model_outputs",
@@ -252,15 +280,17 @@ def build_prediction_validity(
             mode=mode,
             origin_index=int(origin_index),
         ),
-        "physical_contract": {
-            "T_kelvin_inclusive": list(TEMPERATURE_RANGE_K),
-            "phi_inclusive": [0.0, 1.0],
-            "w_surf_minimum_inclusive": 0.0,
-            "w_int_minimum_inclusive": 0.0,
-        },
+        "physical_contract": _physical_contract(),
     }
     common.serialization.canonical_json_sha256(result)
     return result
+
+
+def _require_schema_version(version: Any) -> None:
+    """Reject superseded or unknown validity schema versions."""
+    if version != PREDICTION_VALIDITY_SCHEMA_VERSION:
+        msg = f"Prediction validity schema_version {version!r} is unsupported; expected {PREDICTION_VALIDITY_SCHEMA_VERSION}."
+        raise ValueError(msg)
 
 
 def validate_prediction_validity_document(  # noqa: C901, PLR0912
@@ -268,7 +298,8 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
 ) -> dict[str, Any]:
     """Admit one JSON-safe record diagnostic without loading numerical payloads."""
     if not isinstance(value, Mapping):
-        raise TypeError("prediction_validity must be one mapping.")
+        msg = "prediction_validity must be one mapping."
+        raise TypeError(msg)
     document = dict(value)
     required = {
         "schema_version",
@@ -286,15 +317,17 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         "physical_contract",
     }
     if set(document) != required:
-        raise ValueError("Prediction validity fields do not match the schema.")
+        msg = "Prediction validity fields do not match the schema."
+        raise ValueError(msg)
+    _require_schema_version(document["schema_version"])
     if (
-        document["schema_version"] != PREDICTION_VALIDITY_SCHEMA_VERSION
-        or document["status"] not in PREDICTION_VALIDITY_STATUSES
+        document["status"] not in PREDICTION_VALIDITY_STATUSES
         or document["count_scope"] != "all_evaluation_grid_cells_in_computed_model_outputs"
         or not isinstance(document["mode"], str)
         or not document["mode"]
     ):
-        raise ValueError("Prediction validity identity or status is invalid.")
+        msg = "Prediction validity identity or status is invalid."
+        raise ValueError(msg)
     count_fields = (
         "origin_index",
         "requested_step_count",
@@ -303,9 +336,11 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         "uncomputed_value_count",
     )
     if any(isinstance(document[name], bool) or not isinstance(document[name], Integral) or int(document[name]) < 0 for name in count_fields):
-        raise ValueError("Prediction validity counts must be non-negative integers.")
+        msg = "Prediction validity counts must be non-negative integers."
+        raise ValueError(msg)
     if document["requested_step_count"] != document["computed_step_count"] + document["uncomputed_step_count"] or document["computed_step_count"] < 1:
-        raise ValueError("Prediction validity step counts are contradictory.")
+        msg = "Prediction validity step counts are contradictory."
+        raise ValueError(msg)
 
     def admit_channels(
         raw: Any,
@@ -313,7 +348,8 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         physical_validity_defined: bool,
     ) -> dict[str, Any]:
         if not isinstance(raw, Mapping) or set(raw) != set(STATE_ORDER):
-            raise ValueError("Prediction validity channels do not match state order.")
+            msg = "Prediction validity channels do not match state order."
+            raise ValueError(msg)
         expected_fields = {
             "total_value_count",
             "finite_value_count",
@@ -332,19 +368,22 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
                 or set(counts) != expected_fields
                 or any(isinstance(item, bool) or not isinstance(item, Integral) or int(item) < 0 for item in counts.values())
             ):
-                raise ValueError("Prediction validity channel counts are invalid.")
+                msg = "Prediction validity channel counts are invalid."
+                raise ValueError(msg)
             if (
                 counts["total_value_count"] != counts["finite_value_count"] + counts["nonfinite_value_count"]
                 or counts["nonfinite_value_count"] != counts["nan_count"] + counts["positive_infinity_count"] + counts["negative_infinity_count"]
                 or (physical_validity_defined and counts["physically_invalid_finite_count"] > counts["finite_value_count"])
             ):
-                raise ValueError("Prediction validity channel count arithmetic is invalid.")
+                msg = "Prediction validity channel count arithmetic is invalid."
+                raise ValueError(msg)
             result[channel] = dict(counts)
         return result
 
     stages = document["stages"]
     if not isinstance(stages, Mapping) or set(stages) != set(_STAGE_NAMES):
-        raise ValueError("Prediction validity stages do not match the schema.")
+        msg = "Prediction validity stages do not match the schema."
+        raise ValueError(msg)
     admitted_stages: dict[str, Any] = {}
     for stage_name in _STAGE_NAMES:
         stage = stages[stage_name]
@@ -354,7 +393,8 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
             or set(stage) != {"physical_validity_defined", "channels"}
             or stage["physical_validity_defined"] is not defined
         ):
-            raise ValueError("Prediction validity stage evidence is invalid.")
+            msg = "Prediction validity stage evidence is invalid."
+            raise ValueError(msg)
         admitted_stages[stage_name] = {
             "physical_validity_defined": defined,
             "channels": admit_channels(
@@ -367,26 +407,32 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         physical_validity_defined=True,
     )
     if channels != admitted_stages["reconstructed_state"]["channels"]:
-        raise ValueError("Prediction validity reconstructed channel counts disagree.")
+        msg = "Prediction validity reconstructed channel counts disagree."
+        raise ValueError(msg)
     total_value_counts = {int(counts["total_value_count"]) for stage in admitted_stages.values() for counts in stage["channels"].values()}
     computed_steps = int(document["computed_step_count"])
     if len(total_value_counts) != 1 or next(iter(total_value_counts)) < computed_steps or next(iter(total_value_counts)) % computed_steps:
-        raise ValueError("Prediction validity stages do not share one exact computed grid support.")
+        msg = "Prediction validity stages do not share one exact computed grid support."
+        raise ValueError(msg)
     grid_value_count = next(iter(total_value_counts)) // computed_steps
     expected_uncomputed_values = int(document["uncomputed_step_count"]) * len(STATE_ORDER) * grid_value_count
     if document["uncomputed_value_count"] != expected_uncomputed_values:
-        raise ValueError("Prediction validity uncomputed count contradicts its grid support.")
+        msg = "Prediction validity uncomputed count contradicts its grid support."
+        raise ValueError(msg)
     total_nonfinite = sum(counts["nonfinite_value_count"] for stage in admitted_stages.values() for counts in stage["channels"].values())
     total_physical = sum(counts["physically_invalid_finite_count"] for counts in channels.values())
     if document["uncomputed_step_count"] and not total_nonfinite:
-        raise ValueError("Prediction validity uncomputed tails require preserved non-finite evidence.")
+        msg = "Prediction validity uncomputed tails require preserved non-finite evidence."
+        raise ValueError(msg)
     expected_status = NONFINITE if total_nonfinite else (FINITE_BUT_PHYSICALLY_INVALID if total_physical else VALID)
     if document["status"] != expected_status:
-        raise ValueError("Prediction validity status contradicts its counts.")
+        msg = "Prediction validity status contradicts its counts."
+        raise ValueError(msg)
     first = document["first_invalid"]
     if expected_status == VALID:
         if first is not None:
-            raise ValueError("Valid prediction evidence cannot identify an invalid value.")
+            msg = "Valid prediction evidence cannot identify an invalid value."
+            raise ValueError(msg)
     elif (
         not isinstance(first, Mapping)
         or set(first)
@@ -409,13 +455,14 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         or first["channel"] not in STATE_ORDER
         or first["channel_index"] != STATE_ORDER.index(first["channel"])
         or not isinstance(first["spatial_index"], list)
-        or len(first["spatial_index"]) != 2
+        or len(first["spatial_index"]) != len(_SPATIAL_INDEX_AXES)
         or any(isinstance(index, bool) or not isinstance(index, Integral) or index < 0 for index in first["spatial_index"])
         or isinstance(first["physical_time"], bool)
         or not isinstance(first["physical_time"], Real)
         or not np.isfinite(float(first["physical_time"]))
     ):
-        raise ValueError("Prediction validity first-invalid evidence is invalid.")
+        msg = "Prediction validity first-invalid evidence is invalid."
+        raise ValueError(msg)
     if isinstance(first, Mapping):
         rollout_step = first["rollout_step"]
         transition_index = first["transition_index"]
@@ -427,22 +474,20 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
             or not isinstance(transition_index, Integral)
             or int(transition_index) != int(document["origin_index"]) + int(rollout_step) - 1
         ):
-            raise ValueError("Prediction validity first-invalid sequence coordinates are invalid.")
+            msg = "Prediction validity first-invalid sequence coordinates are invalid."
+            raise ValueError(msg)
         stage_counts = admitted_stages[str(first["stage"])]["channels"][str(first["channel"])]
         if first["kind"] == NONFINITE:
             if stage_counts["nonfinite_value_count"] < 1:
-                raise ValueError("Prediction validity first non-finite value lacks counted evidence.")
+                msg = "Prediction validity first non-finite value lacks counted evidence."
+                raise ValueError(msg)
         elif first["stage"] != "reconstructed_state" or channels[str(first["channel"])]["physically_invalid_finite_count"] < 1:
-            raise ValueError("Prediction validity first physical invalidity lacks counted evidence.")
+            msg = "Prediction validity first physical invalidity lacks counted evidence."
+            raise ValueError(msg)
     contract = document["physical_contract"]
-    expected_contract = {
-        "T_kelvin_inclusive": list(TEMPERATURE_RANGE_K),
-        "phi_inclusive": [0.0, 1.0],
-        "w_surf_minimum_inclusive": 0.0,
-        "w_int_minimum_inclusive": 0.0,
-    }
-    if contract != expected_contract:
-        raise ValueError("Prediction validity physical contract is invalid.")
+    if contract != _physical_contract():
+        msg = "Prediction validity physical contract is invalid."
+        raise ValueError(msg)
     common.serialization.canonical_json_sha256(document)
     document["channels"] = channels
     document["stages"] = admitted_stages
@@ -478,6 +523,87 @@ def validate_prediction_validity(
     return expected
 
 
+def validate_persisted_state_prediction_validity(
+    value: Mapping[str, Any],
+    *,
+    reconstructed_states: Any,
+    prediction_available: Any,
+    physical_times: Any,
+    mode: str,
+    origin_index: int,
+) -> dict[str, Any]:
+    """Admit diagnostics against persisted states when raw and decoded stages are not stored.
+
+    Step counts, reconstructed-state counts and the earliest state invalidity are recomputed.
+    Raw and decoded stage counts stay writer-validated provenance; they are only required to
+    obey per-channel non-finite propagation (raw <= decoded <= state), assuming elementwise decoding.
+    """
+    document = validate_prediction_validity_document(value)
+    states = _prediction_array(reconstructed_states, label="reconstructed_states")
+    available = _availability(prediction_available, length=states.shape[0])
+    times = _times(physical_times, length=states.shape[0])
+    physical_invalid = prediction_physical_invalid_mask(states)
+    if (
+        document["mode"] != mode
+        or document["origin_index"] != int(origin_index)
+        or document["requested_step_count"] != len(available)
+        or document["computed_step_count"] != int(available.sum())
+    ):
+        msg = "Prediction validity step counts or identity contradict the persisted availability."
+        raise ValueError(msg)
+    if document["channels"] != _channel_counts(states, available, physical_invalid=physical_invalid):
+        msg = "Prediction validity reconstructed counts contradict persisted states."
+        raise ValueError(msg)
+    # Decoding scales by positive finite factors and reconstruction adds a finite current state:
+    # NaN passes through unchanged, while overflow can only add infinities of either sign.
+    for channel in STATE_ORDER:
+        counts = [document["stages"][stage]["channels"][channel] for stage in _STAGE_NAMES]
+        raw, decoded, state = ({key: count[key] for key in ("nan_count", "positive_infinity_count", "negative_infinity_count")} for count in counts)
+        if not (
+            raw["nan_count"] == decoded["nan_count"] == state["nan_count"]
+            and raw["positive_infinity_count"] <= decoded["positive_infinity_count"] <= state["positive_infinity_count"]
+            and raw["negative_infinity_count"] <= decoded["negative_infinity_count"] <= state["negative_infinity_count"]
+        ):
+            msg = "Prediction validity non-finite propagation contradicts the persisted states."
+            raise ValueError(msg)
+    first = document["first_invalid"]
+    if first is None:
+        return document
+    step = int(first["rollout_step"])
+    if (
+        not 1 <= step <= len(available)
+        or any(not 0 <= index < size for index, size in zip(first["spatial_index"], states.shape[-2:], strict=True))
+        or float(first["physical_time"]) != float(times[step])
+        or first["channel"] not in STATE_ORDER
+    ):
+        msg = "Prediction validity first-invalid location is outside the persisted support."
+        raise ValueError(msg)
+    earliest = _first_invalid(
+        stages=(("reconstructed_state", states),),
+        physical_invalid=physical_invalid,
+        available=available,
+        times=times,
+        mode=mode,
+        origin_index=int(origin_index),
+    )
+    state_stage = first["stage"] == "reconstructed_state"
+    # A raw or decoded non-finite value always reaches the state at the same element.
+    upstream_reaches_state = first["kind"] == NONFINITE and not bool(
+        np.isfinite(states[(step - 1, STATE_ORDER.index(first["channel"]), *first["spatial_index"])])
+    )
+    # A persisted NaN was a raw NaN at the same element, so the earliest one bounds the writer's
+    # chronological (step, stage, channel, y, x) order of first-invalid evidence from above.
+    nan_locations = np.argwhere(np.isnan(states[: int(available.sum())]))
+    first_key = (step, _STAGE_NAMES.index(first["stage"]), STATE_ORDER.index(first["channel"]), *first["spatial_index"])
+    nan_key = None if not nan_locations.size else (int(nan_locations[0][0]) + 1, 0, *(int(item) for item in nan_locations[0][1:]))
+    if ((first != earliest) if state_stage else (not upstream_reaches_state or (earliest is not None and step > int(earliest["rollout_step"])))) or (
+        nan_key is not None and first_key > nan_key
+    ):
+        msg = "Prediction validity first-invalid evidence contradicts the persisted states."
+        raise ValueError(msg)
+    return document
+
+
 def aggregate_case_prediction_validity(
     *,
     case_id: str,
@@ -485,7 +611,8 @@ def aggregate_case_prediction_validity(
 ) -> dict[str, Any]:
     """Aggregate unique-chain record diagnostics into one exact case summary."""
     if not isinstance(case_id, str) or not case_id or not records:
-        raise ValueError("Case prediction validity requires an ID and records.")
+        msg = "Case prediction validity requires an ID and records."
+        raise ValueError(msg)
     admitted = [validate_prediction_validity_document(record) for record in records]
     status = cast(
         "PredictionValidityStatus",
@@ -503,7 +630,8 @@ def aggregate_case_prediction_validity(
             channel_values = [cast("Mapping[str, Any]", item[channel]) for item in source]
             fields = set(channel_values[0])
             if any(set(item) != fields for item in channel_values):
-                raise ValueError("Prediction validity channel count fields disagree.")
+                msg = "Prediction validity channel count fields disagree."
+                raise ValueError(msg)
             result[channel] = {field: sum(int(item[field]) for item in channel_values) for field in sorted(fields)}
         return result
 
@@ -512,7 +640,8 @@ def aggregate_case_prediction_validity(
         values = [cast("Mapping[str, Any]", item["stages"])[stage] for item in admitted]
         defined = values[0]["physical_validity_defined"]
         if any(item["physical_validity_defined"] is not defined for item in values):
-            raise ValueError("Prediction validity stage definitions disagree.")
+            msg = "Prediction validity stage definitions disagree."
+            raise ValueError(msg)
         stage_summary[stage] = {
             "physical_validity_defined": defined,
             "channels": sum_channels([cast("Mapping[str, Any]", item["channels"]) for item in values]),

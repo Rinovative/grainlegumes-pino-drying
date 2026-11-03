@@ -1,16 +1,18 @@
-"""
-generation_publication_attempt.py
+"""Publish and admit durable unsuccessful Generation attempt evidence.
 
-Publish and admit durable unsuccessful Generation attempt evidence.
 Responsibilities:
-  - Resolve collision-safe campaign, case, and attempt storage paths
+  - Resolve collision-safe case and attempt storage paths
   - Derive failure-stage-specific retained artifact inventories
-  - Atomically publish hash-inventoried attempt receipts and replay payloads
-  - Admit current attempt evidence and append replay-completion audits
+  - Atomically publish hash-inventoried attempt receipts and their retained payload
+  - Record the Slurm allocation, step, and campaign submission index that produced each attempt
+  - Admit current attempt evidence and its scratch-cleanup and license-compaction audits
+
 Design principles:
   - Attempt paths are operational locators and never scientific identities
-  - Failed work remains bounded even when successful campaign cases use full retention
-  - Replay payload cleanup never rewrites the original attempt receipt
+  - Failed work follows the resolved full or compact retention contract, whatever its failure stage
+  - Compact retention bounds long logs but keeps each one complete as a gzip sibling
+  - Audits are appended beside the original attempt receipt, which is never rewritten
+
 This module does NOT:
   - Execute COMSOL, derive campaign terminality, or publish processed cases
   - Duplicate canonical sampled parameters from raw case evidence
@@ -19,6 +21,7 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import gzip
 import json
 import os
 import re
@@ -27,13 +30,14 @@ import stat
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from src import common
 from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_source as source_service
+from src.generation.runtime import generation_runtime_dispatch_identity as dispatch_identity
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -43,10 +47,6 @@ if TYPE_CHECKING:
 
 ATTEMPT_SCHEMA_KIND: Final = "generation_case_attempt"
 ATTEMPT_SCHEMA_VERSION: Final = 1
-REPLAY_SCHEMA_KIND: Final = "generation_case_attempt_replay"
-REPLAY_SCHEMA_VERSION: Final = 1
-REPLAY_FAILURE_SCHEMA_KIND: Final = "generation_case_attempt_replay_failure"
-REPLAY_FAILURE_SCHEMA_VERSION: Final = 1
 CLEANUP_SCHEMA_KIND: Final = "generation_case_attempt_cleanup"
 CLEANUP_SCHEMA_VERSION: Final = 1
 LICENSE_COMPACTION_SCHEMA_KIND: Final = "generation_license_attempt_compaction"
@@ -64,6 +64,8 @@ _CASE_STATES: Final = frozenset(
     }
 )
 _FAILURE_STAGES: Final = frozenset({"input", "solver", "exports", "conversion", "publication"})
+_RUN_PREFIX: Final = "run_"
+_RUN_DIRECTORY: Final = re.compile(r"run_([0-9]{4,})\Z")
 _SMALL_RUNTIME_PATHS: Final = (
     Path("runtime/solver.log"),
     Path("runtime/stdout.log"),
@@ -73,11 +75,9 @@ _SMALL_RUNTIME_PATHS: Final = (
     Path("runtime/processing_provenance.json"),
     Path("runtime/status.json"),
     Path("runtime/stop.json"),
+    Path("runtime/solver_steps.csv"),
 )
 _MAX_RETAINED_RUNTIME_LOG_BYTES: Final = 1024 * 1024
-_MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS: Final = 160
-_MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS: Final = 1024
-_RETAINED_SOLVED_MODEL_PAYLOAD: Final = "payload/solved.mph"
 _BOUNDED_RUNTIME_LOG_PATHS: Final = frozenset(
     {
         Path("runtime/solver.log"),
@@ -123,6 +123,8 @@ _ATTEMPT_RECEIPT_KEYS: Final = frozenset(
         "canonical_raw_case",
         "input_files",
         "job_id",
+        "slurm_step_id",
+        "submission_index",
         "job_name",
         "node",
         "allocated_cores",
@@ -139,47 +141,9 @@ _ATTEMPT_RECEIPT_KEYS: Final = frozenset(
         "timed_out",
         "retention_policy",
         "retained_inventory",
-        "replay_required_payload",
-        "replay_artifact_membership_complete",
-        "temporary_recovery_payload",
         "intentionally_omitted_artifacts",
         "unexpectedly_missing_artifacts",
         "quality_flags",
-        "postprocessing_replay_available",
-        "recorded_at",
-    }
-)
-_REPLAY_RECEIPT_KEYS: Final = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "campaign_run_id",
-        "case_id",
-        "attempt_index",
-        "processing_git_commit",
-        "processed_directory",
-        "processed_case_hdf5_sha256",
-        "removed_temporary_payload",
-        "cleanup_state",
-        "recorded_at",
-    }
-)
-_REPLAY_FAILURE_RECEIPT_KEYS: Final = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "campaign_run_id",
-        "case_id",
-        "failed_attempt",
-        "source_attempt",
-        "replay_payload",
-        "replay_payload_sha256",
-        "converter_dependency_sha256",
-        "output_contract_sha256",
-        "time_contract_sha256",
-        "result",
-        "error_type",
-        "error_message",
         "recorded_at",
     }
 )
@@ -225,14 +189,7 @@ _DIAGNOSTIC_KEYS: Final = frozenset(
         "quality_flag",
     }
 )
-_RETENTION_POLICIES: Final = frozenset(
-    {
-        "full",
-        "compact",
-        "compact_conversion_recovery",
-        "compact_publication_recovery",
-    }
-)
+_RETENTION_POLICIES: Final = frozenset({"full", "compact"})
 AttemptCaseState = Literal[
     "failed",
     "timed_out",
@@ -268,20 +225,10 @@ class AttemptEvidence:
     receipt_path: Path
     payload: dict[str, Any]
 
-    @property
-    def replay_available(self) -> bool:
-        """Return whether intact replay evidence remains and replay is unfinished."""
-        return self.payload["postprocessing_replay_available"] is True and not (self.directory / "replay.json").exists()
-
-    @property
-    def replay_completed(self) -> bool:
-        """Return whether replay publication has a durable audit receipt."""
-        return (self.directory / "replay.json").is_file()
-
 
 def _utc_now() -> str:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -340,10 +287,21 @@ def _case_payload(
     return scratch, canonical_path, reference.source_id
 
 
+def attempt_run_directories(attempts_directory: Path) -> tuple[Path, ...]:
+    """List the retained failure bundles ``run_NNNN`` of one case in attempt order."""
+    if not attempts_directory.is_dir() or attempts_directory.is_symlink():
+        return ()
+    runs = [
+        (int(match.group(1)), entry)
+        for entry in attempts_directory.iterdir()
+        if entry.is_dir() and not entry.is_symlink() and (match := _RUN_DIRECTORY.fullmatch(entry.name)) is not None
+    ]
+    return tuple(entry for _index, entry in sorted(runs, key=lambda item: item[0]))
+
+
 def _attempt_index(
     config: GenerationConfig,
     case_index: int,
-    campaign_run_id: str,
     *,
     storage_root: Path,
     requested: int | None,
@@ -354,22 +312,14 @@ def _attempt_index(
             message = f"attempt_index must be a positive integer, got {requested!r}."
             raise ValueError(message)
         return requested
-    root = common.paths.resolve_generation_attempt_case_directory(
+    root = common.paths.resolve_generation_attempts_directory(
         config.batch_storage_name,
         config.case_id(case_index),
-        campaign_run_id,
         storage_root=storage_root,
     )
-    indices = (
-        [
-            int(entry.name[8:])
-            for entry in root.iterdir()
-            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
-        ]
-        if root.is_dir() and not root.is_symlink()
-        else []
-    )
-    return max(indices, default=0) + 1
+    _safe_attempt_history_root(root, storage_root=storage_root)
+    runs = attempt_run_directories(root)
+    return (int(runs[-1].name[len(_RUN_PREFIX) :]) if runs else 0) + 1
 
 
 def _previous_attempt_evidence(
@@ -378,22 +328,15 @@ def _previous_attempt_evidence(
 ) -> AttemptEvidence | None:
     """Admit the exact contiguous predecessor for one new attempt."""
     parent = target.parent
-    existing_indices = (
-        sorted(
-            int(entry.name[8:])
-            for entry in parent.iterdir()
-            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
-        )
-        if parent.is_dir() and not parent.is_symlink()
-        else []
-    )
+    existing_indices = [int(entry.name[len(_RUN_PREFIX) :]) for entry in attempt_run_directories(parent)]
     expected_indices = list(range(1, attempt_index))
     if existing_indices != expected_indices:
         message = f"Attempt history must be contiguous before append; expected={expected_indices}, observed={existing_indices}: {parent}"
         raise ValueError(message)
     if attempt_index == 1:
         return None
-    return load_attempt(parent / f"attempt_{attempt_index - 1:04d}")
+    case_directory = common.paths.locate_generation_attempt_case_directory(target)
+    return load_attempt(common.paths.resolve_generation_case_attempt_run_directory(case_directory, attempt_index - 1))
 
 
 def _path_has_symlink(path: Path, *, stop: Path) -> bool:
@@ -406,18 +349,39 @@ def _path_has_symlink(path: Path, *, stop: Path) -> bool:
     return stop.is_symlink()
 
 
-def _safe_attempt_target(path: Path, *, storage_root: Path) -> None:
-    """Require one lexical attempts target beneath a non-symlink storage root."""
+def _safe_attempt_history_root(path: Path, *, storage_root: Path | str) -> None:
+    """Reject relocated attempt histories before listing or reading them."""
+    storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
+    root = path.absolute()
+    if not root.is_relative_to(storage) or _path_has_symlink(root, stop=storage):
+        message = f"Attempt history escapes storage or contains a symbolic link: {root}"
+        raise ValueError(message)
+
+
+def _safe_attempt_target(
+    path: Path,
+    *,
+    storage_root: Path,
+    batch_storage_name: str,
+    case_id: str,
+    attempt_index: int,
+) -> None:
+    """Admit only the exact resolved canonical attempt target."""
     storage = storage_root.absolute()
     target = path.absolute()
-    attempts = common.paths.get_generation_attempts_root(storage_root=storage).absolute()
-    if not target.is_relative_to(attempts) or target == attempts:
-        message = f"Attempt target escapes the attempts root: {target}"
+    expected = common.paths.resolve_generation_attempt_run_directory(
+        batch_storage_name,
+        case_id,
+        attempt_index,
+        storage_root=storage,
+    ).absolute()
+    if target != expected or target == storage or not target.is_relative_to(storage):
+        message = f"Attempt target disagrees with its authoritative storage locator: {target}"
         raise ValueError(message)
     if _path_has_symlink(target.parent, stop=storage):
         message = f"Attempt target contains a symbolic-link component: {target}"
         raise ValueError(message)
-    if target.exists() and (not target.is_dir() or target.is_symlink()):
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
         message = f"Attempt target is not one ordinary directory: {target}"
         raise ValueError(message)
 
@@ -444,87 +408,48 @@ def _ordinary_source(root: Path, relative: Path) -> Path | None:
 def _export_paths(
     config: GenerationConfig,
     work_directory: Path,
-) -> tuple[tuple[Path, ...], bool]:
-    """Return configured ordinary exports and whether replay membership is complete."""
+) -> tuple[Path, ...]:
+    """Return the configured ordinary exports present in one case workspace."""
     export_root = Path(config.scientific_values["output_contract"]["exports_root"])
     paths: list[Path] = []
-    complete = True
     for contract in config.scientific_values["output_contract"]["exports"]:
         pattern = contract.get("pattern")
         if not isinstance(pattern, str) or not pattern:
-            complete = False
             continue
-        matches: list[Path] = []
         for source in sorted((work_directory / export_root).glob(pattern)):
             relative = source.relative_to(work_directory)
             if _ordinary_source(work_directory, relative) is not None:
-                matches.append(relative)
-        if contract["required"] and not matches:
-            complete = False
-        if not contract["allow_multiple"] and len(matches) > 1:
-            complete = False
-        paths.extend(matches)
-    return tuple(dict.fromkeys(paths)), complete
+                paths.append(relative)
+    return tuple(dict.fromkeys(paths))
 
 
 def _retention_paths(
     config: GenerationConfig,
     *,
-    failure_stage: str,
     work_directory: Path | None,
-) -> tuple[str, tuple[Path, ...], tuple[Path, ...], list[str]]:
-    """Derive retained, temporary-recovery, and omitted artifact paths."""
+) -> tuple[str, tuple[Path, ...], list[str]]:
+    """Derive the retained and the omitted artifact paths of one failed attempt, whatever its failure stage."""
+    policy = str(config.execution_values["retention_policy"])
+    if policy not in {"full", "compact"}:
+        message = f"Failed-attempt retention policy is not resolved: {policy!r}."
+        raise ValueError(message)
     if work_directory is None:
-        return "compact", (), (), ["case_workspace"]
-    export_paths, _exports_complete = _export_paths(config, work_directory)
+        return policy, (), ["case_workspace"]
+    export_paths = _export_paths(config, work_directory)
+    case_hdf5 = Path("runtime/case.h5")
     retained: list[Path] = [relative for relative in _SMALL_RUNTIME_PATHS if _ordinary_source(work_directory, relative) is not None]
-    temporary: list[Path] = []
-    policy = "compact"
-    if failure_stage == "conversion":
-        policy = "compact_conversion_recovery"
-        temporary.extend(export_paths)
-    elif failure_stage == "publication":
-        policy = "compact_publication_recovery"
-        temporary.extend(export_paths)
-        temporary.extend(
-            relative for relative in (Path("runtime/case.h5"), Path("runtime/status.json")) if _ordinary_source(work_directory, relative) is not None
-        )
-    retained.extend(temporary)
+    if policy == "full":
+        retained.extend(relative for relative in _LARGE_MODEL_PATHS if _ordinary_source(work_directory, relative) is not None)
+        retained.extend(export_paths)
+        if _ordinary_source(work_directory, case_hdf5) is not None:
+            retained.append(case_hdf5)
     retained = list(dict.fromkeys(retained))
     omitted = [
         relative.as_posix()
-        for relative in (*_LARGE_MODEL_PATHS, *export_paths)
+        for relative in (*_LARGE_MODEL_PATHS, *export_paths, case_hdf5)
         if _ordinary_source(work_directory, relative) is not None and relative not in retained
     ]
-    return policy, tuple(retained), tuple(dict.fromkeys(temporary)), sorted(omitted)
-
-
-def _replay_required_paths(
-    failure_stage: str,
-    export_paths: Sequence[Path],
-) -> tuple[Path, ...]:
-    """Return the exact retained paths required for postprocessing replay."""
-    common_paths = (
-        Path("runtime/solver.log"),
-        Path("runtime/stdout.log"),
-        Path("runtime/timing.json"),
-        Path("runtime/execution_provenance.json"),
-        *export_paths,
-    )
-    if failure_stage == "conversion":
-        return tuple(dict.fromkeys(common_paths))
-    if failure_stage == "publication":
-        return tuple(
-            dict.fromkeys(
-                (
-                    *common_paths,
-                    Path("runtime/case.h5"),
-                    Path("runtime/status.json"),
-                    Path("runtime/processing_provenance.json"),
-                )
-            )
-        )
-    return ()
+    return policy, tuple(retained), sorted(omitted)
 
 
 def derive_stage_states(
@@ -566,12 +491,17 @@ def _copy_retained_file(
     destination: Path,
     *,
     relative: Path,
-) -> None:
-    """Copy one artifact while bounding retained runtime-log bytes."""
+    full_retention: bool,
+) -> tuple[Path, ...]:
+    """Copy an artifact; under compact retention a long log keeps a bounded copy plus its complete gzip copy.
+
+    The bounded copy keeps the retained log path; the ``.gz`` sibling retains the
+    complete log as diagnostic evidence.
+    """
     maximum = _MAX_RETAINED_RUNTIME_LOG_BYTES
-    if relative not in _BOUNDED_RUNTIME_LOG_PATHS or source.stat().st_size <= maximum:
+    if full_retention or relative not in _BOUNDED_RUNTIME_LOG_PATHS or source.stat().st_size <= maximum:
         shutil.copy2(source, destination)
-        return
+        return (destination,)
     marker = b"\n... retained log middle omitted ...\n"
     if maximum <= len(marker):
         message = "Retained runtime-log byte bound is too small for its omission marker."
@@ -585,6 +515,10 @@ def _copy_retained_file(
         tail = stream.read(tail_bytes)
     destination.write_bytes(head + marker + tail)
     shutil.copystat(source, destination, follow_symlinks=False)
+    complete = destination.with_name(f"{destination.name}.gz")
+    with source.open("rb") as stream, gzip.open(complete, "wb") as compressed:
+        shutil.copyfileobj(stream, compressed)
+    return (destination, complete)
 
 
 def _copy_retained(
@@ -592,7 +526,7 @@ def _copy_retained(
     staging: Path,
     paths: Sequence[Path],
     *,
-    temporary_paths: frozenset[Path],
+    full_retention: bool,
 ) -> dict[str, dict[str, Any]]:
     """Copy and hash one exact retained inventory beneath staging."""
     inventory: dict[str, dict[str, Any]] = {}
@@ -602,16 +536,14 @@ def _copy_retained(
             continue
         destination = staging / "payload" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _copy_retained_file(source, destination, relative=relative)
-        if destination.is_symlink() or not destination.is_file():
-            message = f"Attempt retention did not produce an ordinary file: {destination}"
-            raise RuntimeError(message)
-        retained_relative = destination.relative_to(staging).as_posix()
-        inventory[retained_relative] = {
-            "sha256": common.serialization.file_sha256(destination),
-            "size_bytes": destination.stat().st_size,
-            "temporary_recovery_payload": relative in temporary_paths,
-        }
+        for produced in _copy_retained_file(source, destination, relative=relative, full_retention=full_retention):
+            if produced.is_symlink() or not produced.is_file():
+                message = f"Attempt retention did not produce an ordinary file: {produced}"
+                raise RuntimeError(message)
+            inventory[produced.relative_to(staging).as_posix()] = {
+                "sha256": common.serialization.file_sha256(produced),
+                "size_bytes": produced.stat().st_size,
+            }
     return inventory
 
 
@@ -683,21 +615,26 @@ def publish_case_attempt(
         raise ValueError(message)
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
     purpose = str(config.scientific_values["campaign_purpose"])
+    case_id = config.case_id(case_index)
     index = _attempt_index(
         config,
         case_index,
-        campaign_run_id,
         storage_root=storage,
         requested=attempt_index,
     )
-    target = common.paths.resolve_generation_attempt_directory(
+    target = common.paths.resolve_generation_attempt_run_directory(
         config.batch_storage_name,
-        config.case_id(case_index),
-        campaign_run_id,
+        case_id,
         index,
         storage_root=storage,
     )
-    _safe_attempt_target(target, storage_root=storage)
+    _safe_attempt_target(
+        target,
+        storage_root=storage,
+        batch_storage_name=config.batch_storage_name,
+        case_id=case_id,
+        attempt_index=index,
+    )
     if target.exists():
         existing = load_attempt(target)
         identity = existing.payload
@@ -723,13 +660,16 @@ def publish_case_attempt(
         storage_root=storage,
         input_generation_id=input_generation_id,
     )
-    policy, retained_paths, temporary_paths, omitted = _retention_paths(
-        config,
-        failure_stage=failure_stage,
-        work_directory=work_directory,
-    )
+    dispatch = dispatch_identity.current_case_dispatch()
+    policy, retained_paths, omitted = _retention_paths(config, work_directory=work_directory)
     target.parent.mkdir(parents=True, exist_ok=True)
-    _safe_attempt_target(target, storage_root=storage)
+    _safe_attempt_target(
+        target,
+        storage_root=storage,
+        batch_storage_name=config.batch_storage_name,
+        case_id=case_id,
+        attempt_index=index,
+    )
     previous = _previous_attempt_evidence(target, index)
     staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
     try:
@@ -740,14 +680,11 @@ def publish_case_attempt(
                 work_directory,
                 staging,
                 retained_paths,
-                temporary_paths=frozenset(temporary_paths),
+                full_retention=policy == "full",
             )
         )
         timing = _timing_evidence(work_directory)
         metrics = dict(solver_metrics or {})
-        export_paths, exports_complete = _export_paths(config, work_directory) if work_directory is not None else ((), False)
-        replay_required = [f"payload/{relative.as_posix()}" for relative in _replay_required_paths(failure_stage, export_paths)]
-        replay_available = exports_complete and bool(replay_required) and all(relative in inventory for relative in replay_required)
         unexpectedly_missing = [f"payload/{relative.as_posix()}" for relative in retained_paths if f"payload/{relative.as_posix()}" not in inventory]
         stage_states = derive_stage_states(case_state, failure_stage)
         receipt = {
@@ -789,6 +726,8 @@ def publish_case_attempt(
             "canonical_raw_case": _raw_reference(case_payload_path.parent, storage_root=storage),
             "input_files": case_payload["input_files"],
             "job_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_step_id": None if dispatch is None else dispatch.step_id,
+            "submission_index": None if dispatch is None else dispatch.submission_index,
             "job_name": os.environ.get("SLURM_JOB_NAME"),
             "node": allocated_node,
             "allocated_cores": os.environ.get("SLURM_CPUS_PER_TASK"),
@@ -805,13 +744,9 @@ def publish_case_attempt(
             "timed_out": timed_out,
             "retention_policy": policy,
             "retained_inventory": inventory,
-            "replay_required_payload": replay_required,
-            "replay_artifact_membership_complete": exports_complete,
-            "temporary_recovery_payload": [f"payload/{relative.as_posix()}" for relative in temporary_paths],
             "intentionally_omitted_artifacts": omitted,
             "unexpectedly_missing_artifacts": unexpectedly_missing,
             "quality_flags": [dict(record) for record in quality_flags],
-            "postprocessing_replay_available": replay_available,
             "recorded_at": _utc_now(),
         }
         _require_previous_attempt_identity(previous, receipt)
@@ -943,7 +878,6 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
         or not isinstance(payload.get("timed_out"), bool)
         or payload["timed_out"] is not (case_state == "timed_out")
         or payload.get("retention_policy") not in _RETENTION_POLICIES
-        or not isinstance(payload.get("postprocessing_replay_available"), bool)
     ):
         message = f"Attempt receipt values are malformed: {path}"
         raise ValueError(message)
@@ -976,6 +910,21 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
         if payload.get(key) is not None and not _nonempty_text(payload.get(key)):
             message = f"Attempt scheduler or timing evidence is malformed: {path}"
             raise ValueError(message)
+    step_id = payload.get("slurm_step_id")
+    submission_index = payload.get("submission_index")
+    if (step_id is None) != (submission_index is None) or (
+        step_id is not None
+        and (
+            not isinstance(step_id, str)
+            or not step_id.isascii()
+            or not step_id.isdigit()
+            or isinstance(submission_index, bool)
+            or not isinstance(submission_index, int)
+            or submission_index < 1
+        )
+    ):
+        message = f"Attempt dispatch identity is malformed: {path}"
+        raise ValueError(message)
     allocated = payload.get("allocated_cores")
     exit_code = payload.get("process_exit_code")
     if (allocated is not None and (not isinstance(allocated, str) or not allocated.isdigit())) or (
@@ -984,8 +933,6 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
         message = f"Attempt process evidence is malformed: {path}"
         raise ValueError(message)
     for key in (
-        "replay_required_payload",
-        "temporary_recovery_payload",
         "intentionally_omitted_artifacts",
         "unexpectedly_missing_artifacts",
     ):
@@ -994,218 +941,6 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
             message = f"Attempt artifact declaration is malformed: {path}"
             raise ValueError(message)
     _validate_quality_flags(payload.get("quality_flags"), path=path)
-
-
-def _replay_audit(
-    directory: Path,
-    *,
-    attempt_payload: Mapping[str, Any],
-) -> tuple[str | None, frozenset[str]]:
-    """Return replay cleanup state and intentionally removable payload paths."""
-    path = directory / "replay.json"
-    if not path.exists():
-        return None, frozenset()
-    payload = _load_json(path, label="attempt replay audit")
-    removed = payload.get("removed_temporary_payload")
-    state = payload.get("cleanup_state")
-    if (
-        set(payload) != _REPLAY_RECEIPT_KEYS
-        or payload.get("schema_kind") != REPLAY_SCHEMA_KIND
-        or payload.get("schema_version") != REPLAY_SCHEMA_VERSION
-        or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
-        or payload.get("case_id") != attempt_payload["case_id"]
-        or payload.get("attempt_index") != attempt_payload["attempt_index"]
-        or not isinstance(payload.get("processing_git_commit"), str)
-        or re.fullmatch(r"[0-9a-f]{40}", payload["processing_git_commit"]) is None
-        or not isinstance(payload.get("processed_directory"), str)
-        or not Path(payload["processed_directory"]).is_absolute()
-        or not isinstance(payload.get("processed_case_hdf5_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", payload["processed_case_hdf5_sha256"]) is None
-        or state not in {"pending", "complete"}
-        or not isinstance(removed, list)
-        or not all(_safe_relative_text(value, prefix="payload/") for value in removed)
-        or not _nonempty_text(payload.get("recorded_at"))
-    ):
-        message = f"Attempt replay audit is invalid: {path}"
-        raise ValueError(message)
-    return str(state), frozenset(removed)
-
-
-def _replay_failure_audit(
-    directory: Path,
-    *,
-    attempt_payload: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Admit immutable replay-failure identity evidence when recorded."""
-    path = directory / "replay_failure.json"
-    if not path.exists():
-        return None
-    payload = _load_json(path, label="attempt replay failure audit")
-    failed = payload.get("failed_attempt")
-    source = payload.get("source_attempt")
-    replay_payload = payload.get("replay_payload")
-    if (
-        set(payload) != _REPLAY_FAILURE_RECEIPT_KEYS
-        or payload.get("schema_kind") != REPLAY_FAILURE_SCHEMA_KIND
-        or payload.get("schema_version") != REPLAY_FAILURE_SCHEMA_VERSION
-        or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
-        or payload.get("case_id") != attempt_payload["case_id"]
-        or not isinstance(failed, dict)
-        or set(failed) != {"attempt_index", "receipt_sha256"}
-        or failed.get("attempt_index") != attempt_payload["attempt_index"]
-        or failed.get("receipt_sha256") != common.serialization.file_sha256(directory / "attempt.json")
-        or not isinstance(source, dict)
-        or set(source) != {"attempt_index", "receipt_sha256"}
-        or source != attempt_payload["previous_attempt"]
-        or not isinstance(replay_payload, list)
-        or not replay_payload
-        or not all(
-            isinstance(identity, dict)
-            and set(identity) == {"relative_path", "sha256", "size_bytes"}
-            and _safe_relative_text(identity.get("relative_path"), prefix="payload/")
-            and isinstance(identity.get("sha256"), str)
-            and re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is not None
-            and isinstance(identity.get("size_bytes"), int)
-            and not isinstance(identity.get("size_bytes"), bool)
-            and identity["size_bytes"] >= 0
-            for identity in replay_payload
-        )
-        or len({identity["relative_path"] for identity in replay_payload}) != len(replay_payload)
-        or payload.get("replay_payload_sha256") != common.serialization.canonical_json_sha256({"replay_payload": replay_payload})
-        or any(
-            not isinstance(payload.get(key), str) or re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None
-            for key in (
-                "converter_dependency_sha256",
-                "output_contract_sha256",
-                "time_contract_sha256",
-            )
-        )
-        or payload.get("result") != "failed"
-        or not isinstance(payload.get("error_type"), str)
-        or not payload["error_type"]
-        or len(payload["error_type"]) > _MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS
-        or not isinstance(payload.get("error_message"), str)
-        or len(payload["error_message"]) > _MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS
-        or not _nonempty_text(payload.get("recorded_at"))
-    ):
-        message = f"Attempt replay failure audit is invalid: {path}"
-        raise ValueError(message)
-    source_path = directory.parent / f"attempt_{int(source['attempt_index']):04d}" / "attempt.json"
-    if not source_path.is_file() or source_path.is_symlink() or common.serialization.file_sha256(source_path) != source["receipt_sha256"]:
-        message = f"Attempt replay failure source receipt is invalid: {source_path}"
-        raise ValueError(message)
-    source_payload = _load_json(source_path, label="replay failure source attempt receipt")
-    _validate_attempt_receipt(source_payload, path=source_path)
-    failed_inventory = attempt_payload.get("retained_inventory")
-    required = attempt_payload.get("replay_required_payload")
-    if not isinstance(failed_inventory, dict) or not isinstance(required, list):
-        message = f"Attempt replay failure payload is invalid: {path}"
-        raise TypeError(message)
-    failed_required = list(required)
-    if attempt_payload["retention_policy"] == "full" and _RETAINED_SOLVED_MODEL_PAYLOAD in failed_inventory:
-        failed_required.append(_RETAINED_SOLVED_MODEL_PAYLOAD)
-    expected_payload = [
-        {
-            "relative_path": relative,
-            "sha256": failed_inventory[relative]["sha256"],
-            "size_bytes": failed_inventory[relative]["size_bytes"],
-        }
-        for relative in dict.fromkeys(failed_required)
-        if isinstance(relative, str) and relative in failed_inventory
-    ]
-    if expected_payload != replay_payload or len(expected_payload) != len(dict.fromkeys(failed_required)):
-        message = f"Attempt replay failure payload identity disagrees with its source: {path}"
-        raise ValueError(message)
-    return payload
-
-
-def replay_failure_evidence(attempt: AttemptEvidence) -> dict[str, Any] | None:
-    """Return admitted immutable replay-failure evidence for one attempt."""
-    return _replay_failure_audit(
-        attempt.directory,
-        attempt_payload=attempt.payload,
-    )
-
-
-def record_replay_failure(
-    failed_attempt: AttemptEvidence,
-    source_attempt: AttemptEvidence,
-    *,
-    converter_dependency_sha256: str,
-    output_contract_sha256: str,
-    time_contract_sha256: str,
-    error: BaseException,
-) -> Path:
-    """Append immutable replay-failure evidence bound to exact retry inputs."""
-    if failed_attempt.payload["previous_attempt"] != {
-        "attempt_index": source_attempt.payload["attempt_index"],
-        "receipt_sha256": common.serialization.file_sha256(source_attempt.receipt_path),
-    }:
-        message = "Replay failure must immediately follow its source attempt."
-        raise ValueError(message)
-    for label, digest in (
-        ("converter dependency", converter_dependency_sha256),
-        ("output contract", output_contract_sha256),
-        ("time contract", time_contract_sha256),
-    ):
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            message = f"Replay {label} identity must be one SHA-256 digest."
-            raise ValueError(message)
-    inventory = failed_attempt.payload["retained_inventory"]
-    required = failed_attempt.payload["replay_required_payload"]
-    if not isinstance(inventory, dict) or not isinstance(required, list) or not required:
-        message = "Replay failure source lacks required retained payload evidence."
-        raise ValueError(message)
-    replay_payload = []
-    source_required = list(required)
-    if failed_attempt.payload["retention_policy"] == "full" and _RETAINED_SOLVED_MODEL_PAYLOAD in inventory:
-        source_required.append(_RETAINED_SOLVED_MODEL_PAYLOAD)
-    for relative in dict.fromkeys(source_required):
-        identity = inventory.get(relative) if isinstance(relative, str) else None
-        if (
-            not isinstance(identity, dict)
-            or not isinstance(identity.get("sha256"), str)
-            or not isinstance(identity.get("size_bytes"), int)
-            or isinstance(identity.get("size_bytes"), bool)
-        ):
-            message = f"Replay failure source payload identity is invalid: {relative!r}"
-            raise TypeError(message)
-        replay_payload.append({"relative_path": relative, "sha256": identity["sha256"], "size_bytes": identity["size_bytes"]})
-    target = failed_attempt.directory / "replay_failure.json"
-    receipt = {
-        "schema_kind": REPLAY_FAILURE_SCHEMA_KIND,
-        "schema_version": REPLAY_FAILURE_SCHEMA_VERSION,
-        "campaign_run_id": failed_attempt.payload["campaign_run_id"],
-        "case_id": failed_attempt.payload["case_id"],
-        "failed_attempt": {
-            "attempt_index": failed_attempt.payload["attempt_index"],
-            "receipt_sha256": common.serialization.file_sha256(failed_attempt.receipt_path),
-        },
-        "source_attempt": {
-            "attempt_index": source_attempt.payload["attempt_index"],
-            "receipt_sha256": common.serialization.file_sha256(source_attempt.receipt_path),
-        },
-        "replay_payload": replay_payload,
-        "replay_payload_sha256": common.serialization.canonical_json_sha256({"replay_payload": replay_payload}),
-        "converter_dependency_sha256": converter_dependency_sha256,
-        "output_contract_sha256": output_contract_sha256,
-        "time_contract_sha256": time_contract_sha256,
-        "result": "failed",
-        "error_type": type(error).__name__[:_MAX_REPLAY_FAILURE_ERROR_TYPE_CHARS],
-        "error_message": (str(error) or type(error).__name__)[:_MAX_REPLAY_FAILURE_ERROR_MESSAGE_CHARS],
-        "recorded_at": _utc_now(),
-    }
-    if target.exists():
-        existing = _load_json(target, label="attempt replay failure audit")
-        comparable = dict(receipt)
-        comparable["recorded_at"] = existing.get("recorded_at")
-        if existing != comparable:
-            message = f"Existing replay failure audit conflicts: {target}"
-            raise FileExistsError(message)
-        return target
-    common.serialization.atomic_write_json(target, receipt)
-    _replay_failure_audit(failed_attempt.directory, attempt_payload=failed_attempt.payload)
-    return target
 
 
 def _validate_cleanup_audit(
@@ -1284,9 +1019,10 @@ def _validate_attempt_chain(
     """Validate every immediate receipt link without rereading retained payload bytes."""
     current_directory = directory
     current_payload = dict(payload)
+    case_directory = common.paths.locate_generation_attempt_case_directory(directory)
     while True:
         index = int(current_payload["attempt_index"])
-        if current_directory.name != f"attempt_{index:04d}":
+        if current_directory != common.paths.resolve_generation_case_attempt_run_directory(case_directory, index):
             message = f"Attempt directory name disagrees with its receipt index: {current_directory}"
             raise ValueError(message)
         previous = current_payload["previous_attempt"]
@@ -1295,7 +1031,7 @@ def _validate_attempt_chain(
         if not isinstance(previous, dict):
             message = f"Attempt predecessor reference is malformed: {current_directory / 'attempt.json'}"
             raise TypeError(message)
-        previous_directory = current_directory.parent / f"attempt_{index - 1:04d}"
+        previous_directory = common.paths.resolve_generation_case_attempt_run_directory(case_directory, index - 1)
         previous_path = previous_directory / "attempt.json"
         previous_payload = _load_json(previous_path, label="previous attempt receipt")
         _validate_attempt_receipt(previous_payload, path=previous_path)
@@ -1311,7 +1047,7 @@ def _validate_attempt_chain(
 
 
 def load_attempt(directory: Path | str) -> AttemptEvidence:
-    """Admit one attempt receipt, inventory, and optional replay audit."""
+    """Admit one attempt receipt, inventory, and optional cleanup and license-compaction audits."""
     root = Path(directory)
     if not root.is_dir() or root.is_symlink():
         message = f"Attempt directory is missing or unsafe: {root}"
@@ -1327,12 +1063,7 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
     if not isinstance(inventory, dict):
         message = f"Attempt retained inventory is invalid: {receipt_path}"
         raise TypeError(message)
-    replay_cleanup_state, removed = _replay_audit(
-        root,
-        attempt_payload=payload,
-    )
     _validate_cleanup_audit(root, attempt_payload=payload)
-    _replay_failure_audit(root, attempt_payload=payload)
     compaction, compacted = _license_compaction_audit(
         root,
         attempt_payload=payload,
@@ -1345,25 +1076,18 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
                 raise ValueError(message)
             if not compacted_path.exists():
                 continue
-        if relative in removed:
-            if replay_cleanup_state == "complete" and (root / relative).exists():
-                message = f"Replay audit claims a retained payload was removed but it still exists: {relative}"
-                raise ValueError(message)
-            if not (root / relative).exists():
-                continue
         path = root / relative
         if (
             not isinstance(relative, str)
             or Path(relative).is_absolute()
             or ".." in Path(relative).parts
             or not isinstance(identity, dict)
-            or set(identity) != {"sha256", "size_bytes", "temporary_recovery_payload"}
+            or set(identity) != {"sha256", "size_bytes"}
             or not isinstance(identity.get("sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None
             or not isinstance(identity.get("size_bytes"), int)
             or isinstance(identity.get("size_bytes"), bool)
             or identity["size_bytes"] < 0
-            or not isinstance(identity.get("temporary_recovery_payload"), bool)
             or not path.is_file()
             or path.is_symlink()
             or path.stat().st_size != identity.get("size_bytes")
@@ -1371,35 +1095,6 @@ def load_attempt(directory: Path | str) -> AttemptEvidence:
         ):
             message = f"Attempt retained artifact identity is invalid: {path}"
             raise ValueError(message)
-    replay_required = payload.get("replay_required_payload")
-    temporary = payload.get("temporary_recovery_payload")
-    if (
-        not isinstance(replay_required, list)
-        or not all(isinstance(value, str) for value in replay_required)
-        or not isinstance(temporary, list)
-        or not all(isinstance(value, str) for value in temporary)
-        or not set(temporary).issubset(replay_required)
-        or any(not value.startswith("payload/") for value in replay_required)
-        or any(not value.startswith("payload/") for value in temporary)
-        or any(value not in inventory for value in temporary)
-        or (removed != frozenset(() if payload["retention_policy"] == "full" else temporary) and replay_cleanup_state is not None)
-    ):
-        message = f"Attempt replay payload declaration is invalid: {receipt_path}"
-        raise ValueError(message)
-    membership_complete = payload.get("replay_artifact_membership_complete")
-    if not isinstance(membership_complete, bool):
-        message = f"Attempt replay membership evidence is invalid: {receipt_path}"
-        raise TypeError(message)
-    expected_available = (
-        payload.get("failure_stage") in {"conversion", "publication"}
-        and membership_complete
-        and bool(replay_required)
-        and not removed
-        and all(relative in inventory for relative in replay_required)
-    )
-    if payload.get("postprocessing_replay_available") is not expected_available and not removed:
-        message = f"Attempt replay availability is inconsistent: {receipt_path}"
-        raise ValueError(message)
     return AttemptEvidence(directory=root, receipt_path=receipt_path, payload=payload)
 
 
@@ -1425,22 +1120,14 @@ def compact_license_only_attempt_payload(
     from src.generation.runtime import generation_runtime_license as license_service  # noqa: PLC0415
 
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
-    root = common.paths.resolve_generation_attempt_case_directory(
+    root = common.paths.resolve_generation_attempts_directory(
         config.batch_storage_name,
         config.case_id(case_index),
-        campaign_run_id,
         storage_root=storage,
     )
     if not root.is_dir() or root.is_symlink():
         return None
-    candidates = sorted(
-        (
-            entry
-            for entry in root.iterdir()
-            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
-        ),
-        key=lambda entry: int(entry.name[8:]),
-    )
+    candidates = attempt_run_directories(root)
     if not candidates:
         return None
     attempt = load_attempt(candidates[-1])
@@ -1462,8 +1149,6 @@ def compact_license_only_attempt_payload(
         payload.get("case_state") != "license_blocked"
         or payload.get("failure_stage") != "solver"
         or any(payload.get(key) != value for key, value in expected_stage_states.items())
-        or payload.get("postprocessing_replay_available") is not False
-        or payload.get("replay_required_payload") != []
         or license_wait.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
         or license_wait.get("campaign_run_id") != campaign_run_id
         or license_wait.get("batch_id") != config.batch_id
@@ -1567,174 +1252,23 @@ def compact_license_only_attempt_payload(
 def latest_case_attempt(
     config: GenerationConfig,
     case_index: int,
-    campaign_run_id: str,
     *,
     storage_root: Path | str,
 ) -> AttemptEvidence | None:
-    """Return the newest admitted attempt for one exact campaign case."""
-    root = common.paths.resolve_generation_attempt_case_directory(
+    """Return the newest admitted failure bundle of one exact campaign case."""
+    root = common.paths.resolve_generation_attempts_directory(
         config.batch_storage_name,
         config.case_id(case_index),
-        campaign_run_id,
         storage_root=storage_root,
     )
+    _safe_attempt_history_root(root, storage_root=storage_root)
     if not root.exists():
         return None
     if not root.is_dir() or root.is_symlink():
         message = f"Attempt history path is unsafe: {root}"
         raise ValueError(message)
-    candidates = sorted(
-        (
-            entry
-            for entry in root.iterdir()
-            if entry.is_dir() and not entry.is_symlink() and entry.name.startswith("attempt_") and entry.name[8:].isdigit()
-        ),
-        key=lambda entry: int(entry.name[8:]),
-    )
+    candidates = attempt_run_directories(root)
     return None if not candidates else load_attempt(candidates[-1])
-
-
-def latest_case_attempt_across_campaign_runs(
-    config: GenerationConfig,
-    case_index: int,
-    *,
-    storage_root: Path | str,
-) -> AttemptEvidence | None:
-    """Return the newest admitted attempt across campaign runs for one case."""
-    case_root = (
-        common.paths.get_generation_attempts_root(storage_root=storage_root)
-        / common.paths.validate_logical_name(config.batch_storage_name, label="batch_storage_name")
-        / common.paths.validate_logical_name(config.case_id(case_index), label="case_id")
-    )
-    if not case_root.exists():
-        return None
-    if not case_root.is_dir() or case_root.is_symlink():
-        message = f"Attempt case history path is unsafe: {case_root}"
-        raise ValueError(message)
-    candidates: list[tuple[datetime, str, int, AttemptEvidence]] = []
-    for run_directory in case_root.iterdir():
-        if not run_directory.is_dir() or run_directory.is_symlink():
-            message = f"Attempt campaign history contains an unsafe entry: {run_directory}"
-            raise ValueError(message)
-        run_id = common.paths.validate_logical_name(run_directory.name, label="campaign_run_id")
-        attempt = latest_case_attempt(
-            config,
-            case_index,
-            run_id,
-            storage_root=storage_root,
-        )
-        if attempt is None:
-            continue
-        try:
-            recorded_at = datetime.fromisoformat(str(attempt.payload["recorded_at"]))
-        except ValueError as error:
-            message = f"Attempt recorded_at is malformed: {attempt.receipt_path}"
-            raise ValueError(message) from error
-        if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
-            message = f"Attempt recorded_at is not timezone-aware: {attempt.receipt_path}"
-            raise ValueError(message)
-        candidates.append(
-            (
-                recorded_at.astimezone(timezone.utc),
-                run_id,
-                int(attempt.payload["attempt_index"]),
-                attempt,
-            )
-        )
-    return None if not candidates else max(candidates, key=lambda item: item[:3])[3]
-
-
-def _replay_receipt(
-    attempt: AttemptEvidence,
-    *,
-    processed_directory: Path,
-    processing_git_commit: str,
-    removed: list[str],
-    cleanup_state: str,
-    recorded_at: str,
-) -> dict[str, Any]:
-    """Return one replay audit state for crash-safe temporary cleanup."""
-    return {
-        "schema_kind": REPLAY_SCHEMA_KIND,
-        "schema_version": REPLAY_SCHEMA_VERSION,
-        "campaign_run_id": attempt.payload["campaign_run_id"],
-        "case_id": attempt.payload["case_id"],
-        "attempt_index": attempt.payload["attempt_index"],
-        "processing_git_commit": processing_git_commit,
-        "processed_directory": str(processed_directory),
-        "processed_case_hdf5_sha256": common.serialization.file_sha256(processed_directory / "case.h5"),
-        "removed_temporary_payload": removed,
-        "cleanup_state": cleanup_state,
-        "recorded_at": recorded_at,
-    }
-
-
-def record_replay_success(
-    attempt: AttemptEvidence,
-    *,
-    processed_directory: Path,
-    processing_git_commit: str,
-) -> Path:
-    """Append replay success and crash-safely remove only temporary recovery bytes."""
-    target = attempt.directory / "replay.json"
-    temporary = list(attempt.payload["temporary_recovery_payload"])
-    remove_temporary = attempt.payload["retention_policy"] != "full"
-    removed = temporary if remove_temporary else []
-    recorded_at = _utc_now()
-    if target.exists():
-        existing = _load_json(target, label="attempt replay audit")
-        if (
-            existing.get("schema_kind") != REPLAY_SCHEMA_KIND
-            or existing.get("schema_version") != REPLAY_SCHEMA_VERSION
-            or existing.get("campaign_run_id") != attempt.payload["campaign_run_id"]
-            or existing.get("case_id") != attempt.payload["case_id"]
-            or existing.get("attempt_index") != attempt.payload["attempt_index"]
-            or existing.get("processing_git_commit") != processing_git_commit
-            or existing.get("processed_directory") != str(processed_directory)
-            or existing.get("processed_case_hdf5_sha256") != common.serialization.file_sha256(processed_directory / "case.h5")
-            or existing.get("removed_temporary_payload") != removed
-        ):
-            message = f"Existing replay audit conflicts: {target}"
-            raise FileExistsError(message)
-        if existing.get("cleanup_state") == "complete":
-            return target
-        recorded_at = str(existing["recorded_at"])
-    else:
-        common.serialization.atomic_write_json(
-            target,
-            _replay_receipt(
-                attempt,
-                processed_directory=processed_directory,
-                processing_git_commit=processing_git_commit,
-                removed=removed,
-                cleanup_state="pending",
-                recorded_at=recorded_at,
-            ),
-        )
-    for relative in removed:
-        path = attempt.directory / relative
-        if not path.absolute().is_relative_to(attempt.directory.absolute()) or path.is_symlink():
-            message = f"Temporary replay cleanup path is unsafe: {path}"
-            raise ValueError(message)
-        path.unlink(missing_ok=True)
-    for directory in sorted(
-        (path for path in (attempt.directory / "payload").rglob("*") if path.is_dir()),
-        reverse=True,
-    ):
-        with suppress(OSError):
-            directory.rmdir()
-    common.serialization.atomic_write_json(
-        target,
-        _replay_receipt(
-            attempt,
-            processed_directory=processed_directory,
-            processing_git_commit=processing_git_commit,
-            removed=removed,
-            cleanup_state="complete",
-            recorded_at=recorded_at,
-        ),
-    )
-    return target
 
 
 def record_attempt_cleanup(

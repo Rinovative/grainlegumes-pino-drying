@@ -1,7 +1,4 @@
-"""
-evaluation_plot_run_summary.py
-
-Summarize authoritative model accuracy, architecture, and physical tradeoffs.
+"""Summarize authoritative model accuracy, architecture, and physical tradeoffs.
 
 Responsibilities:
   - Build provenance-backed run and architecture summary tables
@@ -34,7 +31,6 @@ import numpy as np
 import pandas as pd
 
 from src.analysis.artifacts import contracts
-from src.analysis.artifacts import timing as artifact_timing
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
@@ -42,10 +38,9 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
 _PHYSICS_LABELS = {
-    "momentum_residual_mse": (r"momentum mean($R_x^2+R_y^2$)", "(Pa/m)^2"),
-    "div_velocity_mse": (r"mean($div(u)^2$)", "s^-2"),
-    "div_eps_velocity_mse": (r"mean($div(eps u)^2$)", "s^-2"),
-    "pressure_boundary_mse": ("pressure boundary diagnostic", "Pa^2"),
+    "momentum_residual_mse": (r"momentum mean($(R_x^2+R_y^2)/G^2$)", "1"),
+    "flux_balance_mse": (r"flux balance mean($((q-\bar q)/Q)^2$)", "1"),
+    "pressure_boundary_mse": (r"pressure boundary diagnostic$/\Delta p^2$", "1"),
 }
 _ROLE_MARKERS = {"ID": "o", "OOD": "s", "unspecified": "D"}
 _MINIMUM_SCOREBOARD_DATASETS = 2
@@ -66,13 +61,13 @@ def _finite_quantile(frame: pd.DataFrame, column: str, quantile: float) -> float
     return float(np.quantile(values, quantile))
 
 
-def _model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool, str]:
+def _model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
     """
-    Read model family, exact trainable count, PI flag, and continuity annotation.
+    Read model family, exact trainable count, and PI flag.
 
-    Values come only from complete provenance. Missing/non-typed parameter counts,
-    physics enablement, or continuity text fail rather than being inferred from
-    labels, configuration paths, or architecture names.
+    Values come only from complete provenance. Missing/non-typed parameter counts
+    or physics enablement fail rather than being inferred from labels,
+    configuration paths, or architecture names.
     """
     provenance = _provenance(frame)
     model = provenance.get("model")
@@ -92,12 +87,7 @@ def _model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool, str]:
     if type(physics_enabled) is not bool:
         msg = "Run summary requires a boolean model.physics_enabled provenance value."
         raise TypeError(msg)
-    physics = provenance.get("physics")
-    continuity = physics.get("selected_training_continuity") if isinstance(physics, Mapping) else "not_applicable"
-    if not isinstance(continuity, str):
-        msg = "Selected training continuity provenance must be a string."
-        raise TypeError(msg)
-    return family, trainable, physics_enabled, continuity
+    return family, trainable, physics_enabled
 
 
 def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
@@ -126,7 +116,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
     Notes
     -----
     The table includes run/config/checkpoint identity, exact trainable parameters,
-    physics enablement, and selected training continuity without deriving a score.
+    and physics enablement without deriving a score.
 
     """
     dataframe.validate_comparison(datasets)
@@ -138,7 +128,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
         aggregate = frame.attrs["normalized_group_macro_rmse"]
         fields = tuple(frame.attrs["output_fields"])
         units = dataframe.field_units(frame)
-        family, trainable, physics_enabled, continuity = _model_metadata(frame)
+        family, trainable, physics_enabled = _model_metadata(frame)
         row: dict[str, Any] = {
             "label": label,
             "dataset_role": dataframe.dataset_role(frame),
@@ -147,7 +137,6 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
             "architecture_family": family,
             "trainable_parameters": trainable,
             "physics_enabled": physics_enabled,
-            "selected_training_continuity": continuity,
             "normalized_group_macro_rmse": float(aggregate["value"]),
             "relative_l2_median": _finite_quantile(frame, "rel_l2", 0.5),
             "relative_l2_q90": _finite_quantile(frame, "rel_l2", 0.9),
@@ -237,69 +226,6 @@ def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.V
     if any(count_headings.values()):
         visible = visible.rename(index={label: count_headings[label] for label in datasets})
     return _styled_table(visible, title=title)
-
-
-def build_runtime_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
-    """Build one row per exact identity-bound operational timing sidecar."""
-    dataframe.validate_comparison(datasets)
-    rows: list[dict[str, Any]] = []
-    for label, frame in datasets.items():
-        raw_payload = frame.attrs.get(dataframe.RUNTIME_COMPARISON_ATTR)
-        if not isinstance(raw_payload, Mapping):
-            msg = f"Artifact {label!r} has no admitted runtime comparison capability."
-            raise dataframe.ComparisonCompatibilityError(msg)
-        payload = artifact_timing.validate_runtime_comparison(raw_payload)
-        runtime = payload["neural_runtime"]
-        aggregates = payload["aggregates"]
-        rows.append(
-            {
-                "label": label,
-                "device": runtime["resolved_device"],
-                "inference_dtype": runtime["inference_dtype"],
-                "case_count": len(payload["cases"]),
-                "neural_operator_forward_median_s": aggregates["neural_operator_forward_s"]["median"],
-                "comsol_solve_median_s": aggregates["comsol_solve_s"]["median"],
-                "speedup_median": aggregates["speedup"]["median"],
-                "comparison_status": payload["comparison"]["status"],
-            }
-        )
-    return pd.DataFrame(rows).set_index("label")
-
-
-def plot_runtime_comparison(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Plot warmed artifact-time forward, solver, and matched speedup evidence."""
-    summary = build_runtime_summary_table(datasets)
-    labels = tuple(str(label) for label in summary.index)
-    positions = np.arange(len(labels), dtype=float)
-    neural = np.asarray(
-        pd.to_numeric(summary["neural_operator_forward_median_s"], errors="raise"),
-        dtype=np.float64,
-    )
-    comsol = np.asarray(pd.to_numeric(summary["comsol_solve_median_s"], errors="coerce"), dtype=np.float64)
-    speedup = np.asarray(pd.to_numeric(summary["speedup_median"], errors="coerce"), dtype=np.float64)
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
-    width = 0.36
-    axes[0].bar(positions - width / 2.0, neural, width=width, label="Neural operator")
-    available_comsol = np.isfinite(comsol)
-    if available_comsol.any():
-        axes[0].bar(positions[available_comsol] + width / 2.0, comsol[available_comsol], width=width, label="COMSOL")
-    axes[0].set_yscale("log")
-    axes[0].set_ylabel("Warmed runtime [s]")
-    axes[0].set_title("Case-matched median runtime")
-    axes[0].legend()
-    available_speedup = np.isfinite(speedup)
-    if available_speedup.any():
-        axes[1].bar(positions[available_speedup], speedup[available_speedup], width=0.55)
-    else:
-        axes[1].text(0.5, 0.5, "Matched COMSOL timing unavailable", ha="center", va="center", transform=axes[1].transAxes)
-    axes[1].set_ylabel("COMSOL / neural operator [ratio]")
-    axes[1].set_title("Case-matched median speedup")
-    tick_labels = tuple(f"{label}\n{summary.loc[label, 'device']}" for label in labels)
-    for axis in axes:
-        axis.set_xticks(positions, tick_labels)
-        axis.grid(axis="y", alpha=0.25)
-    figure.suptitle("Authoritative artifact runtime")
-    return figure
 
 
 def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
@@ -502,7 +428,7 @@ def _add_data_configuration(
             data,
             (
                 ("train_dataset", "Data · Training dataset"),
-                ("ood_datasets", "Data · OOD datasets"),
+                ("additional_evaluation_datasets", "Data · Additional evaluation datasets"),
                 ("batch_size", "Data · Batch size"),
             ),
         )
@@ -574,24 +500,16 @@ def _add_physics_configuration(
     row["Physics-informed loss · Enabled"] = physics_enabled
     if not physics_enabled:
         return
-    continuity = str(physics.get("continuity"))
     derivatives = _config_mapping(physics.get("derivatives"), label="loss.physics.derivatives")
-    residual_weight = _config_mapping(physics.get("residual_weight"), label="loss.physics.residual_weight")
-    boundary_weight = _config_mapping(physics.get("boundary_weight"), label="loss.physics.boundary_weight")
+    for term, title in (("momentum", "Momentum residual"), ("continuity", "Flux-balance continuity"), ("boundary", "Pressure-boundary")):
+        weight = _config_mapping(physics.get(f"{term}_weight"), label=f"loss.physics.{term}_weight")
+        row[f"Physics-informed loss · {title} weight"] = _weight_display(weight.get("target"))
+        row[f"Physics-informed loss · {title} schedule"] = _warmup_display(weight)
     row.update(
         {
-            "Physics-informed loss · Momentum residual weight": _weight_display(residual_weight.get("target")),
-            "Physics-informed loss · Continuity formulation": continuity,
-            "Physics-informed loss · Continuity weight": _weight_display(residual_weight.get("target")),
-            "Physics-informed loss · Pressure-boundary weight": _weight_display(boundary_weight.get("target")),
-            "Physics-informed loss · Momentum/continuity schedule": _warmup_display(residual_weight),
-            "Physics-informed loss · Pressure-boundary schedule": _warmup_display(boundary_weight),
             "Physics-informed loss · Derivative operator": derivatives.get("kind"),
             "Physics-informed loss · Derivative extension": derivatives.get("extension"),
             "Physics-informed loss · Interior crop": physics.get("interior_crop"),
-            "Physics-informed loss · Velocity representation": (
-                "porosity-weighted velocity εu" if continuity == "div_eps_velocity" else "velocity u"
-            ),
         }
     )
     _copy_configuration_fields(
@@ -707,8 +625,8 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
     Returns
     -------
     matplotlib.figure.Figure
-        Four linear-axis panels pairing ``normalized_group_macro_rmse`` with the median
-        momentum, dual-continuity, or pressure-boundary diagnostic.
+        Three panels pairing ``normalized_group_macro_rmse`` with the median
+        dimensionless momentum, flux-balance, or pressure-boundary diagnostic.
 
     Raises
     ------
@@ -728,18 +646,13 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
         "Accuracy versus physical consistency",
         layout.effective_case_counts(datasets),
     )
-    figure = plt.figure(figsize=(15.0, 9.5))
-    grid = figure.add_gridspec(2, 3, width_ratios=(1.0, 1.0, 0.32), wspace=0.28, hspace=0.32)
-    axes = np.asarray(
-        [
-            [figure.add_subplot(grid[0, 0]), figure.add_subplot(grid[0, 1])],
-            [figure.add_subplot(grid[1, 0]), figure.add_subplot(grid[1, 1])],
-        ]
-    )
-    legend_axis = figure.add_subplot(grid[:, 2])
+    figure = plt.figure(figsize=(19.0, 5.5))
+    grid = figure.add_gridspec(1, 4, width_ratios=(1.0, 1.0, 1.0, 0.32), wspace=0.30)
+    axes = tuple(figure.add_subplot(grid[0, column]) for column in range(len(dataframe.STEADY_PHYSICS_METRICS)))
+    legend_axis = figure.add_subplot(grid[0, 3])
     legend_axis.axis("off")
     colors = plt.get_cmap("tab10")
-    for axis, metric in zip(axes.flat, dataframe.STEADY_PHYSICS_METRICS, strict=True):
+    for axis, metric in zip(axes, dataframe.STEADY_PHYSICS_METRICS, strict=True):
         metric_label, unit = _PHYSICS_LABELS[metric]
         for index, (label, frame) in enumerate(datasets.items()):
             primary = float(frame.attrs["normalized_group_macro_rmse"]["value"])
@@ -747,7 +660,7 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
             if primary < 0.0 or physics_value < 0.0:
                 msg = f"Pareto metrics must be non-negative. {label!r} supplied {primary}, {physics_value}."
                 raise ValueError(msg)
-            _family, _count, physics_enabled, _continuity = _model_metadata(frame)
+            _family, _count, physics_enabled = _model_metadata(frame)
             role = dataframe.dataset_role(frame)
             color = colors(index % colors.N)
             axis.scatter(
@@ -772,9 +685,9 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
         axis.set_ylabel(f"Median {metric_label} [{unit}]")
         axis.set_title(metric)
         axis.grid(True, which="both", linestyle="--", alpha=0.3)
-    handles, labels = axes.flat[0].get_legend_handles_labels()
+    handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         legend_axis.legend(handles, labels, loc="upper left", title="Model / dataset", frameon=True)
-    figure.subplots_adjust(top=0.88, bottom=0.09, left=0.07, right=0.98)
-    layout.title_over_axes(figure, figure_title, tuple(axes.flat), y=0.97)
+    figure.subplots_adjust(top=0.84, bottom=0.14, left=0.06, right=0.98)
+    layout.title_over_axes(figure, figure_title, axes, y=0.96)
     return figure

@@ -1,16 +1,19 @@
-"""
-generation_runtime_stop.py
+"""Control one owned COMSOL process through its documented status-file protocol.
 
-Control one owned COMSOL process through its documented status-file protocol.
 Responsibilities:
   - Validate bounded graceful-stop and hard-timeout timing contracts
   - Derive and publish COMSOL status commands only inside one owned workspace
   - Persist concise stop-request evidence with an explicit reason and timestamp
+  - Admit and remove exact capacity-only checkout status artifacts after ownership validation
   - Escalate an unresponsive owned process group through Cancel, TERM, and KILL
+  - Stop a solver gracefully when its simulated time stalls below a configured minimum
+  - Record the solving time at which the simulated time first reached that minimum, without influencing any stop decision
+
 Design principles:
   - Status-file paths are fail-closed against escapes and symbolic links
   - Graceful stopping precedes process-group escalation at the hard deadline
   - Injected time and wait boundaries make lifecycle behavior directly testable
+
 This module does NOT:
   - Start COMSOL processes or prepare case workspaces
   - Classify solver output or publish simulation results
@@ -28,7 +31,7 @@ import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -44,7 +47,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 0.25
 DEFAULT_ESCALATION_WAIT_SECONDS = 5.0
 _MAX_STATUS_EXCERPT_BYTES = 160
 
-StopReason = Literal["timeout", "cancelled"]
+StopReason = Literal["timeout", "stalled", "cancelled"]
 
 
 class OwnedSolverProcess(Protocol):
@@ -68,6 +71,39 @@ TimestampClock = Callable[[], str]
 CancellationRequested = Callable[[], bool]
 ForceRequested = Callable[[], bool]
 ProgressCallback = Callable[[], None]
+SimulatedSeconds = Callable[[], float | None]
+
+
+@dataclass(frozen=True, slots=True)
+class StallRule:
+    """
+    Stop a solver whose simulated time is still below a minimum after a fixed solving time.
+
+    Attributes
+    ----------
+    check_after_seconds : float
+        Solving time, measured from controller construction, after which the rule applies.
+    minimum_simulated_seconds : float
+        Simulated time the solver must have reached by then.
+    simulated_seconds : SimulatedSeconds
+        Latest simulated time reported by the solver, or ``None`` while none is known.
+        An unknown time never triggers the rule; the timeout remains the backstop.
+    observed_simulated_seconds : SimulatedSeconds | None, optional
+        Independent reader of the same solver output, used only to record when the minimum is first
+        reached; it never informs a stop decision and its failures are ignored.
+
+    """
+
+    check_after_seconds: float
+    minimum_simulated_seconds: float
+    simulated_seconds: SimulatedSeconds
+    observed_simulated_seconds: SimulatedSeconds | None = None
+
+    def __post_init__(self) -> None:
+        """Reject non-positive thresholds."""
+        if not (self.check_after_seconds > 0.0 and self.minimum_simulated_seconds > 0.0):
+            msg = "Stall rule thresholds must be positive."
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +121,10 @@ class StopResult:
         Whether the COMSOL ``Stop 2`` command was published.
     force_escalated : bool
         Whether the hard deadline required ``Cancel`` and process-group signals.
+    minimum_simulated_reached_after_seconds : float | None
+        Solving time, measured from controller construction like ``StallRule.check_after_seconds``,
+        at which the stall rule's simulated time was first observed at or above its minimum;
+        ``None`` without a stall rule or when that was never observed.
 
     """
 
@@ -92,16 +132,22 @@ class StopResult:
     reason: StopReason | None
     graceful_stop_requested: bool
     force_escalated: bool
+    minimum_simulated_reached_after_seconds: float | None = None
 
     @property
     def timed_out(self) -> bool:
         """Return whether timeout control, rather than cancellation, ended the case."""
         return self.reason == "timeout"
 
+    @property
+    def stalled(self) -> bool:
+        """Return whether the stall rule ended the case."""
+        return self.reason == "stalled"
+
 
 def _utc_timestamp() -> str:
     """Return one timezone-aware UTC evidence timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _default_wait(process: OwnedSolverProcess, timeout: float | None) -> int:
@@ -528,14 +574,12 @@ class UnexpectedStopStatusContentError(RuntimeError):
         *,
         exit_code: int | None = None,
         required_exports_present: bool | None = None,
-        replay_available: bool | None = None,
     ) -> None:
         """Initialize exact status-file and optional post-termination evidence."""
         self.diagnostics = {
             **diagnostics,
             "solver_exit_code": exit_code,
             "required_exports_present": required_exports_present,
-            "replay_available": replay_available,
         }
         self.exit_code = exit_code
         self.timed_out = False
@@ -552,17 +596,13 @@ class UnexpectedStopStatusContentError(RuntimeError):
         *,
         exit_code: int,
         required_exports_present: bool,
-        replay_available: bool,
     ) -> UnexpectedStopStatusContentError:
         """Return the same rejection enriched after the owned solver has exited."""
-        base = {
-            key: value for key, value in self.diagnostics.items() if key not in {"solver_exit_code", "required_exports_present", "replay_available"}
-        }
+        base = {key: value for key, value in self.diagnostics.items() if key not in {"solver_exit_code", "required_exports_present"}}
         return UnexpectedStopStatusContentError(
             base,
             exit_code=exit_code,
             required_exports_present=required_exports_present,
-            replay_available=replay_available,
         )
 
 
@@ -570,11 +610,11 @@ def _unexpected_status_diagnostics(
     path: Path,
     command: str,
     accepted_existing: frozenset[str],
+    *,
+    raw: bytes,
+    size: int,
 ) -> dict[str, object]:
     """Return bounded content and ownership evidence for one rejected status file."""
-    size = path.stat().st_size
-    with path.open("rb") as stream:
-        raw = stream.read(_MAX_STATUS_EXCERPT_BYTES + 1)
     bounded = raw[:_MAX_STATUS_EXCERPT_BYTES]
     try:
         excerpt = bounded.decode("utf-8")
@@ -605,20 +645,25 @@ def _unexpected_status_diagnostics(
 
 def _write_verified_command(path: Path, command: str, *, accepted_existing: frozenset[str]) -> None:
     """Atomically publish one exact COMSOL command without replacing unknown content."""
-    if path.exists():
-        admitted = {command, *accepted_existing}
-        if path.stat().st_size > max(len(value.encode("utf-8")) for value in admitted):
-            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing))
-        try:
-            existing = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as error:
-            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing)) from error
-        if existing == command:
+    try:
+        identity, raw = _read_capacity_status_without_following(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid():
+            message = f"COMSOL stop status is not one owned regular file: {path}."
+            raise RuntimeError(message)
+        if identity.st_size > _MAX_CAPACITY_STATUS_BYTES or len(raw) != identity.st_size:
+            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing, raw=raw, size=identity.st_size))
+        if raw == command.encode("utf-8"):
             return
-        if existing not in accepted_existing:
-            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing))
+        admitted = {value.encode("utf-8") for value in accepted_existing}
+        running = _CAPACITY_STATUS_PATTERN.fullmatch(raw)
+        if raw not in admitted and not (command == STOP_COMMAND and running is not None and running.group("state") == b"Running"):
+            raise UnexpectedStopStatusContentError(_unexpected_status_diagnostics(path, command, accepted_existing, raw=raw, size=identity.st_size))
     common.serialization.atomic_write_text(path, command)
-    if path.read_text(encoding="utf-8") != command:
+    verified_identity, verified = _read_capacity_status_without_following(path)
+    if not stat.S_ISREG(verified_identity.st_mode) or verified_identity.st_uid != os.geteuid() or verified != command.encode("utf-8"):
         msg = f"COMSOL stop status command was not durably verified at {path}."
         raise RuntimeError(msg)
 
@@ -649,6 +694,8 @@ class SolverStopController:
         Maximum regular wait interval.
     escalation_wait_seconds : float, optional
         Bounded wait between Cancel, TERM, and KILL escalation steps.
+    stall_rule : StallRule | None, optional
+        Graceful stop for a solver whose simulated time stalls; ``None`` disables it.
 
     """
 
@@ -665,6 +712,7 @@ class SolverStopController:
         timestamp_clock: TimestampClock = _utc_timestamp,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         escalation_wait_seconds: float = DEFAULT_ESCALATION_WAIT_SECONDS,
+        stall_rule: StallRule | None = None,
     ) -> None:
         """Initialize one controller for a single owned solver process group."""
         validate_stop_timing(
@@ -688,8 +736,11 @@ class SolverStopController:
         self._started_at = monotonic_clock()
         self._graceful_deadline = self._started_at + timeout_seconds - graceful_stop_reserve_seconds
         self._hard_deadline = self._started_at + timeout_seconds
+        self._graceful_stop_reserve_seconds = graceful_stop_reserve_seconds
         self._reason: StopReason | None = None
         self._force_escalated = False
+        self._stall_rule = stall_rule
+        self._minimum_reached_after: float | None = None
 
     def request_graceful_stop(self, reason: StopReason) -> None:
         """Atomically request a COMSOL controlled stop and persist its evidence."""
@@ -739,7 +790,7 @@ class SolverStopController:
         while True:
             completed = self._process.poll()
             if completed is not None:
-                return StopResult(completed, self._reason, self._reason is not None, self._force_escalated)
+                return self._result(completed, self._force_escalated)
             now = self._monotonic_clock()
             if force_requested():
                 self.request_graceful_stop("cancelled")
@@ -748,8 +799,13 @@ class SolverStopController:
                 self.request_graceful_stop("cancelled")
             elif now >= self._graceful_deadline:
                 self.request_graceful_stop("timeout")
+            elif self._stalled(now):
+                self.request_graceful_stop("stalled")
+                # A stalled solver gets the same orderly-stop reserve as a timed-out one, not the rest of its timeout.
+                self._hard_deadline = min(self._hard_deadline, now + self._graceful_stop_reserve_seconds)
             if now >= self._hard_deadline:
                 return self._force_stop()
+            self._observe_minimum(now)
             next_deadline = self._hard_deadline if self._reason is not None else self._graceful_deadline
             wait_seconds = min(self._poll_interval_seconds, max(0.0, next_deadline - now))
             try:
@@ -757,12 +813,37 @@ class SolverStopController:
             except subprocess.TimeoutExpired:
                 progress_callback()
                 continue
-            return StopResult(completed, self._reason, self._reason is not None, self._force_escalated)
+            return self._result(completed, self._force_escalated)
+
+    def _observe_minimum(self, now: float) -> None:
+        """Record when the stall rule's observation reader first reports the minimum; never affects stop control."""
+        rule = self._stall_rule
+        if rule is None or rule.observed_simulated_seconds is None or self._minimum_reached_after is not None:
+            return
+        try:
+            simulated = rule.observed_simulated_seconds()
+        except Exception:  # noqa: BLE001 -- calibration evidence must never change or abort stop control
+            return
+        if simulated is not None and simulated >= rule.minimum_simulated_seconds:
+            self._minimum_reached_after = now - self._started_at
+
+    def _stalled(self, now: float) -> bool:
+        """Return whether the stall rule applies and the solver's simulated time is below its minimum."""
+        rule = self._stall_rule
+        if rule is None or self._reason is not None or now - self._started_at < rule.check_after_seconds:
+            return False
+        simulated = rule.simulated_seconds()
+        return simulated is not None and simulated < rule.minimum_simulated_seconds
+
+    def _result(self, exit_code: int, force_escalated: bool) -> StopResult:
+        """Observe the minimum once more after the process exit and return the final outcome."""
+        self._observe_minimum(self._monotonic_clock())
+        return StopResult(exit_code, self._reason, self._reason is not None, force_escalated, self._minimum_reached_after)
 
     def _force_stop(self) -> StopResult:
         """Escalate the owned process group only after the hard deadline."""
         if self._process.poll() is not None:
-            return StopResult(self._wait_process(self._process, 0.0), self._reason, self._reason is not None, self._force_escalated)
+            return self._result(self._wait_process(self._process, 0.0), self._force_escalated)
         status_path = derive_stop_status_path(self._active_work_directory)
         _write_verified_command(status_path, CANCEL_COMMAND, accepted_existing=frozenset({STOP_COMMAND}))
         self._force_escalated = True
@@ -771,13 +852,13 @@ class SolverStopController:
         except subprocess.TimeoutExpired:
             self._signal_owned_group(signal.SIGTERM)
         else:
-            return StopResult(completed, self._reason, self._reason is not None, True)
+            return self._result(completed, True)
         try:
             completed = self._wait_process(self._process, self._escalation_wait_seconds)
         except subprocess.TimeoutExpired:
             self._signal_owned_group(signal.SIGKILL)
             completed = self._wait_process(self._process, self._escalation_wait_seconds)
-        return StopResult(completed, self._reason, self._reason is not None, True)
+        return self._result(completed, True)
 
     def _signal_owned_group(self, value: signal.Signals) -> None:
         """Signal only the process group identified by the owned solver PID."""

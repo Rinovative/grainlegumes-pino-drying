@@ -1,11 +1,10 @@
-"""
-experiments_notebook_support.py
-
-Prepare typed, read-only state and tables for the training control notebook.
+"""Prepare typed, read-only state and tables for the training control notebook.
 
 Responsibilities:
-  - Resolve official configuration, TaskSpec, metadata previews, and pure paths
+  - Resolve steady and transient protocol children, TaskSpec, metadata, and pure paths
+  - List the built Datasets of a configuration's task and apply explicit training-Dataset and Stage-B-seconds selections
   - Prepare deterministic table specifications from already resolved values
+  - Inspect saved configuration and summary identities with truthful artifact paths
   - Represent optional completed-run inspection and validation displays
 
 Design principles:
@@ -29,6 +28,8 @@ from typing import TYPE_CHECKING, Any
 from src import common, datasets
 
 from .config import experiments_config_loader as config_loader
+from .config import experiments_config_naming as config_naming
+from .config import experiments_config_transient_plan as transient_plan
 
 if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
@@ -44,7 +45,7 @@ class DatasetPreview:
     path: Path
     exists: bool
     sample_count: int | None
-    fingerprint: str | None
+    dataset_digest: str | None
     metadata_validated: bool
 
 
@@ -60,6 +61,8 @@ class NotebookContext:
     output_root: Path
     run_dir: Path
     dataset_previews: tuple[DatasetPreview, ...]
+    protocol: str = "direct"
+    stage_configs: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,8 +100,9 @@ def _dataset_preview(
     metadata_root: Path,
 ) -> DatasetPreview:
     """Return one validated metadata preview or an explicit absent marker."""
-    dataset_path = common.paths.resolve_dataset_path(dataset_id, dataset_root=dataset_root)
+    dataset_path = common.paths.resolve_dataset_path(task.id, dataset_id, dataset_root=dataset_root)
     metadata_directory = common.paths.resolve_dataset_metadata_dir(
+        task.id,
         dataset_id,
         metadata_root=metadata_root,
     )
@@ -109,39 +113,86 @@ def _dataset_preview(
             path=dataset_path,
             exists=dataset_path.is_file() and not dataset_path.is_symlink(),
             sample_count=None,
-            fingerprint=None,
+            dataset_digest=None,
             metadata_validated=False,
         )
 
-    summary = datasets.contracts.metadata.load_dataset_metadata_summary(
+    manifest = datasets.packages.manifest.load_package_manifest_evidence(
+        task.id,
         dataset_id,
-        task=task,
-        dataset_root=dataset_root,
-        metadata_root=metadata_root,
+        storage_root=dataset_root.parent,
     )
+    view = datasets.contracts.views.get_view(task.id)
+    if manifest["registered_task_id"] != view.registered_task_id or manifest["dataset_view"] != view.id:
+        msg = "Dataset manifest does not match the selected task."
+        raise ValueError(msg)
     return DatasetPreview(
         role=role,
-        dataset_id=summary.dataset_id,
-        path=summary.dataset_path,
-        exists=summary.dataset_exists,
-        sample_count=summary.sample_count,
-        fingerprint=summary.fingerprint,
+        dataset_id=dataset_id,
+        path=dataset_path,
+        exists=True,
+        sample_count=manifest["sample_count"],
+        dataset_digest=manifest["dataset_digest"],
         metadata_validated=True,
     )
 
 
-def prepare_notebook_context(config_path: Path | str) -> NotebookContext:
-    """Resolve configuration, TaskSpec, metadata summaries, and paths atomically."""
+def list_built_datasets(config_path: Path | str) -> tuple[str, ...]:
+    """Return the sorted IDs of the built Datasets of the task a configuration belongs to."""
+    task_id = config_naming.config_source_from_path(config_path).task
+    dataset_root = common.paths.get_datasets_root()
+    manifests = (dataset_root / task_id).glob(f"*/{common.paths.DATASET_MANIFEST_FILENAME}")
+    built = tuple(sorted(manifest.parent.name for manifest in manifests))
+    if not built:
+        msg = f"No built {task_id} Dataset exists below {dataset_root}; build one before selecting it."
+        raise FileNotFoundError(msg)
+    return built
+
+
+def prepare_notebook_context(
+    config_path: Path | str,
+    *,
+    stage: str | None = None,
+    train_dataset: str | None = None,
+    train_seconds: float | None = None,
+) -> NotebookContext:
+    """Resolve configuration, TaskSpec, metadata summaries, and paths atomically.
+
+    ``train_dataset`` replaces ``data.train_dataset`` of every stage and ``train_seconds``
+    sets Stage B's measured target of a matched plan, exactly as the ``--train-dataset``
+    and ``--train-seconds`` training options do; ``None`` keeps the configured value.
+    """
     selected_path = Path(config_path)
-    official_config = config_loader.load_and_resolve_config(selected_path)
+    raw = config_loader.apply_training_overrides(
+        config_loader.load_authored_config(selected_path),
+        train_dataset=train_dataset,
+        train_seconds=train_seconds,
+    )
+    config_source = config_naming.config_source_from_path(selected_path)
+    if transient_plan.is_matched_a1_b_config(raw):
+        plan = transient_plan.resolve_matched_a1_b_plan(raw, source=config_source)
+        protocol = "matched_a1_b"
+        stage_configs = tuple(dict(config) for config in plan.stages)
+    else:
+        protocol = "direct"
+        stage_configs = (config_loader.resolve_config(raw, source=config_source),)
+    if stage is None:
+        official_config = stage_configs[0]
+    else:
+        matches = [config for config in stage_configs if config["training"].get("comparison_arm") == stage]
+        if len(matches) != 1:
+            msg = f"Stage {stage!r} is unavailable in the selected {protocol} configuration."
+            raise ValueError(msg)
+        official_config = matches[0]
     task = config_loader.validate_resolved_task_contract(official_config)
     objective = config_loader.get_resolved_objective(official_config)
 
     dataset_root = Path(official_config["paths"]["dataset_root"])
-    metadata_root = Path(official_config["paths"]["dataset_metadata_root"])
+    metadata_root = Path(official_config["paths"]["dataset_root"])
+    data = official_config["data"]
     roles = [
-        ("ID train and evaluation source", official_config["data"]["train_dataset"]),
-        *(("OOD diagnostic source", dataset_id) for dataset_id in official_config["data"]["ood_datasets"]),
+        ("ID train / validation / test source", data["train_dataset"]),
+        *(("Dataset-declared OOD", dataset_id) for dataset_id in data["additional_evaluation_datasets"]),
     ]
     previews = tuple(
         _dataset_preview(
@@ -155,11 +206,7 @@ def prepare_notebook_context(config_path: Path | str) -> NotebookContext:
     )
 
     output_root = Path(official_config["paths"]["output_root"])
-    run_dir = common.paths.resolve_run_output_dir(
-        task.id,
-        official_config["run"]["name"],
-        output_root=output_root,
-    )
+    run_dir = common.paths.resolve_config_run_dir(official_config)
     return NotebookContext(
         config_path=selected_path,
         official_config=official_config,
@@ -169,51 +216,85 @@ def prepare_notebook_context(config_path: Path | str) -> NotebookContext:
         output_root=output_root,
         run_dir=run_dir,
         dataset_previews=previews,
+        protocol=protocol,
+        stage_configs=stage_configs,
     )
 
 
-def prepare_run_inspection(
-    run_dir: Path | str,
-    *,
-    ood_dataset_id: str,
-) -> RunInspection:
-    """Read one validated run summary and prepare expected-path records."""
+def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
+    """Inspect saved configuration and summary without opening tensor artifacts."""
     from . import experiments_run as run_service  # noqa: PLC0415 -- optional run inspection stays lazy
 
     selected_run = Path(run_dir).expanduser().resolve()
     if not selected_run.is_dir():
-        msg = f"Completed run directory not found: {selected_run}"
+        msg = f"Run directory not found: {selected_run}"
         raise FileNotFoundError(msg)
-
     summary = run_service.read_run_summary(selected_run)
-    objective = summary.get("objective")
-    objective_id = objective.get("id", "not available") if isinstance(objective, Mapping) else "not available"
+    config = config_loader.validate_resolved_config(
+        config_loader.load_yaml(common.paths.resolve_run_config_path(selected_run)),
+    )
+    if summary.get("task") != config["task"] or summary.get("run_name") != config["run"]["name"]:
+        msg = "Saved run summary and configuration identity disagree."
+        raise ValueError(msg)
+    objective = config_loader.get_resolved_objective(config)
+    data = config["data"]
     summary_rows: tuple[tuple[str, object], ...] = (
         ("Run directory", selected_run),
+        ("Saved task", config["task"]),
+        ("Saved run name", config["run"]["name"]),
+        ("Stage / comparison arm", config["training"].get("comparison_arm", "direct")),
         ("Status", summary.get("status", "not available")),
-        ("Objective", objective_id),
+        ("Objective", objective["id"]),
         ("Completed epoch", summary.get("completed_epoch", "not available")),
         ("Best epoch", summary.get("best_epoch", "not available")),
         ("Best metric", summary.get("best_metric", "not available")),
     )
-    expected_paths = (
-        ("config.yaml", selected_run / common.paths.RUN_CONFIG_FILENAME),
-        ("summary.json", selected_run / common.paths.RUN_SUMMARY_FILENAME),
-        ("split_indices.pt", selected_run / common.paths.RUN_SPLIT_INDICES_FILENAME),
-        ("normalizer.pt", selected_run / common.paths.RUN_NORMALIZER_FILENAME),
-        ("best_checkpoint.pt", selected_run / common.paths.RUN_BEST_CHECKPOINT_FILENAME),
-        ("last_checkpoint.pt", selected_run / common.paths.RUN_LAST_CHECKPOINT_FILENAME),
-        ("wandb/", selected_run / "wandb"),
-        ("analysis/id/", selected_run / "analysis" / "id"),
-        (
-            f"analysis/ood/{ood_dataset_id}/",
-            selected_run / "analysis" / "ood" / ood_dataset_id,
-        ),
+    expected_paths = [(name, selected_run / name) for name in common.paths.CURRENT_RUN_REQUIRED_FILES]
+    expected_paths.extend(
+        [
+            ("wandb/", selected_run / "wandb"),
+            ("analysis/id/", common.paths.resolve_id_analysis_dir(selected_run)),
+        ]
     )
+    if config["task"] == "transient_drying":
+        expected_paths.append(("history.json", selected_run / "history.json"))
+    additional = data["additional_evaluation_datasets"]
+    if additional:
+        identity = datasets.contracts.identity.combined_dataset_id(additional)
+        expected_paths.append(
+            (
+                f"analysis/additional_evaluation/{identity}/",
+                common.paths.resolve_additional_evaluation_analysis_dir(selected_run, identity),
+            )
+        )
     return RunInspection(
         run_dir=selected_run,
         summary_rows=summary_rows,
         existence_rows=tuple((label, path.exists()) for label, path in expected_paths),
+    )
+
+
+def prepare_protocol_table(context: NotebookContext) -> NotebookTable:
+    """Preview authored stage dependencies and budgets without allocating runs."""
+    rows = []
+    for config in context.stage_configs or (context.official_config,):
+        training = config["training"]
+        matched = training.get("matched_a1_b", {})
+        teacher = training.get("teacher_handoff")
+        rows.append(
+            (
+                training.get("comparison_arm", "direct"),
+                config["run"]["name"],
+                training["epochs"],
+                teacher["source_run_name"] if teacher else "none",
+                matched.get("train_seconds"),
+                matched.get("receipt_source_run_name"),
+            )
+        )
+    return _table(
+        title=f"Training protocol: {context.protocol}",
+        columns=("Arm", "Run name", "Epoch cap", "Teacher source", "B train seconds", "Measured budget source"),
+        rows=rows,
     )
 
 
@@ -230,8 +311,10 @@ def _readable_value(value: object) -> str:
         return "none"
     if isinstance(value, float):
         return f"{value:.8g}"
+    if isinstance(value, Mapping):
+        return "; ".join(f"{key}={_readable_value(item)}" for key, item in value.items())
     if isinstance(value, (list, tuple)):
-        return ", ".join(_readable_value(item) for item in value)
+        return ", ".join(_readable_value(item) for item in value) if value else "none"
     return str(value)
 
 
@@ -281,9 +364,84 @@ def _settings_table(
     )
 
 
+def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[NotebookTable, ...]:
+    """Render resolved transient settings without borrowing steady physics semantics."""
+    config = context.official_config
+    data = config["data"]
+    training = config["training"]
+    model = config["model"]
+    return (
+        _settings_table(
+            "Task and data",
+            (
+                ("Task ID", context.task.id, "Registered scientific task"),
+                ("ID dataset", data["train_dataset"], "Disjoint train, validation, and untouched ID-test cases"),
+                ("Case partition", "Dataset manifest", "Fixed case membership independent of training seed"),
+                ("Additional Evaluation datasets", data["additional_evaluation_datasets"], "Optional explicitly assigned scientific roles"),
+                ("Input profile", config["input_profile"], "Resolved transient input semantics"),
+                ("Output fields", context.task.output_names, "Ordered physical state channels"),
+                ("Backend", data["transient_backend_preference"], "Requested maintained data backend"),
+                ("Backend required", data["transient_backend_required"], "Fail-closed backend requirement"),
+                ("Spatial stride", data["spatial_stride"], "Declared model spatial support"),
+            ),
+        ),
+        _settings_table(
+            "Model",
+            (
+                ("Variant", config_loader.resolved_model_variant(config), "Production semantic model identity"),
+                ("Kind", model["kind"], "Maintained neural-operator family"),
+                *((key, value, "Resolved architecture parameter") for key, value in model["params"].items()),
+            ),
+        ),
+        _settings_table(
+            "Temporal protocol and training",
+            (
+                ("Protocol", context.protocol, "Direct or matched A0/B/A1 request"),
+                ("Arm", training["comparison_arm"], "Selected child configuration"),
+                ("Sampling", config["temporal"]["sampling"], "Authoritative transition or rollout sampling"),
+                ("Time conditioning", config["temporal"]["temporal_conditioning"], "Configured temporal features"),
+                ("Epoch cap", training["epochs"], "Operational cap; does not establish measured budget completion"),
+                ("Curriculum", training["curriculum"], "Configured rollout lengths and milestones"),
+                ("Teacher handoff", training["teacher_handoff"], "Common Stage-A checkpoint dependency"),
+                ("Matched protocol", training.get("matched_a1_b"), "A1 consumes B measured train-time receipt"),
+                ("ID evaluation interval", training["evaluation_interval"], "Validation cadence for model selection"),
+                ("Additional evaluation interval", training["additional_evaluation_interval"], "Diagnostic cadence"),
+            ),
+        ),
+        _settings_table(
+            "Runtime, optimization, and loss",
+            (
+                ("Device policy", config["run"]["device"], "Resolved policy; no device probe"),
+                ("Seed", config["run"]["seed"], "Saved deterministic seed"),
+                ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
+                ("Batch size", data["batch_size"], "Training batch size"),
+                ("Workers", data["num_workers"], "Dataloader worker count"),
+                ("Mixed precision", training["mixed_precision"], "Configured precision policy"),
+                ("Gradient accumulation", training["gradient_accumulation_steps"], "Batches per optimizer step"),
+                ("Optimizer", config["optimizer"], "Production optimization settings"),
+                ("Scheduler", config["scheduler"], "Validation-objective learning-rate policy"),
+                ("Scaling", config["scaling"], "Training-only fitted scaling contract"),
+                ("Data loss", config["loss"]["data"], "Saved increment and auxiliary state objective"),
+                ("Physics loss", config["loss"]["physics"], "Resolved transient physics selection"),
+            ),
+        ),
+        _settings_table(
+            "Evaluation and tracking",
+            (
+                ("Primary objective", context.objective["id"], "Validation model-selection metric"),
+                ("Direction", context.objective["direction"], "Production objective direction"),
+                ("Metrics", [metric["id"] for metric in config["evaluation"]["metrics"]], "Resolved normalized and physical metrics"),
+                ("W&B", config["tracking"]["wandb"], "Configured observer; inspection never initializes it"),
+            ),
+        ),
+    )
+
+
 def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTable, ...]:
     """Prepare ordered presentation tables from one resolved configuration."""
     config = context.official_config
+    if context.task.id == "transient_drying":
+        return _prepare_transient_configuration_tables(context)
     task = context.task
     model = config["model"]
     model_params = model["params"]
@@ -340,36 +498,24 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
         ),
         (
             "Continuity",
-            physics["continuity"],
-            "Selected training form when enabled. Both forms remain diagnostic",
+            "cross-section flux balance",
+            "Task-owned mass balance: integral of v across x is constant over y",
         ),
         ("Interior crop", physics["interior_crop"], "Boundary cells excluded from residual diagnostics"),
     ]
     if physics["enabled"]:
-        physics_rows.extend(
-            [
-                (
-                    "Residual weight",
-                    physics["residual_weight"]["target"],
-                    "Active target momentum and continuity weight",
-                ),
-                (
-                    "Residual warmup",
-                    f"{physics['residual_weight']['warmup']['kind']} over {physics['residual_weight']['warmup']['epochs']} epochs",
-                    "Active residual-weight schedule",
-                ),
-                (
-                    "Boundary weight",
-                    physics["boundary_weight"]["target"],
-                    "Active target boundary-loss weight",
-                ),
-                (
-                    "Boundary warmup",
-                    f"{physics['boundary_weight']['warmup']['kind']} over {physics['boundary_weight']['warmup']['epochs']} epochs",
-                    "Active boundary-weight schedule",
-                ),
-            ]
-        )
+        for term in ("momentum", "continuity", "boundary"):
+            weight = physics[f"{term}_weight"]
+            physics_rows.extend(
+                [
+                    (f"{term.capitalize()} weight", weight["target"], f"Active target weight of the dimensionless {term} term"),
+                    (
+                        f"{term.capitalize()} warmup",
+                        f"{weight['warmup']['kind']} over {weight['warmup']['epochs']} epochs",
+                        f"Active {term}-weight schedule",
+                    ),
+                ]
+            )
     else:
         physics_rows.extend(
             [
@@ -393,8 +539,8 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 ("Task ID", task.id, "Registered scientific task"),
                 ("Task schema", task.schema_version, "Task contract schema version"),
                 ("Task digest", _short_digest(task.contract_digest), "Short display of the full TaskSpec digest"),
-                ("ID dataset", data["train_dataset"], "Task-owned train and evaluation source"),
-                ("OOD dataset", data["ood_datasets"], "Task-owned diagnostic source"),
+                ("ID dataset", data["train_dataset"], "Fixed Train/validation/ID-test partition"),
+                ("Additional evaluation", data["additional_evaluation_datasets"], "Dataset-declared OOD holdouts"),
                 ("Input fields", task.input_names, "Ordered model input channels"),
                 ("Output fields", task.output_names, "Ordered prediction channels"),
                 ("Tensor layout", task.tensor_layout, "Saved tensor dimension order"),
@@ -418,9 +564,9 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                     "Completed-epoch cadence for objective, scheduler, and checkpoint selection",
                 ),
                 (
-                    "OOD evaluation interval",
-                    training["ood_evaluation_interval"],
-                    "Completed-epoch cadence for diagnostic OOD evaluation",
+                    "Additional evaluation interval",
+                    training["additional_evaluation_interval"],
+                    "Completed-epoch cadence for additional evaluation",
                 ),
                 ("Mixed precision", training["mixed_precision"], "CUDA mixed-precision policy"),
                 ("Seed", config["run"]["seed"], "Root deterministic seed"),
@@ -509,12 +655,12 @@ def prepare_dataset_table(
             ),
             _readable_value(preview.exists),
             _readable_value(preview.sample_count) if preview.metadata_validated else "not available",
-            _short_digest(preview.fingerprint),
+            _short_digest(preview.dataset_digest),
         )
         for preview in context.dataset_previews
     )
     return _table(
-        columns=("Role", "Dataset ID", "Resolved path", "Exists", "Sample count", "Fingerprint"),
+        columns=("Role", "Dataset ID", "Resolved path", "Exists", "Sample count", "Dataset digest"),
         rows=rows,
     )
 
@@ -545,7 +691,11 @@ def prepare_run_preview_table(
         ("W&B mode", wandb["mode"], "Production observer mode"),
         ("Target epochs", config["training"]["epochs"], "Official training duration"),
         ("ID dataset", config["data"]["train_dataset"], "Train and evaluation source"),
-        ("OOD dataset", ", ".join(config["data"]["ood_datasets"]), "Diagnostic source"),
+        (
+            "Additional evaluation",
+            config["data"]["additional_evaluation_datasets"],
+            "Optional saved diagnostic datasets",
+        ),
         (
             "Resolved config digest",
             _short_digest(context.official_config_digest),
@@ -572,7 +722,7 @@ def prepare_run_preview_table(
         (
             "Run directory exists",
             _readable_value(context.run_dir.exists()),
-            "Existing paths are never reopened without explicit resume",
+            "An existing run continues only when its saved science matches",
         ),
     )
     return _table(columns=("Setting", "Value", "Meaning"), rows=rows)
@@ -588,7 +738,7 @@ _RUN_OUTPUT_ROWS = (
     ),
     (
         "split_indices.pt",
-        "Exact ID train, ID evaluation, and OOD membership",
+        "Exact train, validation, ID-test, and additional evaluation membership",
         "yes",
         "Resume, inference, and artifacts",
     ),
@@ -608,8 +758,8 @@ _RUN_OUTPUT_ROWS = (
     ("wandb/", "Local SDK state for online or offline tracking", "no", "W&B SDK and local diagnostics"),
     ("analysis/id/", "ID evaluation artifacts", "no", "Single-model and comparison evaluation"),
     (
-        "analysis/ood/<dataset>/",
-        "Named OOD evaluation artifacts",
+        "analysis/additional_evaluation/<combined dataset ID>/",
+        "Optional additional evaluation artifacts",
         "no",
         "Single-model and comparison evaluation",
     ),
@@ -622,11 +772,17 @@ _RUN_OUTPUT_ROWS = (
 )
 
 
-def prepare_run_output_inventory_table() -> NotebookTable:
+def prepare_run_output_inventory_table(*, task_id: str = "steady_flow") -> NotebookTable:
     """Prepare the maintained saved-run file inventory."""
+    rows: tuple[tuple[str, str, str, str], ...] = _RUN_OUTPUT_ROWS
+    if task_id == "transient_drying":
+        rows = (
+            *rows,
+            ("history.json", "Durable completed-epoch transient history", "yes", "Training and Evaluation"),
+        )
     return _table(
         columns=("File or directory", "Purpose", "Required", "Consumer"),
-        rows=_RUN_OUTPUT_ROWS,
+        rows=rows,
     )
 
 

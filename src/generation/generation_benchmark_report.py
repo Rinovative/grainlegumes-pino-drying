@@ -1,27 +1,31 @@
-"""
-generation_benchmark_report.py
-
-Interpret core benchmark measurements and render stable reports.
+"""Interpret core benchmark sweep measurements and render stable reports.
 
 Responsibilities:
-  - Calculate runtime, throughput, resource, and license metrics
-  - Serialize per-work-unit CSV evidence
-  - Render the benchmark Markdown conclusion
+  - Calculate measured node throughput, case times, and memory per sweep and core-count variant
+  - Compare variants within each sweep (one node) and across sweeps, and recommend a core count
+  - Serialize per-work-unit CSV evidence and render the benchmark Markdown conclusion
 
 Design principles:
-  - Keep compute ranking separate from operational waits
-  - Preserve report field order and persisted payload semantics
-  - Consume immutable suite configuration without lifecycle imports
+  - Throughput is measured from step receipts of one node job, never extrapolated from single cases
+  - Failed candidates cost node time inside the makespan, so failures are priced into throughput, not excluded
+  - A variant is recommendable only when it reached the success target in every sweep and its node job fits the memory limit
+  - Upper bounds are labelled as bounds; unavailable values stay None
 
 This module does NOT:
   - Submit jobs or validate persisted evidence chains
   - Publish or repair report artifacts
+
+Notes:
+  A measurement is one variant attempt of one sweep: its candidates ran as steps of one node job with floor(cores/k)
+  cases at a time until the success target was reached (a failed candidate is replaced by the next one; the rest
+  are skipped). Makespan is the time from the first step start to the last step end of the executed candidates;
+  measured throughput is successful cases per node-hour over that makespan.
+
 """
 
 from __future__ import annotations
 
 import csv
-import math
 import statistics
 from datetime import datetime
 from io import StringIO
@@ -48,6 +52,45 @@ WORK_UNIT_TIMING_FIELDS: Final = frozenset(
     }
 )
 MAX_BENCHMARK_LOG_EXCERPT_BYTES: Final = 8 * 1024
+SUMMARY_METRIC_FIELDS: Final = (
+    "suite_name",
+    "suite_digest",
+    "benchmark_mode",
+    "case_pool_size",
+    "target_successful_cases",
+    "cores_per_node",
+    "sweeps",
+    "measurements",
+    "variants",
+    "recommended_cores_per_case",
+    "recommended_throughput_cases_per_node_hour",
+    "recommendation_basis",
+    "production_interpretation",
+    "production_configuration_modified",
+    "dataset_membership",
+    "complete",
+)
+_SECONDS_PER_HOUR: Final = 3600.0
+_CSV_FIELDS: Final = (
+    "sweep_id",
+    "variant_id",
+    "cores_per_case",
+    "variant_attempt",
+    "case_role",
+    "work_unit_id",
+    "outcome",
+    "node",
+    "cpu_model",
+    "slurm_job_id",
+    "slurm_step_id",
+    "step_started_at",
+    "step_ended_at",
+    "case_wall_seconds",
+    "comsol_process_seconds",
+    "peak_memory_bytes",
+    "step_max_rss_bytes",
+    "error_type",
+)
 
 
 def parse_benchmark_timestamp(value: object, *, label: str) -> datetime:
@@ -82,572 +125,291 @@ def parse_benchmark_timestamp(value: object, *, label: str) -> datetime:
 
 
 def _production_interpretation(suite: benchmark_config.CoreBenchmarkSuite) -> dict[str, Any]:
-    """Resolve current production count and authoritative core-setting owner."""
+    """Resolve the current production core count and its authoritative owner."""
     campaign = config_service.load_campaign_config(
         suite.production_campaign_path,
         require_executable=False,
     )
-    execution = benchmark_config.load_yaml_mapping(
-        suite.production_cores_config_path,
-        label="benchmark production execution config",
-    )
-    cluster = benchmark_config.require_mapping(execution.get("cluster"), label="benchmark production execution cluster")
-    cores = benchmark_config.require_positive_integer(
-        cluster.get("cores_per_case"),
-        label="benchmark production cores_per_case",
-    )
-    if cores != campaign.execution_values["cluster"]["cores_per_case"]:
-        message = "Current production campaign and core-setting config disagree."
-        raise ValueError(message)
+    cluster = campaign.execution_values["cluster"]
     return {
         "campaign_config": benchmark_config.repository_relative(suite.production_campaign_path),
         "campaign_total_cases": campaign.total_case_count,
-        "current_production_cores_per_case": cores,
-        "current_estimated_cases_per_node": suite.cores_per_node // cores,
-        "current_max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
+        "current_production_cores_per_case": suite.production_cores_per_case,
+        "current_concurrent_cases_per_node": cluster["concurrent_cases_per_node"],
+        "current_node_jobs": cluster["node_jobs"],
         "cores_config": benchmark_config.repository_relative(suite.production_cores_config_path),
         "cores_key": suite.production_cores_key,
     }
 
 
-def _solver_overlap_metrics(
-    records: Sequence[Mapping[str, Any]],
-) -> tuple[int, bool]:
-    """Return peak successful solver concurrency and two-case overlap."""
-    intervals = [
-        (
-            parse_benchmark_timestamp(record["solver_interval"]["started_at"], label="solver started_at"),
-            parse_benchmark_timestamp(record["solver_interval"]["ended_at"], label="solver ended_at"),
-        )
-        for record in records
-    ]
-    if not intervals:
-        return 0, False
-    peak = max(sum(start <= instant < end for start, end in intervals) for instant in (start for start, _end in intervals))
-    overlapped = len(intervals) == len(benchmark_config.BENCHMARK_REPRESENTATIVE_CASE_ROLES) and max(intervals[0][0], intervals[1][0]) < min(
-        intervals[0][1], intervals[1][1]
-    )
-    return max(1, peak), overlapped
+def _median(values: Sequence[float]) -> float | None:
+    return statistics.median(values) if values else None
 
 
-def _projected_resource_feasibility(
-    estimate: int,
-    limit: int | None,
-) -> str:
-    """Classify one projected node resource against an authoritative limit."""
-    if limit is None:
-        return "operator_review_required"
-    return "pass" if estimate <= limit else "fail"
+def _unit_wall_seconds(unit: Mapping[str, Any]) -> float | None:
+    """Return the step wall time of one unit from its worker receipts, or None when a receipt is missing."""
+    if not unit.get("started_at") or not unit.get("ended_at"):
+        return None
+    started = parse_benchmark_timestamp(unit["started_at"], label="step started_at")
+    ended = parse_benchmark_timestamp(unit["ended_at"], label="step ended_at")
+    return (ended - started).total_seconds()
 
 
-def _variant_resource_feasibility(memory: str, scratch: str) -> str:
-    """Combine independent memory and scratch feasibility classifications."""
-    if "fail" in {memory, scratch}:
-        return "fail"
-    if "operator_review_required" in {memory, scratch}:
-        return "operator_review_required"
-    return "pass"
+def _unit_peak_bytes(unit: Mapping[str, Any]) -> int | None:
+    """Return one case's peak memory: the step's sacct MaxRSS, else the worker's child peak, else None (unknown)."""
+    if unit.get("step_max_rss_bytes") is not None:
+        return int(unit["step_max_rss_bytes"])
+    record = unit.get("record") or {}
+    peak = (record.get("resource") or {}).get("peak_memory_bytes")
+    return None if peak is None else int(peak)
 
 
-def _ordered_unique_text(values: Sequence[object]) -> list[str]:
-    """Return non-empty text values once in stable encounter order."""
-    result: list[str] = []
-    for value in values:
-        if not isinstance(value, str) or not value or value in result:
-            continue
-        result.append(value)
-    return result
+def _measurement_metrics(suite: benchmark_config.CoreBenchmarkSuite, measurement: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the metrics of one sweep variant measurement."""
+    variant = suite.variant(str(measurement["variant_id"]))
+    units = [unit for unit in measurement["units"] if unit["outcome"] != "skipped"]
+    successes = [unit for unit in units if unit["outcome"] == "success"]
+    starts = [parse_benchmark_timestamp(unit["started_at"], label="step started_at") for unit in units if unit.get("started_at")]
+    ends = [parse_benchmark_timestamp(unit["ended_at"], label="step ended_at") for unit in units if unit.get("ended_at")]
+    makespan = (max(ends) - min(starts)).total_seconds() if starts and ends and len(ends) == len(units) else None
+    walls = [value for unit in units if (value := _unit_wall_seconds(unit)) is not None]
+    comsol = [float(unit["record"]["timings_seconds"]["comsol_process_seconds"]) for unit in successes]
+    peaks = [_unit_peak_bytes(unit) for unit in units]
+    known_peaks = [value for value in peaks if value is not None]
+    concurrency = suite.resources(variant).concurrent_cases
+    return {
+        "sweep_id": measurement["sweep_id"],
+        "order": measurement["order"],
+        "variant_id": variant.variant_id,
+        "cores_per_case": variant.cores_per_case,
+        "variant_attempt": measurement["variant_attempt"],
+        "concurrent_cases": concurrency,
+        "node_job_id": measurement["node_job_id"],
+        "node": measurement["node"],
+        "cpu_model": measurement["cpu_model"],
+        "foreign_jobs_at_start": measurement["foreign_jobs_at_start"],
+        "foreign_jobs_at_end": measurement["foreign_jobs_at_end"],
+        "cases": len(units),
+        "successful_cases": len(successes),
+        "reached_target": len(successes) >= suite.target_successful_cases,
+        "failed_case_roles": sorted(str(unit["case_role"]) for unit in units if unit["outcome"] != "success"),
+        "makespan_seconds": makespan,
+        "throughput_cases_per_node_hour": (len(successes) * _SECONDS_PER_HOUR / makespan if makespan and makespan > 0.0 else None),
+        "median_case_wall_seconds": _median(walls),
+        "max_case_wall_seconds": max(walls) if walls else None,
+        "median_comsol_process_seconds": _median(comsol),
+        "max_comsol_process_seconds": max(comsol) if comsol else None,
+        "max_case_peak_memory_bytes": max(known_peaks) if known_peaks and len(known_peaks) == len(units) else None,
+        "node_peak_memory_upper_bound_bytes": concurrency * max(known_peaks) if known_peaks and len(known_peaks) == len(units) else None,
+        "node_job_memory": suite.resources(variant).node_job_memory,
+    }
 
 
 def summarize_core_benchmark_results(
     suite: benchmark_config.CoreBenchmarkSuite,
-    records: Sequence[Mapping[str, Any]],
+    measurements: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """
-    Calculate separated runtime, throughput, resource, and license metrics.
+    Summarize measured sweep variants and recommend the core count with the highest node throughput.
 
     Parameters
     ----------
-    suite : benchmark_config.CoreBenchmarkSuite
-        Immutable suite defining the measured variants and cases.
-    records : Sequence[Mapping[str, Any]]
-        One validated result record for every suite work unit.
+    suite : CoreBenchmarkSuite
+        Resolved suite the measurements belong to.
+    measurements : Sequence[Mapping[str, Any]]
+        One entry per measured sweep variant: identity, node evidence, and its units with outcome, step
+        receipt times, and validated result record (or None for a step that ended without evidence).
 
     Returns
     -------
     dict[str, Any]
-        Stable summary payload with compute-only recommendations.
+        Deterministic metrics, per-variant comparison across sweeps, and the recommendation.
 
     """
-    expected_count = len(suite.variants) * suite.representative_case_count
-    if len(records) != expected_count:
-        message = f"Benchmark summary requires {expected_count} work-unit records, got {len(records)}."
-        raise ValueError(message)
-    production = _production_interpretation(suite)
-    by_variant: list[dict[str, Any]] = []
-    for variant in suite.variants:
-        selected = [record for record in records if record.get("variant_id") == variant.variant_id]
-        if len(selected) != suite.representative_case_count:
-            message = f"Benchmark records do not cover both cases for {variant.variant_id!r}."
-            raise ValueError(message)
-        successes = [record for record in selected if record.get("status") == "success"]
-        failures = [record for record in selected if record.get("status") == "failed"]
-        pending = [record for record in selected if record.get("status") == "pending"]
-        solve_times = [float(record["timings_seconds"]["comsol_process_seconds"]) for record in successes]
-        if any(not math.isfinite(value) or value <= 0.0 for value in solve_times):
-            message = f"Benchmark summary received invalid successful COMSOL timings for {variant.variant_id!r}."
-            raise ValueError(message)
-        queue_values = [record["timings_seconds"]["scheduler_queue_seconds"] for record in successes]
-        queue_wait = None if any(value is None for value in queue_values) else sum(float(value) for value in queue_values)
-        license_wait = sum(float(record["timings_seconds"]["license_wait_seconds"]) for record in successes)
-        license_probe = sum(float(record["timings_seconds"]["license_probe_seconds"]) for record in successes)
-        conversion = sum(float(record["timings_seconds"]["export_conversion_seconds"]) for record in successes)
-        publication = sum(float(record["timings_seconds"]["publication_seconds"]) for record in successes)
-        preparation = sum(float(record["timings_seconds"]["canonical_input_preparation_seconds"]) for record in successes)
-        controller_elapsed = sum(float(record["timings_seconds"]["total_controller_elapsed_seconds"]) for record in successes)
-        operational_values = (
-            license_wait,
-            license_probe,
-            conversion,
-            publication,
-            preparation,
-            controller_elapsed,
+    measured = [_measurement_metrics(suite, measurement) for measurement in measurements]
+    # A case that failed in every measurement fails for case-intrinsic reasons and disqualifies no single variant.
+    shared_failures = set.intersection(*(set(row["failed_case_roles"]) for row in measured)) if measured else set()
+    variants: list[dict[str, Any]] = []
+    for variant in sorted(suite.variants, key=lambda item: item.cores_per_case):
+        rows = [row for row in measured if row["variant_id"] == variant.variant_id]
+        throughputs = [float(row["throughput_cases_per_node_hour"]) for row in rows if row["throughput_cases_per_node_hour"] is not None]
+        failed = sorted({role for row in rows for role in row["failed_case_roles"]})
+        memory_fits = config_service.parse_slurm_memory_mib(suite.resources(variant).node_job_memory, label="node_job_memory") <= (
+            config_service.parse_slurm_memory_mib(suite.node_memory_limit, label="node_memory_limit")
         )
-        if any(not math.isfinite(value) or value < 0.0 for value in operational_values):
-            message = f"Benchmark summary received invalid separated timing evidence for {variant.variant_id!r}."
-            raise ValueError(message)
-        license_records = [record["license"] for record in successes]
-        blocked_count = sum(int(value["license_blocked_submission_count"]) for value in license_records)
-        resources = [record["resource"] for record in successes]
-        peak_memory = max((int(value["peak_memory_bytes"]) for value in resources), default=0)
-        peak_scratch = max((int(value["peak_scratch_bytes"]) for value in resources), default=0)
-        cases_per_node = suite.cores_per_node // variant.cores_per_case
-        estimated_memory = cases_per_node * peak_memory
-        estimated_scratch = cases_per_node * peak_scratch
-        memory_feasibility = _projected_resource_feasibility(estimated_memory, suite.node_memory_limit_bytes)
-        scratch_feasibility = _projected_resource_feasibility(estimated_scratch, suite.node_scratch_limit_bytes)
-        resource_feasibility = _variant_resource_feasibility(memory_feasibility, scratch_feasibility)
-        concurrency, overlapped = _solver_overlap_metrics(successes)
-        if solve_times:
-            median_solve = float(statistics.median(solve_times))
-            median_core_hours = variant.cores_per_case * median_solve / 3600.0
-            node_throughput = cases_per_node * 3600.0 / median_solve
-            minimum_solve = min(solve_times)
-            maximum_solve = max(solve_times)
-        else:
-            median_solve = None
-            median_core_hours = None
-            node_throughput = None
-            minimum_solve = None
-            maximum_solve = None
-        raw_excerpts = _ordered_unique_text([value["raw_excerpt"] for value in license_records])
-        by_variant.append(
+        variants.append(
             {
                 "variant_id": variant.variant_id,
-                "execution_id": suite.execution_id(variant),
                 "cores_per_case": variant.cores_per_case,
-                "successful_measurement_count": len(successes),
-                "failed_measurement_count": len(failures),
-                "pending_measurement_count": len(pending),
-                "individual_comsol_process_seconds": solve_times,
-                "median_comsol_process_seconds": median_solve,
-                "minimum_comsol_process_seconds": minimum_solve,
-                "maximum_comsol_process_seconds": maximum_solve,
-                "median_core_hours_per_case": median_core_hours,
-                "estimated_cases_per_node": cases_per_node,
-                "estimated_cases_per_node_hour": node_throughput,
-                "throughput_label": "compute-only estimated node throughput",
-                "peak_memory_per_case_bytes": peak_memory,
-                "estimated_peak_memory_per_node_bytes": estimated_memory,
-                "peak_scratch_per_case_bytes": peak_scratch,
-                "estimated_peak_scratch_per_node_bytes": estimated_scratch,
-                "memory_feasibility": memory_feasibility,
-                "scratch_feasibility": scratch_feasibility,
-                "resource_feasibility": resource_feasibility,
-                "scheduler_queue_seconds": queue_wait,
-                "license_wait_seconds": license_wait,
-                "license_probe_seconds": license_probe,
-                "canonical_input_preparation_seconds": preparation,
-                "export_conversion_seconds": conversion,
-                "publication_seconds": publication,
-                "total_controller_elapsed_seconds": controller_elapsed,
-                "license_blocked_submission_count": blocked_count,
-                "detected_features": _ordered_unique_text([value["detected_feature"] for value in license_records]),
-                "detected_comsol_flexnet_codes": _ordered_unique_text([value["detected_error_code"] for value in license_records]),
-                "matched_signatures": _ordered_unique_text([signature for value in license_records for signature in value["matched_signatures"]]),
-                "bounded_raw_excerpts": [value[:MAX_BENCHMARK_LOG_EXCERPT_BYTES] for value in raw_excerpts],
-                "observed_peak_solver_concurrency": concurrency,
-                "requested_cases_overlapped_in_solver_execution": overlapped,
+                "concurrent_cases": suite.resources(variant).concurrent_cases,
+                "measured_sweeps": [row["sweep_id"] for row in rows],
+                "throughput_by_sweep": {row["sweep_id"]: row["throughput_cases_per_node_hour"] for row in rows},
+                "mean_throughput_cases_per_node_hour": statistics.fmean(throughputs) if throughputs else None,
+                "failed_case_roles": failed,
+                "variant_specific_failed_case_roles": sorted(set(failed) - shared_failures),
+                "recommendable": (
+                    bool(rows)
+                    and len(rows) == len(suite.sweeps)
+                    and memory_fits
+                    and len(throughputs) == len(rows)
+                    and all(row["reached_target"] for row in rows)
+                ),
+                "production": variant.cores_per_case == suite.production_cores_per_case,
             }
         )
-    complete = [
-        record
-        for record in by_variant
-        if record["successful_measurement_count"] == suite.representative_case_count
-        and record["failed_measurement_count"] == 0
-        and record["pending_measurement_count"] == 0
-    ]
-    fastest_measurement = min(
-        (
-            (runtime, int(record["cores_per_case"]), str(record["variant_id"]))
-            for record in complete
-            for runtime in record["individual_comsol_process_seconds"]
-        ),
-        default=None,
-    )
-    fastest_cores = None if fastest_measurement is None else fastest_measurement[1]
-    core_efficient = (
-        min(
-            complete,
-            key=lambda record: (
-                float(record["median_core_hours_per_case"]),
-                int(record["cores_per_case"]),
-            ),
-        )
-        if complete
-        else None
-    )
-    lowest_core_hours_cores = None if core_efficient is None else int(core_efficient["cores_per_case"])
-    feasible = [record for record in complete if record["resource_feasibility"] != "fail"]
-    if feasible:
-        best_throughput = max(float(record["estimated_cases_per_node_hour"]) for record in feasible)
-        throughput_ties = [record for record in feasible if float(record["estimated_cases_per_node_hour"]) >= 0.95 * best_throughput]
-        recommended = min(
-            throughput_ties,
-            key=lambda record: (
-                float(record["median_core_hours_per_case"]),
-                int(record["cores_per_case"]),
-            ),
-        )
-    else:
-        recommended = None
-    recommended_cores = None if recommended is None else int(recommended["cores_per_case"])
-    recommended_cases_per_node = None if recommended is None else int(recommended["estimated_cases_per_node"])
-    incomplete_license_concurrency = any(
-        record["license_blocked_submission_count"] > 0 and not record["requested_cases_overlapped_in_solver_execution"] for record in by_variant
-    )
-    all_overlap_observed = bool(by_variant) and all(record["requested_cases_overlapped_in_solver_execution"] for record in by_variant)
-    if incomplete_license_concurrency:
-        license_qualification = "compute recommendation valid; concurrent-license observation incomplete"
-    elif all_overlap_observed:
-        license_qualification = "compute recommendation valid; concurrent-license execution observed"
-    else:
-        license_qualification = "compute recommendation valid; requested solver overlap not observed"
-    production["recommended_difference_from_current_cores_per_case"] = (
-        None if recommended_cores is None else recommended_cores - int(production["current_production_cores_per_case"])
-    )
-    production["recommended_differs_from_current"] = (
-        None if recommended_cores is None else recommended_cores != int(production["current_production_cores_per_case"])
-    )
-    recommended_detail = (
-        None
-        if recommended is None
-        else {
-            "variant_id": recommended["variant_id"],
-            "cores_per_case": recommended_cores,
-            "estimated_cases_per_node": recommended_cases_per_node,
-            "estimated_cases_per_node_hour": recommended["estimated_cases_per_node_hour"],
-            "median_comsol_process_seconds": recommended["median_comsol_process_seconds"],
-            "median_core_hours_per_case": recommended["median_core_hours_per_case"],
-            "resource_feasibility": recommended["resource_feasibility"],
-            "license_qualification": license_qualification,
-            "proposed_configuration": {
-                "cores_per_case": recommended_cores,
-                "cases_per_node": recommended_cases_per_node,
-                "max_running_cases": production["current_max_running_cases"],
-            },
-            "manual_review_required": True,
-        }
-    )
-    canary = suite.canary_variant()
+    candidates = [item for item in variants if item["recommendable"]]
+    best = max(candidates, key=lambda item: (item["mean_throughput_cases_per_node_hour"], -item["cores_per_case"]), default=None)
+    complete = len(measured) == len(suite.sweeps) * len(suite.variants)
     return {
         "schema_kind": BENCHMARK_SUMMARY_SCHEMA_KIND,
         "schema_version": benchmark_config.BENCHMARK_SCHEMA_VERSION,
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
         "benchmark_mode": "core_selection",
-        "representative_cases": suite.case_selections(),
-        "cases_per_variant": suite.representative_case_count,
-        "required_successful_measurements": expected_count,
+        "case_pool_size": suite.representative_case_count,
+        "target_successful_cases": suite.target_successful_cases,
         "cores_per_node": suite.cores_per_node,
-        "variants": by_variant,
-        "fastest_single_case_cores": fastest_cores,
-        "fastest_single_case": (
-            None
-            if fastest_measurement is None
-            else {
-                "cores_per_case": fastest_measurement[1],
-                "variant_id": fastest_measurement[2],
-                "comsol_process_seconds": fastest_measurement[0],
-            }
-        ),
-        "lowest_core_hours_cores": lowest_core_hours_cores,
-        "lowest_core_hours": (
-            None
-            if core_efficient is None
-            else {
-                "cores_per_case": lowest_core_hours_cores,
-                "variant_id": core_efficient["variant_id"],
-                "median_core_hours_per_case": core_efficient["median_core_hours_per_case"],
-            }
-        ),
-        "recommended_cores_per_case": recommended_cores,
-        "recommended_estimated_cases_per_node": recommended_cases_per_node,
-        "recommended_production": recommended_detail,
+        "sweeps": [
+            {"sweep_id": sweep.sweep_id, "order": sweep.order, "variant_order": [variant.variant_id for variant in suite.sweep_variants(sweep)]}
+            for sweep in suite.sweeps
+        ],
+        "measurements": measured,
+        "variants": variants,
+        "recommended_cores_per_case": None if best is None else best["cores_per_case"],
+        "recommended_throughput_cases_per_node_hour": None if best is None else best["mean_throughput_cases_per_node_hour"],
         "recommendation_basis": (
-            "maximize compute-only estimated cases per node-hour among resource-feasible variants; "
-            "within 5% prefer lower median core-hours, then fewer cores"
+            "highest mean measured node throughput (successful cases per node-hour, one node job per sweep; failed candidates "
+            "were replaced and their node time counts) among variants that reached the success target in every sweep "
+            "within the node memory limit; ties prefer fewer cores"
         ),
-        "timing_contract": {
-            "primary_runtime": "successful comsol_process_seconds only",
-            "excluded_from_ranking": [
-                "scheduler_queue_seconds",
-                "license_wait_seconds",
-                "license_probe_seconds",
-                "canonical_input_preparation_seconds",
-                "export_conversion_seconds",
-                "publication_seconds",
-                "total_controller_elapsed_seconds",
-            ],
-            "license_only_attempts_contribute_successful_runtime_observations": 0,
-        },
-        "resource_limits": {
-            "node_memory_limit_bytes": suite.node_memory_limit_bytes,
-            "node_scratch_limit_bytes": suite.node_scratch_limit_bytes,
-            "missing_limit_policy": "operator_review_required",
-        },
-        "license_qualification": license_qualification,
-        "production_interpretation": production,
+        "production_interpretation": _production_interpretation(suite),
         "production_configuration_modified": False,
         "dataset_membership": "none",
-        "canary_wave": {
-            "variant_id": canary.variant_id,
-            "cores_per_case": canary.cores_per_case,
-            "case_roles": [item.case_role for item in suite.representative_cases],
-            "included_in_final_measurements": True,
-            "additional_canary_work_units": 0,
-        },
+        "complete": complete,
     }
 
 
-def results_csv(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    queue_by_work_unit: Mapping[str, float | None] | None = None,
-) -> str:
-    """
-    Serialize stable per-work-unit timing, resource, and license evidence.
-
-    Parameters
-    ----------
-    records : Sequence[Mapping[str, Any]]
-        Validated result records in persisted work-unit order.
-    queue_by_work_unit : Mapping[str, float | None] | None, optional
-        Reconciled scheduler queue time for each work unit.
-
-    Returns
-    -------
-    str
-        Deterministic CSV content with a fixed column order.
-
-    """
-    stream = StringIO(newline="")
-    fields: tuple[str, ...] = (
-        "variant_id",
-        "cores_per_case",
-        "case_position",
-        "case_role",
-        "work_unit_id",
-        "status",
-        "attempt",
-        "scheduler_queue_seconds",
-        "license_wait_seconds",
-        "license_probe_seconds",
-        "canonical_input_preparation_seconds",
-        "comsol_process_seconds",
-        "export_conversion_seconds",
-        "publication_seconds",
-        "total_controller_elapsed_seconds",
-        "core_hours",
-        "solver_started_at",
-        "solver_ended_at",
-        "node",
-        "partition",
-        "requested_cpus",
-        "allocated_cpus",
-        "comsol_np",
-        "slurm_job_id",
-        "peak_memory_bytes",
-        "peak_scratch_bytes",
-        "license_blocked_submission_count",
-        "detected_feature",
-        "detected_comsol_flexnet_code",
-        "matched_signatures",
-        "license_raw_excerpt",
-        "solver_log_sha256",
-        "solver_log_size_bytes",
-        "solver_log_excerpt",
-        "hdf5_sha256",
-        "hdf5_size_bytes",
-    )
-    writer: csv.DictWriter[str] = csv.DictWriter(
-        stream,
-        fieldnames=fields,
-        lineterminator="\n",
-    )
+def results_csv(measurements: Sequence[Mapping[str, Any]]) -> str:
+    """Return one CSV row per work unit of every measured sweep variant."""
+    buffer = StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(_CSV_FIELDS), lineterminator="\n")
     writer.writeheader()
-    for record in records:
-        timings_value = record.get("timings_seconds")
-        timings = timings_value if isinstance(timings_value, dict) else {}
-        resource_value = record.get("resource")
-        resource = resource_value if isinstance(resource_value, dict) else {}
-        license_value = record.get("license")
-        license_evidence = license_value if isinstance(license_value, dict) else {}
-        interval_value = record.get("solver_interval")
-        interval = interval_value if isinstance(interval_value, dict) else {}
-        solver_log_value = record.get("solver_log")
-        solver_log = solver_log_value if isinstance(solver_log_value, dict) else {}
-        hdf5_value = record.get("hdf5")
-        hdf5 = hdf5_value if isinstance(hdf5_value, dict) else {}
-        cores = record.get("cores_per_case")
-        solve = timings.get("comsol_process_seconds")
-        core_hours = (
-            float(solve) * int(cores) / 3600.0
-            if isinstance(solve, (int, float)) and not isinstance(solve, bool) and isinstance(cores, int) and not isinstance(cores, bool)
-            else None
-        )
-        writer.writerow(
-            {
-                "variant_id": record.get("variant_id"),
-                "cores_per_case": cores,
-                "case_position": record.get("case_position"),
-                "case_role": record.get("case_role"),
-                "work_unit_id": record.get("work_unit_id"),
-                "status": record.get("status"),
-                "attempt": record.get("attempt"),
-                **{
-                    field: (
-                        queue_by_work_unit.get(str(record.get("work_unit_id")), timings.get(field))
-                        if field == "scheduler_queue_seconds" and queue_by_work_unit is not None
-                        else timings.get(field)
-                    )
-                    for field in WORK_UNIT_TIMING_FIELDS
-                },
-                "core_hours": core_hours,
-                "solver_started_at": interval.get("started_at"),
-                "solver_ended_at": interval.get("ended_at"),
-                "node": resource.get("node"),
-                "partition": resource.get("partition"),
-                "requested_cpus": resource.get("requested_cpus"),
-                "allocated_cpus": resource.get("allocated_cpus"),
-                "comsol_np": resource.get("comsol_np"),
-                "slurm_job_id": resource.get("slurm_job_id"),
-                "peak_memory_bytes": resource.get("peak_memory_bytes"),
-                "peak_scratch_bytes": resource.get("peak_scratch_bytes"),
-                "license_blocked_submission_count": license_evidence.get("license_blocked_submission_count"),
-                "detected_feature": license_evidence.get("detected_feature"),
-                "detected_comsol_flexnet_code": license_evidence.get("detected_error_code"),
-                "matched_signatures": ",".join(license_evidence.get("matched_signatures", [])),
-                "license_raw_excerpt": license_evidence.get("raw_excerpt"),
-                "solver_log_sha256": solver_log.get("sha256"),
-                "solver_log_size_bytes": solver_log.get("size_bytes"),
-                "solver_log_excerpt": solver_log.get("excerpt"),
-                "hdf5_sha256": hdf5.get("sha256"),
-                "hdf5_size_bytes": hdf5.get("size_bytes"),
-            }
-        )
-    return stream.getvalue()
+    for measurement in measurements:
+        for unit in measurement["units"]:
+            record = unit.get("record") or {}
+            resource = record.get("resource") or {}
+            timings = record.get("timings_seconds") or {}
+            error = record.get("error") or {}
+            writer.writerow(
+                {
+                    "sweep_id": measurement["sweep_id"],
+                    "variant_id": measurement["variant_id"],
+                    "cores_per_case": measurement["cores_per_case"],
+                    "variant_attempt": measurement["variant_attempt"],
+                    "case_role": unit["case_role"],
+                    "work_unit_id": unit["work_unit_id"],
+                    "outcome": unit["outcome"],
+                    "node": resource.get("node", measurement["node"]),
+                    "cpu_model": resource.get("cpu_model", measurement["cpu_model"]),
+                    "slurm_job_id": resource.get("slurm_job_id", measurement["node_job_id"]),
+                    "slurm_step_id": resource.get("slurm_step_id"),
+                    "step_started_at": unit.get("started_at"),
+                    "step_ended_at": unit.get("ended_at"),
+                    "case_wall_seconds": _unit_wall_seconds(unit),
+                    "comsol_process_seconds": timings.get("comsol_process_seconds"),
+                    "peak_memory_bytes": resource.get("peak_memory_bytes"),
+                    "step_max_rss_bytes": unit.get("step_max_rss_bytes"),
+                    "error_type": error.get("type"),
+                }
+            )
+    return buffer.getvalue()
 
 
 def _format_metric(value: object) -> str:
-    """Format one optional finite numeric metric compactly for Markdown."""
+    """Return one stable Markdown cell."""
     if value is None:
-        return "-"
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        message = f"Benchmark metric must be numeric or null, got {value!r}."
-        raise TypeError(message)
-    return f"{float(value):.6g}"
+        return "unavailable"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
 
 
 def core_benchmark_markdown(summary: Mapping[str, Any]) -> str:
-    """
-    Render the fast core-selection evidence without mixing operational waits.
-
-    Parameters
-    ----------
-    summary : Mapping[str, Any]
-        Validated benchmark summary payload.
-
-    Returns
-    -------
-    str
-        Deterministic Markdown report content.
-
-    """
+    """Render the benchmark conclusion: per-sweep measurements, per-variant comparison, and the recommendation."""
     lines = [
-        f"# Core-selection benchmark: {summary['suite_name']}",
-        "",
-        "Two deterministic scientific cases are measured concurrently in each of four sequential core-count waves.",
-        "The first production-core wave is both the canary and two final measurements; there is no additional canary or second phase.",
-        "Queue, license wait, and license-probe time are reported separately and do not affect compute ranking.",
+        f"# Core benchmark: {summary['suite_name']}",
         "",
         (
-            "| cores | successes | median COMSOL (s) | min (s) | max (s) | "
-            "core-hours/case | cases/node | cases/node-hour | queue (s) | license wait (s) | "
-            "memory/case (bytes) | scratch/case (bytes) | peak solver concurrency | overlap | feasibility |"
+            f"Success target per variant: {summary['target_successful_cases']} of a {summary['case_pool_size']}-case pool "
+            f"(failed candidates are replaced); node cores: {summary['cores_per_node']}; complete: {summary['complete']}."
         ),
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: | :--- |",
+        "",
+        "## Measurements (one node job per sweep, variants in sweep order on the same node)",
+        "",
+        "| sweep | k | concurrent | node | CPU | successful/tried | makespan s | cases per node-hour | median case s | max case s "
+        "| max case peak GiB | node peak bound GiB | failed |",
+        "| --- | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
     ]
-    for record in summary["variants"]:
-        values = (
-            record["cores_per_case"],
-            record["successful_measurement_count"],
-            _format_metric(record["median_comsol_process_seconds"]),
-            _format_metric(record["minimum_comsol_process_seconds"]),
-            _format_metric(record["maximum_comsol_process_seconds"]),
-            _format_metric(record["median_core_hours_per_case"]),
-            record["estimated_cases_per_node"],
-            _format_metric(record["estimated_cases_per_node_hour"]),
-            _format_metric(record["scheduler_queue_seconds"]),
-            _format_metric(record["license_wait_seconds"]),
-            record["peak_memory_per_case_bytes"],
-            record["peak_scratch_per_case_bytes"],
-            record["observed_peak_solver_concurrency"],
-            "yes" if record["requested_cases_overlapped_in_solver_execution"] else "no",
-            record["resource_feasibility"],
-        )
-        lines.append("| " + " | ".join(str(value) for value in values) + " |")
-    recommended = summary["recommended_production"]
-    lines.extend(
-        [
-            "",
-            "## Conclusions",
-            "",
-            f"- Fastest individual solve: {summary['fastest_single_case_cores']} cores per case.",
-            f"- Lowest median core-hours: {summary['lowest_core_hours_cores']} cores per case.",
-        ]
-    )
-    if recommended is None:
-        lines.append("- Production recommendation: unavailable until all eight measurements and resource checks are valid.")
-    else:
-        proposal = recommended["proposed_configuration"]
-        lines.extend(
-            [
-                f"- Compute-based production recommendation: {recommended['cores_per_case']} cores per case.",
-                f"- Estimated cases per node: {recommended['estimated_cases_per_node']}.",
-                f"- Proposed cores_per_case: {proposal['cores_per_case']}.",
-                f"- Proposed cases_per_node: {proposal['cases_per_node']}.",
-                f"- Proposed max_running_cases: {proposal['max_running_cases']}.",
-                "- Apply only after manual review; no production configuration was edited.",
-            ]
+    for row in summary["measurements"]:
+        peak = row["max_case_peak_memory_bytes"]
+        bound = row["node_peak_memory_upper_bound_bytes"]
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    str(row["sweep_id"]),
+                    str(row["cores_per_case"]),
+                    str(row["concurrent_cases"]),
+                    _format_metric(row["node"]),
+                    _format_metric(row["cpu_model"]),
+                    f"{row['successful_cases']}/{row['cases']}",
+                    _format_metric(row["makespan_seconds"]),
+                    _format_metric(row["throughput_cases_per_node_hour"]),
+                    _format_metric(row["median_case_wall_seconds"]),
+                    _format_metric(row["max_case_wall_seconds"]),
+                    _format_metric(None if peak is None else peak / 2**30),
+                    _format_metric(None if bound is None else bound / 2**30),
+                    ", ".join(row["failed_case_roles"]) or "none",
+                )
+            )
+            + " |"
         )
     lines.extend(
-        [
-            f"- License qualification: {summary['license_qualification']}.",
-            f"- Basis: {summary['recommendation_basis']}.",
-            "- Throughput is a compute-only estimate from per-case solver time, not a fully packed-node measurement.",
-            "- Dataset membership: none.",
+        (
             "",
-        ]
+            "## Variants across sweeps",
+            "",
+            "| k | concurrent | throughput by sweep | mean cases per node-hour | recommendable | production |",
+            "| ---: | ---: | --- | ---: | --- | --- |",
+        )
     )
-    return chr(10).join(lines)
+    for variant in summary["variants"]:
+        by_sweep = ", ".join(f"{sweep}: {_format_metric(value)}" for sweep, value in variant["throughput_by_sweep"].items()) or "unavailable"
+        lines.append(
+            f"| {variant['cores_per_case']} | {variant['concurrent_cases']} | {by_sweep} | "
+            f"{_format_metric(variant['mean_throughput_cases_per_node_hour'])} | {variant['recommendable']} | {variant['production']} |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Recommendation",
+            "",
+            f"Recommended cores_per_case: {_format_metric(summary['recommended_cores_per_case'])} "
+            f"({_format_metric(summary['recommended_throughput_cases_per_node_hour'])} cases per node-hour).",
+            f"Basis: {summary['recommendation_basis']}.",
+            f"Current production cores_per_case: {summary['production_interpretation']['current_production_cores_per_case']}; "
+            "the benchmark does not change the production configuration.",
+            "The node peak memory column is an upper bound (concurrent cases times the largest single-case peak).",
+            "Variant-specific failed roles (failing in some but not all measurements) per k: "
+            + (
+                "; ".join(
+                    f"{variant['cores_per_case']}: {', '.join(variant['variant_specific_failed_case_roles']) or 'none'}"
+                    for variant in summary["variants"]
+                )
+                or "none"
+            )
+            + ".",
+            "",
+        )
+    )
+    return "\n".join(lines)

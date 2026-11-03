@@ -1,5 +1,14 @@
-# ruff: noqa: S101, PLR2004, SLF001
-"""Protect completed-run transient inference reconstruction and explicit physical requests."""
+"""Protect completed-run transient inference reconstruction and explicit physical requests.
+
+Responsibilities:
+  - Check saved reconstruction, explicit requests, runtime placement, rollout recurrence, and timing
+
+Design principles:
+  - Saved scaling is reused without fitting; invalid feedback retains diagnostic evidence
+
+This module does NOT:
+  - Train transient models or generate reference physics
+"""
 
 from __future__ import annotations
 
@@ -11,13 +20,15 @@ import pytest
 import torch
 from torch import nn
 
-from src import datasets, domain, experiments
+from src import datasets, domain, experiments, learning
 from src.learning.inference import learning_inference_transient as transient
 from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient import learning_transient_rollout as rollout
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
 from src.learning.transient.learning_transient_tensorizer import TransientTensorizer
+
+_CHECKPOINT_SCHEMA_VERSION = learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
 
 
 class _IncrementModel(nn.Module):
@@ -159,10 +170,9 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
         "model": {"kind": "fno", "params": {}},
     }
     completed = {
-        "is_completed": True,
         "config": config,
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
     }
     observed: list[tuple[dict[str, Any], tuple[int, int]]] = []
     monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _run_dir: completed)
@@ -226,10 +236,9 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
         },
     }
     completed = {
-        "is_completed": True,
         "config": config,
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
         "checkpoint_identity": {"epoch": 7},
         "selected_checkpoint_sha256": "b" * 64,
         "selected_checkpoint_epoch": 7,
@@ -274,7 +283,6 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
     )
     model = _IncrementModel()
     completed = {
-        "is_completed": True,
         "config": {
             "task": "transient_drying",
             "input_profile": "canonical_physics_complete_v1",
@@ -282,7 +290,7 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
             "model": {"kind": "rno", "params": {"in_channels": 20, "n_modes": [64, 64]}},
         },
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": 1, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
         "checkpoint_identity": {"epoch": 7},
         "selected_checkpoint_sha256": "b" * 64,
         "selected_checkpoint_epoch": 7,
@@ -298,6 +306,14 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
             completed=completed,
             evaluation_spatial_shape=(32, 48),
         )
+
+
+def test_context_rejects_an_optuna_trial_before_reading_scaling_evidence() -> None:
+    """A trial keeps no checkpoints, so inference names that instead of failing on the missing scaling evidence."""
+    completed = {"config": {"task": "transient_drying", "run": {"layout": {"trial": "0000__study"}}}}
+
+    with pytest.raises(RuntimeError, match="trials keep no checkpoints"):
+        transient.build_transient_inference_context(completed=completed)
 
 
 def test_request_validation_rejects_shape_dtype_placement_and_time_contracts() -> None:
@@ -437,7 +453,6 @@ def test_one_step_and_autonomous_recurrence_cast_deltas_and_report_cpu_timing(mo
     assert rollout.timing.device == "cpu"
     assert rollout.timing.model_calls == 3
     assert rollout.timing.model_seconds >= 0.0
-    assert not hasattr(rollout.timing, "speedup")
 
 
 def test_autonomous_rollout_preallocates_outputs_without_list_stack(
@@ -682,3 +697,28 @@ def test_registered_airflow_default_rejects_task_policy_drift(monkeypatch: pytes
     monkeypatch.setattr(transient.domain.tasks.registry, "get_task", lambda _task_id: SimpleNamespace(training_airflow_source="external"))
     with pytest.raises(RuntimeError, match="comsol_reference"):
         transient.predict_transient_step(context, **_request(1))
+
+
+def test_warm_teacher_forced_diagnostic_builds_the_reference_prefix_state() -> None:
+    """Predict every step from its reference state and continue rolling origins from the captured state."""
+    model = _IncrementModel()
+    context = _context(model, model_kind="rno")
+    request = transient.prepare_transient_request(context, **_request(3))
+    reference = torch.stack([torch.full((1, 4, 2, 3), float(step)) for step in range(3)], dim=1)
+    warm = transient.teacher_forced_prepared_transient_diagnostic(context, request, reference_states=reference, capture=(0, 2))
+
+    assert model.hidden_inputs == [None, 0, 1]
+    assert dict(warm.captured_hidden) == {0: None, 2: 1}
+    assert len(warm.step_seconds) == 3
+    assert warm.timing.model_calls == 3
+    for step in range(3):
+        cold = transient.predict_prepared_transient_step(
+            context, transient.window_transient_prepared_request(request, origin=step, length=1, state=reference[:, step])
+        )
+        assert torch.allclose(warm.next_states[:, step], cold.next_state)
+
+    origin = transient.window_transient_prepared_request(request, origin=2, length=1, state=reference[:, 2])
+    transient.rollout_prepared_transient_autonomous_diagnostic(context, origin, initial_hidden=warm.captured_hidden[2])
+    assert model.hidden_inputs[-1] == 1
+    with pytest.raises(ValueError, match="align with the prepared request"):
+        transient.teacher_forced_prepared_transient_diagnostic(context, request, reference_states=reference + 1.0)

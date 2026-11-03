@@ -1,7 +1,4 @@
-"""
-analysis_artifact_timing.py
-
-Measure and validate COMSOL and neural artifact runtime comparisons.
+"""Measure and validate COMSOL and neural artifact runtime comparisons.
 
 Responsibilities:
   - Measure synchronized neural forward passes after explicit warmup
@@ -43,6 +40,16 @@ SCHEMA_VERSION = 1
 WARMUP_PASSES = 1
 MEASUREMENT_CLOCK = "time.perf_counter_ns"
 CASE_DURATION_ATTRIBUTION = "equal_share_of_observed_batch_forward_duration"
+_RUNTIME_COMPARISON_BOUNDARIES = {
+    "reference_component": "comsol_process_s",
+    "surrogate_component": "batch_amortized_neural_operator_forward_s",
+    "reference_boundary": "Measured COMSOL process wall time; includes overhead beyond solver studies",
+    "surrogate_boundary": "Synchronized warmed loader-batch forward wall time divided equally among batch cases",
+    "comparison_scope": (
+        "COMSOL process / batch-amortized model forward duration ratio; "
+        "distinct boundaries, not isolated single-case latency or a like-for-like solver speedup"
+    ),
+}
 _SHA256_HEX_LENGTH = 64
 _SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
 
@@ -283,17 +290,17 @@ def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
     cases: list[dict[str, Any]] = []
     case_ids: list[str] = []
     for position, value_case in enumerate(raw_cases):
-        if not isinstance(value_case, Mapping) or set(value_case) != {"case_id", "elapsed_seconds"}:
+        if not isinstance(value_case, Mapping) or set(value_case) != {"case_id", "comsol_process_seconds"}:
             msg = f"Simulation batch timing case {position} has invalid fields."
             raise ValueError(msg)
         case_id = _require_text(value_case.get("case_id"), label=f"simulation case {position} case_id")
-        duration = _duration(value_case.get("elapsed_seconds"), label=f"simulation case {position} elapsed duration")
+        duration = _duration(value_case.get("comsol_process_seconds"), label=f"simulation case {position} elapsed duration")
         case_ids.append(case_id)
-        cases.append({"case_id": case_id, "elapsed_seconds": duration})
+        cases.append({"case_id": case_id, "comsol_process_seconds": duration})
     if len(case_ids) != len(set(case_ids)):
         msg = "Simulation batch timing case IDs must be unique."
         raise ValueError(msg)
-    summary = _summary([case["elapsed_seconds"] for case in cases])
+    summary = _summary([case["comsol_process_seconds"] for case in cases])
 
     def source_optional(value: float | None) -> float | list[Any]:
         return [] if value is None else value
@@ -356,8 +363,8 @@ def build_runtime_comparison(
     warmup_passes: int = WARMUP_PASSES,
 ) -> dict[str, Any]:
     """Build one case-matched comparison from amortized loader-batch forwards."""
-    if split_role not in {"eval", "ood"}:
-        msg = "Runtime comparison split_role must be eval or ood."
+    if split_role not in {"eval", "additional_evaluation"}:
+        msg = "Runtime comparison split_role must be eval or additional_evaluation."
         raise ValueError(msg)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         msg = "Runtime comparison batch_size must be positive."
@@ -367,7 +374,7 @@ def build_runtime_comparison(
         raise ValueError(msg)
     neural_cases: list[dict[str, Any]] = []
     for position, raw_case in enumerate(cases):
-        if not isinstance(raw_case, Mapping) or set(raw_case) != {"case_id", "source_index", "neural_operator_forward_s"}:
+        if not isinstance(raw_case, Mapping) or set(raw_case) != {"case_id", "source_index", "batch_amortized_neural_operator_forward_s"}:
             msg = f"Neural timing case {position} has invalid fields."
             raise ValueError(msg)
         case_id = _require_text(raw_case.get("case_id"), label=f"Neural timing case {position} case_id")
@@ -379,8 +386,8 @@ def build_runtime_comparison(
             {
                 "case_id": case_id,
                 "source_index": source_index,
-                "neural_operator_forward_s": _duration(
-                    raw_case.get("neural_operator_forward_s"),
+                "batch_amortized_neural_operator_forward_s": _duration(
+                    raw_case.get("batch_amortized_neural_operator_forward_s"),
                     label=f"Neural timing case {position} forward duration",
                 ),
             }
@@ -409,7 +416,7 @@ def build_runtime_comparison(
         if simulation_timing["batch_manifest_sha256"] != expected_digest:
             msg = "Simulation timing does not bind the dataset-authoritative batch manifest."
             raise ValueError(msg)
-        comsol_by_id = {case["case_id"]: float(case["elapsed_seconds"]) for case in simulation_timing["cases"]}
+        comsol_by_id = {case["case_id"]: float(case["comsol_process_seconds"]) for case in simulation_timing["cases"]}
         comparison = {
             "status": "available",
             "simulation_profile": simulation_timing["simulation_profile"],
@@ -419,19 +426,19 @@ def build_runtime_comparison(
 
     records: list[dict[str, Any]] = []
     matched_comsol: list[float] = []
-    speedups: list[float] = []
+    duration_ratios: list[float] = []
     forward_values: list[float] = []
     for case in neural_cases:
-        forward_s = float(case["neural_operator_forward_s"])
+        forward_s = float(case["batch_amortized_neural_operator_forward_s"])
         comsol_s = comsol_by_id.get(str(case["case_id"]))
         forward_values.append(forward_s)
         if comsol_s is None:
-            speedup = None
+            duration_ratio = None
         else:
-            speedup = comsol_s / forward_s
+            duration_ratio = comsol_s / forward_s
             matched_comsol.append(comsol_s)
-            speedups.append(speedup)
-        records.append({**case, "comsol_solve_s": comsol_s, "speedup": speedup})
+            duration_ratios.append(duration_ratio)
+        records.append({**case, "comsol_process_s": comsol_s, "comsol_process_to_batch_amortized_forward_ratio": duration_ratio})
 
     payload = {
         "schema_kind": RUNTIME_COMPARISON_SCHEMA_KIND,
@@ -447,12 +454,13 @@ def build_runtime_comparison(
             "warmup_passes": warmup_passes,
             "cuda_synchronized": neural_runtime.get("device_type") == "cuda",
         },
+        "boundaries": dict(_RUNTIME_COMPARISON_BOUNDARIES),
         "comparison": comparison,
         "cases": records,
         "aggregates": {
-            "neural_operator_forward_s": _summary(forward_values),
-            "comsol_solve_s": _summary(matched_comsol),
-            "speedup": _summary(speedups),
+            "batch_amortized_neural_operator_forward_s": _summary(forward_values),
+            "comsol_process_s": _summary(matched_comsol),
+            "comsol_process_to_batch_amortized_forward_ratio": _summary(duration_ratios),
         },
     }
     return validate_runtime_comparison(payload)
@@ -472,6 +480,7 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         "model_identity",
         "neural_runtime",
         "measurement",
+        "boundaries",
         "comparison",
         "cases",
         "aggregates",
@@ -483,8 +492,8 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     ):
         msg = "Runtime comparison has an invalid schema."
         raise ValueError(msg)
-    if payload.get("split_role") not in {"eval", "ood"}:
-        msg = "Runtime comparison split_role must be eval or ood."
+    if payload.get("split_role") not in {"eval", "additional_evaluation"}:
+        msg = "Runtime comparison split_role must be eval or additional_evaluation."
         raise ValueError(msg)
     _validate_identity(
         payload.get("dataset_identity"),
@@ -531,6 +540,9 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     if measurement.get("cuda_synchronized") is not (runtime["device_type"] == "cuda"):
         msg = "Runtime comparison CUDA synchronization metadata is inconsistent."
         raise ValueError(msg)
+    if payload.get("boundaries") != _RUNTIME_COMPARISON_BOUNDARIES:
+        msg = "Runtime comparison must disclose its distinct process and batch-amortized forward boundaries."
+        raise ValueError(msg)
 
     comparison = payload.get("comparison")
     if not isinstance(comparison, Mapping):
@@ -562,10 +574,16 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     case_ids: list[str] = []
     source_indices: list[int] = []
     forwards: list[float] = []
-    solves: list[float] = []
-    speedups: list[float] = []
+    process_durations: list[float] = []
+    duration_ratios: list[float] = []
     for position, raw_case in enumerate(raw_cases):
-        required_case = {"case_id", "source_index", "neural_operator_forward_s", "comsol_solve_s", "speedup"}
+        required_case = {
+            "case_id",
+            "source_index",
+            "batch_amortized_neural_operator_forward_s",
+            "comsol_process_s",
+            "comsol_process_to_batch_amortized_forward_ratio",
+        }
         if not isinstance(raw_case, Mapping) or set(raw_case) != required_case:
             msg = f"Runtime comparison case {position} has invalid fields."
             raise ValueError(msg)
@@ -574,26 +592,28 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         if isinstance(source_index, bool) or not isinstance(source_index, int) or source_index < 0:
             msg = f"cases[{position}].source_index must be non-negative."
             raise TypeError(msg)
-        forward_s = _duration(raw_case.get("neural_operator_forward_s"), label=f"cases[{position}].neural_operator_forward_s")
-        solve_value = raw_case.get("comsol_solve_s")
-        speedup_value = raw_case.get("speedup")
-        if solve_value is None or speedup_value is None:
-            if (solve_value is None) != (speedup_value is None):
+        forward_s = _duration(
+            raw_case.get("batch_amortized_neural_operator_forward_s"), label=f"cases[{position}].batch_amortized_neural_operator_forward_s"
+        )
+        process_value = raw_case.get("comsol_process_s")
+        ratio_value = raw_case.get("comsol_process_to_batch_amortized_forward_ratio")
+        if process_value is None or ratio_value is None:
+            if (process_value is None) != (ratio_value is None):
                 msg = f"Runtime comparison case {position} has an incomplete match."
                 raise ValueError(msg)
-            solve_s = None
-            speedup = None
+            process_s = None
+            duration_ratio = None
         else:
             if status != "available":
                 msg = f"Unavailable comparison cannot contain matched case {position}."
                 raise ValueError(msg)
-            solve_s = _duration(solve_value, label=f"cases[{position}].comsol_solve_s")
-            speedup = _duration(speedup_value, label=f"cases[{position}].speedup")
-            if not math.isclose(speedup, solve_s / forward_s, rel_tol=1e-12, abs_tol=0.0):
-                msg = f"Runtime comparison case {position} speedup is invalid."
+            process_s = _duration(process_value, label=f"cases[{position}].comsol_process_s")
+            duration_ratio = _duration(ratio_value, label=f"cases[{position}].comsol_process_to_batch_amortized_forward_ratio")
+            if not math.isclose(duration_ratio, process_s / forward_s, rel_tol=1e-12, abs_tol=0.0):
+                msg = f"Runtime comparison case {position} duration ratio is invalid."
                 raise ValueError(msg)
-            solves.append(solve_s)
-            speedups.append(speedup)
+            process_durations.append(process_s)
+            duration_ratios.append(duration_ratio)
         case_ids.append(case_id)
         source_indices.append(source_index)
         forwards.append(forward_s)
@@ -601,12 +621,18 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         msg = "Runtime comparison case IDs and source indices must be unique."
         raise ValueError(msg)
     aggregates = payload.get("aggregates")
-    if not isinstance(aggregates, Mapping) or set(aggregates) != {"neural_operator_forward_s", "comsol_solve_s", "speedup"}:
+    if not isinstance(aggregates, Mapping) or set(aggregates) != {
+        "batch_amortized_neural_operator_forward_s",
+        "comsol_process_s",
+        "comsol_process_to_batch_amortized_forward_ratio",
+    }:
         msg = "Runtime comparison aggregates have invalid fields."
         raise ValueError(msg)
-    _validate_summary(aggregates["neural_operator_forward_s"], expected=_summary(forwards), label="forward aggregate")
-    _validate_summary(aggregates["comsol_solve_s"], expected=_summary(solves), label="COMSOL aggregate")
-    _validate_summary(aggregates["speedup"], expected=_summary(speedups), label="speedup aggregate")
+    _validate_summary(aggregates["batch_amortized_neural_operator_forward_s"], expected=_summary(forwards), label="forward aggregate")
+    _validate_summary(aggregates["comsol_process_s"], expected=_summary(process_durations), label="COMSOL aggregate")
+    _validate_summary(
+        aggregates["comsol_process_to_batch_amortized_forward_ratio"], expected=_summary(duration_ratios), label="process-to-forward ratio aggregate"
+    )
     return payload
 
 

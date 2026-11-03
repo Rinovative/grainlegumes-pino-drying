@@ -1,7 +1,4 @@
-"""
-analysis_presentation_registry.py
-
-Declare capability-aware user-facing EDA section and plot presentation order.
+"""Declare capability-aware user-facing EDA section and plot presentation order.
 
 Responsibilities:
   - Keep section keys, tab names, plot keys, and display names reviewable together

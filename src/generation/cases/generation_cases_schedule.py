@@ -1,16 +1,17 @@
-"""
-generation_cases_schedule.py
+"""Generate one deterministic grid-resolved temporal inlet schedule.
 
-Generate one deterministic grid-resolved temporal inlet schedule.
 Responsibilities:
   - Compose dedicated smooth, event, and trend processes on the regular time grid
   - Realize exact temperature and humidity-ratio amplitude and correlation contracts
   - Derive relative humidity thermodynamically and report schedule-quality evidence
   - Build physical COMSOL startup and boundary interpolation tables
+  - Bind requested regular output support independently of sampled schedule support
+
 Design principles:
   - One temporal process family serves natural, parameter-OOD, and stress supports
   - Simplex weights mean relative component contribution exactly once
   - Temporal generation remains independent of every spatial-field implementation
+
 This module does NOT:
   - Generate pressure or other spatial fields, define supports, or add learned channels
   - Infer values from an early solver stop
@@ -46,6 +47,7 @@ _MAGNUS_TEMPERATURE_OFFSET_C = 243.04
 _RELATIVE_HUMIDITY_ROOT_TOLERANCE = 256.0 * np.finfo(np.float64).eps
 SCHEDULE_GENERATOR_VERSION: Final = 1
 COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
+SEPARATE_OUTPUT_TIME_POLICY: Final = "common.time.regular_times_with_separate_schedule_time_support"
 STARTUP_RELATIVE_HUMIDITY_TOLERANCE: Final = 1.0e-12
 STARTUP_POLICY_ID: Final = "coupled_temperature_humidity_equilibrium_minimum_margin_v1"
 _STARTUP_HUMIDITY_START_POLICY: Final = "select_strictest_startup_rh_upper_bound_from_minimum_equilibrium_margin"
@@ -463,16 +465,42 @@ def _startup_ramp_metadata(
     }
 
 
+def regular_output_times(handoff: Mapping[str, Any], regular_times: np.ndarray) -> np.ndarray:
+    """Admit the requested output grid as an exact prefix of sampled support."""
+    policy = handoff.get("regular_output_time_policy")
+    if policy == "common.time.regular_times_unchanged" and "regular_output_grid" not in handoff:
+        return np.asarray(regular_times, dtype=np.float64)
+    grid = handoff.get("regular_output_grid")
+    if policy != SEPARATE_OUTPUT_TIME_POLICY or not isinstance(grid, Mapping) or set(grid) != {"start_h", "stop_h", "interval_h", "node_count"}:
+        msg = "Separate sampled support requires an explicit regular output grid and policy."
+        raise ValueError(msg)
+    count = grid["node_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or not _MINIMUM_SCHEDULE_NODES <= count <= len(regular_times):
+        msg = "Requested regular output grid must fit the sampled schedule support."
+        raise ValueError(msg)
+    expected = {
+        "start_h": float(regular_times[0]),
+        "stop_h": float(regular_times[count - 1]),
+        "interval_h": float(regular_times[1] - regular_times[0]),
+        "node_count": count,
+    }
+    if any(isinstance(grid[name], bool) for name in ("start_h", "stop_h", "interval_h")) or dict(grid) != expected:
+        msg = "Requested regular output grid must be an exact prefix of sampled support."
+        raise ValueError(msg)
+    return np.asarray(regular_times[:count], dtype=np.float64)
+
+
 def _boundary_handoff_metadata(
     canonical: Schedule,
     *,
     startup_metadata: Mapping[str, Any],
     regular_interval: float,
     rejoin_row: np.ndarray | None,
+    output_time_contract: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Describe how the canonical schedule becomes the COMSOL interpolation table."""
     canonical_values = np.asarray(canonical.values, dtype=np.float64)
-    return {
+    result: dict[str, Any] = {
         "handoff_version": COMSOL_BOUNDARY_HANDOFF_VERSION,
         "representation": "comsol_linear_interpolation_table",
         "startup_ramp": dict(startup_metadata),
@@ -486,6 +514,19 @@ def _boundary_handoff_metadata(
         "rejoin_row": None if rejoin_row is None else [float(value) for value in rejoin_row],
         "regular_output_time_policy": "common.time.regular_times_unchanged",
     }
+    if output_time_contract is not None:
+        output_times = np.asarray(output_time_contract["regular_times"], dtype=np.float64)
+        result["regular_output_time_policy"] = SEPARATE_OUTPUT_TIME_POLICY
+        result["regular_output_grid"] = {
+            "start_h": float(output_times[0]),
+            "stop_h": float(output_times[-1]),
+            "interval_h": float(output_time_contract["interval"]),
+            "node_count": int(output_times.size),
+        }
+        if not np.array_equal(regular_output_times(result, canonical_values[:, 0]), output_times):
+            msg = "Requested regular output times must retain the exact sampled support prefix."
+            raise ValueError(msg)
+    return result
 
 
 def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centralized primitive and derived-RH validation
@@ -569,6 +610,9 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
         "rejoin_row",
         "regular_output_time_policy",
     }
+    if handoff.get("regular_output_time_policy") == SEPARATE_OUTPUT_TIME_POLICY:
+        expected_handoff_keys.add("regular_output_grid")
+    regular_output_times(handoff, regular)
     if set(handoff) != expected_handoff_keys:
         msg = "COMSOL boundary handoff provenance has invalid fields."
         raise ValueError(msg)
@@ -583,7 +627,6 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
         handoff["handoff_version"] != COMSOL_BOUNDARY_HANDOFF_VERSION
         or handoff["representation"] != "comsol_linear_interpolation_table"
         or handoff["canonical_regular_grid"] != expected_grid_metadata
-        or handoff["regular_output_time_policy"] != "common.time.regular_times_unchanged"
         or canonical_start.shape != (len(profiles.SCHEDULE_FIELDS),)
         or not np.isfinite(canonical_start).all()
         or canonical_start[0] != regular[0]
@@ -852,6 +895,7 @@ def build_comsol_boundary_schedule(
     initial_dry_basis_moisture: np.ndarray | None,
     oswin_parameters: Mapping[str, Any] | None,
     pressure: float,
+    output_time_contract: Mapping[str, Any] | None = None,
 ) -> ComsolBoundarySchedule:
     """Apply the configured startup handoff to both primitive schedule values."""
     canonical_values = np.asarray(canonical.values, dtype=np.float64)
@@ -944,6 +988,7 @@ def build_comsol_boundary_schedule(
         startup_metadata=startup_metadata,
         regular_interval=regular_interval,
         rejoin_row=rejoin_row,
+        output_time_contract=output_time_contract,
     )
     validate_comsol_boundary_schedule(
         handoff_values,

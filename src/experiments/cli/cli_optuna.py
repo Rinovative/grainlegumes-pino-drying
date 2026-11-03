@@ -1,17 +1,15 @@
-"""
-cli_optuna.py
-
-Run or validate config-driven Optuna studies from the command line.
+"""Run or validate config-driven Optuna studies from the command line.
 
 Responsibilities:
   - Parse Optuna YAML paths and runtime overrides
   - Print dry-run study summaries without starting training
-  - Delegate study execution to experiments.tuning.optuna
+  - Delegate study execution to experiments.tuning.optuna and keep the Optuna library logger at WARNING
 
 Design principles:
   - CLI code stays thin and side-effect-light
   - Search spaces live in YAML files
   - Runtime overrides are explicit command-line options
+  - The study lines come from the console reporter, not from the library logger
 
 This module does NOT:
   - Create, reopen, or optimize studies. ``experiments.tuning.optuna`` owns lifecycle
@@ -48,17 +46,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Number of additional fresh trials to run (existing trial history is never resumed)",
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        help="Override the total epoch budget for every trial (names the study directory: another budget is another study)",
+    )
+    parser.add_argument("--train-dataset", help="Override the exact training Dataset ID (changes study identity)")
     cli_device.add_device_argument(parser, default=None, help_prefix="Override experiment run.device for all trials")
     parser.add_argument(
-        "--output-root",
-        type=str,
-        default=None,
-        help="Invocation-only study database and fresh trial output root (excluded from the signature)",
-    )
-    parser.add_argument(
-        "--show-progress-bar",
-        action="store_true",
-        help="Show Optuna progress bar during study optimization",
+        "--revision",
+        help="Label of a deliberately separate study location for otherwise identical science (stored as run.revision)",
     )
     return parser
 
@@ -89,34 +86,29 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from src.experiments.tuning import optuna  # noqa: PLC0415
 
-        study_config = optuna.load_optuna_study_config(args.config_path)
-        study_config = optuna.with_runtime_overrides(
-            study_config,
-            device=args.device,
-            output_root=args.output_root,
+        study_config = optuna.load_optuna_study_config(
+            args.config_path,
+            epochs=args.epochs,
+            train_dataset=args.train_dataset,
+            revision=args.revision,
         )
+        study_config = optuna.with_runtime_overrides(study_config, device=args.device)
         if args.dry_run:
             print(json.dumps(optuna.describe_optuna_study_config(study_config), indent=2))
             return 0
-        study = optuna.run_optuna_study(
-            study_config,
-            n_trials=args.n_trials,
-            show_progress_bar=args.show_progress_bar,
-        )
+        import optuna as optuna_sdk  # noqa: PLC0415
+
+        # Our own trial and study lines replace the library's INFO lines; its warnings and errors stay.
+        optuna_sdk.logging.set_verbosity(optuna_sdk.logging.WARNING)
+        optuna.run_optuna_study(study_config, n_trials=args.n_trials)
     except KeyboardInterrupt:
         print("Optuna study interrupted.", file=sys.stderr)
         return 130
     except Exception as error:  # noqa: BLE001
-        print(f"Optuna study failed: {type(error).__name__}: {error}", file=sys.stderr)
-        return 1
+        from src.experiments import experiments_console  # noqa: PLC0415
 
-    print("Optuna study complete")
-    print(f"  Study name: {study.study_name}")
-    try:
-        print(f"  Best trial: {study.best_trial.number}")
-        print(f"  Best value: {study.best_trial.value}")
-    except ValueError:
-        print("  Best trial: unavailable")
+        print(f"Optuna study failed: {type(error).__name__}: {experiments_console.sanitized_exception_message(error)}", file=sys.stderr)
+        return 1
     return 0
 
 

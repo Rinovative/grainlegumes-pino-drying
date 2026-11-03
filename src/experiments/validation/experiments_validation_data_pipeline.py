@@ -1,7 +1,4 @@
-"""
-experiments_validation_data_pipeline.py
-
-Validate the complete production data pipeline before an experiment is run.
+"""Validate the complete production data pipeline before an experiment is run.
 
 Responsibilities:
   - Admit complete task-bound ID and OOD datasets and metadata artifacts
@@ -29,6 +26,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
@@ -209,6 +207,17 @@ def _full_source_dataset(loader: Any) -> Any:
     return selected.dataset
 
 
+def _components(source: Any) -> tuple[Any, ...]:
+    """Return the verified packages beneath one possibly combined evaluation source."""
+    return tuple(getattr(source, "sources", (source,)))
+
+
+def _role_sample_ids(evidence: Any) -> tuple[str, ...]:
+    """Return ordered sample IDs of one admitted split role."""
+    sample_ids = evidence.source.sample_ids
+    return tuple(sample_ids[index] for index in evidence.index_values)
+
+
 def _validate_tensor_contract(
     *,
     loader: Any,
@@ -338,6 +347,21 @@ def _validate_loader_pass(
     )
 
 
+def _membership_contract(
+    label: str,
+    *,
+    id_contract: _DatasetContract,
+    additional_contracts: tuple[_DatasetContract, ...],
+) -> _DatasetContract:
+    """Return the tensor contract that owns one membership row."""
+    if label != "Additional evaluation":
+        return id_contract
+    if not additional_contracts:
+        msg = "Additional evaluation membership requires an additional Dataset tensor contract."
+        raise RuntimeError(msg)
+    return additional_contracts[0]
+
+
 def _membership_record(
     *,
     role: str,
@@ -392,16 +416,31 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         seed_plan=seed_plan,
     )
     train_loader = built["train"]
-    eval_loader = built["eval"]
-    ood_loader = built["ood"]
+    evaluation_loaders = {
+        "ID validation": built["eval"],
+        "ID test": built["id_test"],
+        **({} if built["additional_evaluation"] is None else {"Additional evaluation": built["additional_evaluation"]}),
+    }
     processor = built["data_processor"]
     split = built["split_indices"]
     normalizer_state = {key: value.detach().cpu().clone() for key, value in processor.state_dict().items()}
 
     id_contract = _validate_tensor_contract(loader=train_loader, role="ID", task=task)
-    ood_contract = _validate_tensor_contract(loader=ood_loader, role="OOD", task=task)
-    metadata_root = Path(effective["paths"]["dataset_metadata_root"])
-    for contract in (id_contract, ood_contract):
+    additional_loader = built["additional_evaluation"]
+    additional_contracts: tuple[_DatasetContract, ...] = (
+        ()
+        if additional_loader is None
+        else tuple(
+            _validate_tensor_contract(
+                loader=SimpleNamespace(dataset=Subset(component, [])),
+                role=f"Additional evaluation {index}",
+                task=task,
+            )
+            for index, component in enumerate(_components(_full_source_dataset(additional_loader)))
+        )
+    )
+    metadata_root = Path(effective["paths"]["dataset_root"])
+    for contract in (id_contract, *additional_contracts):
         datasets.contracts.metadata.load_dataset_metadata(
             contract.identity.dataset_id,
             dataset_identity=contract.identity,
@@ -412,38 +451,20 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     split_contract = datasets.preprocessing.splits.admit_split_contract(
         split,
         train_identity=id_contract.identity,
-        ood_identity=ood_contract.identity,
-        expected_train_ratio=effective["data"]["train_ratio"],
-        expected_ood_fraction=effective["data"]["ood_fraction"],
-        expected_split_seed=seed_plan["split"],
+        additional_evaluation_identity=None if additional_loader is None else _full_source_dataset(additional_loader).identity,
     )
-    train_indices = split_contract.role("train").indices
-    eval_indices = split_contract.role("eval").indices
-    ood_indices = split_contract.role("ood").indices
-    _require(
-        not bool(torch.isin(train_indices, eval_indices).any().item()),
-        "ID train/evaluation overlap",
-    )
-    id_membership = torch.cat((train_indices, eval_indices))
-    _require(
-        torch.equal(
-            torch.sort(id_membership).values,
-            torch.arange(len(id_contract.source)),
-        ),
-        "ID membership is incomplete",
-    )
-    _require(
-        torch.unique(ood_indices).numel() == ood_indices.numel(),
-        "OOD membership contains duplicates",
-    )
-
-    id_ids = id_contract.identity.sample_ids
-    ood_ids = ood_contract.identity.sample_ids
-    expected = {
-        "train": tuple(id_ids[int(index)] for index in train_indices.tolist()),
-        "eval": tuple(id_ids[int(index)] for index in eval_indices.tolist()),
-        "ood": tuple(ood_ids[int(index)] for index in ood_indices.tolist()),
+    role_loaders: dict[str, datasets.preprocessing.splits.SplitRole] = {
+        "ID validation": "validation",
+        "ID test": "id_test",
+        "Additional evaluation": "additional_evaluation",
     }
+    expected = {"ID train": _role_sample_ids(split_contract.train)}
+    expected.update({label: _role_sample_ids(split_contract.role(role_loaders[label])) for label in evaluation_loaders})
+    id_sets = [set(split_contract.role(role).index_values) for role in datasets.preprocessing.splits.ID_SPLIT_ROLES]
+    _require(
+        not any(left & right for index, left in enumerate(id_sets) for right in id_sets[index + 1 :]),
+        "ID train/validation/test overlap",
+    )
 
     generator = train_loader.generator
     _require(
@@ -454,14 +475,8 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         isinstance(train_loader.sampler, RandomSampler),
         "training loader must use RandomSampler",
     )
-    _require(
-        isinstance(eval_loader.sampler, SequentialSampler),
-        "evaluation loader must be stable",
-    )
-    _require(
-        isinstance(ood_loader.sampler, SequentialSampler),
-        "OOD loader must be stable",
-    )
+    for label, loader in evaluation_loaders.items():
+        _require(isinstance(loader.sampler, SequentialSampler), f"{label} loader must be stable")
     sampler_state = generator.get_state().clone()
     first_epoch_batches = tuple(tuple(batch) for batch in train_loader.batch_sampler)
     sampler_after = generator.get_state().clone()
@@ -490,26 +505,18 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         "input": _ChannelMoments(),
         "output": _ChannelMoments(),
     }
-    train_pass = _validate_loader_pass(
-        loader=train_loader,
-        role="ID train",
-        expected_ids=expected["train"],
-        processor=processor,
-        raw_moments=raw_moments,
-        normalized_moments=normalized_moments,
-    )
-    eval_pass = _validate_loader_pass(
-        loader=eval_loader,
-        role="ID evaluation",
-        expected_ids=expected["eval"],
-        processor=processor,
-    )
-    ood_pass = _validate_loader_pass(
-        loader=ood_loader,
-        role="OOD",
-        expected_ids=expected["ood"],
-        processor=processor,
-    )
+    passes = {
+        "ID train": _validate_loader_pass(
+            loader=train_loader,
+            role="ID train",
+            expected_ids=expected["ID train"],
+            processor=processor,
+            raw_moments=raw_moments,
+            normalized_moments=normalized_moments,
+        )
+    }
+    for label, loader in evaluation_loaders.items():
+        passes[label] = _validate_loader_pass(loader=loader, role=label, expected_ids=expected[label], processor=processor)
 
     channel_records: list[ChannelStatisticsRecord] = []
     for tensor_role, names, prefix in (
@@ -602,40 +609,19 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         "output zero-variance epsilon policy failed",
     )
 
-    coverage = (
+    coverage = tuple(
         LoaderCoverageRecord(
-            loader="ID train",
-            sampler=type(train_loader.sampler).__name__,
-            batches=len(train_loader),
-            batch_size=train_loader.batch_size,
-            final_batch=train_pass.final_batch_size,
-            drop_last=train_loader.drop_last,
-            inverse_checked=train_pass.inverse_checked,
+            loader=label,
+            sampler=type(loader.sampler).__name__,
+            batches=len(loader),
+            batch_size=loader.batch_size,
+            final_batch=passes[label].final_batch_size,
+            drop_last=loader.drop_last,
+            inverse_checked=passes[label].inverse_checked,
             finite=True,
             result="PASS",
-        ),
-        LoaderCoverageRecord(
-            loader="ID evaluation",
-            sampler=type(eval_loader.sampler).__name__,
-            batches=len(eval_loader),
-            batch_size=eval_loader.batch_size,
-            final_batch=eval_pass.final_batch_size,
-            drop_last=eval_loader.drop_last,
-            inverse_checked=eval_pass.inverse_checked,
-            finite=True,
-            result="PASS",
-        ),
-        LoaderCoverageRecord(
-            loader="OOD",
-            sampler=type(ood_loader.sampler).__name__,
-            batches=len(ood_loader),
-            batch_size=ood_loader.batch_size,
-            final_batch=ood_pass.final_batch_size,
-            drop_last=ood_loader.drop_last,
-            inverse_checked=ood_pass.inverse_checked,
-            finite=True,
-            result="PASS",
-        ),
+        )
+        for label, loader in {"ID train": train_loader, **evaluation_loaders}.items()
     )
     dataset_membership = (
         _membership_record(
@@ -646,52 +632,30 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
             shape=f"x{id_contract.input_shape}, y{id_contract.output_shape}",
             policy="complete identity and metadata artifact binding",
         ),
-        _membership_record(
-            role="ID train",
-            contract=id_contract,
-            expected_ids=expected["train"],
-            observed_ids=train_pass.observed_ids,
-            shape="BCHW",
-            policy="RandomSampler permutation",
-        ),
-        _membership_record(
-            role="ID evaluation",
-            contract=id_contract,
-            expected_ids=expected["eval"],
-            observed_ids=eval_pass.observed_ids,
-            shape="BCHW",
-            policy="SequentialSampler",
-        ),
-        _membership_record(
-            role="OOD full",
-            contract=ood_contract,
-            expected_ids=ood_contract.identity.sample_ids,
-            observed_ids=ood_contract.identity.sample_ids,
-            shape=f"x{ood_contract.input_shape}, y{ood_contract.output_shape}",
-            policy="complete identity and metadata artifact binding",
-        ),
-        _membership_record(
-            role="OOD selected",
-            contract=ood_contract,
-            expected_ids=expected["ood"],
-            observed_ids=ood_pass.observed_ids,
-            shape="BCHW",
-            policy="SequentialSampler",
+        *(
+            _membership_record(
+                role=label,
+                contract=_membership_contract(label, id_contract=id_contract, additional_contracts=additional_contracts),
+                expected_ids=expected[label],
+                observed_ids=passes[label].observed_ids,
+                shape="BCHW",
+                policy="RandomSampler permutation" if label == "ID train" else "SequentialSampler",
+            )
+            for label in passes
         ),
     )
 
-    first_split = {key: split[key].clone() for key in ("train_indices", "eval_indices", "ood_indices")}
-    del built, train_loader, eval_loader, ood_loader, processor, id_contract, ood_contract
+    first_split = split_contract
+    del built, train_loader, evaluation_loaders, additional_loader, processor, id_contract, additional_contracts
     gc.collect()
     repeated = config_loader.create_dataloaders_from_config(
         effective,
         seed_plan=seed_plan,
     )
-    for key, values in first_split.items():
-        _require(
-            torch.equal(repeated["split_indices"][key], values),
-            f"repeated production split changed {key}",
-        )
+    _require(
+        datasets.preprocessing.splits.admit_split_contract(repeated["split_indices"]) == first_split,
+        "repeated production split changed membership",
+    )
     del repeated
     gc.collect()
 

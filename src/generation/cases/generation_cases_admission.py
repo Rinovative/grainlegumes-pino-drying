@@ -1,15 +1,14 @@
-"""
-generation_cases_admission.py
+"""Admit immutable canonical pre-execution input batches for inspection.
 
-Admit immutable canonical pre-execution input batches for inspection.
 Responsibilities:
   - Validate input-generation manifests, case evidence, and adapter hashes
   - Reconstruct column-major spatial fields on the declared Cartesian grid
-  - Compare independently generated case bundles under one exact identity contract
   - Expose immutable lazy discovery records to analysis consumers
+
 Design principles:
   - Metadata is the sole discovery boundary; arbitrary raw directories are ignored
   - Persisted identities, lifecycle state, and adapter contracts fail closed
+
 This module does NOT:
   - Run COMSOL, infer missing raw inputs, or publish generation results
 """
@@ -67,6 +66,7 @@ INPUT_GENERATION_IDENTITY_FIELDS = (
     "scientific_config_digest",
     "git_commit",
     "generator_version",
+    "producer_identity",
     "case_schema_version",
     "case_contract_digest",
     "template_relative_path",
@@ -195,7 +195,6 @@ class InputCaseReference:
     case_json_sha256: str
     case_json_size_bytes: int
     case_directory: Path
-    input_directory: Path
     parameter_metadata: Mapping[str, Any] | None
     _case_payload_json: str
 
@@ -437,17 +436,6 @@ def _validate_schedule(payload: Mapping[str, Any], schedule: np.ndarray) -> None
     )
 
 
-def _resolve_adapter_directory(
-    case_directory: Path,
-    supplied: Path | str | None,
-) -> Path:
-    """Resolve an explicit adapter root or the canonical nested input directory."""
-    if supplied is not None:
-        return Path(supplied).expanduser().resolve()
-    nested = case_directory / "inputs"
-    return nested if nested.is_dir() else case_directory
-
-
 def admit_input_case(
     directory: Path | str,
     *,
@@ -456,7 +444,6 @@ def admit_input_case(
     label: str,
     batch_storage_name: str | None = None,
     campaign_purpose: str | None = None,
-    input_directory: Path | str | None = None,
     parameter_metadata: Mapping[str, Any] | None = None,
 ) -> AdmittedInputCase:
     """
@@ -476,8 +463,6 @@ def admit_input_case(
         Manifest-validated flat semantic storage locator.
     campaign_purpose : str | None, optional
         Manifest-validated canonical campaign purpose.
-    input_directory : pathlib.Path | str | None, optional
-        Alternate directory containing retained input adapters.
     parameter_metadata : Mapping[str, Any] | None, optional
         Canonical parameter descriptions and report symbols.
 
@@ -504,7 +489,6 @@ def admit_input_case(
             campaign_purpose,
             label="campaign_purpose",
         )
-    adapter_directory = _resolve_adapter_directory(directory, input_directory)
     payload = json.loads((directory / "case.json").read_text(encoding="utf-8"))
     case_service.validate_case_payload_schema(payload)
     profile_id = str(payload["simulation_profile"])
@@ -515,12 +499,12 @@ def admit_input_case(
     ):
         msg = "case.json input or simulation identity is invalid."
         raise ValueError(msg)
-    fields = _admit_fields(adapter_directory, payload)
+    fields = _admit_fields(directory, payload)
     scalars: Mapping[str, float] = MappingProxyType({})
     schedule: np.ndarray | None = None
     if profile_id == profiles.TRANSIENT_DRYING_PROFILE:
         scalar_spec = payload["input_contract"]["scalar"]
-        scalar_path = _input_path(adapter_directory, payload, "scalar")
+        scalar_path = _input_path(directory, payload, "scalar")
         scalar_rows = list(csv.reader(scalar_path.read_text(encoding="utf-8").splitlines(), delimiter=scalar_spec["delimiter"]))
         if (
             not scalar_rows
@@ -537,9 +521,7 @@ def admit_input_case(
             raise ValueError(msg_1)
         scalars = MappingProxyType({entry.name: entry.value for entry in entries})
         schedule_spec = payload["input_contract"]["schedule"]
-        schedule_header, schedule = read_input_adapter_table(
-            _input_path(adapter_directory, payload, "schedule"), delimiter=schedule_spec["delimiter"]
-        )
+        schedule_header, schedule = read_input_adapter_table(_input_path(directory, payload, "schedule"), delimiter=schedule_spec["delimiter"])
         if tuple(schedule_header) != profiles.SCHEDULE_FIELDS:
             msg_2 = "Schedule adapter header is invalid."
             raise ValueError(msg_2)
@@ -605,7 +587,7 @@ def _validate_input_manifest_shape(
 def _validated_batch_locators(
     manifest: Mapping[str, Any],
     directory: Path,
-) -> tuple[str, str]:
+) -> tuple[str, str, Path]:
     """Validate immutable identity and its distinct semantic storage locator."""
     batch_id = manifest.get("batch_id")
     batch_storage_name = manifest.get("batch_storage_name")
@@ -625,10 +607,8 @@ def _validated_batch_locators(
         message = "Input-generation manifest input_generation_id must be text."
         raise TypeError(message)
     common.paths.validate_logical_name(generation_id, label="input_generation_id")
-    if directory.name != generation_id or directory.parent.name != "input_generations" or directory.parent.parent.name != batch_storage_name:
-        message = "Input-generation metadata directory must use its exact current generation identity."
-        raise ValueError(message)
-    return batch_id, batch_storage_name
+    storage_root = common.paths.resolve_generation_input_metadata_storage_root(directory, batch_storage_name, generation_id)
+    return batch_id, batch_storage_name, storage_root
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,7 +627,6 @@ def _load_input_batch_envelope(
     *,
     raw_directory: Path | str | None,
     expected_input_generation_id: str | None,
-    require_raw_directory: bool = True,
 ) -> _InputBatchEnvelope:
     """Validate immutable batch identity before bounded case reconstruction."""
     metadata_candidate = Path(directory).expanduser()
@@ -679,7 +658,7 @@ def _load_input_batch_envelope(
     if compute_input_generation_id(manifest) != generation_id:
         message = "Input-generation manifest disagrees with its deterministic source identity."
         raise ValueError(message)
-    batch_id, batch_storage_name = _validated_batch_locators(
+    batch_id, batch_storage_name, storage_root = _validated_batch_locators(
         manifest,
         directory,
     )
@@ -709,19 +688,18 @@ def _load_input_batch_envelope(
     profiles.resolve_profile(profile_id)
     scientific_digest = config_service.compute_scientific_config_digest(resolved)
     case_input_digest = config_service.compute_case_input_config_digest(resolved)
-    expected_batch_name = config_service.build_batch_name(
+    expected_batch_name, locator_regime = config_service.resolve_batch_locators(
         profile_id,
         str(manifest["material_family"]),
         str(manifest["sampling_regime"]),
+        resolved,
     )
-    if resolved.get("campaign_purpose") == config_service.PILOT_CAMPAIGN_PURPOSE:
-        expected_batch_name = config_service.build_batch_name(
-            profile_id,
-            str(manifest["material_family"]),
-            config_service.PILOT_CAMPAIGN_PURPOSE,
-        )
+    supplemental = resolved.get("supplemental_design")
+    stored_locator_regime = supplemental.get("batch_locator_regime") if isinstance(supplemental, Mapping) else None
+    storage_parts = common.paths.campaign_batch_parts(batch_storage_name)
     if (
-        scientific_digest != manifest["scientific_config_digest"]
+        (locator_regime != manifest["sampling_regime"] and stored_locator_regime != locator_regime)
+        or scientific_digest != manifest["scientific_config_digest"]
         or scientific_digest != manifest["batch_identity"]
         or case_input_digest != manifest["case_input_config_digest"]
         or expected_batch_name != manifest["batch_name"]
@@ -730,22 +708,26 @@ def _load_input_batch_envelope(
             scientific_digest,
         )
         != batch_id
-        or config_service.build_batch_storage_name(
-            profile_id,
-            str(manifest["material_family"]),
-            str(manifest["sampling_regime"]),
-            str(manifest["campaign_purpose"]),
-            scientific_digest,
+        or (
+            f"source~{profile_id}~{storage_parts[1]}~{manifest['material_family']}~{locator_regime}"
+            if storage_parts is not None
+            else config_service.build_batch_storage_name(
+                profile_id,
+                str(manifest["material_family"]),
+                str(manifest["sampling_regime"]),
+                str(manifest["campaign_purpose"]),
+                scientific_digest,
+            )
         )
         != batch_storage_name
     ):
         message = "Resolved generation identities do not bind the input manifest."
         raise ValueError(message)
     if raw_directory is None:
-        raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+        raw_directory = common.paths.resolve_generation_input_generation_cases_directory(
             batch_storage_name,
             str(generation_id),
-            storage_root=directory.parents[4],
+            storage_root=storage_root,
         )
     raw_candidate = Path(raw_directory).expanduser()
     if raw_candidate.is_symlink():
@@ -753,17 +735,14 @@ def _load_input_batch_envelope(
         raise ValueError(message)
     raw = raw_candidate.resolve()
     if not raw.is_dir():
-        if not require_raw_directory:
-            return _InputBatchEnvelope(
-                directory=directory,
-                raw_directory=raw,
-                manifest=manifest,
-                resolved_config=resolved,
-                parameter_metadata=resolved["registry_metadata"],
-            )
         message = f"Canonical input raw batch is missing or unsafe: {raw}"
         raise ValueError(message)
-    if raw.name != generation_id or raw.parent.name != "input_generations" or raw.parent.parent.name != batch_storage_name:
+    expected_raw = common.paths.resolve_generation_input_generation_cases_directory(
+        batch_storage_name,
+        str(generation_id),
+        storage_root=storage_root,
+    )
+    if raw != expected_raw:
         message = "Input-generation raw directory must use its exact current generation identity."
         raise ValueError(message)
     return _InputBatchEnvelope(
@@ -775,83 +754,6 @@ def _load_input_batch_envelope(
     )
 
 
-def admit_retired_input_case_metadata(
-    directory: Path | str,
-    case_index: int,
-    *,
-    expected_input_generation_id: str,
-) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]:
-    """Admit durable input metadata for one case after raw cleanup."""
-    if isinstance(case_index, bool) or not isinstance(case_index, int) or case_index < 1:
-        message = "Retired input metadata requires a positive integer case index."
-        raise ValueError(message)
-    envelope = _load_input_batch_envelope(
-        directory,
-        raw_directory=None,
-        expected_input_generation_id=expected_input_generation_id,
-        require_raw_directory=False,
-    )
-    records = envelope.manifest["cases"]
-    indices = envelope.manifest["case_indices"]
-    expected_digest = frozenset("0123456789abcdef")
-    case_input_ids: set[str] = set()
-    simulation_case_ids: set[str] = set()
-    selected: Mapping[str, Any] | None = None
-    for record, index in zip(records, indices, strict=True):
-        input_files = record.get("input_files") if isinstance(record, Mapping) else None
-        valid_files = (
-            isinstance(input_files, Mapping)
-            and bool(input_files)
-            and all(
-                isinstance(name, str)
-                and name
-                and not Path(name).is_absolute()
-                and ".." not in Path(name).parts
-                and Path(name).as_posix() == name
-                and isinstance(identity, Mapping)
-                and set(identity) == {"sha256", "size_bytes"}
-                and isinstance(identity.get("sha256"), str)
-                and len(identity["sha256"]) == _SHA256_LENGTH
-                and set(identity["sha256"]).issubset(expected_digest)
-                and isinstance(identity.get("size_bytes"), int)
-                and not isinstance(identity.get("size_bytes"), bool)
-                and identity["size_bytes"] >= 0
-                for name, identity in (input_files.items() if isinstance(input_files, Mapping) else ())
-            )
-        )
-        case_input_id = record.get("case_input_id") if isinstance(record, Mapping) else None
-        simulation_case_id = record.get("simulation_case_id") if isinstance(record, Mapping) else None
-        if (
-            not isinstance(record, Mapping)
-            or set(record) != INPUT_CASE_RECORD_KEYS
-            or record.get("case_index") != index
-            or record.get("case_id") != f"case_{index:04d}"
-            or not isinstance(case_input_id, str)
-            or len(case_input_id) != _SHA256_LENGTH
-            or not set(case_input_id).issubset(expected_digest)
-            or not isinstance(simulation_case_id, str)
-            or len(simulation_case_id) != _SHA256_LENGTH
-            or not set(simulation_case_id).issubset(expected_digest)
-            or any(
-                not isinstance(record.get(name), str) or len(record[name]) != _SHA256_LENGTH or not set(record[name]).issubset(expected_digest)
-                for name in ("case_json_sha256", "seed_evidence_sha256")
-            )
-            or not valid_files
-            or case_input_id in case_input_ids
-            or simulation_case_id in simulation_case_ids
-        ):
-            message = "Retired input-generation metadata has malformed, duplicate, or incomplete case evidence."
-            raise ValueError(message)
-        case_input_ids.add(case_input_id)
-        simulation_case_ids.add(simulation_case_id)
-        if index == case_index:
-            selected = record
-    if selected is None:
-        message = f"Input-generation manifest does not declare retired case index {case_index}."
-        raise ValueError(message)
-    return envelope.manifest, envelope.resolved_config, selected
-
-
 def _raise_for_execution_artifact(*roots: Path) -> None:
     """Preserve exact artifact classification only after layout evidence conflicts."""
     for root in roots:
@@ -859,6 +761,11 @@ def _raise_for_execution_artifact(*roots: Path) -> None:
             if next(root.rglob(name), None) is not None:
                 message = f"Input-generated raw evidence contains an execution or success artifact under {root}: {name}."
                 raise ValueError(message)
+
+
+def _input_case_directory(raw_directory: Path, case_id: str) -> Path:
+    """Resolve one canonical material-local candidate input directory."""
+    return common.paths.resolve_generation_case_inputs_directory(raw_directory / case_id)
 
 
 def _validate_input_case_record(
@@ -884,9 +791,8 @@ def _validate_input_case_record(
         message = "Input-generation case identity or hash inventory is invalid."
         raise ValueError(message)
     case_id = str(record["case_id"])
-    case_directory = envelope.raw_directory / case_id
-    input_directory = case_directory / "inputs"
-    case_payload_path = case_directory / "case.json"
+    case_directory = _input_case_directory(envelope.raw_directory, case_id)
+    case_payload_path = case_directory / common.paths.GENERATION_CASE_PAYLOAD_FILENAME
     try:
         case_payload_bytes = case_payload_path.read_bytes()
         case_payload = json.loads(case_payload_bytes)
@@ -920,13 +826,12 @@ def _validate_input_case_record(
     ):
         message = f"Canonical raw case source identity disagrees with its manifest: {case_payload_path}"
         raise ValueError(message)
-    case_entries = tuple(case_directory.iterdir()) if case_directory.is_dir() and not case_directory.is_symlink() else ()
-    input_entries = tuple(input_directory.iterdir()) if input_directory.is_dir() and not input_directory.is_symlink() else ()
-    if (
-        {entry.name for entry in case_entries} != {"case.json", "inputs"}
-        or {entry.name for entry in input_entries} != set(record["input_files"])
-        or any(not entry.is_file() or entry.is_symlink() for entry in input_entries)
-    ):
+    entries = tuple(case_directory.iterdir()) if case_directory.is_dir() and not case_directory.is_symlink() else ()
+    if {entry.name for entry in entries} != {
+        common.paths.GENERATION_CASE_PAYLOAD_FILENAME,
+        common.paths.GENERATION_INPUT_REFERENCE_FILENAME,
+        *record["input_files"],
+    } or any(not entry.is_file() or entry.is_symlink() for entry in entries):
         _raise_for_execution_artifact(case_directory)
         message = f"Canonical raw case layout is invalid: {case_directory}"
         raise ValueError(message)
@@ -961,13 +866,23 @@ def _load_input_batch_metadata(
         expected_names.add(str(record["case_id"]))
         normalized_records.append(record)
         case_payloads.append(case_payload)
-    observed_names = {entry.name for entry in envelope.raw_directory.iterdir()}
+    campaign_layout = common.paths.campaign_batch_parts(str(envelope.manifest["batch_storage_name"])) is not None
+    try:
+        # A campaign material holds its cases beside the reserved _record/ and nothing else.
+        observed_entries = (
+            common.paths.generation_material_case_directories(envelope.raw_directory) if campaign_layout else tuple(envelope.raw_directory.iterdir())
+        )
+    except ValueError:
+        observed_entries = None
+    observed_names = set() if observed_entries is None else {entry.name for entry in observed_entries}
     if (
-        len(expected_names) != len(records)
-        or observed_names != expected_names
-        or any(not (envelope.raw_directory / case_id).is_dir() for case_id in expected_names)
+        observed_entries is None
+        or len(expected_names) != len(records)
+        or (not expected_names.issubset(observed_names) if campaign_layout else observed_names != expected_names)
+        or any(not _input_case_directory(envelope.raw_directory, case_id).is_dir() for case_id in expected_names)
     ):
-        _raise_for_execution_artifact(envelope.raw_directory)
+        if not campaign_layout:
+            _raise_for_execution_artifact(envelope.raw_directory)
         message = "Input-generation raw case membership is not exact."
         raise ValueError(message)
     return _InputBatchMetadata(
@@ -998,7 +913,6 @@ def _case_reference(
     record: Mapping[str, Any],
     case_payload: Mapping[str, Any],
     case_directory: Path,
-    input_directory: Path,
     parameter_metadata: Mapping[str, Any] | None,
     validation_depth: Literal["evidence", "full"],
 ) -> InputCaseReference:
@@ -1024,7 +938,7 @@ def _case_reference(
         message = "Input source case.json disagrees with metadata hash inventory."
         raise ValueError(message)
     for filename, identity in input_files.items():
-        path = input_directory / str(filename)
+        path = case_directory / str(filename)
         size_bytes = identity.get("size_bytes") if isinstance(identity, Mapping) else None
         digest = identity.get("sha256") if isinstance(identity, Mapping) else None
         if (
@@ -1060,7 +974,6 @@ def _case_reference(
         str(record["case_json_sha256"]),
         payload_path.stat().st_size,
         case_directory,
-        input_directory,
         parameter_metadata,
         json.dumps(case_payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
     )
@@ -1123,98 +1036,10 @@ def admit_input_case_evidence(
         source=provisional,
         record=record,
         case_payload=case_payload,
-        case_directory=envelope.raw_directory / case_id,
-        input_directory=envelope.raw_directory / case_id / "inputs",
+        case_directory=_input_case_directory(envelope.raw_directory, case_id),
         parameter_metadata=envelope.parameter_metadata,
         validation_depth=validation_depth,
     )
-
-
-def admit_input_batch(
-    directory: Path | str,
-    *,
-    raw_directory: Path | str | None = None,
-    expected_input_generation_id: str | None = None,
-) -> tuple[AdmittedInputCase, ...]:
-    """
-    Validate one canonical non-executed input batch and all declared cases.
-
-    Parameters
-    ----------
-    directory : Path | str
-        Batch metadata directory containing the manifest and resolved config.
-    raw_directory : Path | str | None, optional
-        Explicit raw root for a staged publication. Final publications derive it
-        from the canonical storage owner.
-    expected_input_generation_id : str | None, optional
-        Expected source identity while validating staged metadata.
-
-    Returns
-    -------
-    tuple[AdmittedInputCase, ...]
-        Manifest-declared cases in canonical index order.
-
-    Raises
-    ------
-    TypeError
-        If persisted JSON evidence has invalid shape.
-    ValueError
-        If lifecycle, source, identity, membership, or adapter evidence differs.
-
-    """
-    metadata = _load_input_batch_metadata(
-        directory,
-        raw_directory=raw_directory,
-        expected_input_generation_id=expected_input_generation_id,
-        validation_depth="full",
-    )
-    manifest = metadata.manifest
-    provisional = InputSource(
-        str(manifest["input_generation_id"]),
-        "input_generated",
-        str(manifest["simulation_profile"]),
-        str(manifest["batch_id"]),
-        str(manifest["batch_storage_name"]),
-        str(manifest["batch_identity"]),
-        str(manifest["material_family"]),
-        str(manifest["sampling_regime"]),
-        str(manifest["campaign_purpose"]),
-        metadata.directory,
-        (),
-        _freeze_json_evidence(manifest),
-        _freeze_json_evidence(metadata.resolved_config),
-    )
-    cases = []
-    for record, case_payload in zip(
-        metadata.records,
-        metadata.case_payloads,
-        strict=True,
-    ):
-        case_id = str(record["case_id"])
-        reference = _case_reference(
-            source=provisional,
-            record=record,
-            case_payload=case_payload,
-            case_directory=metadata.raw_directory / case_id,
-            input_directory=metadata.raw_directory / case_id / "inputs",
-            parameter_metadata=metadata.parameter_metadata,
-            validation_depth="full",
-        )
-        case = admit_input_case_reference(reference)
-        if any(
-            case.payload[key] != manifest[key]
-            for key in (
-                "batch_id",
-                "batch_identity",
-                "case_input_config_digest",
-                "scientific_config_digest",
-                "git_commit",
-            )
-        ):
-            message = "Input-generated case provenance disagrees with its batch manifest."
-            raise ValueError(message)
-        cases.append(case)
-    return tuple(cases)
 
 
 def admit_input_batch_source(
@@ -1257,8 +1082,7 @@ def admit_input_batch_source(
             source=provisional,
             record=record,
             case_payload=case_payload,
-            case_directory=metadata.raw_directory / str(record["case_id"]),
-            input_directory=metadata.raw_directory / str(record["case_id"]) / "inputs",
+            case_directory=_input_case_directory(metadata.raw_directory, str(record["case_id"])),
             parameter_metadata=metadata.parameter_metadata,
             validation_depth=validation_depth,
         )
@@ -1288,8 +1112,10 @@ def admit_input_batch_source(
 def discover_input_batches(
     storage_root: Path | str | None = None,
     *,
+    task: str | None = None,
     max_sources: int | None = None,
     max_cases_per_source: int | None = None,
+    validation_depth: Literal["evidence", "full"] = "full",
 ) -> InputSourceDiscovery:
     """
     Discover canonical input-generated batches through metadata only.
@@ -1300,14 +1126,18 @@ def discover_input_batches(
     if max_sources is not None and (isinstance(max_sources, bool) or not isinstance(max_sources, int) or max_sources < 1):
         message = "max_sources must be a positive integer when supplied."
         raise ValueError(message)
+    tasks = profiles.available_profiles() if task is None else (profiles.resolve_profile(task).id,)
+    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+    canonical = (path for task_name in tasks for path in common.paths.generation_design_directories(task_name, storage_root=storage))
     candidates = tuple(
         path
-        for path in sorted(
-            common.paths.get_generation_meta_root(
-                storage_root=storage_root,
-            ).glob("*/input_generations/*")
-        )
-        if path.is_dir() and (path / "input_generation_manifest.json").is_file()
+        for path in sorted(set(canonical))
+        if path.is_dir()
+        and not path.is_symlink()
+        and path.resolve(strict=False).is_relative_to(storage)
+        and all(not parent.is_symlink() for parent in path.parents if parent.is_relative_to(storage))
+        and (path / "input_generation_manifest.json").is_file()
+        and not (path / "input_generation_manifest.json").is_symlink()
     )
     sources: list[InputSource] = []
     issues: list[InputDiscoveryIssue] = []
@@ -1318,6 +1148,7 @@ def discover_input_batches(
             source = admit_input_batch_source(
                 directory,
                 maximum_cases=max_cases_per_source,
+                validation_depth=validation_depth,
             )
         except (
             OSError,
@@ -1334,7 +1165,8 @@ def discover_input_batches(
                 )
             )
         else:
-            sources.append(source)
+            if task is None or source.profile_id == task:
+                sources.append(source)
     return InputSourceDiscovery(tuple(sources), tuple(issues))
 
 
@@ -1353,105 +1185,5 @@ def admit_input_case_reference(
         label=label,
         batch_storage_name=reference.batch_storage_name,
         campaign_purpose=reference.campaign_purpose,
-        input_directory=reference.input_directory,
         parameter_metadata=reference.parameter_metadata,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class CaseBundleEquivalence:
-    """Summarize exact identity and byte equality for two generated bundles."""
-
-    case_id: str
-    case_index: int
-    case_input_id: str
-    simulation_case_id: str
-    git_commit: str
-    seed_evidence_sha256: str
-    input_files: tuple[tuple[str, int, str], ...]
-
-
-def assert_case_bundle_equivalent(
-    first_directory: Path | str,
-    second_directory: Path | str,
-    *,
-    first_input_directory: Path | str | None = None,
-    second_input_directory: Path | str | None = None,
-) -> CaseBundleEquivalence:
-    """
-    Require two independently generated case bundles to be exactly equivalent.
-
-    Equality requires byte-identical ``case.json`` and declared adapter files,
-    including matching Git, resolved science, batch, case, seed, template, input,
-    and simulation identities. Extra runtime workspace files are ignored.
-
-    Parameters
-    ----------
-    first_directory, second_directory : Path | str
-        Directories containing the two authoritative ``case.json`` files.
-    first_input_directory, second_input_directory : Path | str | None, optional
-        Alternate adapter roots, such as retained completed-raw inputs.
-
-    Returns
-    -------
-    CaseBundleEquivalence
-        Shared exact identity and adapter hash evidence.
-
-    Raises
-    ------
-    ValueError
-        If either bundle is invalid or any source, payload, hash, or byte differs.
-
-    """
-    case_directories = tuple(Path(directory).expanduser().resolve() for directory in (first_directory, second_directory))
-    input_directories = (
-        _resolve_adapter_directory(case_directories[0], first_input_directory),
-        _resolve_adapter_directory(case_directories[1], second_input_directory),
-    )
-    payloads = tuple(json.loads((directory / "case.json").read_text(encoding="utf-8")) for directory in case_directories)
-    for payload, case_directory, input_directory in zip(
-        payloads,
-        case_directories,
-        input_directories,
-        strict=True,
-    ):
-        if not isinstance(payload, dict):
-            message = "Case-equivalence payloads must be JSON objects."
-            raise TypeError(message)
-        case_service.validate_case_payload_schema(payload)
-        admit_input_case(
-            case_directory,
-            source_id="equivalence-check",
-            source_kind="input_generated",
-            label="equivalence check",
-            input_directory=input_directory,
-        )
-    if payloads[0] != payloads[1]:
-        differing = sorted(key for key in set(payloads[0]) | set(payloads[1]) if payloads[0].get(key) != payloads[1].get(key))
-        message = f"Generated case bundles are not equivalent; differing case.json fields: {differing}."
-        raise ValueError(message)
-    payload = payloads[0]
-    filenames = ("case.json", *sorted(payload["input_files"]))
-    for filename in filenames:
-        first_path = case_directories[0] / filename if filename == "case.json" else input_directories[0] / filename
-        second_path = case_directories[1] / filename if filename == "case.json" else input_directories[1] / filename
-        if first_path.read_bytes() != second_path.read_bytes():
-            message = f"Generated case bundles differ in persisted bytes: {filename}."
-            raise ValueError(message)
-    input_files = tuple(
-        (
-            filename,
-            int(payload["input_files"][filename]["size_bytes"]),
-            str(payload["input_files"][filename]["sha256"]),
-        )
-        for filename in sorted(payload["input_files"])
-    )
-    return CaseBundleEquivalence(
-        case_id=str(payload["case_id"]),
-        case_index=int(payload["case_index"]),
-        case_input_id=str(payload["case_input_id"]),
-        simulation_case_id=str(payload["simulation_case_id"]),
-        git_commit=str(payload["git_commit"]),
-        seed_evidence_sha256=common.serialization.canonical_json_sha256(payload["seed_evidence"]),
-        input_files=input_files,
     )

@@ -2,7 +2,7 @@
 Completed-epoch training, optimization, and persistence services.
 
 Provides:
-- adapter: task-owned batch adaptation and matched-compute protocol contracts
+- adapter: task-owned training-step, evaluation-view and optimizer-work contracts
 - checkpoint: atomic checkpoint and continuation-state persistence
 - events: phase-aware progress and metric event contracts
 - loop: training and evaluation epoch execution

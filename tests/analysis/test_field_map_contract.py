@@ -1,4 +1,15 @@
-# ruff: noqa: D100, D103, PLR2004, S101
+"""Protect physical field-map coordinates, bounds, and colorbar contracts.
+
+Responsibilities:
+  - Check discrete boundaries, signed and categorical scales, overflow, and definition isolation
+
+Design principles:
+  - Rendering preserves input values and exact locked color boundaries
+
+This module does NOT:
+  - Quantize scientific data or validate model predictions
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -50,7 +61,6 @@ def test_categorical_definition_uses_actual_categories_without_expansion() -> No
     assert definition.color_count == 2
     assert definition.category_labels == ("bed", "air")
     assert definition.contourf_kwargs()["levels"] is definition.boundaries
-    assert np.array_equal(definition.encode_categories(source), np.asarray((0, 1, 0)))
     assert np.array_equal(source, np.asarray(("bed", "air", "bed"), dtype=object))
 
 
@@ -89,8 +99,7 @@ def test_locked_definition_reports_overflow_without_adding_visible_colors() -> N
     assert locked.normalizer.clip is False
 
 
-def test_identical_cache_reuse_is_bounded_without_sharing_mutable_renderers() -> None:
-    field_maps.clear_field_map_cache()
+def test_repeated_builds_return_isolated_definitions_without_sharing_mutable_renderers() -> None:
     first = field_maps.build_field_map((0.0, 1.0), semantic="linear_positive", field="phi", unit="1", comparison_scope="case-a")
     first.normalizer.clip = False
     first.colormap.colorbar_extend = True
@@ -104,9 +113,6 @@ def test_identical_cache_reuse_is_bounded_without_sharing_mutable_renderers() ->
     assert np.array_equal(first.boundaries, second.boundaries)
     with pytest.raises(ValueError, match="WRITEABLE"):
         second.boundaries.setflags(write=True)
-    cache_info = field_maps.field_map_cache_info()
-    assert cache_info.hits == 1
-    assert cache_info.currsize <= 128
     assert different_scope.comparison_scope == "case-b"
 
 

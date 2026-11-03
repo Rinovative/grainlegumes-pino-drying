@@ -1,18 +1,15 @@
-"""
-analysis_field_maps.py
-
-Define one exact discrete color-scale contract for scientific field maps.
+"""Define one exact discrete color-scale contract for scientific field maps.
 
 Responsibilities:
   - Build truthful continuous, categorical, and constant field-map definitions
   - Preserve exact comparison boundaries and semantic colormap selection
   - Supply Matplotlib-ready normalization and rendering keyword arguments
-  - Reuse identical in-process definitions through a bounded cache
 
 Design principles:
   - Eleven visible colors require twelve strictly increasing continuous boundaries
   - Scientific values remain continuous and caller-owned arrays are never modified
   - Locked comparison scales preserve every boundary rather than only extrema
+  - Every returned definition owns a fresh colormap and normalizer and read-only boundary arrays
 
 This module does NOT:
   - Render figures, select subplot layouts, or load scientific datasets
@@ -23,8 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import numpy as np
 from matplotlib import colormaps
@@ -37,10 +33,9 @@ if TYPE_CHECKING:
 
 N_COLOR_BINS: Final = 11
 _CONTINUOUS_BOUNDARY_COUNT = N_COLOR_BINS + 1
-_CACHE_SIZE = 128
 
 
-class FieldMapSemantic(str, Enum):
+class FieldMapSemantic(str, Enum):  # noqa: UP042 -- string-enum str/repr behavior is an established presentation contract
     """Describe the scientific quantity semantics for a displayed field."""
 
     LINEAR_POSITIVE = "linear_positive"
@@ -55,22 +50,6 @@ class FieldMapSemantic(str, Enum):
 
 FieldMapKind = FieldMapSemantic
 FieldMapExtend = Literal["neither", "min", "max", "both"]
-
-
-@dataclass(frozen=True, slots=True)
-class _ContinuousFieldMapState:
-    """Hold cache-safe immutable state for one continuous visual scale."""
-
-    semantic: FieldMapSemantic
-    field: str
-    unit: str
-    display_transform: str
-    comparison_scope: str | None
-    bound_policy: str
-    extend: FieldMapExtend
-    locked: bool
-    boundaries: tuple[float, ...]
-    colormap_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,19 +101,6 @@ class FieldMapDefinition:
         """Return keyword arguments ready for an ``Axes.imshow`` call."""
         return self._image_kwargs()
 
-    def encode_categories(self, values: Sequence[object] | np.ndarray) -> np.ndarray:
-        """Return display codes for declared categories without mutating input."""
-        if self.semantic is not FieldMapSemantic.CATEGORICAL:
-            msg = "Category encoding is available only for categorical field maps."
-            raise ValueError(msg)
-        indices = {label: index for index, label in enumerate(self.category_labels)}
-        array = np.asarray(values, dtype=object)
-        try:
-            return cast("np.ndarray", np.vectorize(lambda value: indices[str(value)], otypes=[np.int64])(array))
-        except KeyError as error:
-            msg = f"Categorical values include undeclared category {error.args[0]!r}."
-            raise ValueError(msg) from error
-
     def _image_kwargs(self) -> dict[str, Any]:
         """Return common scalar-mappable arguments without caller data."""
         return {"cmap": self.colormap, "norm": self.normalizer}
@@ -178,26 +144,7 @@ def build_field_map(
     boundaries, locked = _boundaries(numeric, resolved, locked_boundaries)
     boundaries = _validate_continuous_boundaries(boundaries)
     extend = _locked_extend(numeric, boundaries) if locked else "neither"
-    state = _cached_continuous_state(
-        resolved.value,
-        *metadata,
-        locked,
-        extend,
-        tuple(float(value) for value in boundaries),
-        _colormap_name(resolved, field, colormap_name),
-    )
-    return _continuous_definition(state)
-
-
-def field_map_cache_info() -> Any:
-    """Return bounded in-process cache diagnostics for continuous scale state."""
-    return _cached_continuous_state.cache_info()
-
-
-def clear_field_map_cache() -> None:
-    """Clear bounded in-process field-map and semantic-colormap reuse state."""
-    _cached_continuous_state.cache_clear()
-    _semantic_colormap.cache_clear()
+    return _continuous(resolved, metadata, locked, extend, boundaries, _colormap_name(resolved, field, colormap_name))
 
 
 def _semantic(value: FieldMapSemantic | str) -> FieldMapSemantic:
@@ -215,7 +162,7 @@ def _semantic(value: FieldMapSemantic | str) -> FieldMapSemantic:
 
 
 def _metadata(field: str, unit: str, transform: str, scope: str | None, policy: str) -> tuple[str, str, str, str | None, str]:
-    """Validate exact cache-relevant presentation metadata."""
+    """Validate exact presentation metadata."""
     for label, value in (("field", field), ("unit", unit), ("display_transform", transform), ("bound_policy", policy)):
         if not isinstance(value, str):
             msg = f"{label} must be text."
@@ -361,22 +308,20 @@ def _categorical(
     )
 
 
-@lru_cache(maxsize=_CACHE_SIZE)
-def _cached_continuous_state(
-    semantic_value: str,
-    field: str,
-    unit: str,
-    transform: str,
-    scope: str | None,
-    policy: str,
+def _continuous(
+    semantic: FieldMapSemantic,
+    metadata: tuple[str, str, str, str | None, str],
     locked: bool,
     extend: FieldMapExtend,
-    values: tuple[float, ...],
+    values: np.ndarray,
     cmap_name: str,
-) -> _ContinuousFieldMapState:
-    """Construct and retain only immutable exact continuous visual state."""
-    return _ContinuousFieldMapState(
-        FieldMapSemantic(semantic_value),
+) -> FieldMapDefinition:
+    """Build continuous rendering state with read-only boundaries and fresh Matplotlib objects."""
+    field, unit, transform, scope, policy = metadata
+    boundaries = _readonly(values)
+    cmap = _new_semantic_colormap(cmap_name, N_COLOR_BINS)
+    return FieldMapDefinition(
+        semantic,
         field,
         unit,
         transform,
@@ -384,39 +329,15 @@ def _cached_continuous_state(
         policy,
         extend,
         locked,
-        values,
-        cmap_name,
-    )
-
-
-def _continuous_definition(state: _ContinuousFieldMapState) -> FieldMapDefinition:
-    """Create isolated mutable Matplotlib objects from cached immutable state."""
-    boundaries = _readonly(state.boundaries)
-    cmap = _new_semantic_colormap(state.colormap_name, N_COLOR_BINS)
-    return FieldMapDefinition(
-        state.semantic,
-        state.field,
-        state.unit,
-        state.display_transform,
-        state.comparison_scope,
-        state.bound_policy,
-        state.extend,
-        state.locked,
         boundaries,
         cmap,
-        BoundaryNorm(boundaries, cmap.N, clip=state.extend == "neither"),
+        BoundaryNorm(boundaries, cmap.N, clip=extend == "neither"),
         _readonly(boundaries),
     )
 
 
 def _new_semantic_colormap(name: str, count: int) -> Colormap:
-    """Return one caller-isolated copy of cached semantic colormap state."""
-    return _semantic_colormap(name, count).copy()
-
-
-@lru_cache(maxsize=32)
-def _semantic_colormap(name: str, count: int) -> Colormap:
-    """Return one private resampled template for an exact visible color count."""
+    """Return one freshly resampled colormap for an exact visible color count."""
     if count < 1:
         msg = "Semantic colormaps require at least one visible color."
         raise ValueError(msg)

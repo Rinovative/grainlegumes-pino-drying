@@ -2,6 +2,7 @@
 Scientific tables and figures for generation-input exploratory analysis.
 
 Provides:
+- atlas: one admitted case with independently selected domain fields
 - boundaries: boundary tables and exact transient schedule comparisons
 - layout: canonical map, normalization, and colorbar geometry
 - moisture: transient moisture, sorption, and inlet-bed diagnostics
@@ -16,6 +17,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from . import generation_input_plot_atlas as atlas
     from . import generation_input_plot_boundaries as boundaries
     from . import generation_input_plot_layout as layout
     from . import generation_input_plot_moisture as moisture
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from . import generation_input_plot_spatial as spatial
 
 _MODULES = {
+    "atlas": "generation_input_plot_atlas",
     "boundaries": "generation_input_plot_boundaries",
     "layout": "generation_input_plot_layout",
     "moisture": "generation_input_plot_moisture",
@@ -32,6 +35,7 @@ _MODULES = {
     "spatial": "generation_input_plot_spatial",
 }
 __all__ = [
+    "atlas",
     "boundaries",
     "layout",
     "moisture",

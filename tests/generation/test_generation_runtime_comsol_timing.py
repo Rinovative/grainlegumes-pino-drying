@@ -1,5 +1,14 @@
-# ruff: noqa: S101, D103, FLY002, PLR2004
-"""Verify structural COMSOL scientific solver timing ownership."""
+"""Verify structural COMSOL scientific solver timing ownership.
+
+Responsibilities:
+  - Check structurally owned solver phase timing, ambiguity, missing logs, and duplicate stdout
+
+Design principles:
+  - Only confirmed top-level phase evidence contributes to available totals
+
+This module does NOT:
+  - Infer solver timing from arbitrary stationary text or time training
+"""
 
 from pathlib import Path
 
@@ -43,7 +52,7 @@ def _complete_transient_log() -> str:
         "-----      Current Progress:  52 % - Evaluating",
         "Solution time: 523 s. (8 minutes, 43 seconds)",
     )
-    return "\n".join((compile_stationary, stationary, compile_transient, transient))
+    return f"{compile_stationary}\n{stationary}\n{compile_transient}\n{transient}"
 
 
 def test_transient_parser_selects_only_structurally_owned_top_level_timings() -> None:

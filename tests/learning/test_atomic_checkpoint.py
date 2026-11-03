@@ -1,22 +1,26 @@
-# ruff: noqa: S101, EM101, TC003, TRY003
-"""
-Protect atomic checkpoint publication when serialization fails mid-write.
+"""Protect atomic checkpoint publication when serialization fails mid-write.
 
-Injected writer failures prove an existing destination remains byte-identical and
-a first publication leaves neither final nor temporary files. Checkpoint schema,
-roles, and resume-state equivalence are covered by ``test_checkpoint_resume``.
-this module isolates only the filesystem transaction.
+Responsibilities:
+  - Check preservation of existing bytes and absence of partial files after save failures
+
+Design principles:
+  - Injected serialization failure isolates the filesystem transaction
+
+This module does NOT:
+  - Validate checkpoint schema or restore training state
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
 
 from src import common
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_failed_atomic_save_preserves_published_checkpoint(
@@ -37,7 +41,8 @@ def test_failed_atomic_save_preserves_published_checkpoint(
         del payload
         stream.write(b"partial-corrupt-data")
         stream.flush()
-        raise OSError("injected serialization failure")
+        msg = "injected serialization failure"
+        raise OSError(msg)
 
     monkeypatch.setattr(torch, "save", fail_after_partial)
     with pytest.raises(OSError, match="injected serialization failure"):
@@ -61,7 +66,8 @@ def test_failed_first_publication_leaves_no_final_or_temp_file(
 
     def fail_writer(temp_path: Path) -> None:
         temp_path.write_text("partial", encoding="utf-8")
-        raise RuntimeError("stop")
+        msg = "stop"
+        raise RuntimeError(msg)
 
     with pytest.raises(RuntimeError, match="stop"):
         common.serialization.atomic_path_write(destination, fail_writer)

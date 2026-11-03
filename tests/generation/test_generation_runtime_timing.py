@@ -1,11 +1,20 @@
-# ruff: noqa: S101, D103, EM101, FLY002, PLR2004, TRY003, TC003
-"""Verify terminal timing evidence loading without runtime-text parsing."""
+"""Verify terminal timing evidence loading without runtime-text parsing.
+
+Responsibilities:
+  - Check terminal timing admission, source ownership, component sums, and record counts
+  - Check the validated stall-progress record and its explicit availability states
+
+Design principles:
+  - Physical time and runtime evidence remain distinct; legacy missing components stay unavailable
+
+This module does NOT:
+  - Parse runtime log text or invent missing timing measurements
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -15,6 +24,8 @@ from src.generation.runtime import generation_runtime_comsol_timing as comsol_ti
 from src.generation.runtime import generation_runtime_timing as timing
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from src.generation.runtime.generation_runtime_batch import (
         TerminalBatchEvidence,
         TerminalCaseEvidence,
@@ -52,12 +63,16 @@ class _Batch:
 
     def case(self, case_id: str) -> _Case:
         if case_id != self._case.case_id:
-            raise ValueError("unknown test case")
+            msg = "unknown test case"
+            raise ValueError(msg)
         return self._case
 
     @staticmethod
     def scientific_config_payload() -> dict[str, Any]:
         return {"scientific_fixed_values": {"f_wet_dm_max": 0.05}}
+
+
+_NOT_PERSISTED = object()
 
 
 def _write_sidecars(
@@ -66,6 +81,7 @@ def _write_sidecars(
     include_solver_timing: bool = True,
     batch_id: str = "batch-1",
     git_commit: str = "a" * 40,
+    stall_progress: Any = _NOT_PERSISTED,
 ) -> None:
     timing_payload = {
         "schema_kind": "simulation_case_timing",
@@ -84,17 +100,17 @@ def _write_sidecars(
         "complete_execution_s": 16.0,
         "license_wait_seconds": 2.0,
     }
+    if stall_progress is not _NOT_PERSISTED:
+        timing_payload["stall_progress"] = stall_progress
     if include_solver_timing:
         solver_timing = comsol_timing.parse_comsol_batch_log_text(
-            "\n".join(
-                (
-                    "<---- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) -",
-                    "Solution time: 3 s.",
-                    "----- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) >",
-                    "<---- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) -",
-                    "Solution time: 4 s.",
-                    "----- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) >",
-                )
+            (
+                "<---- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) -\n"
+                "Solution time: 3 s.\n"
+                "----- Stationary Solver 1 in Stationary Airflow/Stationary Airflow Solution (sol1) >\n"
+                "<---- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) -\n"
+                "Solution time: 4 s.\n"
+                "----- Time-Dependent Solver 1 in Transient Drying/Transient Drying Solution (sol2) >"
             ),
             simulation_profile="transient_drying",
         )
@@ -113,8 +129,10 @@ def _write_sidecars(
         "case_state": "successful",
         "stages": {"solver": "succeeded", "exports": "succeeded", "conversion": "succeeded", "publication": "succeeded"},
     }
-    (directory / "timing.json").write_text(json.dumps(timing_payload), encoding="utf-8")
-    (directory / "status.json").write_text(json.dumps(status_payload), encoding="utf-8")
+    evidence = directory / "evidence"
+    evidence.mkdir(exist_ok=True)
+    (evidence / "timing.json").write_text(json.dumps(timing_payload), encoding="utf-8")
+    (evidence / "status.json").write_text(json.dumps(status_payload), encoding="utf-8")
 
 
 def test_load_case_timing_separates_physical_and_runtime_evidence(tmp_path: Path) -> None:
@@ -124,7 +142,7 @@ def test_load_case_timing_separates_physical_and_runtime_evidence(tmp_path: Path
         cast("TerminalCaseEvidence", case),
         batch=cast("TerminalBatchEvidence", _Batch(case)),
     )
-    assert case.requests == [("processed", "timing.json"), ("processed", "status.json")]
+    assert case.requests == [("processed", "evidence/timing.json"), ("processed", "evidence/status.json")]
     assert (result.physical_duration_hours, result.time_to_target_hours, result.target_reached, result.right_censored) == (96.0, None, False, True)
     assert (result.final_wet_fraction, result.target_wet_fraction_limit) == (0.07, 0.05)
     assert (result.comsol_process_seconds, result.export_conversion_seconds, result.complete_execution_seconds) == (12.0, 3.0, 16.0)
@@ -158,7 +176,7 @@ def test_load_case_timing_admits_replacement_with_its_actual_source_batch(tmp_pa
 
 def test_load_case_timing_rejects_target_status_inconsistent_with_admitted_limit(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / "status.json"
+    source = tmp_path / "evidence" / "status.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["target_reached"] = True
     source.write_text(json.dumps(payload), encoding="utf-8")
@@ -172,7 +190,7 @@ def test_load_case_timing_rejects_target_status_inconsistent_with_admitted_limit
 
 def test_load_case_timing_rejects_status_runtime_inconsistent_with_timing(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / "status.json"
+    source = tmp_path / "evidence" / "status.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["runtime_s"] = 13.0
     source.write_text(json.dumps(payload), encoding="utf-8")
@@ -186,7 +204,7 @@ def test_load_case_timing_rejects_status_runtime_inconsistent_with_timing(tmp_pa
 
 def test_load_case_timing_rejects_timing_owned_by_a_different_source_batch(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / "timing.json"
+    source = tmp_path / "evidence" / "timing.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["batch_id"] = "replacement-batch"
     source.write_text(json.dumps(payload), encoding="utf-8")
@@ -205,7 +223,7 @@ def test_load_case_timing_rejects_timing_owned_by_a_different_source_batch(tmp_p
 )
 def test_load_case_timing_rejects_identity_schema_and_nonfinite_evidence(tmp_path: Path, path: str, field: str, value: Any) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / path
+    source = tmp_path / "evidence" / path
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload[field] = value
     source.write_text(json.dumps(payload), encoding="utf-8")
@@ -233,9 +251,60 @@ def test_load_case_timing_keeps_legacy_solver_components_explicitly_unavailable(
     assert result.as_dict()["component_timing_availability"]["scientific_solver_seconds"] == "unavailable_not_persisted"
 
 
+@pytest.mark.parametrize(
+    ("stall_progress", "expected", "availability"),
+    [
+        ({"minimum_simulated_seconds": 3600.0, "reached_after_seconds": 412.5}, (3600.0, 412.5), "available"),
+        ({"minimum_simulated_seconds": 3600.0, "reached_after_seconds": None}, (3600.0, None), "unavailable_missing"),
+        (None, (None, None), "unavailable_not_applicable"),
+        (_NOT_PERSISTED, (None, None), "unavailable_not_persisted"),
+    ],
+)
+def test_load_case_timing_exposes_the_stall_progress_with_explicit_availability(
+    tmp_path: Path, stall_progress: Any, expected: tuple[float | None, float | None], availability: str
+) -> None:
+    _write_sidecars(tmp_path, stall_progress=stall_progress)
+    case = _Case(tmp_path)
+
+    result = timing.load_case_timing(
+        cast("TerminalCaseEvidence", case),
+        batch=cast("TerminalBatchEvidence", _Batch(case)),
+    )
+
+    assert (result.stall_minimum_simulated_seconds, result.stall_minimum_reached_after_seconds) == expected
+    payload = result.as_dict()
+    assert (payload["stall_minimum_simulated_seconds"], payload["stall_minimum_reached_after_seconds"]) == expected
+    assert payload["component_timing_availability"]["stall_progress"] == availability
+
+
+@pytest.mark.parametrize(
+    "stall_progress",
+    [
+        "3600",
+        {"minimum_simulated_seconds": 3600.0},
+        {"minimum_simulated_seconds": 3600.0, "reached_after_seconds": 5.0, "extra": 1},
+        {"minimum_simulated_seconds": 0.0, "reached_after_seconds": None},
+        {"minimum_simulated_seconds": float("nan"), "reached_after_seconds": None},
+        {"minimum_simulated_seconds": True, "reached_after_seconds": None},
+        {"minimum_simulated_seconds": 3600.0, "reached_after_seconds": -1.0},
+        {"minimum_simulated_seconds": 3600.0, "reached_after_seconds": float("inf")},
+        {"minimum_simulated_seconds": 3600.0, "reached_after_seconds": "soon"},
+    ],
+)
+def test_load_case_timing_rejects_malformed_stall_progress(tmp_path: Path, stall_progress: Any) -> None:
+    _write_sidecars(tmp_path, stall_progress=stall_progress)
+    case = _Case(tmp_path)
+
+    with pytest.raises((TypeError, ValueError), match="stall_progress"):
+        timing.load_case_timing(
+            cast("TerminalCaseEvidence", case),
+            batch=cast("TerminalBatchEvidence", _Batch(case)),
+        )
+
+
 def test_load_case_timing_rejects_solver_sum_inconsistent_with_structural_evidence(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / "timing.json"
+    source = tmp_path / "evidence" / "timing.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["comsol_scientific_solver_seconds"] = 8.0
     source.write_text(json.dumps(payload), encoding="utf-8")
@@ -250,7 +319,7 @@ def test_load_case_timing_rejects_solver_sum_inconsistent_with_structural_eviden
 
 def test_load_case_timing_rejects_total_record_count_smaller_than_phase_evidence(tmp_path: Path) -> None:
     _write_sidecars(tmp_path)
-    source = tmp_path / "timing.json"
+    source = tmp_path / "evidence" / "timing.json"
     payload = json.loads(source.read_text(encoding="utf-8"))
     payload["comsol_solver_timing"]["solution_time_record_count"] = 1
     source.write_text(json.dumps(payload), encoding="utf-8")

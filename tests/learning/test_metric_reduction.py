@@ -1,10 +1,14 @@
-# ruff: noqa: S101
-"""
-Protect global physical-group RMSE reduction and raw train-scale semantics.
+"""Protect global physical-group RMSE reduction and raw train-scale semantics.
 
-Two behavioral tests cover equal group weighting, component observability,
-batch-partition invariance, task-owned groups, and contextual invalid-state
-failures. Tensor-space routing remains covered by ``test_metric_spaces``.
+Responsibilities:
+  - Check global physical-group RMSE, equal group weighting, partition invariance, and invalid
+    scales
+
+Design principles:
+  - Task-owned groups use global sufficient statistics and raw train scales
+
+This module does NOT:
+  - Route normalized/physical tensors or assess fitted-normalizer quality
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import pytest
 import torch
 from support import configs
 
-from src import domain, experiments, learning
+from src import domain, learning
 
 _TASK = domain.tasks.registry.get_task("steady_flow")
 _OBJECTIVE_METRIC = next(metric for metric in _TASK.default_metrics if metric.kind == "group_macro_rmse")
@@ -27,7 +31,7 @@ _VECTOR_IDS = (_NORMALIZED_VECTOR_METRIC.id, _PHYSICAL_VECTOR_METRIC.id)
 
 def _metric_config(*metric_ids: str) -> dict[str, Any]:
     """Return a resolved config containing only requested public metrics."""
-    config = experiments.config.loader.resolve_config(configs.direct_config())
+    config = configs.resolve(configs.direct_config())
     requested = set(metric_ids)
     config["evaluation"]["metrics"] = [metric for metric in config["evaluation"]["metrics"] if metric["id"] in requested]
     return config
@@ -58,7 +62,7 @@ def _evaluate_physical_partitions(
             )
         start = stop
     assert start == pred.shape[0]
-    return learning.metrics.metrics.finalize_metrics(metrics)
+    return {metric_id: metric.compute() for metric_id, metric in metrics.items()}
 
 
 def test_group_objective_uses_equal_physical_groups_and_global_statistics() -> None:

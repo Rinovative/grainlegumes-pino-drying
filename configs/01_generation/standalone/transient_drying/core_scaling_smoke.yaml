@@ -1,0 +1,32 @@
+# Role: Smoke profile of the core-scaling benchmark: one sweep node job, six candidate cases, three successes each for k = 8 then 16 (about 45 min). Edit: rarely.
+# Proves the node-mode path end to end (batch licence via -usebatchlic, node worker, success target with replacement, evidence, report) before the full benchmark.
+schema_kind: generation_core_scaling_benchmark_suite
+schema_version: 3
+suite_name: transient_core_scaling_smoke
+benchmark_mode: core_selection
+# Six candidates of the production campaign batch; case 2 is known to stall, so replacement is exercised.
+case_pool:
+  campaign_config: configs/01_generation/standalone/transient_drying/lentil_chickpea_kidney_bean.yaml
+  material_family: lentil
+  sampling_regime: natural
+  first_case_index: 1
+  case_count: 6
+target_successful_cases: 3
+# One sweep in one node-job slot; the production core count runs first.
+sweeps:
+- {sweep_id: sweep_1, order: ascending}
+# A smoke is not repeated automatically: an interrupted variant fails the smoke for inspection.
+retry:
+  maximum_variant_attempts: 1
+resources:
+  partition: null  # null uses the production partition from execution.yaml
+  sweep_wall_time: "03:00:00"
+  scheduler_options: []
+production_interpretation:
+  campaign_config: configs/01_generation/standalone/transient_drying/lentil_chickpea_kidney_bean.yaml
+  cores_config: configs/01_generation/execution.yaml
+  cores_key: cluster.cores_per_case
+# The production core count (8) plus one larger count, so a variant boundary is exercised.
+variants:
+- {variant_id: cores_08, cores_per_case: 8}
+- {variant_id: cores_16, cores_per_case: 16}

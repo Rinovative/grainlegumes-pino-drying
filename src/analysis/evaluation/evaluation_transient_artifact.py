@@ -1,9 +1,21 @@
-"""
-Persist and admit sequence-aware transient-drying Evaluation artifacts.
+"""Persist and admit sequence-aware transient-drying Evaluation artifacts.
 
-This module owns the variable-length sequence payload and its strict identity.
-It does not reconstruct models, select Dataset membership, calculate metrics,
-or publish an artifact target into a completed run.
+Responsibilities:
+  - Validate variable-length sequence records and exact scientific identities
+  - Stage deduplicated complete-case payloads with explicit resumable work evidence
+  - Bind completed manifests to payload digests and support lazy case loading
+  - Publish validated operational telemetry outside scientific artifact identity
+
+Design principles:
+  - Case bundles retain each distinct prediction chain once per origin, without its first state, and explicit horizon prefixes
+  - Chain storage is verified before publication to rebuild every record bit for bit; the loader takes first states from the reference
+  - Increments and invalid masks are rederived from persisted states on load (loaded increments are state differences, not decoded model increments)
+  - Prediction IEEE values and validity evidence are preserved without numerical repair
+  - Payload paths, manifest inventories and persisted identity fail closed
+
+This module does NOT:
+  - Reconstruct models, select Dataset membership or calculate scientific metrics
+  - Publish a staged artifact target into a completed run
 """
 
 from __future__ import annotations
@@ -24,12 +36,13 @@ import pandas as pd
 from src import common
 from src.analysis.artifacts import analysis_artifact_performance as artifact_performance
 from src.analysis.artifacts import contracts
+from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
-TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "transient_drying_evaluation_sequence"
-TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 4
+TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "evaluation_transient_sequence"
+TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 5
 TRANSIENT_ARTIFACT_KIND: Final = "transient_sequence"
 _STEP_CONTRACT: Final = transient_contract.TRANSIENT_STEP_CONTRACT
 STATE_ORDER: Final = tuple(field.name for field in _STEP_CONTRACT.dynamic_state)
@@ -43,11 +56,12 @@ _MINIMUM_TRAJECTORY_STATES: Final = 2
 _SPATIAL_AXIS_COUNT: Final = 2
 _SPATIAL_STATE_RANK: Final = 4
 _SHA256_HEX_LENGTH: Final = 64
+_CHAIN_FIELDS: Final = ("predicted_states", "prediction_available")
 _RESUME_DESCRIPTOR_NAME: Final = ".transient-resume.json"
 _CASE_MANIFEST_DIRECTORY_NAME: Final = ".transient-cases"
 
 EvaluationMode = Literal["teacher_forced_one_step", "autonomous_full", "rolling_origin"]
-DatasetRole = Literal["id", "ood"]
+DatasetRole = Literal["id", "additional_evaluation"]
 RequestedHorizon = int | Literal["full"]
 EVALUATION_MODES: Final[tuple[EvaluationMode, ...]] = (
     "teacher_forced_one_step",
@@ -55,11 +69,15 @@ EVALUATION_MODES: Final[tuple[EvaluationMode, ...]] = (
     "rolling_origin",
 )
 ROLLING_ORIGIN_POLICY: Final = "early_middle_late_unique"
+# One-step records and rolling origins start the RNO from the hidden state built
+# over the case's reference prefix; the autonomous full rollout starts cold.
+RECURRENT_STATE_POLICY: Final = "teacher_forced_reference_prefix"
 
 _IDENTITY_KEYS: Final = {
     "case_id",
     "dataset_identity",
     "dataset_role",
+    "evaluation_assignment",
     "material_family",
     "simulation_identity",
     "model_kind",
@@ -153,6 +171,7 @@ def evaluation_protocol_identity(evaluation_config: Mapping[str, Any]) -> str:
             "modes": list(EVALUATION_MODES),
             "fixed_horizons": list(FIXED_HORIZONS),
             "rolling_origin_policy": ROLLING_ORIGIN_POLICY,
+            "recurrent_state_policy": RECURRENT_STATE_POLICY,
         }
     )
 
@@ -453,6 +472,27 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
     if identity["case_id"] != case_id or identity["dataset_role"] != dataset_role:
         message = "Sequence identity contradicts its case or Dataset role."
         raise TransientSequenceArtifactError(message)
+    dataset_identity = identity["dataset_identity"]
+    if not isinstance(dataset_identity, dict) or not dataset_identity:
+        message = "Sequence Dataset identity must be a non-empty mapping."
+        raise TransientSequenceArtifactError(message)
+    assignment = identity["evaluation_assignment"]
+    if dataset_role == "id":
+        if assignment is not None:
+            message = "ID-test sequence cannot claim an additional Evaluation assignment."
+            raise TransientSequenceArtifactError(message)
+    elif (
+        not isinstance(assignment, dict)
+        or set(assignment) != {"dataset_id", "role", "relation", "assumptions"}
+        or assignment.get("dataset_id") != dataset_identity.get("source_dataset_id")
+        or assignment.get("role") != "ood"
+        or not isinstance(assignment.get("relation"), str)
+        or not assignment["relation"].strip()
+        or not isinstance(assignment.get("assumptions"), list)
+        or any(not isinstance(item, str) or not item.strip() for item in assignment["assumptions"])
+    ):
+        message = "Additional Evaluation sequence lacks its exact Dataset-declared assignment."
+        raise TransientSequenceArtifactError(message)
     if identity["model_kind"] not in {"fno", "uno", "rno"}:
         message = "Sequence model kind must be exactly 'fno', 'uno', or 'rno'."
         raise TransientSequenceArtifactError(message)
@@ -641,8 +681,8 @@ class TransientSequenceRecord:
     reference_states: np.ndarray
     predicted_states: np.ndarray
     reference_increments: np.ndarray | None
-    predicted_increments: np.ndarray
-    scaled_model_outputs: np.ndarray
+    predicted_increments: np.ndarray  # decoded when freshly built; state differences when loaded from a bundle
+    scaled_model_outputs: np.ndarray | None  # None when loaded from a bundle
     prediction_available: np.ndarray
     prediction_nonfinite_mask: np.ndarray
     prediction_physical_invalid_mask: np.ndarray
@@ -684,8 +724,8 @@ class TransientSequenceRecord:
             message = f"Unsupported transient Evaluation mode {self.mode!r}."
             raise TransientSequenceArtifactError(message)
         case_id = _nonempty_text(self.case_id, label="case_id")
-        if self.dataset_role not in {"id", "ood"}:
-            message = "Dataset role must be 'id' or 'ood'."
+        if self.dataset_role not in {"id", "additional_evaluation"}:
+            message = "Dataset role must be 'id' or 'additional_evaluation'."
             raise TransientSequenceArtifactError(message)
         origin_index = _nonnegative_int(self.origin_index, label="origin_index")
         available = _nonnegative_int(self.available_horizon, label="available_horizon")
@@ -770,13 +810,13 @@ class TransientSequenceRecord:
             label="predicted_increments",
             ndim=4,
         )
-        scaled_outputs = _prediction_array(
-            self.scaled_model_outputs,
-            label="scaled_model_outputs",
-            ndim=4,
+        scaled_outputs = (
+            None if self.scaled_model_outputs is None else _prediction_array(self.scaled_model_outputs, label="scaled_model_outputs", ndim=4)
         )
         expected_prediction_shape = (available, len(STATE_ORDER), height, width)
-        if predicted_increments.shape != expected_prediction_shape or scaled_outputs.shape != expected_prediction_shape:
+        if predicted_increments.shape != expected_prediction_shape or (
+            scaled_outputs is not None and scaled_outputs.shape != expected_prediction_shape
+        ):
             message = "Prediction increments and raw scaled outputs must have [available,4,Y,X] shape."
             raise TransientSequenceArtifactError(message)
         prediction_available = _mask_array(
@@ -818,7 +858,8 @@ class TransientSequenceRecord:
             message = "Prediction physical-invalid mask contradicts reconstructed prediction values."
             raise TransientSequenceArtifactError(message)
         if not prediction_available.all() and any(
-            not bool(np.isnan(values[~prediction_available]).all()) for values in (scaled_outputs, predicted_increments, predicted[1:])
+            not bool(np.isnan(values[~prediction_available]).all())
+            for values in (predicted_increments, predicted[1:], *(() if scaled_outputs is None else (scaled_outputs,)))
         ):
             message = "Uncomputed prediction tails must contain only explicit NaN sentinels."
             raise TransientSequenceArtifactError(message)
@@ -836,16 +877,22 @@ class TransientSequenceRecord:
         if reference_increments is not None and not np.allclose(reference_increments, np.diff(reference, axis=0), rtol=0.0, atol=2.0e-5):
             message = "Reference increments contradict reference absolute states."
             raise TransientSequenceArtifactError(message)
-        prediction_validity = transient_validity.validate_prediction_validity(
-            self.prediction_validity,
-            scaled_model_outputs=scaled_outputs,
-            decoded_physical_increments=predicted_increments,
-            reconstructed_states=predicted[1:],
-            prediction_available=prediction_available,
-            physical_times=times,
-            mode=self.mode,
-            origin_index=origin_index,
-        )
+        validity_arguments: dict[str, Any] = {
+            "decoded_physical_increments": predicted_increments,
+            "reconstructed_states": predicted[1:],
+            "prediction_available": prediction_available,
+            "physical_times": times,
+            "mode": self.mode,
+            "origin_index": origin_index,
+        }
+        if scaled_outputs is not None:
+            prediction_validity = transient_validity.validate_prediction_validity(
+                self.prediction_validity, scaled_model_outputs=scaled_outputs, **validity_arguments
+            )
+        else:
+            # Loaded records: raw scaled stages are not persisted, so only state-derived evidence is recomputed.
+            validity_arguments.pop("decoded_physical_increments")
+            prediction_validity = transient_validity.validate_persisted_state_prediction_validity(self.prediction_validity, **validity_arguments)
 
         identity = _validate_identity(self.identity, case_id=case_id, dataset_role=self.dataset_role)
         _validate_spatial_representation_identity(
@@ -915,7 +962,7 @@ class UnavailableHorizon:
         requested = _nonnegative_int(self.requested_horizon, label="unavailable requested_horizon")
         available = _nonnegative_int(self.available_transitions, label="unavailable available_transitions")
         reason = _nonempty_text(self.reason, label="unavailable reason")
-        if self.dataset_role not in {"id", "ood"} or requested < 1 or available >= requested:
+        if self.dataset_role not in {"id", "additional_evaluation"} or requested < 1 or available >= requested:
             message = "Unavailable horizon evidence must identify a genuinely unsupported fixed horizon."
             raise TransientSequenceArtifactError(message)
         return {
@@ -957,7 +1004,7 @@ def _chain_id_from_coordinates(*, mode: str, origin_index: int) -> str:
 
 
 def _chain_id(record: TransientSequenceRecord) -> str:
-    """Return one case-local prediction-chain identity independent of fixed prefixes."""
+    """Return one case-local prediction-chain coordinate identity independent of fixed prefixes."""
     return _chain_id_from_coordinates(
         mode=record.mode,
         origin_index=record.origin_index,
@@ -969,9 +1016,10 @@ def _record_row(
     *,
     payload_path: str,
     payload_sha256: str,
+    chain_id: str,
     metric_statistics: Mapping[str, Mapping[str, object]] | None,
 ) -> dict[str, Any]:
-    """Build one bounded Parquet row that refers to a case-local numerical bundle."""
+    """Build one bounded Parquet row that refers to a case-local numerical bundle and its stored chain."""
     target = record.target
     return {
         "schema_kind": TRANSIENT_SEQUENCE_SCHEMA_KIND,
@@ -998,7 +1046,7 @@ def _record_row(
         "predicted_time_to_target": target["predicted_time_to_target"],
         "payload_path": payload_path,
         "payload_sha256": payload_sha256,
-        "chain_id": _chain_id(record),
+        "chain_id": chain_id,
         "metric_statistics_json": json.dumps(metric_statistics, ensure_ascii=True, allow_nan=False, separators=(",", ":"), sort_keys=True)
         if metric_statistics is not None
         else None,
@@ -1017,9 +1065,11 @@ def _record_row(
 
 
 def _case_payload_path(case_id: str) -> Path:
-    """Return a safe deterministic bundle path without using case text as a filename."""
-    digest = common.serialization.canonical_json_sha256({"case_id": case_id})
-    return Path("npz") / f"case-{digest}.npz"
+    """Return the bundle path named by one strict package case ID."""
+    try:
+        return Path("npz") / dataframe.case_payload_filename(case_id)
+    except ValueError as error:
+        raise TransientSequenceArtifactError(str(error)) from error
 
 
 def _validate_repository_evidence(
@@ -1048,7 +1098,7 @@ def _validate_repository_evidence(
 
 
 def _validate_parent_experiment_evidence(value: Any) -> dict[str, Any]:
-    """Admit exact grouped-parent evidence or explicit legacy parent absence."""
+    """Admit exact current parent Experiment evidence."""
     evidence = _json_copy(value, label="run parent_experiment")
     kind = evidence.get("kind")
     if kind == "grouped":
@@ -1057,7 +1107,6 @@ def _validate_parent_experiment_evidence(value: Any) -> dict[str, Any]:
             "parent_available",
             "parent_label",
             "parent_identity_sha256",
-            "run_revision",
             "source_repository",
             "child_source_repository",
         }
@@ -1072,31 +1121,34 @@ def _validate_parent_experiment_evidence(value: Any) -> dict[str, Any]:
         if not isinstance(digest, str) or len(digest) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in digest):
             message = "Grouped parent experiment identity digest is invalid."
             raise TransientSequenceArtifactError(message)
-        _nonnegative_int(
-            evidence["run_revision"],
-            label="parent experiment run_revision",
-        )
         evidence["source_repository"] = _validate_repository_evidence(
             evidence["source_repository"],
             label="parent source_repository",
             required=True,
         )
-    elif kind == "legacy":
-        required = {
-            "kind",
-            "parent_available",
-            "reason",
-            "child_source_repository",
-        }
-        if set(evidence) != required or evidence["parent_available"] is not False:
-            message = "Legacy parent experiment absence evidence is incomplete."
+    elif kind == "independent":
+        required = {"kind", "layout", "run_name", "semantic_config_sha256", "source_repository"}
+        if set(evidence) != required:
+            message = "Independent run identity evidence is incomplete."
             raise TransientSequenceArtifactError(message)
-        _nonempty_text(
-            evidence["reason"],
-            label="legacy parent absence reason",
+        layout = evidence["layout"]
+        common.paths.resolve_config_run_dir({"run": {"layout": layout}, "paths": {"output_root": "."}})
+        if layout["stage"] not in {"a0", "single"}:
+            message = "Independent identity requires a shared A0 or single run."
+            raise TransientSequenceArtifactError(message)
+        common.paths.validate_logical_name(evidence["run_name"], label="independent run name")
+        digest = evidence["semantic_config_sha256"]
+        if not isinstance(digest, str) or len(digest) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in digest):
+            message = "Independent semantic config identity is invalid."
+            raise TransientSequenceArtifactError(message)
+        evidence["source_repository"] = _validate_repository_evidence(
+            evidence["source_repository"],
+            label="independent source_repository",
+            required=False,
         )
+        return evidence
     else:
-        message = "Run parent experiment evidence must be grouped or legacy."
+        message = "Run parent Experiment evidence must be grouped or independent."
         raise TransientSequenceArtifactError(message)
     evidence["child_source_repository"] = _validate_repository_evidence(
         evidence["child_source_repository"],
@@ -1113,15 +1165,28 @@ def _prediction_arrays_equal(left: np.ndarray, right: np.ndarray) -> bool:
     return bool(np.array_equal(left, right))
 
 
-def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -> None:
-    """Write one deduplicated complete-case bundle and unique prediction chains."""
+def _chain_content_key(record: TransientSequenceRecord) -> bytes:
+    """Return the grouping key of one chain: its origin and the arrays stored for it (states after the origin, availability)."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(record.origin_index.to_bytes(8, "little"))
+    digest.update(record.predicted_states[1:])
+    digest.update(record.prediction_available)
+    return digest.digest()
+
+
+def _rebuild_chain_states(reference_states: np.ndarray, stored_states: np.ndarray) -> np.ndarray:
+    """Return a chain's states: the reference state at its origin followed by the stored predicted states."""
+    return np.concatenate((reference_states[:1], stored_states))
+
+
+def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -> dict[str, str]:
+    """Write one deduplicated complete-case bundle and return the stored chain id of each chain.
+
+    Bit-identical chains share one stored chain; no chain stores its first state.
+    """
     if not records:
         message = "Transient case bundle requires at least one record."
         raise ValueError(message)
-    reference_increment_flags = {record.reference_increments is not None for record in records}
-    if len(reference_increment_flags) != 1:
-        message = "Case records disagree on reference-increment availability."
-        raise TransientSequenceArtifactError(message)
     exemplar = records[0]
     trajectory_length = exemplar.trajectory_length
     shared_times = np.empty(trajectory_length, dtype=np.float64)
@@ -1190,14 +1255,7 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
             not _prediction_arrays_equal(left, right)
             for left, right in (
                 (record.predicted_states, current.predicted_states),
-                (record.predicted_increments, current.predicted_increments),
-                (record.scaled_model_outputs, current.scaled_model_outputs),
                 (record.prediction_available, current.prediction_available),
-                (record.prediction_nonfinite_mask, current.prediction_nonfinite_mask),
-                (
-                    record.prediction_physical_invalid_mask,
-                    current.prediction_physical_invalid_mask,
-                ),
             )
         ):
             message = "One transient prediction chain has contradictory duplicate evidence."
@@ -1213,17 +1271,24 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
             "boundary_conditioning": shared_boundary,
         }
     )
-    if reference_increment_flags == {True}:
-        payload["reference_increments"] = np.diff(shared_reference, axis=0)
+    stored_chain: dict[str, str] = {}
+    owners: dict[bytes, str] = {}
     for chain, record in chains.items():
-        prefix = f"chain_{chain}_"
-        payload[f"{prefix}predicted_states"] = record.predicted_states
-        payload[f"{prefix}predicted_increments"] = record.predicted_increments
-        payload[f"{prefix}scaled_model_outputs"] = record.scaled_model_outputs
-        payload[f"{prefix}prediction_available"] = record.prediction_available
-        payload[f"{prefix}prediction_nonfinite_mask"] = record.prediction_nonfinite_mask
-        payload[f"{prefix}prediction_physical_invalid_mask"] = record.prediction_physical_invalid_mask
+        stored_chain[chain] = owners.setdefault(_chain_content_key(record), chain)
+        if stored_chain[chain] == chain:
+            payload[f"chain_{chain}_predicted_states"] = record.predicted_states[1:]
+            payload[f"chain_{chain}_prediction_available"] = record.prediction_available
+    for record in records:
+        owner = f"chain_{stored_chain[_chain_id(record)]}_"
+        horizon = record.available_horizon
+        rebuilt = _rebuild_chain_states(shared_reference[record.origin_index :], payload[f"{owner}predicted_states"][:horizon])
+        if not np.array_equal(rebuilt.view(np.uint32), record.predicted_states.view(np.uint32)) or not np.array_equal(
+            payload[f"{owner}prediction_available"][:horizon], record.prediction_available
+        ):
+            message = "Transient chain storage would not rebuild its record bit for bit."
+            raise TransientSequenceArtifactError(message)
     cast("Any", np.savez)(path, **payload)
+    return stored_chain
 
 
 class TransientSequenceArtifactStager:
@@ -1246,8 +1311,8 @@ class TransientSequenceArtifactStager:
             message = f"Transient artifact staging root must not be symbolic: {artifact_root}"
             raise ValueError(message)
         self.dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
-        if dataset_role not in {"id", "ood"}:
-            message = "dataset_role must be 'id' or 'ood'."
+        if dataset_role not in {"id", "additional_evaluation"}:
+            message = "dataset_role must be 'id' or 'additional_evaluation'."
             raise ValueError(message)
         self.dataset_role: DatasetRole = dataset_role
         self.root = artifact_root.resolve()
@@ -1408,14 +1473,11 @@ class TransientSequenceArtifactStager:
             case_payload = _TransientCasePayload(
                 payload_path,
                 expected_sha256=digest,
+                chain_lengths=_stored_chain_lengths(summaries),
             )
             try:
                 for row in rows:
-                    _record_from_row(
-                        self.root,
-                        cast("Mapping[str, Any]", row),
-                        case_payload,
-                    )
+                    _record_from_row(cast("Mapping[str, Any]", row), case_payload)
             finally:
                 case_payload.close()
         except (OSError, TypeError, ValueError) as error:
@@ -1460,6 +1522,9 @@ class TransientSequenceArtifactStager:
         if self._finalized:
             message = "Transient artifact staging is already finalized."
             raise RuntimeError(message)
+        if any(record.scaled_model_outputs is None for record in records):
+            message = "Fresh transient records require raw scaled model outputs for write admission."
+            raise TransientSequenceArtifactError(message)
         admitted = tuple(record.validated() for record in records)
         case_ids = {record.case_id for record in admitted}
         record_ids = {record.record_id for record in admitted}
@@ -1483,15 +1548,16 @@ class TransientSequenceArtifactStager:
         relative = _case_payload_path(case_id)
         payload_path = self.root / relative
         temporary_path = payload_path.with_name(f".{payload_path.stem}.partial{payload_path.suffix}")
-        _write_case_bundle(temporary_path, admitted)
+        stored_chain = _write_case_bundle(temporary_path, admitted)
         temporary_path.replace(payload_path)
-        payload_digest = common.serialization.file_sha256(payload_path)
+        payload_digest = contracts.cached_file_sha256(payload_path)
         payload = (relative.as_posix(), payload_digest)
         rows = [
             _record_row(
                 record,
                 payload_path=payload[0],
                 payload_sha256=payload[1],
+                chain_id=stored_chain[_chain_id(record)],
                 metric_statistics=(None if metric_statistics is None else metric_statistics.get(record.record_id)),
             )
             for record in admitted
@@ -1562,7 +1628,7 @@ class TransientSequenceArtifactStager:
         outputs = {
             "parquet": {
                 "path": parquet_path.relative_to(self.root).as_posix(),
-                "sha256": common.serialization.file_sha256(parquet_path),
+                "sha256": contracts.cached_file_sha256(parquet_path),
             },
             "npz": [{"path": relative, "sha256": digest} for relative, digest in sorted(self._case_payloads.values())],
         }
@@ -1723,10 +1789,13 @@ def _require_relative_payload(root: Path, relative: Any) -> Path:
 
 
 class _TransientCasePayload(Mapping[str, np.ndarray]):
-    """Own one open case bundle and materialize requested arrays on demand."""
+    """Own one open case bundle and materialize requested arrays on demand.
 
-    def __init__(self, path: Path, *, expected_sha256: str) -> None:
-        if common.serialization.file_sha256(path) != expected_sha256:
+    ``chain_lengths`` gives the exact state count each stored chain must keep.
+    """
+
+    def __init__(self, path: Path, *, expected_sha256: str, chain_lengths: Mapping[str, int]) -> None:
+        if contracts.cached_file_sha256(path) != expected_sha256:
             message = f"Transient case payload digest changed: {path}"
             raise TransientSequenceArtifactError(message)
         try:
@@ -1743,7 +1812,26 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
         self._archive: Any = archive
         self._fields = frozenset(str(name) for name in archive.files)
         self._arrays: dict[str, np.ndarray] = {}
+        self._chain_lengths = chain_lengths
+        self._chains: dict[tuple[str, int], np.ndarray] = {}
         self._closed = False
+
+    def chain_states(self, chain: str, origin_index: int) -> np.ndarray:
+        """Return one stored chain rebuilt once per open case: its reference origin state followed by its stored states.
+
+        Records take views of the result, so records that share a stored chain share its memory.
+        """
+        rebuilt = self._chains.get((chain, origin_index))
+        if rebuilt is None:
+            name = f"chain_{chain}_predicted_states"
+            expected = (self._chain_lengths.get(chain),)
+            if self[name].shape[:1] != expected or self[f"chain_{chain}_prediction_available"].shape != expected:
+                message = "Transient stored chain length contradicts the longest record that uses it."
+                raise TransientSequenceArtifactError(message)
+            rebuilt = _rebuild_chain_states(self["reference_states"][origin_index:], self._arrays.pop(name))
+            rebuilt.flags.writeable = False
+            self._chains[chain, origin_index] = rebuilt
+        return rebuilt
 
     def __getitem__(self, key: str) -> np.ndarray:
         """Return one cached array, decompressing only its selected NPZ member."""
@@ -1760,6 +1848,7 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
         except (OSError, ValueError, KeyError) as error:
             message = f"Transient case payload member cannot be read: {key!r}"
             raise TransientSequenceArtifactError(message) from error
+        value.flags.writeable = False  # records hold views of these shared arrays
         self._arrays[key] = value
         return value
 
@@ -1781,23 +1870,26 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
             return
         self._archive.close()
         self._arrays.clear()
+        self._chains.clear()
         self._closed = True
 
 
-def _load_case_payload(root: Path, row: Mapping[str, Any]) -> _TransientCasePayload:
+def _stored_chain_lengths(summaries: Sequence[TransientSequenceRecordSummary]) -> dict[str, int]:
+    """Return the state count each stored chain of one case keeps: its longest record's available horizon."""
+    lengths: dict[str, int] = {}
+    for summary in summaries:
+        lengths[summary.chain_id] = max(lengths.get(summary.chain_id, 0), summary.available_horizon)
+    return lengths
+
+
+def _load_case_payload(root: Path, row: Mapping[str, Any], chain_lengths: Mapping[str, int]) -> _TransientCasePayload:
     """Open one digest-validated case bundle without eagerly decompressing its fields."""
     path = _require_relative_payload(root, row["payload_path"])
-    return _TransientCasePayload(path, expected_sha256=str(row["payload_sha256"]))
+    return _TransientCasePayload(path, expected_sha256=str(row["payload_sha256"]), chain_lengths=chain_lengths)
 
 
-def _record_from_row(root: Path, row: Mapping[str, Any], payload: Mapping[str, np.ndarray] | None = None) -> TransientSequenceRecord:
+def _record_from_row(row: Mapping[str, Any], payload: _TransientCasePayload) -> TransientSequenceRecord:
     """Reconstruct one exact row record from its selected case bundle prefix."""
-    if payload is None:
-        owned_payload = _load_case_payload(root, row)
-        try:
-            return _record_from_row(root, row, owned_payload)
-        finally:
-            owned_payload.close()
     required_common = {
         "physical_times",
         "reference_states",
@@ -1828,22 +1920,18 @@ def _record_from_row(root: Path, row: Mapping[str, Any], payload: Mapping[str, n
             raise TransientSequenceArtifactError(message)
     chain = _nonempty_text(row["chain_id"], label="summary chain_id")
     prefix = f"chain_{chain}_"
-    needed = {
-        f"{prefix}{suffix}"
-        for suffix in (
-            "predicted_states",
-            "predicted_increments",
-            "scaled_model_outputs",
-            "prediction_available",
-            "prediction_nonfinite_mask",
-            "prediction_physical_invalid_mask",
-        )
-    }
+    needed = {f"{prefix}{suffix}" for suffix in _CHAIN_FIELDS}
     if not needed.issubset(payload):
         message = "Transient case bundle lacks the selected prediction chain."
         raise TransientSequenceArtifactError(message)
     available = int(row["available_horizon"])
     state_count = available + 1
+    reference_states = payload["reference_states"][int(row["origin_index"]) : int(row["origin_index"]) + state_count]
+    predicted_states = payload.chain_states(chain, int(row["origin_index"]))[:state_count]
+    prediction_available = payload[f"{prefix}prediction_available"][:available]
+    computed_mask = prediction_available[:, None, None, None]
+    with np.errstate(invalid="ignore", over="ignore"):
+        predicted_increments = predicted_states[1:] - predicted_states[:-1]
     try:
         requested: RequestedHorizon = "full" if row["requested_horizon"] == "full" else int(row["requested_horizon"])
         record = TransientSequenceRecord(
@@ -1856,18 +1944,14 @@ def _record_from_row(root: Path, row: Mapping[str, Any], payload: Mapping[str, n
             trajectory_length=int(row["trajectory_length"]),
             physical_times=payload["physical_times"][int(row["origin_index"]) : int(row["origin_index"]) + state_count],
             transition_indices=np.arange(int(row["origin_index"]), int(row["origin_index"]) + available, dtype=np.int64),
-            reference_states=payload["reference_states"][int(row["origin_index"]) : int(row["origin_index"]) + state_count],
-            predicted_states=payload[f"{prefix}predicted_states"][:state_count],
-            reference_increments=(
-                None
-                if "reference_increments" not in payload
-                else payload["reference_increments"][int(row["origin_index"]) : int(row["origin_index"]) + available]
-            ),
-            predicted_increments=payload[f"{prefix}predicted_increments"][:available],
-            scaled_model_outputs=payload[f"{prefix}scaled_model_outputs"][:available],
-            prediction_available=payload[f"{prefix}prediction_available"][:available],
-            prediction_nonfinite_mask=payload[f"{prefix}prediction_nonfinite_mask"][:available],
-            prediction_physical_invalid_mask=payload[f"{prefix}prediction_physical_invalid_mask"][:available],
+            reference_states=reference_states,
+            predicted_states=predicted_states,
+            reference_increments=np.diff(reference_states, axis=0),
+            predicted_increments=predicted_increments,
+            scaled_model_outputs=None,
+            prediction_available=prediction_available,
+            prediction_nonfinite_mask=(~np.isfinite(predicted_states[1:])) & computed_mask,
+            prediction_physical_invalid_mask=transient_validity.prediction_physical_invalid_mask(predicted_states[1:]) & computed_mask,
             prediction_validity=json.loads(str(row["prediction_validity_json"])),
             spatial_mask=payload["spatial_mask"],
             temporal_mask=payload["temporal_mask"][int(row["origin_index"]) : int(row["origin_index"]) + state_count],
@@ -1929,6 +2013,7 @@ class TransientSequenceArtifactIndex:
     _rows: dict[str, Mapping[str, Any]] = field(default_factory=dict, repr=False)
     _case_cache: OrderedDict[str, _TransientCasePayload] = field(default_factory=OrderedDict, init=False, repr=False)
     _record_cache: dict[str, TransientSequenceRecord] = field(default_factory=dict, init=False, repr=False)
+    _chain_lengths: dict[str, dict[str, int]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate the bounded cache and manifest-record correspondence."""
@@ -1939,6 +2024,9 @@ class TransientSequenceArtifactIndex:
         if not record_ids or len(record_ids) != len(set(record_ids)) or set(self._rows) != set(record_ids):
             message = "Transient sequence index rows contradict its summary inventory."
             raise TransientSequenceArtifactError(message)
+        self._chain_lengths = {
+            case_id: _stored_chain_lengths([summary for summary in self.summaries if summary.case_id == case_id]) for case_id in self.case_ids
+        }
 
     @property
     def record_ids(self) -> tuple[str, ...]:
@@ -1955,13 +2043,13 @@ class TransientSequenceArtifactIndex:
         """Return the number of currently decompressed case bundles."""
         return len(self._case_cache)
 
-    def _payload(self, row: Mapping[str, Any]) -> Mapping[str, np.ndarray]:
+    def _payload(self, row: Mapping[str, Any]) -> _TransientCasePayload:
         case_id = str(row["case_id"])
         cached = self._case_cache.pop(case_id, None)
         if cached is not None:
             self._case_cache[case_id] = cached
             return cached
-        payload = _load_case_payload(self.root, row)
+        payload = _load_case_payload(self.root, row, self._chain_lengths[case_id])
         self._case_cache[case_id] = payload
         while len(self._case_cache) > self.cache_limit:
             evicted, evicted_payload = self._case_cache.popitem(last=False)
@@ -1981,7 +2069,7 @@ class TransientSequenceArtifactIndex:
         except KeyError as error:
             message = f"Unknown transient sequence record {record_id!r}."
             raise KeyError(message) from error
-        record = _record_from_row(self.root, row, self._payload(row))
+        record = _record_from_row(row, self._payload(row))
         self._record_cache[record_id] = record
         return record
 
@@ -2038,7 +2126,7 @@ _SUMMARY_COLUMNS = frozenset(
 )
 
 
-def _summary_from_row(  # noqa: C901, PLR0912
+def _summary_from_row(  # noqa: C901
     root: Path, row: Mapping[str, Any], *, dataset_role: DatasetRole
 ) -> TransientSequenceRecordSummary:
     """Validate one compact record row without decompressing its case bundle."""
@@ -2115,13 +2203,6 @@ def _summary_from_row(  # noqa: C901, PLR0912
         message = "Transient sequence summary duplicates contradict identity or prediction-validity JSON."
         raise TransientSequenceArtifactError(message)
     chain_id = _nonempty_text(row["chain_id"], label="summary chain_id")
-    expected_chain_id = _chain_id_from_coordinates(
-        mode=str(mode),
-        origin_index=origin,
-    )
-    if chain_id != expected_chain_id:
-        message = "Transient sequence prediction-chain identity is invalid."
-        raise TransientSequenceArtifactError(message)
     raw_statistics = row["metric_statistics_json"]
     metric_statistics: Mapping[str, Mapping[str, object]] | None = None
     if raw_statistics is not None:
@@ -2248,6 +2329,25 @@ def _summary_from_row(  # noqa: C901, PLR0912
     )
 
 
+def _validate_chain_storage(summaries: Sequence[TransientSequenceRecordSummary]) -> None:
+    """Require each chain to be stored by an owner chain of its case with the same origin and at least its longest horizon."""
+    stored: dict[tuple[str, str], str] = {}
+    origin: dict[tuple[str, str], int] = {}
+    longest: dict[tuple[str, str], int] = {}
+    contradictory = False
+    for summary in summaries:
+        key = (summary.case_id, _chain_id_from_coordinates(mode=summary.mode, origin_index=summary.origin_index))
+        contradictory |= stored.setdefault(key, summary.chain_id) != summary.chain_id
+        origin[key] = summary.origin_index
+        longest[key] = max(longest.get(key, 0), summary.available_horizon)
+    if contradictory or any(
+        stored.get((case_id, owner)) != owner or origin[case_id, owner] != origin[case_id, chain] or longest[case_id, owner] < longest[case_id, chain]
+        for (case_id, chain), owner in stored.items()
+    ):
+        message = "Transient sequence prediction-chain identity is invalid."
+        raise TransientSequenceArtifactError(message)
+
+
 def validate_transient_sequence_payload_inventory(
     index: TransientSequenceArtifactIndex,
 ) -> None:
@@ -2272,23 +2372,10 @@ def validate_transient_sequence_payload_inventory(
     for case_id in index.case_ids:
         summaries = tuple(summary for summary in index.summaries if summary.case_id == case_id)
         path = _require_relative_payload(index.root, summaries[0].payload_path)
-        chain_fields = {
-            f"chain_{summary.chain_id}_{suffix}"
-            for summary in summaries
-            for suffix in (
-                "predicted_states",
-                "predicted_increments",
-                "scaled_model_outputs",
-                "prediction_available",
-                "prediction_nonfinite_mask",
-                "prediction_physical_invalid_mask",
-            )
-        }
-        optional_fields = {"reference_increments"}
+        chain_fields = {f"chain_{summary.chain_id}_{suffix}" for summary in summaries for suffix in _CHAIN_FIELDS}
         with np.load(path, allow_pickle=False) as loaded:
             actual = set(loaded.files)
-        allowed = common_fields.union(chain_fields, optional_fields)
-        if not common_fields.union(chain_fields).issubset(actual) or actual.difference(allowed):
+        if actual != common_fields.union(chain_fields):
             message = f"Transient case payload field inventory contradicts its summary for case {case_id!r}."
             raise TransientSequenceArtifactError(message)
 
@@ -2377,8 +2464,8 @@ def _index_from_admitted_frame(
         label="artifact dataset.name",
     )
     dataset_role = dataset.get("role")
-    if dataset_role not in {"id", "ood"}:
-        message = "Transient artifact Dataset role must be id or ood."
+    if dataset_role not in {"id", "additional_evaluation"}:
+        message = "Transient artifact Dataset role must be id or additional_evaluation."
         raise TransientSequenceArtifactError(message)
     if frame.empty or "record_id" not in frame or frame["record_id"].duplicated().any():
         message = "Transient artifact summary must contain unique non-empty records."
@@ -2393,6 +2480,7 @@ def _index_from_admitted_frame(
         )
         for row in rows
     )
+    _validate_chain_storage(summaries)
     paths_by_case: dict[str, set[tuple[str, str]]] = {}
     for summary in summaries:
         paths_by_case.setdefault(summary.case_id, set()).add(
@@ -2487,6 +2575,12 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
         "artifact_kind": TRANSIENT_ARTIFACT_KIND,
         "task": "transient_drying",
     }
+    if provenance["artifact_schema_version"] != TRANSIENT_SEQUENCE_SCHEMA_VERSION:
+        message = (
+            f"Transient artifact schema version {provenance['artifact_schema_version']!r} is unsupported; "
+            f"expected {TRANSIENT_SEQUENCE_SCHEMA_VERSION}. Regenerate the artifact."
+        )
+        raise TransientSequenceArtifactError(message)
     if any(provenance[key] != value for key, value in expected_static.items()):
         message = "Transient artifact schema or task identity is unsupported."
         raise TransientSequenceArtifactError(message)
@@ -2512,8 +2606,8 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
         raise TypeError(message)
     dataset_name = common.paths.validate_logical_name(dataset.get("name"), label="artifact dataset.name")
     dataset_role = dataset.get("role")
-    if dataset_role not in {"id", "ood"}:
-        message = "Transient artifact Dataset role must be id or ood."
+    if dataset_role not in {"id", "additional_evaluation"}:
+        message = "Transient artifact Dataset role must be id or additional_evaluation."
         raise TransientSequenceArtifactError(message)
     parquet_files = sorted(artifact_root.glob("*.parquet"))
     if len(parquet_files) != 1 or parquet_files[0].name != f"{dataset_name}.parquet":

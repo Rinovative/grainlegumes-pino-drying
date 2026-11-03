@@ -1,7 +1,4 @@
-"""
-evaluation_panel.py
-
-Compose curated evaluation panels over admitted artifacts.
+"""Compose curated evaluation panels over admitted artifacts.
 
 Responsibilities:
   - Keep the approved single-model and comparison view order explicit
@@ -27,18 +24,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from html import escape
+from itertools import pairwise
+from math import isfinite
 from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
-import matplotlib.pyplot as plt
 import pandas as pd
-from matplotlib.figure import Figure
 
 from src import analysis
+from src.analysis.evaluation import evaluation_transient_artifact as transient_artifact
+from src.analysis.presentation import analysis_compute as compute
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.learning.models import naming
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
+
+    from matplotlib.figure import Figure
 
     from src.analysis.evaluation.evaluation_selection import EvaluationSelectionState
     from src.analysis.evaluation.evaluation_session import EvaluationSession
@@ -64,6 +69,8 @@ COMPARISON_EVALUATION_SECTION_KEYS = SINGLE_MODEL_EVALUATION_SECTION_KEYS
 TRANSIENT_EVALUATION_SECTION_KEYS = (
     *SINGLE_MODEL_EVALUATION_SECTION_KEYS,
     "temporal_rollout",
+    "runtime",
+    "matched_stages",
 )
 
 EVALUATION_SECTION_TITLES = {
@@ -77,6 +84,8 @@ EVALUATION_SECTION_TITLES = {
     "sample_viewer": "Sample Viewer",
     "outlier_analysis": "Outlier & Extreme Case Analysis",
     "temporal_rollout": "Temporal & Rollout Analysis",
+    "runtime": "Measured Runtime & Accuracy",
+    "matched_stages": "Controlled Training Stages",
 }
 
 
@@ -113,7 +122,7 @@ def _dropdown(
 def _physics_available(datasets: Mapping[str, pd.DataFrame]) -> bool:
     """Return whether every frame supplies compatible maintained physics evidence."""
     try:
-        analysis.evaluation.dataframe.validate_comparison(datasets, require_physics=True)
+        analysis.evaluation.dataframe.validate_comparison(datasets, require_physics=True, verify_grid=False)
     except analysis.evaluation.dataframe.ComparisonCompatibilityError:
         return False
     return True
@@ -332,7 +341,7 @@ def _build_sections(
     viewers = analysis.ui.viewers
     controls = analysis.ui.components
     dataset_map = dict(datasets)
-    analysis.evaluation.dataframe.validate_comparison(dataset_map)
+    analysis.evaluation.dataframe.validate_comparison(dataset_map, verify_grid=False)
     frames = tuple(dataset_map.values())
     display_fields = analysis.evaluation.presentation.shared_display_fields(frames)
     channels = tuple(field.label for field in display_fields)
@@ -391,7 +400,10 @@ def _build_sections(
             plot_func=plots.error_behavior.plot_mean_error_maps,
             start_cases=100,
             step_size=50,
-            controls={"error_mode": controls.ui_radio_error_mode()},
+            controls={
+                "error_mode": controls.ui_radio_error_mode(),
+                "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
+            },
         ),
         toggle(
             "1-5. Std error maps",
@@ -400,6 +412,7 @@ def _build_sections(
             plot_func=plots.error_behavior.plot_std_error_maps,
             start_cases=100,
             step_size=50,
+            controls={"display_spatial_stride": controls.ui_dropdown_display_spatial_stride()},
         ),
     ]
 
@@ -458,33 +471,25 @@ def _build_sections(
                 step_size=50,
             ),
             toggle(
-                "4-3. Velocity continuity residual (∇·u)",
+                "4-3. Cross-section flux balance",
                 viewers.make_casecount_viewer,
-                plot_name="4-3. Velocity continuity residual (∇·u)",
-                plot_func=plots.physical_consistency.plot_velocity_divergence,
+                plot_name="4-3. Cross-section flux balance",
+                plot_func=plots.physical_consistency.plot_flux_balance,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "4-4. Porosity-weighted continuity residual (∇·(εu))",
+                "4-4. Darcy–Brinkman operator residual",  # noqa: RUF001
                 viewers.make_casecount_viewer,
-                plot_name="4-4. Porosity-weighted continuity residual (∇·(εu))",
-                plot_func=plots.physical_consistency.plot_div_eps_u_consistency,
-                start_cases=100,
-                step_size=50,
-            ),
-            toggle(
-                "4-5. Darcy–Brinkman operator residual",  # noqa: RUF001
-                viewers.make_casecount_viewer,
-                plot_name="4-5. Darcy–Brinkman operator residual",  # noqa: RUF001
+                plot_name="4-4. Darcy–Brinkman operator residual",  # noqa: RUF001
                 plot_func=plots.physical_consistency.plot_brinkman_residual,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "4-6. Pressure and boundary-condition consistency",
+                "4-5. Pressure and boundary-condition consistency",
                 viewers.make_casecount_viewer,
-                plot_name="4-6. Pressure and boundary-condition consistency",
+                plot_name="4-5. Pressure and boundary-condition consistency",
                 plot_func=plots.physical_consistency.plot_pressure_consistency,
                 start_cases=100,
                 step_size=50,
@@ -546,6 +551,7 @@ def _build_sections(
             controls={
                 "scale_mode": controls.ui_radio_pred_scale_mode(),
                 "error_mode": controls.ui_radio_error_mode(),
+                "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
             },
             selection_state=selection_state,
             channel_fields=display_fields,
@@ -563,6 +569,7 @@ def _build_sections(
                     "kappa_scale": controls.ui_radio_kappa_scale(),
                     "channel": controls.ui_dropdown_channel(channels=channels),
                     "error_mode": controls.ui_radio_error_mode(),
+                    "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
                 },
                 selection_state=selection_state,
                 channel_fields=display_fields,
@@ -581,6 +588,7 @@ def _build_sections(
                     "model_1": _dropdown(labels, description="Model 1:", value=labels[0]),
                     "model_2": _dropdown(labels, description="Model 2:", value=labels[1]),
                     "scale_mode": controls.ui_radio_pred_scale_mode(),
+                    "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
                 },
                 selection_state=selection_state,
                 channel_fields=display_fields,
@@ -604,6 +612,7 @@ def _build_sections(
             controls={
                 "channel": controls.ui_dropdown_channel(channels=channels),
                 "error_mode": controls.ui_radio_error_mode(),
+                "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
             },
             dataset_selection="dropdown",
             max_positions=_OUTLIER_COUNT + 1,
@@ -626,6 +635,7 @@ def _build_sections(
                     controls={
                         "parameter": _dropdown(parameter_options, description="Parameter:"),
                         "error_mode": controls.ui_radio_error_mode(),
+                        "display_spatial_stride": controls.ui_dropdown_display_spatial_stride(),
                     },
                     dataset_selection="dropdown",
                     max_positions=2,
@@ -684,6 +694,7 @@ def _build_panel(
     comparison: bool,
     sections: Sequence[str] | str,
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build one lazy panel without an outer dataset selector."""
     dataset_map = dict(datasets)
@@ -718,8 +729,9 @@ def _build_panel(
         open_btn_text=open_text,
         close_btn_text="Close",
         export_state=export_state,
-        export_dir="",
+        export_dir="" if export_dir is None else str(export_dir),
         export_btn_text="Export PDF",
+        protected_export_roots=tuple(frame.attrs["artifact_root"] for frame in datasets.values() if "artifact_root" in frame.attrs),
     )
 
 
@@ -761,7 +773,7 @@ def _normalize_contexts(
             if not any(frame is canonical for canonical in canonical_frames):
                 msg = f"Evaluation context {key!r} frame {model_label!r} is not an exact canonical frame owned by the supplied session."
                 raise ValueError(msg)
-        analysis.evaluation.dataframe.validate_comparison(datasets)
+        analysis.evaluation.dataframe.validate_comparison(datasets, verify_grid=False)
         normalized.append(EvaluationContext(key=key, label=label, datasets=datasets))
     keys = tuple(context.key for context in normalized)
     labels = tuple(context.label for context in normalized)
@@ -780,6 +792,7 @@ def build_single_model_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build one single-model panel containing every supplied dataset."""
     normalized = _normalize_contexts(session, contexts, comparison=False)
@@ -793,6 +806,7 @@ def build_single_model_panel(
         comparison=False,
         sections=sections,
         selection_state=selection_state,
+        export_dir=export_dir,
     )
 
 
@@ -802,6 +816,7 @@ def build_comparison_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build separate role-local comparison panels without a selector."""
     normalized = _normalize_contexts(session, contexts, comparison=True)
@@ -811,6 +826,7 @@ def build_comparison_panel(
             comparison=True,
             sections=sections,
             selection_state=selection_state,
+            export_dir=export_dir,
         )
         for context in normalized
     ]
@@ -841,6 +857,7 @@ class _ActivatableVBox(widgets.VBox):
         children: Sequence[widgets.Widget],
         *,
         activate: Callable[[], None],
+        deactivate: Callable[[], None] | None = None,
     ) -> None:
         """Retain the normal VBox contract beside one activation callback."""
         super().__init__(
@@ -848,24 +865,34 @@ class _ActivatableVBox(widgets.VBox):
             layout=widgets.Layout(align_items="flex-start"),
         )
         self._activate_callback = activate
+        self._deactivate_callback = deactivate
 
     def activate(self) -> None:
         """Synchronize this cached view from the shared Evaluation state."""
         self._activate_callback()
 
+    def deactivate(self) -> None:
+        """Stop hidden views from rendering on shared preference changes."""
+        if self._deactivate_callback is not None:
+            self._deactivate_callback()
+
 
 def _shared_transient_physical_times(records: Sequence[Any]) -> tuple[float, ...]:
-    """Return exact stored physical times shared by every selected case."""
+    """Return exact physical times supported by at least one selected case."""
     admitted = tuple(records)
     if not admitted:
         msg = "Aggregate transient spatial views require complete-rollout records."
         raise ValueError(msg)
-    shared = {float(value) for value in admitted[0].physical_times}
-    for record in admitted[1:]:
-        shared.intersection_update(float(value) for value in record.physical_times)
-    times = tuple(sorted(shared))
+    support: set[float] = set()
+    for record in admitted:
+        values = tuple(float(value) for value in record.physical_times)
+        if not values or not all(isfinite(value) for value in values) or any(right <= left for left, right in pairwise(values)):
+            msg = "Aggregate transient physical times must be finite and strictly increasing."
+            raise ValueError(msg)
+        support.update(values)
+    times = tuple(sorted(support))
     if not times:
-        msg = "Aggregate transient cases share no exact stored physical time."
+        msg = "Aggregate transient cases contain no exact stored physical time."
         raise ValueError(msg)
     return times
 
@@ -1015,29 +1042,6 @@ def _compact_transient_case_row(
     return selector, row, previous, following
 
 
-def _clear_transient_export(
-    export_state: dict[str, Any] | None,
-    *,
-    plot_name: str | None,
-    title: str | None,
-) -> None:
-    """Clear one stale panel-local figure after a legitimate empty selection."""
-    if export_state is None:
-        return
-    previous = export_state.get("fig")
-    if isinstance(previous, Figure):
-        plt.close(previous)
-    export_state.update(
-        {
-            "fig": None,
-            "figures": (),
-            "plot_name": plot_name,
-            "title": title,
-            "filename_stem": None,
-        }
-    )
-
-
 def _transient_channel_state(
     *,
     title: str,
@@ -1106,6 +1110,30 @@ def _transient_outlier_inventory(
     return tuple(ordered) or inventory
 
 
+def _transient_reference_scales(
+    session: TransientEvaluationSession, frame_name: str, fields: Sequence[str], record: Any
+) -> dict[str, error_diagnostics.ReferenceScale | str]:
+    """Read persisted train-only state scales for only selected stored fields."""
+    scaling_state = session.scaling_state(frame_name)
+    identity = record.identity if isinstance(record.identity, Mapping) else {}
+    scaling_identity = identity.get("scaling_identity")
+    expected_scaler_identity = str(scaling_identity.get("semantic_digest", "")) if isinstance(scaling_identity, Mapping) else ""
+    result: dict[str, error_diagnostics.ReferenceScale | str] = {}
+    for field in fields:
+        index = (
+            transient_artifact.STATE_ORDER.index(field) if field in transient_artifact.STATE_ORDER else transient_artifact.STATE_ORDER.index("w_surf")
+        )
+        result[field] = error_diagnostics.transient_reference_scale(
+            scaling_state,
+            field=field,
+            unit=transient_artifact.STATE_UNITS[index],
+            state_order=transient_artifact.STATE_ORDER,
+            dataset_identity=str(scaling_state.get("train_membership_digest", "")),
+            expected_scaler_identity=expected_scaler_identity,
+        )
+    return result
+
+
 def _make_transient_sample_viewer(
     *,
     session: TransientEvaluationSession,
@@ -1148,7 +1176,9 @@ def _make_transient_sample_viewer(
     )
     status = widgets.HTML()
     scale_lock = analysis.ui.components.ui_checkbox_map_scale_lock(value=True)
-    scale_container = widgets.HBox((scale_lock,))
+    error_mode = analysis.ui.components.ui_radio_transient_error_mode()
+    display_stride = analysis.ui.components.ui_dropdown_display_spatial_stride()
+    scale_container = widgets.HBox((scale_lock, error_mode, display_stride))
     time_container = widgets.VBox()
     output = analysis.ui.components.ui_output_plot()
     navigator: analysis.ui.time.TimeStepNavigator | None = None
@@ -1195,14 +1225,13 @@ def _make_transient_sample_viewer(
             return
         channels = channel_state.selected
         if not channels:
-            _clear_transient_export(
-                export_state,
-                plot_name=export_plot_name,
-                title=export_title,
+            analysis.ui.viewers.clear_rendered_figure(
+                out=output,
+                message="Select at least one compatible channel.",
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
             )
-            with output:
-                output.clear_output(wait=True)
-                print("Select at least one compatible channel.")
             return
         record = selected_record()
         if outlier:
@@ -1217,12 +1246,20 @@ def _make_transient_sample_viewer(
             physical_time = navigator.selection.physical_time
         publish(record, physical_time, channels)
         entry = current_entry()
-        context = analysis.presentation.display_labels.material_role_display_label(
-            entry.material_family,
-            entry.dataset_role,
+        reference_scales = (
+            _transient_reference_scales(session, entry.frame_name, channels, record)
+            if error_mode.value == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+            else {}
         )
+        assignment = entry.evaluation_assignment
+        declared_role = str(assignment["role"]) if assignment is not None else entry.dataset_role
+        context = analysis.presentation.display_labels.material_role_display_label(entry.material_family, declared_role)
+        relation = f" · relation: {assignment['relation']}" if assignment is not None else ""
         suffix = f" · selected-channel error-max time: {physical_time:g} h" if outlier else ""
-        status.value = f"<span style='color:#555'><b>{escape(context)}</b> · Exact case: <code>{escape(entry.case_id)}</code>{escape(suffix)}</span>"
+        status.value = (
+            f"<span style='color:#555'><b>{escape(context)}</b> · Exact case: "
+            f"<code>{escape(entry.case_id)}</code>{escape(relation)}{escape(suffix)}</span>"
+        )
         if export_state is not None:
             export_state["filename_stem"] = "__".join(
                 (
@@ -1242,6 +1279,9 @@ def _make_transient_sample_viewer(
                 "state_fields": channels,
                 "physical_time": physical_time,
                 "lock_scale": bool(scale_lock.value),
+                "error_mode": str(error_mode.value),
+                "reference_scales": reference_scales,
+                "display_spatial_stride": display_stride.value,
             },
             export_state=export_state,
             export_plot_name=export_plot_name,
@@ -1296,6 +1336,8 @@ def _make_transient_sample_viewer(
     previous.on_click(lambda _button: step_case(-1))
     following.on_click(lambda _button: step_case(1))
     scale_lock.observe(lambda _change: render(), names="value")
+    error_mode.observe(lambda _change: render(), names="value")
+    display_stride.observe(lambda _change: render(), names="value")
     rebind_case()
     children: tuple[widgets.Widget, ...] = (
         case_row,
@@ -1313,16 +1355,30 @@ def _transient_material_contexts(
     *,
     comparison: bool,
 ) -> tuple[tuple[str, tuple[str, str]], ...]:
-    """Return material-first labels and exact frame/material coordinates."""
+    """Return material-first labels with every case-declared Experiment role."""
+    inventory = session.case_inventory()
+
+    def context_label(frame_name: str, material: str) -> str:
+        roles = tuple(
+            dict.fromkeys(
+                str(entry.evaluation_assignment["role"]) if entry.evaluation_assignment is not None else "id"
+                for entry in inventory
+                if entry.frame_name == frame_name and entry.material_family == material
+            )
+        )
+        if not roles:
+            message = "Transient aggregate context lacks case role evidence."
+            raise ValueError(message)
+        material_label = analysis.presentation.display_labels.material_display_label(material)
+        role_labels = " + ".join(analysis.presentation.display_labels.evaluation_role_display_label(role) for role in roles)
+        return f"{material_label} · {role_labels}"
+
     return tuple(
         (
             " · ".join(
                 part
                 for part in (
-                    analysis.presentation.display_labels.material_role_display_label(
-                        material,
-                        session.dataset_role(frame_name),
-                    ),
+                    context_label(frame_name, material),
                     frame_name if comparison else None,
                 )
                 if part is not None
@@ -1340,6 +1396,7 @@ def _make_transient_aggregate_viewer(
     fields: Sequence[Any],
     plot_kind: str,
     comparison: bool,
+    evaluation_compute_device: str | compute.AnalysisComputePreference = "cpu",
     selection_state: EvaluationSelectionState | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
@@ -1369,6 +1426,7 @@ def _make_transient_aggregate_viewer(
     active: dict[str, Any] = {"key": None, "series": None}
     navigator: analysis.ui.time.TimeStepNavigator | None = None
     state = {"updating": False}
+    visible = {"value": True}
 
     def record_series() -> dict[str, tuple[Any, ...]]:
         limit = int(case_count.value)
@@ -1396,23 +1454,23 @@ def _make_transient_aggregate_viewer(
         return cast("dict[str, tuple[Any, ...]]", value)
 
     def render() -> None:
-        if state["updating"] or navigator is None:
+        if state["updating"] or not visible["value"] or navigator is None:
             return
         channels = channel_state.selected
         if not channels:
-            _clear_transient_export(
-                export_state,
-                plot_name=export_plot_name,
-                title=export_title,
+            analysis.ui.viewers.clear_rendered_figure(
+                out=output,
+                message="Select at least one compatible channel.",
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
             )
-            with output:
-                output.clear_output(wait=True)
-                print("Select at least one compatible channel.")
             return
-        series = record_series()
+        full_series = record_series()
         physical_time = navigator.selection.physical_time
-        coverage = "; ".join(f"{label}: {len(records)}" for label, records in series.items())
-        status.value = f"<span style='color:#555'><b>All material-role partitions</b> · {escape(coverage)} exact cases</span>"
+        series = {label: tuple(record for record in records if physical_time in record.physical_times) for label, records in full_series.items()}
+        coverage = "; ".join(f"{label}: n(t)={len(records)}" for label, records in series.items())
+        status.value = f"<span style='color:#555'><b>Exact t={physical_time:g} h support</b> · {escape(coverage)}</span>"
         if selection_state is not None:
             case_ids = tuple(
                 dict.fromkeys(
@@ -1458,10 +1516,16 @@ def _make_transient_aggregate_viewer(
             }
         else:
             plot_func = analysis.evaluation.plots.transient.plot_aggregate_error_maps
+            requested_device = (
+                evaluation_compute_device.requested
+                if isinstance(evaluation_compute_device, compute.AnalysisComputePreference)
+                else evaluation_compute_device
+            )
             kwargs = {
                 "state_fields": channels,
                 "physical_time": physical_time,
                 "statistic": "mean" if plot_kind == "mean_error" else "std",
+                "compute_device": requested_device,
             }
         analysis.ui.viewers.render_figure(
             out=output,
@@ -1516,9 +1580,19 @@ def _make_transient_aggregate_viewer(
         )
 
     case_count.observe(rebind, names="value")
+    if isinstance(evaluation_compute_device, compute.AnalysisComputePreference):
+        evaluation_compute_device.subscribe(render)
     fewer.on_click(lambda _button: step_count(-1))
     more.on_click(lambda _button: step_count(1))
     rebind()
+
+    def activate() -> None:
+        visible["value"] = True
+        rebind()
+
+    def deactivate() -> None:
+        visible["value"] = False
+
     return _ActivatableVBox(
         (
             count_row,
@@ -1527,7 +1601,8 @@ def _make_transient_aggregate_viewer(
             time_container,
             output,
         ),
-        activate=rebind,
+        activate=activate,
+        deactivate=deactivate,
     )
 
 
@@ -1663,14 +1738,13 @@ def _make_transient_scope_viewer(  # noqa: C901, PLR0915 -- one coordinated EDA 
             return
         channels = channel_state.selected
         if not channels:
-            _clear_transient_export(
-                export_state,
-                plot_name=export_plot_name,
-                title=export_title,
+            analysis.ui.viewers.clear_rendered_figure(
+                out=output,
+                message="Select at least one compatible channel.",
+                export_state=export_state,
+                export_plot_name=export_plot_name,
+                export_title=export_title,
             )
-            with output:
-                output.clear_output(wait=True)
-                print("Select at least one compatible channel.")
             return
         series, scaling_states = selected_series()
         if scope.value == "single":
@@ -1808,6 +1882,13 @@ def _transient_summary_table(session: TransientEvaluationSession) -> pd.DataFram
     return frame.loc[:, list(columns)]
 
 
+def _finite_mean_or_nan(values: pd.Series) -> float:
+    """Return the mean of all-finite values, otherwise NaN, so partial evidence never ranks."""
+    if all(pd.notna(value) and isfinite(float(value)) for value in values):
+        return float(values.mean())
+    return float("nan")
+
+
 def _transient_comparison_summary(session: TransientEvaluationSession) -> pd.DataFrame:
     """Return one ranked full-rollout model comparison scoreboard."""
     frame = session.dataset_dataframe(modes=("autonomous_full",))
@@ -1816,7 +1897,16 @@ def _transient_comparison_summary(session: TransientEvaluationSession) -> pd.Dat
         "normalized_drying_group_macro_rmse",
         *(f"normalized_rmse_{field}" for field in analysis.evaluation.transient_artifact.STATE_ORDER),
     )
-    return selected.groupby("frame", sort=False)[list(columns)].mean().sort_values("normalized_drying_group_macro_rmse").reset_index()
+    ranked = (
+        selected.groupby("frame", sort=False)[list(columns)]
+        .agg(_finite_mean_or_nan)
+        .sort_values("normalized_drying_group_macro_rmse", na_position="last")
+        .reset_index()
+    )
+    ranked["Ranking criterion"] = "Equal-material mean of cumulative full-rollout normalized Drying group macro RMSE (lower is better)"
+    ranked["Material count"] = ranked["frame"].map(selected.groupby("frame")["material_family"].nunique())
+    ranked["Metric available"] = ranked["normalized_drying_group_macro_rmse"].map(lambda value: pd.notna(value) and isfinite(float(value)))
+    return ranked
 
 
 def _transient_architecture_table(session: TransientEvaluationSession) -> pd.DataFrame:
@@ -1833,10 +1923,20 @@ def _transient_architecture_table(session: TransientEvaluationSession) -> pd.Dat
             msg = "Transient architecture presentation requires record identity."
             raise TypeError(msg)
         parameters = identity.get("model_parameters")
+        saved_config = session.canonical_frames[frame_name].attrs.get(analysis.evaluation.dataframe.COMPLETED_RUN_CONFIG_ATTR)
+        model_config = saved_config if isinstance(saved_config, Mapping) else {"model": {"kind": identity.get("model_kind"), "params": parameters}}
+        try:
+            architecture_label = naming.architecture_label(model_config)
+        except (KeyError, TypeError, ValueError):
+            architecture_label = "Unavailable: incomplete architecture metadata"
+        run = saved_config.get("run", {}) if isinstance(saved_config, Mapping) else {}
         rows.append(
             {
                 "Artifact": frame_name,
                 "Model family": identity.get("model_kind"),
+                "Architecture label": architecture_label,
+                "Stage": run.get("layout", {}).get("stage", identity.get("stage_identity", "Unavailable")),
+                "Seed": run.get("seed", "Unavailable"),
                 "Configuration": (dict(parameters) if isinstance(parameters, Mapping) else "Unavailable"),
             }
         )
@@ -1866,7 +1966,7 @@ def _transient_outlier_table(
                     "Rank": rank,
                     "Material · Role": analysis.presentation.display_labels.material_role_display_label(
                         str(row.material_family),
-                        str(row.dataset_role),
+                        str(row.declared_evaluation_role),
                     ),
                     "Artifact": str(row.frame),
                     "Exact case": str(row.case_id),
@@ -1926,11 +2026,122 @@ TRANSIENT_PLOT_CLASSIFICATION = {
 }
 
 
+def _make_transient_runtime_viewer(
+    *,
+    session: TransientEvaluationSession,
+    kind: str,
+    export_state: dict[str, Any] | None = None,
+    export_plot_name: str | None = None,
+    export_title: str | None = None,
+) -> widgets.Widget:
+    """Display saved timing evidence with explicit model and measurement boundaries."""
+    plots = analysis.evaluation.plots.transient
+    model = _dropdown(session.frame_names, description="Saved model:")
+    measure = _dropdown(
+        (
+            ("Prepared rollout request wall [s]", "prepared_wall"),
+            ("Model calls only [s]", "model"),
+            ("COMSOL drying solution / model-call time [ratio]", "ratio"),
+        ),
+        description="Measured boundary:",
+    )
+    output = widgets.Output()
+    status = widgets.HTML(
+        "Saved measurements only. Model calls exclude request preparation and scaling; "
+        "prepared-request wall excludes Dataset/checkpoint loading and request construction. "
+        "COMSOL reported solution and process times are separate boundaries. Duration ratios do not establish like-for-like end-to-end acceleration."
+    )
+
+    def render(_change: object = None) -> None:
+        kwargs: dict[str, Any] = {}
+        args: tuple[Any, ...]
+        function: Callable[..., Any]
+        if kind == "tradeoff":
+            frame = session.case_dataframe(modes=("autonomous_full",))
+            frame = frame.loc[(frame["scope"] == "cumulative") & (frame["requested_horizon"] == "full")]
+            function = plots.plot_accuracy_runtime_comparison
+            args = (frame, {name: session.timing_report(name) for name in session.frame_names})
+            kwargs["measure"] = measure.value
+        elif kind == "pipeline":
+            values = session.pipeline_degradation()
+            selected = values[session.frame_names.index(model.value)]
+            function = plots.plot_pipeline_degradation
+            args = ((selected,),)
+            status.value = (
+                "Airflow conditions A/B/C are reference, drying-surrogate and full airflow-surrogate pipelines; "
+                "they are separate from training stages A0/B/A1. "
+                + (
+                    "Full pipeline C prediction evidence is available."
+                    if selected.c_available
+                    else f"Full pipeline C unavailable: {escape(str(selected.c_unavailable_reason))}"
+                )
+            )
+        else:
+            function = plots.plot_timing_distributions if kind == "distributions" else plots.plot_timing_speedups
+            args = (session.timing_report(str(model.value)),)
+        if export_state is not None:
+            context = "all_selected_models" if kind == "tradeoff" else str(model.value)
+            export_state["filename_stem"] = f"transient_{context}_{export_plot_name or kind}_{measure.value if kind == 'tradeoff' else kind}"
+        analysis.ui.viewers.render_figure(
+            out=output,
+            plot_func=function,
+            args=args,
+            kwargs=kwargs,
+            export_state=export_state,
+            export_plot_name=export_plot_name,
+            export_title=f"{export_title or kind} · {'all selected models' if kind == 'tradeoff' else model.value}",
+        )
+
+    model.observe(render, names="value")
+    measure.observe(render, names="value")
+    render()
+    control = measure if kind == "tradeoff" else model
+    return widgets.VBox((control, status, output))
+
+
+def _transient_matched_stage_status(reason: str | None) -> widgets.HTML:
+    """Explain missing controlled comparison evidence without blocking general plots."""
+    text = reason or "Select exactly one admitted A0/B/A1 or A0/B/A+ group with shared A0 and immutable B budget evidence."
+    return widgets.HTML(f"<b>Controlled stage comparison unavailable.</b> {escape(text)} General prediction comparisons remain available.")
+
+
+def _transient_training_compute(loader: Callable[[], pd.DataFrame | None]) -> Figure:
+    """Plot only the performance evidence admitted by the workflow lineage validator."""
+    performance = loader()
+    if performance is None:
+        msg = "Admitted controlled stage comparison lacks performance evidence."
+        raise RuntimeError(msg)
+    return analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance)
+
+
+def _transient_runtime_entry(session: TransientEvaluationSession, kind: str) -> Callable[..., widgets.Widget]:
+    """Bind one lazy runtime viewer to the existing figure export context."""
+
+    def build(
+        *,
+        export_state: dict[str, Any] | None = None,
+        export_plot_name: str | None = None,
+        export_title: str | None = None,
+    ) -> widgets.Widget:
+        return _make_transient_runtime_viewer(
+            session=session,
+            kind=kind,
+            export_state=export_state,
+            export_plot_name=export_plot_name,
+            export_title=export_title,
+        )
+
+    return build
+
+
 def _build_transient_sections(
     *,
     session: TransientEvaluationSession,
     comparison: bool,
     selection_state: EvaluationSelectionState | None,
+    evaluation_compute_device: str | compute.AnalysisComputePreference,
+    training_performance: Callable[[], pd.DataFrame | None] | None = None,
+    matched_stage_unavailable_reason: str | None = None,
 ) -> dict[str, tuple[list[tuple[str, Callable[..., Any], str]], str]]:
     """Bind compatible transient evidence under the established Evaluation sections."""
     fields = _transient_channel_fields(session)
@@ -1997,6 +2208,7 @@ def _build_transient_sections(
                 fields=supported_fields,
                 plot_kind=plot_kind,
                 comparison=comparison,
+                evaluation_compute_device=evaluation_compute_device,
                 selection_state=selection_state,
                 export_state=export_state,
                 export_plot_name=export_plot_name,
@@ -2075,6 +2287,11 @@ def _build_transient_sections(
                     aggregate_view("std_error"),
                     "1_5_std_error_maps",
                 ),
+                (
+                    "1-6. Endpoint vs cumulative error",
+                    lambda: plots.plot_endpoint_vs_cumulative(session.dataset_dataframe()),
+                    "1_6_endpoint_cumulative_error",
+                ),
             ],
             EVALUATION_SECTION_TITLES["global_error"],
         ),
@@ -2124,6 +2341,27 @@ def _build_transient_sections(
             EVALUATION_SECTION_TITLES["outlier_analysis"],
         ),
     }
+    registry["runtime"] = (
+        [
+            ("Measured runtime distributions", _transient_runtime_entry(session, "distributions"), "runtime_distributions"),
+            ("Boundary-specific duration ratios", _transient_runtime_entry(session, "ratios"), "runtime_boundary_ratios"),
+            ("Accuracy vs measured runtime", _transient_runtime_entry(session, "tradeoff"), "accuracy_runtime_comparison"),
+            ("Airflow substitution evidence", _transient_runtime_entry(session, "pipeline"), "airflow_substitution"),
+        ],
+        EVALUATION_SECTION_TITLES["runtime"],
+    )
+    registry["matched_stages"] = (
+        [("Shared-A0 performance vs committed budget", partial(_transient_training_compute, training_performance), "matched_stage_compute")]
+        if training_performance is not None
+        else [
+            (
+                "Controlled stage availability",
+                partial(_transient_matched_stage_status, matched_stage_unavailable_reason),
+                "matched_stage_availability",
+            )
+        ],
+        EVALUATION_SECTION_TITLES["matched_stages"],
+    )
     has_full, has_horizon, has_target = _transient_temporal_capabilities(session)
     temporal_entries: list[tuple[str, Callable[..., Any], str]] = []
     if has_full:
@@ -2153,7 +2391,7 @@ def _build_transient_sections(
         temporal_entries.append(
             (
                 "9-4. Final-state drying summary",
-                lambda: plots.plot_target_time(session.full_autonomous_summaries()),
+                lambda: plots.plot_target_time({name: session.full_autonomous_summaries(name) for name in session.frame_names}),
                 "9_4_final_state_drying_summary",
             )
         )
@@ -2171,17 +2409,24 @@ def build_transient_panel(
     sections: Sequence[str] | str = "all",
     comparison: bool = False,
     training_performance: Callable[[], pd.DataFrame | None] | None = None,
+    matched_stage_unavailable_reason: str | None = None,
     selection_state: EvaluationSelectionState | None = None,
+    evaluation_compute_device: str | compute.AnalysisComputePreference = "cpu",
+    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build the baseline Evaluation architecture with transient capabilities."""
-    del training_performance
     if not session.frame_names:
         msg = "Transient panel requires one open session with frames."
         raise ValueError(msg)
+    if comparison:
+        session.require_common_comparison_grids()
     registry = _build_transient_sections(
         session=session,
         comparison=comparison,
         selection_state=selection_state,
+        evaluation_compute_device=evaluation_compute_device,
+        training_performance=training_performance,
+        matched_stage_unavailable_reason=matched_stage_unavailable_reason,
     )
     selected = _transient_section_keys(sections, registry=registry)
     if not selected:
@@ -2209,6 +2454,7 @@ def build_transient_panel(
         open_btn_text=("Model comparison - Open Evaluation" if comparison else "Single model - Open Evaluation"),
         close_btn_text="Close",
         export_state=export_state,
-        export_dir="",
+        export_dir="" if export_dir is None else str(export_dir),
         export_btn_text="Export PDF",
+        protected_export_roots=session.artifact_roots,
     )

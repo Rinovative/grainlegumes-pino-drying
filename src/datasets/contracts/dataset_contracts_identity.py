@@ -1,7 +1,4 @@
-"""
-dataset_contracts_identity.py
-
-Define and verify persisted final-dataset and split identity contracts.
+"""Define and verify persisted final-dataset and split identity contracts.
 
 Responsibilities:
   - Validate the single current task-aware training-dataset schema
@@ -15,8 +12,8 @@ Design principles:
 
 This module does NOT:
   - Load final datasets into model-ready samples. ``src.datasets.runtime.factory`` owns that
-  - Choose training/evaluation ratios or random seeds. Experiment services own them
-  - Publish dataset files. The generation-domain builder owns publication
+  - Choose training/evaluation ratios or random seeds. The authored Dataset plan owns them
+  - Publish dataset files. Dataset package services own publication
 """
 
 from __future__ import annotations
@@ -26,57 +23,23 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from src import domain, generation
+from src import domain
 
 if TYPE_CHECKING:
     from torch import Tensor
 
     from src.domain.tasks.domain_task_spec import TaskSpec
 
+PACKAGE_SELECTION_SCHEMA_VERSION = 3
 TRAINING_DATASET_SCHEMA_VERSION = 1
-TRAINING_DATASET_SCHEMA_KIND = "training_dataset"
-GENERATED_BATCH_IDENTITY_SCHEMA_VERSION = 1
+TRAINING_DATASET_SCHEMA_KIND = "dataset_steady_tensor_payload"
 CASE_FINGERPRINT_VERSION = 1
 TRAINING_TENSOR_DTYPE: Final = "float32"
 _SHA256_HEX_LENGTH = 64
 _TENSOR_HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
-_GENERATED_BATCH_IDENTITY_KEYS: Final = frozenset(
-    {
-        "schema_version",
-        "batch_id",
-        "simulation_profile",
-        "batch_identity",
-        "scientific_config_digest",
-        "template",
-        "export_contract_sha256",
-        "available_learning_views",
-        "airflow_source",
-        "intended_case_ids",
-        "cases",
-        "batch_manifest_identity_sha256",
-        "identity_contract_sha256",
-    }
-)
-_GENERATED_BATCH_SEMANTIC_CONTRACT: Final = {
-    "schema_kind": "generated_batch_semantic_identity",
-    "schema_version": 1,
-    "template_locator_semantics": "provenance_only",
-    "case_artifact_semantics": "canonical_hdf5_content",
-    "case_receipt_semantics": "provenance_only",
-}
-GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST: Final = hashlib.sha256(
-    json.dumps(
-        _GENERATED_BATCH_SEMANTIC_CONTRACT,
-        ensure_ascii=True,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-).hexdigest()
 _DATASET_CONVERSION_CONTRACTS: Final = {
     "steady_flow": {
         "schema_kind": "dataset_conversion_contract",
@@ -101,18 +64,6 @@ _DATASET_CONVERSION_CONTRACTS: Final = {
         "payload_semantics": "portable_source_hdf5_transition_index",
     },
 }
-_GENERATED_TEMPLATE_KEYS = frozenset({"relative_path", "sha256"})
-_GENERATED_CASE_KEYS = frozenset(
-    {
-        "case_id",
-        "material_family",
-        "case_input_id",
-        "simulation_case_id",
-        "case_hdf5_sha256",
-        "success_sha256",
-        "provenance_sha256",
-    }
-)
 _REQUIRED_KEYS = frozenset(
     {
         "schema_version",
@@ -125,7 +76,7 @@ _REQUIRED_KEYS = frozenset(
         "sample_count",
         "spatial_shape",
         "sample_ids",
-        "generated_batch_identity",
+        "source_selection_identity",
         "source_identities",
         "source_metadata",
         "source_provenance",
@@ -154,8 +105,7 @@ class DatasetIdentity:
     sample_ids: tuple[str, ...]
     sample_count: int
     spatial_shape: tuple[int, ...]
-    generated_batch_identity_sha256: str | None = field(default=None, compare=False, repr=False)
-    generated_batch_identity: dict[str, Any] | None = field(default=None, compare=False, repr=False)
+    source_selection_identity: dict[str, Any] | None = field(default=None, compare=False, repr=False)
     source_metadata: tuple[dict[str, Any], ...] | None = field(default=None, compare=False, repr=False)
     source_provenance: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
@@ -223,91 +173,134 @@ def dataset_conversion_contract_identity(dataset_view: str) -> dict[str, Any]:
 def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """Select the positive content and interpretation dependencies of a package."""
     value = dict(provenance)
+    if value.get("schema_kind") != "dataset_selection_manifest" or value.get("schema_version") != PACKAGE_SELECTION_SCHEMA_VERSION:
+        msg = "Dataset package uses an unsupported selection contract."
+        raise ValueError(msg)
     dataset_view = _require_non_empty_string(value.get("dataset_view"), label="Dataset package dataset_view")
     expected_conversion = dataset_conversion_contract_identity(dataset_view)
-    if value.get("builder_identity") != expected_conversion:
+    builder = value.get("builder_identity")
+    conversion = {key: builder.get(key) for key in expected_conversion} if isinstance(builder, Mapping) else None
+    if conversion != expected_conversion:
         message = "Dataset package builder_identity does not match the maintained conversion contract."
         raise ValueError(message)
+    if not isinstance(builder, Mapping) or set(builder) != set(expected_conversion) | {"implementation_sha256"}:
+        message = "Dataset builder implementation evidence is invalid."
+        raise ValueError(message)
+    _require_sha256(builder["implementation_sha256"], label="Dataset builder implementation")
     source_cases = value.get("source_case_identities")
     if not isinstance(source_cases, list) or not source_cases:
         message = "Dataset package source_case_identities must be a non-empty ordered list."
         raise ValueError(message)
-    case_keys = (
-        "package_case_id",
-        "batch_id",
-        "source_case_id",
-        "case_input_id",
-        "simulation_case_id",
-        "case_hdf5_sha256",
-        "material_family",
-        "material_role",
-        "evaluation_regime",
-        "natural_support_state",
-        "simulation_profile",
-        "membership",
-        "ood_group",
-        "ood_parameters",
-        "task_relevant_ood_parameters",
-    )
-    composite_keys = ("composite_source_kind", "completion_receipt_sha256")
     projected_cases: list[dict[str, Any]] = []
-    composite_bound = any(
-        isinstance(source_case, Mapping) and source_case.get("completion_receipt_sha256") is not None for source_case in source_cases
-    )
+    package_ids: set[str] = set()
+    physical_inputs: set[str] = set()
+    simulations: set[str] = set()
     for index, source_case in enumerate(source_cases):
-        if not isinstance(source_case, Mapping):
-            message = f"Dataset package source_case_identities[{index}] must be a mapping."
-            raise TypeError(message)
-        required_keys = case_keys + composite_keys if composite_bound else case_keys
-        missing = [key for key in required_keys if key not in source_case]
-        if missing:
-            message = f"Dataset package source_case_identities[{index}] is missing semantic fields {missing}."
-            raise ValueError(message)
-        projected = {key: copy.deepcopy(source_case[key]) for key in case_keys}
-        if composite_bound:
-            if any(source_case[key] is None for key in composite_keys):
-                message = "Composite Dataset package sources must all bind the same completion receipt."
-                raise ValueError(message)
-            projected.update({key: copy.deepcopy(source_case[key]) for key in composite_keys})
-        projected_cases.append(projected)
+        if not isinstance(source_case, Mapping) or set(source_case) != {"package_case_id", "source", "design"}:
+            msg = f"Dataset source_case_identities[{index}] has an unsupported contract."
+            raise ValueError(msg)
+        if not isinstance(source_case["source"], Mapping) or not isinstance(source_case["design"], Mapping):
+            msg = f"Dataset source_case_identities[{index}] lacks source or design evidence."
+            raise TypeError(msg)
+        package_id = _require_non_empty_string(source_case["package_case_id"], label="package_case_id")
+        source = source_case["source"]
+        design = source_case["design"]
+        required_source = {
+            "task",
+            "campaign_name",
+            "campaign_digest",
+            "source_plan_sha256",
+            "material_family",
+            "domain_profile",
+            "source_batch_id",
+            "case_id",
+            "case_input_id",
+            "simulation_case_id",
+            "case_hdf5_relative",
+            "case_hdf5_sha256",
+            "reservation_sha256",
+            "decision_sha256",
+        }
+        required_design = {
+            "sampling_method",
+            "original_design_size",
+            "candidate_position",
+            "origin",
+            "root_seed",
+            "candidate_seed",
+            "derived_seeds",
+            "design_evidence",
+        }
+        if not required_source.issubset(source) or not required_design.issubset(design):
+            msg = f"Dataset source_case_identities[{index}] lacks exact source or design provenance."
+            raise ValueError(msg)
+        for key in ("campaign_digest", "source_plan_sha256", "case_hdf5_sha256", "reservation_sha256", "decision_sha256"):
+            _require_sha256(source[key], label=f"source.{key}")
+        if source.get("selected_pool_sha256") is not None:
+            _require_sha256(source["selected_pool_sha256"], label="source.selected_pool_sha256")
+        original_size = design["original_design_size"]
+        candidate_position = design["candidate_position"]
+        if (
+            isinstance(original_size, bool)
+            or not isinstance(original_size, int)
+            or original_size < 1
+            or isinstance(candidate_position, bool)
+            or not isinstance(candidate_position, int)
+            or candidate_position < 0
+        ):
+            msg = "Dataset source original design size or candidate position is invalid."
+            raise ValueError(msg)
+        if package_id in package_ids or source["case_input_id"] in physical_inputs or source["simulation_case_id"] in simulations:
+            msg = "Dataset selection repeats a package or physical source case."
+            raise ValueError(msg)
+        package_ids.add(package_id)
+        physical_inputs.add(source["case_input_id"])
+        simulations.add(source["simulation_case_id"])
+        projected_cases.append(copy.deepcopy(dict(source_case)))
     package_keys = (
         "schema_kind",
         "schema_version",
-        "dataset_name",
         "dataset_view",
         "registered_task_id",
-        "evaluation_regime",
+        "source_task",
         "materials",
         "channel_contract",
         "channel_contract_digest",
-        "source_simulation_profiles",
-        "source_batch_ids",
-        "source_template_digests",
-        "included_source_cases",
-        "matched_case_input_ids",
-        "airflow_provenance",
-        "steady_flow_conditioning",
-        "operation_config_digests",
-        "source_role",
-        "training_eligible",
-        "duplicate_case_input_policy",
-        "case_membership",
-        "split_membership",
-        "membership_counts",
-        "available_ood_groups",
-        "ood_group_indexes",
-        "ood_parameter_indexes",
-        "task_relevant_ood_parameters",
+        "grid",
         "builder_identity",
-        "schema_identity",
     )
     missing = [key for key in package_keys if key not in value]
     if missing:
         message = f"Dataset package semantic identity is missing fields {missing}."
         raise ValueError(message)
     payload = {key: copy.deepcopy(value[key]) for key in package_keys}
+    from . import dataset_contracts_partition as partition_contract  # noqa: PLC0415
+
+    fixed = value.get("case_partition")
+    if fixed is not None:
+        fixed = partition_contract.validate_fixed_partition(
+            fixed,
+            case_ids=[entry["package_case_id"] for entry in projected_cases],
+            material_by_case={entry["package_case_id"]: entry["source"]["material_family"] for entry in projected_cases},
+        )
+    payload["case_partition"] = copy.deepcopy(fixed)
     payload["source_case_identities"] = projected_cases
     return payload
+
+
+def package_content_digest(value: Mapping[str, Any]) -> str:
+    """Return the digest of a Dataset's scientific content, without split-generation provenance.
+
+    Two Datasets with the same interpretation, source cases, builder and ordered
+    Train/validation/test/OOD membership are the same content even when other
+    split seeds or recipes produced that membership. The seeds and recipe stay in
+    the manifest as provenance.
+    """
+    payload = package_semantic_identity_payload(value)
+    partition = payload.get("case_partition")
+    if isinstance(partition, dict):
+        payload["case_partition"] = {key: item for key, item in partition.items() if key not in {"seed_input", "seed", "recipe"}}
+    return hashlib.sha256(_canonical_json(payload, label="Dataset content identity")).hexdigest()
 
 
 def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str, str]:
@@ -315,7 +308,7 @@ def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str
     payload = package_semantic_identity_payload(provenance)
     digest = hashlib.sha256(_canonical_json(payload, label="Dataset package identity")).hexdigest()
     name = _require_non_empty_string(provenance.get("dataset_name"), label="Dataset package dataset_name")
-    return f"{name}__{digest[:16]}", digest
+    return name, digest
 
 
 def _update_hash(hasher: Any, value: bytes) -> None:
@@ -401,269 +394,6 @@ def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
 def _json_mapping_copy(value: Any, *, label: str) -> dict[str, Any]:
     mapping = dict(_require_mapping(value, label=label))
     return json.loads(_canonical_json(mapping, label=label).decode("utf-8"))
-
-
-def _require_exact_mapping(
-    value: Any,
-    expected: set[str] | frozenset[str],
-    *,
-    label: str,
-) -> dict[str, Any]:
-    """Return an isolated JSON mapping with exactly the declared keys."""
-    normalized = _json_mapping_copy(value, label=label)
-    missing = sorted(set(expected).difference(normalized))
-    unexpected = sorted(set(normalized).difference(expected))
-    if missing or unexpected:
-        msg = f"{label} keys do not match. Missing: {missing}. Unexpected: {unexpected}."
-        raise ValueError(msg)
-    return normalized
-
-
-def _generated_cases_semantic_payload(cases: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Select source-case content identities without receipt provenance."""
-    case_keys = (
-        "case_id",
-        "material_family",
-        "case_input_id",
-        "simulation_case_id",
-        "case_hdf5_sha256",
-    )
-    return [{key: copy.deepcopy(case[key]) for key in case_keys} for case in cases]
-
-
-def _generated_batch_semantic_payload(batch_identity: Mapping[str, Any]) -> dict[str, Any]:
-    """Select generated content identity without locator or receipt provenance."""
-    cases = batch_identity.get("cases")
-    if not isinstance(cases, list):
-        message = "Generated batch semantic identity cases must be a list."
-        raise TypeError(message)
-    return {
-        "identity_contract_sha256": batch_identity["identity_contract_sha256"],
-        "schema_version": batch_identity["schema_version"],
-        "batch_id": batch_identity["batch_id"],
-        "simulation_profile": batch_identity["simulation_profile"],
-        "batch_identity": batch_identity["batch_identity"],
-        "scientific_config_digest": batch_identity["scientific_config_digest"],
-        "template": {"sha256": batch_identity["template"]["sha256"]},
-        "export_contract_sha256": batch_identity["export_contract_sha256"],
-        "available_learning_views": copy.deepcopy(batch_identity["available_learning_views"]),
-        "airflow_source": batch_identity["airflow_source"],
-        "intended_case_ids": copy.deepcopy(batch_identity["intended_case_ids"]),
-        "cases": _generated_cases_semantic_payload(cases),
-    }
-
-
-def _validate_generated_batch_identity(
-    value: Any,
-    *,
-    sample_ids: Sequence[str],
-    label: str,
-) -> dict[str, Any]:
-    """Validate one current generated-batch semantic identity."""
-    batch_identity = _json_mapping_copy(value, label=label)
-    keys = set(batch_identity)
-    if keys != _GENERATED_BATCH_IDENTITY_KEYS:
-        missing = sorted(_GENERATED_BATCH_IDENTITY_KEYS.difference(keys))
-        unexpected = sorted(keys.difference(_GENERATED_BATCH_IDENTITY_KEYS))
-        message = f"{label} keys do not match. Missing: {missing}. Unexpected: {unexpected}."
-        raise ValueError(message)
-    schema_version = batch_identity["schema_version"]
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != GENERATED_BATCH_IDENTITY_SCHEMA_VERSION:
-        msg = f"{label}.schema_version must be integer {GENERATED_BATCH_IDENTITY_SCHEMA_VERSION}."
-        raise ValueError(msg)
-    _require_non_empty_string(batch_identity["batch_id"], label=f"{label}.batch_id")
-    profile = _require_non_empty_string(
-        batch_identity["simulation_profile"],
-        label=f"{label}.simulation_profile",
-    )
-    try:
-        profile_contract = generation.contracts.get_profile_contract(profile)
-    except ValueError as error:
-        msg = f"{label}.simulation_profile is unsupported: {profile!r}."
-        raise ValueError(msg) from error
-    _require_sha256(batch_identity["batch_identity"], label=f"{label}.batch_identity")
-    _require_sha256(batch_identity["scientific_config_digest"], label=f"{label}.scientific_config_digest")
-    _require_sha256(
-        batch_identity["export_contract_sha256"],
-        label=f"{label}.export_contract_sha256",
-    )
-    template = _require_exact_mapping(
-        batch_identity["template"],
-        _GENERATED_TEMPLATE_KEYS,
-        label=f"{label}.template",
-    )
-    relative_path = _require_non_empty_string(
-        template["relative_path"],
-        label=f"{label}.template.relative_path",
-    )
-    if Path(relative_path).is_absolute() or ".." in Path(relative_path).parts or not relative_path.endswith(".mph"):
-        msg = f"{label}.template.relative_path must be one safe relative .mph path."
-        raise ValueError(msg)
-    _require_sha256(template["sha256"], label=f"{label}.template.sha256")
-    views = _require_string_sequence(
-        batch_identity["available_learning_views"],
-        label=f"{label}.available_learning_views",
-        unique=True,
-    )
-    if views != profile_contract.available_learning_views or batch_identity["airflow_source"] != profile_contract.airflow_source:
-        msg = f"{label} has learning-view or airflow provenance inconsistent with {profile!r}."
-        raise ValueError(msg)
-    intended = _require_string_sequence(
-        batch_identity["intended_case_ids"],
-        label=f"{label}.intended_case_ids",
-        unique=True,
-    )
-    if intended != tuple(sample_ids):
-        msg = f"{label}.intended_case_ids must equal the dataset sample_ids in order."
-        raise ValueError(msg)
-    raw_cases = batch_identity["cases"]
-    if not isinstance(raw_cases, list) or len(raw_cases) != len(intended):
-        msg = f"{label}.cases must align one-to-one with intended_case_ids."
-        raise ValueError(msg)
-    normalized_cases: list[dict[str, Any]] = []
-    for index, (case_id, raw_case) in enumerate(zip(intended, raw_cases, strict=True)):
-        case_label = f"{label}.cases[{index}]"
-        case = _require_exact_mapping(raw_case, _GENERATED_CASE_KEYS, label=case_label)
-        if case["case_id"] != case_id:
-            msg = f"{label}.cases must follow intended_case_ids exactly."
-            raise ValueError(msg)
-        _require_non_empty_string(case["material_family"], label=f"{case_label}.material_family")
-        for key in ("case_input_id", "simulation_case_id", "case_hdf5_sha256", "success_sha256", "provenance_sha256"):
-            _require_sha256(case[key], label=f"{case_label}.{key}")
-        normalized_cases.append(case)
-    batch_identity["template"] = template
-    batch_identity["cases"] = normalized_cases
-    contract_digest = _require_sha256(
-        batch_identity["identity_contract_sha256"],
-        label=f"{label}.identity_contract_sha256",
-    )
-    if contract_digest != GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST:
-        message = f"{label}.identity_contract_sha256 is not the maintained generated-batch semantic contract."
-        raise ValueError(message)
-    digest_payload = _generated_batch_semantic_payload(batch_identity)
-    expected_digest = hashlib.sha256(_canonical_json(digest_payload, label=label)).hexdigest()
-    actual_digest = _require_sha256(
-        batch_identity["batch_manifest_identity_sha256"],
-        label=f"{label}.batch_manifest_identity_sha256",
-    )
-    if actual_digest != expected_digest:
-        msg = f"{label}.batch_manifest_identity_sha256 does not match its content."
-        raise ValueError(msg)
-    return batch_identity
-
-
-def generated_batch_semantic_identity_payload(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the validated current generated-batch semantic identity payload."""
-    intended = value.get("intended_case_ids")
-    sample_ids = _require_string_sequence(intended, label="Generated batch intended_case_ids", unique=True)
-    normalized = _validate_generated_batch_identity(
-        value,
-        sample_ids=sample_ids,
-        label="Generated batch identity",
-    )
-    return _generated_batch_semantic_payload(normalized)
-
-
-def build_generated_batch_identity(source_manifest: Mapping[str, Any]) -> dict[str, Any]:
-    """Build the current scientific identity from one admitted terminal manifest."""
-    manifest = _require_mapping(source_manifest, label="Source manifest")
-    indices = manifest.get("intended_case_indices")
-    if not isinstance(indices, list):
-        msg = "Source manifest.intended_case_indices must be a list."
-        raise TypeError(msg)
-    intended = [f"case_{index:04d}" for index in indices]
-    records = manifest.get("cases")
-    if not isinstance(records, list):
-        msg = "Source manifest.cases must be a list."
-        raise TypeError(msg)
-    cases: list[dict[str, Any]] = []
-    for index, record_value in enumerate(records):
-        record = _require_mapping(record_value, label=f"Source manifest.cases[{index}]")
-        cases.append(
-            {
-                "case_id": record.get("case_id"),
-                "material_family": record.get("material_family"),
-                "case_input_id": record.get("case_input_id"),
-                "simulation_case_id": record.get("simulation_case_id"),
-                "case_hdf5_sha256": record.get("case_hdf5_sha256"),
-                "success_sha256": record.get("success_sha256"),
-                "provenance_sha256": record.get("provenance_sha256"),
-            }
-        )
-    content: dict[str, Any] = {
-        "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
-        "identity_contract_sha256": GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST,
-        "batch_id": manifest.get("batch_id"),
-        "simulation_profile": manifest.get("simulation_profile"),
-        "batch_identity": manifest.get("batch_identity"),
-        "scientific_config_digest": manifest.get("scientific_config_digest"),
-        "template": manifest.get("template"),
-        "export_contract_sha256": manifest.get("export_contract_sha256"),
-        "available_learning_views": manifest.get("available_learning_views"),
-        "airflow_source": manifest.get("airflow_source"),
-        "intended_case_ids": intended,
-        "cases": cases,
-    }
-    result = dict(content)
-    result["batch_manifest_identity_sha256"] = hashlib.sha256(
-        _canonical_json(_generated_batch_semantic_payload(result), label="Generated batch identity")
-    ).hexdigest()
-    return _validate_generated_batch_identity(
-        result,
-        sample_ids=intended,
-        label="Generated batch identity",
-    )
-
-
-def build_generated_package_identity(
-    *,
-    dataset_name: str,
-    simulation_profile: str,
-    campaign_digest: str,
-    template: Mapping[str, Any],
-    export_contract_sha256: str,
-    available_learning_views: Sequence[str],
-    airflow_source: str,
-    cases: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Build one aggregate generated-source identity for a multi-batch package."""
-    normalized_cases = [_json_mapping_copy(case, label=f"Package cases[{index}]") for index, case in enumerate(cases)]
-    sample_ids = [str(case.get("case_id")) for case in normalized_cases]
-    template_mapping = _require_mapping(template, label="Generated package template")
-    source_digest_payload = {
-        "dataset_name": dataset_name,
-        "simulation_profile": simulation_profile,
-        "campaign_digest": campaign_digest,
-        "template": {"sha256": template_mapping.get("sha256")},
-        "export_contract_sha256": export_contract_sha256,
-        "available_learning_views": list(available_learning_views),
-        "airflow_source": airflow_source,
-        "cases": _generated_cases_semantic_payload(normalized_cases),
-    }
-    source_digest = hashlib.sha256(_canonical_json(source_digest_payload, label="Generated package source identity")).hexdigest()
-    content: dict[str, Any] = {
-        "schema_version": GENERATED_BATCH_IDENTITY_SCHEMA_VERSION,
-        "identity_contract_sha256": GENERATED_BATCH_SEMANTIC_CONTRACT_DIGEST,
-        "batch_id": dataset_name,
-        "simulation_profile": simulation_profile,
-        "batch_identity": source_digest,
-        "scientific_config_digest": campaign_digest,
-        "template": dict(template),
-        "export_contract_sha256": export_contract_sha256,
-        "available_learning_views": list(available_learning_views),
-        "airflow_source": airflow_source,
-        "intended_case_ids": sample_ids,
-        "cases": normalized_cases,
-    }
-    result = dict(content)
-    result["batch_manifest_identity_sha256"] = hashlib.sha256(
-        _canonical_json(_generated_batch_semantic_payload(result), label="Generated package identity")
-    ).hexdigest()
-    return _validate_generated_batch_identity(
-        result,
-        sample_ids=sample_ids,
-        label="Generated package identity",
-    )
 
 
 def _require_tensor(value: Any, *, label: str, rank: int) -> Tensor:
@@ -777,24 +507,6 @@ def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, label: 
         raise ValueError(msg)
 
 
-def source_file_identity(path: Path | str) -> dict[str, Any]:
-    """Return basename, exact size, and streaming SHA-256 for one source file."""
-    source_path = Path(path)
-    hasher = hashlib.sha256()
-    size = 0
-    with source_path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            size += len(chunk)
-            hasher.update(chunk)
-    return {"name": source_path.name, "size_bytes": size, "sha256": hasher.hexdigest()}
-
-
-def canonical_metadata_identity(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the canonical byte count and SHA-256 of portable JSON metadata."""
-    encoded = _canonical_json(dict(value), label="Source metadata identity")
-    return {"canonical_size_bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest()}
-
-
 def compute_case_fingerprint(
     *,
     task: TaskSpec,
@@ -837,16 +549,11 @@ def compute_case_fingerprint(
 
 def _training_fingerprint_metadata(
     payload: Mapping[str, Any],
-    *,
-    generated_batch_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Select payload metadata while excluding source provenance and locators."""
-    metadata = {
+    return {
         key: value for key, value in payload.items() if key not in {"inputs", "outputs", "dataset_fingerprint", "dataset_id", "source_provenance"}
     }
-    if "identity_contract_sha256" in generated_batch_identity:
-        metadata["generated_batch_identity"] = _generated_batch_semantic_payload(generated_batch_identity)
-    return metadata
 
 
 def build_training_dataset_payload(
@@ -854,7 +561,7 @@ def build_training_dataset_payload(
     task: TaskSpec,
     dataset_id: str,
     sample_ids: Sequence[str],
-    generated_batch_identity: Mapping[str, Any],
+    source_selection_identity: Mapping[str, Any],
     source_identities: Sequence[Mapping[str, Any]],
     source_metadata: Sequence[Mapping[str, Any]],
     source_provenance: Mapping[str, Any],
@@ -866,14 +573,22 @@ def build_training_dataset_payload(
     normalized_dataset_id = _require_non_empty_string(dataset_id, label="dataset_id")
     normalized_sample_ids = _require_string_sequence(sample_ids, label="sample_ids", unique=True)
     normalized_case_fingerprints = _require_sha256_sequence(case_fingerprints, label="case_fingerprints")
-    normalized_batch_identity = _validate_generated_batch_identity(
-        generated_batch_identity,
-        sample_ids=normalized_sample_ids,
-        label="generated_batch_identity",
-    )
+    normalized_selection_identity = _json_mapping_copy(source_selection_identity, label="source_selection_identity")
+    if (
+        set(normalized_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
+        or normalized_selection_identity["schema_kind"] != "dataset_source_selection"
+        or normalized_selection_identity["schema_version"] != 1
+        or not isinstance(normalized_selection_identity["source_cases"], list)
+        or len(normalized_selection_identity["source_cases"]) != len(normalized_sample_ids)
+    ):
+        msg = "Steady Dataset source selection identity is invalid."
+        raise ValueError(msg)
     normalized_sources = [_json_mapping_copy(value, label=f"source_identities[{index}]") for index, value in enumerate(source_identities)]
     normalized_metadata = [_json_mapping_copy(value, label=f"source_metadata[{index}]") for index, value in enumerate(source_metadata)]
     normalized_provenance = _json_mapping_copy(source_provenance, label="source_provenance")
+    if normalized_selection_identity["source_cases"] != normalized_provenance.get("source_case_identities"):
+        msg = "Steady payload selection identity disagrees with Dataset provenance."
+        raise ValueError(msg)
     sample_count = len(normalized_sample_ids)
     if sample_count <= 0:
         msg = "Training datasets must contain at least one sample."
@@ -907,7 +622,7 @@ def build_training_dataset_payload(
         "sample_count": sample_count,
         "spatial_shape": list(normalized_inputs.shape[2:]),
         "sample_ids": list(normalized_sample_ids),
-        "generated_batch_identity": normalized_batch_identity,
+        "source_selection_identity": normalized_selection_identity,
         "source_identities": normalized_sources,
         "source_metadata": normalized_metadata,
         "source_provenance": normalized_provenance,
@@ -920,10 +635,7 @@ def build_training_dataset_payload(
         "outputs": normalized_outputs,
         "dataset_fingerprint": "",
     }
-    fingerprint_metadata = _training_fingerprint_metadata(
-        payload,
-        generated_batch_identity=normalized_batch_identity,
-    )
+    fingerprint_metadata = _training_fingerprint_metadata(payload)
     payload["dataset_fingerprint"] = _content_fingerprint(
         fingerprint_metadata,
         (("inputs", normalized_inputs), ("outputs", normalized_outputs)),
@@ -948,11 +660,17 @@ def validate_training_dataset_payload(
     if len(sample_ids) != sample_count:
         msg = f"Training dataset sample_count={sample_count} does not match {len(sample_ids)} sample_ids."
         raise ValueError(msg)
-    generated_batch_identity = _validate_generated_batch_identity(
-        mapping.get("generated_batch_identity"),
-        sample_ids=sample_ids,
-        label="Training dataset.generated_batch_identity",
-    )
+    source_selection_identity = _json_mapping_copy(mapping.get("source_selection_identity"), label="source_selection_identity")
+    if (
+        set(source_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
+        or source_selection_identity["schema_kind"] != "dataset_source_selection"
+        or source_selection_identity["schema_version"] != 1
+        or not isinstance(source_selection_identity["source_cases"], list)
+        or len(source_selection_identity["source_cases"]) != sample_count
+    ):
+        msg_0 = "Steady Dataset source selection identity is invalid."
+        message = msg_0
+        raise ValueError(message)
     source_identities = mapping.get("source_identities")
     source_metadata = mapping.get("source_metadata")
     if not isinstance(source_identities, (list, tuple)) or len(source_identities) != sample_count:
@@ -971,6 +689,10 @@ def validate_training_dataset_payload(
         mapping.get("source_provenance"),
         label="Training dataset.source_provenance",
     )
+    if source_selection_identity["source_cases"] != source_provenance.get("source_case_identities"):
+        msg_0 = "Steady payload selection identity disagrees with Dataset provenance."
+        message = msg_0
+        raise ValueError(message)
     case_fingerprints = _require_sha256_sequence(
         mapping.get("case_fingerprints"),
         label="Training dataset.case_fingerprints",
@@ -1006,14 +728,11 @@ def validate_training_dataset_payload(
     fingerprint = _require_sha256(mapping.get("dataset_fingerprint"), label="Training dataset.dataset_fingerprint")
     if verify_content:
         normalized_mapping = dict(mapping)
-        normalized_mapping["generated_batch_identity"] = generated_batch_identity
+        normalized_mapping["source_selection_identity"] = source_selection_identity
         normalized_mapping["source_identities"] = normalized_sources
         normalized_mapping["source_metadata"] = normalized_metadata
         normalized_mapping["source_provenance"] = source_provenance
-        fingerprint_metadata = _training_fingerprint_metadata(
-            normalized_mapping,
-            generated_batch_identity=generated_batch_identity,
-        )
+        fingerprint_metadata = _training_fingerprint_metadata(normalized_mapping)
         expected = _content_fingerprint(fingerprint_metadata, (("inputs", inputs), ("outputs", outputs)))
         if fingerprint != expected:
             msg = f"Training dataset fingerprint mismatch for {dataset_id!r}."
@@ -1026,8 +745,7 @@ def validate_training_dataset_payload(
         sample_ids=sample_ids,
         sample_count=sample_count,
         spatial_shape=spatial_shape,
-        generated_batch_identity_sha256=str(generated_batch_identity["batch_manifest_identity_sha256"]),
-        generated_batch_identity=generated_batch_identity,
+        source_selection_identity=source_selection_identity,
         source_metadata=tuple(normalized_metadata),
         source_provenance=source_provenance,
     )

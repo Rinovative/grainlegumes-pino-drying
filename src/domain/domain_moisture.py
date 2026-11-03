@@ -1,20 +1,27 @@
-"""
-domain_moisture.py
+"""Define canonical granular-phase moisture and equilibrium-sorption conversions.
 
-Define canonical granular-phase moisture and equilibrium-sorption conversions.
 Responsibilities:
   - Convert dry-basis and wet-basis moisture without duplicating formulas
   - Evaluate and invert the maintained modified-Oswin equilibrium relation
   - Derive local moisture from dry-solid and water mass densities
   - Derive bulk wet-basis moisture from integrated dry and water mass
+
 Design principles:
   - Moisture basis is explicit in every public name
   - Forward and inverse sorption use one exact temperature convention
   - Invalid mass and moisture domains fail before division
   - Bulk moisture is mass weighted, never an unqualified spatial mean
+
 This module does NOT:
   - Cache derived moisture fields or define dataset normalization
   - Own material coefficients, humidity clipping policy, or spatial quadrature rules
+
+Notes:
+  Modified-Oswin convention:
+    ``X_eq_db = 0.01 * (A_osw + B_osw * (T - 273.15 K)) * (phi_eff / (1 - phi_eff)) ** C_osw``.
+    Temperature is kelvin; ``phi_eff`` uses caller-supplied ``clip_bounds``
+    when present, and otherwise relative humidity must be below one.
+
 """
 
 from __future__ import annotations

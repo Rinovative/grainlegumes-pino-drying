@@ -1,18 +1,27 @@
-"""
-dataset_packages_transient_shards.py
+"""Build and admit Dataset-bound derived PT shards for transient trajectories.
 
-Build and admit Dataset-bound derived PT shards for transient trajectories.
 Responsibilities:
   - Pack complete canonical cases into soft-target immutable PyTorch shards
-  - Bind derived payloads to Dataset, index, source, and GPU publication identity
+  - Bind derived payloads to exact Dataset manifest and index identity
   - Atomically publish and strictly validate shard receipts and tensor contents
+
 Design principles:
   - Canonical HDF5 remains authoritative and sufficient for exact reconstruction
   - One case belongs to exactly one shard and exact-stop data remains diagnostic
   - Scientific Dataset identity is independent of derived packing policy
+
 This module does NOT:
   - Change package manifests, Dataset IDs, split membership, or Training semantics
   - Delete, rewrite, or recover canonical Generation HDF5 artifacts
+
+Notes:
+  Published layout:
+    ``transient_shard_directory()`` resolves the Dataset-specific
+    ``02_datasets/transient_drying/<dataset>/transient_pt_shards/`` directory, which contains ``receipt.json`` and
+    numbered ``shard_00000.pt`` payloads.
+    The receipt's ``case_locator`` maps each package case ID to its shard index
+    and case position for case-complete lookup.
+
 """
 
 from __future__ import annotations
@@ -24,7 +33,8 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -33,7 +43,6 @@ import torch
 
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
-from src.generation.contracts import generation_contracts_source as source_service
 
 from . import DEFAULT_TRANSIENT_PT_SHARD_BYTES
 from . import dataset_packages_manifest as package_manifest
@@ -42,34 +51,19 @@ from . import dataset_packages_trajectory as trajectory
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-TRANSIENT_PT_SHARD_SCHEMA_KIND: Final = "transient_pt_shard_payload"
+TRANSIENT_PT_SHARD_SCHEMA_KIND: Final = "transient_dataset_pt_shard_payload"
 TRANSIENT_PT_SHARD_SCHEMA_VERSION: Final = 1
-TRANSIENT_PT_RECEIPT_SCHEMA_KIND: Final = "transient_pt_shard_receipt"
+TRANSIENT_PT_RECEIPT_SCHEMA_KIND: Final = "transient_dataset_pt_shard_receipt"
 TRANSIENT_PT_RECEIPT_SCHEMA_VERSION: Final = 1
 TRANSIENT_PT_SHARD_DIRECTORY: Final = "transient_pt_shards"
 TRANSIENT_PT_RECEIPT_FILENAME: Final = "receipt.json"
+_TASK: Final = "transient_drying"
 _MINIMUM_STATE_COUNT: Final = 2
 _TRANSIENT_TENSOR_RANK: Final = 4
 _STATIC_TENSOR_RANK: Final = 3
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
-_TERMINAL_PUBLICATION_IDENTITY_KEYS: Final = {
-    "campaign_run_id",
-    "campaign_id",
-    "git_commit",
-    "campaign_terminal_sha256",
-    "transfer_inventory_sha256",
-}
-_COMPOSITE_PUBLICATION_IDENTITY_KEYS: Final = {
-    "completion_id",
-    "parent_run_id",
-    "parent_partial_sha256",
-    "completion_receipt_sha256",
-    "combined_inventory_sha256",
-}
-_PUBLICATION_IDENTITY_KEY_SETS: Final = (
-    _TERMINAL_PUBLICATION_IDENTITY_KEYS,
-    _COMPOSITE_PUBLICATION_IDENTITY_KEYS,
-)
+_DATASET_PUBLICATION_IDENTITY_KEYS: Final = {"dataset_id", "dataset_digest", "manifest_sha256", "index_digest"}
+_CONTENT_STAT_CACHE_SIZE: Final = 128
 ProgressCallback = Callable[[Mapping[str, Any]], None]
 ValidationDepth = Literal["evidence", "full"]
 
@@ -80,7 +74,7 @@ class TransientShardContractError(ValueError):
 
 def _utc_now() -> str:
     """Return one timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def transient_shard_directory(
@@ -89,35 +83,42 @@ def transient_shard_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Return the immutable derived-payload directory for one Dataset."""
-    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
-    return common.paths.get_dataset_packages_root(storage_root=storage_root) / logical_id / TRANSIENT_PT_SHARD_DIRECTORY
-
-
-def transient_shard_receipt_path(
-    dataset_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Return the readiness receipt path for one derived payload."""
-    return transient_shard_directory(dataset_id, storage_root=storage_root) / TRANSIENT_PT_RECEIPT_FILENAME
+    directory = common.paths.resolve_dataset_dir(_TASK, dataset_id, dataset_root=common.paths.get_datasets_root(storage_root=storage_root))
+    return directory / TRANSIENT_PT_SHARD_DIRECTORY
 
 
 def _validate_publication_identity(value: Any) -> dict[str, str]:
-    """Validate stable canonical GPU publication binding fields."""
-    if not isinstance(value, dict) or set(value) not in _PUBLICATION_IDENTITY_KEY_SETS:
-        message = "Transient shard publication identity keys are invalid."
+    """Validate exact immutable Dataset identity for one derived publication."""
+    if not isinstance(value, dict) or set(value) != _DATASET_PUBLICATION_IDENTITY_KEYS:
+        message = "Transient shard Dataset publication identity keys are invalid."
         raise TransientShardContractError(message)
     result: dict[str, str] = {}
     for key in sorted(value):
         item = value[key]
         if not isinstance(item, str) or not item:
-            message = f"Transient shard GPU publication identity {key!r} is invalid."
+            message = f"Transient shard Dataset publication identity {key!r} is invalid."
             raise TransientShardContractError(message)
-        if (key.endswith("_sha256") or key == "combined_inventory_sha256") and _SHA256_PATTERN.fullmatch(item) is None:
-            message = f"Transient shard GPU publication digest {key!r} is invalid."
+        if key != "dataset_id" and _SHA256_PATTERN.fullmatch(item) is None:
+            message = f"Transient shard Dataset publication digest {key!r} is invalid."
             raise TransientShardContractError(message)
         result[key] = item
     return result
+
+
+def _publication_identity_from_dataset(
+    manifest: Mapping[str, Any],
+    index: Mapping[str, Any],
+    manifest_sha256: str,
+) -> dict[str, str]:
+    """Derive shard provenance from the already admitted Dataset bytes."""
+    return _validate_publication_identity(
+        {
+            "dataset_id": manifest["dataset_id"],
+            "dataset_digest": manifest["dataset_digest"],
+            "manifest_sha256": manifest_sha256,
+            "index_digest": index["index_digest"],
+        }
+    )
 
 
 def _package_context(
@@ -132,12 +133,10 @@ def _package_context(
         raise ValueError(message)
     storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
     manifest_loader = package_manifest.load_package_manifest if validation_depth == "full" else package_manifest.load_package_manifest_evidence
-    manifest = manifest_loader(dataset_id, storage_root=storage)
-    if manifest["dataset_view"] != "transient_drying":
-        message = f"PT shards apply only to transient_drying packages: {dataset_id!r}."
-        raise TransientShardContractError(message)
-    manifest_path = common.paths.get_dataset_metadata_root(storage_root=storage) / dataset_id / "dataset_manifest.json"
-    index_path = common.paths.get_dataset_packages_root(storage_root=storage) / dataset_id / str(manifest["payload_filename"])
+    manifest = manifest_loader(_TASK, dataset_id, storage_root=storage)
+    datasets_root = common.paths.get_datasets_root(storage_root=storage)
+    manifest_path = common.paths.resolve_dataset_manifest_path(_TASK, dataset_id, dataset_root=datasets_root)
+    index_path = common.paths.resolve_dataset_path(_TASK, dataset_id, dataset_root=datasets_root)
     index = trajectory.load_transient_index(index_path)
     if (
         index["dataset_id"] != manifest["dataset_id"]
@@ -152,13 +151,17 @@ def _package_context(
     return storage, manifest, index, common.serialization.file_sha256(manifest_path)
 
 
+def _canonical_payload_path(storage: Path, manifest: Mapping[str, Any]) -> Path:
+    """Locate the canonical index independently of any shard staging directory."""
+    return common.paths.resolve_dataset_path(_TASK, str(manifest["dataset_id"]), dataset_root=common.paths.get_datasets_root(storage_root=storage))
+
+
 def _canonical_payload_stat_identity(
     storage: Path,
     manifest: Mapping[str, Any],
 ) -> tuple[int, dict[str, int]]:
     """Return the cheap immutable identity of one admitted package payload."""
-    path = common.paths.get_dataset_packages_root(storage_root=storage) / str(manifest["dataset_id"]) / str(manifest["payload_filename"])
-    return _file_stat_identity(path)
+    return _file_stat_identity(_canonical_payload_path(storage, manifest))
 
 
 def _case_samples(index: Mapping[str, Any]) -> tuple[tuple[dict[str, Any], ...], ...]:
@@ -176,7 +179,7 @@ def _resolve_source(
     storage: Path,
     case: Mapping[str, Any],
 ) -> Path:
-    """Resolve one canonical GPU HDF5 locator and verify its exact digest."""
+    """Resolve one canonical Source HDF5 locator and verify its exact digest."""
     relative_value = case.get("source_relative_path")
     relative = Path(relative_value) if isinstance(relative_value, str) else None
     if relative is None or not relative_value or relative.is_absolute() or ".." in relative.parts:
@@ -184,10 +187,10 @@ def _resolve_source(
         raise TransientShardContractError(message)
     path = (storage / relative).resolve()
     if not path.is_relative_to(storage) or not path.is_file() or path.is_symlink():
-        message = f"Canonical GPU transient source is missing or unsafe: {path}."
+        message = f"Canonical transient Source is missing or unsafe: {path}."
         raise FileNotFoundError(message)
     if common.serialization.file_sha256(path) != case.get("source_hdf5_sha256"):
-        message = f"Canonical GPU transient source changed after Dataset publication: {path}."
+        message = f"Canonical transient Source changed after Dataset publication: {path}."
         raise TransientShardContractError(message)
     return path
 
@@ -254,6 +257,55 @@ def _file_stat_identity(path: Path) -> tuple[int, dict[str, int]]:
             "mtime_ns": observed.st_mtime_ns,
             "ctime_ns": observed.st_ctime_ns,
         },
+    )
+
+
+@lru_cache(maxsize=_CONTENT_STAT_CACHE_SIZE)
+def _verified_portable_file_content(
+    path: Path,
+    size_bytes: int,
+    stat_identity: tuple[tuple[str, int], ...],
+    expected_sha256: str,
+) -> bool:
+    """Cache a content check only for one exact local file stat and expected hash."""
+    return common.serialization.file_sha256(path) == expected_sha256 and _file_stat_identity(path) == (size_bytes, dict(stat_identity))
+
+
+def _published_file_matches(
+    path: Path,
+    *,
+    expected_size: int | None,
+    expected_stat: Mapping[str, int] | None,
+    expected_sha256: str,
+) -> bool:
+    """Admit unchanged stat evidence cheaply, or verify the published hash otherwise.
+
+    Device numbers are local to a node or mount namespace, and copies, restores
+    and metadata changes replace inode or ctime without changing bytes. A size
+    mismatch fails without hashing; any other stat change requires the published
+    hash. The bounded cache never alters a persisted receipt and observes writes
+    before and after hashing, including when a prior process-local check is reused.
+    """
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or not isinstance(expected_stat, Mapping)
+        or set(expected_stat) != {"device", "inode", "mtime_ns", "ctime_ns"}
+        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in expected_stat.values())
+        or _SHA256_PATTERN.fullmatch(expected_sha256) is None
+    ):
+        return False
+    size_bytes, observed_stat = _file_stat_identity(path)
+    if size_bytes != expected_size:
+        return False
+    if observed_stat == dict(expected_stat):
+        return True
+    return (
+        _verified_portable_file_content(path.resolve(), size_bytes, tuple(observed_stat.items()), expected_sha256)
+        and not path.is_symlink()
+        and _file_stat_identity(path) == (size_bytes, observed_stat)
     )
 
 
@@ -715,11 +767,12 @@ def _validate_receipt_directory(
     manifest_sha256: str,
     canonical_payload_size_bytes: int,
     canonical_payload_stat_identity: Mapping[str, int],
+    canonical_payload_path: Path,
     publication_identity: Mapping[str, str] | None,
     validation_depth: ValidationDepth,
     content_hash_verified: bool = False,
 ) -> dict[str, Any]:
-    """Validate one derived directory against package and optional GPU identity."""
+    """Validate one derived directory against exact current Dataset identity."""
     required = {
         "schema_kind",
         "schema_version",
@@ -749,7 +802,7 @@ def _validate_receipt_directory(
         raise TransientShardContractError(message)
     observed_publication = _validate_publication_identity(receipt["publication_identity"])
     if publication_identity is not None and observed_publication != dict(publication_identity):
-        message = f"Transient PT shard GPU publication identity conflicts: {directory}."
+        message = f"Transient PT shard Dataset publication identity conflicts: {directory}."
         raise TransientShardContractError(message)
     shards = receipt["shards"]
     locator = receipt["case_locator"]
@@ -791,7 +844,15 @@ def _validate_receipt_directory(
         or not isinstance(receipt["canonical_payload_size_bytes"], int)
         or receipt["canonical_payload_size_bytes"] != canonical_payload_size_bytes
         or not valid_canonical_stat_identity
-        or canonical_stat_identity != dict(canonical_payload_stat_identity)
+        or (
+            canonical_stat_identity != dict(canonical_payload_stat_identity)
+            and not _published_file_matches(
+                canonical_payload_path,
+                expected_size=receipt["canonical_payload_size_bytes"],
+                expected_stat=canonical_stat_identity,
+                expected_sha256=receipt["canonical_payload_sha256"],
+            )
+        )
         or expected_derived_id is None
         or receipt["derived_payload_id"] != expected_derived_id
         or receipt["shard_count"] != len(shards)
@@ -846,8 +907,12 @@ def _validate_receipt_directory(
         if not shard_path.is_file() or shard_path.is_symlink():
             message = f"Transient PT shard is missing or unsafe: {shard_path}."
             raise FileNotFoundError(message)
-        observed_size, observed_stat_identity = _file_stat_identity(shard_path)
-        if observed_size != record["size_bytes"] or observed_stat_identity != stat_identity:
+        if not _published_file_matches(
+            shard_path,
+            expected_size=record["size_bytes"],
+            expected_stat=stat_identity,
+            expected_sha256=str(record["sha256"]),
+        ):
             message = f"Transient PT shard changed after immutable publication: {shard_path}."
             raise TransientShardContractError(message)
         observed_case_ids.extend(record["case_ids"])
@@ -915,6 +980,7 @@ def _load_transient_shard_receipt_directory(
         manifest_sha256=manifest_sha256,
         canonical_payload_size_bytes=canonical_payload_size_bytes,
         canonical_payload_stat_identity=canonical_payload_stat_identity,
+        canonical_payload_path=directory.parent / common.paths.get_dataset_payload_filename(_TASK),
         publication_identity=publication_identity,
         validation_depth=validation_depth,
     )
@@ -924,7 +990,6 @@ def load_transient_shard_receipt(
     dataset_id: str,
     *,
     storage_root: Path | str | None = None,
-    publication_identity: Mapping[str, str] | None = None,
     validation_depth: ValidationDepth = "full",
 ) -> dict[str, Any]:
     """Load one package-bound shard receipt with evidence or full validation."""
@@ -940,7 +1005,7 @@ def load_transient_shard_receipt(
         storage,
         manifest,
     )
-    expected_publication = None if publication_identity is None else _validate_publication_identity(dict(publication_identity))
+    expected_publication = _publication_identity_from_dataset(manifest, index, manifest_sha256)
     return _load_transient_shard_receipt_directory(
         transient_shard_directory(dataset_id, storage_root=storage),
         manifest=manifest,
@@ -968,7 +1033,7 @@ def load_transient_shard_payload(
     if type(validate_values) is not bool:
         message = "validate_values must be boolean."
         raise TypeError(message)
-    storage, manifest, index, _manifest_sha256 = _package_context(
+    storage, manifest, index, manifest_sha256 = _package_context(
         dataset_id,
         storage_root=storage_root,
         validation_depth="evidence",
@@ -982,10 +1047,10 @@ def load_transient_shard_payload(
             transient_shard_directory(dataset_id, storage_root=storage),
             manifest=manifest,
             index=index,
-            manifest_sha256=_manifest_sha256,
+            manifest_sha256=manifest_sha256,
             canonical_payload_size_bytes=canonical_size,
             canonical_payload_stat_identity=canonical_stat,
-            publication_identity=None,
+            publication_identity=_publication_identity_from_dataset(manifest, index, manifest_sha256),
             validation_depth="evidence",
         )
     else:
@@ -993,6 +1058,9 @@ def load_transient_shard_payload(
     shards = admitted.get("shards")
     if admitted.get("dataset_id") != dataset_id or not isinstance(shards, list) or shard_index >= len(shards):
         message = f"Transient PT shard index {shard_index} is outside the admitted receipt."
+        raise TransientShardContractError(message)
+    if admitted.get("publication_identity") != _publication_identity_from_dataset(manifest, index, manifest_sha256):
+        message = "Transient PT shard receipt does not bind the current Dataset identity."
         raise TransientShardContractError(message)
     record = shards[shard_index]
     if not isinstance(record, dict):
@@ -1002,8 +1070,12 @@ def load_transient_shard_payload(
     if not shard_path.is_file() or shard_path.is_symlink():
         message = f"Transient PT shard is missing or unsafe: {shard_path}."
         raise FileNotFoundError(message)
-    observed_size, observed_stat_identity = _file_stat_identity(shard_path)
-    if observed_size != record.get("size_bytes") or observed_stat_identity != record.get("stat_identity"):
+    if not _published_file_matches(
+        shard_path,
+        expected_size=record.get("size_bytes"),
+        expected_stat=record.get("stat_identity"),
+        expected_sha256=str(record.get("sha256")),
+    ):
         message = f"Transient PT shard changed after immutable publication: {shard_path}."
         raise TransientShardContractError(message)
     payload = _load_transient_shard_payload(shard_path)
@@ -1055,7 +1127,7 @@ def _raw_shard_destination_conflicts(
         return False
     observed_keys = set(raw_publication)
     expected_keys = set(publication_identity)
-    if observed_keys in _PUBLICATION_IDENTITY_KEY_SETS and observed_keys != expected_keys:
+    if observed_keys != expected_keys:
         return True
     return any(key in raw_publication and raw_publication[key] != value for key, value in publication_identity.items())
 
@@ -1153,7 +1225,6 @@ def build_transient_shards(
     dataset_id: str,
     *,
     storage_root: Path | str | None = None,
-    publication_identity: Mapping[str, str],
     target_shard_bytes: int = DEFAULT_TRANSIENT_PT_SHARD_BYTES,
     existing_validation_depth: ValidationDepth = "evidence",
     rebuild_invalid: bool = False,
@@ -1169,7 +1240,6 @@ def build_transient_shards(
     if not isinstance(rebuild_invalid, bool):
         message = "rebuild_invalid must be boolean."
         raise TypeError(message)
-    stable_publication = _validate_publication_identity(dict(publication_identity))
     storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
     destination = transient_shard_directory(dataset_id, storage_root=storage)
     context_depth: ValidationDepth = existing_validation_depth if destination.exists() else "full"
@@ -1178,11 +1248,13 @@ def build_transient_shards(
         storage_root=storage,
         validation_depth=context_depth,
     )
+    stable_publication = _publication_identity_from_dataset(manifest, index, manifest_sha256)
     canonical_size, canonical_stat = _canonical_payload_stat_identity(
         storage,
         manifest,
     )
     lock_path = common.paths.resolve_dataset_build_lock_path(
+        _TASK,
         dataset_id,
         storage_root=storage,
     )
@@ -1306,12 +1378,12 @@ def build_transient_shards(
                 manifest_sha256=manifest_sha256,
                 canonical_payload_size_bytes=canonical_size,
                 canonical_payload_stat_identity=canonical_stat,
+                canonical_payload_path=_canonical_payload_path(storage, manifest),
                 publication_identity=stable_publication,
                 validation_depth="full",
                 content_hash_verified=True,
             )
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source_service.validate_admitted_source_before_publication()
             if replace_invalid:
                 backup = state_root / (f".{dataset_id}.transient-pt.invalid-{uuid.uuid4().hex}.backup")
                 destination.replace(backup)

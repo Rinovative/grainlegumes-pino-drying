@@ -1,5 +1,14 @@
-# ruff: noqa: S101, PLR2004
-"""Protect the canonical grid-resolved transient schedule contracts."""
+"""Protect the canonical grid-resolved transient schedule contracts.
+
+Responsibilities:
+  - Check deterministic schedules, physical limits, startup equilibrium, rejoin, and grid support
+
+Design principles:
+  - Canonical amplitudes and startup handoff stay unclipped and scientifically explicit
+
+This module does NOT:
+  - Run drying simulations or fit sorption records
+"""
 
 from __future__ import annotations
 

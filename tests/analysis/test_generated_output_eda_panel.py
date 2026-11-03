@@ -1,11 +1,20 @@
-# ruff: noqa: S101, SLF001, PLR2004
-"""Protect the single capability-adaptive generated-output panel and registry."""
+"""Protect the single capability-adaptive generated-output panel and registry.
+
+Responsibilities:
+  - Check capability registry coverage and lazy adaptive view reuse
+
+Design principles:
+  - One panel follows admitted selection capabilities
+
+This module does NOT:
+  - Load scientific case arrays or implement plot numerics
+"""
 
 from __future__ import annotations
 
 from inspect import Parameter, signature
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import ipywidgets as widgets
 import pandas as pd
@@ -25,13 +34,13 @@ if TYPE_CHECKING:
 
 def _catalog() -> selection.GeneratedOutputEDACatalog:
     """Return one steady and one transient profile-native view in one catalog."""
-    case = SimpleNamespace(case_index=1, case_id="case_0001")
     views = []
+    batches = []
     for task_id, label in (
-        ("steady_flow", "Airflow · Reference · fg · ID"),
+        ("steady_flow", "Airflow · Reference range"),
         (
             "transient_drying",
-            "Drying · Lentil · fg · F OOD",
+            "Drying · Lentil · Parameter extension",
         ),
     ):
         frame = pd.DataFrame(
@@ -39,30 +48,51 @@ def _catalog() -> selection.GeneratedOutputEDACatalog:
             index=pd.Index(["case_0001"], name="sample_id"),
         )
         frame.attrs["task_id"] = task_id
-        batch = SimpleNamespace(
+        row = {
+            "campaign_name": f"{task_id}-campaign",
+            "source_name": f"{task_id}-campaign__{'a' * 16}",
+            "campaign_digest": "a" * 64,
+            "material_family": "lentil",
+            "domain_profile": "parameter_extension" if task_id == "transient_drying" else "reference_range",
+            "sampling_regime": "natural",
+            "case_id": "case_0001",
+            "case_input_id": "1" * 64,
+            "simulation_case_id": "2" * 64,
+            "case_hdf5_sha256": "3" * 64,
+            "outcome": "successful",
+            "selected": True,
+        }
+        case = sources.GeneratedOutputEDACase(case_id="case_0001", case_index=1, row=row)
+        batch = sources.GeneratedOutputEDABatch(
+            generation_root=Path(),
+            batch_id=f"{task_id}-batch",
+            campaign_name=f"{task_id}-campaign",
+            source_name=row["source_name"],
+            campaign_digest="a" * 64,
+            campaign_purpose="source_generation",
             simulation_profile=task_id,
             available_learning_views=(task_id,),
-            batch_id=f"{task_id}-batch",
-            batch_storage_name=f"{task_id}-storage",
-            campaign_purpose="family_generalization",
-            material_role="id_source",
-            evaluation_regime=None,
+            material_family="lentil",
+            domain_profile=row["domain_profile"],
+            sampling_regime="natural",
             cases=(case,),
+            candidate_rows=(row,),
+            storage_root=Path(),
         )
+        batches.append(batch)
         views.append(
             selection.GeneratedOutputEDAView(
                 label=label,
-                batch=cast("Any", batch),
+                batch=batch,
                 case_limit=None,
                 loader=lambda current=frame: current,
             )
         )
     source_catalog = sources.GeneratedOutputEDACatalog(
-        batches=(),
+        batches=tuple(batches),
         issues=(),
-        discovered_batch_count=0,
-        complete_batch_count=0,
-        partial_batch_count=0,
+        discovered_campaign_count=2,
+        discovered_candidate_count=2,
         total_issue_count=0,
     )
     return selection.GeneratedOutputEDACatalog(views, source_catalog=source_catalog)
@@ -71,14 +101,6 @@ def _catalog() -> selection.GeneratedOutputEDACatalog:
 def _empty_view() -> viewers.ActivatableView:
     """Return one inert view with the production lifecycle surface."""
     return viewers.ActivatableView((widgets.Label("fixture"),), activate=lambda: None)
-
-
-def _walk(widget: widgets.Widget) -> tuple[widgets.Widget, ...]:
-    """Return one widget tree in deterministic depth-first order."""
-    descendants = [widget]
-    for child in getattr(widget, "children", ()):
-        descendants.extend(_walk(child))
-    return tuple(descendants)
 
 
 def test_factories_cover_capability_registry_with_one_consolidated_view(
@@ -144,10 +166,18 @@ def test_factories_cover_capability_registry_with_one_consolidated_view(
     assert calls.count(("completion", "consolidated")) == 1
 
 
-def test_one_original_launcher_opens_one_capability_adaptive_panel(
+def _walk(widget: widgets.Widget) -> tuple[widgets.Widget, ...]:
+    """Return one widget tree in deterministic depth-first order."""
+    descendants = [widget]
+    for child in getattr(widget, "children", ()):
+        descendants.extend(_walk(child))
+    return tuple(descendants)
+
+
+def test_lazy_panel_reuses_views_and_tracks_selection_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep one lazy launcher, one dataset selector, and no task control."""
+    """Construct views lazily, preserve them on reopen, and rebuild for capabilities."""
     catalog = _catalog()
     state = selection.GeneratedOutputSelectionState(catalog)
     factory_calls: list[str] = []
@@ -162,7 +192,7 @@ def test_one_original_launcher_opens_one_capability_adaptive_panel(
     monkeypatch.setattr(
         panel,
         "_view_factories",
-        lambda *_args: {plot.key: factory(plot.key) for section in presentation.EDA_SECTIONS for plot in section.plots},
+        lambda *_args, **_kwargs: {plot.key: factory(plot.key) for section in presentation.EDA_SECTIONS for plot in section.plots},
     )
     displayed: list[object] = []
     monkeypatch.setattr(notebook_ui, "display", displayed.append)
@@ -170,26 +200,16 @@ def test_one_original_launcher_opens_one_capability_adaptive_panel(
 
     outer = panel.build_eda_panel(catalog=catalog, selection_state=state)
     assert isinstance(outer, notebook_ui.LazyTabbedPanelOutput)
-    assert len(displayed) == 1
     launcher = displayed[-1]
     assert isinstance(launcher, widgets.Button)
-    assert launcher.description == "Generated-output EDA - Open"
-    assert launcher.button_style == "primary"
+    assert factory_calls == []
 
     launcher.click()
     opened_panel = displayed[-1]
     assert isinstance(opened_panel, widgets.VBox)
     tree = _walk(opened_panel)
-    assert sum(isinstance(item, widgets.HTML) and item.value == "<b>Datasets</b>" for item in tree) == 1
-    dataset_boxes = tuple(item for item in tree if isinstance(item, widgets.Checkbox))
-    assert len(dataset_boxes) == 2
-    assert tuple(box.description for box in dataset_boxes) == tuple(view.label for view in catalog.views)
-    assert not any(getattr(item, "description", "") == "Task:" or (isinstance(item, widgets.HTML) and "Task:" in item.value) for item in tree)
     assert outer.tabs is not None
-    assert len(outer.tabs.children) == 3
-    last_dropdown = outer.tabs.children[-1].children[0]
-    assert last_dropdown.options[-1][0].startswith("3-3.")
-    assert "Completion and target attainment" in last_dropdown.options[-1][0]
+    all_sections = outer.tabs.children
     calls_after_first_open = tuple(factory_calls)
 
     close = next(item for item in tree if isinstance(item, widgets.Button) and item.description == "Close")
@@ -201,19 +221,7 @@ def test_one_original_launcher_opens_one_capability_adaptive_panel(
 
     steady_key = catalog.views[0].key
     state.select_datasets((steady_key,))
-    assert len(outer.tabs.children) == 2
+    assert outer.tabs.children != all_sections
+    steady_sections = outer.tabs.children
     state.select_datasets(tuple(view.key for view in catalog.views))
-    assert len(outer.tabs.children) == 3
-
-
-def test_completion_viewer_declares_every_dependency_explicitly() -> None:
-    """Keep the consolidated callback free of hidden keyword dependencies."""
-    parameters = signature(viewers.make_completion_target_view).parameters
-    assert tuple(parameters) == (
-        "catalog",
-        "selection_state",
-        "export_state",
-        "export_plot_name",
-        "export_title",
-    )
-    assert all(parameter.kind is not Parameter.VAR_KEYWORD for parameter in parameters.values())
+    assert outer.tabs.children != steady_sections

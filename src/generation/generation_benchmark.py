@@ -1,21 +1,27 @@
-"""
-generation_benchmark.py
-
-Own the isolated transient COMSOL core-scaling benchmark lifecycle.
+"""Own the isolated transient COMSOL core-scaling benchmark lifecycle on node-job sweeps.
 
 Responsibilities:
-  - Plan, submit, resume, and execute benchmark work units
-  - Validate and persist immutable measurement evidence
-  - Finalize and transfer benchmark artifacts
+  - Plan, submit, resume, and execute sweep node jobs whose steps measure the benchmark work units
+  - Validate and persist immutable measurement evidence bound to the frozen source snapshot
+  - Finalize and validate benchmark artifacts
 
 Design principles:
-  - CPU-materialized proofs bind every core wave to the same two exact inputs
-  - Scientific identity and resource work-unit identity stay separate
+  - Slurm-materialized proofs bind every variant and sweep to the same exact inputs
+  - The run owns deterministic raw copies of the representative production cases (inputs/<case_role>) and never reserves
+    production candidates, freezes a campaign plan, or writes canonical input storage
+  - Scientific identity, resource work-unit identity, and the allocation (node job) stay separate
+  - A variant attempt is measured inside exactly one node job; an interrupted attempt is rerun as a new attempt
   - Successful work-unit evidence is immutable and failed attempts are append-only
 
 This module does NOT:
   - Resolve benchmark suite configuration or interpret measurements
-  - Publish training cases or modify production resources
+  - Implement the node worker or publish training cases
+
+Notes:
+  Each sweep is one node job in one node-job slot (job name gen-seat-<seat>, Slurm singleton) running the
+  generic node worker; the benchmark writes all tickets of the sweep before submission, one ticket group per variant in
+  the sweep order, and a stop ticket. Node-job identity is recovered by the submission token in the job comment.
+
 """
 
 from __future__ import annotations
@@ -26,15 +32,15 @@ import math
 import os
 import re
 import resource as resource_usage
-import shlex
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -43,13 +49,13 @@ import numpy as np
 import yaml
 
 from src import common
-from src.generation.cases import generation_cases_input as input_service
+from src.generation.cases import generation_cases_case as case_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_storage as storage_service
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
-from src.generation.runtime import generation_runtime_license as license_service
+from src.generation.runtime import generation_runtime_node as node_service
 from src.generation.runtime import generation_runtime_preparation as preparation_service
 from src.generation.runtime import generation_runtime_progress as progress_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
@@ -65,62 +71,34 @@ BENCHMARK_PROOF_SCHEMA_KIND: Final = "generation_core_scaling_case_proof"
 BENCHMARK_RESULT_SCHEMA_KIND: Final = "generation_core_scaling_result"
 BENCHMARK_SUMMARY_SCHEMA_KIND: Final = benchmark_report.BENCHMARK_SUMMARY_SCHEMA_KIND
 BENCHMARK_PREFLIGHT_SCHEMA_KIND: Final = "generation_core_scaling_preflight"
-BENCHMARK_CLEANUP_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_cleanup"
 BENCHMARK_CANCELLATION_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_cancellations"
 BENCHMARK_SCHEMA_VERSION: Final = benchmark_config.BENCHMARK_SCHEMA_VERSION
 BENCHMARK_FAMILY: Final = "core_scaling"
-BENCHMARK_TRANSFER_FILENAME: Final = "transfer_complete.json"
-BENCHMARK_LOCAL_CLEANUP_FILENAME: Final = "cpu_source_cleanup.json"
-_MAX_RECENT_JOB_IDS: Final = 16
 _MAX_COMSOL_VERSION_EVIDENCE_BYTES: Final = 16 * 1024
-_MAX_SLURM_JOB_NAME_LENGTH: Final = 48
 _MAX_SLURM_ENV_VALUE_CHARACTERS: Final = 128
-_SACCT_QUEUE_FIELDS: Final = 5
-_MAX_DIRTY_PATH_PREVIEW: Final = 5
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _BENCHMARK_RUN_ID_PATTERN: Final = re.compile(r"core_scaling_transient__[0-9a-f]{16}")
-_ACTIVE_SCHEDULER_STATES: Final = frozenset(
-    {
-        "COMPLETING",
-        "CONFIGURING",
-        "PENDING",
-        "REQUEUED",
-        "RESIZING",
-        "RUNNING",
-        "SIGNALING",
-        "STAGE_OUT",
-        "SUSPENDED",
-    }
-)
+
+
+_TOKEN_PATTERN: Final = re.compile(r"[a-z0-9]{16}")
+
+_CASE_PUBLICATION_MARGIN_SECONDS: Final = 600
+
+_STEP_LAUNCH_WAIT_SECONDS: Final = 120
+
+_NOT_STARTED_GRACE_SECONDS: Final = 120
+
+_CASE_FAILURE_STEP_STATES: Final = frozenset({"FAILED", "OUT_OF_MEMORY", "TIMEOUT", "COMPLETED"})  # any other step state is an interruption
+_STEP_ACCOUNTING_FILENAME: Final = "step_accounting.json"
+_PLAN_TOKEN: Final = "0" * 16  # stands for the per-submission token in the deterministic plan digest
+_BINDING_WAIT_SECONDS: Final = 180  # NFS visibility of the driver's manifest on the step's node (probe P1: 52 s)
+_INTERRUPTION_ERRORS: Final = frozenset({"CaseInterruptedError", "KeyboardInterrupt", "SystemExit"})
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
-_SUMMARY_METRIC_FIELDS: Final = (
-    "suite_name",
-    "suite_digest",
-    "benchmark_mode",
-    "representative_cases",
-    "cases_per_variant",
-    "required_successful_measurements",
-    "cores_per_node",
-    "variants",
-    "fastest_single_case_cores",
-    "lowest_core_hours_cores",
-    "recommended_cores_per_case",
-    "recommended_estimated_cases_per_node",
-    "recommended_production",
-    "recommendation_basis",
-    "timing_contract",
-    "resource_limits",
-    "license_qualification",
-    "production_interpretation",
-    "production_configuration_modified",
-    "dataset_membership",
-    "canary_wave",
-)
 
 
 def _utc_now() -> str:
     """Return one timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _slurm_scheduler_start_time_evidence() -> dict[str, str | None]:
@@ -158,7 +136,7 @@ def _slurm_scheduler_start_time_evidence() -> dict[str, str | None]:
             "warning": "value is not positive",
         }
     try:
-        started = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        started = datetime.fromtimestamp(timestamp, tz=UTC)
     except (OverflowError, OSError, ValueError):
         return {
             "status": "invalid",
@@ -174,6 +152,31 @@ def _slurm_scheduler_start_time_evidence() -> dict[str, str | None]:
     }
 
 
+def _executing_source() -> tuple[str, str]:
+    """Return the commit and source fingerprint this process executes: the admitted frozen tree, or the live checkout."""
+    if common.paths.source_tree_id() is not None:
+        tree = source_service.verify_admitted_source_tree()
+        return tree.git_commit, tree.source_fingerprint_sha256
+    repository = common.paths.get_project_root()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    fingerprint = subprocess.run(  # noqa: S603 -- fixed source fingerprint invocation
+        [sys.executable, str(repository / "scripts" / "source_fingerprint.py"), str(repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if _SHA256_PATTERN.fullmatch(fingerprint) is None:
+        message = f"The live source fingerprint is malformed: {fingerprint!r}."
+        raise RuntimeError(message)
+    return source_service.validate_git_commit(commit), fingerprint
+
+
 def resolve_core_benchmark_runtime_identity(
     path: Path | str,
     *,
@@ -182,60 +185,37 @@ def resolve_core_benchmark_runtime_identity(
 ) -> dict[str, Any]:
     """Resolve the deterministic runtime identity without persistent mutation."""
     suite = benchmark_config.load_core_benchmark_suite(path, require_executable=True)
+    commit, fingerprint = _executing_source()
+    if commit != source_service.validate_git_commit(git_commit):
+        message = f"Benchmark source commit {commit} does not match the requested commit {git_commit}."
+        raise RuntimeError(message)
     version = _comsol_version_evidence(
         comsol_version_output,
         configured_executable=suite.resource_contract()["comsol_executable"],
     )
     run_id = core_benchmark_run_id(
         suite,
-        git_commit=git_commit,
+        git_commit=commit,
+        source_fingerprint=fingerprint,
         comsol_version=version,
     )
     return {
         "schema_kind": "generation_core_scaling_benchmark_runtime_identity",
-        "schema_version": 1,
+        "schema_version": BENCHMARK_SCHEMA_VERSION,
         "benchmark_run_id": run_id,
         "suite_digest": suite.suite_digest,
-        "git_commit": source_service.validate_git_commit(git_commit),
+        "git_commit": commit,
+        "source_fingerprint_sha256": fingerprint,
         "comsol_version": version,
     }
 
 
-def _repository_commit() -> str:
-    """Return the exact commit of the current shared repository."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],  # noqa: S607 -- site PATH owns Git
-        cwd=common.paths.get_project_root(),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return source_service.validate_git_commit(result.stdout.strip())
-
-
-def _require_clean_repository() -> None:
-    """Require the benchmark checkout to contain only exact committed source."""
-    result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"],  # noqa: S607 -- site PATH owns Git
-        cwd=common.paths.get_project_root(),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    changes = [line for line in result.stdout.splitlines() if line]
-    if changes:
-        preview = ", ".join(changes[:_MAX_DIRTY_PATH_PREVIEW])
-        suffix = "" if len(changes) <= _MAX_DIRTY_PATH_PREVIEW else f" (+{len(changes) - _MAX_DIRTY_PATH_PREVIEW} more)"
-        message = f"Standalone benchmark requires clean exact committed source; working-tree changes: {preview}{suffix}"
-        raise RuntimeError(message)
-
-
 def _require_current_checkout(manifest: Mapping[str, Any]) -> None:
-    """Require the executing repository to equal the persisted source commit."""
-    expected = source_service.validate_git_commit(manifest.get("git_commit"))
-    actual = _repository_commit()
+    """Require the executing source (commit and fingerprint) to equal the persisted benchmark source."""
+    expected = (source_service.validate_git_commit(manifest.get("git_commit")), manifest.get("source_fingerprint_sha256"))
+    actual = _executing_source()
     if actual != expected:
-        message = f"Benchmark checkout commit {actual} does not match persisted commit {expected}."
+        message = f"Benchmark source {actual} does not match the persisted source {expected}."
         raise RuntimeError(message)
 
 
@@ -268,10 +248,14 @@ def _benchmark_identity(
     suite: benchmark_config.CoreBenchmarkSuite,
     *,
     git_commit: str,
+    source_fingerprint: str,
     comsol_version: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the actual dependency-scoped standalone benchmark identity."""
+    """Return the actual dependency-scoped standalone benchmark identity, bound to the frozen source snapshot."""
     commit = source_service.validate_git_commit(git_commit)
+    if _SHA256_PATTERN.fullmatch(str(source_fingerprint)) is None:
+        message = "Benchmark source fingerprint is malformed."
+        raise ValueError(message)
     version = benchmark_config.require_mapping(comsol_version, label="benchmark COMSOL version evidence")
     if (
         set(version) != {"configured_executable", "output", "digest"}
@@ -290,6 +274,7 @@ def _benchmark_identity(
         "schema_kind": BENCHMARK_RUN_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "git_commit": commit,
+        "source_fingerprint_sha256": source_fingerprint,
         "suite_digest": suite.suite_digest,
         "case_selection_digests": [case["selection_digest"] for case in cases],
         "scientific_config_digest": suite.case_config.scientific_config_digest,
@@ -297,7 +282,7 @@ def _benchmark_identity(
         "template_sha256": suite.case_config.template_sha256,
         "export_contract_sha256": cases[0]["export_contract_sha256"],
         "execution_config_digest": cases[0]["execution_config_digest"],
-        "variant_wave_order": [variant.variant_id for variant in suite.variant_wave_order()],
+        "sweeps": _sweep_records(suite),
         "representative_case_count": suite.representative_case_count,
         "variants": _variant_records(suite),
         "comsol_version": version,
@@ -308,6 +293,7 @@ def core_benchmark_run_id(
     suite: benchmark_config.CoreBenchmarkSuite,
     *,
     git_commit: str,
+    source_fingerprint: str,
     comsol_version: Mapping[str, Any],
 ) -> str:
     """Return the standalone run identity from actual benchmark dependencies."""
@@ -315,6 +301,7 @@ def core_benchmark_run_id(
         _benchmark_identity(
             suite,
             git_commit=git_commit,
+            source_fingerprint=source_fingerprint,
             comsol_version=comsol_version,
         )
     )
@@ -402,7 +389,7 @@ def _validate_preflight_payload(
         "comsol_runtime",
         "python_runtime",
         "storage_capabilities",
-        "submission_command_digest",
+        "sweep_plan_digest",
         "checks",
     }
     if (
@@ -419,22 +406,12 @@ def _validate_preflight_payload(
         payload.get("benchmark_identity"),
         label="benchmark preflight identity",
     )
-    expected_identity = _benchmark_identity(
-        suite,
-        git_commit=git_commit,
-        comsol_version=benchmark_config.require_mapping(
-            identity.get("comsol_version"),
-            label="benchmark preflight COMSOL version",
-        ),
-    )
+    fingerprint = str(identity.get("source_fingerprint_sha256"))
+    comsol_version = benchmark_config.require_mapping(identity.get("comsol_version"), label="benchmark preflight COMSOL version")
+    expected_identity = _benchmark_identity(suite, git_commit=git_commit, source_fingerprint=fingerprint, comsol_version=comsol_version)
     if (
         identity != expected_identity
-        or core_benchmark_run_id(
-            suite,
-            git_commit=git_commit,
-            comsol_version=identity["comsol_version"],
-        )
-        != run_id
+        or core_benchmark_run_id(suite, git_commit=git_commit, source_fingerprint=fingerprint, comsol_version=comsol_version) != run_id
     ):
         message = f"Standalone benchmark preflight identity conflicts: {run_id}"
         raise ValueError(message)
@@ -466,8 +443,8 @@ def _validate_preflight_payload(
     ):
         message = f"Standalone benchmark Python runtime evidence is malformed: {run_id}"
         raise ValueError(message)
-    if _SHA256_PATTERN.fullmatch(str(payload.get("submission_command_digest"))) is None:
-        message = f"Standalone benchmark command evidence is malformed: {run_id}"
+    if _SHA256_PATTERN.fullmatch(str(payload.get("sweep_plan_digest"))) is None:
+        message = f"Standalone benchmark sweep plan evidence is malformed: {run_id}"
         raise ValueError(message)
     benchmark_report.parse_benchmark_timestamp(payload.get("recorded_at"), label="benchmark preflight recorded_at")
     preflight_seconds = payload.get("benchmark_preflight_seconds")
@@ -493,11 +470,10 @@ def preflight_core_benchmark(
     """Run inexpensive benchmark-owned source, runtime, storage, and command checks."""
     started = time.perf_counter()
     requested_commit = source_service.validate_git_commit(git_commit)
-    current_commit = _repository_commit()
+    current_commit, fingerprint = _executing_source()
     if current_commit != requested_commit:
-        message = f"Shared repository commit {current_commit} does not match requested benchmark commit {requested_commit}."
+        message = f"Benchmark source commit {current_commit} does not match requested benchmark commit {requested_commit}."
         raise RuntimeError(message)
-    _require_clean_repository()
     suite = benchmark_config.load_core_benchmark_suite(path, require_executable=True)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     persistent = _probe_directory_capability(storage, label="benchmark persistent storage")
@@ -514,38 +490,9 @@ def preflight_core_benchmark(
         comsol_version_output,
         configured_executable=suite.resource_contract()["comsol_executable"],
     )
-    if any(
-        argument == "-usebatchlic" or argument.startswith("-usebatchlic=")
-        for argument in suite.case_config.execution_values["runtime"]["extra_arguments"]
-    ):
-        message = "Standalone benchmark rejects unverified COMSOL -usebatchlic."
-        raise ValueError(message)
-    identity = _benchmark_identity(
-        suite,
-        git_commit=requested_commit,
-        comsol_version=version,
-    )
-    run_id = core_benchmark_run_id(
-        suite,
-        git_commit=requested_commit,
-        comsol_version=version,
-    )
+    identity = _benchmark_identity(suite, git_commit=requested_commit, source_fingerprint=fingerprint, comsol_version=version)
+    run_id = core_benchmark_run_id(suite, git_commit=requested_commit, source_fingerprint=fingerprint, comsol_version=version)
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
-    commands = [
-        build_core_benchmark_slurm_command(
-            suite,
-            run_id=run_id,
-            storage_root=storage,
-            log_directory=logs,
-            variant=variant,
-            case_position=case_position,
-        )
-        for variant, case_position in _measured_sequence(suite)
-    ]
-    if any(argument == "--licenses" or argument.startswith("--licenses=") for command in commands for argument in command):
-        message = "Standalone benchmark Slurm commands must not request --licenses."
-        raise ValueError(message)
     payload = {
         "schema_kind": BENCHMARK_PREFLIGHT_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
@@ -572,18 +519,16 @@ def preflight_core_benchmark(
             "scratch": scratch,
             "persistent": persistent,
         },
-        "submission_command_digest": common.serialization.canonical_json_sha256(commands),
+        "sweep_plan_digest": common.serialization.canonical_json_sha256(_sweep_plan(suite, run_id=run_id)),
         "checks": {
-            "clean_exact_source": "pass",
+            "frozen_source_snapshot": "pass",
             "suite_and_case": "pass",
             "template_and_export_contract": "pass",
             "comsol_executable_and_version": "pass",
             "python_runtime_and_imports": "pass",
-            "scheduler_resources": "pass",
+            "node_job_resources": "pass",
             "scratch_storage": "pass",
             "persistent_storage": "pass",
-            "slurm_commands": "pass",
-            "unsupported_license_flags_absent": "pass",
         },
     }
     directory.mkdir(parents=True, exist_ok=True)
@@ -636,100 +581,170 @@ def _load_core_benchmark_preflight(
     return payload
 
 
+def _sweep_records(suite: benchmark_config.CoreBenchmarkSuite) -> list[dict[str, Any]]:
+    """Return persisted sweep identities: seat and variant order of every sweep."""
+    return [
+        {
+            "sweep_id": sweep.sweep_id,
+            "order": sweep.order,
+            "seat": seat,
+            "variant_order": [variant.variant_id for variant in suite.sweep_variants(sweep)],
+        }
+        for seat, sweep in enumerate(suite.sweeps, start=1)
+    ]
+
+
+def _format_seconds(seconds: int) -> str:
+    """Return one Slurm ``HH:MM:SS`` time."""
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _unit_ticket(
+    suite: benchmark_config.CoreBenchmarkSuite,
+    *,
+    run_id: str,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant: benchmark_config.CoreBenchmarkVariant,
+    variant_attempt: int,
+    case_position: int,
+    group: int,
+    seq: int,
+    token: str,
+) -> node_service.NodeTicket:
+    """Return the step ticket that measures one work unit inside its sweep node job."""
+    repository = common.paths.get_project_root().resolve()
+    representative = suite.representative_case(case_position)
+    timeout = int(suite.case_config.execution_values["runtime"]["timeout_seconds"])
+    seat = suite.sweeps.index(sweep) + 1
+    return node_service.NodeTicket(
+        seq=seq,
+        kind=node_service.STEP_KIND,
+        group=group,
+        cores=variant.cores_per_case,
+        memory=suite.resources(variant).memory_per_case,
+        time_limit=_format_seconds(timeout + _CASE_PUBLICATION_MARGIN_SECONDS),
+        required_seconds=timeout + _CASE_PUBLICATION_MARGIN_SECONDS + _STEP_LAUNCH_WAIT_SECONDS,
+        label=f"bm{seat}-c{variant.cores_per_case:02d}-a{variant_attempt}-{representative.case_role}"[:48],
+        argv=(
+            str(repository / "scripts" / "generation_node.sh"),
+            str(repository),
+            "benchmark-case",
+            run_id,
+            sweep.sweep_id,
+            variant.variant_id,
+            str(variant_attempt),
+            representative.case_role,
+        ),
+        env={"GENERATION_BENCHMARK_RUN_ID": run_id, "GENERATION_NODE_TOKEN": token},
+        success_target=suite.target_successful_cases,
+    )
+
+
+def _sweep_tickets(
+    suite: benchmark_config.CoreBenchmarkSuite,
+    *,
+    run_id: str,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant_attempts: Sequence[tuple[benchmark_config.CoreBenchmarkVariant, int]],
+    token: str,
+) -> tuple[node_service.NodeTicket, ...]:
+    """Return every ticket of one sweep node job: one group per variant in sweep order, then the stop ticket."""
+    tickets: list[node_service.NodeTicket] = []
+    for group, (variant, attempt) in enumerate(variant_attempts):
+        for case_position in range(1, suite.representative_case_count + 1):
+            tickets.append(
+                _unit_ticket(
+                    suite,
+                    run_id=run_id,
+                    sweep=sweep,
+                    variant=variant,
+                    variant_attempt=attempt,
+                    case_position=case_position,
+                    group=group,
+                    seq=len(tickets) + 1,
+                    token=token,
+                )
+            )
+    tickets.append(node_service.NodeTicket(seq=len(tickets) + 1, kind=node_service.STOP_KIND))
+    return tuple(tickets)
+
+
+def _sweep_plan(suite: benchmark_config.CoreBenchmarkSuite, *, run_id: str) -> list[dict[str, Any]]:
+    """Return the deterministic first-attempt plan of every sweep: node-job resources and ticket payloads."""
+    return [
+        {
+            "sweep_id": sweep.sweep_id,
+            "seat": seat,
+            "node_job": {
+                "cores_per_node": suite.cores_per_node,
+                "node_job_memory": suite.sweep_node_job_memory(),
+                "node_job_wall_time": suite.sweep_wall_time,
+                "partition": suite.partition,
+            },
+            "tickets": [
+                ticket.to_payload()
+                for ticket in _sweep_tickets(
+                    suite,
+                    run_id=run_id,
+                    sweep=sweep,
+                    variant_attempts=[(variant, 1) for variant in suite.sweep_variants(sweep)],
+                    token=_PLAN_TOKEN,
+                )
+            ],
+        }
+        for seat, sweep in enumerate(suite.sweeps, start=1)
+    ]
+
+
+def _validated_node_job_ids(manifest: Mapping[str, Any]) -> tuple[str, ...]:
+    """Validate the node-job records and return their known job IDs in record order."""
+    run_id = str(manifest.get("benchmark_run_id"))
+    records = manifest.get("node_jobs")
+    job_ids = manifest.get("measured_job_ids")
+    if not isinstance(records, list) or not isinstance(job_ids, list):
+        message = f"Benchmark node-job records are malformed: {run_id}"
+        raise TypeError(message)
+    known: list[str] = []
+    tokens: set[str] = set()
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or _TOKEN_PATTERN.fullmatch(str(record.get("token"))) is None
+            or record.get("status") not in {"submitting", "submitted", "submission_failed", "unknown"}
+            or str(record.get("token")) in tokens
+        ):
+            message = f"Benchmark node-job record is malformed: {run_id}"
+            raise ValueError(message)
+        tokens.add(str(record["token"]))
+        job_id = record.get("job_id")
+        if job_id is not None:
+            if not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None:
+                message = f"Benchmark node-job record has a malformed Slurm job ID: {run_id}"
+                raise ValueError(message)
+            known.append(job_id)
+    if known != job_ids or len(set(known)) != len(known):
+        message = f"Benchmark job IDs disagree with the node-job records: {run_id}"
+        raise ValueError(message)
+    intent = manifest.get("node_job_intent")
+    unresolved = [str(record["token"]) for record in records if record["status"] == "submitting"]
+    if (intent is None and unresolved) or (intent is not None and unresolved != [intent]):
+        message = f"Benchmark node-job intent is inconsistent: {run_id}"
+        raise ValueError(message)
+    return tuple(known)
+
+
 def _variant_records(suite: benchmark_config.CoreBenchmarkSuite) -> list[dict[str, Any]]:
-    """Return persisted variant identities from one resolved suite."""
+    """Return persisted variant identities and derived node-job resources from one resolved suite."""
     return [
         {
             "variant_id": variant.variant_id,
-            "config": benchmark_config.repository_relative(variant.source_path),
             "cores_per_case": variant.cores_per_case,
+            "concurrent_cases": suite.resources(variant).concurrent_cases,
+            "node_job_memory": suite.resources(variant).node_job_memory,
             "execution_id": suite.execution_id(variant),
         }
         for variant in suite.variants
     ]
-
-
-def _node_environment(suite: benchmark_config.CoreBenchmarkSuite, run_id: str, storage_root: Path) -> list[str]:
-    """Return exact environment bindings consumed by the compute-node script."""
-    site = suite.case_campaign.execution_values["site"]
-    runtime_root = common.paths.get_runtime_root().resolve()
-    source_commit = os.environ.get("GENERATION_GIT_COMMIT", "")
-    source_sha = os.environ.get("GENERATION_SOURCE_SHA256", "")
-    native_venv = os.environ.get("GENERATION_NATIVE_VENV", "")
-    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
-        message = "GENERATION_GIT_COMMIT must contain the exact launch commit."
-        raise ValueError(message)
-    if re.fullmatch(r"[0-9a-f]{64}", source_sha) is None:
-        message = "GENERATION_SOURCE_SHA256 must contain the launch source fingerprint."
-        raise ValueError(message)
-    if Path(native_venv) != runtime_root / "venvs" / "native":
-        message = "GENERATION_NATIVE_VENV must be the sibling runtime Generation venv."
-        raise ValueError(message)
-    return [
-        f"GENERATION_GIT_COMMIT={source_commit}",
-        f"GENERATION_SOURCE_SHA256={source_sha}",
-        f"GENERATION_NATIVE_VENV={native_venv}",
-        f"STORAGE_ROOT={storage_root.resolve()}",
-        f"GENERATION_BENCHMARK_RUN_ID={run_id}",
-        f"GENERATION_COMSOL_MODULE={site['comsol_module']}",
-        f"GENERATION_PYTHON_EXECUTABLE={site['python_executable']}",
-        f"GENERATION_COMSOL_EXECUTABLE={site['comsol_executable']}",
-    ]
-
-
-def _measured_sequence(
-    suite: benchmark_config.CoreBenchmarkSuite,
-) -> tuple[tuple[benchmark_config.CoreBenchmarkVariant, int], ...]:
-    """Return both cases for each production-first sequential variant wave."""
-    return tuple(
-        (variant, case_position) for variant in suite.variant_wave_order() for case_position in range(1, suite.representative_case_count + 1)
-    )
-
-
-def build_core_benchmark_slurm_command(
-    suite: benchmark_config.CoreBenchmarkSuite,
-    *,
-    run_id: str,
-    storage_root: Path,
-    log_directory: Path,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-) -> list[str]:
-    """Build one ordinary measured benchmark Slurm job."""
-    repository = common.paths.get_project_root().resolve()
-    launcher = repository / "scripts" / "generation_node.sh"
-    if not launcher.is_file() or launcher.is_symlink():
-        message = f"Benchmark compute-node launcher is missing or unsafe: {launcher}"
-        raise FileNotFoundError(message)
-    if not storage_root.is_absolute() or not log_directory.is_absolute():
-        message = "Benchmark Slurm storage and log roots must be absolute."
-        raise ValueError(message)
-    suite.work_unit_id(variant, case_position)
-    environment = _node_environment(suite, run_id, storage_root)
-    representative = suite.representative_case(case_position)
-    worker = [
-        str(launcher),
-        str(repository),
-        "benchmark-case",
-        run_id,
-        variant.variant_id,
-        representative.case_role,
-    ]
-    wrapped = shlex.join(["env", *environment, *worker])
-    job_suffix = f"c{variant.cores_per_case:02d}-{representative.case_role[:3]}-{run_id.rsplit('__', maxsplit=1)[-1][:4]}"
-    job_name = f"td-bench-{job_suffix}"
-    if len(job_name) > _MAX_SLURM_JOB_NAME_LENGTH or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", job_name) is None:
-        message = f"Benchmark Slurm job name is unsafe or exceeds 48 characters: {job_name!r}."
-        raise ValueError(message)
-    return cluster_service.build_generation_slurm_command(
-        repository=repository,
-        job_name=job_name,
-        cores_per_task=variant.cores_per_case,
-        partition=suite.partition,
-        wall_time=suite.wall_time,
-        scheduler_options=suite.scheduler_options,
-        wrapped=wrapped,
-    )
 
 
 def _plan_payload(
@@ -739,30 +754,9 @@ def _plan_payload(
     storage: Path,
     preflight: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build the canonical two-case, four-wave benchmark plan."""
+    """Build the canonical sweep plan: one node job per sweep, one ticket group per variant."""
     run_id = str(preflight["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
-    sequence = _measured_sequence(suite)
-    work_unit_commands = [
-        {
-            "variant_id": variant.variant_id,
-            "cores_per_case": variant.cores_per_case,
-            "case_position": case_position,
-            "case_role": suite.representative_case(case_position).case_role,
-            "work_unit_id": suite.work_unit_id(variant, case_position),
-            "command": build_core_benchmark_slurm_command(
-                suite,
-                run_id=run_id,
-                storage_root=storage,
-                log_directory=logs,
-                variant=variant,
-                case_position=case_position,
-            ),
-        }
-        for variant, case_position in sequence
-    ]
-    wave_order = suite.variant_wave_order()
     return {
         "schema_kind": "generation_core_scaling_benchmark_plan",
         "schema_version": BENCHMARK_SCHEMA_VERSION,
@@ -773,6 +767,7 @@ def _plan_payload(
         "suite_digest": suite.suite_digest,
         "suite_config": benchmark_config.repository_relative(suite.source_path),
         "git_commit": git_commit,
+        "source_fingerprint_sha256": preflight["benchmark_identity"]["source_fingerprint_sha256"],
         "preflight": {
             "receipt_sha256": common.serialization.file_sha256(_preflight_path(run_id, storage_root=storage)),
             "benchmark_identity": preflight["benchmark_identity"],
@@ -780,47 +775,26 @@ def _plan_payload(
             "checks": preflight["checks"],
         },
         "representative_cases": suite.case_selections(),
-        "parallel_cases_per_variant": suite.representative_case_count,
         "variants": _variant_records(suite),
-        "variant_wave_order": [variant.variant_id for variant in wave_order],
-        "required_successful_measurements": len(sequence),
-        "canary_wave": {
-            "variant_id": wave_order[0].variant_id,
-            "cores_per_case": wave_order[0].cores_per_case,
-            "case_roles": [item.case_role for item in suite.representative_cases],
-            "included_in_final_measurements": True,
-            "additional_canary_work_units": 0,
-        },
-        "measurement_waves": [
-            {
-                "wave_position": wave_position,
-                "variant_id": variant.variant_id,
-                "cores_per_case": variant.cores_per_case,
-                "depends_on_wave": None if wave_position == 1 else wave_position - 1,
-                "work_unit_ids": [suite.work_unit_id(variant, case_position) for case_position in range(1, suite.representative_case_count + 1)],
-                "case_execution": "concurrent",
-            }
-            for wave_position, variant in enumerate(wave_order, start=1)
-        ],
+        "sweeps": _sweep_records(suite),
+        "required_successes_per_sweep": len(suite.variants) * suite.target_successful_cases,
         "resource_contract": suite.resource_contract(),
+        "sweep_plan": _sweep_plan(suite, run_id=run_id),
         "paths": {
             "storage_root": str(storage),
             "benchmark_root": str(directory),
-            "scheduler_logs": str(logs),
+            "scheduler_logs": str(common.paths.get_runtime_root().resolve() / "logs" / "generation"),
         },
         "canonical_input_preparation": {
-            "execution_environment": "cpu_login",
-            "scheduler_job": False,
+            "execution_environment": "slurm_driver",
+            "scheduler_job": True,
             "proof_directory": "canonical_cases",
             "case_count": suite.representative_case_count,
         },
-        "submission_commands": {"work_units": work_unit_commands},
         "isolation": {
-            "scientific_cases_per_job": 1,
-            "maximum_active_benchmark_jobs": suite.representative_case_count,
+            "node_jobs": len(suite.sweeps),
+            "variant_groups_overlap": False,
             "scheduler_arrays": False,
-            "ordered_variant_waves": True,
-            "case_execution_within_variant": "concurrent",
             "queue_wait_primary_metric": False,
             "license_wait_primary_metric": False,
         },
@@ -899,7 +873,7 @@ def load_core_benchmark_scheduler_job_ids(
     *,
     storage_root: Path | str,
 ) -> tuple[str, ...]:
-    """Load only exact persisted scheduler ownership for one benchmark run."""
+    """Load only exact persisted scheduler ownership (the sweep node jobs) of one benchmark run."""
     manifest = _load_json(
         _manifest_path(run_id, storage_root=storage_root),
         label="core benchmark manifest",
@@ -912,33 +886,10 @@ def load_core_benchmark_scheduler_job_ids(
     ):
         message = f"Core benchmark manifest schema or run identity is invalid: {run_id}"
         raise ValueError(message)
-    job_ids = manifest.get("measured_job_ids")
-    if (
-        not isinstance(job_ids, list)
-        or len(job_ids) != len(set(job_ids))
-        or not all(isinstance(job_id, str) and _JOB_ID_PATTERN.fullmatch(job_id) is not None for job_id in job_ids)
-    ):
-        message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
-        raise ValueError(message)
-    history = manifest.get("submission_history")
-    if not isinstance(history, list):
-        message = f"Benchmark submission history is malformed: {run_id}"
-        raise TypeError(message)
-    history_ids: list[str] = []
-    for record in history:
-        if (
-            not isinstance(record, dict)
-            or record.get("role") != "measure"
-            or not isinstance(record.get("job_id"), str)
-            or _JOB_ID_PATTERN.fullmatch(record["job_id"]) is None
-        ):
-            message = f"Benchmark submission history is malformed: {run_id}"
-            raise ValueError(message)
-        history_ids.append(record["job_id"])
-    if history_ids != job_ids:
-        message = f"Benchmark job IDs disagree with submission history: {run_id}"
-        raise ValueError(message)
-    return tuple(job_ids)
+    if manifest.get("node_job_intent") is not None:
+        message = f"Core benchmark {run_id} has an unresolved node-job submission; resume it before relying on its job ownership."
+        raise RuntimeError(message)
+    return _validated_node_job_ids(manifest)
 
 
 def load_core_benchmark_manifest(
@@ -961,18 +912,18 @@ def load_core_benchmark_manifest(
             "suite_digest",
             "suite_config",
             "git_commit",
+            "source_fingerprint_sha256",
             "preflight",
             "representative_cases",
             "variants",
-            "variant_wave_order",
-            "canary_wave",
-            "measurement_waves",
-            "required_successful_measurements",
+            "sweeps",
+            "required_successes_per_sweep",
             "resource_contract",
             "created_at",
             "state",
             "measured_job_ids",
-            "submission_history",
+            "node_jobs",
+            "node_job_intent",
         },
         label="core benchmark manifest",
     )
@@ -989,38 +940,19 @@ def load_core_benchmark_manifest(
         label="benchmark manifest suite_config",
     )
     suite = benchmark_config.load_core_benchmark_suite(suite_path, require_executable=True)
-    wave_order = suite.variant_wave_order()
     expected = {
         "suite_name": suite.suite_name,
         "suite_digest": suite.suite_digest,
         "representative_cases": suite.case_selections(),
         "variants": _variant_records(suite),
-        "variant_wave_order": [variant.variant_id for variant in wave_order],
-        "canary_wave": {
-            "variant_id": wave_order[0].variant_id,
-            "cores_per_case": wave_order[0].cores_per_case,
-            "case_roles": [item.case_role for item in suite.representative_cases],
-            "included_in_final_measurements": True,
-            "additional_canary_work_units": 0,
-        },
-        "measurement_waves": [
-            {
-                "wave_position": wave_position,
-                "variant_id": variant.variant_id,
-                "cores_per_case": variant.cores_per_case,
-                "depends_on_wave": None if wave_position == 1 else wave_position - 1,
-                "work_unit_ids": [suite.work_unit_id(variant, case_position) for case_position in range(1, suite.representative_case_count + 1)],
-                "case_execution": "concurrent",
-            }
-            for wave_position, variant in enumerate(wave_order, start=1)
-        ],
-        "required_successful_measurements": (len(suite.variants) * suite.representative_case_count),
+        "sweeps": _sweep_records(suite),
+        "required_successes_per_sweep": len(suite.variants) * suite.target_successful_cases,
         "resource_contract": suite.resource_contract(),
     }
-
     if any(manifest.get(key) != value for key, value in expected.items()):
         message = f"Core benchmark manifest no longer matches current suite source: {run_id}"
         raise ValueError(message)
+    _validated_node_job_ids(manifest)
     preflight = _load_core_benchmark_preflight(
         run_id,
         suite=suite,
@@ -1033,14 +965,18 @@ def load_core_benchmark_manifest(
         "comsol_runtime": preflight["comsol_runtime"],
         "checks": preflight["checks"],
     }
-    if manifest.get("preflight") != expected_preflight:
+    if (
+        manifest.get("preflight") != expected_preflight
+        or manifest["source_fingerprint_sha256"] != preflight["benchmark_identity"]["source_fingerprint_sha256"]
+    ):
         message = f"Core benchmark manifest preflight identity is inconsistent: {run_id}"
         raise ValueError(message)
     return manifest, suite
 
 
 def _submit(command: Sequence[str], *, git_commit: str, run_id: str) -> str:
-    """Submit one typed Slurm command and return its parsable root job ID."""
+    """Submit one typed Slurm command from the executing source tree, lease that tree for it, and return its parsable root job ID."""
+    cluster_service.executing_tree_id()
     environment = os.environ.copy()
     environment["GENERATION_GIT_COMMIT"] = git_commit
     environment["GENERATION_BENCHMARK_RUN_ID"] = run_id
@@ -1055,17 +991,8 @@ def _submit(command: Sequence[str], *, git_commit: str, run_id: str) -> str:
     if _JOB_ID_PATTERN.fullmatch(job_id) is None:
         message = f"Slurm returned an invalid benchmark job identifier: {result.stdout!r}."
         raise RuntimeError(message)
+    cluster_service.lease_executing_tree(job_id)
     return job_id
-
-
-def _success_path(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-) -> Path:
-    """Return the immutable success evidence path for one case_position."""
-    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position) / "success.json"
 
 
 def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
@@ -1075,6 +1002,8 @@ def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
     identity_keys = (
         "benchmark_run_id",
         "suite_digest",
+        "sweep_id",
+        "variant_attempt",
         "variant_id",
         "execution_id",
         "case_position",
@@ -1092,7 +1021,7 @@ def _validate_benchmark_attempt_chain(attempts: Sequence[Path]) -> None:
         if attempt_path.name != f"attempt-{expected_index:04d}.json":
             message = f"Benchmark attempt history is not contiguous: {attempt_path}"
             raise ValueError(message)
-        payload = _load_json(attempt_path, label="benchmark case_position attempt")
+        payload = _load_json(attempt_path, label="benchmark work-unit attempt")
         previous = payload.get("previous_attempt")
         if expected_index == 1:
             valid_previous = previous is None
@@ -1131,8 +1060,7 @@ def _validate_result_identity(
     result: Mapping[str, Any],
     *,
     suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
+    unit: _WorkUnit,
     status: str,
 ) -> None:
     """Validate identity fields shared by successful and failed attempts."""
@@ -1141,14 +1069,16 @@ def _validate_result_identity(
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "status": status,
         "suite_digest": suite.suite_digest,
-        "variant_id": variant.variant_id,
-        "execution_id": suite.execution_id(variant),
-        "case_position": case_position,
-        "case_role": suite.representative_case(case_position).case_role,
-        "work_unit_id": suite.work_unit_id(variant, case_position),
+        "sweep_id": unit.sweep.sweep_id,
+        "variant_attempt": unit.attempt,
+        "variant_id": unit.variant.variant_id,
+        "execution_id": suite.execution_id(unit.variant),
+        "case_position": unit.case_position,
+        "case_role": suite.representative_case(unit.case_position).case_role,
+        "work_unit_id": _unit_id(suite, unit),
         "scientific_config_digest": suite.case_config.scientific_config_digest,
         "template_sha256": suite.case_config.template_sha256,
-        "cores_per_case": variant.cores_per_case,
+        "cores_per_case": unit.variant.cores_per_case,
     }
     if any(result.get(key) != value for key, value in expected.items()):
         message = f"Benchmark {status} evidence conflicts for {expected['work_unit_id']}."
@@ -1186,46 +1116,47 @@ def _validate_resource_evidence(
     result: Mapping[str, Any],
     *,
     suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
+    unit: _WorkUnit,
 ) -> None:
-    """Validate allocation plus observed per-case memory and scratch evidence."""
+    """Validate the node-job allocation, step identity, node, and observed per-case memory and scratch evidence."""
+    work_unit_id = _unit_id(suite, unit)
     resource = result.get("resource")
     expected_keys = {
         "node",
+        "cpu_model",
         "partition",
         "requested_cpus",
         "allocated_cpus",
         "comsol_np",
         "slurm_job_id",
+        "slurm_step_id",
         "peak_memory_bytes",
         "peak_scratch_bytes",
     }
     if not isinstance(resource, dict) or set(resource) != expected_keys:
-        message = f"Benchmark resource evidence is missing for {suite.work_unit_id(variant, case_position)}."
+        message = f"Benchmark resource evidence is missing for {work_unit_id}."
         raise TypeError(message)
-    expected = {
-        "requested_cpus": variant.cores_per_case,
-        "allocated_cpus": variant.cores_per_case,
-        "comsol_np": variant.cores_per_case,
-    }
-    if any(resource.get(key) != value for key, value in expected.items()):
-        message = f"Benchmark allocation evidence conflicts for {suite.work_unit_id(variant, case_position)}."
+    cores = unit.variant.cores_per_case
+    if any(resource.get(key) != cores for key in ("requested_cpus", "allocated_cpus", "comsol_np")):
+        message = f"Benchmark allocation evidence conflicts for {work_unit_id}."
         raise ValueError(message)
-    if suite.partition is not None and resource.get("partition") != suite.partition:
-        message = f"Benchmark partition evidence conflicts for {suite.work_unit_id(variant, case_position)}."
+    if resource.get("partition") != suite.partition:
+        message = f"Benchmark partition evidence conflicts for {work_unit_id}."
         raise ValueError(message)
     node = resource.get("node")
     if not isinstance(node, str) or not node or any(character in node for character in "\r\n\t"):
-        message = f"Benchmark node evidence is malformed for {suite.work_unit_id(variant, case_position)}."
+        message = f"Benchmark node evidence is malformed for {work_unit_id}."
         raise ValueError(message)
-    if _JOB_ID_PATTERN.fullmatch(str(resource.get("slurm_job_id"))) is None:
-        message = f"Benchmark slurm_job_id is malformed for {suite.work_unit_id(variant, case_position)}."
+    if resource.get("cpu_model") is not None and not isinstance(resource.get("cpu_model"), str):
+        message = f"Benchmark CPU model evidence is malformed for {work_unit_id}."
+        raise ValueError(message)
+    if _JOB_ID_PATTERN.fullmatch(str(resource.get("slurm_job_id"))) is None or _JOB_ID_PATTERN.fullmatch(str(resource.get("slurm_step_id"))) is None:
+        message = f"Benchmark Slurm job or step identity is malformed for {work_unit_id}."
         raise ValueError(message)
     for key in ("peak_memory_bytes", "peak_scratch_bytes"):
         value = resource.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            message = f"Benchmark {key} is malformed for {suite.work_unit_id(variant, case_position)}."
+            message = f"Benchmark {key} is malformed for {work_unit_id}."
             raise ValueError(message)
 
 
@@ -1436,24 +1367,12 @@ def _validate_success_result(
     result: Mapping[str, Any],
     *,
     suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
+    unit: _WorkUnit,
 ) -> None:
     """Validate one immutable successful representative-case measurement."""
-    work_unit_id = suite.work_unit_id(variant, case_position)
-    _validate_result_identity(
-        result,
-        suite=suite,
-        variant=variant,
-        case_position=case_position,
-        status="success",
-    )
-    _validate_resource_evidence(
-        result,
-        suite=suite,
-        variant=variant,
-        case_position=case_position,
-    )
+    work_unit_id = _unit_id(suite, unit)
+    _validate_result_identity(result, suite=suite, unit=unit, status="success")
+    _validate_resource_evidence(result, suite=suite, unit=unit)
     _validate_scheduler_timing(result, work_unit_id=work_unit_id)
     _validate_worker_interval(result, work_unit_id=work_unit_id)
     _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=True)
@@ -1481,26 +1400,12 @@ def _validate_failure_result(
     result: Mapping[str, Any],
     *,
     suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-    attempts: Sequence[Path],
+    unit: _WorkUnit,
 ) -> None:
-    """Validate one append-only failed scientific work-unit attempt."""
-    del attempts
-    work_unit_id = suite.work_unit_id(variant, case_position)
-    _validate_result_identity(
-        result,
-        suite=suite,
-        variant=variant,
-        case_position=case_position,
-        status="failed",
-    )
-    _validate_resource_evidence(
-        result,
-        suite=suite,
-        variant=variant,
-        case_position=case_position,
-    )
+    """Validate one append-only failed work-unit attempt."""
+    work_unit_id = _unit_id(suite, unit)
+    _validate_result_identity(result, suite=suite, unit=unit, status="failed")
+    _validate_resource_evidence(result, suite=suite, unit=unit)
     _validate_scheduler_timing(result, work_unit_id=work_unit_id)
     _validate_worker_interval(result, work_unit_id=work_unit_id)
     _validate_work_unit_timings(result, work_unit_id=work_unit_id, success=False)
@@ -1508,281 +1413,6 @@ def _validate_failure_result(
     if not isinstance(error, dict) or not isinstance(error.get("type"), str) or not error["type"] or not isinstance(error.get("message"), str):
         message = f"Benchmark failure error evidence is malformed for {work_unit_id}."
         raise ValueError(message)
-    if result.get("temporary_license_retry") is not None:
-        message = f"Temporary license capacity must remain operationally pending for {work_unit_id}."
-        raise ValueError(message)
-
-
-def _benchmark_license_wait_path(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-) -> Path:
-    """Return the sole mutable license-wait record for one case_position."""
-    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position) / "license_wait.json"
-
-
-def _benchmark_wait_timestamp(value: object, *, label: str) -> datetime:
-    """Return one timezone-aware benchmark wait timestamp."""
-    if not isinstance(value, str):
-        message = f"{label} must be a timezone-aware timestamp."
-        raise TypeError(message)
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError as error:
-        message = f"{label} must be a timezone-aware timestamp."
-        raise ValueError(message) from error
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        message = f"{label} must be a timezone-aware timestamp."
-        raise ValueError(message)
-    return parsed.astimezone(timezone.utc)
-
-
-def _validate_benchmark_license_wait(
-    payload: object,
-    *,
-    run_id: str,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-    path: Path,
-) -> dict[str, Any]:
-    """Validate one compact benchmark operational wait record."""
-    work_unit_id = suite.work_unit_id(variant, case_position)
-    expected_keys = {
-        "schema_kind",
-        "schema_version",
-        "benchmark_run_id",
-        "work_unit_id",
-        "suite_digest",
-        "variant_id",
-        "case_position",
-        "case_role",
-        "scientific_config_digest",
-        "classification",
-        "feature",
-        "error_code",
-        "matched_signatures",
-        "comsol_exit_code",
-        "solver_progress_started",
-        "expected_exports_exist",
-        "first_blocked_at",
-        "last_blocked_at",
-        "retry_count",
-        "latest_job_id",
-        "recent_job_ids",
-        "hostname",
-        "raw_excerpt",
-        "delay_before_next_attempt_seconds",
-        "cumulative_wait_seconds",
-        "cumulative_probe_seconds",
-        "cumulative_scheduler_queue_seconds",
-        "retry_budget_remaining",
-        "next_retry_at",
-    }
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != expected_keys
-        or payload.get("schema_kind") != "generation_temporary_license_wait"
-        or payload.get("schema_version") != 1
-        or payload.get("benchmark_run_id") != run_id
-        or payload.get("work_unit_id") != work_unit_id
-        or payload.get("suite_digest") != suite.suite_digest
-        or payload.get("variant_id") != variant.variant_id
-        or payload.get("case_position") != case_position
-        or payload.get("case_role") != suite.representative_case(case_position).case_role
-        or payload.get("scientific_config_digest") != suite.case_config.scientific_config_digest
-        or payload.get("classification") != license_service.TEMPORARY_LICENSE_CAPACITY
-        or not isinstance(payload.get("feature"), str)
-        or not payload["feature"]
-        or (payload.get("error_code") is not None and not isinstance(payload["error_code"], str))
-        or not isinstance(payload.get("matched_signatures"), list)
-        or not payload["matched_signatures"]
-        or not all(isinstance(value, str) and value for value in payload["matched_signatures"])
-        or payload.get("solver_progress_started") is not False
-        or payload.get("expected_exports_exist") is not False
-        or not isinstance(payload.get("raw_excerpt"), str)
-        or not payload["raw_excerpt"]
-        or not isinstance(payload.get("hostname"), str)
-        or not payload["hostname"]
-        or not isinstance(payload.get("retry_budget_remaining"), bool)
-    ):
-        message = f"Benchmark license-wait evidence is malformed: {path}"
-        raise ValueError(message)
-    exit_code = payload.get("comsol_exit_code")
-    retry_count = payload.get("retry_count")
-    delay = payload.get("delay_before_next_attempt_seconds")
-    cumulative = payload.get("cumulative_wait_seconds")
-    cumulative_probe = payload.get("cumulative_probe_seconds")
-    cumulative_queue = payload.get("cumulative_scheduler_queue_seconds")
-    job_id = payload.get("latest_job_id")
-    recent_job_ids = payload.get("recent_job_ids")
-    if (
-        (exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)))
-        or isinstance(retry_count, bool)
-        or not isinstance(retry_count, int)
-        or retry_count < 1
-        or isinstance(delay, bool)
-        or not isinstance(delay, (int, float))
-        or float(delay) < 0.0
-        or isinstance(cumulative, bool)
-        or not isinstance(cumulative, (int, float))
-        or float(cumulative) < float(delay)
-        or isinstance(cumulative_probe, bool)
-        or not isinstance(cumulative_probe, (int, float))
-        or not math.isfinite(float(cumulative_probe))
-        or float(cumulative_probe) < 0.0
-        or (cumulative_queue is not None and not _finite_nonnegative(cumulative_queue))
-        or not isinstance(job_id, str)
-        or _JOB_ID_PATTERN.fullmatch(job_id) is None
-        or not isinstance(recent_job_ids, list)
-        or not recent_job_ids
-        or len(recent_job_ids) > _MAX_RECENT_JOB_IDS
-        or len(recent_job_ids) != len(set(recent_job_ids))
-        or recent_job_ids[-1] != job_id
-        or not all(isinstance(value, str) and _JOB_ID_PATTERN.fullmatch(value) for value in recent_job_ids)
-    ):
-        message = f"Benchmark license-wait counters are malformed: {path}"
-        raise ValueError(message)
-    first = _benchmark_wait_timestamp(payload["first_blocked_at"], label="first_blocked_at")
-    last = _benchmark_wait_timestamp(payload["last_blocked_at"], label="last_blocked_at")
-    prior_cumulative = float(cumulative) - float(delay)
-    policy = suite.case_config.execution_values["runtime"]["temporary_license_retry"]
-    expected_delay = license_service.bounded_retry_delay_seconds(
-        policy,
-        attempt_index=retry_count,
-        cumulative_wait_seconds=prior_cumulative,
-    )
-    if last < first or float(delay) != expected_delay:
-        message = f"Benchmark license-wait timing is inconsistent: {path}"
-        raise ValueError(message)
-    if payload["retry_budget_remaining"]:
-        next_retry = _benchmark_wait_timestamp(payload["next_retry_at"], label="next_retry_at")
-        if float(delay) <= 0.0 or next_retry != last + timedelta(seconds=float(delay)):
-            message = f"Benchmark license-wait eligibility is inconsistent: {path}"
-            raise ValueError(message)
-    elif payload["next_retry_at"] is not None or float(delay) != 0.0:
-        message = f"Benchmark exhausted license-wait evidence is inconsistent: {path}"
-        raise ValueError(message)
-    return payload
-
-
-def _load_benchmark_license_wait(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-    *,
-    run_id: str,
-) -> dict[str, Any] | None:
-    """Load one benchmark wait record when present."""
-    path = _benchmark_license_wait_path(directory, suite, variant, case_position)
-    if not path.exists():
-        return None
-    if not path.is_file() or path.is_symlink():
-        message = f"Benchmark license-wait evidence is unsafe: {path}"
-        raise ValueError(message)
-    return _validate_benchmark_license_wait(
-        _load_json(path, label="benchmark license-wait evidence"),
-        run_id=run_id,
-        suite=suite,
-        variant=variant,
-        case_position=case_position,
-        path=path,
-    )
-
-
-def _record_benchmark_license_wait(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-    error: license_service.TemporaryLicenseCapacityError,
-    *,
-    run_id: str,
-    job_id: str,
-    license_probe_seconds: float,
-    scheduler_queue_seconds: float | None,
-) -> dict[str, Any]:
-    """Update compact wait evidence with excluded probe and optional queue timing."""
-    if not _finite_nonnegative(license_probe_seconds):
-        message = "Benchmark license_probe_seconds must be finite and non-negative."
-        raise ValueError(message)
-    if scheduler_queue_seconds is not None and not _finite_nonnegative(scheduler_queue_seconds):
-        message = "Benchmark scheduler_queue_seconds must be finite and non-negative."
-        raise ValueError(message)
-    current = _load_benchmark_license_wait(
-        directory,
-        suite,
-        variant,
-        case_position,
-        run_id=run_id,
-    )
-    if current is not None and job_id in current["recent_job_ids"]:
-        message = f"Benchmark license wait already includes job {job_id}."
-        raise FileExistsError(message)
-    now = datetime.now(timezone.utc)
-    retry_count = 1 if current is None else int(current["retry_count"]) + 1
-    prior_cumulative = 0.0 if current is None else float(current["cumulative_wait_seconds"])
-    prior_probe = 0.0 if current is None else float(current["cumulative_probe_seconds"])
-    prior_queue = (0.0 if scheduler_queue_seconds is not None else None) if current is None else current["cumulative_scheduler_queue_seconds"]
-    policy = suite.case_config.execution_values["runtime"]["temporary_license_retry"]
-    delay = license_service.bounded_retry_delay_seconds(
-        policy,
-        attempt_index=retry_count,
-        cumulative_wait_seconds=prior_cumulative,
-    )
-    recent_job_ids = [] if current is None else [str(value) for value in current["recent_job_ids"]]
-    recent_job_ids.append(job_id)
-    recent_job_ids = recent_job_ids[-_MAX_RECENT_JOB_IDS:]
-    work_unit_id = suite.work_unit_id(variant, case_position)
-    payload = {
-        "schema_kind": "generation_temporary_license_wait",
-        "schema_version": 1,
-        "benchmark_run_id": run_id,
-        "work_unit_id": work_unit_id,
-        "suite_digest": suite.suite_digest,
-        "variant_id": variant.variant_id,
-        "case_position": case_position,
-        "case_role": suite.representative_case(case_position).case_role,
-        "scientific_config_digest": suite.case_config.scientific_config_digest,
-        "classification": error.evidence.classification,
-        "feature": error.evidence.feature,
-        "error_code": error.evidence.license_code,
-        "matched_signatures": list(error.evidence.matched_signatures),
-        "comsol_exit_code": error.exit_code,
-        "solver_progress_started": error.solver_progress_started,
-        "expected_exports_exist": error.expected_exports_exist,
-        "first_blocked_at": now.isoformat() if current is None else current["first_blocked_at"],
-        "last_blocked_at": now.isoformat(),
-        "retry_count": retry_count,
-        "latest_job_id": job_id,
-        "recent_job_ids": recent_job_ids,
-        "hostname": socket.gethostname(),
-        "raw_excerpt": error.evidence.raw_excerpt,
-        "delay_before_next_attempt_seconds": delay,
-        "cumulative_wait_seconds": prior_cumulative + delay,
-        "cumulative_probe_seconds": prior_probe + license_probe_seconds,
-        "cumulative_scheduler_queue_seconds": (
-            None if prior_queue is None or scheduler_queue_seconds is None else float(prior_queue) + scheduler_queue_seconds
-        ),
-        "retry_budget_remaining": delay > 0.0,
-        "next_retry_at": (now + timedelta(seconds=delay)).isoformat() if delay > 0.0 else None,
-    }
-    path = _benchmark_license_wait_path(directory, suite, variant, case_position)
-    common.serialization.atomic_write_json(path, payload)
-    admitted = _load_benchmark_license_wait(
-        directory,
-        suite,
-        variant,
-        case_position,
-        run_id=run_id,
-    )
-    if admitted != payload:
-        message = f"Benchmark license-wait evidence did not re-admit: {path}"
-        raise RuntimeError(message)
-    return payload
 
 
 def _validate_materialized_case_proof(
@@ -1805,112 +1435,6 @@ def _validate_hdf5_scientific_identity(
         raise RuntimeError(message)
 
 
-def _normalized_scheduler_state(value: str) -> str:
-    """Return one Slurm state without suffix or annotation."""
-    return value.split("+", maxsplit=1)[0].split(maxsplit=1)[0]
-
-
-def _accounted_root_state(
-    scheduler: Mapping[str, Any],
-    *,
-    job_id: str,
-) -> str | None:
-    """Return one exact root-job state from scheduler accounting."""
-    for line in str(scheduler["sacct"]["output"]).splitlines():
-        accounted_job_id, separator, remainder = line.partition("|")
-        if separator and accounted_job_id == job_id:
-            state, _separator, _remaining_fields = remainder.partition("|")
-            return _normalized_scheduler_state(state)
-    return None
-
-
-def _accounting_timestamp(value: str) -> datetime | None:
-    """Parse one optional Slurm accounting timestamp without relabeling its zone."""
-    if value in {"", "Unknown", "N/A"}:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed
-
-
-def _accounted_queue_seconds(scheduler: Mapping[str, Any], job_ids: Sequence[str]) -> float | None:
-    """Derive queue duration from exact terminal root-job accounting rows."""
-    if scheduler["sacct"]["error"] is not None:
-        return None
-    requested = set(job_ids)
-    rows: dict[str, float] = {}
-    for line in str(scheduler["sacct"]["output"]).splitlines():
-        fields = line.split("|")
-        if len(fields) < _SACCT_QUEUE_FIELDS or fields[0] not in requested:
-            continue
-        state = _normalized_scheduler_state(fields[1])
-        submitted = _accounting_timestamp(fields[3])
-        started = _accounting_timestamp(fields[4])
-        if state in _ACTIVE_SCHEDULER_STATES or submitted is None or started is None or started < submitted:
-            continue
-        rows[fields[0]] = (started - submitted).total_seconds()
-    if set(rows) != requested:
-        return None
-    return sum(rows.values())
-
-
-def _controller_scheduler_queue_accounting(
-    manifest: Mapping[str, Any],
-    records: Sequence[Mapping[str, Any]],
-    scheduler: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Report terminal accounting queue evidence for every successful work unit."""
-    evidence: list[dict[str, Any]] = []
-    for record in records:
-        if record.get("status") != "success":
-            continue
-        submissions = [
-            str(submission["job_id"])
-            for submission in manifest["submission_history"]
-            if submission.get("role") == "measure"
-            and submission.get("variant_id") == record.get("variant_id")
-            and submission.get("case_role") == record.get("case_role")
-        ]
-        queue_seconds = _accounted_queue_seconds(scheduler, submissions) if submissions else None
-        timings = benchmark_config.require_mapping(record["timings_seconds"], label="benchmark timings")
-        resource = benchmark_config.require_mapping(record["resource"], label="benchmark resource")
-        evidence.append(
-            {
-                "work_unit_id": record["work_unit_id"],
-                "variant_id": record["variant_id"],
-                "case_role": record["case_role"],
-                "slurm_job_id": resource["slurm_job_id"],
-                "job_ids": submissions,
-                "node": resource["node"],
-                "requested_cpus": resource["requested_cpus"],
-                "comsol_process_seconds": timings["comsol_process_seconds"],
-                "scheduler_queue_seconds": queue_seconds,
-                "scheduler_queue_availability": "available" if queue_seconds is not None else "unavailable",
-                "license_wait_seconds": timings["license_wait_seconds"],
-                "export_conversion_seconds": timings["export_conversion_seconds"],
-                "publication_seconds": timings["publication_seconds"],
-            }
-        )
-    return evidence
-
-
-def _controller_queue_by_work_unit(accounting: Sequence[Mapping[str, Any]]) -> dict[str, float | None]:
-    """Return controller-owned queue timing keyed by work unit."""
-    return {str(item["work_unit_id"]): item["scheduler_queue_seconds"] for item in accounting}
-
-
-def _apply_controller_queue_to_summary(summary: dict[str, Any], accounting: Sequence[Mapping[str, Any]]) -> None:
-    """Overlay terminal accounting queue totals onto derived summary variants."""
-    queues = _controller_queue_by_work_unit(accounting)
-    for variant in summary["variants"]:
-        work_units = [item["work_unit_id"] for item in accounting if item["variant_id"] == variant["variant_id"]]
-        values = [queues[work_unit_id] for work_unit_id in work_units]
-        available_values = [value for value in values if value is not None]
-        variant["scheduler_queue_seconds"] = sum(available_values) if values and len(available_values) == len(values) else None
-
-
 def _active_benchmark_job_ids(scheduler: Mapping[str, Any]) -> frozenset[str]:
     """Return exact active root job IDs from one admitted scheduler query."""
     result: set[str] = set()
@@ -1921,59 +1445,14 @@ def _active_benchmark_job_ids(scheduler: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(result)
 
 
-def _scientific_failure_count(attempts: Sequence[Path]) -> int:
-    """Count only terminal scientific failures in one admitted attempt chain."""
-    _validate_benchmark_attempt_chain(attempts)
-    return sum(
-        record.get("status") == "failed"
-        and benchmark_config.require_mapping(record.get("error"), label="benchmark attempt error").get("type") != "SourceAdmissionError"
-        for path in attempts
-        if (record := _load_json(path, label="benchmark work-unit attempt"))
-    )
-
-
-def _work_unit_directory(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-) -> Path:
+def _work_unit_directory(directory: Path, suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit) -> Path:
     """Return one benchmark work-unit evidence directory."""
-    return directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, case_position)
+    return directory / "runs" / unit.sweep.sweep_id / suite.execution_id(unit.variant) / _unit_id(suite, unit)
 
 
-def _work_unit_attempts(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
-) -> tuple[Path, ...]:
-    """Return one sorted immutable scientific-attempt chain."""
-    return tuple(
-        sorted(
-            _work_unit_directory(
-                directory,
-                suite,
-                variant,
-                case_position,
-            ).glob("attempt-*.json")
-        )
-    )
-
-
-def _latest_work_unit_submission(
-    manifest: Mapping[str, Any],
-    *,
-    variant_id: str,
-    case_role: str,
-) -> Mapping[str, Any] | None:
-    """Return the newest submission for one exact case-role work unit."""
-    matches = [
-        record
-        for record in manifest["submission_history"]
-        if record.get("role") == "measure" and record.get("variant_id") == variant_id and record.get("case_role") == case_role
-    ]
-    return None if not matches else matches[-1]
+def _work_unit_attempts(directory: Path, suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit) -> tuple[Path, ...]:
+    """Return one sorted immutable attempt chain."""
+    return tuple(sorted(_work_unit_directory(directory, suite, unit).glob("attempt-*.json")))
 
 
 def _persist_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
@@ -1981,158 +1460,544 @@ def _persist_manifest(path: Path, manifest: Mapping[str, Any]) -> None:
     common.serialization.atomic_write_json(path, dict(manifest))
 
 
-def _submit_benchmark_work_unit(
+@dataclass(frozen=True, slots=True)
+class _WorkUnit:
+    """One measured case of one variant attempt in one sweep."""
+
+    sweep: benchmark_config.CoreBenchmarkSweep
+    variant: benchmark_config.CoreBenchmarkVariant
+    attempt: int
+    case_position: int
+
+
+def _unit_id(suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit) -> str:
+    """Return the stable work-unit identity."""
+    return suite.work_unit_id(unit.sweep, unit.variant, unit.attempt, unit.case_position)
+
+
+def _variant_units(
+    suite: benchmark_config.CoreBenchmarkSuite,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant: benchmark_config.CoreBenchmarkVariant,
+    attempt: int,
+) -> tuple[_WorkUnit, ...]:
+    """Return every work unit of one variant attempt in one sweep."""
+    return tuple(_WorkUnit(sweep, variant, attempt, position) for position in range(1, suite.representative_case_count + 1))
+
+
+def _pending_record(suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit) -> dict[str, Any]:
+    """Return the identity of a work unit that has no terminal evidence yet."""
+    return {
+        "status": "pending",
+        "sweep_id": unit.sweep.sweep_id,
+        "variant_attempt": unit.attempt,
+        "variant_id": unit.variant.variant_id,
+        "execution_id": suite.execution_id(unit.variant),
+        "case_position": unit.case_position,
+        "case_role": suite.representative_case(unit.case_position).case_role,
+        "work_unit_id": _unit_id(suite, unit),
+        "cores_per_case": unit.variant.cores_per_case,
+    }
+
+
+def _unit_record(directory: Path, suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit) -> dict[str, Any]:
+    """Return the validated success, the latest validated failure, or a pending identity of one work unit.
+
+    The whole attempt chain is validated every time, and a success publication must equal its attempt receipt.
+    """
+    unit_directory = _work_unit_directory(directory, suite, unit)
+    attempts = _work_unit_attempts(directory, suite, unit)
+    _validate_benchmark_attempt_chain(attempts)
+    success_path = unit_directory / "success.json"
+    latest = None if not attempts else _load_json(attempts[-1], label="benchmark work-unit attempt")
+    if success_path.is_file():
+        record = _load_json(success_path, label="benchmark work-unit success")
+        if latest != record:
+            message = f"Benchmark success does not match its latest attempt receipt: {success_path}"
+            raise ValueError(message)
+        _validate_success_result(record, suite=suite, unit=unit)
+        return record
+    if latest is None:
+        return _pending_record(suite, unit)
+    if latest.get("status") == "failed":
+        _validate_failure_result(latest, suite=suite, unit=unit)
+        return latest
+    if latest.get("status") != "success":
+        message = f"Benchmark attempt has an unsupported status: {attempts[-1]}"
+        raise ValueError(message)
+    _validate_success_result(latest, suite=suite, unit=unit)
+    return _pending_record(suite, unit)
+
+
+def _node_directory(directory: Path, record: Mapping[str, Any]) -> Path:
+    """Return the node directory of one sweep node-job record."""
+    return directory / "node_jobs" / str(record["token"])
+
+
+def _sweep_node_jobs(manifest: Mapping[str, Any], sweep: benchmark_config.CoreBenchmarkSweep) -> list[Mapping[str, Any]]:
+    """Return the node-job records of one sweep in submission order."""
+    return [record for record in manifest["node_jobs"] if record.get("sweep_id") == sweep.sweep_id]
+
+
+def _node_job_active(record: Mapping[str, Any], active_job_ids: frozenset[str]) -> bool:
+    """Return whether one node job may still run tickets or deliver receipts.
+
+    An unresolved submission counts as active, and so does a node job that left the queue less than
+    _NOT_STARTED_GRACE_SECONDS ago (or whose departure was not yet observed by the driver): its worker's receipts can
+    reach the driver's node over NFS up to about a minute late (probe P1), so it is not yet judged.
+    """
+    if record["status"] in {"submitting", "unknown"}:
+        return True
+    if record["status"] != "submitted":
+        return False
+    if str(record["job_id"]) in active_job_ids:
+        return True
+    observed = record.get("terminal_observed_at")
+    if observed is None:
+        return True
+    elapsed = (datetime.now(UTC) - benchmark_report.parse_benchmark_timestamp(observed, label="terminal_observed_at")).total_seconds()
+    return elapsed < _NOT_STARTED_GRACE_SECONDS
+
+
+def _observe_terminal_node_jobs(manifest: dict[str, Any], active_job_ids: frozenset[str]) -> bool:
+    """Record the first time the driver sees each submitted node job outside the queue; return whether anything changed."""
+    changed = False
+    for record in manifest["node_jobs"]:
+        if record["status"] == "submitted" and str(record["job_id"]) not in active_job_ids and record.get("terminal_observed_at") is None:
+            record["terminal_observed_at"] = _utc_now()
+            changed = True
+    return changed
+
+
+def _ticket_seq(record: Mapping[str, Any], unit: _WorkUnit, suite: benchmark_config.CoreBenchmarkSuite) -> int | None:
+    """Return the ticket sequence of one work unit inside one node-job record, if it holds it."""
+    unit_id = _unit_id(suite, unit)
+    matches = [int(ticket["seq"]) for ticket in record["tickets"] if ticket["work_unit_id"] == unit_id]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rss_bytes(value: str) -> int | None:
+    """Parse one sacct MaxRSS value (``1234K``, ``2.5G``, plain bytes); None when empty or malformed."""
+    text = value.strip()
+    if not text:
+        return None
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+    scale = units.get(text[-1].upper(), 1)
+    number = text[:-1] if text[-1].upper() in units else text
+    try:
+        return int(float(number) * scale)
+    except ValueError:
+        return None
+
+
+def _step_rows(scheduler: Mapping[str, Any]) -> dict[tuple[str, str], dict[str, Any]] | None:
+    """Return sacct step evidence keyed by (node job id, step name); None when accounting is unavailable."""
+    accounting = scheduler.get("sacct", {})
+    if accounting.get("error") is not None or "output" not in accounting:
+        return None
+    return {
+        key: {"step_id": row["step_id"], "state": row["state"], "exit_code": row["exit_code"], "max_rss_bytes": _rss_bytes(row["max_rss"])}
+        for key, row in cluster_service.parse_step_accounting(str(accounting["output"])).items()
+    }
+
+
+def _terminal_step_rows(directory: Path, manifest: Mapping[str, Any], *, capture: bool) -> dict[tuple[str, str], dict[str, Any]]:
+    """Return the step accounting of a finished benchmark from its persisted snapshot; finalization captures it once.
+
+    Validation after finalization reads only the snapshot, so it does not depend on live or expiring Slurm accounting.
+    """
+    path = directory / _STEP_ACCOUNTING_FILENAME
+    job_ids = [str(value) for value in manifest["measured_job_ids"]]
+    if capture and not path.exists():
+        rows = _step_rows(_scheduler_evidence(job_ids))
+        if rows is None:
+            message = "Core benchmark step accounting is unavailable; finalization needs it."
+            raise RuntimeError(message)
+        _write_immutable_json(
+            path,
+            {
+                "schema_kind": "generation_core_scaling_step_accounting",
+                "schema_version": 1,
+                "job_ids": job_ids,
+                "captured_at": _utc_now(),
+                "rows": [{"job_id": job_id, "step_name": name, **row} for (job_id, name), row in sorted(rows.items())],
+            },
+            label="benchmark step accounting",
+        )
+    payload = _load_json(path, label="benchmark step accounting")
+    if (
+        payload.get("schema_kind") != "generation_core_scaling_step_accounting"
+        or payload.get("schema_version") != 1
+        or payload.get("job_ids") != job_ids
+        or not isinstance(payload.get("rows"), list)
+    ):
+        message = f"Core benchmark step accounting snapshot does not match its node jobs: {path}"
+        raise ValueError(message)
+    return {
+        (str(row["job_id"]), str(row["step_name"])): {key: row[key] for key in ("step_id", "state", "exit_code", "max_rss_bytes")}
+        for row in payload["rows"]
+    }
+
+
+def _unit_outcome(
+    record: Mapping[str, Any],
+    finished: Mapping[str, Any] | None,
+    step: Mapping[str, Any] | None,
+    *,
+    step_rows_known: bool,
+) -> str:
+    """Classify one unit: success, failed (scientific), failed_without_evidence (the step ran and failed), skipped, or pending.
+
+    Interruptions (cancel, node-job end, a step that never started, a launch failure) stay pending, so the variant
+    attempt is judged interrupted and measured again instead of counting as a case failure. A candidate the worker
+    skipped because its variant already reached the success target is ``skipped``. Success needs the same verdict as
+    the worker's target count: success evidence and a zero exit status. Evidence followed by a non-zero exit (for
+    example a failed cleanup) is a failure the worker already replaced; a zero exit without success evidence counts as
+    a failure once the evidence grace period has passed, since the worker counted it towards the target.
+    """
+    if finished is not None and finished.get("outcome") == "skipped":
+        if record["status"] != "pending":
+            message = f"Benchmark work unit {record['work_unit_id']} has case evidence although its ticket was skipped."
+            raise ValueError(message)
+        return "skipped"
+    exited_nonzero = finished is not None and finished.get("outcome") == "exited" and int(finished["exit_code"]) != 0
+    if record["status"] == "success":
+        return "failed" if exited_nonzero else "success"
+    if record["status"] == "failed":
+        error = record.get("error") or {}
+        return "pending" if error.get("type") in _INTERRUPTION_ERRORS else "failed"
+    if finished is None:
+        return "pending"
+    if int(finished["exit_code"]) == 0:
+        ended = benchmark_report.parse_benchmark_timestamp(finished["ended_at"], label="step receipt ended_at")
+        return "failed_without_evidence" if (datetime.now(UTC) - ended).total_seconds() >= _BINDING_WAIT_SECONDS else "pending"
+    if not step_rows_known:
+        return "failed_without_evidence" if finished.get("outcome") == "exited" and int(finished["exit_code"]) not in {130, 143} else "pending"
+    if step is None or str(step["state"]) not in _CASE_FAILURE_STEP_STATES:
+        return "pending"
+    return "failed_without_evidence"
+
+
+def _variant_holders(
+    manifest: Mapping[str, Any], sweep: benchmark_config.CoreBenchmarkSweep, variant: benchmark_config.CoreBenchmarkVariant
+) -> list[Mapping[str, Any]]:
+    """Return the node-job records of one sweep that hold tickets of one variant, excluding failed submissions."""
+    return [
+        record
+        for record in _sweep_node_jobs(manifest, sweep)
+        if record["status"] != "submission_failed" and any(ticket["variant_id"] == variant.variant_id for ticket in record["tickets"])
+    ]
+
+
+def _await_dispatch(
+    run_id: str, *, storage: Path, job_id: str, unit_id: str
+) -> tuple[dict[str, Any], benchmark_config.CoreBenchmarkSuite, Mapping[str, Any]]:
+    """Load the manifest until it shows this step's dispatch, for at most _BINDING_WAIT_SECONDS (NFS visibility delay)."""
+    token = os.environ.get("GENERATION_NODE_TOKEN")
+    if token is None or _TOKEN_PATTERN.fullmatch(token) is None:
+        message = "Benchmark work unit requires the GENERATION_NODE_TOKEN of its node job."
+        raise RuntimeError(message)
+    deadline = time.monotonic() + _BINDING_WAIT_SECONDS
+    while True:
+        manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
+        try:
+            record, _ticket = _dispatched_ticket(manifest, job_id=job_id, unit_id=unit_id, token=token)
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(10)
+            continue
+        return manifest, suite, record
+
+
+def _variant_state(
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    directory: Path,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant: benchmark_config.CoreBenchmarkVariant,
+    active_job_ids: frozenset[str],
+    step_rows: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Classify the latest attempt of one variant in one sweep from evidence, receipts, step accounting, and liveness.
+
+    measured: every unit has terminal case evidence from the one node job that held the attempt; running: that node job
+    may still run or deliver receipts; interrupted: the node job ended before every unit finished and at least one unit
+    started; not_started: no unit of the attempt started. Every new node job gives its variants new attempt numbers, so an
+    attempt is held by exactly one node job; ``started_attempts`` counts the attempts in which a unit started.
+    """
+    holders = _variant_holders(manifest, sweep, variant)
+    by_attempt: dict[int, list[Mapping[str, Any]]] = {}
+    for record in holders:
+        for attempt in {int(ticket["variant_attempt"]) for ticket in record["tickets"] if ticket["variant_id"] == variant.variant_id}:
+            by_attempt.setdefault(attempt, []).append(record)
+    if not by_attempt:
+        return {
+            "variant_id": variant.variant_id,
+            "state": "unplanned",
+            "attempt": None,
+            "job_id": None,
+            "units": [],
+            "started_attempts": 0,
+            "max_attempt": 0,
+        }
+    if any(len(owners) != 1 for owners in by_attempt.values()):
+        message = f"Benchmark variant {variant.variant_id} of {sweep.sweep_id} has an attempt held by more than one node job."
+        raise ValueError(message)
+    started_attempts = 0
+    for attempt, owners in by_attempt.items():
+        holder = owners[0]
+        node_directory = _node_directory(directory, holder)
+        tickets = [ticket for ticket in holder["tickets"] if ticket["variant_id"] == variant.variant_id and int(ticket["variant_attempt"]) == attempt]
+        if step_rows is not None:
+            executed = any((str(holder["job_id"]), str(ticket["label"])) in step_rows for ticket in tickets) or any(
+                _unit_record(directory, suite, unit)["status"] != "pending" for unit in _variant_units(suite, sweep, variant, attempt)
+            )
+        else:
+            executed = any(node_service.read_node_receipt(node_directory, int(ticket["seq"]), "started") is not None for ticket in tickets)
+        started_attempts += int(executed)
+    attempt = max(by_attempt)
+    holder = by_attempt[attempt][0]
+    node_directory = _node_directory(directory, holder)
+    units: list[dict[str, Any]] = []
+    for unit in _variant_units(suite, sweep, variant, attempt):
+        record = _unit_record(directory, suite, unit)
+        seq = _ticket_seq(holder, unit, suite)
+        ticket = None if seq is None else next(item for item in holder["tickets"] if int(item["seq"]) == seq)
+        started = None if seq is None else node_service.read_node_receipt(node_directory, seq, "started")
+        finished = None if seq is None else node_service.read_node_receipt(node_directory, seq, "finished")
+        step = (
+            None if step_rows is None or ticket is None or holder["job_id"] is None else step_rows.get((str(holder["job_id"]), str(ticket["label"])))
+        )
+        if record["status"] in {"success", "failed"} and str(record["resource"]["slurm_job_id"]) != str(holder["job_id"]):
+            message = (
+                f"Benchmark evidence of {record['work_unit_id']} comes from job {record['resource']['slurm_job_id']}, "
+                f"not its node job {holder['job_id']}."
+            )
+            raise ValueError(message)
+        outcome = _unit_outcome(record, finished, step, step_rows_known=step_rows is not None)
+        units.append({"unit": unit, "record": record, "outcome": outcome, "started": started, "finished": finished, "seq": seq, "step": step})
+    if all(item["outcome"] != "pending" for item in units):
+        state = "measured"
+    elif _node_job_active(holder, active_job_ids):
+        state = "running"
+    elif any(item["started"] is not None or item["record"]["status"] != "pending" for item in units):
+        state = "interrupted"
+    else:
+        state = "not_started"
+    return {
+        "variant_id": variant.variant_id,
+        "state": state,
+        "attempt": attempt,
+        "job_id": holder["job_id"],
+        "token": holder["token"],
+        "units": units,
+        "started_attempts": started_attempts,
+        "max_attempt": attempt,
+    }
+
+
+def _sweep_state(
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    directory: Path,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    active_job_ids: frozenset[str],
+    step_rows: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Classify one sweep and, when it needs a node job, the variant attempts that node job must measure."""
+    variants = [_variant_state(manifest, suite, directory, sweep, variant, active_job_ids, step_rows) for variant in suite.sweep_variants(sweep)]
+    running = any(_node_job_active(record, active_job_ids) for record in _sweep_node_jobs(manifest, sweep))
+    result: dict[str, Any] = {"sweep_id": sweep.sweep_id, "variants": variants, "next_variant_attempts": []}
+    if running:
+        result["state"] = "running"
+        return result
+    remaining = [item for item in variants if item["state"] != "measured"]
+    if not remaining:
+        result["state"] = "complete"
+        return result
+    next_attempts: list[tuple[benchmark_config.CoreBenchmarkVariant, int]] = []
+    for item in remaining:
+        variant = suite.variant(str(item["variant_id"]))
+        if int(item["started_attempts"]) >= suite.maximum_variant_attempts:
+            result["state"] = "variant_failed"
+            result["failed_variant_id"] = variant.variant_id
+            return result
+        next_attempts.append((variant, int(item["max_attempt"]) + 1))
+    result["state"] = "ready_to_submit"
+    result["next_variant_attempts"] = next_attempts
+    return result
+
+
+def _recover_node_job_intent(manifest: dict[str, Any], *, directory: Path, manifest_path: Path) -> None:
+    """Resolve an interrupted node-job submission through squeue (name and comment) or the worker's node.json."""
+    token = manifest["node_job_intent"]
+    if token is None:
+        return
+    record = next(item for item in manifest["node_jobs"] if item["token"] == token)
+    seat_jobs = cluster_service.query_seat_jobs([int(record["seat"])])
+    matches = [job_id for job_id, (_seat, _state, comment) in seat_jobs.items() if comment == token]
+    if len(matches) > 1:
+        message = f"Benchmark node-job recovery for token {token} is ambiguous: {matches}"
+        raise RuntimeError(message)
+    job_id = matches[0] if matches else None
+    if job_id is None:
+        node_record = node_service.read_node_record(_node_directory(directory, record), "node")
+        job_id = None if node_record is None else str(node_record["job_id"])
+    if job_id is None:
+        recorded = benchmark_report.parse_benchmark_timestamp(record["recorded_at"], label="node-job recorded_at")
+        if (datetime.now(UTC) - recorded).total_seconds() < _NOT_STARTED_GRACE_SECONDS:
+            return
+        record["status"] = "submission_failed"
+        record["error"] = "no queued job and no worker record carry this submission token"
+    else:
+        record["status"] = "submitted"
+        record["job_id"] = job_id
+        record["submitted_at"] = record["recorded_at"]
+        manifest["measured_job_ids"].append(job_id)
+        cluster_service.lease_executing_tree(job_id)
+    manifest["node_job_intent"] = None
+    _persist_manifest(manifest_path, manifest)
+
+
+def _submit_sweep_node_job(
     manifest: dict[str, Any],
     suite: benchmark_config.CoreBenchmarkSuite,
     *,
     storage: Path,
-    logs: Path,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_position: int,
+    directory: Path,
+    manifest_path: Path,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant_attempts: Sequence[tuple[benchmark_config.CoreBenchmarkVariant, int]],
 ) -> str:
-    """Submit and durably bind one ordinary case-role benchmark job."""
+    """Persist the node-job intent and its tickets, submit the sweep node job, and record its job ID."""
     run_id = str(manifest["benchmark_run_id"])
-    representative = suite.representative_case(case_position)
-    command = build_core_benchmark_slurm_command(
-        suite,
-        run_id=run_id,
+    token = secrets.token_hex(8)
+    seat = suite.sweeps.index(sweep) + 1
+    tickets = _sweep_tickets(suite, run_id=run_id, sweep=sweep, variant_attempts=variant_attempts, token=token)
+    record: dict[str, Any] = {
+        "token": token,
+        "sweep_id": sweep.sweep_id,
+        "seat": seat,
+        "status": "submitting",
+        "job_id": None,
+        "recorded_at": _utc_now(),
+        "submitted_at": None,
+        "error": None,
+        "command": None,
+        "tickets": [
+            {
+                "seq": ticket.seq,
+                "variant_id": str(ticket.argv[5]),
+                "variant_attempt": int(ticket.argv[6]),
+                "case_role": str(ticket.argv[7]),
+                "work_unit_id": suite.work_unit_id(
+                    sweep, suite.variant(str(ticket.argv[5])), int(ticket.argv[6]), suite.case_position(str(ticket.argv[7]))
+                ),
+                "label": ticket.label,
+            }
+            for ticket in tickets
+            if ticket.kind == node_service.STEP_KIND
+        ],
+        "stop_ticket_seq": tickets[-1].seq,
+    }
+    node_directory = _node_directory(directory, record)
+    for subdirectory in (node_service.TICKETS_DIRECTORY, node_service.RECEIPTS_DIRECTORY, node_service.CONTROL_DIRECTORY):
+        (node_directory / subdirectory).mkdir(parents=True, exist_ok=True)
+    exclusions = cluster_service.standard_node_exclusions(suite.partition, suite.cores_per_node, match="exact")
+    site = suite.case_campaign.execution_values["site"]
+    record["command"] = cluster_service.build_node_job_submission_command(
+        seat=seat,
+        submission_token=token,
+        node_directory=node_directory,
         storage_root=storage,
-        log_directory=logs,
-        variant=variant,
-        case_position=case_position,
+        cores_per_node=suite.cores_per_node,
+        node_job_memory=suite.sweep_node_job_memory(),
+        node_job_wall_time=suite.sweep_wall_time,
+        partition=suite.partition,
+        exclusions=exclusions,
+        comsol_module=str(site["comsol_module"]),
+        python_executable=str(site["python_executable"]),
+        comsol_executable=str(site["comsol_executable"]),
+        scheduler_options=suite.scheduler_options,
     )
-    submitted_at = _utc_now()
-    job_id = _submit(
-        command,
-        git_commit=str(manifest["git_commit"]),
-        run_id=run_id,
-    )
+    manifest["node_jobs"].append(record)
+    manifest["node_job_intent"] = token
+    source_service.validate_admitted_source_before_publication()
+    _persist_manifest(manifest_path, manifest)
+    for ticket in tickets:
+        node_service.write_node_ticket(node_directory, ticket)
+    try:
+        job_id = _submit(record["command"], git_commit=str(manifest["git_commit"]), run_id=run_id)
+    except subprocess.CalledProcessError as error:
+        record["status"] = "submission_failed"
+        record["error"] = error.stderr.strip() or str(error)
+        manifest["node_job_intent"] = None
+        _persist_manifest(manifest_path, manifest)
+        raise
+    record["status"] = "submitted"
+    record["job_id"] = job_id
+    record["submitted_at"] = _utc_now()
     manifest["measured_job_ids"].append(job_id)
-    manifest["submission_history"].append(
-        {
-            "submitted_at": submitted_at,
-            "role": "measure",
-            "variant_id": variant.variant_id,
-            "case_position": case_position,
-            "case_role": representative.case_role,
-            "work_unit_id": suite.work_unit_id(variant, case_position),
-            "command": command,
-            "job_id": job_id,
-        }
-    )
+    manifest["node_job_intent"] = None
     manifest["state"] = "running"
-    _persist_manifest(_manifest_path(run_id, storage_root=storage), manifest)
+    _persist_manifest(manifest_path, manifest)
     return job_id
 
 
-def _submit_pending(
+def _advance_sweeps(
     manifest: dict[str, Any],
     suite: benchmark_config.CoreBenchmarkSuite,
     *,
     storage: Path,
 ) -> dict[str, Any]:
-    """Submit eligible cases from only the first incomplete variant wave."""
+    """Submit the next node job of every sweep that needs one and derive the benchmark state."""
     run_id = str(manifest["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     manifest_path = _manifest_path(run_id, storage_root=storage)
     if manifest.get("state") in {"cancel_requested", "force_cancel_requested"}:
         return manifest
-    logs = common.paths.get_runtime_root().resolve() / "logs" / "generation"
-    logs.mkdir(parents=True, exist_ok=True)
-    persisted_job_ids = [str(value) for value in manifest["measured_job_ids"]]
-    if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted_job_ids):
-        message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
-        raise ValueError(message)
-    scheduler = _scheduler_evidence(persisted_job_ids)
-    if scheduler["squeue"]["error"] is not None:
-        message = f"Could not verify active benchmark jobs before resume: {scheduler['squeue']['error']}"
-        raise RuntimeError(message)
-    active_job_ids = _active_benchmark_job_ids(scheduler)
+    _recover_node_job_intent(manifest, directory=directory, manifest_path=manifest_path)
+    if manifest["node_job_intent"] is not None:
+        return manifest
     proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
     if not all(path.is_file() for path in proof_paths):
         manifest["state"] = "inputs_ready"
         _persist_manifest(manifest_path, manifest)
         return manifest
-    proofs = _load_case_proofs(run_id, suite, storage_root=storage)
-    records = _result_records(directory, suite)
-    _validate_records_against_proof(
-        records,
-        run_id=run_id,
-        manifest=manifest,
-        proofs=proofs,
-    )
-    for wave_position, variant in enumerate(suite.variant_wave_order(), start=1):
-        wave_records = [record for record in records if record.get("variant_id") == variant.variant_id]
-        if all(record.get("status") == "success" for record in wave_records):
-            continue
-        exhausted: list[str] = []
-        eligible: list[int] = []
-        blocked = False
-        active = False
-        terminal_without_result = False
-        for case_position in range(1, suite.representative_case_count + 1):
-            representative = suite.representative_case(case_position)
-            record = next(item for item in wave_records if item.get("case_position") == case_position)
-            if record.get("status") == "success":
-                continue
-            attempts = _work_unit_attempts(
-                directory,
-                suite,
-                variant,
-                case_position,
-            )
-            if _scientific_failure_count(attempts) >= suite.maximum_work_unit_attempts:
-                exhausted.append(suite.work_unit_id(variant, case_position))
-                continue
-            latest = _latest_work_unit_submission(
-                manifest,
-                variant_id=variant.variant_id,
-                case_role=representative.case_role,
-            )
-            if latest is not None and str(latest["job_id"]) in active_job_ids:
-                active = True
-                continue
-            wait = _load_benchmark_license_wait(
-                directory,
-                suite,
-                variant,
-                case_position,
-                run_id=run_id,
-            )
-            if wait is not None and (not bool(wait["retry_budget_remaining"]) or not license_service.wait_record_is_eligible(wait)):
-                blocked = True
-                continue
-            if latest is not None and record.get("status") == "pending" and wait is None:
-                if scheduler["sacct"]["error"] is not None:
-                    message = f"Could not reconcile terminal benchmark work through accounting: {scheduler['sacct']['error']}"
-                    raise RuntimeError(message)
-                state = _accounted_root_state(
-                    scheduler,
-                    job_id=str(latest["job_id"]),
-                )
-                if state is None or state in _ACTIVE_SCHEDULER_STATES:
-                    active = True
-                    continue
-                terminal_without_result = True
-                continue
-            eligible.append(case_position)
-        if exhausted or terminal_without_result:
-            manifest["state"] = "canary_failed" if wave_position == 1 else "work_unit_failed"
-            _persist_manifest(manifest_path, manifest)
-            return manifest
-        for case_position in eligible:
-            _submit_benchmark_work_unit(
+    scheduler = _scheduler_evidence(list(manifest["measured_job_ids"]))
+    if scheduler["squeue"]["error"] is not None:
+        message = f"Could not verify active benchmark node jobs: {scheduler['squeue']['error']}"
+        raise RuntimeError(message)
+    active_job_ids = _active_benchmark_job_ids(scheduler)
+    if _observe_terminal_node_jobs(manifest, active_job_ids):
+        _persist_manifest(manifest_path, manifest)
+    states: list[str] = []
+    step_rows = _step_rows(scheduler)
+    if step_rows is None:
+        message = f"Could not read benchmark step accounting: {scheduler['sacct']['error']}"
+        raise RuntimeError(message)
+    for sweep in suite.sweeps:
+        sweep_state = _sweep_state(manifest, suite, directory, sweep, active_job_ids, step_rows)
+        if sweep_state["state"] == "ready_to_submit":
+            _submit_sweep_node_job(
                 manifest,
                 suite,
                 storage=storage,
-                logs=logs,
-                variant=variant,
-                case_position=case_position,
+                directory=directory,
+                manifest_path=manifest_path,
+                sweep=sweep,
+                variant_attempts=sweep_state["next_variant_attempts"],
             )
-        manifest["state"] = "running" if eligible or active else "license_blocked" if blocked else "running"
-        _persist_manifest(manifest_path, manifest)
-        return manifest
-    manifest["state"] = "complete"
+            states.append("running")
+        else:
+            states.append(sweep_state["state"])
+    if all(state == "complete" for state in states):
+        manifest["state"] = "complete"
+    elif "running" in states:
+        manifest["state"] = "running"
+    else:
+        manifest["state"] = "variant_failed"
     _persist_manifest(manifest_path, manifest)
     return manifest
 
@@ -2144,17 +2009,14 @@ def _prepare_core_benchmark_locked(
     storage: Path,
     scratch_root: Path | str,
 ) -> tuple[dict[str, Any], benchmark_config.CoreBenchmarkSuite]:
-    """Materialize one manifest and canonical input while submission is locked."""
+    """Materialize one manifest and canonical inputs while submission is locked."""
     run_id = str(plan["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     manifest_path = directory / "benchmark_manifest.json"
     if manifest_path.exists():
-        manifest, suite = load_core_benchmark_manifest(
-            run_id,
-            storage_root=storage,
-        )
+        manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
         if manifest["state"] in {"cancel_requested", "force_cancel_requested"}:
-            scheduler = _scheduler_evidence(manifest["measured_job_ids"])
+            scheduler = _scheduler_evidence(list(manifest["measured_job_ids"]))
             if scheduler["squeue"]["error"] is not None:
                 message = "Could not verify benchmark cancellation before explicit resume."
                 raise RuntimeError(message)
@@ -2172,28 +2034,24 @@ def _prepare_core_benchmark_locked(
             "suite_digest": suite.suite_digest,
             "suite_config": benchmark_config.repository_relative(suite.source_path),
             "git_commit": plan["git_commit"],
+            "source_fingerprint_sha256": plan["source_fingerprint_sha256"],
             "preflight": plan["preflight"],
             "representative_cases": suite.case_selections(),
             "variants": _variant_records(suite),
-            "variant_wave_order": plan["variant_wave_order"],
-            "canary_wave": plan["canary_wave"],
-            "measurement_waves": plan["measurement_waves"],
-            "required_successful_measurements": plan["required_successful_measurements"],
+            "sweeps": _sweep_records(suite),
+            "required_successes_per_sweep": plan["required_successes_per_sweep"],
             "resource_contract": suite.resource_contract(),
             "created_at": _utc_now(),
             "state": "preparing_inputs",
             "measured_job_ids": [],
-            "submission_history": [],
+            "node_jobs": [],
+            "node_job_intent": None,
         }
         _persist_manifest(manifest_path, manifest)
     proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
     if not all(path.is_file() for path in proof_paths):
         try:
-            _materialize_core_benchmark_inputs(
-                run_id,
-                storage_root=storage,
-                work_root=scratch_root,
-            )
+            _materialize_core_benchmark_inputs(run_id, storage_root=storage, work_root=scratch_root)
         except Exception:
             manifest["state"] = "input_preparation_failed"
             _persist_manifest(manifest_path, manifest)
@@ -2245,7 +2103,7 @@ def submit_core_benchmark(
     comsol_version_output: str,
     comsol_executable_path: Path | str,
 ) -> dict[str, Any]:
-    """Reuse canonical Slurm-prepared input, then submit one measured work unit."""
+    """Reuse canonical Slurm-prepared inputs, then submit the sweep node jobs that are due."""
     plan = plan_core_benchmark(
         path,
         git_commit=git_commit,
@@ -2258,19 +2116,9 @@ def submit_core_benchmark(
     run_id = str(plan["benchmark_run_id"])
     directory = core_benchmark_directory(run_id, storage_root=storage)
     directory.mkdir(parents=True, exist_ok=True)
-    lock = directory / "submission.lock"
-    with common.locking.exclusive_file_lock(lock, blocking=False):
-        manifest, suite = _prepare_core_benchmark_locked(
-            path,
-            plan,
-            storage=storage,
-            scratch_root=scratch_root,
-        )
-        return _submit_pending(
-            manifest,
-            suite,
-            storage=storage,
-        )
+    with common.locking.exclusive_file_lock(directory / "submission.lock", blocking=False):
+        manifest, suite = _prepare_core_benchmark_locked(path, plan, storage=storage, scratch_root=scratch_root)
+        return _advance_sweeps(manifest, suite, storage=storage)
 
 
 def resume_core_benchmark(
@@ -2279,51 +2127,31 @@ def resume_core_benchmark(
     storage_root: Path | str,
     scratch_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Repair missing input readiness using current scratch, then submit work."""
+    """Repair missing input readiness using current scratch, then advance every sweep."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest_path = _manifest_path(run_id, storage_root=storage)
-    lock = manifest_path.parent / "submission.lock"
-    with common.locking.exclusive_file_lock(lock, blocking=False):
-        manifest, suite = load_core_benchmark_manifest(
-            run_id,
-            storage_root=storage,
-        )
+    with common.locking.exclusive_file_lock(manifest_path.parent / "submission.lock", blocking=False):
+        manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
         _require_current_checkout(manifest)
         proof_paths = tuple(_canonical_case_proof_path(manifest_path.parent, representative) for representative in suite.representative_cases)
         if not all(path.is_file() for path in proof_paths):
-            preflight = _load_core_benchmark_preflight(
-                run_id,
-                suite=suite,
-                git_commit=str(manifest["git_commit"]),
-                storage_root=storage,
-            )
+            preflight = _load_core_benchmark_preflight(run_id, suite=suite, git_commit=str(manifest["git_commit"]), storage_root=storage)
             scratch = benchmark_config.require_mapping(
-                benchmark_config.require_mapping(
-                    preflight["storage_capabilities"],
-                    label="benchmark preflight storage capabilities",
-                )["scratch"],
+                benchmark_config.require_mapping(preflight["storage_capabilities"], label="benchmark preflight storage capabilities")["scratch"],
                 label="benchmark preflight scratch capability",
             )
             work_root = Path(str(scratch["path"])) if scratch_root is None else Path(scratch_root)
             if scratch_root is not None:
                 _probe_directory_capability(work_root, label="benchmark scratch")
             try:
-                _materialize_core_benchmark_inputs(
-                    run_id,
-                    storage_root=storage,
-                    work_root=work_root,
-                )
+                _materialize_core_benchmark_inputs(run_id, storage_root=storage, work_root=work_root)
             except Exception:
                 manifest["state"] = "input_preparation_failed"
                 _persist_manifest(manifest_path, manifest)
                 raise
             manifest["state"] = "inputs_ready"
             _persist_manifest(manifest_path, manifest)
-        return _submit_pending(
-            manifest,
-            suite,
-            storage=storage,
-        )
+        return _advance_sweeps(manifest, suite, storage=storage)
 
 
 def _canonical_case_proof_path(
@@ -2332,6 +2160,31 @@ def _canonical_case_proof_path(
 ) -> Path:
     """Return one immutable representative-case proof path."""
     return directory / "canonical_cases" / f"{representative.case_role}.json"
+
+
+def _benchmark_input_directory(
+    directory: Path,
+    representative: benchmark_config.CoreBenchmarkRepresentativeCase,
+) -> Path:
+    """Return the benchmark-owned raw case bundle directory of one representative case."""
+    return directory / "inputs" / representative.case_role
+
+
+def _generate_benchmark_input_bundle(
+    suite: benchmark_config.CoreBenchmarkSuite,
+    representative: benchmark_config.CoreBenchmarkRepresentativeCase,
+    directory: Path,
+) -> Path:
+    """Generate (or reuse) one deterministic raw case bundle inside the benchmark run, never in canonical storage."""
+    final = _benchmark_input_directory(directory, representative)
+    if final.exists():
+        return final
+    staging = final.parent / f".staging-{representative.case_role}-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    case_service.generate_case_input_bundle(suite.case_config, representative.case_index, staging)
+    staging.rename(final)
+    return final
 
 
 def _proof_payload(
@@ -2390,7 +2243,7 @@ def _materialize_core_benchmark_inputs(
     storage_root: Path | str,
     work_root: Path | str,
 ) -> tuple[Path, ...]:
-    """Materialize both canonical inputs in the allocated CPU worker."""
+    """Generate both benchmark-owned raw inputs and their proofs in the allocated CPU worker."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
     _require_current_checkout(manifest)
@@ -2412,12 +2265,7 @@ def _materialize_core_benchmark_inputs(
             paths.append(path)
             continue
         preparation_start = time.monotonic()
-        input_service.generate_input_cases(
-            suite.case_config,
-            1,
-            case_start=representative.case_index,
-            storage_root=storage,
-        )
+        raw_case_directory = _generate_benchmark_input_bundle(suite, representative, directory)
         prepared: preparation_service.PreparedCase | None = None
         try:
             prepared = preparation_service.prepare_case_work_directory(
@@ -2425,6 +2273,7 @@ def _materialize_core_benchmark_inputs(
                 representative.case_index,
                 storage_root=storage,
                 work_root=work_root,
+                raw_case_directory=raw_case_directory,
             )
             proof = _proof_payload(
                 suite,
@@ -2491,28 +2340,6 @@ def _load_case_proof(
     return proof
 
 
-def _measured_submission(
-    manifest: Mapping[str, Any],
-    *,
-    job_id: str,
-    variant_id: str,
-    case_role: str,
-) -> Mapping[str, Any]:
-    """Return the persisted submission for one exact case-role work unit."""
-    matches = [
-        record
-        for record in manifest["submission_history"]
-        if record.get("role") == "measure"
-        and record.get("job_id") == job_id
-        and record.get("variant_id") == variant_id
-        and record.get("case_role") == case_role
-    ]
-    if len(matches) != 1:
-        message = "Current benchmark job is not bound to this exact case-role work unit."
-        raise RuntimeError(message)
-    return matches[0]
-
-
 def _benchmark_peak_child_memory_bytes() -> int:
     """Return Linux child-process peak resident memory in bytes."""
     peak_kibibytes = resource_usage.getrusage(resource_usage.RUSAGE_CHILDREN).ru_maxrss
@@ -2552,6 +2379,32 @@ def _bounded_solver_log(path: Path) -> dict[str, Any]:
     }
 
 
+def _dispatched_ticket(
+    manifest: Mapping[str, Any],
+    *,
+    job_id: str,
+    unit_id: str,
+    token: str | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Return the node-job record and ticket that bind one work unit to the current node job.
+
+    A submitted record must carry this job ID; with the ticket's token, a record whose submission the driver has not yet
+    acknowledged (status submitting) also binds, because its tickets are already executable.
+    """
+    matches = [
+        (record, ticket)
+        for record in manifest["node_jobs"]
+        if (record.get("status") == "submitted" and str(record.get("job_id")) == job_id)
+        or (token is not None and record.get("token") == token and record.get("status") == "submitting")
+        for ticket in record["tickets"]
+        if ticket["work_unit_id"] == unit_id
+    ]
+    if len(matches) != 1:
+        message = "Current benchmark node job does not hold exactly one ticket for this work unit."
+        raise RuntimeError(message)
+    return matches[0]
+
+
 def _successful_license_evidence(wait: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return compact license evidence while letting success remain authoritative."""
     if wait is None:
@@ -2579,24 +2432,11 @@ def _successful_license_evidence(wait: Mapping[str, Any] | None) -> dict[str, An
     }
 
 
-def _total_controller_elapsed_seconds(
-    manifest: Mapping[str, Any],
-    *,
-    variant_id: str,
-    case_role: str,
-    completion_time: str,
-) -> float:
-    """Measure from the first submission through terminal successful evidence."""
-    submissions = [
-        benchmark_report.parse_benchmark_timestamp(record["submitted_at"], label="benchmark submitted_at")
-        for record in manifest["submission_history"]
-        if record.get("role") == "measure" and record.get("variant_id") == variant_id and record.get("case_role") == case_role
-    ]
-    if not submissions:
-        message = "Benchmark work unit lacks a persisted submission timestamp."
-        raise RuntimeError(message)
+def _total_controller_elapsed_seconds(submitted_at: str, completion_time: str) -> float:
+    """Measure from the node-job submission through terminal work-unit evidence."""
+    submitted = benchmark_report.parse_benchmark_timestamp(submitted_at, label="benchmark submitted_at")
     completed = benchmark_report.parse_benchmark_timestamp(completion_time, label="benchmark completion_time")
-    elapsed = (completed - min(submissions)).total_seconds()
+    elapsed = (completed - submitted).total_seconds()
     if elapsed < 0.0:
         message = "Benchmark controller elapsed timing is negative."
         raise RuntimeError(message)
@@ -2605,88 +2445,79 @@ def _total_controller_elapsed_seconds(
 
 def run_core_benchmark_case(
     run_id: str,
+    sweep_id: str,
     variant_id: str,
+    variant_attempt: int,
     case_role: str,
     *,
     storage_root: Path | str,
     work_root: Path | str,
 ) -> dict[str, Any]:
-    """Run one case-role measurement and retain compact performance evidence."""
+    """Run one work unit as a step of its sweep node job and retain compact performance evidence."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage)
     _require_current_checkout(manifest)
     worker_started_at = _utc_now()
     start_time_evidence = _slurm_scheduler_start_time_evidence()
-    variant = suite.variant(variant_id)
-    case_position = suite.case_position(case_role)
-    representative = suite.representative_case(case_position)
-    work_unit_id = suite.work_unit_id(variant, case_position)
-    if source_service.required_git_commit() != manifest["git_commit"]:
-        message = "Benchmark worker checkout does not match the launch commit."
-        raise RuntimeError(message)
+    unit = _WorkUnit(suite.sweep(sweep_id), suite.variant(variant_id), variant_attempt, suite.case_position(case_role))
+    variant = unit.variant
+    representative = suite.representative_case(unit.case_position)
+    work_unit_id = _unit_id(suite, unit)
     allocated_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     job_id = os.environ.get("SLURM_JOB_ID")
-    if job_id is None or _JOB_ID_PATTERN.fullmatch(job_id) is None:
-        message = "Benchmark case work unit requires one numeric SLURM_JOB_ID."
+    step_id = os.environ.get("SLURM_STEP_ID")
+    if job_id is None or _JOB_ID_PATTERN.fullmatch(job_id) is None or step_id is None or _JOB_ID_PATTERN.fullmatch(step_id) is None:
+        message = "Benchmark work unit requires one numeric SLURM_JOB_ID and SLURM_STEP_ID (a step of its node job)."
         raise RuntimeError(message)
-    submission = _measured_submission(
-        manifest,
-        job_id=job_id,
-        variant_id=variant.variant_id,
-        case_role=representative.case_role,
-    )
-    submit_time = str(submission["submitted_at"])
+    manifest, suite, node_record = _await_dispatch(run_id, storage=storage, job_id=job_id, unit_id=work_unit_id)
+    submit_time = str(node_record["submitted_at"] or node_record["recorded_at"])
     if allocated_cpus is None or not allocated_cpus.isdigit() or int(allocated_cpus) != variant.cores_per_case:
-        message = f"Benchmark Slurm allocation must exactly match cores_per_case; requested={variant.cores_per_case}, allocated={allocated_cpus!r}."
+        message = f"Benchmark step must exactly match cores_per_case; requested={variant.cores_per_case}, allocated={allocated_cpus!r}."
         raise RuntimeError(message)
-    proof = _load_case_proof(
-        run_id,
-        suite,
-        case_position,
-        storage_root=storage,
-    )
+    proof = _load_case_proof(run_id, suite, unit.case_position, storage_root=storage)
     directory = core_benchmark_directory(run_id, storage_root=storage)
-    work_unit_directory = directory / "runs" / suite.execution_id(variant) / work_unit_id
+    work_unit_directory = _work_unit_directory(directory, suite, unit)
     work_unit_directory.mkdir(parents=True, exist_ok=True)
     success_path = work_unit_directory / "success.json"
     lock_path = work_unit_directory / "execution.lock"
+    node_name = os.environ.get("SLURMD_NODENAME", socket.gethostname())
+    cpu_model = node_service.read_cpu_model()
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
         attempts = tuple(sorted(work_unit_directory.glob("attempt-*.json")))
         _validate_benchmark_attempt_chain(attempts)
         if success_path.exists():
-            existing_success = _load_json(
-                success_path,
-                label="benchmark case success",
-            )
-            _validate_success_result(
-                existing_success,
-                suite=suite,
-                variant=variant,
-                case_position=case_position,
-            )
+            existing_success = _load_json(success_path, label="benchmark work-unit success")
+            _validate_success_result(existing_success, suite=suite, unit=unit)
             return existing_success
         attempt_number = len(attempts) + 1
         previous_attempt = _benchmark_previous_attempt_reference(attempts)
-        prior_wait = _load_benchmark_license_wait(
-            directory,
-            suite,
-            variant,
-            case_position,
-            run_id=run_id,
-        )
-        license_evidence = _successful_license_evidence(prior_wait)
+        license_evidence = _successful_license_evidence(None)
         attempt_path = work_unit_directory / f"attempt-{attempt_number:04d}.json"
         prepared: preparation_service.PreparedCase | None = None
-        solver_start: float | None = None
         success: dict[str, Any]
-        progress_reporter = _benchmark_progress_reporter(
-            manifest,
-            directory=directory,
-            variant=variant,
-            case_role=representative.case_role,
-            work_unit_id=work_unit_id,
-            job_id=job_id,
-        )
+        identity = {
+            "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
+            "schema_version": BENCHMARK_SCHEMA_VERSION,
+            "benchmark_run_id": run_id,
+            "suite_digest": suite.suite_digest,
+            "sweep_id": unit.sweep.sweep_id,
+            "variant_attempt": unit.attempt,
+            "variant_id": variant.variant_id,
+            "execution_id": suite.execution_id(variant),
+            "case_position": unit.case_position,
+            "case_role": representative.case_role,
+            "work_unit_id": work_unit_id,
+            "attempt": attempt_number,
+            "previous_attempt": previous_attempt,
+            "git_commit": manifest["git_commit"],
+            "case_input_id": proof["case_input_id"],
+            "simulation_case_id": proof["simulation_case_id"],
+            "scientific_config_digest": proof["scientific_config_digest"],
+            "template_sha256": suite.case_config.template_sha256,
+            "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
+            "cores_per_case": variant.cores_per_case,
+        }
+        progress_reporter = _benchmark_progress_reporter(manifest, directory=directory, suite=suite, unit=unit, job_id=job_id)
         progress_reporter.update(phase="preparing", force=True)
         try:
             prepared = preparation_service.prepare_case_work_directory(
@@ -2694,6 +2525,7 @@ def run_core_benchmark_case(
                 representative.case_index,
                 storage_root=storage,
                 work_root=work_root,
+                raw_case_directory=_benchmark_input_directory(directory, representative),
             )
             actual_proof = _proof_payload(
                 suite,
@@ -2702,17 +2534,13 @@ def run_core_benchmark_case(
                 canonical_input_preparation_seconds=float(proof["canonical_input_preparation_seconds"]),
             )
             _validate_materialized_case_proof(actual_proof, proof)
-            solver_start = time.monotonic()
             result = runtime_service.execute_prepared_case(
                 suite.case_config,
                 prepared,
                 cores_per_case=variant.cores_per_case,
-                worker_slot=case_position - 1,
+                worker_slot=unit.case_position - 1,
                 scheduler_kind="slurm",
-                allocated_node=os.environ.get(
-                    "SLURMD_NODENAME",
-                    socket.gethostname(),
-                ),
+                allocated_node=node_name,
                 progress_reporter=progress_reporter,
             )
             publication_start = time.monotonic()
@@ -2726,61 +2554,23 @@ def run_core_benchmark_case(
             progress_reporter.update(phase="publishing", force=True)
             command_np = result.command[result.command.index("-np") + 1]
             completion_time = _utc_now()
-            scheduler_timing = _scheduler_timing(
-                submit_time=submit_time,
-                completion_time=completion_time,
-            )
-            scheduler_queue_seconds = None
-            timings = {
-                "scheduler_queue_seconds": scheduler_queue_seconds,
-                "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
-                "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
-                "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
-                "comsol_process_seconds": float(result.timing["comsol_process_seconds"]),
-                "export_conversion_seconds": float(result.timing["export_conversion_seconds"]),
-                "publication_seconds": publication_seconds,
-                "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(
-                    manifest,
-                    variant_id=variant.variant_id,
-                    case_role=representative.case_role,
-                    completion_time=completion_time,
-                ),
-            }
             success = {
-                "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
-                "schema_version": BENCHMARK_SCHEMA_VERSION,
+                **identity,
                 "status": "success",
                 "recorded_at": completion_time,
-                "benchmark_run_id": run_id,
-                "suite_digest": suite.suite_digest,
-                "variant_id": variant.variant_id,
-                "execution_id": suite.execution_id(variant),
-                "case_position": case_position,
-                "case_role": representative.case_role,
-                "work_unit_id": work_unit_id,
-                "attempt": attempt_number,
-                "previous_attempt": previous_attempt,
-                "git_commit": manifest["git_commit"],
-                "case_input_id": proof["case_input_id"],
-                "simulation_case_id": proof["simulation_case_id"],
-                "scientific_config_digest": proof["scientific_config_digest"],
-                "template_sha256": suite.case_config.template_sha256,
-                "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
-                "cores_per_case": variant.cores_per_case,
                 "resource": {
-                    "node": os.environ.get(
-                        "SLURMD_NODENAME",
-                        socket.gethostname(),
-                    ),
+                    "node": node_name,
+                    "cpu_model": cpu_model,
                     "partition": os.environ.get("SLURM_JOB_PARTITION", suite.partition),
                     "requested_cpus": variant.cores_per_case,
                     "allocated_cpus": int(allocated_cpus),
                     "comsol_np": int(command_np),
                     "slurm_job_id": job_id,
+                    "slurm_step_id": step_id,
                     "peak_memory_bytes": _benchmark_peak_child_memory_bytes(),
                     "peak_scratch_bytes": int(result.timing["scratch_peak_bytes"]),
                 },
-                "scheduler_timing": scheduler_timing,
+                "scheduler_timing": _scheduler_timing(submit_time=submit_time, completion_time=completion_time),
                 "worker_interval": {
                     "started_at": worker_started_at,
                     "ended_at": completion_time,
@@ -2790,7 +2580,16 @@ def run_core_benchmark_case(
                     "started_at": result.timing["started_at"],
                     "ended_at": result.timing["ended_at"],
                 },
-                "timings_seconds": timings,
+                "timings_seconds": {
+                    "scheduler_queue_seconds": None,
+                    "license_wait_seconds": float(license_evidence["license_wait_seconds"]),
+                    "license_probe_seconds": float(license_evidence["license_probe_seconds"]),
+                    "canonical_input_preparation_seconds": float(proof["canonical_input_preparation_seconds"]),
+                    "comsol_process_seconds": float(result.timing["comsol_process_seconds"]),
+                    "export_conversion_seconds": float(result.timing["export_conversion_seconds"]),
+                    "publication_seconds": publication_seconds,
+                    "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(submit_time, completion_time),
+                },
                 "license": license_evidence,
                 "solver_log": _bounded_solver_log(result.solver_log),
                 "hdf5": {
@@ -2802,73 +2601,28 @@ def run_core_benchmark_case(
             }
             source_service.validate_admitted_source_before_publication()
             _write_immutable_json(attempt_path, success, label="benchmark attempt")
-            _write_immutable_json(
-                success_path,
-                success,
-                label="benchmark case success",
-            )
+            _write_immutable_json(success_path, success, label="benchmark work-unit success")
             progress_reporter.update(phase="completed", terminal=True)
         except BaseException as error:
             progress_reporter.update(phase="failed", terminal=True)
             completion_time = _utc_now()
-            scheduler_timing = _scheduler_timing(
-                submit_time=submit_time,
-                completion_time=completion_time,
-            )
-            if isinstance(
-                error,
-                license_service.TemporaryLicenseCapacityError,
-            ) and bool(suite.case_config.execution_values["runtime"]["temporary_license_retry"]["enabled"]):
-                if solver_start is None:
-                    message = "Temporary license capacity was reported before solver launch."
-                    raise RuntimeError(message) from error
-                _record_benchmark_license_wait(
-                    directory,
-                    suite,
-                    variant,
-                    case_position,
-                    error,
-                    run_id=run_id,
-                    job_id=job_id,
-                    license_probe_seconds=time.monotonic() - solver_start,
-                    scheduler_queue_seconds=None,
-                )
-                raise
             failure = {
-                "schema_kind": BENCHMARK_RESULT_SCHEMA_KIND,
-                "schema_version": BENCHMARK_SCHEMA_VERSION,
+                **identity,
                 "status": "failed",
                 "recorded_at": completion_time,
-                "benchmark_run_id": run_id,
-                "suite_digest": suite.suite_digest,
-                "variant_id": variant.variant_id,
-                "execution_id": suite.execution_id(variant),
-                "case_position": case_position,
-                "case_role": representative.case_role,
-                "work_unit_id": work_unit_id,
-                "attempt": attempt_number,
-                "previous_attempt": previous_attempt,
-                "git_commit": manifest["git_commit"],
-                "case_input_id": proof["case_input_id"],
-                "simulation_case_id": proof["simulation_case_id"],
-                "scientific_config_digest": proof["scientific_config_digest"],
-                "template_sha256": suite.case_config.template_sha256,
-                "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
-                "cores_per_case": variant.cores_per_case,
                 "resource": {
-                    "node": os.environ.get(
-                        "SLURMD_NODENAME",
-                        socket.gethostname(),
-                    ),
+                    "node": node_name,
+                    "cpu_model": cpu_model,
                     "partition": os.environ.get("SLURM_JOB_PARTITION", suite.partition),
                     "requested_cpus": variant.cores_per_case,
                     "allocated_cpus": int(allocated_cpus),
                     "comsol_np": variant.cores_per_case,
                     "slurm_job_id": job_id,
+                    "slurm_step_id": step_id,
                     "peak_memory_bytes": _benchmark_peak_child_memory_bytes(),
                     "peak_scratch_bytes": (0 if prepared is None else _benchmark_scratch_bytes(prepared.work_directory)),
                 },
-                "scheduler_timing": scheduler_timing,
+                "scheduler_timing": _scheduler_timing(submit_time=submit_time, completion_time=completion_time),
                 "worker_interval": {
                     "started_at": worker_started_at,
                     "ended_at": completion_time,
@@ -2882,125 +2636,17 @@ def run_core_benchmark_case(
                     "comsol_process_seconds": None,
                     "export_conversion_seconds": None,
                     "publication_seconds": 0.0,
-                    "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(
-                        manifest,
-                        variant_id=variant.variant_id,
-                        case_role=representative.case_role,
-                        completion_time=completion_time,
-                    ),
+                    "total_controller_elapsed_seconds": _total_controller_elapsed_seconds(submit_time, completion_time),
                 },
                 "error": {"type": type(error).__name__, "message": str(error)},
             }
             if not attempt_path.exists():
-                _write_immutable_json(
-                    attempt_path,
-                    failure,
-                    label="benchmark failed attempt",
-                )
+                _write_immutable_json(attempt_path, failure, label="benchmark failed attempt")
             raise
         finally:
             if prepared is not None:
                 _cleanup_prepared(prepared, storage=storage)
         return success
-
-
-def _result_records(
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-) -> list[dict[str, Any]]:
-    """Return one latest terminal-or-pending record per configured case_position."""
-    records: list[dict[str, Any]] = []
-    for variant in suite.variants:
-        for case_position in range(1, suite.representative_case_count + 1):
-            work_unit_id = suite.work_unit_id(variant, case_position)
-            work_unit_directory = directory / "runs" / suite.execution_id(variant) / work_unit_id
-            success_path = work_unit_directory / "success.json"
-            if success_path.is_file():
-                record = _load_json(
-                    success_path,
-                    label="benchmark case_position success",
-                )
-                _validate_success_result(
-                    record,
-                    suite=suite,
-                    variant=variant,
-                    case_position=case_position,
-                )
-                records.append(record)
-                continue
-            attempts = tuple(sorted(work_unit_directory.glob("attempt-*.json")))
-            wait = _load_benchmark_license_wait(
-                directory,
-                suite,
-                variant,
-                case_position,
-                run_id=directory.name,
-            )
-            attempt = (
-                None
-                if not attempts
-                else _load_json(
-                    attempts[-1],
-                    label="benchmark case_position attempt",
-                )
-            )
-            if wait is not None and (
-                attempt is None
-                or _benchmark_wait_timestamp(
-                    wait["last_blocked_at"],
-                    label="last_blocked_at",
-                )
-                > _benchmark_wait_timestamp(
-                    attempt["recorded_at"],
-                    label="attempt recorded_at",
-                )
-            ):
-                records.append(
-                    {
-                        "status": "pending",
-                        "variant_id": variant.variant_id,
-                        "execution_id": suite.execution_id(variant),
-                        "case_position": case_position,
-                        "case_role": suite.representative_case(case_position).case_role,
-                        "work_unit_id": work_unit_id,
-                        "cores_per_case": variant.cores_per_case,
-                        "temporary_license_retry": wait,
-                    }
-                )
-                continue
-            if attempt is not None:
-                if attempt.get("status") == "failed":
-                    _validate_failure_result(
-                        attempt,
-                        suite=suite,
-                        variant=variant,
-                        case_position=case_position,
-                        attempts=attempts,
-                    )
-                    records.append(attempt)
-                    continue
-                if attempt.get("status") == "success":
-                    _validate_success_result(
-                        attempt,
-                        suite=suite,
-                        variant=variant,
-                        case_position=case_position,
-                    )
-                else:
-                    message = f"Benchmark attempt has an unsupported status: {attempts[-1]}"
-                    raise ValueError(message)
-            records.append(
-                {
-                    "status": "pending",
-                    "variant_id": variant.variant_id,
-                    "execution_id": suite.execution_id(variant),
-                    "case_position": case_position,
-                    "case_role": suite.representative_case(case_position).case_role,
-                    "work_unit_id": work_unit_id,
-                    "cores_per_case": variant.cores_per_case,
-                }
-            )
-    return records
 
 
 def _load_case_proofs(
@@ -3022,40 +2668,6 @@ def _load_case_proofs(
             start=1,
         )
     }
-
-
-def _validate_records_against_proof(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    run_id: str,
-    manifest: Mapping[str, Any],
-    proofs: Mapping[str, Mapping[str, Any]],
-) -> None:
-    """Bind each terminal result to its exact nominal or natural proof."""
-    if set(proofs) != {item.case_role for item in manifest_case_roles(manifest)}:
-        message = "Benchmark canonical proof roles do not match the run manifest."
-        raise ValueError(message)
-    for record in records:
-        if record.get("status") == "pending" and "benchmark_run_id" not in record:
-            continue
-        case_role = record.get("case_role")
-        proof = proofs.get(str(case_role))
-        if proof is None:
-            message = f"Benchmark result has an unknown representative case role: {case_role!r}."
-            raise ValueError(message)
-        expected = {
-            "benchmark_run_id": run_id,
-            "git_commit": manifest["git_commit"],
-            "case_role": case_role,
-            "case_input_id": proof["case_input_id"],
-            "simulation_case_id": proof["simulation_case_id"],
-            "scientific_config_digest": proof["scientific_config_digest"],
-            "template_sha256": proof["template"]["sha256"],
-            "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
-        }
-        if any(record.get(key) != value for key, value in expected.items()):
-            message = f"Benchmark result is not bound to the canonical proof: {record.get('work_unit_id')!r}."
-            raise ValueError(message)
 
 
 def manifest_case_roles(
@@ -3114,7 +2726,7 @@ def _scheduler_evidence(job_ids: Sequence[str]) -> dict[str, Any]:
             "--parsable2",
             "--jobs",
             selection,
-            ("--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,TotalCPU,MaxRSS,NodeList,AllocCPUS,Partition"),
+            f"--format={cluster_service.STEP_ACCOUNTING_FORMAT}",
         ],
     }
     return {name: _scheduler_command_evidence(command) for name, command in commands.items()}
@@ -3148,47 +2760,212 @@ def _active_benchmark_jobs(
     return pending, running
 
 
+def _active_job_ids_without_scheduler(manifest: Mapping[str, Any], directory: Path) -> frozenset[str]:
+    """Approximate liveness without a scheduler query: submitted node jobs whose worker has not written node_exit.json."""
+    return frozenset(
+        str(record["job_id"])
+        for record in manifest["node_jobs"]
+        if record["status"] == "submitted" and node_service.read_node_record(_node_directory(directory, record), "exit") is None
+    )
+
+
+def _measurement_input(
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    directory: Path,
+    sweep: benchmark_config.CoreBenchmarkSweep,
+    variant_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the JSON evidence of one measured sweep variant: node, step receipts, step accounting, and records."""
+    holder = next(record for record in manifest["node_jobs"] if record["token"] == variant_state["token"])
+    node_record = node_service.read_node_record(_node_directory(directory, holder), "node") or {}
+    exit_record = node_service.read_node_record(_node_directory(directory, holder), "exit") or {}
+    variant = suite.variant(str(variant_state["variant_id"]))
+    return {
+        "sweep_id": sweep.sweep_id,
+        "order": sweep.order,
+        "variant_id": variant.variant_id,
+        "cores_per_case": variant.cores_per_case,
+        "variant_attempt": variant_state["attempt"],
+        "node_job_id": holder["job_id"],
+        "node": node_record.get("host"),
+        "cpu_model": node_record.get("cpu_model"),
+        "foreign_jobs_at_start": node_record.get("foreign_jobs_at_start"),
+        "foreign_jobs_at_end": exit_record.get("foreign_jobs_at_end"),
+        "units": [
+            {
+                "work_unit_id": _unit_id(suite, item["unit"]),
+                "case_role": suite.representative_case(item["unit"].case_position).case_role,
+                "outcome": item["outcome"],
+                "started_at": None if item["started"] is None else item["started"]["started_at"],
+                "ended_at": None if item["finished"] is None or item["outcome"] == "skipped" else item["finished"]["ended_at"],
+                "step_exit_code": None if item["finished"] is None else item["finished"]["exit_code"],
+                "step_max_rss_bytes": None if item["step"] is None else item["step"]["max_rss_bytes"],
+                "record": None if item["record"]["status"] == "pending" else item["record"],
+            }
+            for item in variant_state["units"]
+        ],
+    }
+
+
+def _measurements(
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    directory: Path,
+    active_job_ids: frozenset[str],
+    step_rows: Mapping[tuple[str, str], Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the measured sweep variants in sweep and sweep-order sequence."""
+    result: list[dict[str, Any]] = []
+    for sweep in suite.sweeps:
+        for variant in suite.sweep_variants(sweep):
+            state = _variant_state(manifest, suite, directory, sweep, variant, active_job_ids, step_rows)
+            if state["state"] == "measured":
+                result.append(_measurement_input(manifest, suite, directory, sweep, state))
+    return result
+
+
+def _validate_measurements_against_proofs(
+    measurements: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+    manifest: Mapping[str, Any],
+    proofs: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Bind every terminal work-unit record to its exact canonical input proof."""
+    if set(proofs) != {item.case_role for item in manifest_case_roles(manifest)}:
+        message = "Benchmark canonical proof roles do not match the run manifest."
+        raise ValueError(message)
+    for measurement in measurements:
+        for unit in measurement["units"]:
+            record = unit["record"]
+            if record is None:
+                continue
+            proof = proofs.get(str(record.get("case_role")))
+            if proof is None:
+                message = f"Benchmark result has an unknown representative case role: {record.get('case_role')!r}."
+                raise ValueError(message)
+            expected = {
+                "benchmark_run_id": run_id,
+                "git_commit": manifest["git_commit"],
+                "case_input_id": proof["case_input_id"],
+                "simulation_case_id": proof["simulation_case_id"],
+                "scientific_config_digest": proof["scientific_config_digest"],
+                "template_sha256": proof["template"]["sha256"],
+                "benchmark_preflight_sha256": manifest["preflight"]["receipt_sha256"],
+            }
+            if any(record.get(key) != value for key, value in expected.items()):
+                message = f"Benchmark result is not bound to the canonical proof: {record.get('work_unit_id')!r}."
+                raise ValueError(message)
+
+
+def _unit_view(
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    directory: Path,
+    unit: _WorkUnit,
+    *,
+    outcome: str,
+    started: Mapping[str, Any] | None,
+    holder_active: bool,
+    job_id: str | None,
+) -> dict[str, Any]:
+    """Return one presentation view of a dispatched or planned work unit."""
+    if outcome == "success":
+        state = "successful"
+    elif outcome in {"failed", "failed_without_evidence"}:
+        state = "failed"
+    elif outcome == "skipped":
+        state = "skipped"
+    elif job_id is None:
+        state = "never_started"
+    elif holder_active and started is not None:
+        state = "running"
+    elif holder_active:
+        state = "scheduler_pending"
+    else:
+        state = "interrupted"
+    runtime: dict[str, Any] = {"availability": "unavailable", "reason": "no_job", "age_seconds": None, "stale": None}
+    if job_id is not None and state == "running":
+        runtime = _load_benchmark_runtime_progress(directory, _benchmark_progress_identity(manifest, suite=suite, unit=unit, job_id=job_id))
+    return {
+        "work_unit_id": _unit_id(suite, unit),
+        "sweep_id": unit.sweep.sweep_id,
+        "variant_id": unit.variant.variant_id,
+        "cores_per_case": unit.variant.cores_per_case,
+        "variant_attempt": unit.attempt,
+        "case_role": suite.representative_case(unit.case_position).case_role,
+        "state": state,
+        "latest_job_id": job_id,
+        "node": None,
+        "runtime_progress": runtime,
+    }
+
+
+def _terminal_measurements(
+    run_id: str,
+    *,
+    storage_root: Path | str,
+    manifest: Mapping[str, Any],
+    suite: benchmark_config.CoreBenchmarkSuite,
+    capture_accounting: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Return every measurement of a finished benchmark and the case proofs, or refuse when sweeps are incomplete.
+
+    Step accounting comes from the snapshot persisted at finalization, so later validation does not depend on live sacct.
+    """
+    directory = core_benchmark_directory(run_id, storage_root=storage_root)
+    proofs = _load_case_proofs(run_id, suite, storage_root=storage_root)
+    step_rows = _terminal_step_rows(directory, manifest, capture=capture_accounting)
+    measurements = _measurements(manifest, suite, directory, frozenset(), step_rows)
+    if len(measurements) != len(suite.sweeps) * len(suite.variants):
+        message = f"Core benchmark {run_id!r} has {len(measurements)} of {len(suite.sweeps) * len(suite.variants)} sweep variant measurements."
+        raise RuntimeError(message)
+    _validate_measurements_against_proofs(measurements, run_id=run_id, manifest=manifest, proofs=proofs)
+    return measurements, proofs
+
+
 def cancel_core_benchmark(
     run_id: str,
     *,
     storage_root: Path | str,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Persist and request cancellation of exact benchmark-owned Slurm jobs."""
+    """Persist and request cancellation of the benchmark's own node jobs (cancel marker, then Slurm signals).
+
+    An unresolved submission is recovered first; a node job whose submission is still unresolved gets the cancel marker,
+    so its worker stops before launching anything.
+    """
     if not isinstance(force, bool):
         message = "force must be boolean."
         raise TypeError(message)
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
     manifest_path = _manifest_path(run_id, storage_root=storage)
-    lock_path = manifest_path.parent / "submission.lock"
+    directory = manifest_path.parent
+    lock_path = directory / "submission.lock"
     with common.locking.exclusive_file_lock(lock_path, blocking=True):
-        manifest, _suite = load_core_benchmark_manifest(
-            run_id,
-            storage_root=storage,
-        )
+        manifest, _suite = load_core_benchmark_manifest(run_id, storage_root=storage)
+        _recover_node_job_intent(manifest, directory=directory, manifest_path=manifest_path)
         job_ids = [str(value) for value in manifest["measured_job_ids"]]
-        if any(_JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in job_ids):
-            message = f"Benchmark manifest contains malformed Slurm job IDs: {run_id}"
-            raise ValueError(message)
         scheduler = _scheduler_evidence(job_ids)
         pending_ids, running_ids = _active_benchmark_jobs(manifest, scheduler)
-        active_ids = [*pending_ids, *running_ids]
+        manifest["state"] = "force_cancel_requested" if force else "cancel_requested"
+        _persist_manifest(manifest_path, manifest)
+        for record in manifest["node_jobs"]:
+            if record["status"] == "submitting" or (record["status"] == "submitted" and str(record["job_id"]) in {*pending_ids, *running_ids}):
+                node_service.publish_node_cancel(_node_directory(directory, record))
         commands: list[list[str]] = []
-        if force and active_ids:
-            commands.append(["scancel", "--signal=KILL", "--full", *active_ids])
+        if force and (pending_ids or running_ids):
+            commands.append(["scancel", "--signal=KILL", "--full", *pending_ids, *running_ids])
         elif not force:
             if pending_ids:
                 commands.append(["scancel", *pending_ids])
             if running_ids:
                 commands.append(["scancel", "--signal=TERM", "--batch", *running_ids])
-
-        receipt_path = manifest_path.parent / "cancellations.json"
+        receipt_path = directory / "cancellations.json"
         attempts: list[dict[str, Any]] = []
         if receipt_path.exists():
-            receipt = _load_json(
-                receipt_path,
-                label="benchmark cancellation receipt",
-            )
+            receipt = _load_json(receipt_path, label="benchmark cancellation receipt")
             if (
                 receipt.get("schema_kind") != BENCHMARK_CANCELLATION_SCHEMA_KIND
                 or receipt.get("schema_version") != 1
@@ -3203,6 +2980,7 @@ def cancel_core_benchmark(
             "mode": "force" if force else "graceful",
             "pending_job_ids": pending_ids,
             "running_job_ids": running_ids,
+            "unresolved_submission": manifest["node_job_intent"],
             "commands": [],
         }
         receipt = {
@@ -3212,10 +2990,6 @@ def cancel_core_benchmark(
             "attempts": [*attempts, attempt],
         }
         common.serialization.atomic_write_json(receipt_path, receipt)
-        manifest["state"] = "force_cancel_requested" if force else "cancel_requested"
-        _persist_manifest(manifest_path, manifest)
-
-        command_results: list[dict[str, Any]] = []
         failures: list[str] = []
         for command in commands:
             result = subprocess.run(  # noqa: S603 -- validated persisted numeric Slurm IDs
@@ -3224,17 +2998,11 @@ def cancel_core_benchmark(
                 capture_output=True,
                 text=True,
             )
-            command_results.append(
-                {
-                    "command": command,
-                    "exit_code": result.returncode,
-                    "stdout": result.stdout.strip(),
-                    "stderr": result.stderr.strip(),
-                }
+            attempt["commands"].append(
+                {"command": command, "exit_code": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
             )
             if result.returncode != 0:
                 failures.append(result.stderr.strip() or f"{command[0]} exit {result.returncode}")
-        attempt["commands"] = command_results
         common.serialization.atomic_write_json(receipt_path, receipt)
         if failures:
             message = f"Slurm benchmark cancellation failed after its request was persisted: {failures}"
@@ -3243,47 +3011,32 @@ def cancel_core_benchmark(
 
 
 def _benchmark_progress_identity(
-    manifest: Mapping[str, Any],
-    *,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_role: str,
-    work_unit_id: str,
-    job_id: str,
+    manifest: Mapping[str, Any], *, suite: benchmark_config.CoreBenchmarkSuite, unit: _WorkUnit, job_id: str, token: str | None = None
 ) -> dict[str, Any]:
-    """Bind common runtime progress to one measured benchmark submission."""
-    matches = [
-        item
-        for item in manifest["submission_history"]
-        if item.get("role") == "measure"
-        and item.get("job_id") == job_id
-        and item.get("work_unit_id") == work_unit_id
-        and item.get("variant_id") == variant.variant_id
-        and item.get("case_role") == case_role
-    ]
-    if len(matches) != 1:
-        message = "Benchmark runtime progress job is not bound to one exact work unit."
-        raise ValueError(message)
+    """Bind common runtime progress to one dispatched work unit of one node job."""
+    unit_id = _unit_id(suite, unit)
+    _dispatched_ticket(manifest, job_id=job_id, unit_id=unit_id, token=token)
     return {
         "schema_kind": "generation_campaign_runtime_progress",
         "schema_version": 1,
         "benchmark_run_id": manifest["benchmark_run_id"],
-        "variant_id": variant.variant_id,
-        "cores_per_case": variant.cores_per_case,
-        "case_role": case_role,
-        "work_unit_id": work_unit_id,
+        "variant_id": unit.variant.variant_id,
+        "cores_per_case": unit.variant.cores_per_case,
+        "case_role": suite.representative_case(unit.case_position).case_role,
+        "work_unit_id": unit_id,
         "slurm_job_id": job_id,
     }
 
 
-def _benchmark_progress_path(directory: Path, job_id: str, *, create: bool) -> Path:
-    """Return a bounded symlink-free benchmark progress receipt path."""
+def _benchmark_progress_path(directory: Path, unit_id: str, *, create: bool) -> Path:
+    """Return a bounded symlink-free benchmark progress receipt path keyed by work unit."""
     progress = directory / "progress"
     if progress.is_symlink() or (progress.exists() and not progress.is_dir()):
         message = "Benchmark progress directory is unsafe."
         raise ValueError(message)
     if create:
         progress.mkdir(mode=0o700, exist_ok=True)
-    path = progress / f"{job_id}.json"
+    path = progress / f"{unit_id}.json"
     if path.is_symlink() or (path.exists() and not path.is_file()):
         message = "Benchmark progress receipt is unsafe."
         raise ValueError(message)
@@ -3294,14 +3047,13 @@ def _benchmark_progress_reporter(
     manifest: Mapping[str, Any],
     *,
     directory: Path,
-    variant: benchmark_config.CoreBenchmarkVariant,
-    case_role: str,
-    work_unit_id: str,
+    suite: benchmark_config.CoreBenchmarkSuite,
+    unit: _WorkUnit,
     job_id: str,
 ) -> progress_service.RuntimeProgressReporter:
-    """Create the shared incremental reporter for one exact benchmark job."""
-    identity = _benchmark_progress_identity(manifest, variant=variant, case_role=case_role, work_unit_id=work_unit_id, job_id=job_id)
-    path = _benchmark_progress_path(directory, job_id, create=True)
+    """Create the shared incremental reporter for one dispatched work unit."""
+    identity = _benchmark_progress_identity(manifest, suite=suite, unit=unit, job_id=job_id, token=os.environ.get("GENERATION_NODE_TOKEN"))
+    path = _benchmark_progress_path(directory, _unit_id(suite, unit), create=True)
     return progress_service.create_bound_runtime_progress_reporter(
         identity,
         path,
@@ -3309,124 +3061,13 @@ def _benchmark_progress_reporter(
     )
 
 
-def _load_benchmark_runtime_progress(directory: Path, identity: Mapping[str, Any], *, job_id: str) -> dict[str, Any]:
+def _load_benchmark_runtime_progress(directory: Path, identity: Mapping[str, Any]) -> dict[str, Any]:
     """Load common validated reporter evidence without affecting execution."""
     try:
-        path = _benchmark_progress_path(directory, job_id, create=False)
+        path = _benchmark_progress_path(directory, str(identity["work_unit_id"]), create=False)
     except (OSError, TypeError, ValueError):
         return {"availability": "unavailable", "reason": "invalid_or_unavailable", "age_seconds": None, "stale": None}
     return progress_service.load_bound_runtime_progress(identity, path)
-
-
-def _benchmark_scheduler_rows(scheduler: Mapping[str, Any]) -> dict[str, dict[str, str | None]]:
-    """Return the one admitted live scheduler view keyed by owned job ID."""
-    rows: dict[str, dict[str, str | None]] = {}
-    for line in str(scheduler["squeue"]["output"]).splitlines():
-        try:
-            job_id, state, reason, node, elapsed = line.split("|", maxsplit=4)
-        except ValueError:
-            continue
-        if _JOB_ID_PATTERN.fullmatch(job_id) is not None:
-            rows[job_id] = {
-                "scheduler_state": state.strip().upper(),
-                "reason": reason or None,
-                "node": None if node in {"", "(null)", "N/A"} else node,
-                "elapsed": None if elapsed in {"", "N/A"} else elapsed,
-            }
-    return rows
-
-
-def _benchmark_work_unit_views(
-    manifest: Mapping[str, Any],
-    records: Sequence[Mapping[str, Any]],
-    scheduler: Mapping[str, Any],
-    *,
-    directory: Path,
-    suite: benchmark_config.CoreBenchmarkSuite,
-) -> list[dict[str, Any]]:
-    """Return disjoint benchmark work-unit views from existing evidence only."""
-    live = _benchmark_scheduler_rows(scheduler)
-    views: list[dict[str, Any]] = []
-    for record in records:
-        variant = suite.variant(str(record["variant_id"]))
-        position = int(record["case_position"])
-        latest = _latest_work_unit_submission(manifest, variant_id=variant.variant_id, case_role=str(record["case_role"]))
-        job_id = None if latest is None else str(latest["job_id"])
-        scheduler_view = live.get(job_id or "", {})
-        state: str
-        if record["status"] == "success":
-            state = "successful"
-        elif record["status"] == "failed":
-            state = "failed"
-        elif job_id is None:
-            state = "never_started"
-        elif scheduler_view.get("scheduler_state") == "PENDING":
-            state = "scheduler_pending"
-        elif job_id in live:
-            state = "running"
-        elif _load_benchmark_license_wait(directory, suite, variant, position, run_id=str(manifest["benchmark_run_id"])) is not None:
-            state = "license_blocked"
-        else:
-            state = "failed"
-        views.append(
-            {
-                "work_unit_id": record["work_unit_id"],
-                "variant_id": variant.variant_id,
-                "cores_per_case": variant.cores_per_case,
-                "case_role": record["case_role"],
-                "state": state,
-                "latest_job_id": job_id,
-                "scheduler_state": scheduler_view.get("scheduler_state"),
-                "node": scheduler_view.get("node"),
-                "elapsed": scheduler_view.get("elapsed"),
-                "reason": scheduler_view.get("reason"),
-                "runtime_progress": (
-                    {"availability": "unavailable", "reason": "no_job", "age_seconds": None, "stale": None}
-                    if job_id is None
-                    else _load_benchmark_runtime_progress(
-                        directory,
-                        _benchmark_progress_identity(
-                            manifest,
-                            variant=variant,
-                            case_role=str(record["case_role"]),
-                            work_unit_id=str(record["work_unit_id"]),
-                            job_id=job_id,
-                        ),
-                        job_id=job_id,
-                    )
-                ),
-            }
-        )
-    return views
-
-
-def _completed_wave_evaluation(
-    suite: benchmark_config.CoreBenchmarkSuite,
-    manifest: Mapping[str, Any],
-    records: Sequence[Mapping[str, Any]],
-    scheduler: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Evaluate only waves whose two measurements are successfully complete."""
-    wave_order = suite.variant_wave_order()
-    completed_variants = tuple(
-        variant
-        for variant in wave_order
-        if len(selected := [record for record in records if record.get("variant_id") == variant.variant_id]) == suite.representative_case_count
-        and all(record.get("status") == "success" for record in selected)
-    )
-    if not completed_variants:
-        return None
-    completed_ids = {variant.variant_id for variant in completed_variants}
-    completed_records = [record for record in records if record.get("variant_id") in completed_ids]
-    partial = benchmark_report.summarize_core_benchmark_results(replace(suite, variants=completed_variants), completed_records)
-    _apply_controller_queue_to_summary(
-        partial,
-        _controller_scheduler_queue_accounting(manifest, records, scheduler),
-    )
-    partial["provisional"] = True
-    partial["completed_wave_count"] = len(completed_variants)
-    partial["final_recommendation_available"] = len(completed_variants) == len(wave_order)
-    return partial
 
 
 def core_benchmark_status(
@@ -3436,178 +3077,92 @@ def core_benchmark_status(
     query_scheduler: bool = True,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Reconstruct precise wave-aware work-unit and scheduler state."""
+    """Reconstruct sweep-, variant-, and work-unit state from evidence, receipts, and node-job liveness."""
+    del now
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    records = _result_records(directory, suite)
-    success_count = sum(record["status"] == "success" for record in records)
     job_ids = [str(value) for value in manifest["measured_job_ids"]]
-    scheduler = (
-        _scheduler_evidence(job_ids)
-        if query_scheduler
-        else {
-            "squeue": {"output": "", "error": None},
-            "sacct": {"output": "", "error": None},
-        }
-    )
+    scheduler = _scheduler_evidence(job_ids) if query_scheduler else {"squeue": {"output": "", "error": None}, "sacct": {"output": "", "error": None}}
     if query_scheduler and scheduler["squeue"]["error"] is not None:
-        message = f"Could not query active core benchmark jobs: {scheduler['squeue']['error']}"
+        message = f"Could not query active core benchmark node jobs: {scheduler['squeue']['error']}"
         raise RuntimeError(message)
-    active_job_ids = _active_benchmark_job_ids(scheduler) if query_scheduler else frozenset()
-    active_work_units = [
-        str(submission["work_unit_id"])
-        for submission in manifest["submission_history"]
-        if submission.get("role") == "measure" and str(submission.get("job_id")) in active_job_ids
-    ]
-    work_units = _benchmark_work_unit_views(manifest, records, scheduler, directory=directory, suite=suite)
-    category_counts = {
-        name: sum(item["state"] == name for item in work_units)
-        for name in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
-    }
-    exhausted: list[dict[str, Any]] = []
-    license_waits: list[dict[str, Any]] = []
-    terminal_without_result: list[dict[str, Any]] = []
-    for record in records:
-        if record["status"] == "success":
-            continue
-        variant = suite.variant(str(record["variant_id"]))
-        case_position = int(record["case_position"])
-        representative = suite.representative_case(case_position)
-        attempts = _work_unit_attempts(directory, suite, variant, case_position)
-        failure_attempts = _scientific_failure_count(attempts)
-        if failure_attempts >= suite.maximum_work_unit_attempts:
-            exhausted.append(
-                {
-                    "variant_id": variant.variant_id,
-                    "case_role": representative.case_role,
-                    "work_unit_id": record["work_unit_id"],
-                    "failure_attempts": failure_attempts,
-                    "maximum_work_unit_attempts": suite.maximum_work_unit_attempts,
-                }
-            )
-            continue
-        latest = _latest_work_unit_submission(
-            manifest,
-            variant_id=variant.variant_id,
-            case_role=representative.case_role,
-        )
-        latest_active = latest is not None and str(latest["job_id"]) in active_job_ids
-        wait = _load_benchmark_license_wait(
-            directory,
-            suite,
-            variant,
-            case_position,
-            run_id=run_id,
-        )
-        if wait is not None and not latest_active:
-            license_waits.append(wait)
-        if query_scheduler and latest is not None and not latest_active and record["status"] == "pending" and wait is None:
-            if scheduler["sacct"]["error"] is not None:
-                message = f"Could not reconcile terminal benchmark work through accounting: {scheduler['sacct']['error']}"
-                raise RuntimeError(message)
-            accounted = _accounted_root_state(scheduler, job_id=str(latest["job_id"]))
-            if accounted is not None and accounted not in _ACTIVE_SCHEDULER_STATES:
-                terminal_without_result.append(
-                    {
-                        "variant_id": variant.variant_id,
-                        "case_role": representative.case_role,
-                        "work_unit_id": record["work_unit_id"],
-                        "scheduler_state": accounted,
-                    }
+    active_job_ids = _active_benchmark_job_ids(scheduler) if query_scheduler else _active_job_ids_without_scheduler(manifest, directory)
+    step_rows = _step_rows(scheduler) if query_scheduler else None
+    work_units: list[dict[str, Any]] = []
+    sweeps: list[dict[str, Any]] = []
+    for sweep in suite.sweeps:
+        sweep_state = _sweep_state(manifest, suite, directory, sweep, active_job_ids, step_rows)
+        for variant_state in sweep_state["variants"]:
+            variant = suite.variant(str(variant_state["variant_id"]))
+            if variant_state["attempt"] is None:
+                work_units.extend(
+                    _unit_view(manifest, suite, directory, unit, outcome="pending", started=None, holder_active=False, job_id=None)
+                    for unit in _variant_units(suite, sweep, variant, 1)
                 )
+                continue
+            holder = next(record for record in manifest["node_jobs"] if record["token"] == variant_state["token"])
+            holder_active = _node_job_active(holder, active_job_ids)
+            work_units.extend(
+                _unit_view(
+                    manifest,
+                    suite,
+                    directory,
+                    item["unit"],
+                    outcome=item["outcome"],
+                    started=item["started"],
+                    holder_active=holder_active,
+                    job_id=None if holder["job_id"] is None else str(holder["job_id"]),
+                )
+                for item in variant_state["units"]
+            )
+        current = next((item for item in sweep_state["variants"] if item["state"] != "measured"), None)
+        sweeps.append(
+            {
+                "sweep_id": sweep.sweep_id,
+                "order": sweep.order,
+                "state": sweep_state["state"],
+                "node_job_ids": [str(record["job_id"]) for record in _sweep_node_jobs(manifest, sweep) if record["job_id"] is not None],
+                "current_variant_id": None if current is None else current["variant_id"],
+                "current_cores_per_case": None if current is None else suite.variant(str(current["variant_id"])).cores_per_case,
+                "measured_variants": sum(item["state"] == "measured" for item in sweep_state["variants"]),
+                "total_variants": len(sweep_state["variants"]),
+            }
+        )
+    categories = ("successful", "running", "scheduler_pending", "interrupted", "never_started", "failed", "skipped")
+    counts = {name: sum(item["state"] == name for item in work_units) for name in categories}
     proof_paths = tuple(_canonical_case_proof_path(directory, representative) for representative in suite.representative_cases)
-    inputs_ready = all(path.is_file() for path in proof_paths)
-    canary = suite.canary_variant()
-    canary_work_units = {suite.work_unit_id(canary, case_position) for case_position in range(1, suite.representative_case_count + 1)}
-    canary_failed = any(item["work_unit_id"] in canary_work_units for item in (*exhausted, *terminal_without_result))
-    blocked_waits = [wait for wait in license_waits if not bool(wait["retry_budget_remaining"]) or not license_service.wait_record_is_eligible(wait)]
+    sweep_states = [item["state"] for item in sweeps]
     if manifest["state"] in {"cancel_requested", "force_cancel_requested"}:
         state = "cancelled"
-    elif not inputs_ready:
+    elif not all(path.is_file() for path in proof_paths):
         state = "inputs_ready"
-    elif success_count == len(records):
+    elif all(item == "complete" for item in sweep_states):
         state = "complete"
-    elif canary_failed:
-        state = "canary_failed"
-    elif exhausted or terminal_without_result:
-        state = "work_unit_failed"
-    elif active_work_units:
+    elif any(item in {"running", "ready_to_submit"} for item in sweep_states):
         state = "running"
-    elif blocked_waits:
-        state = "license_blocked"
     else:
-        state = "running"
-    wave_order = suite.variant_wave_order()
-    current_wave = next(
-        (
-            {
-                "wave_position": position,
-                "variant_id": variant.variant_id,
-                "cores_per_case": variant.cores_per_case,
-            }
-            for position, variant in enumerate(wave_order, start=1)
-            if not all(record.get("status") == "success" for record in records if record.get("variant_id") == variant.variant_id)
-        ),
-        None,
-    )
-    completed_variants = tuple(
-        variant
-        for variant in wave_order
-        if len(selected := [record for record in records if record.get("variant_id") == variant.variant_id]) == suite.representative_case_count
-        and all(record.get("status") == "success" for record in selected)
-    )
-    current_variant_id = None if current_wave is None else str(current_wave["variant_id"])
-    waves = [
-        {
-            "wave_position": position,
-            "variant_id": variant.variant_id,
-            "cores_per_case": variant.cores_per_case,
-            "state": ("complete" if variant in completed_variants else "current" if variant.variant_id == current_variant_id else "never_started"),
+        state = "variant_failed"
+    measurements = _measurements(manifest, suite, directory, active_job_ids, step_rows)
+    partial = None
+    if measurements and state != "complete":
+        partial = benchmark_report.summarize_core_benchmark_results(suite, measurements)
+        partial["provisional"] = True
+    final_summary: dict[str, Any] | None = None
+    if state == "complete" and (directory / "summary.json").is_file():
+        summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
+        final_summary = {
+            "path": str(directory / "summary.md"),
+            "markdown": _load_validated_core_benchmark_markdown(directory / "summary.md", summary),
+            "recommended_cores_per_case": summary.get("recommended_cores_per_case"),
+            "recommended_throughput_cases_per_node_hour": summary.get("recommended_throughput_cases_per_node_hour"),
         }
-        for position, variant in enumerate(wave_order, start=1)
-    ]
-    current_submissions = [
-        item for item in manifest["submission_history"] if item.get("role") == "measure" and item.get("variant_id") == current_variant_id
-    ]
-    status_now = now or datetime.now(timezone.utc)
-    current_wave_elapsed = None
-    if current_submissions:
-        submitted = min(
-            benchmark_report.parse_benchmark_timestamp(str(item["submitted_at"]), label="benchmark submitted_at") for item in current_submissions
-        )
-        current_wave_elapsed = str(timedelta(seconds=max(0, int((status_now - submitted).total_seconds()))))
-    progress_timestamps = [
+    progress = [
         str(runtime["updated_at"])
         for unit in work_units
-        if unit.get("variant_id") == current_variant_id
-        and isinstance((runtime := unit.get("runtime_progress")), dict)
+        if isinstance((runtime := unit.get("runtime_progress")), dict)
         and runtime.get("availability") == "available"
         and isinstance(runtime.get("updated_at"), str)
     ]
-    submission_timestamps = [str(item["submitted_at"]) for item in current_submissions]
-    last_progress_timestamp = max((*progress_timestamps, *submission_timestamps), default=None)
-    partial_evaluation = _completed_wave_evaluation(suite, manifest, records, scheduler)
-    final_summary: dict[str, Any] | None = None
-    final_markdown_path = directory / "summary.md"
-    if state == "complete":
-        summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
-        markdown = _load_validated_core_benchmark_markdown(
-            final_markdown_path,
-            summary,
-        )
-        recommended = summary.get("recommended_production")
-        recommended_values = recommended if isinstance(recommended, dict) else {}
-        final_summary = {
-            "path": str(final_markdown_path),
-            "markdown": markdown,
-            "fastest_single_case_cores": summary.get("fastest_single_case_cores"),
-            "lowest_core_hours_cores": summary.get("lowest_core_hours_cores"),
-            "recommended_cores_per_case": summary.get("recommended_cores_per_case"),
-            "estimated_cases_per_node": recommended_values.get("estimated_cases_per_node"),
-            "estimated_compute_only_cases_per_node_hour": recommended_values.get("estimated_cases_per_node_hour"),
-            "license_qualification": summary.get("license_qualification"),
-        }
-
     return {
         "schema_kind": "generation_run_status",
         "schema_version": 1,
@@ -3615,41 +3170,21 @@ def core_benchmark_status(
         "suite_name": suite.suite_name,
         "benchmark_run_id": run_id,
         "state": state,
-        "successful_work_units": category_counts["successful"],
-        "running_work_units": category_counts["running"],
-        "scheduler_pending_work_units": category_counts["scheduler_pending"],
-        "license_blocked_work_units": category_counts["license_blocked"],
-        "never_started_work_units": category_counts["never_started"],
-        "failed_work_units": category_counts["failed"],
-        "total_work_units": len(records),
+        "successful_work_units": counts["successful"],
+        "running_work_units": counts["running"],
+        "scheduler_pending_work_units": counts["scheduler_pending"],
+        "interrupted_work_units": counts["interrupted"],
+        "never_started_work_units": counts["never_started"],
+        "failed_work_units": counts["failed"],
+        "skipped_work_units": counts["skipped"],
+        "total_work_units": len(work_units),
         "work_units": work_units,
-        "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
-        "work_unit_failures": [*exhausted, *terminal_without_result],
-        "license_waits": license_waits,
-        "successful_measurements": _controller_scheduler_queue_accounting(
-            manifest,
-            records,
-            scheduler,
-        ),
+        "sweeps": sweeps,
         "scheduler": scheduler,
-        "current_wave": current_wave,
-        "wave_count": len(wave_order),
-        "completed_wave_count": len(completed_variants),
-        "waves": waves,
-        "current_wave_elapsed": current_wave_elapsed,
-        "last_progress_timestamp": last_progress_timestamp,
+        "last_progress_timestamp": max(progress, default=None),
         "eta": "unavailable",
-        "partial_evaluation": partial_evaluation,
+        "partial_evaluation": partial,
         "final_summary": final_summary,
-        "canary": {
-            "variant_id": canary.variant_id,
-            "cores_per_case": canary.cores_per_case,
-            "case_roles": [item.case_role for item in suite.representative_cases],
-            "work_unit_ids": sorted(canary_work_units),
-            "included_in_final_measurements": True,
-            "additional_work_units": 0,
-            "validated": all(record.get("status") == "success" for record in records if record.get("variant_id") == canary.variant_id),
-        },
         "resume_action": (
             "none; terminal benchmark evidence is complete" if state == "complete" else f"rerun ./scripts/generation run {manifest['suite_config']}"
         ),
@@ -3696,39 +3231,23 @@ def _validate_summary_identity(
     suite: benchmark_config.CoreBenchmarkSuite,
     manifest: Mapping[str, Any],
     proofs: Mapping[str, Mapping[str, Any]],
-    records: Sequence[Mapping[str, Any]],
+    measurements: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Bind one summary revision to both inputs and all terminal evidence."""
+    """Bind one summary revision to the inputs, the frozen source, and all terminal measurement evidence."""
     expected_identity = {
         "schema_kind": BENCHMARK_SUMMARY_SCHEMA_KIND,
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "benchmark_run_id": run_id,
         "git_commit": manifest["git_commit"],
+        "source_fingerprint_sha256": manifest["source_fingerprint_sha256"],
         "template_sha256": suite.case_config.template_sha256,
         "representative_case_identities": _proof_identities(suite, proofs),
         "preflight": manifest["preflight"],
-        "result_set_digest": common.serialization.canonical_json_sha256(records),
+        "result_set_digest": common.serialization.canonical_json_sha256(list(measurements)),
     }
     if any(summary.get(key) != value for key, value in expected_identity.items()):
         message = "Core benchmark summary is not bound to its terminal source evidence."
         raise ValueError(message)
-    accounting = summary.get("scheduler_accounting")
-    if not isinstance(accounting, dict) or set(accounting) != {"output", "error"}:
-        message = "Core benchmark scheduler accounting evidence is malformed."
-        raise TypeError(message)
-    queue_accounting = summary.get("successful_measurements")
-    if queue_accounting is not None:
-        if not isinstance(queue_accounting, list):
-            message = "Core benchmark successful-measurement evidence is malformed."
-            raise TypeError(message)
-        expected_measurements = _controller_scheduler_queue_accounting(
-            manifest,
-            records,
-            {"sacct": accounting},
-        )
-        if queue_accounting != expected_measurements:
-            message = "Core benchmark successful-measurement evidence is stale or incomplete."
-            raise ValueError(message)
     generated_at = summary.get("generated_at")
     if not isinstance(generated_at, str) or not generated_at or any(character in generated_at for character in "\r\n\t"):
         message = "Core benchmark summary timestamp is malformed."
@@ -3738,14 +3257,11 @@ def _validate_summary_identity(
 def _summary_metrics_match(
     summary: Mapping[str, Any],
     suite: benchmark_config.CoreBenchmarkSuite,
-    records: Sequence[Mapping[str, Any]],
+    measurements: Sequence[Mapping[str, Any]],
 ) -> bool:
-    """Return whether derived metrics match the current campaign interpretation."""
-    recomputed = benchmark_report.summarize_core_benchmark_results(suite, records)
-    accounting = summary.get("successful_measurements")
-    if isinstance(accounting, list):
-        _apply_controller_queue_to_summary(recomputed, accounting)
-    return all(summary.get(key) == recomputed[key] for key in _SUMMARY_METRIC_FIELDS)
+    """Return whether derived metrics match a recomputation from the measurements."""
+    recomputed = benchmark_report.summarize_core_benchmark_results(suite, measurements)
+    return all(summary.get(key) == recomputed[key] for key in benchmark_report.SUMMARY_METRIC_FIELDS)
 
 
 def _validate_summary_payload(
@@ -3755,18 +3271,11 @@ def _validate_summary_payload(
     suite: benchmark_config.CoreBenchmarkSuite,
     manifest: Mapping[str, Any],
     proofs: Mapping[str, Mapping[str, Any]],
-    records: Sequence[Mapping[str, Any]],
+    measurements: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Bind one terminal summary to both inputs and recomputed metrics."""
-    _validate_summary_identity(
-        summary,
-        run_id=run_id,
-        suite=suite,
-        manifest=manifest,
-        proofs=proofs,
-        records=records,
-    )
-    if not _summary_metrics_match(summary, suite, records):
+    """Bind one terminal summary to its inputs and recomputed metrics."""
+    _validate_summary_identity(summary, run_id=run_id, suite=suite, manifest=manifest, proofs=proofs, measurements=measurements)
+    if not _summary_metrics_match(summary, suite, measurements):
         message = "Core benchmark summary metrics are stale or inconsistent."
         raise ValueError(message)
 
@@ -3774,20 +3283,13 @@ def _validate_summary_payload(
 def _validate_or_repair_summary_outputs(
     directory: Path,
     summary: Mapping[str, Any],
-    records: Sequence[Mapping[str, Any]],
+    measurements: Sequence[Mapping[str, Any]],
     *,
     repair_missing: bool,
 ) -> None:
     """Validate deterministic summary views and create only missing retry output."""
     expected = {
-        "runs.csv": benchmark_report.results_csv(
-            records,
-            queue_by_work_unit=(
-                _controller_queue_by_work_unit(summary["successful_measurements"])
-                if isinstance(summary.get("successful_measurements"), list)
-                else None
-            ),
-        ),
+        "runs.csv": benchmark_report.results_csv(measurements),
         "summary.md": benchmark_report.core_benchmark_markdown(summary),
     }
     for name, content in expected.items():
@@ -3800,157 +3302,52 @@ def _validate_or_repair_summary_outputs(
             raise ValueError(message)
 
 
-def _has_strictly_more_available_queue_measurements(
-    existing: object,
-    fresh: Sequence[Mapping[str, Any]],
-) -> bool:
-    """Return whether fresh accounting adds queue evidence without regression."""
-    if not isinstance(existing, list):
-        return False
-    existing_by_work_unit = {
-        item.get("work_unit_id"): item for item in existing if isinstance(item, dict) and isinstance(item.get("work_unit_id"), str)
-    }
-    fresh_by_work_unit = {item.get("work_unit_id"): item for item in fresh if isinstance(item.get("work_unit_id"), str)}
-    if len(existing_by_work_unit) != len(existing) or set(existing_by_work_unit) != set(fresh_by_work_unit):
-        return False
-    existing_available = {
-        work_unit_id for work_unit_id, item in existing_by_work_unit.items() if item.get("scheduler_queue_availability") == "available"
-    }
-    fresh_available = {work_unit_id for work_unit_id, item in fresh_by_work_unit.items() if item.get("scheduler_queue_availability") == "available"}
-    return existing_available < fresh_available
-
-
-def _refresh_summary_queue_accounting(
-    existing: Mapping[str, Any],
-    fresh: Sequence[Mapping[str, Any]],
-    scheduler_accounting: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return one derived-summary revision with fresher controller queue evidence."""
-    refreshed = dict(existing)
-    refreshed["variants"] = [dict(variant) for variant in existing["variants"]]
-    _apply_controller_queue_to_summary(refreshed, fresh)
-    refreshed["successful_measurements"] = [dict(item) for item in fresh]
-    refreshed["scheduler_accounting"] = dict(scheduler_accounting)
-    refreshed["generated_at"] = _utc_now()
-    return refreshed
-
-
 def finalize_core_benchmark(
     run_id: str,
     *,
     storage_root: Path | str,
 ) -> dict[str, Any]:
-    """Publish aggregate evidence only after all eight measurements succeed."""
+    """Publish aggregate evidence only after every sweep measured every variant and no node job is active."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    scheduler = _scheduler_evidence(manifest["measured_job_ids"])
+    scheduler = _scheduler_evidence(list(manifest["measured_job_ids"]))
     if scheduler["squeue"]["error"] is not None:
-        message = f"Could not verify terminal benchmark jobs before finalization: {scheduler['squeue']['error']}"
+        message = f"Could not verify terminal benchmark node jobs before finalization: {scheduler['squeue']['error']}"
         raise RuntimeError(message)
     if scheduler["squeue"]["output"]:
-        message = "Core benchmark cannot finalize while persisted Slurm jobs remain active."
+        message = "Core benchmark cannot finalize while its node jobs remain active."
         raise RuntimeError(message)
-    proofs = _load_case_proofs(run_id, suite, storage_root=storage_root)
-    records = _result_records(directory, suite)
-    _validate_records_against_proof(
-        records,
-        run_id=run_id,
-        manifest=manifest,
-        proofs=proofs,
-    )
-    incomplete = [record["work_unit_id"] for record in records if record["status"] != "success"]
-    if incomplete:
-        message = f"Core benchmark requires eight valid successes before finalization; incomplete={incomplete}."
-        raise RuntimeError(message)
-    result_set_digest = common.serialization.canonical_json_sha256(records)
+    measurements, proofs = _terminal_measurements(run_id, storage_root=storage_root, manifest=manifest, suite=suite, capture_accounting=True)
+    result_set_digest = common.serialization.canonical_json_sha256(measurements)
     current = directory / "summary.json"
+    manifest_path = _manifest_path(run_id, storage_root=storage_root)
     if current.exists():
         existing = _load_json(current, label="core benchmark summary")
         if existing.get("result_set_digest") == result_set_digest:
-            _validate_summary_identity(
-                existing,
-                run_id=run_id,
-                suite=suite,
-                manifest=manifest,
-                proofs=proofs,
-                records=records,
-            )
-            if _summary_metrics_match(existing, suite, records):
-                fresh_accounting = _controller_scheduler_queue_accounting(
-                    manifest,
-                    records,
-                    scheduler,
-                )
-                if _has_strictly_more_available_queue_measurements(
-                    existing.get("successful_measurements"),
-                    fresh_accounting,
-                ):
-                    refreshed = _refresh_summary_queue_accounting(
-                        existing,
-                        fresh_accounting,
-                        scheduler["sacct"],
-                    )
-                    _archive_summary(directory)
-                    common.serialization.atomic_write_text(
-                        directory / "runs.csv",
-                        benchmark_report.results_csv(
-                            records,
-                            queue_by_work_unit=_controller_queue_by_work_unit(
-                                fresh_accounting,
-                            ),
-                        ),
-                    )
-                    common.serialization.atomic_write_json(current, refreshed)
-                    common.serialization.atomic_write_text(
-                        directory / "summary.md",
-                        benchmark_report.core_benchmark_markdown(refreshed),
-                    )
-                    manifest["state"] = "complete"
-                    _persist_manifest(
-                        _manifest_path(run_id, storage_root=storage_root),
-                        manifest,
-                    )
-                    return refreshed
-                _validate_or_repair_summary_outputs(
-                    directory,
-                    existing,
-                    records,
-                    repair_missing=True,
-                )
-                manifest["state"] = "complete"
-                _persist_manifest(
-                    _manifest_path(run_id, storage_root=storage_root),
-                    manifest,
-                )
-                return existing
-    summary = benchmark_report.summarize_core_benchmark_results(suite, records)
-    queue_accounting = _controller_scheduler_queue_accounting(manifest, records, scheduler)
-    _apply_controller_queue_to_summary(summary, queue_accounting)
+            _validate_summary_payload(existing, run_id=run_id, suite=suite, manifest=manifest, proofs=proofs, measurements=measurements)
+            _validate_or_repair_summary_outputs(directory, existing, measurements, repair_missing=True)
+            manifest["state"] = "complete"
+            _persist_manifest(manifest_path, manifest)
+            return existing
+    summary = benchmark_report.summarize_core_benchmark_results(suite, measurements)
     summary.update(
         {
             "benchmark_run_id": run_id,
             "git_commit": manifest["git_commit"],
+            "source_fingerprint_sha256": manifest["source_fingerprint_sha256"],
             "template_sha256": suite.case_config.template_sha256,
             "representative_case_identities": _proof_identities(suite, proofs),
             "preflight": manifest["preflight"],
-            "scheduler_accounting": scheduler["sacct"],
-            "successful_measurements": queue_accounting,
             "result_set_digest": result_set_digest,
             "generated_at": _utc_now(),
         }
     )
     _archive_summary(directory)
-    common.serialization.atomic_write_text(
-        directory / "runs.csv",
-        benchmark_report.results_csv(records, queue_by_work_unit=_controller_queue_by_work_unit(queue_accounting)),
-    )
+    common.serialization.atomic_write_text(directory / "runs.csv", benchmark_report.results_csv(measurements))
     common.serialization.atomic_write_json(current, summary)
-    common.serialization.atomic_write_text(
-        directory / "summary.md",
-        benchmark_report.core_benchmark_markdown(summary),
-    )
+    common.serialization.atomic_write_text(directory / "summary.md", benchmark_report.core_benchmark_markdown(summary))
     manifest["state"] = "complete"
-    _persist_manifest(_manifest_path(run_id, storage_root=storage_root), manifest)
+    _persist_manifest(manifest_path, manifest)
     return summary
 
 
@@ -4001,11 +3398,7 @@ def load_core_benchmark_markdown(
     )
 
 
-def _directory_inventory(
-    directory: Path,
-    *,
-    ignored_names: frozenset[str] = frozenset(),
-) -> dict[str, Any]:
+def _directory_inventory(directory: Path) -> dict[str, Any]:
     """Return a symlink-free deterministic file inventory."""
     if not directory.is_dir() or directory.is_symlink():
         message = f"Benchmark evidence directory is missing or unsafe: {directory}"
@@ -4015,7 +3408,7 @@ def _directory_inventory(
         if path.is_symlink():
             message = f"Benchmark evidence contains an unsafe symlink: {path}"
             raise ValueError(message)
-        if path.is_file() and path.name not in ignored_names:
+        if path.is_file():
             files.append(
                 {
                     "relative_path": path.relative_to(directory).as_posix(),
@@ -4036,482 +3429,32 @@ def validate_core_benchmark(
     *,
     storage_root: Path | str,
 ) -> dict[str, Any]:
-    """Validate both case proofs, eight successes, summaries, and isolation."""
+    """Validate the case proofs, every sweep variant measurement, the summaries, and isolation."""
     manifest, suite = load_core_benchmark_manifest(run_id, storage_root=storage_root)
     directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    proofs = _load_case_proofs(run_id, suite, storage_root=storage_root)
-    records = _result_records(directory, suite)
-    _validate_records_against_proof(
-        records,
-        run_id=run_id,
-        manifest=manifest,
-        proofs=proofs,
-    )
-    incomplete = [record["work_unit_id"] for record in records if record["status"] != "success"]
-    if incomplete:
-        message = f"Core benchmark {run_id!r} does not have eight valid successes: {incomplete}."
-        raise RuntimeError(message)
+    measurements, proofs = _terminal_measurements(run_id, storage_root=storage_root, manifest=manifest, suite=suite)
     if manifest["state"] != "complete":
         message = f"Core benchmark manifest is not complete: {manifest['state']!r}."
         raise ValueError(message)
     summary = load_core_benchmark_summary(run_id, storage_root=storage_root)
-    _validate_summary_payload(
-        summary,
-        run_id=run_id,
-        suite=suite,
-        manifest=manifest,
-        proofs=proofs,
-        records=records,
-    )
-    _validate_or_repair_summary_outputs(
-        directory,
-        summary,
-        records,
-        repair_missing=False,
-    )
+    _validate_summary_payload(summary, run_id=run_id, suite=suite, manifest=manifest, proofs=proofs, measurements=measurements)
+    _validate_or_repair_summary_outputs(directory, summary, measurements, repair_missing=False)
     expected_root = (common.paths.get_generation_performance_benchmark_root(storage_root=storage_root) / BENCHMARK_FAMILY).resolve()
-    raw_root = common.paths.get_generation_raw_root(storage_root=storage_root).resolve()
-    processed_root = common.paths.get_generation_processed_root(storage_root=storage_root).resolve()
-    if directory.parent.resolve() != expected_root or directory.is_relative_to(raw_root) or directory.is_relative_to(processed_root):
+    if directory.parent.resolve() != expected_root:
         message = f"Core benchmark evidence escaped its dedicated metadata namespace: {directory}"
         raise ValueError(message)
-    inventory = _directory_inventory(
-        directory,
-        ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
-    )
+    inventory = _directory_inventory(directory)
     return {
         "status": "complete",
         "benchmark_run_id": run_id,
         "suite_digest": suite.suite_digest,
         "representative_case_identities": _proof_identities(suite, proofs),
-        "successful_measurements": len(records),
-        "required_successful_measurements": len(suite.variants) * suite.representative_case_count,
+        "measurements": len(measurements),
+        "required_measurements": len(suite.sweeps) * len(suite.variants),
         "namespace": str(directory),
         "dataset_membership": "none",
         "inventory": inventory,
     }
-
-
-def core_benchmark_transfer_plan(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-) -> dict[str, Any]:
-    """Return the single dedicated benchmark directory eligible for transfer."""
-    validated = validate_core_benchmark(run_id, storage_root=storage_root)
-    storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    directory = core_benchmark_directory(run_id, storage_root=storage)
-    manifest, _suite = load_core_benchmark_manifest(run_id, storage_root=storage)
-    return {
-        "benchmark_run_id": run_id,
-        "git_commit": manifest["git_commit"],
-        "relative_directory": directory.relative_to(storage).as_posix(),
-        "inventory": validated["inventory"],
-    }
-
-
-def _validate_expected_transfer_inventory(
-    inventory: Mapping[str, Any],
-    *,
-    expected_sha256: str,
-    expected_file_count: int,
-    expected_size_bytes: int,
-) -> None:
-    """Require staged evidence to equal the pre-transfer CPU inventory."""
-    if _SHA256_PATTERN.fullmatch(expected_sha256) is None:
-        message = "Expected benchmark inventory SHA-256 is malformed."
-        raise ValueError(message)
-    for label, value in (
-        ("expected_file_count", expected_file_count),
-        ("expected_size_bytes", expected_size_bytes),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            message = f"{label} must be an integer >= 0, got {value!r}."
-            raise ValueError(message)
-    expected = {
-        "inventory_sha256": expected_sha256,
-        "file_count": expected_file_count,
-        "size_bytes": expected_size_bytes,
-    }
-    if any(inventory.get(key) != value for key, value in expected.items()):
-        message = "Staged benchmark evidence differs from the pre-transfer CPU inventory."
-        raise RuntimeError(message)
-
-
-def publish_transferred_core_benchmark(
-    run_id: str,
-    *,
-    staging_root: Path | str,
-    destination_root: Path | str,
-    source_host: str,
-    source_storage_root: str,
-    expected_inventory_sha256: str,
-    expected_file_count: int,
-    expected_size_bytes: int,
-) -> dict[str, Any]:
-    """Validate staged benchmark evidence and atomically publish it in shared storage."""
-    if not source_host or any(character in source_host for character in "\r\n\t"):
-        message = "Benchmark transfer source_host must be safe non-empty text."
-        raise ValueError(message)
-    source_root = Path(source_storage_root)
-    if (
-        not source_root.is_absolute()
-        or source_root == Path("/")
-        or ".." in source_root.parts
-        or any(character in source_storage_root for character in "\r\n\t")
-    ):
-        message = "Benchmark source_storage_root must be a safe absolute non-root path."
-        raise ValueError(message)
-    staging = workspace_service.validate_transfer_staging(staging_root, run_id=run_id)
-    destination = workspace_service.resolve_storage_root(destination_root, create=True)
-    incoming_root = (destination / ".incoming").resolve()
-    if not staging.is_relative_to(incoming_root) or staging.stat().st_dev != destination.stat().st_dev:
-        message = "Benchmark staging must be below destination .incoming on the destination filesystem."
-        raise ValueError(message)
-    source = core_benchmark_directory(run_id, storage_root=staging)
-    target = core_benchmark_directory(run_id, storage_root=destination)
-    if source.is_dir() and not source.is_symlink():
-        inventory = validate_core_benchmark(run_id, storage_root=staging)["inventory"]
-    elif target.is_dir() and not target.is_symlink():
-        inventory = validate_core_benchmark(run_id, storage_root=destination)["inventory"]
-    else:
-        message = f"Benchmark incoming and final publications are both missing: {run_id}"
-        raise FileNotFoundError(message)
-    _validate_expected_transfer_inventory(
-        inventory,
-        expected_sha256=expected_inventory_sha256,
-        expected_file_count=expected_file_count,
-        expected_size_bytes=expected_size_bytes,
-    )
-    if target.exists():
-        target_inventory = _directory_inventory(
-            target,
-            ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
-        )
-        if target_inventory != inventory:
-            message = f"Existing benchmark publication conflicts: {target}"
-            raise FileExistsError(message)
-        if source.exists() and _directory_inventory(source) != inventory:
-            message = f"Incoming benchmark publication conflicts: {source}"
-            raise RuntimeError(message)
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source.replace(target)
-        if _directory_inventory(target) != inventory:
-            message = "Benchmark inventory changed during atomic incoming publication."
-            raise RuntimeError(message)
-    validate_core_benchmark(run_id, storage_root=destination)
-    receipt_path = target / BENCHMARK_TRANSFER_FILENAME
-    if receipt_path.exists():
-        existing = _load_json(receipt_path, label="benchmark transfer receipt")
-        identity = {
-            "benchmark_run_id": run_id,
-            "source_host": source_host,
-            "source_storage_root": source_storage_root,
-            "destination_storage_root": str(destination),
-            "inventory": inventory,
-            "source_removed": False,
-        }
-        if all(existing.get(key) == value for key, value in identity.items()):
-            return existing
-        message = f"Existing benchmark transfer receipt conflicts: {receipt_path}"
-        raise FileExistsError(message)
-    receipt = {
-        "schema_kind": "generation_core_scaling_benchmark_transfer",
-        "schema_version": BENCHMARK_SCHEMA_VERSION,
-        "status": "transfer_complete",
-        "recorded_at": _utc_now(),
-        "benchmark_run_id": run_id,
-        "source_host": source_host,
-        "source_storage_root": source_storage_root,
-        "destination_storage_root": str(destination),
-        "inventory": inventory,
-        "source_removed": False,
-    }
-    _write_immutable_json(
-        receipt_path,
-        receipt,
-        label="benchmark transfer receipt",
-    )
-    return receipt
-
-
-def _benchmark_cleanup_receipt_path(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-) -> Path:
-    """Return durable CPU cleanup evidence outside the removable source."""
-    safe_id = common.paths.validate_logical_name(run_id, label="benchmark_run_id")
-    storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    return common.paths.get_generation_meta_root(storage_root=storage) / "benchmark_cleanup" / f"{safe_id}.json"
-
-
-def _benchmark_transfer_receipt(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-) -> dict[str, Any]:
-    """Load one exact host transfer receipt after validating its publication."""
-    validated = validate_core_benchmark(run_id, storage_root=storage_root)
-    directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    receipt = _load_json(
-        directory / BENCHMARK_TRANSFER_FILENAME,
-        label="benchmark transfer receipt",
-    )
-    if (
-        set(receipt)
-        != {
-            "schema_kind",
-            "schema_version",
-            "status",
-            "recorded_at",
-            "benchmark_run_id",
-            "source_host",
-            "source_storage_root",
-            "destination_storage_root",
-            "inventory",
-            "source_removed",
-        }
-        or receipt.get("schema_kind") != "generation_core_scaling_benchmark_transfer"
-        or receipt.get("schema_version") != 1
-        or receipt.get("status") != "transfer_complete"
-        or receipt.get("benchmark_run_id") != run_id
-        or receipt.get("destination_storage_root") != str(workspace_service.resolve_storage_root(storage_root, create=False))
-        or receipt.get("inventory") != validated["inventory"]
-        or receipt.get("source_removed") is not False
-        or not isinstance(receipt.get("source_host"), str)
-        or not receipt["source_host"]
-        or not isinstance(receipt.get("source_storage_root"), str)
-        or not Path(receipt["source_storage_root"]).is_absolute()
-    ):
-        message = f"Benchmark transfer receipt is invalid: {directory}"
-        raise ValueError(message)
-    return receipt
-
-
-def core_benchmark_cleanup_authorization(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-) -> dict[str, Any]:
-    """Build a hash-bound authorization from the validated host publication."""
-    receipt = _benchmark_transfer_receipt(run_id, storage_root=storage_root)
-    inventory = {key: receipt["inventory"][key] for key in ("inventory_sha256", "file_count", "size_bytes")}
-    identity = {
-        "benchmark_run_id": run_id,
-        "source_host": receipt["source_host"],
-        "source_storage_root": receipt["source_storage_root"],
-        "destination_storage_root": receipt["destination_storage_root"],
-        "inventory": inventory,
-    }
-    return {
-        "schema_kind": "generation_core_scaling_benchmark_cleanup_authorization",
-        "schema_version": 1,
-        **identity,
-        "authorization_sha256": common.serialization.canonical_json_sha256(identity),
-    }
-
-
-def _validate_benchmark_cleanup_identity(
-    inventory: Mapping[str, Any],
-    *,
-    run_id: str,
-    storage: Path,
-    source_host: str,
-    destination_storage_root: str,
-    expected_inventory_sha256: str,
-    expected_file_count: int,
-    expected_size_bytes: int,
-    authorization_sha256: str,
-) -> dict[str, Any]:
-    """Return the canonical cleanup identity after exact argument validation."""
-    _validate_expected_transfer_inventory(
-        inventory,
-        expected_sha256=expected_inventory_sha256,
-        expected_file_count=expected_file_count,
-        expected_size_bytes=expected_size_bytes,
-    )
-    exact_inventory = {
-        "inventory_sha256": expected_inventory_sha256,
-        "file_count": expected_file_count,
-        "size_bytes": expected_size_bytes,
-    }
-    identity = {
-        "benchmark_run_id": run_id,
-        "source_host": source_host,
-        "source_storage_root": str(storage),
-        "destination_storage_root": destination_storage_root,
-        "inventory": exact_inventory,
-    }
-    expected_authorization = common.serialization.canonical_json_sha256(identity)
-    if (
-        not source_host
-        or any(character in source_host for character in "\r\n\t")
-        or not Path(destination_storage_root).is_absolute()
-        or Path(destination_storage_root) == Path("/")
-        or authorization_sha256 != expected_authorization
-    ):
-        message = "Benchmark cleanup authorization identity is invalid."
-        raise ValueError(message)
-    return identity
-
-
-def cleanup_core_benchmark_source(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-    source_host: str,
-    destination_storage_root: str,
-    expected_inventory_sha256: str,
-    expected_file_count: int,
-    expected_size_bytes: int,
-    authorization_sha256: str,
-    confirm: bool = False,
-) -> dict[str, Any]:
-    """Plan or transactionally delete one transferred terminal CPU source."""
-    if not isinstance(confirm, bool):
-        message = "Benchmark cleanup confirm flag must be boolean."
-        raise TypeError(message)
-    storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    receipt_path = _benchmark_cleanup_receipt_path(run_id, storage_root=storage)
-    lock_path = receipt_path.with_suffix(".lock")
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    with common.locking.exclusive_file_lock(lock_path, blocking=True):
-        existing: dict[str, Any] | None = None
-        if receipt_path.exists():
-            existing = _load_json(receipt_path, label="benchmark CPU cleanup receipt")
-            if (
-                existing.get("schema_kind") != BENCHMARK_CLEANUP_SCHEMA_KIND
-                or existing.get("schema_version") != 1
-                or existing.get("benchmark_run_id") != run_id
-                or existing.get("authorization_sha256") != authorization_sha256
-                or existing.get("status") not in {"deleting", "complete"}
-            ):
-                message = f"Benchmark cleanup receipt conflicts: {receipt_path}"
-                raise FileExistsError(message)
-            if existing["status"] == "complete":
-                return {
-                    **existing,
-                    "receipt_sha256": common.serialization.file_sha256(receipt_path),
-                }
-        source = core_benchmark_directory(run_id, storage_root=storage)
-        quarantine = source.parent / f".cleanup-{run_id}"
-        if source.exists() and quarantine.exists():
-            message = "Benchmark source and cleanup quarantine both exist."
-            raise RuntimeError(message)
-        if source.exists():
-            validated = validate_core_benchmark(run_id, storage_root=storage)
-            identity = _validate_benchmark_cleanup_identity(
-                validated["inventory"],
-                run_id=run_id,
-                storage=storage,
-                source_host=source_host,
-                destination_storage_root=destination_storage_root,
-                expected_inventory_sha256=expected_inventory_sha256,
-                expected_file_count=expected_file_count,
-                expected_size_bytes=expected_size_bytes,
-                authorization_sha256=authorization_sha256,
-            )
-            manifest, _suite = load_core_benchmark_manifest(run_id, storage_root=storage)
-            scheduler = _scheduler_evidence(manifest["measured_job_ids"])
-            if scheduler["squeue"]["error"] is not None:
-                message = "Benchmark cleanup cannot prove scheduler inactivity."
-                raise RuntimeError(message)
-            if scheduler["squeue"]["output"]:
-                message = "Benchmark cleanup is blocked by active Slurm work."
-                raise RuntimeError(message)
-        elif existing is not None and quarantine.exists():
-            identity = _validate_benchmark_cleanup_identity(
-                existing["inventory"],
-                run_id=run_id,
-                storage=storage,
-                source_host=source_host,
-                destination_storage_root=destination_storage_root,
-                expected_inventory_sha256=expected_inventory_sha256,
-                expected_file_count=expected_file_count,
-                expected_size_bytes=expected_size_bytes,
-                authorization_sha256=authorization_sha256,
-            )
-        else:
-            message = f"Benchmark source is missing without complete cleanup evidence: {source}"
-            raise FileNotFoundError(message)
-        if not confirm:
-            return {
-                "schema_kind": BENCHMARK_CLEANUP_SCHEMA_KIND,
-                "schema_version": 1,
-                "status": "authorized",
-                **identity,
-                "authorization_sha256": authorization_sha256,
-                "reclaimed_bytes": 0,
-            }
-        pending = {
-            "schema_kind": BENCHMARK_CLEANUP_SCHEMA_KIND,
-            "schema_version": 1,
-            "status": "deleting",
-            "recorded_at": _utc_now(),
-            "completed_at": None,
-            **identity,
-            "authorization_sha256": authorization_sha256,
-            "reclaimed_bytes": 0,
-        }
-        common.serialization.atomic_write_json(receipt_path, pending)
-        if source.exists():
-            source.replace(quarantine)
-        if not quarantine.is_dir() or quarantine.is_symlink():
-            message = f"Benchmark cleanup quarantine is unsafe: {quarantine}"
-            raise RuntimeError(message)
-        shutil.rmtree(quarantine)
-        completed = {
-            **pending,
-            "status": "complete",
-            "completed_at": _utc_now(),
-            "reclaimed_bytes": expected_size_bytes,
-        }
-        common.serialization.atomic_write_json(receipt_path, completed)
-        return {
-            **completed,
-            "receipt_sha256": common.serialization.file_sha256(receipt_path),
-        }
-
-
-def record_core_benchmark_cleanup(
-    run_id: str,
-    *,
-    storage_root: Path | str,
-    authorization_sha256: str,
-    cleanup_receipt_sha256: str,
-    reclaimed_bytes: int,
-) -> dict[str, Any]:
-    """Bind remote cleanup evidence to the validated host publication."""
-    authorization = core_benchmark_cleanup_authorization(run_id, storage_root=storage_root)
-    if (
-        authorization_sha256 != authorization["authorization_sha256"]
-        or _SHA256_PATTERN.fullmatch(cleanup_receipt_sha256) is None
-        or isinstance(reclaimed_bytes, bool)
-        or not isinstance(reclaimed_bytes, int)
-        or reclaimed_bytes != authorization["inventory"]["size_bytes"]
-    ):
-        message = "Benchmark cleanup completion evidence is invalid."
-        raise ValueError(message)
-    directory = core_benchmark_directory(run_id, storage_root=storage_root)
-    receipt = {
-        "schema_kind": "generation_core_scaling_benchmark_host_cleanup",
-        "schema_version": 1,
-        "status": "complete",
-        "recorded_at": _utc_now(),
-        "benchmark_run_id": run_id,
-        "authorization_sha256": authorization_sha256,
-        "cleanup_receipt_sha256": cleanup_receipt_sha256,
-        "reclaimed_bytes": reclaimed_bytes,
-    }
-    _write_immutable_json(
-        directory / BENCHMARK_LOCAL_CLEANUP_FILENAME,
-        receipt,
-        label="benchmark host cleanup receipt",
-    )
-    validate_core_benchmark(run_id, storage_root=storage_root)
-    return receipt
 
 
 def core_benchmark_source_status(
@@ -4522,28 +3465,6 @@ def core_benchmark_source_status(
 ) -> dict[str, Any]:
     """Report the common CPU source-storage state for one benchmark."""
     storage = workspace_service.resolve_storage_root(storage_root, create=False)
-    cleanup_path = _benchmark_cleanup_receipt_path(run_id, storage_root=storage)
-    if cleanup_path.is_file() and not cleanup_path.is_symlink():
-        cleanup = _load_json(cleanup_path, label="benchmark CPU cleanup receipt")
-        if (
-            cleanup.get("schema_kind") != BENCHMARK_CLEANUP_SCHEMA_KIND
-            or cleanup.get("schema_version") != 1
-            or cleanup.get("benchmark_run_id") != run_id
-            or cleanup.get("status") != "complete"
-        ):
-            message = f"Benchmark CPU cleanup receipt is invalid: {cleanup_path}"
-            raise ValueError(message)
-        return {
-            "schema_kind": "generation_run_source_status",
-            "schema_version": 1,
-            "run_kind": "benchmark",
-            "run_id": run_id,
-            "run_state": "complete",
-            "source_state": "cleaned",
-            "reclaimable_bytes": 0,
-            "cleanup_eligibility": "already_cleaned",
-            "active_slurm": False,
-        }
     source = core_benchmark_directory(run_id, storage_root=storage)
     if not source.is_dir() or source.is_symlink():
         message = f"Benchmark source is missing without cleanup evidence: {source}"
@@ -4553,10 +3474,7 @@ def core_benchmark_source_status(
         storage_root=storage,
         query_scheduler=query_scheduler,
     )
-    inventory = _directory_inventory(
-        source,
-        ignored_names=frozenset({BENCHMARK_TRANSFER_FILENAME, BENCHMARK_LOCAL_CLEANUP_FILENAME}),
-    )
+    inventory = _directory_inventory(source)
     active = bool(status["running_work_units"] or status["scheduler_pending_work_units"])
     return {
         "schema_kind": "generation_run_source_status",

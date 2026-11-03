@@ -1,311 +1,131 @@
-# ruff: noqa: S101, PLR2004
-"""Final configuration, naming, ownership, sampling, and domain contracts."""
+"""Final configuration, naming, ownership, sampling, and domain contracts.
+
+Responsibilities:
+  - Check config-owned sampling, source sentinels, scalar handoff, startup, and retry policy
+
+Design principles:
+  - Scientific identity excludes operational provenance and binds active physical controls
+
+This module does NOT:
+  - Execute campaigns or alter maintained scientific configuration
+"""
 
 from __future__ import annotations
 
 import copy
+import math
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import yaml
 
-from src import common, domain, generation
-from src.datasets.packages import dataset_packages_planning as package_planning
+from src import common, generation
 from src.generation.cases import generation_cases_fields as fields
 from src.generation.cases import generation_cases_sampling as sampling
 from src.generation.cases import generation_cases_seeding as seeding
-from src.generation.publication import (
-    generation_publication_campaign_evidence as campaign_evidence,
-)
+from src.generation.validation import generation_validation_sentinels as sentinels
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_transient_family_campaign_resolves_the_120_case_scientific_contract() -> None:
-    """Protect the deliberate production materials, split, and package contract."""
-    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/transient_drying/family_generalization.yaml"
-    campaign = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
+def _edit_layer(config_path: Path, layer: str, mutate: Callable[[dict[str, Any]], None]) -> None:
+    """Apply one in-place mutation to a test-owned layered campaign YAML file."""
+    path = config_path.parent / layer
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    mutate(payload)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _set_license_wait(updates: dict[str, object]) -> Callable[[dict[str, Any]], None]:
+    """Return a mutation applying dotted keys below ``runtime.license_wait``."""
+
+    def mutate(execution: dict[str, Any]) -> None:
+        for dotted, value in updates.items():
+            target = execution["runtime"]["license_wait"]
+            *parents, key = dotted.split(".")
+            for parent in parents:
+                target = target[parent]
+            target[key] = value
+
+    return mutate
+
+
+@pytest.mark.parametrize("profile", ["steady_flow", "transient_drying"])
+def test_small_configuration_controls_membership_and_sampling(generation_config_factory: Any, profile: str) -> None:
+    """Resolve a nondefault small source design with a stable sampling order."""
+    path, _template = generation_config_factory(
+        simulation_profile=profile,
+        campaign_purpose="source_generation",
+        natural_count=5,
     )
-    case_counts = {(batch.material_family, batch.sampling_regime): len(batch.case_indices) for batch in campaign.batches}
-
-    assert campaign.material_roles == {
-        "seen": ("lentil", "chickpea"),
-        "near_family_ood": ("kidney_bean",),
-        "far_family_ood": (),
-        "extreme_family_ood": (),
-    }
-    assert case_counts == {
-        ("chickpea", "natural"): 50,
-        ("kidney_bean", "natural"): 20,
-        ("lentil", "natural"): 50,
-    }
-    assert campaign.total_case_count == 120
-    assert campaign.membership["per_seen_material"] == {
-        "train": 40,
-        "validation": 5,
-        "id_test": 5,
-    }
-    assert {name: count * len(campaign.material_roles["seen"]) for name, count in campaign.membership["per_seen_material"].items()} == {
-        "train": 80,
-        "validation": 10,
-        "id_test": 10,
-    }
-    assert all(batch.sampling_regime != "parameter_ood" for batch in campaign.batches)
-
-    packages = {(package["dataset_view"], package["evaluation_regime"]): package for package in campaign.dataset_packages}
-    assert set(packages) == {
-        ("transient_drying", "id"),
-        ("transient_drying", "near_family_ood"),
-        ("steady_flow", "id"),
-        ("steady_flow", "near_family_ood"),
-    }
-    for view in ("transient_drying", "steady_flow"):
-        identity = packages[(view, "id")]
-        held_out = packages[(view, "near_family_ood")]
-        assert identity["dataset_name"] == f"{view}__lentil+chickpea__id"
-        assert identity["materials"] == ["lentil", "chickpea"]
-        assert identity["source_case_count"] == 100
-        assert identity["membership"]["totals"] == {
-            "train": 80,
-            "validation": 10,
-            "id_test": 10,
-        }
-        assert held_out["dataset_name"] == f"{view}__kidney_bean__near_family_ood"
-        assert held_out["materials"] == ["kidney_bean"]
-        assert held_out["source_case_count"] == 20
-        assert "membership" not in held_out
-    assert packages[("transient_drying", "id")]["training_payload"]["required"] is True
-    assert packages[("transient_drying", "near_family_ood")]["training_payload"]["required"] is True
-    assert all("training_payload" not in package for key, package in packages.items() if key[0] == "steady_flow")
+    campaign = generation.cases.config.load_campaign_config(path)
+    assert campaign.total_case_count == 5
+    assert campaign.profile.id == profile
+    assert campaign.selected_targets == {"lentil": 5}
+    assert campaign.dataset_packages == ()
+    for batch in campaign.batches:
+        for design in batch.scientific_values["sampling"]["blocks"].values():
+            assert sorted(design["permutation"]) == list(range(5))
 
 
-def test_steady_flow_id_dataset_is_independent_and_balanced() -> None:
-    """Protect the standalone Airflow ID Dataset and its exact 80/10/10 splits."""
-    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/id_dataset.yaml"
-    campaign = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
+def test_kappa_mean_ood_tails_map_to_their_porosity_tails_through_field_generation(generation_config_factory: Any) -> None:
+    """Keep each authored permeability tail on its mapped porosity tail in the realized fields."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch=generation.cases.config.build_batch_name("steady_flow", "lentil", "natural"),
     )
-    counts = {batch.material_family: len(batch.case_indices) for batch in campaign.batches}
-    airflow_designs = [batch.scientific_values["sampling"]["blocks"]["airflow"] for batch in campaign.batches]
-
-    assert campaign.campaign_purpose == "steady_flow_id_dataset"
-    assert len(campaign.batches) == 3
-    assert all(batch.sampling_regime == "natural" for batch in campaign.batches)
-    assert campaign.profile.id == "steady_flow"
-    assert counts == {"lentil": 350, "chickpea": 350, "kidney_bean": 350}
-    assert campaign.total_case_count == 1050
-    assert len(airflow_designs) == 3
-    assert all(batch.scientific_values["sampling"]["method"] == "lhs" for batch in campaign.batches)
-    assert all(tuple(batch.scientific_values["sampling"]["blocks"]) == ("airflow",) for batch in campaign.batches)
-    assert len({design["design_seed"] for design in airflow_designs}) == 3
-    assert len({design["design_sha256"] for design in airflow_designs}) == 3
-    assert all(sorted(design["permutation"]) == list(range(350)) for design in airflow_designs)
-    assert campaign.membership["per_seen_material"] == {
-        "train": 280,
-        "validation": 35,
-        "id_test": 35,
-    }
-    assert {name: count * len(campaign.material_roles["seen"]) for name, count in campaign.membership["per_seen_material"].items()} == {
-        "train": 840,
-        "validation": 105,
-        "id_test": 105,
-    }
-    assert campaign.material_roles["near_family_ood"] == ()
-    assert campaign.material_roles["far_family_ood"] == ()
-    assert campaign.material_roles["extreme_family_ood"] == ()
-    assert len(campaign.dataset_packages) == 1
-    package = campaign.dataset_packages[0]
-    assert package["dataset_view"] == "steady_flow"
-    assert package["evaluation_regime"] == "id"
-    assert package["materials"] == ["lentil", "chickpea", "kidney_bean"]
-    assert "sources" not in package
+    coupling = config.scientific_values["material"]["porosity_coupling"]
+    natural = coupling["natural_porosity_support"]
+    base_values = dict(sampling.sample_case(config, 1).values)
+    lower_guard = float(base_values["eps_min_global"])
+    upper_guard = float(base_values["eps_max_global"])
+    assert set(coupling["kappa_ood_porosity_supports"]) == {"lower", "upper"}
+    for direction, tail in coupling["kappa_ood_porosity_supports"].items():
+        for kappa_key, porosity_key in (("kappa_lower", "porosity_lower"), ("kappa_upper", "porosity_upper")):
+            mapped = generation.contracts.porosity.solve_reference_porosity(
+                float(tail[kappa_key]),
+                float(coupling["A_KC_reference"]),
+                eps_min_global=lower_guard,
+                eps_max_global=upper_guard,
+            )
+            assert mapped == pytest.approx(float(tail[porosity_key]), rel=0.0, abs=2e-15)
+        values = {**base_values, "kappa_mean": math.sqrt(float(tail["kappa_lower"]) * float(tail["kappa_upper"]))}
+        diagnostics = fields.generate_spatial_fields(
+            config.profile.id,
+            config.scientific_values["grid"],
+            values,
+            seeds={name: seeding.derive_seed(7, "kappa_ood", direction, name) for name in ("bed", "pressure_bc", "packing_scatter")},
+            family_bounds=None,
+            porosity_coupling=coupling,
+            active_ood_unit="kappa_mean",
+        ).metadata["porosity"]
+        assert diagnostics["packing_scatter_support_kind"] == f"kappa_mean_ood_{direction}"
+        if direction == "lower":
+            assert max(diagnostics["eps_reference"], diagnostics["eps_bed_mean"]) < float(natural["lower"])
+        else:
+            assert min(diagnostics["eps_reference"], diagnostics["eps_bed_mean"]) > float(natural["upper"])
+        assert diagnostics["eps_bed_min"] >= lower_guard
+        assert diagnostics["eps_bed_max"] <= upper_guard
 
 
-def test_cross_profile_stationary_view_is_neutral_and_train_capable(
+def test_source_sentinels_reject_wrong_purpose_profile_and_missing_natural_batch(
     generation_config_factory: Any,
 ) -> None:
-    """Derive membership from the declared package, not source/view equality."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        campaign_purpose="family_generalization",
-        natural_count=3,
-    )
+    """Keep the current Source inventory and purpose admission fail-closed."""
+    steady_path, _steady_template = generation_config_factory(simulation_profile="steady_flow", campaign_purpose="source_generation")
+    steady = generation.cases.config.load_campaign_config(steady_path)
 
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    by_view = {package["dataset_view"]: package for package in campaign.dataset_packages}
-
-    assert by_view["transient_drying"]["split_eligibility"] == {
-        "train": True,
-        "validation": True,
-        "id_test": True,
-        "parameter_ood": False,
-    }
-    stationary = by_view["steady_flow"]
-    assert stationary["split_eligibility"] == {
-        "train": True,
-        "validation": True,
-        "id_test": True,
-        "parameter_ood": False,
-    }
-    assert stationary["membership"] == by_view["transient_drying"]["membership"]
-    assert "intended_usage" not in stationary
-    assert "evaluation_only" not in stationary
-    assert "training_forbidden" not in stationary
-
-
-def test_package_only_cross_profile_request_preserves_simulation_identity(
-    generation_config_factory: Any,
-) -> None:
-    """Separate additive Dataset requests from immutable simulation identity."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        campaign_purpose="family_generalization",
-        natural_count=3,
-    )
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    authored["dataset_packages"] = [
-        {
-            "dataset_view": "transient_drying",
-            "evaluation_regime": "id",
-            "source_role": "seen",
-            "dataset_revision": 0,
-        }
-    ]
-    config_path.write_text(
-        yaml.safe_dump(authored, sort_keys=False),
-        encoding="utf-8",
-    )
-    base = generation.cases.config.load_campaign_config(config_path)
-
-    authored["dataset_packages"].append(
-        {
-            "dataset_view": "steady_flow",
-            "evaluation_regime": "id",
-            "source_role": "seen",
-            "dataset_revision": 0,
-        }
-    )
-    config_path.write_text(
-        yaml.safe_dump(authored, sort_keys=False),
-        encoding="utf-8",
-    )
-    extended = generation.cases.config.load_campaign_config(config_path)
-
-    assert extended.campaign_digest == base.campaign_digest
-    assert extended.package_request_digest != base.package_request_digest
-    assert [batch.batch_id for batch in extended.batches] == [batch.batch_id for batch in base.batches]
-    assert {package["dataset_view"] for package in extended.dataset_packages} == {"steady_flow", "transient_drying"}
-
-
-def test_dataset_revision_changes_request_identity_not_simulation_identity(
-    generation_config_factory: Any,
-) -> None:
-    """Version the logical publication request without changing simulated data."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        campaign_purpose="family_generalization",
-        natural_count=3,
-    )
-    base = generation.cases.config.load_campaign_config(config_path)
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    authored["dataset_packages"][0]["dataset_revision"] = 1
-    config_path.write_text(yaml.safe_dump(authored, sort_keys=False), encoding="utf-8")
-    revised = generation.cases.config.load_campaign_config(config_path)
-
-    assert revised.campaign_digest == base.campaign_digest
-    assert revised.package_request_digest != base.package_request_digest
-    assert [batch.batch_id for batch in revised.batches] == [batch.batch_id for batch in base.batches]
-    assert generation.cases.config.dataset_package_scientific_plan(
-        revised.dataset_packages[0]
-    ) == generation.cases.config.dataset_package_scientific_plan(base.dataset_packages[0])
-
-
-def test_active_campaign_keeps_its_launch_package_snapshot(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep additive package requests out of in-flight solver continuation."""
-    config_path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        campaign_purpose="family_generalization",
-        natural_count=3,
-    )
-    authored = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    authored["dataset_packages"] = [
-        {
-            "dataset_view": "transient_drying",
-            "evaluation_regime": "id",
-            "source_role": "seen",
-            "dataset_revision": 0,
-        }
-    ]
-    config_path.write_text(
-        yaml.safe_dump(authored, sort_keys=False),
-        encoding="utf-8",
-    )
-    launched = generation.cases.config.load_campaign_config(config_path)
-    manifest = {
-        "campaign_config": "configs/generation/campaigns/test.yaml",
-        "campaign_id": launched.campaign_id,
-        "campaign_digest": launched.campaign_digest,
-        "execution_config_digest": common.serialization.canonical_json_sha256(launched.execution_values),
-        "selected_batch_names": [batch.batch_name for batch in launched.batches],
-        "dataset_packages": list(launched.dataset_packages),
-    }
-
-    authored["dataset_packages"].append(
-        {
-            "dataset_view": "steady_flow",
-            "evaluation_regime": "id",
-            "source_role": "seen",
-            "dataset_revision": 0,
-        }
-    )
-    config_path.write_text(
-        yaml.safe_dump(authored, sort_keys=False),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        campaign_evidence,
-        "resolve_campaign_config_path",
-        lambda _value: config_path,
-    )
-
-    active = campaign_evidence.campaign_from_manifest(manifest)
-    current = campaign_evidence.current_campaign_from_manifest(manifest)
-
-    assert [package["dataset_view"] for package in active.dataset_packages] == ["transient_drying"]
-    assert {package["dataset_view"] for package in current.dataset_packages} == {
-        "steady_flow",
-        "transient_drying",
-    }
-    assert active.campaign_digest == current.campaign_digest
-    assert active.package_request_digest != current.package_request_digest
-
-
-def test_primary_airflow_training_source_is_selected_by_exact_dataset_name() -> None:
-    """Keep the independent campaign primary without forbidding neutral packages."""
-    campaign_path = common.paths.get_project_root() / "configs/generation/campaigns/steady_flow/id_dataset.yaml"
-    campaign = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
-    )
-    package = campaign.dataset_packages[0]
-
-    assert campaign.campaign_purpose == "steady_flow_id_dataset"
-    assert campaign.profile.id == "steady_flow"
-    assert package["membership"]["totals"] == {
-        "train": 840,
-        "validation": 105,
-        "id_test": 105,
-    }
-    assert domain.tasks.registry.get_task("steady_flow").default_datasets.train == package["dataset_name"]
+    with pytest.raises(ValueError, match="lacks natural batches"):
+        sentinels.inspect_sentinel_workload(replace(steady, batches=()))
+    with pytest.raises(ValueError, match="not a Source campaign"):
+        sentinels.inspect_sentinel_workload(replace(steady, campaign_purpose="other"))
 
 
 def test_semantic_seed_derivation_is_version_bound() -> None:
@@ -328,10 +148,7 @@ def test_incomplete_mapping_declaration_is_discovery_only(
 ) -> None:
     """Permit structural discovery only when executable mappings are not required."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    profile_path = config_path.parent / "profile.yaml"
-    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
-    profile["exports"][0]["columns"]["x"] = None
-    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    _edit_layer(config_path, "profile.yaml", lambda profile: profile["exports"][0]["columns"].update(x=None))
 
     campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
     assert "x" not in campaign.batches[0].scientific_values["output_contract"]["exports"][0]["columns"]
@@ -342,17 +159,14 @@ def test_incomplete_mapping_declaration_is_discovery_only(
         generation.cases.config.load_campaign_config(config_path)
 
 
-@pytest.mark.parametrize("option", ["--exclusive", "--reservation=reserved", "--nodelist=node-a"])
+@pytest.mark.parametrize("option", ["--exclusive", "--reservation=reserved", "--nodelist=node-a", "--signal=B:TERM@10"])
 def test_execution_rejects_nonordinary_scheduler_options(
     generation_config_factory: Any,
     option: str,
 ) -> None:
     """Prevent execution YAML from reintroducing exclusivity or reservations."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["cluster"]["scheduler_options"] = [option]
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution["cluster"].update(scheduler_options=[option]))
 
     with pytest.raises(generation.cases.config.GenerationConfigError, match="allocation directives"):
         generation.cases.config.load_campaign_config(config_path)
@@ -615,8 +429,9 @@ def test_startup_ramp_configuration_is_strict(
         ("runtime", "maximum_failed_cases", -1, "must be an integer >= 0"),
         ("runtime", "maximum_failed_cases", 1.5, "must be an integer >= 0"),
         ("runtime", "maximum_failed_cases", True, "must be an integer >= 0"),
-        ("submission", "max_running_cases", 0, "must be an integer >= 1"),
-        ("submission", "max_running_cases", 1.5, "must be an integer >= 1"),
+        ("cluster", "node_jobs", 0, "must be an integer >= 1"),
+        ("cluster", "node_jobs", 1.5, "must be an integer >= 1"),
+        ("cluster", "node_jobs", 5, "must be between 1 and 4"),
     ],
 )
 def test_execution_count_limits_reject_invalid_domains(
@@ -626,15 +441,134 @@ def test_execution_count_limits_reject_invalid_domains(
     value: object,
     message: str,
 ) -> None:
-    """Reject invalid failure-threshold and optional running-cap values."""
+    """Reject invalid failure-threshold and node-job counts."""
     config_path, _template = generation_config_factory()
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution[section][key] = value
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution[section].update({key: value}))
 
     with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
         generation.cases.config.load_campaign_config(config_path)
+
+
+def test_execution_accepts_the_full_per_user_node_job_cap(generation_config_factory: Any) -> None:
+    """The cap of four node jobs is a valid execution choice, not only the default two."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution["cluster"].update({"node_jobs": 4}))
+
+    config = generation.cases.config.load_campaign_config(config_path)
+
+    assert config.execution_values["cluster"]["node_jobs"] == 4
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    [
+        ("cluster", "node_job_wall_time", "00:10:00", "must exceed execution.runtime.timeout_seconds plus a 600 s publication margin"),
+        ("cluster", "node_job_wall_time", "24:00:01", "must not exceed 24:00:00"),
+        ("cluster", "node_job_wall_time", "6h", "must use HH:MM:SS"),
+        ("cluster", "memory_per_case", "20", "memory size <int>M, <int>G or <int>T"),
+        ("cluster", "memory_per_case", "1.5G", "memory size <int>M, <int>G or <int>T"),
+        ("cluster", "node_memory_overhead", "0G", "memory size <int>M, <int>G or <int>T"),
+        ("cluster", "node_memory_limit", "100 GB", "memory size <int>M, <int>G or <int>T"),
+        ("cluster", "memory_per_case", "30G", "node_memory_limit is 100G"),
+        ("cluster", "cores_per_case", 25, "must not exceed site.cores_per_node"),
+    ],
+)
+def test_node_job_contract_rejects_what_does_not_fit(
+    generation_config_factory: Any,
+    section: str,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    """Fail closed on a node job that cannot hold one case, an ill-formed size, and a node memory above its limit."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution[section].update({key: value}))
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_execution_schema_version_one_is_not_read(generation_config_factory: Any) -> None:
+    """A version-1 file is refused with the supported version named, before any field is interpreted."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution.update({"schema_version": 1}))
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=r"schema_version 1 is not supported; schema_version 2 .* is required"):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_node_job_resources_derive_concurrency_and_memory_from_the_case_step(generation_config_factory: Any) -> None:
+    """Derive the concurrent case steps and the node-job memory, rounded up to whole GiB, from test-owned inputs."""
+    config_path, _template = generation_config_factory(cores_per_case=5, cores_per_node=24)
+    _edit_layer(
+        config_path,
+        "execution.yaml",
+        lambda execution: execution["cluster"].update({"memory_per_case": "1500M", "node_memory_overhead": "600M", "node_memory_limit": "1T"}),
+    )
+
+    cluster = generation.cases.config.load_campaign_config(config_path).execution_values["cluster"]
+
+    # 24 // 5 = 4 case steps of 1500 MiB plus 600 MiB = 6600 MiB, which Slurm needs as 7 GiB.
+    assert cluster["concurrent_cases_per_node"] == 4
+    assert cluster["node_job_memory"] == "7G"
+    assert cluster["memory_per_case"] == "1500M"
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--mem=32G",
+        "--mem-per-cpu=4G",
+        "--dependency=afterok:1",
+        "--comment=run",
+        "--exclude=hpc111",
+        "--nodelist=hpc111",
+        "--exclusive",
+        "--gres=gpu:1",
+        "--gpus-per-node=1",
+        "--array=1-2",
+        "--nodes=2",
+        "--ntasks=2",
+        "--partition=long",
+        "--qos=high",
+        "--reservation=maintenance",
+        "--mem 32G",
+    ],
+)
+def test_scheduler_options_cannot_override_pipeline_owned_allocation(generation_config_factory: Any, option: str) -> None:
+    """Resources, dependencies, node selection, and GPUs are pipeline-owned, so configuration cannot carry them."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution["cluster"].update({"scheduler_options": [option]}))
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="pipeline-owned allocation directives"):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("stall_stop", "message"),
+    [
+        ({"check_after_seconds": 0, "minimum_simulated_seconds": 3600}, "needs positive"),
+        ({"check_after_seconds": 900, "minimum_simulated_seconds": -1}, "needs positive"),
+        ({"check_after_seconds": 900}, "missing"),
+    ],
+)
+def test_execution_rejects_an_invalid_stall_rule(generation_config_factory: Any, stall_stop: dict[str, float], message: str) -> None:
+    """The optional stall rule needs both positive thresholds and nothing else."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution["runtime"].update({"stall_stop": stall_stop}))
+
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=message):
+        generation.cases.config.load_campaign_config(config_path)
+
+
+def test_execution_without_a_stall_rule_resolves_without_one(generation_config_factory: Any) -> None:
+    """An execution file without stall_stop keeps only the timeout."""
+    config_path, _template = generation_config_factory()
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution["runtime"].pop("stall_stop", None))
+
+    campaign = generation.cases.config.load_campaign_config(config_path)
+
+    assert "stall_stop" not in campaign.batches[0].execution_values["runtime"]
 
 
 def test_valid_config_edits_are_resolved_without_source_synchronization(
@@ -644,7 +578,7 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     campaign_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         natural_count=3,
-        campaign_purpose="family_generalization",
+        campaign_purpose="source_generation",
     )
     campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
     common_path = campaign_path.parent / "common.yaml"
@@ -655,7 +589,6 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
 
     campaign["sampling"]["seed_base"] = 12345
-    campaign["membership"]["seed"] = 12346
     common["grid"].update({"nx": 17, "ny": 11, "Lx": 1.6, "Ly": 1.0})
     common["time"].update({"start": 0.0, "stop": 84.0, "interval": 0.5})
     operations["boundary_schedule"]["startup_ramp"]["duration_h"] = 0.25
@@ -669,18 +602,19 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
             "maximum_failed_cases": 3,
         }
     )
-    execution["cluster"]["wall_time"] = "01:15:00"
+    execution["cluster"]["node_job_wall_time"] = "02:00:00"
     execution["submission"].update(
         {
             "max_admission_cases": 2,
             "poll_interval_seconds": 7,
-            "max_running_cases": 3,
         }
     )
     execution["cluster"]["cores_per_case"] = 8
+    execution["cluster"]["node_jobs"] = 1
     execution["site"]["cpu_host"] = "synthetic-host"
 
-    campaign_path.write_text(
+    renamed_campaign_path = campaign_path.with_name("lentil-d3__reference-range__lhs-s12345.yaml")
+    renamed_campaign_path.write_text(
         yaml.safe_dump(campaign, sort_keys=False),
         encoding="utf-8",
     )
@@ -697,11 +631,11 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
         encoding="utf-8",
     )
 
-    resolved = generation.cases.config.load_campaign_config(campaign_path)
+    resolved = generation.cases.config.load_campaign_config(renamed_campaign_path)
     scientific = resolved.batches[0].scientific_values
 
     assert resolved.total_case_count == 3
-    assert resolved.membership == campaign["membership"]
+    assert resolved.selected_targets == {"lentil": 3}
     assert scientific["campaign_seed"] == 12345
     assert scientific["grid"]["dx"] == pytest.approx(0.1)
     assert scientific["grid"]["dy"] == pytest.approx(0.1)
@@ -718,12 +652,14 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert resolved.execution_values["runtime"]["timeout_seconds"] == 4200.0
     assert resolved.execution_values["runtime"]["maximum_failed_cases"] == 3
     assert resolved.execution_values["runtime"]["graceful_stop_reserve_seconds"] == 300.0
-    assert resolved.execution_values["cluster"]["wall_time"] == "01:15:00"
-    assert resolved.execution_values["cluster"]["cores_per_case"] == 8
+    cluster = resolved.execution_values["cluster"]
+    assert cluster["node_job_wall_time"] == "02:00:00"
+    assert (cluster["cores_per_case"], cluster["node_jobs"]) == (8, 1)
+    # The fixture site has 24 cores: three 8-core case steps of 1G plus the 1G overhead make a 4G node job.
+    assert (cluster["concurrent_cases_per_node"], cluster["node_job_memory"]) == (3, "4G")
     assert resolved.execution_values["submission"] == {
         "max_admission_cases": 2,
         "poll_interval_seconds": 7,
-        "max_running_cases": 3,
     }
     assert resolved.execution_values["site"]["cpu_host"] == "synthetic-host"
 
@@ -735,7 +671,7 @@ def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
     campaign_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         natural_count=3,
-        campaign_purpose="family_generalization",
+        campaign_purpose="source_generation",
     )
     registry_path = campaign_path.parent / "registry.yaml"
     registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
@@ -774,7 +710,7 @@ def test_sampling_coordinate_order_is_config_owned_and_identity_bound(
 def test_invalid_config_combinations_report_authoritative_owner(
     generation_config_factory: Any,
 ) -> None:
-    """Reject invalid counts, membership, role overlap, and package sources."""
+    """Report the authored source owner for an invalid design count."""
 
     def expect_failure(
         mutate: Callable[[dict[str, Any]], None],
@@ -783,7 +719,7 @@ def test_invalid_config_combinations_report_authoritative_owner(
         campaign_path, _template = generation_config_factory(
             simulation_profile="transient_drying",
             natural_count=3,
-            campaign_purpose="family_generalization",
+            campaign_purpose="source_generation",
         )
         campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
         mutate(campaign)
@@ -812,57 +748,6 @@ def test_invalid_config_combinations_report_authoritative_owner(
         ),
         "sampling.counts.natural.lentil",
     )
-    expect_failure(
-        lambda campaign: campaign["membership"]["per_seen_material"].__setitem__("train", 999),
-        "membership.per_seen_material",
-    )
-    expect_failure(
-        lambda campaign: campaign["material_roles"]["near_family_ood"].append("lentil"),
-        "material_roles",
-    )
-    expect_failure(
-        lambda campaign: campaign["dataset_packages"][0].__setitem__(
-            "source_role",
-            "far_family_ood",
-        ),
-        "dataset_packages[0]",
-    )
-
-
-def test_readiness_distinguishes_failed_static_sentinels_from_pending(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Report an executed failing scientific sentinel as a launch blocker."""
-    monkeypatch.setattr(
-        generation.readiness.sentinel_service,
-        "run_static_sentinels",
-        lambda *_args: {"status": "blocked_by_scientific_sanity_guard"},
-    )
-    steady_path, _steady_template = generation_config_factory(
-        simulation_profile="steady_flow",
-        natural_count=3,
-        campaign_purpose="family_generalization",
-    )
-    transient_path, _transient_template = generation_config_factory(
-        simulation_profile="transient_drying",
-        natural_count=3,
-        campaign_purpose="family_generalization",
-    )
-    for campaign_path in (steady_path, transient_path):
-        campaign = yaml.safe_load(campaign_path.read_text(encoding="utf-8"))
-        campaign["profile_config"] = str((campaign_path.parent / "profile.yaml").resolve())
-        campaign_path.write_text(
-            yaml.safe_dump(campaign, sort_keys=False),
-            encoding="utf-8",
-        )
-    report = generation.readiness.build_readiness_report(
-        steady_path,
-        transient_path,
-        run_static_sentinels=True,
-    )
-    assert "STATIC_GENERATOR_SENTINELS_BLOCKED" in report["status_lines"]
-    assert report["production_ready_for_user_launch"] is False
 
 
 def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
@@ -884,7 +769,7 @@ def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "no_ramp_case")
-    schedule_path = bundle.directory / "inputs" / "schedule.csv"
+    schedule_path = bundle.directory / "schedule.csv"
     header = schedule_path.read_text(encoding="utf-8").splitlines()[0]
     schedule = np.loadtxt(schedule_path, delimiter=";", skiprows=1)
     regular_times = np.asarray(
@@ -942,7 +827,7 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
         1,
         tmp_path / "stale_four_column_case",
     )
-    schedule_path = bundle.directory / "inputs" / "schedule.csv"
+    schedule_path = bundle.directory / "schedule.csv"
     lines = schedule_path.read_text(encoding="utf-8").splitlines()
     stale_lines = (
         f"{lines[0]};phi_in_bc",
@@ -992,7 +877,7 @@ def test_target_reaches_scalar_handoff_and_scientific_identity(
         config_path,
         only_batch=batch_name,
     )
-    material_path = config_path.parents[3] / "materials/lentil.yaml"
+    material_path = config_path.parents[3] / "physical_model/materials/lentil.yaml"
     assert tmp_path in material_path.parents
     authored = yaml.safe_load(material_path.read_text(encoding="utf-8"))
     assert set(authored["target_moisture"]) == {
@@ -1056,7 +941,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case")
-    scalar_path = bundle.directory / "inputs" / "scalars.csv"
+    scalar_path = bundle.directory / "scalars.csv"
     content = scalar_path.read_text(encoding="utf-8")
     assert bundle.scalar_handoff is not None
     assert bundle.scalar_handoff.field_names == generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
@@ -1081,7 +966,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
     with pytest.raises(ValueError, match="missing, duplicate, unknown"):
         generation.contracts.scalar_handoff.admit_case_scalar_handoff(
             payload,
-            bundle.directory / "inputs",
+            bundle.directory,
         )
 
 
@@ -1169,75 +1054,6 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
     assert all(effect > 1e-10 for effect in observed.values()), observed
 
 
-def test_steady_conditioning_audit_rejects_hidden_case_varying_solver_input(
-    generation_config_factory: Any,
-) -> None:
-    """Require every varying stationary dependency to be a declared task input."""
-    config_path, _template = generation_config_factory(simulation_profile="steady_flow")
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    batch = campaign.require_batch(
-        material_family="lentil",
-        sampling_regime="natural",
-    )
-    contract = copy.deepcopy(batch.scientific_values["steady_flow_conditioning"])
-    record = {
-        "simulation_profile": "steady_flow",
-        "steady_flow_conditioning": contract,
-    }
-
-    accepted = package_planning.audit_steady_flow_conditioning([record])
-    assert accepted["hidden_conditioning"] is False
-    assert accepted["T_flow_ref_owner"] == "package_fixed"
-    coupled_record = copy.deepcopy(record)
-    coupled_record["simulation_profile"] = "transient_drying"
-    mixed = package_planning.audit_steady_flow_conditioning([record, coupled_record])
-    assert mixed["source_profiles"] == ["steady_flow", "transient_drying"]
-    assert mixed["conditioning_contract_digest"] == accepted["conditioning_contract_digest"]
-
-    hidden = copy.deepcopy(record)
-    dependency = next(item for item in hidden["steady_flow_conditioning"]["dependencies"] if item["name"] == "T_flow_ref")
-    dependency["affects_stationary_solution"] = True
-    dependency["owner"] = "model_input"
-    with pytest.raises(ValueError, match=r"Hidden steady-flow conditioning.*T_flow_ref"):
-        package_planning.audit_steady_flow_conditioning([hidden])
-
-
-def test_duplicate_source_policy_is_explicit() -> None:
-    """Resolve matched physical inputs only through an explicit source policy."""
-    physical_id = "c" * 64
-    candidates = [
-        {
-            "package_case_id": "steady_case",
-            "simulation_case_id": "1" * 64,
-            "case_input_id": physical_id,
-            "simulation_profile": "steady_flow",
-            "material_family": "lentil",
-        },
-        {
-            "package_case_id": "transient_case",
-            "simulation_case_id": "2" * 64,
-            "case_input_id": physical_id,
-            "simulation_profile": "transient_drying",
-            "material_family": "lentil",
-        },
-    ]
-    with pytest.raises(ValueError, match="requires an explicit source preference"):
-        package_planning.resolve_duplicate_case_inputs(
-            candidates,
-            dataset_view="steady_flow",
-            policy="reject_duplicates",
-        )
-
-    selected, decisions = package_planning.resolve_duplicate_case_inputs(
-        list(reversed(candidates)),
-        dataset_view="steady_flow",
-        policy="prefer_transient_source",
-    )
-    assert [candidate["package_case_id"] for candidate in selected] == ["transient_case"]
-    assert decisions[0]["selected_simulation_case_id"] == "2" * 64
-    assert decisions[0]["excluded_simulation_case_ids"] == ["1" * 64]
-
-
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
@@ -1259,13 +1075,7 @@ def test_transient_bulk_moisture_tolerance_validation(
 ) -> None:
     """Reject malformed or scientifically over-broad bulk tolerances."""
     config_path, _template = generation_config_factory()
-    common_path = config_path.parent / "common.yaml"
-    common = yaml.safe_load(common_path.read_text(encoding="utf-8"))
-    common["validation"]["transient_bulk_moisture"][key] = value
-    common_path.write_text(
-        yaml.safe_dump(common, sort_keys=False),
-        encoding="utf-8",
-    )
+    _edit_layer(config_path, "common.yaml", lambda common: common["validation"]["transient_bulk_moisture"].update({key: value}))
 
     with pytest.raises(
         generation.cases.config.GenerationConfigError,
@@ -1275,158 +1085,65 @@ def test_transient_bulk_moisture_tolerance_validation(
 
 
 @pytest.mark.parametrize(
-    ("key", "value", "exception", "message"),
+    ("updates", "exception", "message"),
     [
-        ("enabled", 1, TypeError, "must be boolean"),
+        ({"enabled": 1}, TypeError, "must be boolean"),
+        ({"initial_delay_seconds": True}, generation.cases.config.GenerationConfigError, "finite real value"),
+        ({"initial_delay_seconds": 0}, generation.cases.config.GenerationConfigError, "must be positive"),
+        ({"maximum_delay_seconds": float("inf")}, generation.cases.config.GenerationConfigError, "finite real value"),
+        ({"maximum_wait_seconds": -1}, generation.cases.config.GenerationConfigError, "must be positive"),
+        ({"maximum_wait_seconds": None}, generation.cases.config.GenerationConfigError, "finite real value"),
         (
-            "initial_delay_seconds",
-            True,
+            {"initial_delay_seconds": 60.0, "maximum_delay_seconds": 59},
+            generation.cases.config.GenerationConfigError,
+            "must be at least initial_delay_seconds",
+        ),
+        (
+            {"initial_delay_seconds": 60.0, "maximum_wait_seconds": 59},
+            generation.cases.config.GenerationConfigError,
+            "must be at least initial_delay_seconds",
+        ),
+        ({"in_allocation_retry.enabled": 1}, TypeError, "must be boolean"),
+        ({"in_allocation_retry.maximum_window_seconds": 0}, generation.cases.config.GenerationConfigError, "must be positive"),
+        (
+            {"in_allocation_retry.pause_after_capacity_failure_seconds": float("inf")},
             generation.cases.config.GenerationConfigError,
             "finite real value",
-        ),
-        (
-            "initial_delay_seconds",
-            0,
-            generation.cases.config.GenerationConfigError,
-            "must be positive",
-        ),
-        (
-            "maximum_delay_seconds",
-            float("inf"),
-            generation.cases.config.GenerationConfigError,
-            "finite real value",
-        ),
-        (
-            "maximum_wait_seconds",
-            -1,
-            generation.cases.config.GenerationConfigError,
-            "must be positive",
         ),
     ],
 )
-def test_temporary_license_retry_configuration_validation(
+def test_license_retry_configuration_rejects_invalid_values(
     generation_config_factory: Any,
-    key: str,
-    value: object,
+    updates: dict[str, object],
     exception: type[Exception],
     message: str,
 ) -> None:
-    """Reject non-boolean controls and non-finite or non-positive delays."""
-    config_path, _template = generation_config_factory()
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"][key] = value
-    execution_path.write_text(
-        yaml.safe_dump(execution, sort_keys=False),
-        encoding="utf-8",
-    )
+    """Reject non-boolean controls, non-finite or non-positive delays, and inverted bounds."""
+    config_path, _template = generation_config_factory(license_maximum_delay_seconds=300.0, license_maximum_wait_seconds=3600.0)
+    _edit_layer(config_path, "execution.yaml", _set_license_wait(updates))
 
     with pytest.raises(exception, match=message):
         generation.cases.config.load_campaign_config(config_path)
 
 
-@pytest.mark.parametrize(
-    ("key", "value", "exception", "message"),
-    [
-        ("enabled", 1, TypeError, "must be boolean"),
-        ("maximum_window_seconds", 0, generation.cases.config.GenerationConfigError, "must be positive"),
-        ("pause_after_capacity_failure_seconds", float("inf"), generation.cases.config.GenerationConfigError, "finite real value"),
-    ],
-)
-def test_in_allocation_license_retry_configuration_validation(
-    generation_config_factory: Any,
-    key: str,
-    value: object,
-    exception: type[Exception],
-    message: str,
-) -> None:
-    """Reject invalid controls and durations for the worker-owned retry window."""
+def test_license_retry_configuration_preserves_non_default_values(generation_config_factory: Any) -> None:
+    """Resolve a test-owned wait budget and in-allocation window unchanged."""
     config_path, _template = generation_config_factory()
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    retry = execution["runtime"]["temporary_license_retry"]
-    retry["in_allocation_retry"] = {
-        "enabled": True,
-        "maximum_window_seconds": 17.0,
-        "pause_after_capacity_failure_seconds": 3.0,
-    }
-    retry["in_allocation_retry"][key] = value
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
-
-    with pytest.raises(exception, match=message):
-        generation.cases.config.load_campaign_config(config_path)
-
-
-def test_in_allocation_license_retry_preserves_non_default_worker_policy(
-    generation_config_factory: Any,
-) -> None:
-    """Resolve a test-owned bounded acquisition window without controller defaults."""
-    config_path, _template = generation_config_factory()
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"]["in_allocation_retry"] = {
-        "enabled": True,
-        "maximum_window_seconds": 17.0,
-        "pause_after_capacity_failure_seconds": 3.0,
-    }
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
-
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    assert campaign.batches[0].execution_values["runtime"]["temporary_license_retry"]["in_allocation_retry"] == {
-        "enabled": True,
-        "maximum_window_seconds": 17.0,
-        "pause_after_capacity_failure_seconds": 3.0,
-    }
-
-
-def test_temporary_license_retry_allows_indefinite_controller_wait(
-    generation_config_factory: Any,
-) -> None:
-    """Accept null as the explicit unbounded controller retry policy."""
-    config_path, _template = generation_config_factory()
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"]["maximum_wait_seconds"] = None
-    execution_path.write_text(
-        yaml.safe_dump(execution, sort_keys=False),
-        encoding="utf-8",
+    _edit_layer(
+        config_path,
+        "execution.yaml",
+        _set_license_wait(
+            {
+                "maximum_wait_seconds": 1800.0,
+                "in_allocation_retry.maximum_window_seconds": 17.0,
+                "in_allocation_retry.pause_after_capacity_failure_seconds": 3.0,
+            }
+        ),
     )
 
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    assert campaign.batches[0].execution_values["runtime"]["temporary_license_retry"]["maximum_wait_seconds"] is None
-
-
-@pytest.mark.parametrize(
-    ("maximum_key", "maximum_value"),
-    [
-        ("maximum_delay_seconds", 59),
-        ("maximum_wait_seconds", 59),
-    ],
-)
-def test_temporary_license_retry_configuration_bounds(
-    generation_config_factory: Any,
-    maximum_key: str,
-    maximum_value: int,
-) -> None:
-    """Require both retry maxima to cover at least the initial delay."""
-    config_path, _template = generation_config_factory(
-        license_initial_delay_seconds=60.0,
-        license_maximum_delay_seconds=300.0,
-        license_maximum_wait_seconds=3600.0,
-    )
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"][maximum_key] = maximum_value
-    execution_path.write_text(
-        yaml.safe_dump(execution, sort_keys=False),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(
-        generation.cases.config.GenerationConfigError,
-        match="must be at least initial_delay_seconds",
-    ):
-        generation.cases.config.load_campaign_config(config_path)
+    retry = generation.cases.config.load_campaign_config(config_path).batches[0].execution_values["runtime"]["license_wait"]
+    assert retry["maximum_wait_seconds"] == 1800.0
+    assert retry["in_allocation_retry"] == {"enabled": True, "maximum_window_seconds": 17.0, "pause_after_capacity_failure_seconds": 3.0}
 
 
 def test_operation_provenance_does_not_change_scientific_identity(
@@ -1437,13 +1154,10 @@ def test_operation_provenance_does_not_change_scientific_identity(
     original = generation.cases.config.load_campaign_config(config_path)
     original_batch = original.batches[0]
 
-    operations_path = config_path.parent / "operations.yaml"
-    operations = yaml.safe_load(operations_path.read_text(encoding="utf-8"))
-    record = operations["parameter_values"]["pressure_bc.mean"]
-    record["provenance"]["note"] = "Changed evidence description only."
-    operations_path.write_text(
-        yaml.safe_dump(operations, sort_keys=False),
-        encoding="utf-8",
+    _edit_layer(
+        config_path,
+        "operations.yaml",
+        lambda operations: operations["parameter_values"]["pressure_bc.mean"]["provenance"].update(note="Changed evidence description only."),
     )
 
     changed = generation.cases.config.load_campaign_config(config_path)

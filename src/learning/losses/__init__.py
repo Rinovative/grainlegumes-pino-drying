@@ -1,9 +1,9 @@
-"""
-Supervised and physics-informed loss services.
+"""Supervised, physics-informed, and transient loss services.
 
 Provides:
 - factory: semantic training-loss construction
 - pino: physics-informed loss composition
+- transient: transient drying loss computation
 """
 
 from __future__ import annotations

@@ -1,11 +1,21 @@
-"""Own the explicit flag and unified storage boundary for real-package tests."""
+"""Enforce explicit opt-in and storage ownership for real-package tests.
+
+Responsibilities:
+  - Resolve the explicit storage root that real-package acceptance requires
+
+Design principles:
+  - RUN_REAL_DATA_TESTS=1 and an explicit coherent STORAGE_ROOT are required without fallback
+
+This module does NOT:
+  - Enable real-data tests implicitly or create missing packages
+"""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from src import common, datasets
+from src import common
 
 REAL_DATA_FLAG = "RUN_REAL_DATA_TESTS"
 STORAGE_ROOT = "STORAGE_ROOT"
@@ -30,42 +40,3 @@ def require_real_storage_root() -> Path:
         message = "Maintained storage path ownership disagrees with the explicit real-data root"
         raise RuntimeError(message)
     return root
-
-
-def require_real_generation_root() -> Path:
-    """Return the generated-simulation area below explicit real storage."""
-    return common.paths.get_generation_root(storage_root=require_real_storage_root())
-
-
-def require_real_generated_batch(batch_id: str) -> Path:
-    """Return one mandatory completed generated batch or fail without fallback."""
-    root = require_real_generation_root()
-    required = (
-        root / "meta" / f"{batch_id}.csv",
-        root / "meta" / f"{batch_id}.json",
-        root / "raw" / batch_id / "batch_manifest.json",
-        root / "processed" / batch_id,
-    )
-    if not all(path.is_file() if path.suffix else path.is_dir() for path in required):
-        message = f"Required real generated batch {batch_id!r} is missing"
-        raise FileNotFoundError(message)
-    return root
-
-
-def require_real_data_root() -> Path:
-    """Return the final-dataset area below explicit real storage."""
-    return common.paths.get_datasets_root(storage_root=require_real_storage_root())
-
-
-def require_real_metadata_package(dataset_id: str) -> Path:
-    """Return one mandatory real metadata package or fail without fallback."""
-    require_real_data_root()
-    metadata_dir = common.paths.resolve_dataset_metadata_dir(dataset_id)
-    required = (
-        metadata_dir / datasets.contracts.metadata.METADATA_FILENAME,
-        metadata_dir / datasets.contracts.metadata.SOURCE_MANIFEST_FILENAME,
-    )
-    if not all(path.is_file() for path in required):
-        message = f"Required real production package {dataset_id!r} is missing"
-        raise FileNotFoundError(message)
-    return metadata_dir

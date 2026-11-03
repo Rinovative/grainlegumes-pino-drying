@@ -1,10 +1,14 @@
-# ruff: noqa: S101
-"""
-Protect shared requested-versus-resolved runtime device behavior at every boundary.
+"""Protect shared requested-versus-resolved runtime device behavior at every boundary.
 
-The suite keeps CPU silence, ``auto`` fallback, explicit hardware failure,
-mixed-precision validation, operation-aware determinism, and one immutable
-resume boundary. Model numerics and queue selection are covered elsewhere.
+Responsibilities:
+  - Check requested/resolved devices, CPU silence, fallback, precision, and immutable resume
+    admission
+
+Design principles:
+  - Explicit hardware failure never silently falls back or mutates saved runs
+
+This module does NOT:
+  - Validate model numerics or select scheduler queues
 """
 
 from __future__ import annotations
@@ -14,9 +18,9 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-from support import configs
+from support import configs, run_state
 
-from src import experiments, learning
+from src import common, experiments, learning
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -138,7 +142,7 @@ def test_invalid_device_values_fail_at_the_exact_semantic_path() -> None:
             experiments.config.loader.ConfigError,
             match=r"run\.device must be exactly one of: auto, cuda, cpu",
         ):
-            experiments.config.loader.resolve_config(raw)
+            configs.resolve(raw)
 
 
 def test_cpu_mixed_precision_is_rejected_before_scaler_construction() -> None:
@@ -158,7 +162,7 @@ def test_cuda_determinism_policy_is_operation_aware_and_never_mutates_config() -
     cuda = _mock_cuda_resolution()
     uno_raw = configs.direct_config(model_kind="uno", physics_enabled=False)
     uno_raw["run"]["deterministic"] = True
-    uno = experiments.config.loader.resolve_config(uno_raw)
+    uno = configs.resolve(uno_raw)
     with pytest.raises(
         learning.device.DeviceResolutionError,
         match=r"(?s)UNO 2D resampling.*bicubic.*run\.deterministic: false.*best-effort CUDA reproducibility",
@@ -166,68 +170,61 @@ def test_cuda_determinism_policy_is_operation_aware_and_never_mutates_config() -
         experiments.run.validate_deterministic_model_device_policy(uno, cuda)
     assert uno["run"]["deterministic"] is True
 
-    reflected_raw = configs.direct_config(model_kind="fno", physics_enabled=True)
-    reflected_raw["run"]["deterministic"] = True
-    reflected_raw["loss"]["physics"]["derivatives"] = {
+    spectral_raw = configs.direct_config(model_kind="fno", physics_enabled=True)
+    spectral_raw["run"]["deterministic"] = True
+    spectral_raw["loss"]["physics"]["derivatives"] = {
         "kind": "spectral",
-        "extension": "reflect",
+        "extension": "fourier_continuation",
     }
-    reflected = experiments.config.loader.resolve_config(reflected_raw)
-    with pytest.raises(
-        learning.device.DeviceResolutionError,
-        match=r"(?s)spectral physics.*extension 'reflect'.*reflection_pad2d_backward_cuda.*will not change",
-    ):
-        experiments.run.validate_deterministic_model_device_policy(reflected, cuda)
-    assert reflected["run"]["deterministic"] is True
-    assert reflected["loss"]["physics"]["derivatives"] == {
-        "kind": "spectral",
-        "extension": "reflect",
-    }
+    spectral = configs.resolve(spectral_raw)
+    experiments.run.validate_deterministic_model_device_policy(spectral, cuda)
+    assert spectral["run"]["deterministic"] is True
 
-    for config in (uno, reflected):
+    for config in (uno, spectral):
         config["run"]["deterministic"] = False
         experiments.run.validate_deterministic_model_device_policy(config, cuda)
         config["run"]["deterministic"] = True
         experiments.run.validate_deterministic_model_device_policy(config, learning.device.resolve_device("cpu"))
 
-    data_only = experiments.config.loader.resolve_config(
+    data_only = configs.resolve(
         configs.direct_config(model_kind="fno", physics_enabled=False),
     )
-    physical = experiments.config.loader.resolve_config(
+    physical = configs.resolve(
         configs.direct_config(model_kind="fno", physics_enabled=True),
     )
     experiments.run.validate_deterministic_model_device_policy(data_only, cuda)
     experiments.run.validate_deterministic_model_device_policy(physical, cuda)
 
 
-def test_strict_cuda_does_not_mutate_an_existing_resume_run(
+@pytest.mark.parametrize("saved_config_resume", [False, True])
+def test_strict_cuda_does_not_mutate_an_existing_run_that_would_continue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    saved_config_resume: bool,
 ) -> None:
     """
-    Resume an existing marker-only run with strict CUDA unavailable.
+    Continue an existing interrupted run with strict CUDA unavailable.
 
-    The byte inventory and lease directory must remain unchanged, proving device
+    Rerunning the authored config and resuming from the saved config must both fail on
+    device resolution; the byte inventory and lease state stay unchanged, proving device
     resolution precedes every mutation of an existing run.
     """
     _hide_cuda(monkeypatch)
     training_root = tmp_path / "training"
     monkeypatch.setenv("STORAGE_ROOT", str(training_root))
-    run_dir = tmp_path / "resume"
-    run_dir.mkdir()
-    (run_dir / "marker.bin").write_bytes(b"unchanged")
+    output_root = tmp_path / "outputs"
+    config = configs.resolve(configs.direct_config(), output_root=output_root)
+    run_dir = common.paths.resolve_config_run_dir(config)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
     before = _file_inventory(run_dir)
 
-    config_path = configs.write_yaml(
-        tmp_path / "request.yaml",
-        configs.direct_config(),
+    request: dict[str, Any] = (
+        {"config_path": common.paths.resolve_run_config_path(run_dir), "resume": run_dir}
+        if saved_config_resume
+        else {"config_path": configs.write_config(tmp_path, configs.direct_config(), canonical_root=tmp_path), "output_root": output_root}
     )
     with pytest.raises(learning.device.DeviceResolutionError):
-        experiments.run.run_experiment(
-            config_path,
-            resume=run_dir,
-            device="cuda",
-        )
+        experiments.run.run_experiment(device="cuda", **request)
 
     assert _file_inventory(run_dir) == before
     assert not (training_root / ".state").exists()

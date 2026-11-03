@@ -1,15 +1,14 @@
-"""
-cli_generation_controller.py
-
-Expose one public Generation workflow command backed by the Python controller.
+"""Expose one public Generation workflow command backed by the Python controller.
 
 Responsibilities:
-  - Parse the public Generation command and admit the shared source
+  - Parse the public Generation command and admit the shared source, committed or not
+  - Submit a run from the login node as its own driver job and run the controller inside that job
   - Dispatch lifecycle commands to the controller and native host boundary
-  - Render run and background-session results with their process exit status
+  - Render run results with their process exit status
 
 Design principles:
-  - One public command covers plan, run, status, cancellation, and smoke
+  - One public command covers plan, run, status, and cancellation
+  - A run freezes the source on the login node and executes only from the frozen tree, like the Dataset plan run
   - Scientific and persisted state remain owned by Generation services
   - Host execution uses the canonical native interpreter and sibling roots
 
@@ -21,13 +20,15 @@ This module does NOT:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
-import shlex
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from src import common
 from src.generation import controller as controller_service
+from src.generation.contracts import generation_contracts_campaign_identity as campaign_identity
 from src.generation.runtime import host as host_service
 
 if TYPE_CHECKING:
@@ -44,140 +45,92 @@ def _fail(message: str, *, exit_code: int = 1) -> NoReturn:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="./scripts/generation", description="Run and inspect Generation workflows")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    run = subcommands.add_parser("run", help="start or resume a campaign, benchmark, or paired workflow")
+    run = subcommands.add_parser("run", help="start or resume a campaign or benchmark as a Slurm driver job")
     run.add_argument("config")
-    run.add_argument("--dry-run", action="store_true")
-    run.add_argument("--preflight-only", action="store_true")
-    run.add_argument("--replacement-pool-size", type=int)
-    run.add_argument("--parent-run-id")
-    run.add_argument("--background", action="store_true")
-    run.add_argument("--git-commit")
+    run.add_argument("--materials", nargs="+", help="select configured materials for this original design")
+    run.add_argument("--cases-per-material", type=int, help="set natural original-design size per selected material")
+    run.add_argument("--duration-hours", type=float, help="set the physical transient horizon in hours; preserve the original boundary schedule")
+    run.add_argument(
+        "--revision",
+        metavar="LABEL",
+        help="keep changed science beside the existing Source of the same name as <name>__rev-LABEL (source campaigns only); seeds do not change",
+    )
+    run.add_argument(
+        "--node-jobs",
+        type=int,
+        help=(
+            "set concurrent node jobs across all Generation runs, 1 to 4 (execution.yaml default 2; a cluster-share cap, use 3 or 4 only "
+            "when the standard nodes are quiet; the COMSOL batch licence counts once per user)"
+        ),
+    )
+    run.add_argument("--cores-per-case", type=int, help="set CPUs for each case step of a node job")
+    run.add_argument(
+        "--case-timeout-seconds",
+        type=float,
+        help="set case runtime with a stop reserve capped at 20 percent; the node-job time must still exceed it by 600 s",
+    )
+    run.add_argument(
+        "--no-retry",
+        action="store_true",
+        help="disable automatic license retries (including within an allocation); set the solver failure budget to 1",
+    )
+    run.add_argument("--dry-run", action="store_true", help="print the resolved plan and check execution readiness; start no work")
+    run.add_argument(
+        "--continue-with-current-code",
+        action="store_true",
+        help="continue an existing campaign with the current code instead of its bound source tree (recorded as a new execution epoch)",
+    )
+    run.add_argument("--max-admission-cases", type=int, help="set the recorded operational limit on fresh candidate admissions")
+    run.add_argument("--driver-partition", default="standard", help="Slurm partition of the submitted driver job: standard or long")
+    run.add_argument("--driver-time", default="06:00:00", help="time limit of the submitted driver job as [D-]HH:MM:SS")
     status = subcommands.add_parser("status", help="inspect a config or persisted run ID")
     status.add_argument("target")
-    status.add_argument("--git-commit")
     cancel = subcommands.add_parser("cancel", help="cancel a campaign or benchmark")
     cancel.add_argument("run_id")
     cancel.add_argument("--force", action="store_true")
-    cancel.add_argument("--git-commit")
-    smoke = subcommands.add_parser("smoke", help="submit a small native COMSOL smoke job")
-    smoke.add_argument("--partition", choices=("gpu", "standard"), action=_StoreOnce)
-    smoke.add_argument("--git-commit")
-    background_status = subcommands.add_parser("background-status", help="inspect a durable background session")
-    background_status.add_argument("session_id")
-    subcommands.add_parser("background-list", help="list durable background sessions")
+    fail_case = subcommands.add_parser("fail-case", help="declare one exhausted solver/validation candidate terminal")
+    fail_case.add_argument("run_id")
+    fail_case.add_argument("material")
+    fail_case.add_argument("case_id")
+    fail_case.add_argument("--reason-code", required=True)
+    fail_case.add_argument("--detail", required=True)
+    amend = subcommands.add_parser("amend-replacements", help="explicitly raise the replacement capacity of one original batch of a campaign run")
+    amend.add_argument("run_id")
+    amend.add_argument("--material", required=True)
+    amend.add_argument("--regime", required=True, help="sampling regime of the original batch, for example natural")
+    amend.add_argument("--capacity", type=int, required=True, help="total replacement candidates the batch may use; it can only grow")
+    amend.add_argument("--reason", required=True, help="why capacity is added after the original design was frozen")
     inputs = subcommands.add_parser("inputs", help="generate selected canonical campaign inputs")
     inputs.add_argument("config")
     inputs.add_argument("options", nargs=argparse.REMAINDER)
     return parser
 
 
-class _StoreOnce(argparse.Action):
-    """Reject a repeated valued option instead of silently taking the last."""
-
-    def __call__(
-        self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str | Sequence[str] | None, option_string: str | None = None
-    ) -> None:
-        """Store the first value and reject any later occurrence."""
-        if getattr(namespace, self.dest, None) is not None:
-            parser.error(f"Specify {option_string} at most once")
-        setattr(namespace, self.dest, values)
+def _inputs_options(options: list[str]) -> bool:
+    """Reject options the command owns and return whether the selection is a dry run."""
+    if any(item in {"--storage-root", "--git-commit"} or item.startswith(("--storage-root=", "--git-commit=")) for item in options):
+        _fail("inputs owns the sibling storage root and the admitted source commit", exit_code=2)
+    return "--dry-run" in options
 
 
-def _background_status(port: host_service.GenerationHost, session_id: str) -> str:
-    payload = port.inspect_background(session_id)
-    fields = (
-        ("workflow_session_id", "workflow_session_id"),
-        ("source_commit", "source_commit"),
-        ("subcommand", "subcommand"),
-        ("tmux_session", "tmux_session_name"),
-        ("tmux_active", "tmux_active"),
-        ("workflow_state", "workflow_state"),
-        ("exit_code", "exit_code"),
-        ("started_at", "started_at"),
-        ("ended_at", "ended_at"),
-        ("campaign_run_ids", "campaign_run_ids"),
-        ("benchmark_run_ids", "benchmark_run_ids"),
-        ("current_or_final_stage", "final_stage"),
-        ("log", "log_path"),
-    )
-
-    def render(value: Any) -> str:
-        if value is None:
-            return "-"
-        if isinstance(value, list):
-            return ",".join(map(str, value)) or "-"
-        return str(value).replace("\n", " ").replace("\t", " ")
-
-    lines = [f"{label}={render(payload[key])}" for label, key in fields]
-    if payload["tmux_active"]:
-        lines.append(f"Attach:\n  tmux attach-session -t {shlex.quote(payload['tmux_session_name'])}")
-    else:
-        lines.append(f"Follow log:\n  tail -n 100 -F {shlex.quote(payload['log_path'])}")
-    return "\n".join(lines)
-
-
-def _background_list(port: host_service.GenerationHost) -> str:
-    sessions = port.list_background()
-    if not sessions:
-        return "No background workflow sessions."
-    lines = ["workflow_session_id\tstate\tsubcommand\tstarted_at\ttmux_session"]
-    lines.extend(
-        "\t".join(str(item[key]) for key in ("workflow_session_id", "workflow_state", "subcommand", "started_at", "tmux_session_name"))
-        for item in sessions
-    )
-    return "\n".join(lines)
-
-
-def _launch_background(port: host_service.GenerationHost, arguments: Sequence[str]) -> int:
-    """Render the host-owned background launch result."""
-    session = port.launch_background(arguments)
-    status = session["status"]
-    session_id = session["workflow_session_id"]
-    tmux_name = session["tmux_session_name"]
-    log = session["log_path"]
-    if status in {"completed", "failed"}:
-        print(f"BACKGROUND {status.upper()}\nworkflow_session_id={session_id}\nlog={log}", file=sys.stderr if status == "failed" else sys.stdout)
-    else:
-        print(
-            f"BACKGROUND {status.upper()}\nworkflow_session_id={session_id}\ntmux_session={tmux_name}\n"
-            f"log={log}\nAttach: tmux attach-session -t {shlex.quote(tmux_name)}"
-        )
-        if status == "started":
-            print(f"Status: ./scripts/generation background-status {session_id}")
-    return int(session["exit_code"])
-
-
-def _inputs_options(options: list[str]) -> tuple[list[str], str | None, bool]:
-    requested_commit: str | None = None
-    dry_run = False
-    remaining: list[str] = []
-    index = 0
-    while index < len(options):
-        item = options[index]
-        if item == "--git-commit":
-            if requested_commit is not None or index + 1 >= len(options):
-                _fail("inputs accepts exactly one valued --git-commit", exit_code=2)
-            requested_commit = options[index + 1]
-            index += 2
-            continue
-        if item == "--storage-root" or item.startswith(("--storage-root=", "--git-commit=")):
-            _fail("inputs owns the sibling storage root", exit_code=2)
-        dry_run = dry_run or item == "--dry-run"
-        remaining.append(item)
-        index += 1
-    return remaining, requested_commit, dry_run
+def _source_line(admission: host_service.SourceAdmission) -> str:
+    """Describe the admitted source, including whether its snapshot (or, read-only, its checkout) carries uncommitted changes."""
+    carrier = "snapshot" if admission.frozen else "checkout"
+    state = "carries uncommitted changes" if admission.uncommitted else "is clean"
+    return f"Source: shared HEAD {admission.commit} ({carrier} {state}) fingerprint {admission.fingerprint} tree {admission.tree_id}"
 
 
 def _run_inputs(repository: Path, config: str, options: list[str]) -> int:
-    remaining, requested_commit, dry_run = _inputs_options(options)
+    dry_run = _inputs_options(options)
     layout = host_service.HostLayout.resolve(repository)
-    admission = host_service.admit_source(layout, requested_commit, require_clean=not dry_run)
+    admission = host_service.admit_source(layout, freeze=not dry_run)
+    print(_source_line(admission), file=sys.stderr)
     host = host_service.GenerationHost(layout, admission)
     path, _ = host.config_file(config)
     output = host.call(
         "generate-input-cases",
         str(path),
-        *remaining,
+        *options,
         "--git-commit",
         admission.commit,
         "--storage-root",
@@ -189,7 +142,98 @@ def _run_inputs(repository: Path, config: str, options: list[str]) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0911, PLR0912
+def _run_record_command(port: host_service.GenerationHost, layout: host_service.HostLayout, args: argparse.Namespace) -> int:
+    """Run one campaign record command through its service operation; it freezes no source and starts no job."""
+    if common.paths.campaign_run_parts(args.run_id) is None:
+        _fail(f"{args.command} requires a canonical campaign handle", exit_code=2)
+    operands: tuple[str, ...]
+    if args.command == "fail-case":
+        operation = "declare-candidate-failure"
+        operands = (args.material, args.case_id, "--reason-code", args.reason_code, "--detail", args.detail)
+    else:
+        if args.capacity < 1:
+            _fail("--capacity must be an integer >= 1", exit_code=2)
+        operation = "amend-replacement-pool"
+        operands = ("--material", args.material, "--regime", args.regime, "--capacity", str(args.capacity), "--reason", args.reason)
+    print(port.call(operation, args.run_id, *operands, "--storage-root", str(layout.storage), scheduled=False), end="")
+    return 0
+
+
+def _scientific_arguments(args: argparse.Namespace) -> tuple[str, ...]:
+    """Render the scientific and execution overrides of one run command as the service arguments that resolve its plan."""
+    scientific_arguments: list[str] = []
+    for key in (
+        "materials",
+        "cases_per_material",
+        "duration_hours",
+        "revision",
+        "node_jobs",
+        "max_admission_cases",
+        "cores_per_case",
+        "case_timeout_seconds",
+        "no_retry",
+    ):
+        value = getattr(args, key)
+        if value is not None and value is not False:
+            scientific_arguments.append("--" + key.replace("_", "-"))
+            if value is not True:
+                if isinstance(value, list):
+                    scientific_arguments.extend(str(item) for item in value)
+                else:
+                    scientific_arguments.append(str(value))
+    return tuple(scientific_arguments)
+
+
+def _run(
+    port: host_service.GenerationHost,
+    args: argparse.Namespace,
+    arguments: Sequence[str],
+    driver: host_service.LauncherJob | None,
+) -> int:
+    """Resolve one run plan, then print it with its readiness, submit its driver job from the login node, or run it inside that job."""
+    controller = controller_service.GenerationController(port)
+    plan = controller.plan(args.config, allow_incomplete=args.dry_run, scientific_arguments=_scientific_arguments(args))
+    if args.max_admission_cases is not None and plan.kind != "campaign":
+        _fail("--max-admission-cases applies to one source campaign", exit_code=2)
+    if args.dry_run:
+        footprint: dict[str, Any] | None
+        if plan.kind == "benchmark":
+            _, inspection = controller.benchmark_resources(plan.config_path)
+            footprint = controller_service.benchmark_scheduler_footprint(
+                inspection["resource_contract"], driver_time=args.driver_time, driver_partition=args.driver_partition
+            )
+        else:
+            footprint = controller_service.scheduler_footprint(
+                controller_service.plan_execution_values(plan.payload),
+                driver_time=args.driver_time,
+                driver_partition=args.driver_partition,
+            )
+        # First stdout line: the unchanged plan plus the Slurm footprint it would ask for (node jobs and driver).
+        print(json.dumps({**plan.payload, "identity": plan.identity, "scheduler_footprint": footprint}, sort_keys=True))
+        print(controller.preflight(plan), file=sys.stderr)
+    elif driver is None:
+        controller.run(plan, args.config, max_admission_cases=args.max_admission_cases)
+    else:
+        # A benchmark, like a campaign, runs from the frozen source snapshot (commit plus recorded changes) it is bound to.
+        task = "benchmark"
+        if plan.kind == "campaign":
+            parts = common.paths.campaign_run_parts(plan.identity)
+            if parts is None:
+                _fail("Campaign plan is not a current source campaign", exit_code=2)
+            task = parts[0]
+        submitted = controller.submit_run_tree(
+            plan,
+            module="src.generation.cli.cli_generation_controller",
+            arguments=arguments,
+            continue_with_current_code=args.continue_with_current_code,
+            job=dataclasses.replace(driver, name=f"generation-{task}"),
+        )
+        result = {"status": "SUBMITTED", "job_id": submitted.job_id, "tree_id": submitted.tree_id, "log_path": str(submitted.log_path)}
+        print(json.dumps(result, sort_keys=True, indent=2))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """Parse one public command and return its process exit status."""
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = _parser()
@@ -198,64 +242,40 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0911, PLR0
     try:
         if args.command == "inputs":
             return _run_inputs(repository, args.config, args.options)
+        driver: host_service.LauncherJob | None = None
         if args.command == "run":
-            if args.dry_run and args.preflight_only:
-                _fail("--dry-run cannot be combined with --preflight-only", exit_code=2)
-            if args.replacement_pool_size is not None and args.replacement_pool_size < 1:
-                _fail("replacement_pool_size must be >= 1", exit_code=2)
-            if args.parent_run_id and args.replacement_pool_size is None:
-                _fail("--parent-run-id requires --replacement-pool-size", exit_code=2)
-            if args.background and (args.dry_run or args.preflight_only):
-                _fail("--background requires an executable run", exit_code=2)
+            if args.max_admission_cases is not None and args.max_admission_cases < 1:
+                _fail("--max-admission-cases must be an integer >= 1", exit_code=2)
+            if args.continue_with_current_code and args.dry_run:
+                _fail("--continue-with-current-code requires an executable run", exit_code=2)
+            if args.revision is not None:
+                campaign_identity.revision_label(args.revision)  # a malformed label is refused before any source is frozen
+            if not args.dry_run and common.paths.source_tree_id() is None:
+                # Started in the live checkout on the login node: submit the controller as its own job from the frozen tree.
+                # The final job name needs the plan's task; this validates the driver options before the source is frozen.
+                driver = host_service.LauncherJob("generation", "generation", args.driver_partition, args.driver_time)
         layout = host_service.HostLayout.resolve(repository)
-        require_clean = args.command == "run" and not (args.dry_run or args.preflight_only)
-        admission = host_service.admit_source(layout, getattr(args, "git_commit", None), require_clean=require_clean)
-        print(f"Source: shared HEAD {admission.commit} fingerprint {admission.fingerprint}", file=sys.stderr)
+        # Only an executing run freezes the source; inspection, cancellation and dry runs stay read-only.
+        admission = host_service.admit_source(layout, freeze=args.command == "run" and not args.dry_run)
+        print(_source_line(admission), file=sys.stderr)
         port = host_service.GenerationHost(layout, admission)
-        if args.command == "run" and args.background:
-            return _launch_background(port, arguments)
-        controller = controller_service.GenerationController(port)
         if args.command == "run":
-            plan = controller.plan(args.config, allow_incomplete=args.dry_run)
-            if args.replacement_pool_size is not None and plan.kind != "campaign":
-                _fail("Replacement completion requires a campaign plan", exit_code=2)
-            if args.dry_run:
-                payload = (
-                    controller.completion_preview(plan, args.replacement_pool_size, args.parent_run_id)
-                    if args.replacement_pool_size is not None
-                    else plan.payload
-                )
-                print(json.dumps(payload, sort_keys=True))
-            elif args.preflight_only:
-                if args.replacement_pool_size is not None:
-                    controller.completion_preview(plan, args.replacement_pool_size, args.parent_run_id)
-                print(controller.preflight(plan))
-            else:
-                controller.run(plan, args.config, pool_size=args.replacement_pool_size, parent_run_id=args.parent_run_id)
-            return 0
+            return _run(port, args, arguments, driver)
+        controller = controller_service.GenerationController(port)
         if args.command == "status":
             print(controller.status(args.target))
             return 0
         if args.command == "cancel":
             print(controller.cancel(args.run_id, force=args.force))
             return 0
-        if args.command == "smoke":
-            partition = args.partition or "gpu"
-            job_id = port.submit_smoke(partition=partition)
-            print(f"GENERATION SMOKE SUBMITTED job={job_id} partition={partition} logs={layout.logs}")
-            return 0
-        if args.command == "background-status":
-            print(_background_status(port, args.session_id))
-            return 0
-        if args.command == "background-list":
-            print(_background_list(port))
-            return 0
+        if args.command in {"fail-case", "amend-replacements"}:
+            return _run_record_command(port, layout, args)
         _fail(f"Unsupported subcommand: {args.command}", exit_code=2)
     except KeyboardInterrupt:
         print("Generation interrupted", file=sys.stderr)
         return 130
     except controller_service.GenerationControllerError as error:
-        print(error, file=sys.stderr)
+        print(error.report(), file=sys.stderr)
         return error.exit_code
     except host_service.GenerationCommandError as error:
         print(error, file=sys.stderr)

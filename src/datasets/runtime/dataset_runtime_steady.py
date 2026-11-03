@@ -1,15 +1,15 @@
-"""
-dataset_runtime_steady.py
+"""Load and select verified steady-flow tensor Dataset packages.
 
-Load and select verified steady-flow tensor Dataset packages.
 Responsibilities:
   - Load steady tensor payloads in authoritative TaskSpec channel order
   - Expose immutable identity-bound runtime selections without tensor copies
-  - Apply manifest-owned ID-membership and parameter-OOD selectors
+  - Apply exact experiment case selections to verified package samples
+
 Design principles:
   - TaskSpec remains the sole learned-channel contract
   - Payload fingerprints are verified before runtime access
   - Selection identity binds source fingerprint, selector, and ordered sample IDs
+
 This module does NOT:
   - Resolve package lifecycle paths or orchestrate DataLoaders
   - Fit normalizers, choose experiment splits, or build tensor payloads
@@ -43,8 +43,6 @@ class SteadyFlowMetadata(TypedDict, total=False):
     source_batch_id: str
     source_simulation_profile: str
     material_family: str
-    evaluation_regime: str
-    dataset_membership: str
     source_hdf5_sha256: str
     generator: dict[str, Any]
 
@@ -204,25 +202,19 @@ def select_dataset(
     dataset: SteadyFlowDataset,
     manifest: Mapping[str, Any],
     *,
-    evaluation_regime: str,
-    membership: str | None,
-    ood_group: str | None,
+    case_ids: Sequence[str] | None,
 ) -> Dataset[SteadyFlowItem]:
     """
-    Apply an explicit manifest-owned steady membership or OOD-group selector.
+    Apply an exact experiment-owned steady source-case selection.
 
     Parameters
     ----------
     dataset : SteadyFlowDataset
         Verified complete steady package runtime.
     manifest : Mapping[str, Any]
-        Validated package manifest containing case selectors.
-    evaluation_regime : str
-        Package evaluation regime.
-    membership : str | None
-        Optional ID membership selector.
-    ood_group : str | None
-        Optional parameter-OOD group selector.
+        Validated package manifest bound to the runtime payload.
+    case_ids : Sequence[str] | None
+        Ordered package case IDs, or the complete package when omitted.
 
     Returns
     -------
@@ -230,26 +222,16 @@ def select_dataset(
         Complete source or immutable identity-bound selection.
 
     """
-    package_case_ids: Sequence[str] | None = None
-    selector = "all"
-    if evaluation_regime == "id" and membership is not None:
-        split_membership = manifest["split_membership"]
-        package_case_ids = split_membership.get(membership)
-        selector = f"id/{membership}"
-    elif evaluation_regime == "parameter_ood" and ood_group is not None:
-        available = manifest["available_ood_groups"]
-        if ood_group not in available:
-            message = f"Steady-flow parameter-OOD group {ood_group!r} is unavailable; available selectors are {available}."
-            raise ValueError(message)
-        package_case_ids = manifest["ood_group_indexes"].get(ood_group)
-        selector = f"parameter_ood/{ood_group}"
-    if package_case_ids is None:
+    if manifest["dataset_id"] != dataset.identity.dataset_id:
+        msg = "Steady Dataset manifest and payload identities disagree."
+        raise ValueError(msg)
+    if case_ids is None:
         return dataset
-    if not isinstance(package_case_ids, list) or not all(isinstance(value, str) for value in package_case_ids):
-        message = f"Manifest selector {selector!r} is malformed."
+    if not isinstance(case_ids, Sequence) or isinstance(case_ids, (str, bytes)) or not all(isinstance(value, str) for value in case_ids):
+        message = "Steady exact case selection is malformed."
         raise TypeError(message)
     return SteadyDatasetSelection(
         dataset,
-        _case_positions(dataset, package_case_ids, selector=selector),
-        selector=selector,
+        _case_positions(dataset, case_ids, selector="exact_cases"),
+        selector="exact_cases",
     )

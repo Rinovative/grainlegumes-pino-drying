@@ -1,7 +1,4 @@
-"""
-eda_capabilities.py
-
-Resolve generated-output dataset capabilities and scientific display fields.
+"""Resolve generated-output dataset capabilities and scientific display fields.
 
 Responsibilities:
   - Read stored and derived field availability from authoritative frame metadata

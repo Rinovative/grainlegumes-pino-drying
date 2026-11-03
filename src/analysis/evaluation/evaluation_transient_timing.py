@@ -1,7 +1,4 @@
-"""
-evaluation_transient_timing.py
-
-Build strict transient drying timing and speedup summaries.
+"""Build strict transient drying timing and speedup summaries.
 
 Responsibilities:
   - Validate bounded raw timing repetitions and disclosure metadata
@@ -32,16 +29,8 @@ _MAX_RAW_REPETITIONS = 10_000
 TIMING_COMPONENTS = frozenset(
     {
         "airflow_no_model_seconds",
-        "airflow_no_preprocessing_seconds",
-        "airflow_no_device_transfer_seconds",
-        "airflow_no_postprocessing_seconds",
-        "airflow_no_end_to_end_seconds",
         "drying_no_rollout_model_seconds",
-        "drying_no_preprocessing_seconds",
-        "drying_no_device_transfer_seconds",
-        "drying_no_postprocessing_seconds",
-        "drying_no_end_to_end_seconds",
-        "surrogate_pipeline_model_seconds",
+        "drying_no_prepared_rollout_wall_seconds",
         "surrogate_pipeline_end_to_end_seconds",
         "comsol_transient_drying_seconds",
         "comsol_scientific_solver_seconds",
@@ -56,6 +45,33 @@ _SPEEDUP_FORMULAS = {
     "hybrid_component_speedup": ("comsol_scientific_solver_seconds", ("comsol_stationary_airflow_seconds", "drying_no_rollout_model_seconds")),
     "comsol_process_speedup": ("comsol_process_seconds", ("surrogate_pipeline_end_to_end_seconds",)),
     "generation_compute_end_to_end_speedup": ("generation_compute_end_to_end_seconds", ("surrogate_pipeline_end_to_end_seconds",)),
+}
+_SPEEDUP_BOUNDARIES = {
+    "drying_only_solver_speedup": (
+        "COMSOL transient study top-level Solution time from its solver log",
+        "Warmed drying rollout model calls only; excludes preparation and reconstruction",
+        "Solver-reported study time divided by isolated model-call time",
+    ),
+    "full_pipeline_solver_speedup": (
+        "Sum of COMSOL stationary and transient top-level Solution times",
+        "Sum of separately measured airflow and drying model-call times",
+        "Solver-reported study times divided by component-composed model-call times",
+    ),
+    "hybrid_component_speedup": (
+        "Sum of COMSOL stationary and transient top-level Solution times",
+        "COMSOL stationary top-level Solution time plus drying model-call time",
+        "Component-composed hybrid duration ratio; no full pipeline wall measurement",
+    ),
+    "comsol_process_speedup": (
+        "Measured COMSOL process wall time; includes process overhead beyond solver studies",
+        "Measured full airflow-to-drying surrogate pipeline wall time",
+        "Distinct process and surrogate pipeline boundaries; queue time is excluded",
+    ),
+    "generation_compute_end_to_end_speedup": (
+        "Measured generation compute pipeline wall time, when explicitly available",
+        "Measured full airflow-to-drying surrogate pipeline wall time",
+        "Distinct generation and surrogate pipeline boundaries; missing timings stay unavailable",
+    ),
 }
 
 
@@ -91,9 +107,14 @@ class SpeedupCaseValue:
 
 @dataclass(frozen=True, slots=True)
 class SpeedupSummary:
-    """Store distributions and the authoritative ratio-of-sums aggregate."""
+    """Store ratios, their exact clock boundaries, and the ratio-of-sums aggregate."""
 
     name: str
+    reference_components: tuple[str, ...]
+    surrogate_components: tuple[str, ...]
+    reference_boundary: str
+    surrogate_boundary: str
+    comparison_scope: str
     total_count: int
     available_count: int
     unavailable_count: int
@@ -208,7 +229,21 @@ def _summary(name: str, cases: Sequence[TransientTimingCase]) -> SpeedupSummary:
             sum(item.reference_seconds for item in available if item.reference_seconds is not None)
             / sum(item.surrogate_seconds for item in available if item.surrogate_seconds is not None)
         )
-    return SpeedupSummary(name, len(values), len(available), len(values) - len(available), ratio_of_sums=ratio, cases=tuple(values), **distribution)
+    reference_boundary, surrogate_boundary, comparison_scope = _SPEEDUP_BOUNDARIES[name]
+    return SpeedupSummary(
+        name=name,
+        reference_components=(reference_name,),
+        surrogate_components=surrogate_names,
+        reference_boundary=reference_boundary,
+        surrogate_boundary=surrogate_boundary,
+        comparison_scope=comparison_scope,
+        total_count=len(values),
+        available_count=len(available),
+        unavailable_count=len(values) - len(available),
+        ratio_of_sums=ratio,
+        cases=tuple(values),
+        **distribution,
+    )
 
 
 def build_transient_timing_report(cases: Sequence[TransientTimingCase]) -> TransientTimingReport:

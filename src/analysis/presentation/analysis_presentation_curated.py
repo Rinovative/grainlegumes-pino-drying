@@ -1,7 +1,4 @@
-"""
-analysis_presentation_curated.py
-
-Render the fixed scientific media inventory accepted by optional W&B tracking.
+"""Render the fixed scientific media inventory accepted by optional W&B tracking.
 
 Responsibilities:
   - Build the fixed steady figure/table bundle from validated aggregate frames
@@ -22,6 +19,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,15 +28,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_transient_artifact as transient_artifact
 from src.analysis.evaluation.evaluation_plot import (
     evaluation_plot_physical_consistency as physical_consistency,
 )
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_run_summary as run_summary
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_spectral_fidelity as spectral_fidelity
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
-
     import pandas as pd
     from matplotlib.figure import Figure
 
@@ -48,7 +46,7 @@ CURATED_ANALYSIS_KEYS = frozenset(
     {
         "run_summary_table",
         "accuracy_physics_pareto",
-        "dual_continuity_diagnostics",
+        "physics_residual_diagnostics",
         "pressure_boundary_summary",
         "spectral_fidelity",
     }
@@ -213,13 +211,13 @@ def render_curated_analysis(
 
     media_files = {
         "accuracy_physics_pareto": target / "accuracy_physics_pareto.png",
-        "dual_continuity_diagnostics": target / "dual_continuity_diagnostics.png",
+        "physics_residual_diagnostics": target / "physics_residual_diagnostics.png",
         "pressure_boundary_summary": target / "pressure_boundary_summary.png",
         "spectral_fidelity": target / "spectral_fidelity.png",
     }
     renderers = {
         "accuracy_physics_pareto": run_summary.plot_accuracy_physics_pareto,
-        "dual_continuity_diagnostics": physical_consistency.plot_spatial_residuals,
+        "physics_residual_diagnostics": physical_consistency.plot_spatial_residuals,
         "pressure_boundary_summary": physical_consistency.plot_pressure_boundary_summary,
         "spectral_fidelity": spectral_fidelity.plot_spectral_fidelity,
     }
@@ -252,13 +250,27 @@ def render_curated_transient_analysis(
     target.mkdir(parents=True, exist_ok=True)
     primary_frame = session.frame_names[0]
     primary_record = session.full_autonomous_records(primary_frame)[0]
-    target_records = session.full_autonomous_records()
+    scaling_state = session.scaling_state(primary_frame)
+    identity = primary_record.identity if isinstance(primary_record.identity, Mapping) else {}
+    scaling_identity = identity.get("scaling_identity")
+    expected_scaler_identity = str(scaling_identity.get("semantic_digest", "")) if isinstance(scaling_identity, Mapping) else ""
+    reference_scales = {
+        field: error_diagnostics.transient_reference_scale(
+            scaling_state,
+            field=field,
+            unit=unit,
+            state_order=transient_artifact.STATE_ORDER,
+            dataset_identity=str(scaling_state.get("train_membership_digest", "")),
+            expected_scaler_identity=expected_scaler_identity,
+        )
+        for field, unit in zip(transient_artifact.STATE_ORDER, transient_artifact.STATE_UNITS, strict=True)
+    }
+    target_records = {name: session.full_autonomous_summaries(name) for name in session.frame_names}
     summary = session.dataset_dataframe()
     timing_report = session.timing_report(primary_frame)
-    primary_accuracy = session.case_dataframe(modes=("autonomous_full",))
-    primary_accuracy = primary_accuracy.loc[
-        (primary_accuracy["frame"] == primary_frame) & (primary_accuracy["scope"] == "cumulative") & (primary_accuracy["requested_horizon"] == "full")
-    ]
+    accuracy = session.case_dataframe(modes=("autonomous_full",))
+    accuracy = accuracy.loc[(accuracy["scope"] == "cumulative") & (accuracy["requested_horizon"] == "full")]
+    timing_reports = {name: session.timing_report(name) for name in session.frame_names}
     media_files = {
         "transient_state_maps": target / "transient_state_maps.png",
         "transient_central_error_time": target / "transient_central_error_time.png",
@@ -272,7 +284,7 @@ def render_curated_transient_analysis(
         "transient_accuracy_speedup": target / "transient_accuracy_speedup.png",
     }
     figures = {
-        "transient_state_maps": transient_plot.plot_state_maps(primary_record),
+        "transient_state_maps": transient_plot.plot_state_maps(primary_record, reference_scales=reference_scales),
         "transient_central_error_time": transient_plot.plot_central_error_vs_time(
             primary_record,
             scaling_state=session.scaling_state(primary_frame),
@@ -283,13 +295,15 @@ def render_curated_transient_analysis(
         "transient_pipeline_degradation": transient_plot.plot_pipeline_degradation(session.pipeline_degradation()),
         "transient_timing_distributions": transient_plot.plot_timing_distributions(timing_report),
         "transient_timing_speedups": transient_plot.plot_timing_speedups(timing_report),
-        "transient_accuracy_inference_time": transient_plot.plot_accuracy_vs_inference_time(primary_accuracy, timing_report),
-        "transient_accuracy_speedup": transient_plot.plot_accuracy_vs_speedup(primary_accuracy, timing_report),
+        "transient_accuracy_inference_time": transient_plot.plot_accuracy_runtime_comparison(accuracy, timing_reports, measure="prepared_wall"),
+        "transient_accuracy_speedup": transient_plot.plot_accuracy_runtime_comparison(accuracy, timing_reports, measure="ratio"),
     }
     if training_performance is not None:
         name = "transient_training_performance_compute"
         media_files[name] = target / f"{name}.png"
         figures[name] = transient_plot.plot_training_performance_vs_compute(training_performance)
+    for name in ("transient_state_maps", "transient_central_error_time", "transient_timing_distributions", "transient_timing_speedups"):
+        figures[name].suptitle(f"Saved model: {primary_frame}")
     for name, figure in figures.items():
         _save_figure(figure, media_files[name])
     return TransientCuratedAnalysisBundle(

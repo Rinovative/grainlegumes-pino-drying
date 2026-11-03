@@ -1,10 +1,7 @@
-"""
-evaluation_plot_samples_outliers.py
-
-Render case, permeability, outlier, and input-extreme views.
+"""Render case, permeability, outlier, and input-extreme views.
 
 Responsibilities:
-  - Rank explicit predictive and physical metrics with canonical identity ties
+  - Rank explicit predictive metrics with canonical identity ties
   - Rank supported scientific metadata independently at low and high extremes
   - Render fixed sample, permeability, and two-model field layouts
   - Overlay velocity streamlines on regular display-only physical coordinates
@@ -27,7 +24,7 @@ from __future__ import annotations
 
 from html import escape
 from numbers import Integral
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 import numpy as np
@@ -38,6 +35,9 @@ from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_field_maps as field_maps
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -57,19 +57,6 @@ _STANDARD_NUMBER_LOWER = 1e-4
 _STANDARD_NUMBER_UPPER = 1e4
 
 
-def _metric_columns(frame: pd.DataFrame) -> tuple[str, ...]:
-    """Return current case metrics in stable scientific order."""
-    fields = presentation.display_fields(frame)
-    predictive = ("rel_l2", "rel_h1", *(field.metric_column for field in fields))
-    physics = tuple(metric for metric in dataframe.STEADY_PHYSICS_METRICS if metric in frame.columns)
-    return tuple(dict.fromkeys(metric for metric in (*predictive, *physics) if metric in frame.columns))
-
-
-def available_case_metrics(frame: pd.DataFrame) -> tuple[str, ...]:
-    """Return explicit current metrics valid for deterministic case ranking."""
-    return _metric_columns(frame)
-
-
 def _rank_positions(frame: pd.DataFrame, values: np.ndarray, *, descending: bool) -> np.ndarray:
     """Return deterministic value order with canonical case/source tie breaking."""
     numeric = np.asarray(values, dtype=float)
@@ -84,72 +71,6 @@ def _rank_positions(frame: pd.DataFrame, values: np.ndarray, *, descending: bool
             primary,
         )
     )
-
-
-def build_outlier_table(
-    datasets: Mapping[str, pd.DataFrame],
-    *,
-    top_k: int = _DEFAULT_TOP_K,
-) -> pd.DataFrame:
-    """Build current metric-ranked identities for programmatic linked use."""
-    dataframe.validate_comparison(datasets)
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
-        msg = "top_k must be a positive integer."
-        raise ValueError(msg)
-    rows: list[dict[str, Any]] = []
-    for label, frame in datasets.items():
-        for metric in _metric_columns(frame):
-            values = np.asarray(pd.to_numeric(frame[metric], errors="raise"), dtype=float)
-            for rank, position in enumerate(_rank_positions(frame, values, descending=True)[:top_k], start=1):
-                source = frame.iloc[int(position)]
-                rows.append(
-                    {
-                        "label": label,
-                        "metric": metric,
-                        "rank": rank,
-                        "value": float(values[position]),
-                        "row_position": int(position),
-                        "case_index": int(source["case_index"]),
-                        "source_index": int(source["source_index"]),
-                    }
-                )
-    return pd.DataFrame(rows)
-
-
-def build_input_extremes_table(
-    datasets: Mapping[str, pd.DataFrame],
-    *,
-    top_k: int = _DEFAULT_TOP_K,
-) -> pd.DataFrame:
-    """Build current metadata low/high identities for programmatic linked use."""
-    dataframe.validate_comparison(datasets)
-    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
-        msg = "top_k must be a positive integer."
-        raise ValueError(msg)
-    parameters = presentation.metadata_parameters(tuple(datasets.values()))
-    rows: list[dict[str, Any]] = []
-    for label, frame in datasets.items():
-        for parameter in parameters:
-            values = np.asarray(pd.to_numeric(frame[parameter], errors="raise"), dtype=float)
-            for extreme, order in (
-                ("low", _rank_positions(frame, values, descending=False)),
-                ("high", _rank_positions(frame, values, descending=True)),
-            ):
-                for rank, position in enumerate(order[:top_k], start=1):
-                    source = frame.iloc[int(position)]
-                    rows.append(
-                        {
-                            "label": label,
-                            "parameter": parameter,
-                            "extreme": extreme,
-                            "rank": rank,
-                            "value": float(values[position]),
-                            "row_position": int(position),
-                            "case_index": int(source["case_index"]),
-                            "source_index": int(source["source_index"]),
-                        }
-                    )
-    return pd.DataFrame(rows)
 
 
 def _fmt_number(value: Any) -> str:
@@ -286,14 +207,6 @@ def plot_input_extremes_table(*, datasets: Mapping[str, pd.DataFrame]) -> widget
     return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HBox(tables)))
 
 
-def plot_outlier_extreme_tables(*, datasets: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
-    """Return programmatic current ranking tables without owning panel composition."""
-    return {
-        "metric_outliers": build_outlier_table(datasets),
-        "input_extremes": build_input_extremes_table(datasets),
-    }
-
-
 def _selected_position(frame: pd.DataFrame, row_position: int) -> int:
     """Validate one zero-based saved-membership position."""
     if isinstance(row_position, bool) or not isinstance(row_position, Integral):
@@ -355,9 +268,14 @@ def _contour(
     cmap: str,
     title: str,
     case: cases.EvaluationCase,
+    display_indices: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> Any:
     """Draw one filled-contour panel and colorbar."""
     displayed = _clip_to_levels(values, levels)
+    if display_indices is not None:
+        x_grid = display_grid.display_sample(x_grid, display_indices)
+        y_grid = display_grid.display_sample(y_grid, display_indices)
+        displayed = np.ma.asarray(display_grid.display_sample(displayed, display_indices))
     image = axis.contourf(x_grid, y_grid, displayed, levels=levels, cmap=cmap)
     axis.set_title(title)
     layout.add_map_colorbar(figure, image, axis)
@@ -374,15 +292,28 @@ def _velocity_indices(frame: pd.DataFrame, case: cases.EvaluationCase) -> tuple[
     return case.fields.index(fields[0]), case.fields.index(fields[1])
 
 
-def _overlay_streamlines(axis: Axes, frame: pd.DataFrame, case: cases.EvaluationCase, values: np.ndarray) -> None:
+def _overlay_streamlines(
+    axis: Axes, frame: pd.DataFrame, case: cases.EvaluationCase, values: np.ndarray, *, display_indices: tuple[np.ndarray, np.ndarray] | None = None
+) -> None:
     """Overlay velocity using authoritative equally spaced display coordinates."""
     first, second = _velocity_indices(frame, case)
     x, y, _x_grid, _y_grid = presentation.display_grid(case)
+    horizontal = values[first]
+    vertical = values[second]
+    if display_indices is not None:
+        y_indices, x_indices = display_indices
+        x = x[x_indices]
+        y = y[y_indices]
+        horizontal = display_grid.display_sample(horizontal, display_indices)
+        vertical = display_grid.display_sample(vertical, display_indices)
+    if len(x) > 1 and len(y) > 1 and (not np.allclose(np.diff(x), np.diff(x)[0]) or not np.allclose(np.diff(y), np.diff(y)[0])):
+        axis.quiver(x, y, horizontal, vertical, color="white", alpha=0.7)
+        return
     axis.streamplot(
         x,
         y,
-        values[first],
-        values[second],
+        horizontal,
+        vertical,
         color="white",
         density=0.65,
         linewidth=0.55,
@@ -403,12 +334,12 @@ def _aggregate_diagonal_permeability(case: cases.EvaluationCase) -> np.ndarray:
     return np.mean(np.stack(diagonals), axis=0)
 
 
-def _require_error_mode(error_mode: str) -> str:
+def _require_error_mode(error_mode: str) -> error_diagnostics.SteadyErrorMode:
     """Require one current error-presentation mode."""
-    if error_mode not in {"MAE", "Relative [%]"}:
-        msg = "error_mode must be 'MAE' or 'Relative [%]'."
+    if error_mode not in error_diagnostics.STEADY_ERROR_MODES:
+        msg = f"error_mode must be one of {error_diagnostics.STEADY_ERROR_MODES}."
         raise ValueError(msg)
-    return error_mode
+    return cast("error_diagnostics.SteadyErrorMode", error_mode)
 
 
 def _require_scale_mode(scale_mode: str) -> str:
@@ -419,13 +350,55 @@ def _require_scale_mode(scale_mode: str) -> str:
     return scale_mode
 
 
-def _error_values(reference: np.ndarray, prediction: np.ndarray, *, error_mode: str) -> tuple[np.ndarray, str]:
-    """Return MAE or current field-RMS-relative percentage evidence."""
-    absolute = np.abs(prediction - reference)
-    if _require_error_mode(error_mode) == "MAE":
-        return absolute, "MAE"
-    denominator = float(np.sqrt(np.mean(reference**2))) + _RELATIVE_DENOMINATOR_FLOOR
-    return absolute / denominator * 100.0, "relative error [% of reference RMS]"
+def _error_values(
+    reference: np.ndarray, prediction: np.ndarray, *, error_mode: str, frame: pd.DataFrame, field: presentation.DisplayField
+) -> error_diagnostics.SelectedErrorMap:
+    """Compute only the selected existing-location field error."""
+    mode = _require_error_mode(error_mode)
+    scale = None
+    if mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
+        scale = error_diagnostics.steady_reference_scale(dataframe.require_complete_provenance(frame), field=field.key, unit=field.unit)
+    return error_diagnostics.selected_error_map(reference, prediction, mode=mode, field=field.key, physical_unit=field.unit, scale=scale)
+
+
+def _error_contour(
+    figure: Figure,
+    axis: Axes,
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    result: error_diagnostics.SelectedErrorMap,
+    *,
+    field: presentation.DisplayField,
+    case: cases.EvaluationCase,
+    display_indices: tuple[np.ndarray, np.ndarray] | None = None,
+) -> None:
+    """Render one selected 11-band error or its reason in the existing axis."""
+    title = f"{field.matplotlib_label} {result.label} [{result.unit}]"
+    axis.set_title(title)
+    if result.map_values is None:
+        axis.text(0.5, 0.5, f"Unavailable: {result.reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
+        _format_axes(axis, case)
+        return
+    definition_values = np.concatenate((result.map_values.ravel(), np.array((0.0, 1.0)))) if result.scale is not None else result.map_values
+    definition = field_maps.build_field_map(
+        definition_values,
+        semantic=field_maps.FieldMapSemantic.RELATIVE_ERROR if result.unit == "%" else field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+        field=field.key,
+        unit=result.unit,
+        display_transform=result.label,
+        comparison_scope=None if result.scale is None else result.scale.dataset_identity,
+        locked_boundaries=np.linspace(0.0, 1.0, 12) if result.scale is not None else None,
+        bound_policy="fixed 0..1 with extension" if result.scale is not None else "full selected field",
+    )
+    map_values = result.map_values
+    if display_indices is not None:
+        x_grid = display_grid.display_sample(x_grid, display_indices)
+        y_grid = display_grid.display_sample(y_grid, display_indices)
+        map_values = display_grid.display_sample(map_values, display_indices)
+    image = axis.contourf(x_grid, y_grid, map_values, **definition.contourf_kwargs())
+    label = "1 (train state std; >1 extended)" if result.scale is not None else result.unit
+    layout.add_map_colorbar(figure, image, axis, label=label)
+    _format_axes(axis, case)
 
 
 def _resolve_display_field(frame: pd.DataFrame, field: str | None) -> presentation.DisplayField:
@@ -450,6 +423,7 @@ def _plot_prediction_overview(
     error_mode: str,
     scale_mode: str,
     title: str,
+    display_spatial_stride: display_grid.DisplayStride,
 ) -> Figure:
     """Render the fixed 4 x 4 prediction/reference/error/input figure."""
     position = _selected_position(frame, row_position)
@@ -461,6 +435,7 @@ def _plot_prediction_overview(
     scale = _require_scale_mode(scale_mode)
     error = _require_error_mode(error_mode)
     _x, _y, x_grid, y_grid = presentation.display_grid(case)
+    display_indices = display_grid.display_indices(x_grid.shape, display_spatial_stride)
     figure, axes = layout.map_subplots(rows=4, columns=4)
     permeability = _aggregate_diagonal_permeability(case)
     positive = permeability[permeability > 0.0]
@@ -490,6 +465,7 @@ def _plot_prediction_overview(
             cmap="turbo",
             title=f"{field.matplotlib_label} pred [{field.unit}]",
             case=case,
+            display_indices=display_indices,
         )
         _contour(
             figure,
@@ -501,24 +477,20 @@ def _plot_prediction_overview(
             cmap="turbo",
             title=f"{field.matplotlib_label} true [{field.unit}]",
             case=case,
+            display_indices=display_indices,
         )
         if field.key in {"u", "v", "velocity_magnitude"}:
-            _overlay_streamlines(axes[row, 0], frame, case, case.prediction)
-            _overlay_streamlines(axes[row, 1], frame, case, case.reference)
-        displayed_error, error_label = _error_values(reference, prediction, error_mode=error)
-        upper = max(float(np.quantile(displayed_error, 0.99)), np.finfo(float).eps)
-        clipped = np.minimum(displayed_error, upper)
-        error_unit = field.unit if error == "MAE" else "%"
-        _contour(
+            _overlay_streamlines(axes[row, 0], frame, case, case.prediction, display_indices=display_indices)
+            _overlay_streamlines(axes[row, 1], frame, case, case.reference, display_indices=display_indices)
+        _error_contour(
             figure,
             axes[row, 2],
             x_grid,
             y_grid,
-            clipped,
-            levels=_levels(clipped, nonnegative=True),
-            cmap="Blues",
-            title=f"{field.matplotlib_label} {error_label} [{error_unit}]",
+            _error_values(reference, prediction, error_mode=error, frame=frame, field=field),
+            field=field,
             case=case,
+            display_indices=display_indices,
         )
         if row == 0:
             _contour(
@@ -531,6 +503,7 @@ def _plot_prediction_overview(
                 cmap="viridis",
                 title="kappa [m²]",
                 case=case,
+                display_indices=display_indices,
             )
         elif row == 1:
             _contour(
@@ -543,6 +516,7 @@ def _plot_prediction_overview(
                 cmap="viridis",
                 title="log10(kappa / 1 m²)",
                 case=case,
+                display_indices=display_indices,
             )
         else:
             axes[row, 3].axis("off")
@@ -561,8 +535,9 @@ def plot_sample_prediction_overview(
     *,
     datasets: Mapping[str, pd.DataFrame],
     row_position: int = 0,
-    error_mode: str = "MAE",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     scale_mode: str = "Independent",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Plot the 4 x 4 selected-case prediction overview."""
     _label, frame = _single_dataset(datasets)
@@ -572,6 +547,7 @@ def plot_sample_prediction_overview(
         error_mode=error_mode,
         scale_mode=scale_mode,
         title="Sample GT vs prediction",
+        display_spatial_stride=display_spatial_stride,
     )
 
 
@@ -581,7 +557,8 @@ def plot_permeability_error_overlay(
     row_position: int = 0,
     channel: str = "U",
     kappa_scale: str = "log10(kappa)",
-    error_mode: str = "MAE",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Plot the 2 x 3 permeability tensor, target, and error view."""
     _label, frame = _single_dataset(datasets)
@@ -593,11 +570,14 @@ def plot_permeability_error_overlay(
     selected = _resolve_display_field(frame, channel)
     reference = presentation.case_field(case, selected, source="reference")
     prediction = presentation.case_field(case, selected, source="prediction")
-    displayed_error, error_label = _error_values(reference, prediction, error_mode=error_mode)
-    upper = max(float(np.quantile(displayed_error, 0.99)), np.finfo(float).eps)
-    displayed_error = np.minimum(displayed_error, upper)
-    contour_levels = np.unique(np.quantile(displayed_error, (0.75, 0.95)))
+    selected_error = _error_values(reference, prediction, error_mode=error_mode, frame=frame, field=selected)
+    displayed_error = selected_error.map_values
+    contour_levels = np.unique(np.quantile(displayed_error, (0.75, 0.95))) if displayed_error is not None else np.array([])
     _x, _y, x_grid, y_grid = presentation.display_grid(case)
+    display_indices = display_grid.display_indices(x_grid.shape, display_spatial_stride)
+    shown_x = display_grid.display_sample(x_grid, display_indices)
+    shown_y = display_grid.display_sample(y_grid, display_indices)
+    shown_error = None if displayed_error is None else display_grid.display_sample(displayed_error, display_indices)
     by_name = dict(zip(case.permeability_names, case.permeability, strict=True))
     if not {"Kxx", "Kxy", "Kyy"}.issubset(by_name):
         msg = "The tensor overlay requires kxx, kxy, and kyy."
@@ -628,9 +608,10 @@ def plot_permeability_error_overlay(
             cmap="viridis",
             title=title,
             case=case,
+            display_indices=display_indices,
         )
         if contour_levels.size:
-            axes[row, column].contour(x_grid, y_grid, displayed_error, levels=contour_levels, colors="red", linewidths=1.0)
+            axes[row, column].contour(shown_x, shown_y, shown_error, levels=contour_levels, colors="red", linewidths=1.0)
     _contour(
         figure,
         axes[0, 2],
@@ -641,20 +622,11 @@ def plot_permeability_error_overlay(
         cmap="turbo",
         title=f"{selected.matplotlib_label} true [{selected.unit}]",
         case=case,
+        display_indices=display_indices,
     )
     if contour_levels.size:
-        axes[0, 2].contour(x_grid, y_grid, displayed_error, levels=contour_levels, colors="red", linewidths=1.0)
-    _contour(
-        figure,
-        axes[1, 2],
-        x_grid,
-        y_grid,
-        displayed_error,
-        levels=_levels(displayed_error, count=11, nonnegative=True),
-        cmap="Reds",
-        title=f"{selected.matplotlib_label} {error_label}",
-        case=case,
-    )
+        axes[0, 2].contour(shown_x, shown_y, shown_error, levels=contour_levels, colors="red", linewidths=1.0)
+    _error_contour(figure, axes[1, 2], x_grid, y_grid, selected_error, field=selected, case=case, display_indices=display_indices)
     layout.apply_map_grid_axis_labels(
         axes,
         x_label=f"x [{case.coordinate_units[0]}]",
@@ -671,6 +643,7 @@ def plot_pressure_velocity_comparison(
     model_1: str | None = None,
     model_2: str | None = None,
     scale_mode: str = "Independent",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Plot 3 x 2 pressure/speed truth and two-model predictions."""
     dataframe.validate_comparison(datasets)
@@ -694,6 +667,15 @@ def plot_pressure_velocity_comparison(
     ):
         msg = "Model comparison requires exact shared case identity and reference fields."
         raise dataframe.ComparisonCompatibilityError(msg)
+    try:
+        display_grid.require_common_grid(
+            display_grid.spatial_grid_identity(first_case.coordinates, coordinate_units=first_case.coordinate_units, field_order=first_case.fields),
+            display_grid.spatial_grid_identity(
+                second_case.coordinates, coordinate_units=second_case.coordinate_units, field_order=second_case.fields
+            ),
+        )
+    except ValueError as error:
+        raise dataframe.ComparisonCompatibilityError(str(error)) from error
     display = presentation.shared_display_fields((datasets[first_label], datasets[second_label]))
     pressure = next(field for field in display if field.label == "p")
     speed = next(field for field in display if field.key == "velocity_magnitude")
@@ -711,6 +693,7 @@ def plot_pressure_velocity_comparison(
     row_cases = (first_case, first_case, second_case)
     scale = _require_scale_mode(scale_mode)
     _x, _y, x_grid, y_grid = presentation.display_grid(first_case)
+    display_indices = display_grid.display_indices(x_grid.shape, display_spatial_stride)
     figure, axes = layout.map_subplots(rows=3, columns=2)
     for row, row_label in enumerate(row_labels):
         pressure_levels = _levels(pressure_values[0] if scale == "Shared (GT)" else pressure_values[row])
@@ -725,6 +708,7 @@ def plot_pressure_velocity_comparison(
             cmap="turbo",
             title=f"{row_label} p [{pressure.unit}]",
             case=first_case,
+            display_indices=display_indices,
         )
         _contour(
             figure,
@@ -736,10 +720,15 @@ def plot_pressure_velocity_comparison(
             cmap="turbo",
             title=f"{row_label} {speed.matplotlib_label} [{speed.unit}]",
             case=first_case,
+            display_indices=display_indices,
         )
         tensor = row_cases[row].reference if row == 0 else row_cases[row].prediction
         _overlay_streamlines(
-            axes[row, 1], datasets[first_label] if row < _MINIMUM_COMPARISON_MODELS else datasets[second_label], row_cases[row], tensor
+            axes[row, 1],
+            datasets[first_label] if row < _MINIMUM_COMPARISON_MODELS else datasets[second_label],
+            row_cases[row],
+            tensor,
+            display_indices=display_indices,
         )
     layout.apply_map_grid_axis_labels(
         axes,
@@ -748,66 +737,6 @@ def plot_pressure_velocity_comparison(
     )
     figure.suptitle(layout.case_title("Pressure and velocity comparison", case_number=first_case.case_index), fontsize=14)
     return figure
-
-
-def plot_task_aware_sample(
-    *,
-    datasets: Mapping[str, pd.DataFrame],
-    positions: Mapping[str, int] | None = None,
-) -> Figure:
-    """Render current learned fields for direct programmatic callers."""
-    dataframe.validate_comparison(datasets)
-    selected = dict.fromkeys(datasets, 0) if positions is None else dict(positions)
-    if set(selected) != set(datasets):
-        msg = "positions must identify every dataset label exactly once."
-        raise ValueError(msg)
-    row_count = sum(len(frame.attrs["output_fields"]) for frame in datasets.values())
-    figure, axes = layout.map_subplots(rows=row_count, columns=3)
-    loaded_cases = {label: cases.load_case(frame, _selected_position(frame, selected[label])) for label, frame in datasets.items()}
-    case_numbers = {label: case.case_index for label, case in loaded_cases.items()}
-    common_case = next(iter(case_numbers.values())) if len(set(case_numbers.values())) == 1 else None
-    row = 0
-    for label in datasets:
-        case = loaded_cases[label]
-        heading = label if common_case is not None else layout.case_title(label, case_number=case.case_index)
-        extent = cases.grid_extent(case)
-        for index, field in enumerate(case.fields):
-            reference = case.reference[index]
-            prediction = case.prediction[index]
-            error = np.abs(prediction - reference)
-            shared_low = float(min(np.min(reference), np.min(prediction)))
-            shared_high = float(max(np.max(reference), np.max(prediction)))
-            if np.isclose(shared_low, shared_high):
-                shared_high += np.finfo(float).eps
-            for column, values, title, cmap, low, high in (
-                (0, reference, "true", "turbo", shared_low, shared_high),
-                (1, prediction, "pred", "turbo", shared_low, shared_high),
-                (2, error, "MAE", "Blues", 0.0, max(float(np.quantile(error, 0.99)), np.finfo(float).eps)),
-            ):
-                image = axes[row, column].imshow(values, origin="lower", extent=extent, aspect="equal", cmap=cmap, vmin=low, vmax=high)
-                axes[row, column].set_title(f"{heading} — {field} {title}")
-                layout.add_map_colorbar(figure, image, axes[row, column])
-            row += 1
-    first_case = next(iter(loaded_cases.values()))
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label=f"x [{first_case.coordinate_units[0]}]",
-        y_label=f"y [{first_case.coordinate_units[1]}]",
-    )
-    if common_case is not None:
-        figure.suptitle(layout.case_title("Task-aware sample", case_number=common_case))
-    else:
-        figure.suptitle("Task-aware samples")
-    return figure
-
-
-def plot_task_aware_sample_at_position(
-    *,
-    datasets: Mapping[str, pd.DataFrame],
-    row_position: int = 0,
-) -> Figure:
-    """Render one shared saved-membership position across comparable datasets."""
-    return plot_task_aware_sample(datasets=datasets, positions=dict.fromkeys(datasets, row_position))
 
 
 def _outlier_positions(frame: pd.DataFrame, field: presentation.DisplayField, *, top_k: int) -> tuple[int, ...]:
@@ -822,9 +751,10 @@ def plot_linked_outlier_cases(
     datasets: Mapping[str, pd.DataFrame],
     channel: str = "U",
     selection_index: int = 0,
-    error_mode: str = "MAE",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     scale_mode: str = "Independent",
     top_k: int = _DEFAULT_TOP_K,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Render one of the worst-five-plus-reference cases for a selected channel."""
     _label, frame = _single_dataset(datasets)
@@ -840,6 +770,7 @@ def plot_linked_outlier_cases(
         error_mode=error_mode,
         scale_mode=scale_mode,
         title=title,
+        display_spatial_stride=display_spatial_stride,
     )
 
 
@@ -848,8 +779,9 @@ def plot_linked_input_extreme_cases(
     datasets: Mapping[str, pd.DataFrame],
     parameter: str,
     selection_index: int = 0,
-    error_mode: str = "MAE",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     scale_mode: str = "Independent",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Render the minimum or maximum case for one supported metadata parameter."""
     _label, frame = _single_dataset(datasets)
@@ -869,4 +801,5 @@ def plot_linked_input_extreme_cases(
         error_mode=error_mode,
         scale_mode=scale_mode,
         title=title,
+        display_spatial_stride=display_spatial_stride,
     )

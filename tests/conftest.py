@@ -1,10 +1,15 @@
-"""
-Provide reusable strict task and dataset fixtures for the CPU contract suite.
+"""Provide reusable strict task and dataset fixtures with isolated storage roots.
 
-The factories model current TaskSpec field order, schema identity, and small
-in-memory tensors while deliberately avoiding production storage and training
-workloads. Scientific equations and lifecycle failures are exercised by their
-own focused modules. These fixtures should not be treated as benchmark data.
+Responsibilities:
+  - Provide registered/synthetic TaskSpec fixtures and compact fingerprinted Dataset payloads
+  - Register the shared Generation and transient-package fixture plugins for every test directory
+
+Design principles:
+  - Autouse storage isolation protects production roots unless real-data access is explicitly
+    selected
+
+This module does NOT:
+  - Supply benchmark data or test scientific equations
 """
 
 from __future__ import annotations
@@ -14,13 +19,15 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 from support import real_data
-from support.synthetic_task import build_synthetic_generated_batch_identity, build_synthetic_task
+from support.synthetic_task import build_synthetic_selection_provenance, build_synthetic_task
 
 from src import datasets, domain
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
+
+pytest_plugins = ("support.generation_fixtures", "support.source_tree", "support.transient_package")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -87,6 +94,8 @@ def training_dataset_payload_factory(
         dtype: torch.dtype = torch.float32,
         source_tokens: Sequence[str] | None = None,
         source_provenance: dict[str, Any] | None = None,
+        material_family: str = "lentil",
+        material_role: str | None = None,
     ) -> dict[str, Any]:
         tokens = tuple(source_tokens or sample_ids)
         inputs = torch.stack(
@@ -114,17 +123,24 @@ def training_dataset_payload_factory(
             )
             for index, sample_id in enumerate(sample_ids)
         ]
+        provenance = build_synthetic_selection_provenance(
+            dataset_name=dataset_id,
+            sample_ids=sample_ids,
+            material_family=material_family,
+            material_role=material_role,
+        )
         return datasets.contracts.identity.build_training_dataset_payload(
             task=steady_task,
             dataset_id=dataset_id,
             sample_ids=sample_ids,
-            generated_batch_identity=build_synthetic_generated_batch_identity(
-                batch_id="synthetic_source",
-                sample_ids=sample_ids,
-            ),
+            source_selection_identity={
+                "schema_kind": "dataset_source_selection",
+                "schema_version": 1,
+                "source_cases": provenance["source_case_identities"],
+            },
             source_identities=identities,
             source_metadata=metadata,
-            source_provenance=source_provenance or {"batch_manifest_sha256": "2" * 64},
+            source_provenance=source_provenance or provenance,
             case_fingerprints=fingerprints,
             inputs=inputs,
             outputs=outputs,

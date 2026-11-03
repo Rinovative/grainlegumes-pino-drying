@@ -1,15 +1,15 @@
-"""
-generation_cases_sampling.py
+"""Generate deterministic blockwise design-of-experiments values.
 
-Generate deterministic blockwise design-of-experiments values.
 Responsibilities:
   - Build independent Latin-hypercube or Sobol designs for four physical blocks
   - Apply typed registry transforms, coupled selections, and parameter OOD tails
   - Persist block seeds, row permutations, row indices, and selection evidence
+
 Design principles:
   - Each block owns an independent label-derived stream and row permutation
   - Coupled sets, family identity, and seeds are metadata rather than dimensions
   - Case values are independent of process ordering, concurrency, and resume
+
 This module does NOT:
   - Define material ranges, invent unresolved values, or generate spatial fields
   - Evaluate arbitrary expressions or select a simulation profile
@@ -37,12 +37,41 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 LHS_MAXIMIN_CANDIDATES = 50
 SOBOL_SKIP = 1000
 SOBOL_LEAP = 200
+CANONICAL_SUPPLEMENTAL_SCHEMA_VERSION = 1
 _NEAREST_NEIGHBOR_COUNT = 2
+
+
+def supplemental_unit_point(
+    *,
+    registry: Mapping[str, Mapping[str, Any]],
+    blocks: Sequence[str],
+    block_parameters: Mapping[str, Sequence[str]],
+    seed: int,
+    ordinal: int,
+) -> dict[str, list[float]]:
+    """Return a prefix-stable Sobol point for one source replacement ordinal."""
+    if type(ordinal) is not int or ordinal < 1:
+        message = "Supplemental candidate ordinal must be positive."
+        raise ValueError(message)
+    dimensions = materials.sampling_block_dimensions(
+        registry,
+        blocks=tuple(blocks),
+        block_parameters={key: tuple(value) for key, value in block_parameters.items()},
+    )
+    return {
+        block: unit_design(
+            "sobol",
+            count=ordinal,
+            dimensions=dimensions[block],
+            seed=seeding.derive_seed(seed, "supplemental_replacement", block),
+        )[ordinal - 1].tolist()
+        for block in blocks
+    }
 
 
 class _SamplingConfig(Protocol):
@@ -161,7 +190,6 @@ def build_sampling_plan(
     method: str,
     blocks: tuple[str, ...],
     block_parameters: Mapping[str, tuple[str, ...]],
-    block_seed_bases: Mapping[str, int] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Build serializable designs for only the profile-active blocks."""
     dimensions = materials.sampling_block_dimensions(
@@ -169,18 +197,12 @@ def build_sampling_plan(
         blocks=blocks,
         block_parameters=block_parameters,
     )
-    overrides = {} if block_seed_bases is None else dict(block_seed_bases)
-    unknown_overrides = sorted(set(overrides).difference(blocks))
-    if unknown_overrides:
-        message = f"Sampling seed overrides target inactive blocks {unknown_overrides}."
-        raise ValueError(message)
     plan: dict[str, dict[str, Any]] = {}
     for block in blocks:
         parameters = block_parameters[block]
         dimension = dimensions[block]
-        paired = block in overrides
-        block_seed_base = overrides.get(block, seed_base)
-        namespace = "paired_equivalence_block" if paired else "sampling_block"
+        block_seed_base = seed_base
+        namespace = "sampling_block"
         design_seed = seeding.derive_seed(block_seed_base, namespace, block, "design")
         permutation_seed = seeding.derive_seed(
             block_seed_base,
@@ -199,7 +221,7 @@ def build_sampling_plan(
             "label": block,
             "parameters": list(parameters),
             "effective_dimension": dimension,
-            "seed_origin": ("paired_equivalence" if paired else "profile_batch"),
+            "seed_origin": "profile_batch",
             "design_seed": design_seed,
             "design_sha256": _array_sha256(design),
             "permutation_seed": permutation_seed,
@@ -852,150 +874,29 @@ def _units(registry: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
     return units
 
 
-def _explicit_nominal_values(
-    registry: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Resolve only authored nominal values and complete atomic records."""
-    values: dict[str, Any] = {}
-    coupled_selections: dict[str, str] = {}
-    for name, entry in registry.items():
-        kind = str(entry["kind"])
-        if kind == "derived":
-            continue
-        if kind == "fixed":
-            values[name] = copy.deepcopy(entry["value"])
-            continue
-        if kind in {"interval", "integer"}:
-            if "nominal" not in entry:
-                message = f"Explicit pilot nominal is missing for resolved parameter owner/key {name!r}."
-                raise ValueError(message)
-            nominal = entry["nominal"]
-            if isinstance(nominal, bool) or not isinstance(nominal, (int, float)) or not math.isfinite(float(nominal)):
-                message = f"Explicit pilot nominal for {name!r} must be finite numeric data."
-                raise ValueError(message)
-            if kind == "integer":
-                integer = int(nominal)
-                if float(integer) != float(nominal):
-                    message = f"Explicit pilot nominal for integer {name!r} is not integral."
-                    raise ValueError(message)
-                values[name] = integer
-            else:
-                values[name] = float(nominal)
-            continue
-        if kind == "simplex":
-            nominal = entry.get("nominal")
-            components = tuple(entry["components"])
-            if not isinstance(nominal, dict) or set(nominal) != set(components):
-                message = f"Explicit pilot nominal simplex is missing or incomplete for owner/key {name!r}."
-                raise ValueError(message)
-            weights = {component: float(nominal[component]) for component in components}
-            if not all(math.isfinite(value) for value in weights.values()) or not math.isclose(
-                sum(weights.values()),
-                1.0,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ):
-                message = f"Explicit pilot nominal simplex {name!r} is non-finite or does not sum to one."
-                raise ValueError(message)
-            minimum = float(entry["minimum_each"])
-            maximum = float(entry["maximum_each"])
-            if any(not minimum <= value <= maximum for value in weights.values()):
-                message = f"Explicit pilot nominal simplex {name!r} violates its configured component bounds."
-                raise ValueError(message)
-            values[name] = weights
-            continue
-        if kind == "categorical":
-            if "nominal" not in entry:
-                message = f"Explicit pilot nominal is missing for categorical owner/key {name!r}."
-                raise ValueError(message)
-            nominal = copy.deepcopy(entry["nominal"])
-            if nominal not in entry["choices"]:
-                message = f"Explicit pilot nominal for {name!r} is not a configured natural choice."
-                raise ValueError(message)
-            values[name] = nominal
-            continue
-        if kind == "parameter_set":
-            records = entry.get("sets")
-            if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
-                message = (
-                    f"Explicit pilot nominal atomic record for owner/key {name!r} must resolve to exactly one complete configured natural record."
-                )
-                raise ValueError(message)
-            record = records[0]
-            components = tuple(entry["components"])
-            record_values = record.get("values")
-            if not isinstance(record_values, dict) or set(record_values) != set(components):
-                message = f"Explicit pilot nominal atomic record {name!r} is incomplete."
-                raise ValueError(message)
-            overlap = set(values).intersection(record_values)
-            if overlap:
-                message = f"Explicit pilot nominal atomic record {name!r} conflicts with values {sorted(overlap)}."
-                raise ValueError(message)
-            values.update(copy.deepcopy(record_values))
-            coupled_selections[name] = str(record["id"])
-            continue
-        message = f"Explicit pilot nominal resolution does not support registry kind {kind!r} for {name!r}."
-        raise ValueError(message)
-    return values, coupled_selections
-
-
-def _sample_nominal_case(config: _SamplingConfig, case_index: int) -> CaseSample:
-    """Return one fail-closed explicit configured nominal with no seed search."""
-    registry = config.scientific_values["material"]["parameter_registry"]
-    values, coupled_selections = _explicit_nominal_values(registry)
-    values = registry_service.resolve_derived_values(
-        registry,
-        values,
-        defer_missing=True,
-    )
-    return CaseSample(
-        values=values,
-        units=_units(registry),
-        coupled_selections=coupled_selections,
-        block_provenance={
-            block: {
-                "sampling_kind": "explicit_configured_nominal",
-                "case_position": config.case_indices.index(case_index),
-                "seed_search": False,
-                "stochastic_field_seed_origin": "normal_label_derived_case_substreams",
-            }
-            for block in config.scientific_values["sampling"]["blocks"]
-        },
-        ood_provenance={
-            "group": None,
-            "active_ood_group": None,
-            "selected_units": [],
-            "active_unit_id": None,
-            "active_record_id": None,
-            "units_per_case": 0,
-            "transform_space_distance": 0.0,
-            "natural_support_state": "nominal_reference",
-            "selections": {},
-            "nominal_source": "explicit_resolved_registry_nominals_and_complete_records",
-            "seed_search": False,
-        },
-    )
-
-
 def _supplemental_design(config: _SamplingConfig) -> dict[str, Any] | None:
     """Validate one persisted prefix-stable replacement design, when present."""
     value = config.scientific_values.get("supplemental_design")
     if value is None:
         return None
-    required = {
+    canonical_required = {
         "schema_kind",
         "schema_version",
-        "completion_id",
-        "parent_run_id",
-        "parent_partial_sha256",
+        "campaign_plan_sha256",
         "parent_campaign_digest",
         "parent_batch_id",
         "parent_scientific_config_digest",
         "parent_failed_case_id",
         "candidate_id",
-        "science_id",
         "candidate_ordinal",
         "batch_ordinal",
+        "round",
+        "population",
+        "target_slot",
+        "material_case_index",
+        "root_seed",
+        "seed_derivation_version",
+        "batch_locator_regime",
         "sampling_algorithm",
         "sampling_seed",
         "block_seeds",
@@ -1006,12 +907,27 @@ def _supplemental_design(config: _SamplingConfig) -> dict[str, Any] | None:
     }
     if (
         not isinstance(value, dict)
-        or set(value) != required
-        or value.get("schema_kind") != "generation_supplemental_design"
-        or value.get("schema_version") != 1
+        or value.get("schema_kind") != "generation_source_supplemental_design"
         or value.get("sampling_algorithm") != "sobol"
+        or value.get("schema_version") != CANONICAL_SUPPLEMENTAL_SCHEMA_VERSION
+        or set(value) != canonical_required
     ):
         message = "Supplemental replacement design has an unsupported schema."
+        raise ValueError(message)
+    if (
+        any(
+            isinstance(value[key], bool) or not isinstance(value[key], int) or value[key] < 1
+            for key in ("round", "population", "target_slot", "material_case_index", "seed_derivation_version")
+        )
+        or isinstance(value["root_seed"], bool)
+        or not isinstance(value["root_seed"], int)
+        or value["root_seed"] < 0
+        or not isinstance(value["batch_locator_regime"], str)
+        or not value["batch_locator_regime"]
+        or not isinstance(value["candidate_id"], str)
+        or not value["candidate_id"].startswith("replacement__")
+    ):
+        message = "Canonical replacement design identity is malformed."
         raise ValueError(message)
     ordinal = value["candidate_ordinal"]
     batch_ordinal = value["batch_ordinal"]
@@ -1070,12 +986,6 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
     """Resolve one deterministic case from profile-active block designs."""
     config.case_id(case_index)
     assignment = config.case_assignment(case_index)
-    pilot_kind = assignment.get("pilot_case_kind")
-    if pilot_kind == "nominal_reference":
-        return _sample_nominal_case(config, case_index)
-    if pilot_kind not in {None, "natural_pilot"}:
-        message = f"Unsupported pilot case kind {pilot_kind!r}."
-        raise ValueError(message)
     if config.seed_base is None:
         message = f"Batch {config.batch_name!r} has no executable sampling seed."
         raise ValueError(message)
@@ -1230,13 +1140,3 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
             "selections": ood_details,
         },
     )
-
-
-def sample_all_cases(config: _SamplingConfig) -> dict[int, CaseSample]:
-    """Return all configured samples in canonical case-index order."""
-    return {case_index: sample_case(config, case_index) for case_index in config.case_indices}
-
-
-def sampling_plan_sha256(config: _SamplingConfig) -> str:
-    """Return the deterministic identity of all persisted block plans."""
-    return common.serialization.canonical_json_sha256(config.scientific_values["sampling"]["blocks"])

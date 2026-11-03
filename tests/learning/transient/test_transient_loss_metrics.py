@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Protect transient reconstructed-state metrics and scaled-increment loss."""
+"""Protect transient reconstructed-state metrics and scaled-increment loss.
+
+Responsibilities:
+  - Check masked global drying metrics, weighted increment losses, Huber, and state auxiliary terms
+
+Design principles:
+  - Task weights and explicit reductions govern reconstructed-state and increment semantics
+
+This module does NOT:
+  - Construct steady physics losses or fit transient scales
+"""
 
 from __future__ import annotations
 
@@ -55,10 +64,7 @@ def _loss_config(
                 "channel_weights": ([1.0, 1.0, 1.0, 1.0] if channel_weights is None else channel_weights),
                 "state_aux_weight": state_aux_weight,
             },
-            "physics": {
-                "enabled": physics_enabled,
-                "continuity": "none",
-            },
+            "physics": {"enabled": physics_enabled},
         },
     }
 

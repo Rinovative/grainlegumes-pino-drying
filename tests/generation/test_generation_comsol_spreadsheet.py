@@ -1,14 +1,26 @@
-# ruff: noqa: PLR2004, S101, TC003
-"""COMSOL Spreadsheet parsing and mapping regressions."""
+"""COMSOL Spreadsheet parsing and mapping regressions.
+
+Responsibilities:
+  - Check spreadsheet numeric rows, units, metadata, and temporal grouping admission
+
+Design principles:
+  - Malformed headers and incomplete state groups fail clearly
+
+This module does NOT:
+  - Invoke COMSOL or publish converted scientific packages
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from src.generation.contracts import generation_contracts_comsol_spreadsheet as spreadsheet
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _TEMPORAL_UNITS = {
     "t": "h",

@@ -1,7 +1,4 @@
-"""
-learning_transient_tensorizer.py
-
-Tensorize admitted physical transient batches into task-owned model inputs.
+"""Tensorize admitted physical transient batches into task-owned model inputs.
 
 Responsibilities:
   - Validate and normalize one-step and rollout batch shapes

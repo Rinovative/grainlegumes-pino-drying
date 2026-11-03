@@ -1,16 +1,16 @@
-"""
-generation_input_plot_boundaries.py
+"""Render unified boundary tables and transient schedule comparisons.
 
-Render unified boundary tables and transient schedule comparisons.
 Responsibilities:
   - Present boundary scalars as Case A, Mean A, Case B, and Mean B
   - Plot primitive and derived boundary quantities over operation and the first hour
   - Derive RH after display-time interpolation and average per-case curves
   - Report unavailable pointwise means when dataset supports differ
+
 Design principles:
   - Cases are solid and dataset means are dashed with consistent A/B colors
   - Temperature and humidity ratio remain the only persisted schedule channels
   - Display interpolation never mutates or adds persisted schedule support
+
 This module does NOT:
   - Render single-case schedules or separate case-versus-mean views
   - Modify startup semantics, psychrometric logic, or generation inputs

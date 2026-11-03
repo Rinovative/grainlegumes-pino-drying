@@ -1,7 +1,4 @@
-"""
-eda_controls.py
-
-Bind generated-output EDA widgets to shared catalog selection state.
+"""Bind generated-output EDA widgets to shared catalog selection state.
 
 Responsibilities:
   - Present one panel-level dataset selector over the complete catalog
@@ -46,20 +43,7 @@ class GeneratedOutputDatasetControl:
         labels = self._catalog.labels()
         self._keys_by_label = {label: key for key, label in labels.items()}
         selected = set(selection_state.selection.dataset_keys)
-        tooltips = {
-            label: "; ".join(
-                (
-                    f"Canonical batch: {view.batch.batch_id}",
-                    f"storage: {view.batch.batch_storage_name}",
-                    f"profile: {view.simulation_profile}",
-                    f"campaign purpose: {view.batch.campaign_purpose or 'unspecified'}",
-                    f"source role: {view.batch.material_role or 'unspecified'}",
-                    f"evaluation regime: {view.batch.evaluation_regime or 'unspecified'}",
-                )
-            )
-            for label, key in self._keys_by_label.items()
-            for view in (self._catalog.view(key),)
-        }
+        tooltips = {label: view.tooltip for label, key in self._keys_by_label.items() for view in (self._catalog.view(key),)}
         self.group = cast(
             "ui.components.CheckboxGroup",
             ui.components.ui_checkbox_datasets(
@@ -165,7 +149,7 @@ class GeneratedOutputControls:
         """Return the shared canonical selection reflected by these controls."""
         return self._state.selection
 
-    def selected_views(self) -> tuple[selection.GeneratedOutputEDAView, ...]:
+    def selected_views(self) -> tuple[selection.EDAView, ...]:
         """Return selected descriptors compatible with this view's requirements."""
         return self._state.selected_views(required_capabilities=self._required_capabilities)
 

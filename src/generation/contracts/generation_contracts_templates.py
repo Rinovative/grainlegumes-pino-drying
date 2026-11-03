@@ -1,15 +1,15 @@
-"""
-generation_contracts_templates.py
+"""Resolve configured COMSOL template paths and adjacent digest sidecars.
 
-Resolve configured COMSOL template paths and adjacent digest sidecars.
 Responsibilities:
   - Validate one repository-relative configured COMSOL template path
   - Derive and parse the adjacent SHA-256 sidecar
   - Bind the expected digest to the exact template bytes
+
 Design principles:
   - Profile YAML owns the concrete path while code owns validation
   - Path containment and byte identity fail closed
   - Sidecar updates are explicit user actions
+
 This module does NOT:
   - Map profile identifiers to files or paths
   - Load profile YAML, update sidecars, or execute COMSOL

@@ -1,5 +1,15 @@
-# ruff: noqa: S101
-"""Protect transient tensorization and Train-only scaling contracts."""
+"""Protect transient tensorization and Train-only scaling contracts.
+
+Responsibilities:
+  - Check tensorization, train-only streaming scales, exact deltas, serialization, and
+    reconstruction
+
+Design principles:
+  - State/transition deduplication and zero statistics preserve authoritative float32 evidence
+
+This module does NOT:
+  - Fit scales from external evaluation data or train transient models
+"""
 
 from __future__ import annotations
 

@@ -1,0 +1,776 @@
+# Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
+# Machine-readable parameter registry: units, transforms, blocks, OOD grouping, applicability, and design order define sampling coordinates.
+schema_kind: generation_parameter_registry
+schema_version: 1
+# Each entry describes a sampled, fixed, derived, or coupled coordinate. A transform controls sampling space; profile_applicability limits where it applies.
+parameters:
+  kappa_mean:
+    kind: interval
+    unit: m^2
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \bar{\kappa}
+    description: Mean scalar bed permeability used by the lognormal permeability field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 1
+  kappa_cv:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: c_{\kappa}
+    description: Coefficient of variation used to derive the lognormal permeability
+      spread.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 2
+  bed.structure.coarse_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{b,c}/L_x
+    description: Coarse bed correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 3
+  bed.structure.fine_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{b,f}/L_x
+    description: Fine bed correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 4
+  bed.structure.coarse_weight:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: airflow
+    ood_group: bed
+    report_symbol: \alpha_{b,c}
+    description: Independent coarse contribution to the bed multiscale field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 5
+  bed.structure.fine_ani_x:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{b,x}
+    description: Fine bed correlation-length multiplier along x.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 7
+  bed.structure.fine_ani_y:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{b,y}
+    description: Fine bed correlation-length multiplier along y.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 8
+  bed.structure.cross_scale_corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \rho_b
+    description: Correlation between coarse and fine bed latent seeds.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 6
+  bed.perturbations.amplitude:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \eta_b
+    description: Root-mean-square amplitude of bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 9
+  bed.perturbations.granularity:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: g_b
+    description: Scale selector for bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 10
+  bed.perturbations.sign_bias:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: q_b
+    description: Positive-sign probability for bed-only local perturbations.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 11
+  permeability.anisotropy.max_ratio:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: a_{\max}
+    description: Maximum permeability anisotropy ratio.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 12
+  permeability.anisotropy.exponent:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \gamma_a
+    description: Exponent mapping bed structure magnitude to anisotropy.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 13
+  permeability.anisotropy.strength:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: s_K
+    description: Multiplier controlling permeability-tensor anisotropy.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 14
+  permeability.orientation.jitter:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: j_{\theta}
+    description: Random perturbation amplitude for permeability orientation.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 15
+  permeability.orientation.smooth_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{\theta}/L_x
+    description: Relative smoothing length for permeability orientation.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 16
+  porosity.smooth_len_rel:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \ell_{\varepsilon}/L_x
+    description: Relative smoothing length for the porosity latent field.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 17
+  porosity.texture_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: bed
+    report_symbol: \Delta\varepsilon
+    description: Porosity texture amplitude around the calibrated reference.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 18
+  pressure_bc.mean:
+    kind: interval
+    unit: Pa
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: \bar{p}_{\mathrm{in}}
+    description: Mean inlet pressure boundary magnitude.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 19
+  pressure_bc.sin_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,\sin}
+    description: Relative sinusoidal inlet-pressure amplitude.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 20
+  pressure_bc.sin_freq:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: f_{p,\sin}
+    description: Sinusoidal inlet-pressure spatial frequency.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 21
+  pressure_bc.sin_phase:
+    kind: interval
+    unit: rad
+    transform: phase
+    block: airflow
+    ood_group: operation
+    report_symbol: \varphi_{p,\sin}
+    description: Sinusoidal inlet-pressure phase.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 22
+  pressure_bc.gauss_count:
+    kind: integer
+    unit: '1'
+    block: airflow
+    ood_group: operation
+    report_symbol: n_{p,G}
+    description: Number of Gaussian inlet-pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 23
+  pressure_bc.gauss_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,G}
+    description: Combined relative amplitude of Gaussian pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 24
+  pressure_bc.gauss_width:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: airflow
+    ood_group: operation
+    report_symbol: \sigma_{p,G}
+    description: Reference width of Gaussian pressure components.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 25
+  pressure_bc.gauss_jitter:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: j_{p,G}
+    description: Relative Gaussian pressure-width jitter.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 26
+  pressure_bc.linear_amp:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: airflow
+    ood_group: operation
+    report_symbol: a_{p,\mathrm{lin}}
+    description: Relative linear inlet-pressure trend.
+    classification: sampled
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    sampling_order: 27
+  initial_moisture.mean_db:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \bar{X}_{0,db}
+    description: Mean initial dry-basis moisture of the generated field.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 1
+  initial_moisture.amplitude_db:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \Delta X_{0,db}
+    description: Maximum dry-basis deviation from the configured initial mean.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 2
+  initial_moisture.structure.coarse_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \ell_{X,c}/L_x
+    description: Coarse initial-moisture correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 3
+  initial_moisture.structure.fine_len_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \ell_{X,f}/L_x
+    description: Fine initial-moisture correlation length divided by bed length.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 4
+  initial_moisture.structure.coarse_weight:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \alpha_{X,c}
+    description: Independent coarse contribution to the initial-moisture multiscale
+      field.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 5
+  initial_moisture.structure.fine_ani_x:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: a_{X,x}
+    description: Fine initial-moisture correlation-length multiplier along x.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 7
+  initial_moisture.structure.fine_ani_y:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: a_{X,y}
+    description: Fine initial-moisture correlation-length multiplier along y.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 8
+  initial_moisture.structure.cross_scale_corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: initial_moisture
+    ood_group: initial_moisture
+    report_symbol: \rho_X
+    description: Correlation between coarse and fine initial-moisture latent seeds.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 6
+  T_in_base:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: T_{\mathrm{in},0}
+    description: Exact temporal mean of the planned inlet-air temperature schedule.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 1
+  T_in_amp:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \Delta T_{\mathrm{in}}
+    description: Maximum absolute inlet-temperature deviation from its exact temporal mean.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 2
+  omega_in_base:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \omega_{\mathrm{in},0}
+    description: Exact temporal mean of the planned inlet humidity-ratio schedule.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 3
+  omega_in_amp:
+    kind: interval
+    unit: kg/kg
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \Delta\omega_{\mathrm{in}}
+    description: Maximum absolute inlet humidity-ratio deviation from its exact temporal mean.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 4
+  schedule.corr:
+    kind: interval
+    unit: '1'
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: \rho_{T,\omega}
+    description: Exact discrete-node Pearson correlation of nonconstant inlet temperature and humidity-ratio schedules.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 5
+  schedule.timescale_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: \tau_{\mathrm{sched}}/t_{\max}
+    description: Gaussian low-pass e-folding correlation time divided by the planned duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 6
+  schedule.component_weights:
+    kind: simplex
+    unit: '1'
+    components:
+    - smooth
+    - event
+    - trend
+    block: operation
+    ood_group: operation
+    report_symbol: \boldsymbol{\lambda}_{\mathrm{sched}}
+    description: Relative contributions of available smooth, event, and trend components, each used once.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: schedule_simplex
+    sampling_order: 7
+  schedule.event_count:
+    kind: integer
+    unit: '1'
+    block: operation
+    ood_group: operation
+    report_symbol: n_{\mathrm{event}}
+    description: Deterministic number of finite-duration schedule events; zero disables only the event contribution.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 8
+  schedule.event_duration_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: d_{\mathrm{event}}/t_{\max}
+    description: Finite event duration divided by the planned schedule duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 9
+  schedule.event_width_rel:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: operation
+    ood_group: operation
+    report_symbol: w_{\mathrm{event}}/t_{\max}
+    description: Smooth event-edge transition width divided by the planned schedule duration.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 10
+  rho_bu_dry_ref:
+    kind: interval
+    unit: kg/m^3
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: \rho_{\mathrm{bu,dry,ref}}
+    description: Reference dry bulk density at calibration porosity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: density_calibration
+    sampling_order: 1
+  k_gr:
+    kind: interval
+    unit: W/(m*K)
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: k_{\mathrm{gr}}
+    description: Dry granular-phase thermal conductivity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 2
+  cp_gr_dry:
+    kind: interval
+    unit: J/(kg*K)
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: c_{p,\mathrm{gr,dry}}
+    description: Dry granular-phase specific heat capacity.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 3
+  r_surf_0:
+    kind: interval
+    unit: 1/s
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: r_{\mathrm{surf},0}
+    description: Reference surface-moisture transfer rate.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
+    sampling_order: 4
+  r_int_surf:
+    kind: interval
+    unit: '1'
+    transform: log
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: r_{\mathrm{int/surf}}
+    description: Internal-to-surface transfer-rate ratio.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
+    sampling_order: 5
+  f_surf:
+    kind: interval
+    unit: '1'
+    transform: logit
+    block: material_properties
+    ood_group: material_properties
+    report_symbol: f_{\mathrm{surf}}
+    description: Initial surface-water fraction.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    atomic_record: two_compartment_kinetics
+    sampling_order: 6
+  T_amb:
+    kind: interval
+    unit: K
+    transform: linear
+    block: operation
+    ood_group: operation
+    report_symbol: T_{\mathrm{amb}}
+    description: Ambient temperature and initial granular-phase temperature source.
+    classification: sampled
+    profile_applicability:
+    - transient_drying
+    sampling_order: 11
+  bed.structure.fine_weight:
+    kind: derived
+    unit: '1'
+    derivation: complement_of_one
+    sources:
+    - bed.structure.coarse_weight
+    report_symbol: \alpha_{b,f}
+    description: Derived complementary fine contribution to the bed multiscale field.
+    classification: derived
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+  initial_moisture.structure.fine_weight:
+    kind: derived
+    unit: '1'
+    derivation: complement_of_one
+    sources:
+    - initial_moisture.structure.coarse_weight
+    report_symbol: \alpha_{X,f}
+    description: Derived complementary fine contribution to initial-moisture structure.
+    classification: derived
+    profile_applicability:
+    - transient_drying
+  eps_min_global:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\min}
+    description: Universal lower porosity bound.
+    classification: fixed
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+  eps_max_global:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\max}
+    description: Universal upper porosity bound.
+    classification: fixed
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+  eps_bed_ref:
+    kind: fixed
+    unit: '1'
+    report_symbol: \varepsilon_{\mathrm{bed,cal,ref}}
+    description: Material calibration porosity for Kozeny-Carman reference coupling
+      and dry bulk density.
+    classification: fixed
+    profile_applicability:
+    - steady_flow
+    - transient_drying
+    atomic_record: density_calibration
+  X_target_wb:
+    kind: fixed
+    unit: '1'
+    report_symbol: X_{\mathrm{target,wb}}
+    description: Material wet-basis target moisture.
+    classification: fixed
+    profile_applicability:
+    - transient_drying
+  oswin:
+    kind: parameter_set
+    components:
+    - A_osw
+    - B_osw
+    - C_osw
+    units:
+      A_osw: '1'
+      B_osw: 1/K
+      C_osw: '1'
+    ood_group: material_properties
+    report_symbol: \boldsymbol{\theta}_{\mathrm{Oswin}}
+    description: Coupled Oswin A, B, and C equilibrium-isotherm record.
+    classification: coupled_record
+    profile_applicability:
+    - transient_drying
+    atomic_record: oswin
+  T_init:
+    kind: derived
+    unit: K
+    derivation: copy
+    sources:
+    - T_amb
+    report_symbol: T_{\mathrm{init}}
+    description: Initial temperature derived from ambient temperature.
+    classification: derived
+    profile_applicability:
+    - transient_drying
+  r_surf:
+    kind: derived
+    unit: 1/s
+    derivation: copy
+    sources:
+    - r_surf_0
+    report_symbol: r_{\mathrm{surf}}
+    description: Surface rate copied from its reference value.
+    classification: derived
+    profile_applicability:
+    - transient_drying
+  r_int:
+    kind: derived
+    unit: 1/s
+    derivation: product
+    sources:
+    - r_int_surf
+    - r_surf
+    report_symbol: r_{\mathrm{int}}
+    description: Internal rate derived from r_int_surf and r_surf.
+    classification: derived
+    profile_applicability:
+    - transient_drying

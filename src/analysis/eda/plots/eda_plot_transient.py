@@ -1,15 +1,15 @@
-"""
-eda_plot_transient.py
+"""Plot transient completed-output exploratory diagnostics.
 
-Plot transient completed-output exploratory diagnostics.
 Responsibilities:
   - Render exact physical-time state and static-field snapshots
-  - Plot physical trajectories, simulated-support schedules, and realized parameters
+  - Plot physical trajectories and simulated-support schedules
   - Consolidate target outcomes, terminal timing, final moisture, and exact evidence
+
 Design principles:
   - Every incompatible physical channel owns a separately labelled axis
   - Plot reductions delegate to the transient EDA semantic owner
   - Missing timing or physical-time evidence remains visibly unavailable
+
 This module does NOT:
   - Change established steady-flow plot functions or presentation styling
   - Run model inference, calculate prediction error, or derive speedup
@@ -18,7 +18,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import math
 from numbers import Integral
 from textwrap import wrap
 from typing import TYPE_CHECKING, Final
@@ -28,15 +27,17 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
+from matplotlib.ticker import MaxNLocator
 
 from src import generation
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_transient as transient
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as layout
 from src.analysis.ui import analysis_ui_time as time_axis
-from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -64,6 +65,7 @@ _TRAJECTORY_ROW_HEIGHT_INCHES: Final = 4.0 * 0.75
 _EARLY_OPERATION_END_HOURS: Final = 1.0
 _HOURS_PER_DAY: Final = 24.0
 _RANGE_SERIES_VALUE_COUNT: Final = 3
+_MINIMUM_DISPERSION_SUPPORT: Final = 2
 _DATASET_HEADER_WRAP_WIDTH: Final = 38
 _MAXIMUM_DATASET_HEADER_LINES: Final = 2
 _OUTCOME_LABELS: Final = ("Reached target", "Right-censored")
@@ -97,24 +99,6 @@ def _integer_count(value: object, *, label: str) -> int:
     return int(value)
 
 
-def _field_axes(count: int, *, width: float = 4.6, height: float = 3.8) -> tuple[Figure, np.ndarray]:
-    """Create one compact row-wrapped field-axis grid."""
-    columns = min(2, count)
-    rows = math.ceil(count / columns)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(width * columns, height * rows),
-        squeeze=False,
-        layout=None,
-    )
-    figure.subplots_adjust(left=0.09, right=0.96, bottom=0.10, top=0.88, wspace=0.30, hspace=0.38)
-    flat = axes.ravel()
-    for axis in flat[count:]:
-        axis.set_visible(False)
-    return figure, flat
-
-
 def _day_display(
     physical_hours: Sequence[float] | np.ndarray,
     *,
@@ -128,7 +112,6 @@ def _day_display(
         include_zero=include_zero,
         right_margin_hours=right_margin_hours,
         major_interval_hours=24.0,
-        minor_interval_hours=None,
     )
 
 
@@ -337,6 +320,7 @@ def _draw_inlet_pressure_axis(
     axis.grid(axis="y", alpha=0.20)
 
 
+@layout.eda_typography()
 def _spatial_map_figure(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -347,6 +331,7 @@ def _spatial_map_figure(
     physical_time_hours: float | None,
     include_schedules: bool,
     title: str,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Render one union-capability map grid with optional exact split schedules."""
     if not datasets or tuple(case_ids) != tuple(datasets):
@@ -355,6 +340,9 @@ def _spatial_map_figure(
     if not isinstance(lock_scale, bool):
         message = "lock_scale must be boolean."
         raise TypeError(message)
+    if include_schedules and not _has_complete_schedules(datasets):
+        include_schedules = False
+        title = "Reference states; full authored schedules unavailable in this Dataset view"
     resolution = capabilities.resolve_fields(
         datasets,
         view=field_view,
@@ -488,9 +476,10 @@ def _spatial_map_figure(
     dataset_labels = tuple(datasets)
     for field_index, field in enumerate(resolution.fields):
         compatible = set(resolution.datasets_by_field[field])
-        units = {capabilities.field_unit(datasets[label], field) for label in compatible}
-        if len(units) != 1:
-            message = f"Spatial field {field!r} has incompatible physical units."
+        units = {capabilities.field_display_unit(datasets[label], field) for label in compatible}
+        representations = {capabilities.field_representation(datasets[label], field) for label in compatible}
+        if len(units) != 1 or len(representations) != 1:
+            message = f"Spatial field {field!r} has incompatible units or representations."
             raise ValueError(message)
         reference_label = resolution.datasets_by_field[field][0]
         values_by_label: dict[str, np.ndarray] = {}
@@ -508,7 +497,9 @@ def _spatial_map_figure(
             else:
                 values = capabilities.field_values(frame, row, field)
             values_by_label[label] = capabilities.field_display_values(frame, field, values)
-        shared_norm = layout.linear_norm(*values_by_label.values()) if lock_scale and values_by_label else None
+        unit = next(iter(units))
+        representation = next(iter(representations))
+        shared_norm = spatial_field_scale(field, unit, representation, *values_by_label.values()) if lock_scale else None
         rightmost_compatible_index = max(index for index, label in enumerate(dataset_labels) if label in compatible)
         for dataset_index, (label, frame) in enumerate(datasets.items()):
             axis = figure.add_subplot(map_grid[field_index, dataset_index])
@@ -538,19 +529,19 @@ def _spatial_map_figure(
                 )
                 continue
             values = values_by_label[label]
-            normalization = shared_norm if shared_norm is not None else layout.linear_norm(values)
+            normalization = shared_norm if shared_norm is not None else spatial_field_scale(field, unit, representation, values)
             row = capabilities.case_row(frame, case_ids[label])
             x, y = capabilities.spatial_coordinates(frame, row)
+            indices = display_grid.display_indices(values.shape, display_spatial_stride)
             image = axis.pcolormesh(
-                x,
-                y,
-                values,
+                display_grid.display_sample(x, indices),
+                display_grid.display_sample(y, indices),
+                display_grid.display_sample(values, indices),
                 shading="auto",
-                cmap=visual_semantics.field_visual_semantics(field).colormap,
-                norm=normalization,
+                **normalization.pcolormesh_kwargs(),
             )
             axis.set_aspect("equal")
-            layout.add_map_colorbar(
+            colorbar = layout.add_map_colorbar(
                 figure,
                 image,
                 axis,
@@ -560,6 +551,7 @@ def _spatial_map_figure(
                     else ""
                 ),
             )
+            colorbar.set_ticks(normalization.ticks.tolist())
         layout.add_channel_row_label(
             map_axes[field_index, 0],
             capabilities.field_quantity_label(
@@ -589,23 +581,20 @@ def _spatial_map_figure(
     return figure
 
 
-def plot_spatial_fields(
-    *,
-    frame: pd.DataFrame,
-    case_id: str,
-    fields: Sequence[str] | None = None,
-    dataset_name: str = "Dataset",
-    lock_scale: bool = False,
-    physical_time_hours: float | None = None,
-) -> Figure:
-    """Plot one case's spatial inputs, outputs, and transient state fields."""
-    return plot_spatial_field_comparison(
-        datasets={dataset_name: frame},
-        case_ids={dataset_name: case_id},
-        fields=fields,
-        lock_scale=lock_scale,
-        physical_time_hours=physical_time_hours,
-    )
+def _has_complete_schedules(datasets: Mapping[str, pd.DataFrame]) -> bool:
+    """Keep runtime interval conditioning distinct from a complete source schedule."""
+    return all(frame.attrs.get("complete_schedule_available", True) for frame in datasets.values())
+
+
+def spatial_field_scale(field: str, unit: str, representation: str, *values: np.ndarray) -> field_maps.FieldMapDefinition:
+    """Build shared eleven-band scales from full, representation-aware arrays."""
+    combined = np.concatenate(tuple(np.ravel(value) for value in values))
+    semantic = field_maps.FieldMapSemantic.LINEAR_POSITIVE
+    if field in {"Kxx", "Kyy", "K_min", "K_max"} and unit == "m^2":
+        semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
+    elif field == "Kxy" or field.startswith("delta_") or visual_semantics.field_visual_semantics(field).centered or np.any(combined < 0.0):
+        semantic = field_maps.FieldMapSemantic.LINEAR_SIGNED
+    return field_maps.build_field_map(combined, semantic=semantic, field=field, unit=unit, display_transform=representation)
 
 
 def plot_spatial_field_comparison(
@@ -615,6 +604,7 @@ def plot_spatial_field_comparison(
     fields: Sequence[str] | None = None,
     lock_scale: bool = False,
     physical_time_hours: float | None = None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Compare compatible spatial fields across steady and transient datasets."""
     return _spatial_map_figure(
@@ -623,28 +613,10 @@ def plot_spatial_field_comparison(
         requested_fields=fields,
         field_view="spatial_map",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
         physical_time_hours=physical_time_hours,
         include_schedules=False,
         title="Retained spatial fields",
-    )
-
-
-def plot_state_snapshot(
-    *,
-    frame: pd.DataFrame,
-    case_id: str,
-    physical_time_hours: float,
-    channels: Sequence[str] | None = None,
-    dataset_name: str = "Dataset",
-    lock_scale: bool = False,
-) -> Figure:
-    """Plot one transient case with schedule context at one master time."""
-    return plot_state_snapshot_comparison(
-        datasets={dataset_name: frame},
-        case_ids={dataset_name: case_id},
-        physical_time_hours=physical_time_hours,
-        channels=channels,
-        lock_scale=lock_scale,
     )
 
 
@@ -655,6 +627,7 @@ def plot_state_snapshot_comparison(
     physical_time_hours: float,
     channels: Sequence[str] | None = None,
     lock_scale: bool = False,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Compare exact/latest-prior transient states with inlet schedules."""
     return _spatial_map_figure(
@@ -663,6 +636,7 @@ def plot_state_snapshot_comparison(
         requested_fields=channels,
         field_view="state_snapshot",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
         physical_time_hours=physical_time_hours,
         include_schedules=True,
         title=f"Transient states and schedules at master t = {physical_time_hours:g} h",
@@ -674,7 +648,7 @@ def _aggregate_supported_schedule(
     case_ids: Sequence[str],
     quantity: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Aggregate one schedule over only cases still within simulated support."""
+    """Evaluate authored piecewise-linear schedules within their simulated support."""
     series = tuple(transient.supported_schedule_series(frame, case_id, quantity) for case_id in case_ids)
     if not series:
         message = "Aggregate schedule plotting requires at least one selected case."
@@ -744,9 +718,13 @@ def _plot_split_time_series(
     lower: np.ndarray | None,
     upper: np.ndarray | None,
     color: str,
+    contributor_count: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Plot exact support in day-scale main and hour-scale startup views."""
     values = (centre,) if lower is None or upper is None else (centre, lower, upper)
+    has_range = len(values) == _RANGE_SERIES_VALUE_COUNT
+    if contributor_count is not None:
+        values = (*values, contributor_count)
     main, startup = _split_physical_time_support(
         physical_time_hours,
         *values,
@@ -759,13 +737,14 @@ def _plot_split_time_series(
             continue
         display_times = times / divisor
         axis.plot(display_times, split_values[0], color=color, marker=None)
-        if len(split_values) == _RANGE_SERIES_VALUE_COUNT:
+        if has_range:
             axis.fill_between(
                 display_times,
                 split_values[1],
                 split_values[2],
                 color=color,
                 alpha=0.18,
+                where=split_values[-1] >= _MINIMUM_DISPERSION_SUPPORT if contributor_count is not None else None,
             )
     return main[0], startup[0]
 
@@ -781,6 +760,18 @@ def _configure_split_time_axes(
         combined_main = np.concatenate(tuple(main_times))
         main_display = _day_display(combined_main, include_zero=False)
         main_display.configure(main_axis)
+        if main_display.maximum_hours < _HOURS_PER_DAY:
+            hour_ticks = np.asarray(MaxNLocator(nbins=6, min_n_ticks=3).tick_values(main_display.minimum_hours, main_display.maximum_hours))
+            hour_ticks = np.unique(
+                np.concatenate(
+                    (
+                        hour_ticks[(hour_ticks >= main_display.minimum_hours) & (hour_ticks <= main_display.maximum_hours)],
+                        (main_display.minimum_hours, main_display.maximum_hours),
+                    )
+                )
+            )
+            main_axis.set_xticks(hour_ticks / _HOURS_PER_DAY, labels=[f"{value:g}" for value in hour_ticks])
+            main_axis.set_xlabel("Time [h]")
         current_limits = main_axis.get_xlim()
         main_axis.set_xlim(
             left=_EARLY_OPERATION_END_HOURS / _HOURS_PER_DAY,
@@ -802,7 +793,6 @@ def _configure_split_time_axes(
             preferred_unit="h",
             include_zero=True,
             major_interval_hours=None,
-            minor_interval_hours=None,
         )
         startup_display.configure(startup_axis)
     else:
@@ -810,6 +800,31 @@ def _configure_split_time_axes(
     startup_axis.set_xlim(0.0, _EARLY_OPERATION_END_HOURS)
 
 
+def _contributor_axes(axes: Sequence[Axes], maximum: int) -> tuple[Axes, ...]:
+    """Keep exact contributor counts distinct from each physical quantity."""
+    result = tuple(axis.twinx() for axis in axes)
+    for axis in result:
+        axis.set_ylim(0.0, maximum + 0.5)
+        axis.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+        axis.set_ylabel("n(t)")
+    return result
+
+
+def _plot_contributors(
+    main_axis: Axes,
+    startup_axis: Axes,
+    physical_time_hours: np.ndarray,
+    counts: np.ndarray,
+    *,
+    color: str,
+) -> None:
+    """Disclose every stored-time count without implying interpolated support."""
+    main, startup = _split_physical_time_support(physical_time_hours, counts)
+    for axis, (times, values), divisor in ((main_axis, main, _HOURS_PER_DAY), (startup_axis, startup, 1.0)):
+        axis.plot(times / divisor, values[0], color=color, marker=".", linestyle="none", alpha=0.5)
+
+
+@layout.eda_typography()
 def _trajectory_figure(
     *,
     datasets: Mapping[str, pd.DataFrame],
@@ -827,7 +842,7 @@ def _trajectory_figure(
         requested=channels,
     )
     colors = _dataset_color_map(datasets)
-    schedule_fields = _schedule_fields()
+    schedule_fields = _schedule_fields() if _has_complete_schedules(datasets) else ()
     rows = len(schedule_fields) + len(resolution.fields)
     figure = plt.figure(
         figsize=(11.8, _TRAJECTORY_ROW_HEIGHT_INCHES * rows),
@@ -836,7 +851,7 @@ def _trajectory_figure(
     grid = figure.add_gridspec(
         rows,
         3,
-        width_ratios=(1.0, 0.34, 0.30),
+        width_ratios=(1.0, 0.34, 0.42),
         height_ratios=([1.0] * rows),
         left=0.10,
         right=0.98,
@@ -847,6 +862,9 @@ def _trajectory_figure(
     )
     main_axes = tuple(figure.add_subplot(grid[row, 0]) for row in range(rows))
     startup_axes = tuple(figure.add_subplot(grid[row, 1]) for row in range(rows))
+    maximum_count = max(min(max_cases, len(frame)) for frame in datasets.values()) if max_cases is not None else 0
+    main_counts = _contributor_axes(main_axes, maximum_count) if maximum_count else ()
+    startup_counts = _contributor_axes(startup_axes, maximum_count) if maximum_count else ()
     for index, schedule_field in enumerate(schedule_fields):
         layout.add_channel_row_label(
             main_axes[index],
@@ -860,6 +878,7 @@ def _trajectory_figure(
         main_times: list[np.ndarray] = []
         startup_times: list[np.ndarray] = []
         for label, frame in datasets.items():
+            contributors = None
             if case_ids is not None:
                 series = transient.supported_schedule_series(
                     frame,
@@ -878,7 +897,7 @@ def _trajectory_figure(
                     message = "Aggregate trajectory plotting lost its case bound."
                     raise RuntimeError(message)
                 selected_case_ids = tuple(str(value) for value in frame.index[:max_cases])
-                physical_time, q10, median, q90, _contributors = _aggregate_supported_schedule(
+                physical_time, q10, median, q90, contributors = _aggregate_supported_schedule(
                     frame,
                     selected_case_ids,
                     schedule_field.name,
@@ -886,6 +905,8 @@ def _trajectory_figure(
                 q10 = field_labels.display_values(q10, schedule_field.unit)
                 median = field_labels.display_values(median, schedule_field.unit)
                 q90 = field_labels.display_values(q90, schedule_field.unit)
+            if contributors is not None:
+                _plot_contributors(main_counts[index], startup_counts[index], physical_time, contributors, color=colors[label])
             main_support, startup_support = _plot_split_time_series(
                 main_axes[index],
                 startup_axes[index],
@@ -894,6 +915,7 @@ def _trajectory_figure(
                 lower=q10,
                 upper=q90,
                 color=colors[label],
+                contributor_count=contributors,
             )
             if main_support.size:
                 main_times.append(main_support)
@@ -929,6 +951,7 @@ def _trajectory_figure(
         main_times = []
         startup_times = []
         for label, frame in compatible.items():
+            contributors = None
             if case_ids is not None:
                 table = transient.trajectory_table(
                     frame,
@@ -971,25 +994,11 @@ def _trajectory_figure(
                             table["spatial_mean"].to_numpy(dtype=float),
                         )
                     )
-                shared_times = time_axis.ordered_time_intersection(times_by_case)
-                if not shared_times:
-                    continue
-                physical_time = np.asarray(shared_times, dtype=float)
-                stacked = np.stack(
-                    [
-                        values[np.searchsorted(times, physical_time)]
-                        for times, values in zip(
-                            times_by_case,
-                            means_by_case,
-                            strict=True,
-                        )
-                    ]
+                physical_time, lower, median, upper, contributors = transient.aggregate_exact_series(
+                    times_by_case,
+                    means_by_case,
                 )
-                lower, median, upper = np.quantile(
-                    stacked,
-                    (0.1, 0.5, 0.9),
-                    axis=0,
-                )
+                _plot_contributors(main_counts[row_index], startup_counts[row_index], physical_time, contributors, color=colors[label])
             main_support, startup_support = _plot_split_time_series(
                 main_axes[row_index],
                 startup_axes[row_index],
@@ -998,6 +1007,7 @@ def _trajectory_figure(
                 lower=lower,
                 upper=upper,
                 color=colors[label],
+                contributor_count=contributors,
             )
             if main_support.size:
                 main_times.append(main_support)
@@ -1013,7 +1023,7 @@ def _trajectory_figure(
             main_axes[row_index].text(
                 0.5,
                 0.5,
-                "Trajectory unavailable on shared exact times",
+                "Trajectory unavailable on stored physical times",
                 ha="center",
                 va="center",
                 transform=main_axes[row_index].transAxes,
@@ -1028,14 +1038,14 @@ def _trajectory_figure(
         axis.tick_params(axis="x", labelbottom=False)
     legend_axis = figure.add_subplot(grid[:, 2])
     legend_axis.set_axis_off()
-    handles: list[object] = [
+    handles: list[Line2D | Patch] = [
         Line2D(
             [],
             [],
             color=colors[label],
-            label=label,
+            label=label if max_cases is None else f"{label} ({min(max_cases, len(frame))} cases)",
         )
-        for label in datasets
+        for label, frame in datasets.items()
     ]
     handles.extend(
         (
@@ -1047,30 +1057,32 @@ def _trajectory_figure(
             ),
         )
     )
+    handles.extend(_temporal_support_legend(aggregate=max_cases is not None, schedules=bool(schedule_fields)))
+    for handle in handles:
+        handle.set_label("\n".join(wrap(str(handle.get_label()), width=16)))
     legend_axis.legend(handles=handles, loc="upper left", frameon=False)
-    scope = "single exact cases" if case_ids is not None else f"first {max_cases} cases"
+    scope = "single exact cases" if case_ids is not None else "available exact-time support"
     layout.set_suptitle_over_axes(
         figure,
-        f"Schedules and reference physical trajectories — {scope}",
+        (
+            f"Schedules and reference physical trajectories — {scope}"
+            if schedule_fields
+            else f"Reference physical trajectories — {scope}; full authored schedules unavailable"
+        ),
         (*main_axes, *startup_axes),
         y=0.98,
     )
     return figure
 
 
-def plot_state_trajectories(
-    *,
-    frame: pd.DataFrame,
-    case_id: str,
-    channels: Sequence[str] | None = None,
-    dataset_name: str = "Dataset",
-) -> Figure:
-    """Plot one exact case's schedules and physical state trajectories."""
-    return plot_state_trajectory_comparison(
-        datasets={dataset_name: frame},
-        case_ids={dataset_name: case_id},
-        channels=channels,
-    )
+def _temporal_support_legend(*, aggregate: bool, schedules: bool) -> list[Line2D]:
+    """Disclose distinct support semantics beside the existing trajectory legend."""
+    handles = []
+    if aggregate:
+        handles.append(Line2D([], [], color="black", marker=".", linestyle="none", label="n(t): exact contributors\n(right axes)"))
+    if schedules:
+        handles.append(Line2D([], [], linestyle="none", label="Schedules: authored linear rule\nStates: observed times only"))
+    return handles
 
 
 def plot_state_trajectory_comparison(
@@ -1097,7 +1109,7 @@ def plot_state_trajectory_summary(
     max_cases: int,
     channels: Sequence[str] | None = None,
 ) -> Figure:
-    """Aggregate schedules and states only on exact shared stored times."""
+    """Aggregate observed state times and explicitly authored schedule functions."""
     if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
         message = "max_cases must be a positive integer."
         raise ValueError(message)
@@ -1109,89 +1121,6 @@ def plot_state_trajectory_summary(
     )
 
 
-def plot_realized_parameters(
-    *,
-    datasets: Mapping[str, pd.DataFrame],
-) -> Figure:
-    """Plot completed-case distributions for each material conditioning scalar."""
-    if not datasets:
-        message = "Realized-parameter plotting requires at least one dataset."
-        raise ValueError(message)
-    fields = transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
-    figure, axes = _field_axes(len(fields), width=4.4, height=3.5)
-    for axis, field in zip(axes, fields, strict=False):
-        values_by_dataset = []
-        labels = []
-        for label, frame in datasets.items():
-            table = transient.scalar_parameter_table(frame)
-            values = table.loc[table["parameter"] == field.name, "value"].to_numpy(dtype=float)
-            if values.size:
-                values_by_dataset.append(field_labels.display_values(values, field.unit))
-                labels.append(label)
-        axis.boxplot(values_by_dataset, tick_labels=labels, showmeans=True)
-        axis.set(
-            title=field.name,
-            ylabel=field_labels.field_label_with_unit(field.name, field.unit),
-        )
-        axis.tick_params(axis="x", rotation=20)
-        axis.grid(axis="y", alpha=0.25)
-    layout.set_suptitle_over_axes(
-        figure,
-        "Realized completed-case material parameters",
-        axes,
-    )
-    return figure
-
-
-def completion_target_detail_table(
-    datasets: Mapping[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """Return exact selected eligible-case values for the companion table."""
-    analysis = transient.completion_target_analysis(datasets)
-    columns = {
-        "dataset": "Dataset",
-        "case_id": "Case",
-        "completion_state": "Completion state",
-        "terminal_time_kind": "Terminal-time meaning",
-        "time_to_target_hours": "Target time [h]",
-        "physical_duration_hours": "Final physical time [h]",
-        "configured_horizon_hours": "Configured maximum [h]",
-        "final_bulk_moisture_wb": "Final bulk moisture [wb]",
-        "target_moisture_wb": "Target moisture [wb]",
-        "final_wet_fraction": "Final dry-matter wet fraction [1]",
-        "target_wet_fraction_limit": "Allowed wet-fraction limit [1]",
-        "final_target_gap": "Wet-fraction target gap [1]",
-        "stationary_airflow_solver_seconds": "Stationary airflow solver [s]",
-        "transient_drying_solver_seconds": "Transient drying solver [s]",
-        "scientific_solver_seconds": "Scientific solver [s]",
-        "comsol_process_seconds": "COMSOL process [s]",
-        "queue_wait_seconds": "Queue wait [s]",
-        "licence_wait_seconds": "Licence wait [s]",
-        "generation_compute_end_to_end_seconds": "Generation compute end-to-end [s]",
-        "complete_execution_seconds": "Complete execution [s]",
-    }
-    available = [name for name in columns if name in analysis.cases]
-    result = analysis.cases.loc[:, available].rename(columns=columns).copy()
-    for column in (
-        "Target time [h]",
-        "Final physical time [h]",
-        "Configured maximum [h]",
-    ):
-        if column not in result:
-            continue
-        result[column] = result[column].map(
-            lambda value: (
-                ""
-                if pd.isna(value)
-                else time_axis.format_terminal_physical_time_hours(
-                    float(value),
-                    include_unit=False,
-                )
-            )
-        )
-    return result
-
-
 def _completion_time_headroom(maximum_hours: float) -> float:
     """Return a small bounded margin beyond one physical-time maximum."""
     if not np.isfinite(maximum_hours) or maximum_hours < 0.0:
@@ -1200,6 +1129,7 @@ def _completion_time_headroom(maximum_hours: float) -> float:
     return min(6.0, max(1.0, 0.035 * max(maximum_hours, 1.0)))
 
 
+@layout.eda_typography()
 def plot_completion_target_analysis(
     *,
     datasets: Mapping[str, pd.DataFrame],

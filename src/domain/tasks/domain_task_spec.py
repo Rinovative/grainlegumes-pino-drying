@@ -1,7 +1,4 @@
-"""
-domain_task_spec.py
-
-Define immutable semantic contracts for learned operator tasks.
+"""Define immutable semantic contracts for learned operator tasks.
 
 Responsibilities:
   - Describe fields, datasets, preprocessing, metrics, and physics selection
@@ -24,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 TASK_SCHEMA_VERSION = 1
 
@@ -49,18 +46,16 @@ OptimizationDirection = Literal["minimize", "maximize"]
 _SUPPORTED_TENSOR_LAYOUT = ("batch", "channel", "y", "x")
 _SUPPORTED_OPERATOR_AXES = (2, 3)
 _SUPPORTED_NORMALIZATION_AXES = (0, 2, 3)
-_FIELD_ROLES = frozenset({"airflow", "boundary", "coordinate", "material", "permeability", "porosity", "state"})
-_METRIC_SPACES = frozenset({"normalized", "physical"})
-_METRIC_REDUCTIONS = frozenset(
-    {
-        "sample_mean",
-        "element_mean",
-        "group_element_mean",
-        "group_macro_element_mean",
-        "vector_element_mean",
-    }
-)
-_OPTIMIZATION_DIRECTIONS = frozenset({"minimize", "maximize"})
+_FIELD_ROLES = frozenset(get_args(FieldRole))
+_METRIC_SPACES = frozenset(get_args(MetricSpace))
+_METRIC_REDUCTIONS = frozenset(get_args(MetricReduction))
+_OPTIMIZATION_DIRECTIONS = frozenset(get_args(OptimizationDirection))
+
+
+def _canonical_sha256(payload: dict[str, object]) -> str:
+    """Return the SHA-256 hex digest of the compact, key-sorted ASCII JSON encoding of ``payload``."""
+    canonical = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,59 +166,6 @@ class InputProfileSpec:
             "fields": list(self.fields),
             "coordinate_policy": self.coordinate_policy,
         }
-
-
-@dataclass(frozen=True, slots=True)
-class DatasetDefaults:
-    """
-    Describe non-executable task-level Dataset catalog references.
-
-    Attributes
-    ----------
-    train : str
-        Conventional training Dataset catalog reference.
-    ood : tuple[str, ...]
-        Ordered out-of-distribution Dataset catalog references.
-
-    Notes
-    -----
-    These references remain task metadata only. Executable experiments must
-    explicitly author exact training and evaluation Dataset IDs.
-
-    Raises
-    ------
-    ValueError
-        If identifiers are empty, OOD defaults are not a non-empty tuple, or any
-        train/OOD identifier is duplicated.
-
-    """
-
-    train: str
-    ood: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        """Reject ambiguous or duplicate logical dataset defaults."""
-        if not isinstance(self.train, str) or not self.train:
-            msg = "Default training dataset id must be a non-empty string."
-            raise ValueError(msg)
-        if not isinstance(self.ood, tuple) or not self.ood or any(not isinstance(name, str) or not name for name in self.ood):
-            msg = "Default OOD datasets must be a non-empty tuple of non-empty strings."
-            raise ValueError(msg)
-        if len(set(self.ood)) != len(self.ood) or self.train in self.ood:
-            msg = "Default dataset ids must be unique across train and OOD roles."
-            raise ValueError(msg)
-
-    def as_dict(self) -> dict[str, object]:
-        """
-        Return a JSON-serializable dataset contract.
-
-        Returns
-        -------
-        dict[str, object]
-            Logical train and ordered OOD dataset identifiers.
-
-        """
-        return {"train": self.train, "ood": list(self.ood)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,42 +371,27 @@ class PhysicsSpec:
     equation_set : str
         Descriptive equation-set identifier.
     continuity : str
-        Default continuity-formulation identifier.
-    allowed_continuities : tuple[str, ...]
-        Exact continuity identifiers experiments may select.
+        Task-owned continuity-formulation identifier.
     boundary : str
-        Descriptive boundary-formulation identifier.
+        Task-owned boundary-formulation identifier.
 
     Raises
     ------
     ValueError
-        If selectors are empty, allowed continuities are empty or duplicated,
-        or the default continuity is not in the allowed tuple.
+        If any selector is empty.
 
     """
 
     kind: str
     equation_set: str
     continuity: str
-    allowed_continuities: tuple[str, ...]
     boundary: str
 
     def __post_init__(self) -> None:
-        """Require explicit, internally consistent semantic physics selectors."""
+        """Require explicit semantic physics selectors."""
         values = (self.kind, self.equation_set, self.continuity, self.boundary)
         if any(not isinstance(value, str) or not value for value in values):
             msg = "Physics kind, equation_set, continuity, and boundary must be non-empty strings."
-            raise ValueError(msg)
-        if (
-            not isinstance(self.allowed_continuities, tuple)
-            or not self.allowed_continuities
-            or any(not isinstance(value, str) or not value for value in self.allowed_continuities)
-            or len(set(self.allowed_continuities)) != len(self.allowed_continuities)
-        ):
-            msg = "Physics allowed_continuities must be a unique non-empty tuple of non-empty strings."
-            raise ValueError(msg)
-        if self.continuity not in self.allowed_continuities:
-            msg = f"Default continuity {self.continuity!r} must be one of the allowed identifiers {list(self.allowed_continuities)!r}."
             raise ValueError(msg)
 
     def as_dict(self) -> dict[str, object]:
@@ -474,15 +401,13 @@ class PhysicsSpec:
         Returns
         -------
         dict[str, object]
-            Semantic physics selector, default continuity, allowed continuity
-            identifiers, and descriptive formulation identifiers.
+            Semantic physics selector and task-owned formulation identifiers.
 
         """
         return {
             "kind": self.kind,
             "equation_set": self.equation_set,
             "continuity": self.continuity,
-            "allowed_continuities": list(self.allowed_continuities),
             "boundary": self.boundary,
         }
 
@@ -508,9 +433,6 @@ class TaskSpec:
         Spatial axes operated on by the neural operator.
     normalization_axes : tuple[int, ...]
         Axes used to fit per-channel normalization.
-    default_datasets : DatasetDefaults
-        Non-executable Dataset catalog references retained in the task contract.
-        Experiment resolution never uses them as implicit selection.
     preprocessing : PreprocessingSpec
         Task-owned preprocessing assumptions.
     data_losses : tuple[str, ...]
@@ -558,7 +480,6 @@ class TaskSpec:
     tensor_layout: tuple[str, ...]
     operator_axes: tuple[int, ...]
     normalization_axes: tuple[int, ...]
-    default_datasets: DatasetDefaults
     preprocessing: PreprocessingSpec
     data_losses: tuple[str, ...]
     default_metrics: tuple[MetricSpec, ...]
@@ -610,7 +531,6 @@ class TaskSpec:
             msg = f"Task {self.id!r} must declare non-empty FieldSpec input/output tuples."
             raise ValueError(msg)
         for value, expected, label in (
-            (self.default_datasets, DatasetDefaults, "default_datasets"),
             (self.preprocessing, PreprocessingSpec, "preprocessing"),
             (self.physics, PhysicsSpec, "physics"),
         ):
@@ -759,13 +679,6 @@ class TaskSpec:
         msg = f"Unknown input profile {selected_id!r} for task {self.id!r}. Available profiles: {available}."
         raise ValueError(msg)
 
-    def in_channels_for_profile(self, profile_id: str | None = None, *, temporal_channels: int = 0) -> int:
-        """Return profile-derived channels plus explicit temporal features."""
-        if isinstance(temporal_channels, bool) or not isinstance(temporal_channels, int) or temporal_channels < 0:
-            msg = "temporal_channels must be a non-negative integer."
-            raise ValueError(msg)
-        return len(self.input_profile(profile_id).fields) + temporal_channels
-
     @property
     def in_channels(self) -> int:
         """
@@ -879,13 +792,7 @@ class TaskSpec:
             Lowercase hexadecimal SHA-256 digest independent of evaluation policy.
 
         """
-        canonical = json.dumps(
-            self.data_contract_payload(),
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(canonical).hexdigest()
+        return _canonical_sha256(self.data_contract_payload())
 
     def contract_payload(self) -> dict[str, object]:
         """
@@ -907,7 +814,6 @@ class TaskSpec:
             "operator_axes": list(self.operator_axes),
             "normalization_axes": list(self.normalization_axes),
             "operator_dimensionality": self.operator_dimensionality,
-            "default_datasets": self.default_datasets.as_dict(),
             "preprocessing": self.preprocessing.as_dict(),
             "data_losses": list(self.data_losses),
             "default_metrics": [metric.as_dict(all_fields=self.metric_names) for metric in self.default_metrics],
@@ -935,13 +841,7 @@ class TaskSpec:
             Lowercase hexadecimal SHA-256 digest.
 
         """
-        canonical = json.dumps(
-            self.contract_payload(),
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(canonical).hexdigest()
+        return _canonical_sha256(self.contract_payload())
 
     def resolved_contract(self) -> dict[str, object]:
         """

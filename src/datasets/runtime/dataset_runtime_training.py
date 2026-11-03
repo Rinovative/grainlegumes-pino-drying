@@ -1,15 +1,15 @@
-"""
-dataset_runtime_training.py
+"""Orchestrate Dataset-partitioned steady-flow preprocessing and DataLoaders.
 
-Orchestrate deterministic steady-data splitting, preprocessing, and DataLoaders.
 Responsibilities:
-  - Resolve verified steady package runtimes for train and OOD roles
-  - Create or replay identity-bound split membership
-  - Seed workers and construct train, evaluation, OOD, and ID-test loaders
+  - Resolve verified steady package runtimes for training and evaluation Datasets
+  - Bind Train/validation/ID-test to the Dataset-owned fixed case partition
+  - Seed workers and construct train, validation, ID-test and additional evaluation loaders
+
 Design principles:
-  - Split admission and normalizer fitting remain delegated to their owners
+  - Membership comes from Dataset manifests; run seeds never repartition data
+  - Normalizers are fitted on Train membership only and reused unchanged
   - Loader and worker seeds do not alter persisted membership identity
-  - The established DataLoader signature and returned payload remain stable
+
 This module does NOT:
   - Define split schemas or normalizer artifact schemas
   - Persist run artifacts or resolve experiment paths
@@ -18,24 +18,30 @@ This module does NOT:
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, Subset, random_split
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.datasets.contracts import dataset_contracts_identity as identity
+from src.datasets.contracts import dataset_contracts_partition as partition_contract
+from src.datasets.packages import dataset_packages_manifest as package_manifest
 from src.datasets.preprocessing import dataset_preprocessing_normalization as normalization
 from src.datasets.preprocessing import dataset_preprocessing_splits as splits
 from src.datasets.runtime import dataset_runtime_factory as runtime_factory
 from src.datasets.runtime import dataset_runtime_steady as steady
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence, Sized
+    from collections.abc import Callable, Mapping, Sequence
+    from pathlib import Path
 
     from neuralop.data.transforms.data_processors import DefaultDataProcessor
 
     from src.domain.tasks.domain_task_spec import TaskSpec
+
+
+_STEADY_TASK: Final = "steady_flow"
 
 
 def _normalized_seed(value: Any, *, label: str) -> int:
@@ -75,256 +81,204 @@ def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
     return worker_init_fn
 
 
-def create_dataloaders(
-    path_train: str,
-    path_test_ood: str | Sequence[str],
-    *,
-    task: TaskSpec,
+def _steady_dataset(dataset_id: str, *, storage_root: Path | str | None) -> steady.SteadyFlowDataset:
+    """Load one complete verified steady package runtime."""
+    request = runtime_factory.DatasetRequest(dataset_id=dataset_id, dataset_view=_STEADY_TASK, storage_root=storage_root)
+    value = runtime_factory.create_dataset(request)
+    if not isinstance(value, steady.SteadyFlowDataset):
+        msg = "Steady Dataset factory returned an unexpected runtime."
+        raise TypeError(msg)
+    return value
+
+
+def _fixed_partition(manifest: Mapping[str, Any], *, dataset_id: str) -> dict[str, Any]:
+    """Require and validate the manifest-owned fixed case partition."""
+    fixed = manifest["case_partition"]
+    if fixed is None:
+        msg = f"Steady Dataset {dataset_id!r} has no fixed case partition; build it from a Dataset plan."
+        raise ValueError(msg)
+    materials = _materials_by_case(manifest)
+    return partition_contract.validate_fixed_partition(fixed, case_ids=tuple(materials), material_by_case=materials)
+
+
+def _materials_by_case(manifest: Mapping[str, Any]) -> dict[str, str]:
+    """Return the source material family of every package case."""
+    return {str(entry["package_case_id"]): str(entry["source"]["material_family"]) for entry in manifest["source_case_identities"]}
+
+
+def additional_evaluation_components(
     train_dataset_id: str,
-    ood_dataset_id: str | Sequence[str],
-    batch_size: int = 16,
-    train_ratio: float = 0.8,
-    ood_fraction: float = 0.2,
-    num_workers: int = 4,
-    pin_memory: bool = True,
-    persistent_workers: bool = True,
-    split_seed: int = 9,
-    loader_seed: int | None = None,
+    additional_evaluation_dataset_ids: Sequence[str],
+    *,
+    storage_root: Path | str | None = None,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """
+    Return the ordered evaluation packages and their declared OOD case IDs.
+
+    Each selected evaluation Dataset contributes its fixed ``ood`` cases; the
+    training Dataset follows when its own partition holds material-family cases
+    out. Family holdouts must not reuse a training material.
+    """
+    dataset_ids = tuple(additional_evaluation_dataset_ids)
+    if len(dataset_ids) != len(set(dataset_ids)) or train_dataset_id in dataset_ids:
+        msg = "Additional evaluation Dataset IDs must be unique and differ from the training Dataset."
+        raise ValueError(msg)
+    package_manifest.declared_evaluation_assignments(_STEADY_TASK, train_dataset_id, dataset_ids, storage_root=storage_root)
+    train_manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, train_dataset_id, storage_root=storage_root)
+    train_partition = _fixed_partition(train_manifest, dataset_id=train_dataset_id)
+    train_materials = {_materials_by_case(train_manifest)[case] for case in train_partition["train"]}
+    components: list[tuple[str, tuple[str, ...]]] = []
+    for dataset_id in dataset_ids:
+        manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, dataset_id, storage_root=storage_root)
+        partition = _fixed_partition(manifest, dataset_id=dataset_id)
+        materials = _materials_by_case(manifest)
+        if train_materials.intersection(materials[case] for case in partition["ood"]):
+            msg = "Declared family-OOD evaluation reuses a training material family."
+            raise ValueError(msg)
+        components.append((dataset_id, tuple(partition["ood"])))
+    if train_partition["ood"]:
+        components.append((train_dataset_id, tuple(train_partition["ood"])))
+    return tuple(components)
+
+
+def additional_evaluation_dataset(
+    components: Sequence[tuple[str, Sequence[str]]],
+    *,
+    storage_root: Path | str | None = None,
+    loaded: Mapping[str, steady.SteadyFlowDataset] | None = None,
+) -> tuple[Dataset[Any] | None, tuple[int, ...]]:
+    """Combine the evaluation packages and locate their declared OOD cases."""
+    if not components:
+        return None, ()
+    parts = [
+        (dict(loaded or {}).get(dataset_id) or _steady_dataset(dataset_id, storage_root=storage_root), case_ids)
+        for dataset_id, case_ids in components
+    ]
+    combined = splits.combine_identity_datasets([dataset for dataset, _ in parts])
+    positions: list[int] = []
+    offset = 0
+    for dataset, case_ids in parts:
+        positions.extend(offset + position for position in splits.role_positions(dataset.identity, case_ids, label="additional_evaluation"))
+        offset += dataset.identity.sample_count
+    return combined, tuple(positions)
+
+
+def create_dataloaders(
+    *,
+    train_dataset_id: str,
+    additional_evaluation_dataset_ids: Sequence[str],
+    task: TaskSpec,
+    storage_root: Path | str | None = None,
+    batch_size: int = 32,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    loader_seed: int = 9,
     worker_seed: int | None = None,
     split_indices: Mapping[str, Any] | None = None,
     data_processor: DefaultDataProcessor | None = None,
-) -> tuple[DataLoader, dict[str, DataLoader], DefaultDataProcessor, dict[str, Any]]:
+    split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
+) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], DefaultDataProcessor, dict[str, Any]]:
     """
-    Create task-aware dataloaders bound to exact dataset identity.
+    Create steady-flow loaders from the Dataset-owned fixed case partition.
 
     Parameters
     ----------
-    path_train : str
-        Current resolved training dataset path.
-    path_test_ood : str or Sequence[str]
-        One or more independently resolved OOD package paths.
+    train_dataset_id : str
+        Published steady Dataset with a fixed Train/validation/ID-test partition.
+    additional_evaluation_dataset_ids : Sequence[str]
+        Published Datasets whose declared OOD cases are evaluated in addition.
     task : TaskSpec
         Authoritative task contract.
-    train_dataset_id : str
-        Expected logical training dataset identifier.
-    ood_dataset_id : str or Sequence[str]
-        Expected logical OOD package identifiers in path order.
+    storage_root : Path | str | None, optional
+        Explicit storage root; the default project storage is used when omitted.
     batch_size : int, optional
         Batch size for all loaders.
-    train_ratio : float, optional
-        Fraction in ``(0, 1)`` assigned to training. The remainder is evaluation.
-        Counts use ``int(train_ratio * full_count)``.
-    ood_fraction : float, optional
-        Fraction in ``(0, 1]`` selected from the OOD dataset, also rounded down
-        with ``int``.
     num_workers : int, optional
         Training DataLoader worker count.
     pin_memory : bool, optional
         Whether the training loader pins host memory.
     persistent_workers : bool, optional
         Whether nonzero training workers persist across epochs.
-    split_seed : int, optional
-        Deterministic train/eval and OOD membership seed.
-    loader_seed : int | None, optional
-        Shuffled training-loader generator seed. Defaults to ``split_seed`` but
-        does not change membership.
+    loader_seed : int, optional
+        Shuffled training-loader generator seed; it never changes membership.
     worker_seed : int | None, optional
-        Base Python/NumPy/PyTorch worker seed. Worker ``i`` receives
-        ``worker_seed + i``. The default is ``loader_seed``.
+        Base worker seed; worker ``i`` receives ``worker_seed + i``. Defaults to
+        ``loader_seed``.
     split_indices : Mapping[str, Any] | None, optional
-        Saved exact membership to validate against datasets, settings, and
-        membership digests. Omission creates deterministic new membership.
+        Saved membership; it must equal the membership rebuilt from the Datasets.
     data_processor : DefaultDataProcessor | None, optional
-        Restored processor. When omitted, input/output normalizers are fit only
-        on the selected training subset over TaskSpec normalization axes.
+        Restored processor. When omitted, normalizers are fitted on Train only.
+    split_persist_callback : Callable or None, optional
+        Persist a newly resolved split before normalizer fitting.
 
     Returns
     -------
-    tuple[DataLoader, dict[str, DataLoader], DefaultDataProcessor, dict[str, Any]]
-        A shuffled train loader, non-shuffled ``eval`` and ``ood`` loaders, a fitted
-        or supplied processor, and the complete current split contract. This
-        function does not persist the contract or processor.
+    tuple[DataLoader, dict[str, DataLoader | None], DefaultDataProcessor, dict[str, Any]]
+        A shuffled train loader, the ``eval`` (validation), ``id_test`` and
+        ``additional_evaluation`` loaders, the processor, and the split payload.
 
     Raises
     ------
     TypeError
-        If seeds/settings, restored split state, or factory datasets violate
-        required types or fail to expose verified ``DatasetIdentity`` objects.
+        If seeds, restored split state, or runtimes have incompatible types.
     ValueError
-        If ratios select an empty split, logical IDs disagree with payloads, or
-        saved membership/settings/identity fail strict validation.
-
-    Notes
-    -----
-    ``num_workers=0`` forces ``persistent_workers=False``. Evaluation and OOD
-    loaders always use the main process without pinned memory. Fitting a new
-    processor materializes the complete selected training tensors in memory.
-    Caller-supplied processors are reused without refitting.
+        If a Dataset lacks its fixed partition, OOD declarations are missing,
+        family holdouts reuse training materials, or saved membership drifts.
 
     """
-    split_settings = splits.admit_split_settings(
-        train_ratio=train_ratio,
-        ood_fraction=ood_fraction,
-        split_seed=split_seed,
-    )
-    train_ratio = split_settings.train_ratio
-    ood_fraction = split_settings.ood_fraction
-    split_seed = split_settings.split_seed
-    loader_seed = _normalized_seed(split_seed if loader_seed is None else loader_seed, label="loader_seed")
+    loader_seed = _normalized_seed(loader_seed, label="loader_seed")
     worker_seed = _normalized_seed(loader_seed if worker_seed is None else worker_seed, label="worker_seed")
     if num_workers == 0:
         persistent_workers = False
 
-    raw_train = steady.create_dataset(path_train, task=task)
-    raw_train_identity = getattr(raw_train, "identity", None)
-    if not isinstance(raw_train_identity, identity.DatasetIdentity):
-        msg = "Task dataset factory must expose a verified DatasetIdentity."
-        raise TypeError(msg)
-    if raw_train_identity.dataset_id != train_dataset_id:
-        msg = f"Resolved training dataset identifier does not match its payload: {raw_train_identity.dataset_id!r}/{train_dataset_id!r}."
+    train_manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, train_dataset_id, storage_root=storage_root)
+    fixed = _fixed_partition(train_manifest, dataset_id=train_dataset_id)
+    full_train = _steady_dataset(train_dataset_id, storage_root=storage_root)
+    if full_train.identity.task != task.id:
+        msg = f"Training Dataset {train_dataset_id!r} does not belong to task {task.id!r}."
         raise ValueError(msg)
-
-    ood_paths = (path_test_ood,) if isinstance(path_test_ood, str) else tuple(path_test_ood)
-    ood_ids = (ood_dataset_id,) if isinstance(ood_dataset_id, str) else tuple(ood_dataset_id)
-    if not ood_paths or len(ood_paths) != len(ood_ids):
-        msg = "OOD package paths and identifiers must be non-empty and aligned."
-        raise ValueError(msg)
-    ood_sources = [steady.create_dataset(path, task=task) for path in ood_paths]
-    for expected_id, source_dataset in zip(ood_ids, ood_sources, strict=True):
-        source_identity = getattr(source_dataset, "identity", None)
-        if not isinstance(source_identity, identity.DatasetIdentity) or source_identity.dataset_id != expected_id:
-            msg = f"Resolved OOD package identifier does not match its payload: {expected_id!r}."
-            raise ValueError(msg)
-    ood_full = splits.combine_identity_datasets(ood_sources)
-    ood_identity = getattr(ood_full, "identity", None)
-    if not isinstance(ood_identity, identity.DatasetIdentity):
-        msg = "Combined OOD packages did not expose a verified DatasetIdentity."
-        raise TypeError(msg)
-
-    package_membership = splits.package_id_membership(raw_train)
-    id_test_set: Dataset[Mapping[str, Any]] | None = None
-    if package_membership is None:
-        full_train: Dataset[Mapping[str, Any]] = raw_train
-        explicit_train_count = None
-    else:
-        train_positions = package_membership["train"]
-        validation_positions = package_membership["validation"]
-        full_train = splits.select_identity_dataset(
-            raw_train,
-            [*train_positions, *validation_positions],
-            label="package train+validation",
-        )
-        id_test_set = splits.select_identity_dataset(
-            raw_train,
-            package_membership["id_test"],
-            label="package id_test",
-        )
-        explicit_train_count = len(train_positions)
-        train_ratio = explicit_train_count / len(cast("Sized", full_train))
-
-    train_identity = getattr(full_train, "identity", None)
-    if not isinstance(train_identity, identity.DatasetIdentity):
-        msg = "Resolved training view did not expose a verified DatasetIdentity."
-        raise TypeError(msg)
-    n_train_full = len(cast("Sized", full_train))
-    n_ood_full = len(cast("Sized", ood_full))
-    if split_indices is None:
-        n_train = int(train_ratio * n_train_full)
-        n_eval = n_train_full - n_train
-        n_ood = int(ood_fraction * n_ood_full)
-        if min(n_train, n_eval, n_ood) <= 0:
-            msg = f"Split settings must select non-empty train/eval/OOD sets. Received train={n_train}, eval={n_eval}, ood={n_ood}."
-            raise ValueError(msg)
-        if explicit_train_count is None:
-            train_random, eval_random = random_split(
-                full_train,
-                [n_train, n_eval],
-                generator=torch.Generator().manual_seed(split_seed),
-            )
-            train_indices = torch.tensor(train_random.indices, dtype=torch.long)
-            eval_indices = torch.tensor(eval_random.indices, dtype=torch.long)
-        else:
-            n_train = explicit_train_count
-            n_eval = n_train_full - n_train
-            train_indices = torch.arange(n_train, dtype=torch.long)
-            eval_indices = torch.arange(n_train, n_train_full, dtype=torch.long)
-        ood_random, _ = random_split(
-            ood_full,
-            [n_ood, n_ood_full - n_ood],
-            generator=torch.Generator().manual_seed(split_seed),
-        )
-        ood_indices = torch.tensor(ood_random.indices, dtype=torch.long)
-        membership_digests = {
-            "train": identity.membership_digest(
-                role="train",
-                dataset_fingerprint=train_identity.fingerprint,
-                sample_ids=train_identity.sample_ids,
-                indices=[int(value) for value in train_indices.tolist()],
-            ),
-            "eval": identity.membership_digest(
-                role="eval",
-                dataset_fingerprint=train_identity.fingerprint,
-                sample_ids=train_identity.sample_ids,
-                indices=[int(value) for value in eval_indices.tolist()],
-            ),
-            "ood": identity.membership_digest(
-                role="ood",
-                dataset_fingerprint=ood_identity.fingerprint,
-                sample_ids=ood_identity.sample_ids,
-                indices=[int(value) for value in ood_indices.tolist()],
-            ),
-        }
-        split_info: dict[str, Any] = {
-            "schema_version": splits.SPLIT_SCHEMA_VERSION,
-            "task": task.id,
-            "task_contract_digest": task.contract_digest,
-            "train_indices": train_indices,
-            "eval_indices": eval_indices,
-            "ood_indices": ood_indices,
-            "metadata": {
-                "datasets": {
-                    "train": train_identity.as_dict(),
-                    "ood": ood_identity.as_dict(),
-                },
-                "n_train_full": n_train_full,
-                "n_train": n_train,
-                "n_eval": n_eval,
-                "n_ood_full": n_ood_full,
-                "n_ood": n_ood,
-                "train_ratio": train_ratio,
-                "ood_fraction": ood_fraction,
-                "split_seed": split_seed,
-                "membership_digests": membership_digests,
-            },
-        }
-    else:
-        split_info = dict(split_indices)
-
-    split_contract = splits.admit_split_contract(
-        split_info,
-        train_identity=train_identity,
-        ood_identity=ood_identity,
-        expected_train_ratio=train_ratio,
-        expected_ood_fraction=ood_fraction,
-        expected_split_seed=split_seed,
+    additional_dataset, additional_positions = additional_evaluation_dataset(
+        additional_evaluation_components(train_dataset_id, additional_evaluation_dataset_ids, storage_root=storage_root),
+        storage_root=storage_root,
+        loaded={train_dataset_id: full_train},
     )
+    additional_identity = cast("identity.DatasetIdentity | None", getattr(additional_dataset, "identity", None))
+    evidence = {
+        role: splits.role_evidence(role, full_train.identity, splits.role_positions(full_train.identity, fixed[role], label=role))
+        for role in splits.ID_SPLIT_ROLES
+    }
+    rebuilt = splits.SplitContract(
+        schema_version=splits.SPLIT_SCHEMA_VERSION,
+        task=task.id,
+        task_contract_digest=task.contract_digest,
+        split_seed=int(fixed["seed"]),
+        case_partition=fixed,
+        case_partition_digest=partition_contract.partition_digest(fixed),
+        train=evidence["train"],
+        validation=evidence["validation"],
+        id_test=evidence["id_test"],
+        additional_evaluation=None
+        if additional_identity is None
+        else splits.role_evidence("additional_evaluation", additional_identity, additional_positions),
+    )
+    split_contract = splits.admit_split_contract(
+        rebuilt.as_payload() if split_indices is None else split_indices,
+        train_identity=full_train.identity,
+        additional_evaluation_identity=additional_identity,
+        expected_split_seed=rebuilt.split_seed,
+    )
+    if split_contract != rebuilt:
+        msg = "Saved steady split does not match the current Dataset partition and evaluation membership."
+        raise ValueError(msg)
     split_info = split_contract.as_payload()
-    train_indices = split_contract.role("train").indices
-    eval_indices = split_contract.role("eval").indices
-    ood_indices = split_contract.role("ood").indices
-    train_set = Subset(full_train, train_indices.tolist())
-    eval_set = Subset(full_train, eval_indices.tolist())
-    ood_subset = Subset(ood_full, ood_indices.tolist())
+    if split_indices is None and split_persist_callback is not None:
+        split_persist_callback(split_info)
 
+    train_set = Subset(full_train, list(split_contract.train.index_values))
     if data_processor is None:
-        fitting_loader = runtime_factory.make_data_loader(
-            train_set,
-            runtime_factory.LoaderSettings(batch_size=batch_size),
-        )
-        data_processor = normalization.fit_data_processor(
-            fitting_loader,
-            task=task,
-        )
+        fitting_loader = runtime_factory.make_data_loader(train_set, runtime_factory.LoaderSettings(batch_size=batch_size))
+        data_processor = normalization.fit_data_processor(fitting_loader, task=task)
 
     generator = torch.Generator().manual_seed(loader_seed)
     worker_init = _make_worker_init_fn(worker_seed) if num_workers > 0 else None
@@ -341,12 +295,11 @@ def create_dataloaders(
         worker_init_fn=worker_init,
     )
     evaluation_settings = runtime_factory.LoaderSettings(batch_size=batch_size)
-    eval_loader = runtime_factory.make_data_loader(eval_set, evaluation_settings)
-    ood_loader = runtime_factory.make_data_loader(ood_subset, evaluation_settings)
-    test_loaders = {"eval": eval_loader, "ood": ood_loader}
-    if id_test_set is not None:
-        test_loaders["id_test"] = runtime_factory.make_data_loader(
-            id_test_set,
-            evaluation_settings,
-        )
-    return train_loader, test_loaders, cast("DefaultDataProcessor", data_processor), split_info
+    evaluation_loaders: dict[str, DataLoader[Any] | None] = {
+        "eval": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.validation.index_values)), evaluation_settings),
+        "id_test": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.id_test.index_values)), evaluation_settings),
+        "additional_evaluation": None
+        if additional_dataset is None
+        else runtime_factory.make_data_loader(Subset(additional_dataset, list(additional_positions)), evaluation_settings),
+    }
+    return train_loader, evaluation_loaders, cast("DefaultDataProcessor", data_processor), split_info

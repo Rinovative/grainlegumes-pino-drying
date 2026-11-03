@@ -1,18 +1,26 @@
-"""
-generation_cases_input.py
+"""Publish and plan canonical pre-execution inputs for maintained generation batches.
 
-Publish and plan canonical pre-execution inputs for maintained generation batches.
 Responsibilities:
   - Initialize shared batch metadata without duplicating runtime ownership
   - Atomically publish bounded deterministic cases into canonical raw storage
   - Validate configured persisted cases before runtime materialization
   - Plan campaign selections without mutating persistent storage
+
 Design principles:
   - One batch metadata and raw location serves EDA and later COMSOL execution
   - Existing cases are reused only after complete manifest and byte validation
   - Conflicting or incomplete canonical evidence always fails closed
+
 This module does NOT:
   - Execute COMSOL, publish processed results, or admit alternate storage layouts
+
+Notes:
+  Publication recovery:
+    - When cases need generation, bundles and metadata are staged under one transaction. Before canonical raw paths change, `transaction.json` binds
+      the batch and generation identities, staged-manifest digest, and new case IDs.
+    - Recovery validates the journal and staged metadata, promotes case directories and references, admits the staged batch, writes the canonical
+      manifest last, then removes transaction state.
+
 """
 
 from __future__ import annotations
@@ -115,6 +123,7 @@ def _manifest_base(
         "scientific_config_digest": config.scientific_config_digest,
         "git_commit": case_service.source_service.required_git_commit(),
         "generator_version": scientific["generator_version"],
+        "producer_identity": source_service.input_producer_identity(),
         "case_schema_version": case_service.CASE_SCHEMA_VERSION,
         "case_contract_digest": case_service.CASE_CONTRACT_DIGEST,
         "template_relative_path": config.template_relative_path,
@@ -185,8 +194,8 @@ def admit_persisted_input_case(
     Notes
     -----
     Source commit is intentionally owned by the persisted input generation.
-    This permits postprocessing replay under newer code without rebinding the
-    solver inputs to that newer processing commit.
+    This lets a campaign that continues under newer code keep the solver inputs
+    of its original input generation without rebinding them to that newer commit.
 
     """
     case_id = config.case_id(case_index)
@@ -199,7 +208,7 @@ def admit_persisted_input_case(
         generation_id,
         storage_root=storage_root,
     )
-    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+    raw_directory = common.paths.resolve_generation_input_generation_cases_directory(
         config.batch_storage_name,
         generation_id,
         storage_root=storage_root,
@@ -363,7 +372,8 @@ def _compatible_source(
 ) -> admission_service.InputSource | None:
     """Select one exact compatible immutable source when current evidence is absent."""
     discovery = admission_service.discover_input_batches(storage_root=storage_root)
-    relevant_issues = [issue for issue in discovery.issues if issue.directory.parent.parent.name == config.batch_storage_name]
+    batch_metadata_directory = common.paths.resolve_generation_batch_metadata_directory(config.batch_storage_name, storage_root=storage_root)
+    relevant_issues = [issue for issue in discovery.issues if issue.directory.resolve() == batch_metadata_directory.resolve()]
     if relevant_issues:
         message = f"Compatible input-source discovery found corrupt evidence for {config.batch_storage_name}: {relevant_issues[0].directory}"
         raise FileExistsError(message)
@@ -398,7 +408,7 @@ def _admit_selected_input_references(
     metadata = common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
-    raw = common.paths.resolve_generation_input_generation_raw_directory(config.batch_storage_name, input_generation_id, storage_root=storage_root)
+    raw = common.paths.resolve_generation_input_generation_cases_directory(config.batch_storage_name, input_generation_id, storage_root=storage_root)
     try:
         source = admission_service.admit_input_batch_source(
             metadata, raw_directory=raw, expected_input_generation_id=input_generation_id, validation_depth=validation_depth
@@ -434,12 +444,39 @@ def _configured_input_locations(
         input_generation_id,
         storage_root=storage_root,
     )
-    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+    raw_directory = common.paths.resolve_generation_input_generation_cases_directory(
         config.batch_storage_name,
         input_generation_id,
         storage_root=storage_root,
     )
     return base, resolved_config, metadata_directory, raw_directory
+
+
+def _published_case_directory(raw_directory: Path, case_id: str) -> Path:
+    """Keep inputs inside their material-local candidate directory."""
+    return common.paths.resolve_generation_case_inputs_directory(raw_directory / case_id)
+
+
+def _write_input_reference(
+    inputs_directory: Path,
+    batch_storage_name: str,
+    input_generation_id: str,
+    case_record: Mapping[str, Any],
+) -> None:
+    """Bind a prepared input directory to its exact immutable input generation before it is published."""
+    case_id = str(case_record["case_id"])
+    _immutable_json(
+        inputs_directory / common.paths.GENERATION_INPUT_REFERENCE_FILENAME,
+        {
+            "schema_kind": "generation_campaign_input_reference",
+            "schema_version": 1,
+            "batch_storage_name": batch_storage_name,
+            "input_generation_id": input_generation_id,
+            "case_id": case_id,
+            "case_json_sha256": case_record["case_json_sha256"],
+        },
+        label="canonical campaign input-generation reference",
+    )
 
 
 def admit_configured_input_case(
@@ -490,6 +527,9 @@ def admit_configured_input_references(
                 validation_depth=validation_depth,
             )
         base, resolved, metadata, raw = _configured_input_locations(config, storage_root=storage_root)
+        if not any(path.exists() or path.is_symlink() for path in (metadata, raw)):
+            message = "Configured raw input source has not been published."
+            raise FileNotFoundError(message)
         records, source = _load_existing(metadata, raw, base=base, resolved_config=resolved, validation_depth=validation_depth)
     expected = set(config.case_indices)
     if not expected.issubset(records):
@@ -526,14 +566,14 @@ def plan_input_cases(
     metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
-    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+    raw_directory = common.paths.resolve_generation_input_generation_cases_directory(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
     manifest_exists = (metadata_directory / "input_generation_manifest.json").is_file()
     raw_exists = raw_directory.is_dir()
     records: dict[int, Mapping[str, Any]] = {}
-    if manifest_exists != raw_exists:
-        message = "Canonical input manifest and raw batch must exist together."
+    if manifest_exists and not raw_exists:
+        message = "Canonical campaign input manifest lacks its material-local case namespace."
         raise FileExistsError(message)
     if manifest_exists:
         records, _source = _load_existing(
@@ -542,9 +582,6 @@ def plan_input_cases(
             base=base,
             resolved_config=resolved_config,
         )
-    elif raw_directory.exists():
-        message = f"Unmanifested canonical raw batch blocks input planning: {raw_directory}"
-        raise FileExistsError(message)
     elif (metadata_directory / "resolved_generation_config.json").exists():
         _immutable_json(
             metadata_directory / "resolved_generation_config.json",
@@ -554,7 +591,8 @@ def plan_input_cases(
     reusable = tuple(index for index in requested if index in records)
     missing = tuple(index for index in requested if index not in records)
     reusable_bytes = sum(
-        sum(path.stat().st_size for path in (raw_directory / config.case_id(index)).rglob("*") if path.is_file()) for index in reusable
+        sum(path.stat().st_size for path in _published_case_directory(raw_directory, config.case_id(index)).rglob("*") if path.is_file())
+        for index in reusable
     )
     estimated_missing_bytes = 0
     if missing:
@@ -649,7 +687,7 @@ def _recover_input_transaction(
     source_service.validate_admitted_source_before_publication()
     raw_directory.mkdir(parents=True, exist_ok=True)
     for case_id in new_case_ids:
-        target = raw_directory / case_id
+        target = _published_case_directory(raw_directory, case_id)
         staged = staged_raw / case_id
         if target.exists() and staged.exists():
             message = f"Input transaction has conflicting staged and final cases: {case_id}"
@@ -658,6 +696,7 @@ def _recover_input_transaction(
             if not staged.is_dir():
                 message = f"Input transaction lost unpublished case evidence: {case_id}"
                 raise RuntimeError(message)
+            target.parent.mkdir(parents=True, exist_ok=True)
             staged.replace(target)
     admission_service.admit_input_batch_source(
         staged_metadata,
@@ -722,6 +761,17 @@ def _emit_case_progress(
     )
 
 
+def _canonical_replacement_design(config: config_service.GenerationConfig, regime: str, case_index: int) -> dict[str, Any] | None:
+    """Require one exact supplemental locator before reserving its case ID."""
+    design = config.scientific_values.get("supplemental_design")
+    if not isinstance(design, dict) or design.get("schema_version") != config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
+        return None
+    if design.get("batch_locator_regime") != regime or design.get("material_case_index") != case_index:
+        message = "Replacement input disagrees with its canonical material-local locator."
+        raise ValueError(message)
+    return design
+
+
 def generate_input_cases(
     config: config_service.GenerationConfig,
     case_count: int,
@@ -739,11 +789,12 @@ def generate_input_cases(
     metadata_directory = common.paths.resolve_generation_input_generation_metadata_directory(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
-    raw_directory = common.paths.resolve_generation_input_generation_raw_directory(
+    raw_directory = common.paths.resolve_generation_input_generation_cases_directory(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
     lock_path = common.paths.resolve_generation_input_lock_path(config.batch_storage_name, storage_root=storage_root)
     transaction = common.paths.resolve_generation_input_transaction_directory(input_generation_id, storage_root=storage_root)
+    campaign_parts = common.paths.campaign_batch_parts(config.batch_storage_name)
     with common.locking.exclusive_file_lock(lock_path, blocking=True):
         _initialize_input_generation_metadata(
             config,
@@ -763,8 +814,11 @@ def generate_input_cases(
             )
         manifest_exists = (metadata_directory / "input_generation_manifest.json").is_file()
         raw_exists = raw_directory.is_dir()
-        if manifest_exists != raw_exists:
+        if not campaign_parts and manifest_exists != raw_exists:
             message = "Canonical input manifest and raw batch must exist together; found incomplete evidence."
+            raise FileExistsError(message)
+        if campaign_parts and manifest_exists and not raw_exists:
+            message = "Canonical campaign input manifest lacks its material-local case namespace."
             raise FileExistsError(message)
         records: dict[int, Mapping[str, Any]] = {}
         if manifest_exists:
@@ -783,7 +837,7 @@ def generate_input_cases(
                 resolved_config=resolved_config,
                 validation_depth=existing_validation_depth,
             )
-        elif raw_directory.exists():
+        elif raw_directory.exists() and campaign_parts is None:
             message = f"Unmanifested canonical raw batch blocks publication: {raw_directory}"
             raise FileExistsError(message)
         generated_indices = [index for index in requested if index not in records]
@@ -807,7 +861,7 @@ def generate_input_cases(
                     start=1,
                 ):
                     case_id = config.case_id(case_index)
-                    target_case = raw_directory / case_id
+                    target_case = _published_case_directory(raw_directory, case_id)
                     _require_case_publication_target(
                         target_case,
                         declared=False,
@@ -818,7 +872,39 @@ def generate_input_cases(
                         case_index,
                         staged_case,
                     )
+                    if campaign_parts is not None:
+                        from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- campaign input publication boundary
+
+                        task, campaign_name, material, regime = campaign_parts
+                        case_payload = json.loads((staged_case / "case.json").read_text(encoding="utf-8"))
+                        seed_evidence = case_payload["seed_evidence"]
+                        supplemental = _canonical_replacement_design(config, regime, case_index)
+                        replacement = supplemental is not None
+                        replacement_design = supplemental if supplemental is not None else {}
+                        lifecycle.reserve_candidate(
+                            task,
+                            campaign_name,
+                            material,
+                            origin="replacement" if replacement else "primary",
+                            design_key=str(replacement_design["candidate_id"]) if replacement else f"{regime}:{case_index}",
+                            candidate_position=case_index,
+                            target_slot=int(replacement_design["target_slot"]) if replacement else case_index,
+                            sample={
+                                "sampled_values": case_payload["sampled_values"],
+                                "sampled_units": case_payload["sampled_units"],
+                                "ood": case_payload["ood"],
+                                "spatial_diagnostics": case_payload["spatial_diagnostics"],
+                                "schedule_diagnostics": case_payload.get("schedule_diagnostics"),
+                                "input_files": case_payload["input_files"],
+                            },
+                            derived_seeds={"batch": seed_evidence["batch_seed"], "case": seed_evidence["case_seed"], **seed_evidence["subseeds"]},
+                            batch_id=str(replacement_design["parent_batch_id"]) if replacement else config.batch_id,
+                            design_evidence=supplemental if replacement else None,
+                            expected_case_id=case_id,
+                            storage_root=storage_root,
+                        )
                     records[case_index] = _case_record(staged_case)
+                    _write_input_reference(staged_case, config.batch_storage_name, input_generation_id, records[case_index])
                     _emit_case_progress(
                         progress,
                         operation="canonical_input_generation",
@@ -844,7 +930,8 @@ def generate_input_cases(
                 source_service.validate_admitted_source_before_publication()
                 raw_directory.mkdir(parents=True, exist_ok=True)
                 for case_index in generated_indices:
-                    target_case = raw_directory / config.case_id(case_index)
+                    target_case = _published_case_directory(raw_directory, config.case_id(case_index))
+                    target_case.parent.mkdir(parents=True, exist_ok=True)
                     (staged_raw / config.case_id(case_index)).replace(target_case)
                 admission_service.admit_input_batch_source(
                     staged_metadata,
@@ -954,24 +1041,19 @@ def _resolve_request_git_commit(
 def _equivalent_cli_command(
     request: CampaignInputGenerationRequest,
     campaign: config_service.CampaignConfig,
-    git_commit: str,
 ) -> tuple[str | None, str | None]:
     """Return a copyable canonical command only for a supported shared launch."""
     repository = common.paths.get_project_root().resolve()
     campaign_path = campaign.source_path.resolve()
     storage_root = Path(request.storage_root).expanduser().resolve()
-    if storage_root != (repository.parent / "storage").resolve():
-        return None, "The maintained Generation launcher owns the sibling storage root."
+    tree_mode = common.paths.source_tree_id() is not None
+    owned_storage = common.paths.get_storage_root() if tree_mode else repository.parent / "storage"
+    if storage_root != owned_storage.resolve():
+        return None, f"The maintained Generation launcher owns the {'explicit' if tree_mode else 'sibling'} storage root."
     try:
         campaign_argument = campaign_path.relative_to(repository).as_posix()
     except ValueError:
         return None, "The maintained Generation launcher requires a campaign config in the repository."
-    try:
-        current_commit = source_service.clean_repository_git_commit(repository)
-    except RuntimeError as error:
-        return None, str(error)
-    if current_commit != git_commit:
-        return None, "The maintained Generation launcher requires the selected commit to equal clean shared HEAD."
     command = [
         "./scripts/generation",
         "inputs",
@@ -991,8 +1073,48 @@ def _equivalent_cli_command(
         command.extend(("--case-count", str(request.case_count)))
     if request.action == "dry_run":
         command.append("--dry-run")
-    command.extend(("--git-commit", git_commit))
     return shlex.join(command), None
+
+
+def _ensure_campaign_plan_for_inputs(
+    campaign: config_service.CampaignConfig,
+    *,
+    storage_root: Path | str | None,
+) -> None:
+    """Freeze a complete v2 plan before reserving its first input case."""
+    if campaign.schema_version != config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
+        return
+    from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- canonical reservation owner
+
+    target_count = sum(campaign.selected_targets.values())
+    if campaign.total_case_count == target_count:
+        lifecycle.create_campaign(campaign, storage_root=storage_root)
+        return
+    if campaign.total_case_count > target_count:
+        message = "Selected campaign inputs exceed the frozen material success targets."
+        raise ValueError(message)
+    try:
+        plan = lifecycle.load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+    except FileNotFoundError as error:
+        message = "Partial canonical input preparation requires an existing complete campaign plan."
+        raise FileNotFoundError(message) from error
+    if plan["campaign_digest"] != campaign.campaign_digest or plan["selected_targets"] != campaign.selected_targets:
+        message = "Partial canonical input preparation conflicts with the frozen campaign science."
+        raise ValueError(message)
+    frozen_batches = {batch["batch_name"]: batch for batch in plan["batches"]}
+    for batch in campaign.batches:
+        frozen = frozen_batches.get(batch.batch_name)
+        if frozen is None or any(
+            frozen[field] != expected
+            for field, expected in (
+                ("batch_id", batch.batch_id),
+                ("scientific_config_digest", batch.scientific_config_digest),
+                ("case_indices", list(batch.case_indices)),
+                ("batch_storage_name", batch.batch_storage_name),
+            )
+        ):
+            message = "Partial canonical input preparation conflicts with a frozen batch."
+            raise ValueError(message)
 
 
 def prepare_campaign_inputs(
@@ -1034,6 +1156,7 @@ def prepare_campaign_inputs(
     """
     commit = source_service.validate_git_commit(git_commit)
     storage = Path(storage_root).expanduser() if storage_root is not None else None
+    _ensure_campaign_plan_for_inputs(campaign, storage_root=storage)
     batches: list[dict[str, Any]] = []
     total_cases = sum(len(batch.case_indices) for batch in campaign.batches)
     completed_offset = 0
@@ -1058,48 +1181,24 @@ def prepare_campaign_inputs(
                     }
                 )
 
-            base, resolved, metadata, raw = _configured_input_locations(batch, storage_root=storage)
-            current: admission_service.InputSource | None
-            try:
-                _records, existing_source = _load_existing(
-                    metadata,
-                    raw,
-                    base=base,
-                    resolved_config=resolved,
-                    validation_depth=existing_validation_depth,
-                )
-            except FileExistsError:
-                if metadata.exists() or raw.exists():
-                    raise
-                current = _compatible_source(batch, base, resolved, storage_root=storage)
-            else:
-                current = existing_source
-            if current is None:
-                generated = generate_input_cases(
-                    batch,
-                    len(batch.case_indices),
-                    case_start=batch.case_indices[0],
-                    storage_root=storage,
-                    progress=report_batch_progress,
-                    existing_validation_depth=existing_validation_depth,
-                )
-                source_id = generated.input_generation_id
-                generated_count, reused_count = generated.generated_case_count, generated.reused_case_count
-                source_commit = commit
-            else:
-                source_id = current.source_id
-                generated_count, reused_count = 0, len(batch.case_indices)
-                source_commit = str(current.manifest_payload()["git_commit"])
+            generated = generate_input_cases(
+                batch,
+                len(batch.case_indices),
+                case_start=batch.case_indices[0],
+                storage_root=storage,
+                progress=report_batch_progress,
+                existing_validation_depth=existing_validation_depth,
+            )
             completed_offset += len(batch.case_indices)
             batches.append(
                 {
                     "batch_id": batch.batch_id,
                     "batch_storage_name": batch.batch_storage_name,
-                    "input_generation_id": source_id,
-                    "source_git_commit": source_commit,
+                    "input_generation_id": generated.input_generation_id,
+                    "source_git_commit": commit,
                     "case_indices": list(batch.case_indices),
-                    "generated_case_count": generated_count,
-                    "reused_case_count": reused_count,
+                    "generated_case_count": generated.generated_case_count,
+                    "reused_case_count": generated.reused_case_count,
                     "requested_case_count": len(batch.case_indices),
                 }
             )
@@ -1176,23 +1275,6 @@ def admit_campaign_inputs_with_references(
     return evidence, references
 
 
-def admit_campaign_inputs(
-    campaign: config_service.CampaignConfig,
-    *,
-    git_commit: str,
-    storage_root: Path | str | None = None,
-    validation_depth: Literal["evidence", "full"] = "evidence",
-) -> dict[str, Any]:
-    """Admit every configured input from immutable batch evidence without generation."""
-    evidence, _references = admit_campaign_inputs_with_references(
-        campaign,
-        git_commit=git_commit,
-        storage_root=storage_root,
-        validation_depth=validation_depth,
-    )
-    return evidence
-
-
 def run_campaign_input_generation(
     request: CampaignInputGenerationRequest,
 ) -> dict[str, Any]:
@@ -1210,6 +1292,7 @@ def run_campaign_input_generation(
         "action": request.action,
         "campaign_config": str(campaign.source_path),
         "campaign_name": campaign.campaign_name,
+        "source_name": campaign.source_name,
         "campaign_id": campaign.campaign_id,
         "campaign_purpose": campaign.campaign_purpose,
         "simulation_profile": campaign.profile.id,
@@ -1239,7 +1322,7 @@ def run_campaign_input_generation(
                         "requested_case_indices": list(indices),
                         "requested_case_range": [indices[0], indices[-1]],
                         "raw_batch_root": str(
-                            common.paths.resolve_generation_raw_batch_directory(
+                            common.paths.resolve_generation_cases_directory(
                                 batch.batch_storage_name,
                                 storage_root=storage_root,
                             )
@@ -1301,12 +1384,12 @@ def run_campaign_input_generation(
                     "complete_manifest_case_indices": list(complete_case_indices),
                     "estimated_storage_bytes": input_plan.estimated_storage_bytes,
                     "raw_batch_root": str(input_plan.raw_directory),
-                    "raw_case_paths": [str(input_plan.raw_directory / batch.case_id(index)) for index in requested],
+                    "raw_case_paths": [str(_published_case_directory(input_plan.raw_directory, batch.case_id(index))) for index in requested],
                     "manifest": str(input_plan.metadata_directory / "input_generation_manifest.json"),
                     "input_generation_id": input_generation_id,
                 }
             )
-    equivalent_command, equivalent_blocker = _equivalent_cli_command(request, campaign, git_commit)
+    equivalent_command, equivalent_blocker = _equivalent_cli_command(request, campaign)
     response.update(
         {
             "estimated_storage_bytes": sum(int(item["estimated_storage_bytes"]) for item in batch_results),

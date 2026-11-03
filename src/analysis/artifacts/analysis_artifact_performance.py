@@ -1,9 +1,18 @@
-"""
-Record bounded operational timing for Evaluation artifact workflows.
+"""Record bounded operational timing for Evaluation artifact workflows.
 
-The evidence in this module describes runtime performance only. It is excluded
-from scientific artifact identity and never changes predictions, metrics,
-Dataset membership, or persisted numerical payloads.
+Responsibilities:
+  - Accumulate non-overlapping stage durations, counters and runtime measurements
+  - Report one line per finished phase, a heartbeat at most once per minute, device and process-memory evidence
+  - Validate operational performance snapshots through one closed schema
+
+Design principles:
+  - Operational telemetry remains separate from scientific artifact identity
+  - Missing memory observations remain unavailable rather than fabricated
+  - A phase prints when it finishes, never when it starts
+
+This module does NOT:
+  - Change predictions, metrics, Dataset membership or numerical payloads
+  - Generate artifacts or publish scientific completion markers
 """
 
 from __future__ import annotations
@@ -20,11 +29,14 @@ from typing import Any, Final
 
 import torch
 
+from src.experiments import experiments_console as console
+
 _SCHEMA_KIND: Final = "evaluation_artifact_operational_performance"
 _SCHEMA_VERSION: Final = 1
 _KIBIBYTE: Final = 1024
 _GIBIBYTE: Final = 1024**3
 _MINIMUM_ETA_CASES: Final = 2
+_HEARTBEAT_SECONDS: Final = 60.0
 _PHASES: Final = frozenset(
     {
         "preflight",
@@ -177,21 +189,9 @@ def current_process_rss_bytes() -> int | None:
         return _peak_process_rss_bytes()
 
 
-def _duration(seconds: float) -> str:
-    """Format one concise non-negative wall duration."""
-    total = max(0, round(seconds))
-    minutes, remainder = divmod(total, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{remainder:02d}s"
-    if minutes:
-        return f"{minutes}m{remainder:02d}s"
-    return f"{remainder}s"
-
-
 @dataclass(slots=True)
 class ArtifactProgressReporter:
-    """Emit compact phase, case-progress, device, memory, and completion logs."""
+    """Emit one line per finished phase, a rate-limited heartbeat, and one completion line."""
 
     task: str
     run: str
@@ -209,8 +209,10 @@ class ArtifactProgressReporter:
     _failed_reported: bool = field(default=False, init=False, repr=False)
     _model_forward_seconds: float = field(default=0.0, init=False, repr=False)
     _timed_forward_calls: int = field(default=0, init=False, repr=False)
-    _announced_work_phases: set[str] = field(default_factory=set, init=False, repr=False)
+    _started_work_phases: set[str] = field(default_factory=set, init=False, repr=False)
     _completed_work_phases: set[str] = field(default_factory=set, init=False, repr=False)
+    _last_output: float = field(default_factory=perf_counter, init=False, repr=False)
+    _device_label: str = field(default="", init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Validate bounded startup metadata and create its telemetry recorder."""
@@ -223,29 +225,30 @@ class ArtifactProgressReporter:
             dtype=self.dtype,
         )
 
+    def _print(self, text: str, *, to_stderr: bool = False) -> None:
+        """Print and flush one line, restarting the heartbeat interval."""
+        print(text, file=sys.stderr if to_stderr else sys.stdout, flush=True)
+        self._last_output = perf_counter()
+
     def startup(self) -> None:
-        """Print one bounded startup summary without exact manifests."""
-        print(
-            f"[ARTIFACT] task={self.task} | run={self.run}",
-            flush=True,
+        """Print one bounded startup line without exact manifests."""
+        self._print(
+            f"artifacts {self.run} | {self.task} {self.stage_label} ({self.checkpoint_label}) | {self.device} {self.dtype}"
+            f" | {self.total_cases} cases | split {self.split} | out {console.display_path(self.output_root)}"
         )
-        print(
-            f"[ARTIFACT] stage={self.stage_label} | checkpoint={self.checkpoint_label} | device={self.device} | dtype={self.dtype}",
-            flush=True,
-        )
-        print(
-            f"[ARTIFACT] cases={self.total_cases} | split={self.split} | output={self.output_root}",
-            flush=True,
-        )
+
+    def _phase_done(self, name: str, elapsed: float, detail: str = "") -> None:
+        """Print the one line of a finished phase."""
+        suffix = f"  {self._device_label}" if name == "model_setup" and self._device_label else detail
+        self._print(f"  {name:<13} {elapsed:6.1f} s   total {self.recorder.elapsed_seconds:.1f} s{suffix}")
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
-        """Print one major phase start/completion and preserve exact failures."""
+        """Print one line when a major phase finishes and preserve exact failures."""
         if name not in _PHASES:
             message = f"Unknown artifact phase {name!r}."
             raise ValueError(message)
         self._current_phase = name
-        print(f"[PHASE] {name}", flush=True)
         started = perf_counter()
         try:
             with self.recorder.stage(name):
@@ -254,23 +257,17 @@ class ArtifactProgressReporter:
             self.failure()
             raise
         else:
-            elapsed = perf_counter() - started
-            print(
-                f"[PHASE] {name} done | {elapsed:.1f} s | total {self.recorder.elapsed_seconds:.1f} s",
-                flush=True,
-            )
+            self._phase_done(name, perf_counter() - started)
         finally:
             self._current_phase = None
 
     @contextmanager
     def work_phase(self, name: str) -> Iterator[None]:
-        """Accumulate one interleaved case-pipeline phase without repeated log lines."""
+        """Accumulate one interleaved case-pipeline phase; it prints once when finished."""
         if name not in _PHASES:
             message = f"Unknown artifact phase {name!r}."
             raise ValueError(message)
-        if name not in self._announced_work_phases:
-            print(f"[PHASE] {name}", flush=True)
-            self._announced_work_phases.add(name)
+        self._started_work_phases.add(name)
         self._current_phase = name
         try:
             with self.recorder.stage(name):
@@ -283,14 +280,12 @@ class ArtifactProgressReporter:
 
     def finish_work_phase(self, name: str) -> None:
         """Report one accumulated interleaved phase exactly once."""
-        if name not in self._announced_work_phases or name in self._completed_work_phases:
+        if name not in self._started_work_phases or name in self._completed_work_phases:
             message = f"Artifact phase {name!r} was not started or was already completed."
             raise RuntimeError(message)
         elapsed = float(self.recorder.stage_seconds.get(name, 0.0))
-        print(
-            f"[PHASE] {name} done | {elapsed:.1f} s | total {self.recorder.elapsed_seconds:.1f} s",
-            flush=True,
-        )
+        detail = f"  {self._completed_cases} cases, {self.recorder.counts.get('forward_call_count', 0)} forwards" if name == "inference" else ""
+        self._phase_done(name, elapsed, detail)
         self._completed_work_phases.add(name)
 
     def device_summary(
@@ -299,13 +294,10 @@ class ArtifactProgressReporter:
         model_device: torch.device,
         scaler_device: torch.device,
     ) -> None:
-        """Print one cheap PyTorch-owned device summary after model setup."""
-        cuda_available = torch.cuda.is_available()
-        gpu_name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" and cuda_available else "CPU"
-        print(
-            f"[DEVICE] {self.device} | {gpu_name} | model={model_device} | scaler={scaler_device} | cuda_available={str(cuda_available).lower()}",
-            flush=True,
-        )
+        """Remember the PyTorch-owned device label that the model_setup line shows."""
+        gpu_name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" and torch.cuda.is_available() else "CPU"
+        mismatch = f" (model {model_device}, scaler {scaler_device})" if {model_device, scaler_device} != {self.device} else ""
+        self._device_label = f"{gpu_name}{mismatch}"
 
     def case_started(
         self,
@@ -314,13 +306,8 @@ class ArtifactProgressReporter:
         material: str,
         rollout_steps: int,
     ) -> None:
-        """Print one meaningful one-case line without rollout-step spam."""
-        self._last_case = case_id
-        if self.total_cases == 1:
-            print(
-                f"[CASE] 1/1 {material} {case_id} | rollout={rollout_steps} steps",
-                flush=True,
-            )
+        """Remember the running case for the failure line."""
+        self._last_case = f"{case_id} ({material}, {rollout_steps} rollout steps)"
 
     def case_completed(
         self,
@@ -331,7 +318,7 @@ class ArtifactProgressReporter:
         timed_forward_calls: int,
         model_forward_seconds: float,
     ) -> None:
-        """Record one case and emit only the bounded progress cadence."""
+        """Record one case and print a heartbeat only when the last line is older than a minute."""
         self._completed_cases += 1
         self._last_case = case_id
         self.recorder.increment("case_count")
@@ -342,29 +329,22 @@ class ArtifactProgressReporter:
         )
         self._timed_forward_calls += timed_forward_calls
         self._model_forward_seconds += model_forward_seconds
-        if self.total_cases == 1:
-            print(
-                f"[CASE] done | forwards={forward_calls} | elapsed={_duration(self.recorder.elapsed_seconds)}",
-                flush=True,
-            )
-            return
-        interval = max(1, math.ceil(self.total_cases / 19))
-        if self._completed_cases not in (1, self.total_cases) and self._completed_cases % interval != 0:
+        if self._completed_cases == self.total_cases or perf_counter() - self._last_output < _HEARTBEAT_SECONDS:
             return
         elapsed = self.recorder.elapsed_seconds
         rate = self._completed_cases / (elapsed / 60.0) if elapsed > 0.0 else 0.0
         percent = round(100.0 * self._completed_cases / self.total_cases)
         parts = [
-            f"[PROGRESS] {self._completed_cases}/{self.total_cases} ({percent}%)",
-            f"material={material}",
+            f"  progress {self._completed_cases}/{self.total_cases} cases ({percent}%)",
+            material,
             f"{rate:.2f} cases/min",
-            f"elapsed {_duration(elapsed)}",
+            f"elapsed {console.format_duration(elapsed)}",
         ]
         if self._completed_cases >= _MINIMUM_ETA_CASES and rate > 0.0:
             remaining = self.total_cases - self._completed_cases
-            parts.append(f"ETA {_duration(60.0 * remaining / rate)}")
+            parts.append(f"eta {console.format_duration(60.0 * remaining / rate)}")
         parts.append(self._memory_text())
-        print(" | ".join(parts), flush=True)
+        self._print(" | ".join(parts))
 
     def case_reused(
         self,
@@ -383,21 +363,10 @@ class ArtifactProgressReporter:
         )
 
     def inference_summary(self) -> None:
-        """Print bounded operational inference timing and throughput."""
-        inference_seconds = self.recorder.stage_seconds.get("inference", 0.0)
-        forward_calls = self.recorder.counts.get("forward_call_count", 0)
-        rate = self._completed_cases / (inference_seconds / 60.0) if inference_seconds > 0.0 else 0.0
+        """Record operational inference timing measurements that the completion line reports."""
         average_ms = 1000.0 * self._model_forward_seconds / self._timed_forward_calls if self._timed_forward_calls > 0 else 0.0
         self.recorder.set_measurement("model_forward_seconds", self._model_forward_seconds)
         self.recorder.set_measurement("average_forward_milliseconds", average_ms)
-        model_clock_label = "GPU forward" if self.device.type == "cuda" else "model forward"
-        print(
-            f"[INFERENCE] {self._completed_cases} cases | {forward_calls} forwards | "
-            f"{model_clock_label} {self._model_forward_seconds:.1f} s | "
-            f"avg {average_ms:.2f} ms/forward | wall {inference_seconds:.1f} s | "
-            f"{rate:.2f} cases/min",
-            flush=True,
-        )
 
     def update_cuda_peaks(self) -> None:
         """Sample allocator peaks once without resetting them."""
@@ -417,48 +386,34 @@ class ArtifactProgressReporter:
         return self.recorder.snapshot()
 
     def done(self, snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """Print one compact success summary and return final telemetry."""
+        """Print the one-line success summary and return final telemetry."""
         admitted = self.final_snapshot() if snapshot is None else dict(snapshot)
         validated = validate_operational_performance(admitted)
-        total = float(validated["total_seconds"])
-        rate = float(validated["measurements"].get("cases_per_minute", 0.0))
-        stages = {str(item["name"]): float(item["seconds"]) for item in validated["stages"]}
         memory = validated["memory"]
+        measurements = validated["measurements"]
         gpu_peak = memory["cuda_peak_allocated_bytes"]
-        gpu_text = "unavailable" if gpu_peak is None else f"{gpu_peak / _GIBIBYTE:.2f} GiB"
         rss_peak = memory["process_peak_rss_bytes"]
-        rss_text = "unavailable" if rss_peak is None else f"{rss_peak / _GIBIBYTE:.2f} GiB"
-        print(
-            f"[DONE] artifact validated | cases={self._completed_cases} | total={_duration(total)} | throughput={rate:.2f} cases/min",
-            flush=True,
-        )
-        print(
-            "[DONE] phases | "
-            + " | ".join(
-                f"{name}={_duration(stages.get(name, 0.0))}"
-                for name in ("inference", "metrics", "serialization", "finalization", "validation", "publication")
-            ),
-            flush=True,
-        )
-        print(
-            f"[DONE] GPU peak={gpu_text} | RSS peak={rss_text} | output={self.output_root}",
-            flush=True,
+        peaks = [f"RSS peak {'unavailable' if rss_peak is None else f'{rss_peak / _GIBIBYTE:.2f} GiB'}"]
+        if gpu_peak is not None:
+            peaks.insert(0, f"GPU peak {gpu_peak / _GIBIBYTE:.2f} GiB")
+        self._print(
+            f"artifacts done | {self._completed_cases} cases | total {console.format_duration(float(validated['total_seconds']))}"
+            f" | {float(measurements.get('cases_per_minute', 0.0)):.2f} cases/min"
+            f" | forward avg {float(measurements.get('average_forward_milliseconds', 0.0)):.2f} ms | {' | '.join(peaks)}"
+            f" | out {console.display_path(self.output_root)}"
         )
         return validated
 
     def failure(self, *, phase: str | None = None) -> None:
-        """Print one phase-aware failure prelude without swallowing the exception."""
+        """Print one phase-aware failure line to stderr without swallowing the exception."""
         if self._failed_reported:
             return
-        resolved_phase = phase or self._current_phase or "unknown"
-        print(
-            f"[FAILED] phase={resolved_phase} | completed={self._completed_cases}/{self.total_cases} | "
-            f"elapsed={_duration(self.recorder.elapsed_seconds)}",
-            flush=True,
+        last_case = "" if self._last_case is None else f" | last case {self._last_case}"
+        self._print(
+            f"artifacts FAILED in {phase or self._current_phase or 'unknown'} | {self._completed_cases}/{self.total_cases} cases done"
+            f" | elapsed {console.format_duration(self.recorder.elapsed_seconds)}{last_case} | out {console.display_path(self.output_root)}",
+            to_stderr=True,
         )
-        if self._last_case is not None:
-            print(f"[FAILED] last_case={self._last_case}", flush=True)
-        print(f"[FAILED] output={self.output_root}", flush=True)
         self._failed_reported = True
 
     def _memory_text(self) -> str:

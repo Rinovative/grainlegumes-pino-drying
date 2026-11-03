@@ -1,7 +1,4 @@
-"""
-eda_plot_case_statistics.py
-
-Plot case-level statistics and metadata distributions for EDA.
+"""Plot case-level statistics and metadata distributions for EDA.
 
 Responsibilities:
   - Plot disjoint generated-case and scalar-material parameter distributions
@@ -32,6 +29,8 @@ from scipy.stats import gaussian_kde
 
 from src import analysis
 from src.analysis.eda import eda_capabilities as capabilities
+from src.analysis.eda.plots import eda_plot_transient as transient_plots
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
@@ -45,6 +44,8 @@ if TYPE_CHECKING:
     import pandas as pd
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
+
+    from src.analysis.eda.eda_dataframe import PublishedTensorValue
 
     CheckboxGroup = analysis.ui.components.CheckboxGroup
 
@@ -61,6 +62,47 @@ _SCALAR_MATERIAL_UNITS = {field.name: field.unit for field in _SCALAR_MATERIAL_F
 _HISTOGRAM_SUPTITLE_Y = 0.98
 _SCALAR_MATERIAL_TITLE_GAP = 3.0 * 1.75 * (_HISTOGRAM_SUPTITLE_Y - 0.97)
 _SCALAR_MATERIAL_GRID_TOP = _HISTOGRAM_SUPTITLE_Y - _SCALAR_MATERIAL_TITLE_GAP
+_SPATIAL_DIMENSIONS = 2
+
+
+@plot_layout.eda_typography()
+def plot_published_tensor(
+    value: PublishedTensorValue, *, x: np.ndarray, y: np.ndarray, display_spatial_stride: display_grid.DisplayStride = "auto"
+) -> Figure:
+    """Show a stored tensor on its actual support and summarize its full grid."""
+    values = value.array
+    figure, axis = plt.subplots(figsize=(7.0, 4.8))
+    if values.ndim == _SPATIAL_DIMENSIONS:
+        scale = transient_plots.spatial_field_scale(value.name, value.unit, value.representation, values)
+        indices = display_grid.display_indices(values.shape, display_spatial_stride)
+        image = axis.pcolormesh(
+            display_grid.display_sample(x, indices),
+            display_grid.display_sample(y, indices),
+            display_grid.display_sample(values, indices),
+            shading="auto",
+            **scale.pcolormesh_kwargs(),
+        )
+        axis.set_aspect("equal")
+        axis.set_xlabel("x [m]")
+        axis.set_ylabel("y [m]")
+        colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
+        colorbar.set_label(value.unit)
+    elif values.ndim == 1 and value.support == "inlet boundary":
+        boundary_y = y[x == np.min(x)]
+        order = np.argsort(boundary_y)
+        axis.plot(boundary_y[order], values[order])
+        axis.set_xlabel("Boundary y [m]")
+        axis.set_ylabel(f"{value.name} [{value.unit}]")
+    elif values.ndim == 0:
+        axis.set_axis_off()
+        axis.text(0.5, 0.5, f"{float(values):g} [{value.unit}]\n{value.support}", ha="center", va="center", transform=axis.transAxes)
+    else:
+        plt.close(figure)
+        message = f"Unsupported published tensor support for {value.name}: {values.shape}."
+        raise ValueError(message)
+    axis.set_title(f"{value.group}: {value.name} [{value.unit}]")
+    figure.text(0.02, 0.02, f"{value.representation}; full support min={float(np.min(values)):g}, max={float(np.max(values)):g}")
+    return figure
 
 
 # ============================================================================
@@ -420,6 +462,7 @@ def _infer_ncols(n_items: int, *, max_cols: int = 5) -> int:
 # ============================================================================
 
 
+@plot_layout.eda_typography()
 def _hist_grid(
     *,
     data_by_dataset: dict[str, dict[str, np.ndarray]],

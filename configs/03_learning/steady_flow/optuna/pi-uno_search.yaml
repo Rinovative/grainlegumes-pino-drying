@@ -1,0 +1,136 @@
+# Role: steady_flow Optuna study; its experiment section overrides base.yaml. Edit: freely.
+# Full physics-informed UNO hyperparameter search.
+#
+# Searches:
+#   - UNO architecture
+#   - continuous mode ratio
+#   - learning rate
+#   - batch size
+#   - physics-loss weights
+#   - independent physics warm-up durations
+study:
+  seed: 9  # Seed controlling Optuna sampling/pruning randomness.
+  n_trials: 100  # Maximum number of trials requested for the study.
+  sampler:
+    kind: tpe  # Optuna sampler family used to propose trial values.
+    multivariate: true  # Allow the TPE sampler to model parameter interactions.
+  pruner:
+    kind: median  # Optuna pruning rule for stopping unpromising trials.
+    n_startup_trials: 5  # Trials completed before pruning decisions begin.
+    n_warmup_steps: 100  # Reported objective steps required before pruning can occur.
+    interval_steps: 5  # Objective-step interval between pruning checks.
+
+experiment:
+  task: steady_flow  # Selects the task contract and its compatible data/model/loss validation.
+  base: ../base.yaml  # Shared task settings; every value set below overrides them.
+  run:
+    deterministic: false  # Request deterministic kernels where supported; may reduce performance or reject unsupported operations.
+  model:
+    kind: uno  # Select the architecture family; its params below are interpreted by that family.
+    params:
+      modes_x: 64  # Fourier modes retained along the x axis.
+      modes_y: 64  # Fourier modes retained along the y axis.
+      hidden_channels: 32  # Width of the model’s hidden feature representation.
+      n_layers: 7  # Number of architecture layers/blocks; affects capacity and compute.
+      mode_ratio: 0.4951318201313778  # UNO fraction controlling intermediate Fourier-mode allocation.
+      channel_mlp_skip: linear  # Channel-MLP skip connection type.
+  loss:
+    physics:
+      enabled: true  # Enable the physics residual and boundary loss terms.
+      derivatives:
+        kind: physical  # Choose physical-grid or spectral derivatives for physics residuals.
+        extension: none  # Boundary extension used by spectral derivatives.
+      interior_crop: 2  # Number of boundary cells excluded from interior residual evaluation.
+      momentum_weight:
+        target: 1.0  # Target multiplier for the dimensionless Brinkman momentum residual.
+        warmup:
+          kind: linear  # Ramp rule used to reach the momentum target weight.
+          epochs: 300  # Epochs over which the momentum weight ramps to its target.
+      continuity_weight:
+        target: 1.0e+3  # Target multiplier for the dimensionless cross-section flux balance.
+        warmup:
+          kind: linear  # Ramp rule used to reach the continuity target weight.
+          epochs: 300  # Epochs over which the continuity weight ramps to its target.
+      boundary_weight:
+        target: 1.0e+2  # Target multiplier for the dimensionless pressure-boundary residual.
+        warmup:
+          kind: linear  # Ramp rule used to reach the boundary target weight.
+          epochs: 300  # Epochs over which the boundary weight ramps to its target.
+  optimizer:
+    lr: 5.319714363424885e-4  # Initial learning rate; controls the optimizer update scale.
+  tracking:
+    wandb:
+      workflow: optuna_trial  # Workflow label attached to tracking metadata.
+      monitor:
+        enabled: true  # Enable periodic qualitative/diagnostic monitoring.
+        max_cases: 4  # Maximum cases sampled for each monitoring pass.
+      upload:
+        evaluation_artifacts: false  # Upload evaluation artifacts to the tracking service.
+
+search_space:
+  # UNO architecture.
+  model.params.modes_x:
+    name: modes_x  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [32, 48, 64]  # Allowed categorical choices for this parameter.
+  model.params.modes_y:
+    name: modes_y  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [32, 48, 64]  # Allowed categorical choices for this parameter.
+  model.params.hidden_channels:
+    name: hidden_channels  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [16, 32, 64]  # Allowed categorical choices for this parameter.
+  model.params.n_layers:
+    name: n_layers  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [5, 7]  # Allowed categorical choices for this parameter.
+  model.params.mode_ratio:
+    name: mode_ratio  # Readable Optuna parameter name for this configuration path.
+    kind: float  # Distribution type used to sample this parameter.
+    low: 0.4  # Inclusive lower search bound.
+    high: 0.6  # Inclusive upper search bound.
+    log: false  # Sample this range logarithmically when true.
+  # Optimisation.
+  optimizer.lr:
+    name: lr  # Readable Optuna parameter name for this configuration path.
+    kind: float  # Distribution type used to sample this parameter.
+    low: 1.0e-4  # Inclusive lower search bound.
+    high: 3.0e-3  # Inclusive upper search bound.
+    log: true  # Sample this range logarithmically when true.
+  data.batch_size:
+    name: batch  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [16, 32]  # Allowed categorical choices for this parameter.
+  # Physics-loss target weights.
+  loss.physics.momentum_weight.target:
+    name: mom_weight  # Readable Optuna parameter name for this configuration path.
+    kind: float  # Distribution type used to sample this parameter.
+    low: 1.0e-2  # Inclusive lower search bound, two decades below the starting weight.
+    high: 1.0e+2  # Inclusive upper search bound, two decades above the starting weight.
+    log: true  # Sample this range logarithmically when true.
+  loss.physics.continuity_weight.target:
+    name: cont_weight  # Readable Optuna parameter name for this configuration path.
+    kind: float  # Distribution type used to sample this parameter.
+    low: 1.0e+1  # Inclusive lower search bound, two decades below the starting weight.
+    high: 1.0e+5  # Inclusive upper search bound, two decades above the starting weight.
+    log: true  # Sample this range logarithmically when true.
+  loss.physics.boundary_weight.target:
+    name: bc_weight  # Readable Optuna parameter name for this configuration path.
+    kind: float  # Distribution type used to sample this parameter.
+    low: 1.0e+0  # Inclusive lower search bound, two decades below the starting weight.
+    high: 1.0e+4  # Inclusive upper search bound, two decades above the starting weight.
+    log: true  # Sample this range logarithmically when true.
+  # Independent warm-up durations.
+  loss.physics.momentum_weight.warmup.epochs:
+    name: mom_warmup  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [0, 1, 50, 100, 150, 200, 250, 300]  # Allowed categorical choices for this parameter.
+  loss.physics.continuity_weight.warmup.epochs:
+    name: cont_warmup  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [0, 1, 50, 100, 150, 200, 250, 300]  # Allowed categorical choices for this parameter.
+  loss.physics.boundary_weight.warmup.epochs:
+    name: bc_warmup  # Readable Optuna parameter name for this configuration path.
+    kind: categorical  # Distribution type used to sample this parameter.
+    values: [0, 1, 50, 100, 150, 200, 250, 300]  # Allowed categorical choices for this parameter.

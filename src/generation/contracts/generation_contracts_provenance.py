@@ -1,15 +1,15 @@
-"""
-generation_contracts_provenance.py
+"""Validate central scientific sources and effective parameter provenance.
 
-Validate central scientific sources and effective parameter provenance.
 Responsibilities:
   - Validate one unique source register with plain canonical locators
   - Validate compact evidence, method, verification, and applicability records
   - Expand source references for resolved inspection without duplicating citations
+
 Design principles:
   - Scientific interpretation is explicit in canonical provenance records
   - Optional detail is admitted only when it has a distinct scientific purpose
   - Atomic-record components inherit their complete record provenance
+
 This module does NOT:
   - Search for evidence, invent derivations, or change scientific values
   - Decide material roles, sampling supports, or parameter-OOD applicability
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
 from typing import Any, Final
 
 EVIDENCE_CLASSES: Final = (
@@ -224,8 +223,3 @@ def resolve_provenance(
     provenance = validate_provenance(value, sources=sources, label=label)
     provenance["sources"] = [copy.deepcopy(dict(sources[source_ref])) for source_ref in provenance["source_refs"]]
     return provenance
-
-
-def source_citations(sources: Mapping[str, Mapping[str, Any]]) -> Mapping[str, str]:
-    """Return a read-only source-key to citation inspection view."""
-    return MappingProxyType({key: str(source["citation"]) for key, source in sources.items()})

@@ -1,7 +1,4 @@
-"""
-evaluation_transient_session.py
-
-Summarize validated transient sequence artifacts without refitting state.
+"""Summarize validated transient sequence artifacts without refitting state.
 
 Responsibilities:
   - Admit transient-sequence frames and their persisted scaling evidence
@@ -32,6 +29,7 @@ import pandas as pd
 import torch
 
 from src import common
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.learning.transient import learning_transient_scaling as scaling
 
 from . import evaluation_transient_artifact as sequence_artifact
@@ -105,13 +103,14 @@ class TransientCaseInventoryEntry:
     case_id: str
     case_label: str
     material_family: str
-    dataset_role: Literal["id", "ood"]
+    dataset_role: Literal["id", "additional_evaluation"]
     dataset_name: str
     source_dataset_ids: tuple[str, ...]
     membership_digests: tuple[str, ...]
     artifact_root: Path
     artifact_identity_sha256: str
     dataset_identity: Mapping[str, Any]
+    evaluation_assignment: Mapping[str, Any] | None = None
 
 
 def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -524,6 +523,36 @@ class TransientEvaluationSession:
         """Return stable named frame order."""
         return tuple(self._frames)
 
+    def require_common_comparison_grids(self) -> None:
+        """Compare every matched case's persisted exact grid without loading arrays."""
+        baseline: dict[tuple[str, str], Mapping[str, Any]] | None = None
+        baseline_name = ""
+        for name, (frame, _artifact) in self._frames.items():
+            grids: dict[tuple[str, str], Mapping[str, Any]] = {}
+            for record in _sequence_records(frame):
+                key = (str(_record_value(record, "dataset_role")), str(_record_value(record, "case_id")))
+                spatial = _record_identity(record).get("spatial_representation")
+                if not isinstance(spatial, Mapping) or not spatial.get("grid_identity_sha256"):
+                    msg = f"Transient model {name!r} case {key!r} lacks exact spatial identity."
+                    raise ValueError(msg)
+                if key in grids and grids[key] != spatial:
+                    msg = f"Transient model {name!r} changes Evaluation grid within case {key!r}."
+                    raise ValueError(msg)
+                grids[key] = spatial
+            if baseline is None:
+                baseline, baseline_name = grids, name
+                continue
+            if grids.keys() != baseline.keys():
+                msg = f"Transient models {baseline_name!r} and {name!r} have different exact case memberships."
+                raise ValueError(msg)
+            for key, spatial in grids.items():
+                if spatial != baseline[key]:
+                    msg = (
+                        f"Transient models {baseline_name!r} and {name!r} have incompatible Evaluation grids for case {key!r}. "
+                        f"Build both on one common grid with: {display_grid.COMMON_GRID_ARTIFACT_COMMAND}"
+                    )
+                    raise ValueError(msg)
+
     @property
     def canonical_frames(self) -> Mapping[str, pd.DataFrame]:
         """Return live admitted frames without exposing mutable session ownership."""
@@ -565,7 +594,7 @@ class TransientEvaluationSession:
             raise KeyError(msg) from error
         return tuple(dict.fromkeys(_material_family(record) for record in _sequence_records(frame)))
 
-    def dataset_role(self, frame_name: str) -> Literal["id", "ood"]:
+    def dataset_role(self, frame_name: str) -> Literal["id", "additional_evaluation"]:
         """Return the exact run-relative Dataset role for one artifact frame."""
         try:
             frame, _artifact = self._frames[frame_name]
@@ -578,13 +607,13 @@ class TransientEvaluationSession:
         provenance = frame.attrs.get("artifact_provenance")
         dataset = provenance.get("dataset") if isinstance(provenance, Mapping) else None
         role = dataset.get("role") if isinstance(dataset, Mapping) else None
-        if role in {"id", "ood"}:
-            return cast("Literal['id', 'ood']", role)
+        if role in {"id", "additional_evaluation"}:
+            return cast("Literal['id', 'additional_evaluation']", role)
         roles = {_record_value(record, "dataset_role") for record in _sequence_records(frame)}
         if roles == {"id"}:
             return "id"
-        if roles == {"ood"}:
-            return "ood"
+        if roles == {"additional_evaluation"}:
+            return "additional_evaluation"
         msg = f"Transient artifact frame {frame_name!r} has inconsistent Dataset roles."
         raise ValueError(msg)
 
@@ -665,6 +694,11 @@ class TransientEvaluationSession:
                         artifact_root=artifact_root,
                         artifact_identity_sha256=artifact_identity,
                         dataset_identity=MappingProxyType(dict(dataset_identity)),
+                        evaluation_assignment=(
+                            MappingProxyType(dict(identity["evaluation_assignment"]))
+                            if isinstance(identity.get("evaluation_assignment"), Mapping)
+                            else None
+                        ),
                     )
                 )
         return tuple(entries)
@@ -697,7 +731,7 @@ class TransientEvaluationSession:
             if (
                 not isinstance(provenance, Mapping)
                 or not isinstance(dataset_value, Mapping)
-                or dataset_value.get("role") not in {"id", "ood"}
+                or dataset_value.get("role") not in {"id", "additional_evaluation"}
                 or not isinstance(artifact_root, str)
                 or not artifact_root
             ):
@@ -714,6 +748,7 @@ class TransientEvaluationSession:
                 "dataset_name": dataset_value.get("name"),
                 "source_dataset_ids": tuple(dataset_value.get("source_dataset_ids", ())),
                 "membership_digests": tuple(dataset_value.get("membership_digests", ())),
+                "evaluation_assignments": tuple(dataset_value.get("evaluation_assignments", ())),
                 "artifact_root": str(Path(artifact_root).resolve()),
                 "artifact_identity_sha256": artifact_identity,
                 "checkpoint_sha256": run.get("best_checkpoint_sha256"),
@@ -734,6 +769,7 @@ class TransientEvaluationSession:
             "dataset_name": index.dataset_name,
             "source_dataset_ids": tuple(dataset.get("source_dataset_ids", ())),
             "membership_digests": tuple(dataset.get("membership_digests", ())),
+            "evaluation_assignments": tuple(dataset.get("evaluation_assignments", ())),
             "artifact_root": str(index.root),
             "artifact_identity_sha256": index.identity_sha256,
             "checkpoint_sha256": run.get("best_checkpoint_sha256"),
@@ -813,26 +849,6 @@ class TransientEvaluationSession:
         if isinstance(index, sequence_artifact.TransientSequenceArtifactIndex):
             return index.record(str(_record_value(summary, "record_id")))
         return summary
-
-    def records_for_case(
-        self,
-        frame_name: str,
-        case_id: str,
-    ) -> tuple[Any, ...]:
-        """Load only one selected case from an indexed transient artifact."""
-        try:
-            frame, _artifact = self._frames[frame_name]
-        except KeyError as error:
-            msg = f"Unknown transient session frame {frame_name!r}."
-            raise KeyError(msg) from error
-        index = frame.attrs.get("transient_sequence_index")
-        if isinstance(index, sequence_artifact.TransientSequenceArtifactIndex):
-            return index.records(case_id=case_id)
-        records = tuple(record for record in _sequence_records(frame) if _record_value(record, "case_id") == case_id)
-        if not records:
-            msg = f"Unknown transient artifact case {case_id!r}."
-            raise KeyError(msg)
-        return records
 
     def full_autonomous_summaries(
         self,
@@ -1012,25 +1028,6 @@ class TransientEvaluationSession:
         self._summary_cache.clear()
         self._dataset_dataframe_cache.clear()
 
-    @property
-    def cache_sizes(self) -> Mapping[str, int]:
-        """Return bounded immutable cache counts for notebook diagnostics."""
-        return MappingProxyType(
-            {
-                "case_dataframes": len(self._case_dataframe_cache),
-                "summaries": len(self._summary_cache),
-                "dataset_dataframes": len(self._dataset_dataframe_cache),
-                "payload_records": sum(
-                    index.cache_size
-                    for frame, _artifact in self._frames.values()
-                    if isinstance(
-                        index := frame.attrs.get("transient_sequence_index"),
-                        sequence_artifact.TransientSequenceArtifactIndex,
-                    )
-                ),
-            }
-        )
-
     def case_dataframe(self, *, modes: Sequence[str] = _DEFAULT_MODES) -> pd.DataFrame:
         """Return cached cumulative and endpoint rows for every available sequence."""
         selected = _validate_modes(modes)
@@ -1057,6 +1054,10 @@ class TransientEvaluationSession:
                     )
                     row = _summary_row(summary)
                     row.update(self._frame_provenance(frame_name))
+                    identity = _record_identity(record)
+                    assignment = identity.get("evaluation_assignment")
+                    row["declared_evaluation_role"] = assignment["role"] if isinstance(assignment, Mapping) else "id"
+                    row["evaluation_relation"] = assignment["relation"] if isinstance(assignment, Mapping) else None
                     row.update(
                         {
                             "case_id": _record_value(record, "case_id"),
@@ -1239,8 +1240,8 @@ class TransientEvaluationSession:
 
     def _wandb_publication_metadata(self) -> dict[str, bool | float | int | str]:
         """Reduce validated role provenance and raw clocks to bounded identities."""
-        if "id" not in self._frames or set(self._frames).difference({"id", "ood"}):
-            msg = "Transient W&B publication requires an ID frame and at most one OOD frame."
+        if "id" not in self._frames or set(self._frames).difference({"id", "additional_evaluation"}):
+            msg = "Transient W&B publication requires an ID frame and at most one additional Evaluation frame."
             raise ValueError(msg)
 
         run_evidence: list[Mapping[str, Any]] = []

@@ -1,16 +1,15 @@
-"""
-experiments_config_loader.py
-
-Load and strictly resolve semantic experiment configurations.
+"""Load and strictly resolve semantic experiment configurations.
 
 Responsibilities:
   - Parse YAML mappings under the strict experiment schema
+  - Merge an authored experiment's optional shared task base before validation
   - Reject unknown keys, identifiers, fields, and contradictory settings
   - Derive task-fixed channels, defaults, objective, and task-contract digest
-  - Construct dataloaders from an already resolved configuration
+  - Construct dataloaders from an already resolved configuration, capping their workers at the CPUs available to the process
+  - Atomically save resolved YAML and derive the run layout and observer organization from the config source
 
 Design principles:
-  - Resolution is strict, path-aware, deterministic, and side-effect free
+  - Semantic resolution is strict, path-aware, deterministic, and side-effect free
   - Task-fixed semantics and full metric definitions come only from domain.tasks
   - Executable YAMLs use one canonical section order and explicitly select their objective
   - Saved configuration identifiers never depend on Python class names
@@ -19,15 +18,22 @@ This module does NOT:
   - Define dataset storage or fingerprints. Dataset objects enforce those contracts
   - Implement physics equations or metric mathematics. Domain and learning modules do
   - Own checkpoint, resume, run-directory, or artifact lifecycle
+
+Notes:
+  Transient epoch allocation:
+    - ``stage_a_only`` trains A0 alone; ``training.epochs`` equals the schedule's ``total_epochs``.
+    - ``matched_a1_b`` preserves independent positive per-stage maximum epochs with ``budget_unit: train_seconds``; A0's cap is its epoch
+      budget, B stops at its measured seconds and A1 at B's receipt.
+
 """
 
 from __future__ import annotations
 
 import copy
 import math
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from decimal import ROUND_HALF_UP, Decimal
 from io import StringIO
 from pathlib import Path
 from typing import Any, NoReturn
@@ -42,7 +48,7 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 from src.learning.transient.learning_transient_curriculum import RolloutCurriculum
 
 from . import experiments_config_defaults as config_defaults
-from . import experiments_config_temporal as config_temporal
+from . import experiments_config_naming as config_naming
 
 
 class ConfigError(ValueError):
@@ -72,7 +78,9 @@ CANONICAL_EXPERIMENT_SECTION_ORDER = (
 )
 _ROOT_KEYS = frozenset(CANONICAL_EXPERIMENT_SECTION_ORDER)
 EXPERIMENT_ROOT_KEYS = _ROOT_KEYS
-_TASK_CONFIG_MARKER = ("configs", "learning")
+# An authored experiment may name its task's shared base; the base owns values every maintained file shares.
+AUTHORED_BASE_KEY = "base"
+AUTHORED_BASE_FILENAME = "base.yaml"
 _TASK_FIXED_KEYS = frozenset(
     {
         "input_fields",
@@ -86,23 +94,23 @@ _TASK_FIXED_KEYS = frozenset(
     }
 )
 _ADAM_BETA_COUNT = 2
+_STEADY_DATA_KEYS = frozenset({"train_dataset", "additional_evaluation_datasets", "batch_size", "num_workers", "pin_memory", "persistent_workers"})
+_PHYSICS_WEIGHT_NAMES = ("momentum_weight", "continuity_weight", "boundary_weight")
 _RESOLVED_PATH_KEYS = frozenset(
     {
         "project_root",
         "storage_root",
-        "dataset_metadata_root",
         "dataset_root",
         "output_root",
     }
 )
 _SECTION_KEYS = {
-    "run": frozenset({"seed", "revision", "deterministic", "device", "suffix", "name", "naming_schema_version"}),
+    "run": frozenset({"seed", "revision", "deterministic", "device", "name", "naming_schema_version", "layout"}),
     "data": frozenset(
         {
             "train_dataset",
-            "ood_datasets",
-            "train_ratio",
-            "ood_fraction",
+            "additional_evaluation_datasets",
+            "additional_evaluation_fraction",
             "batch_size",
             "num_workers",
             "pin_memory",
@@ -111,8 +119,6 @@ _SECTION_KEYS = {
             "transient_backend_preference",
             "transient_backend_required",
             "hdf5_cache_size",
-            "allow_technical_smoke",
-            "dataset_references",
         }
     ),
     "model": frozenset({"kind", "params"}),
@@ -125,15 +131,14 @@ _SECTION_KEYS = {
             "epochs",
             "stage_schedule",
             "evaluation_interval",
-            "ood_evaluation_interval",
+            "additional_evaluation_interval",
             "mixed_precision",
             "stage",
             "comparison_arm",
             "gradient_accumulation_steps",
-            "fixed_evaluation_horizon",
             "curriculum",
-            "matched_compute",
             "teacher_handoff",
+            "matched_a1_b",
         }
     ),
     "tracking": frozenset({"wandb"}),
@@ -146,6 +151,27 @@ def _as_mapping(value: Any, *, path: str) -> dict[str, Any]:
         msg = f"{path} must be a mapping, got {type(value).__name__}."
         raise ConfigError(msg)
     return dict(value)
+
+
+def _is_positive_finite(value: object) -> bool:
+    """Return whether one YAML value is a positive finite real number, rejecting booleans."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(float(value)) and value > 0
+
+
+def _non_negative_number(value: object, *, path: str) -> float:
+    """Return one finite non-negative YAML number; reject booleans and numeric text."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0:
+        msg = f"{path} must be a finite non-negative number, got {value!r}."
+        raise ConfigError(msg)
+    return float(value)
+
+
+def _non_negative_integer(value: object, *, path: str) -> int:
+    """Return one non-negative YAML integer; reject booleans, floats, and numeric text."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"{path} must be a non-negative integer, got {value!r}."
+        raise ConfigError(msg)
+    return value
 
 
 def _reject_unknown(mapping: Mapping[str, Any], allowed: frozenset[str], *, path: str) -> None:
@@ -178,13 +204,9 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         _reject_unknown(section_mapping, allowed, path=section)
 
     raw_run = _as_mapping(user_config.get("run"), path="run")
-    derived_run_keys = sorted({"name", "naming_schema_version"}.intersection(raw_run))
+    derived_run_keys = sorted({"name", "naming_schema_version", "layout"}.intersection(raw_run))
     if derived_run_keys:
         msg = f"Derived run key(s) must not be supplied by an executable request: {derived_run_keys}."
-        raise ConfigError(msg)
-    raw_data = _as_mapping(user_config.get("data"), path="data")
-    if "dataset_references" in raw_data:
-        msg = "data.dataset_references is resolved metadata and must not be authored."
         raise ConfigError(msg)
 
     model = _as_mapping(user_config.get("model"), path="model")
@@ -206,10 +228,10 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 frozenset(
                     {
                         "enabled",
-                        "continuity",
                         "derivatives",
                         "interior_crop",
-                        "residual_weight",
+                        "momentum_weight",
+                        "continuity_weight",
                         "boundary_weight",
                     }
                 ),
@@ -222,7 +244,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                     frozenset({"kind", "extension"}),
                     path="loss.physics.derivatives",
                 )
-            for weight_name in ("residual_weight", "boundary_weight"):
+            for weight_name in _PHYSICS_WEIGHT_NAMES:
                 if weight_name not in physics:
                     continue
                 weight = _as_mapping(physics[weight_name], path=f"loss.physics.{weight_name}")
@@ -309,46 +331,6 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         raise ConfigError(msg)
 
 
-def task_directory_from_config_path(yaml_path: Path | str) -> str | None:
-    """Return the task owned by a ``configs/learning/<task>/`` source path."""
-    parts = Path(yaml_path).expanduser().parts
-    matches = [index for index in range(len(parts) - 1) if tuple(parts[index : index + len(_TASK_CONFIG_MARKER)]) == _TASK_CONFIG_MARKER]
-    if not matches:
-        return None
-    if len(matches) != 1:
-        msg = f"Config path contains an ambiguous repeated configs/learning marker: {yaml_path}"
-        raise ConfigError(msg)
-    task_index = matches[0] + len(_TASK_CONFIG_MARKER)
-    if task_index >= len(parts) - 1:
-        msg = f"Task-first config path must include configs/learning/<task>/<workflow>/...: {yaml_path}"
-        raise ConfigError(msg)
-    try:
-        return common.paths.validate_logical_name(parts[task_index], label="config directory task")
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-
-
-def validate_task_directory_identity(
-    yaml_path: Path | str,
-    *,
-    raw_task: object,
-    resolved_task: object,
-) -> None:
-    """Require a task-first source directory to agree with raw and resolved task identity."""
-    directory_task = task_directory_from_config_path(yaml_path)
-    if directory_task is None:
-        return
-    if raw_task != directory_task:
-        msg = (
-            f"Task config path mismatch for {yaml_path}: directory task is {directory_task!r}, "
-            f"but raw task is {raw_task!r}. Move the YAML or set its authoritative task to {directory_task!r}."
-        )
-        raise ConfigError(msg)
-    if resolved_task != directory_task:
-        msg = f"Task config path mismatch for {yaml_path}: directory task is {directory_task!r}, but resolved task is {resolved_task!r}."
-        raise ConfigError(msg)
-
-
 def load_yaml(path: Path | str) -> dict[str, Any]:
     """
     Load one YAML experiment mapping under the strict schema.
@@ -406,6 +388,61 @@ def save_yaml(config: dict[str, Any], path: Path | str) -> None:
     common.serialization.atomic_write_text(destination, stream.getvalue())
 
 
+def apply_authored_base(mapping: Mapping[str, Any], *, origin: Path | str) -> dict[str, Any]:
+    """
+    Merge the optional shared task base named by one authored experiment mapping.
+
+    Parameters
+    ----------
+    mapping : Mapping[str, Any]
+        Authored experiment mapping, optionally with a ``base`` key.
+    origin : Path or str
+        YAML file the mapping was read from; ``base`` is relative to it.
+
+    Returns
+    -------
+    dict[str, Any]
+        Independent mapping without ``base``; authored values override the
+        base values through ``deep_merge``.
+
+    Raises
+    ------
+    ConfigError
+        If ``base`` does not name ``base.yaml`` in the authored file's directory
+        or an enclosing directory named after the mapping's task, or if that
+        base names another base.
+
+    """
+    authored = dict(mapping)
+    if AUTHORED_BASE_KEY not in authored:
+        return authored
+    reference = authored.pop(AUTHORED_BASE_KEY)
+    source = Path(origin).expanduser().resolve()
+    if not isinstance(reference, str) or not reference or Path(reference).is_absolute():
+        msg = f"{source}: base must be a relative path to the task's base.yaml."
+        raise ConfigError(msg)
+    base_path = (source.parent / reference).resolve()
+    task = authored.get("task")
+    if (
+        base_path.name != AUTHORED_BASE_FILENAME
+        or base_path.parent not in (source.parent, *source.parent.parents)
+        or base_path.parent.name != task
+        or not base_path.is_file()
+    ):
+        msg = f"{source}: base {reference!r} must name base.yaml in the enclosing {task!r} task directory."
+        raise ConfigError(msg)
+    shared = load_yaml(base_path)
+    if AUTHORED_BASE_KEY in shared:
+        msg = f"{base_path}: a task base cannot name another base."
+        raise ConfigError(msg)
+    return deep_merge(shared, authored)
+
+
+def load_authored_config(path: Path | str) -> dict[str, Any]:
+    """Load one authored experiment YAML with its optional shared task base merged."""
+    return apply_authored_base(load_yaml(path), origin=path)
+
+
 def deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     """
     Recursively merge mappings while replacing scalar and list leaves.
@@ -436,8 +473,8 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     """
     Resolve loss semantics against the registered task contract in place.
 
-    The helper validates supervised space/weight, continuity formulation,
-    derivative/extension compatibility, crop size, and both linear warmup
+    The helper validates supervised space/weight, derivative/extension
+    compatibility, crop size, and the three physics-term linear warmup
     schedules. Canonical numeric values are written back into ``config`` only
     after their path-qualified constraints have been checked.
     """
@@ -452,11 +489,7 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     except ValueError as error:
         msg = f"loss.data: {error}"
         raise ConfigError(msg) from error
-    weight = float(data_loss["weight"])
-    if weight < 0:
-        msg = f"loss.data.weight must be non-negative, got {weight}."
-        raise ConfigError(msg)
-    data_loss["weight"] = weight
+    data_loss["weight"] = _non_negative_number(data_loss["weight"], path="loss.data.weight")
 
     physics = _as_mapping(loss["physics"], path="loss.physics")
     if not isinstance(physics["enabled"], bool):
@@ -466,23 +499,6 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     if selected_physics != task.physics:
         msg = f"Task {task.id!r} physics registry entry does not match its task contract."
         raise ConfigError(msg)
-    continuity = physics.get("continuity")
-    if not isinstance(continuity, str) or not continuity:
-        msg = "loss.physics.continuity must be a non-empty semantic identifier."
-        raise ConfigError(msg)
-    if continuity not in selected_physics.allowed_continuities:
-        available = ", ".join(selected_physics.allowed_continuities)
-        msg = (
-            f"Unknown continuity identifier {continuity!r} at loss.physics.continuity "
-            f"for task {task.id!r}. Available continuity formulations: {available}."
-        )
-        raise ConfigError(msg)
-    try:
-        domain.physics.contracts.validate_continuity_kind(continuity)
-    except ValueError as error:
-        msg = f"loss.physics.continuity: {error}"
-        raise ConfigError(msg) from error
-    physics["continuity"] = continuity
     derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
     try:
         domain.physics.contracts.validate_derivative_kind(
@@ -492,28 +508,16 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     except ValueError as error:
         msg = f"loss.physics.derivatives: {error}"
         raise ConfigError(msg) from error
-    interior_crop = int(physics["interior_crop"])
-    if interior_crop < 0:
-        msg = f"loss.physics.interior_crop must be non-negative, got {interior_crop}."
-        raise ConfigError(msg)
-    physics["interior_crop"] = interior_crop
+    physics["interior_crop"] = _non_negative_integer(physics["interior_crop"], path="loss.physics.interior_crop")
 
-    for weight_name in ("residual_weight", "boundary_weight"):
+    for weight_name in _PHYSICS_WEIGHT_NAMES:
         weight_config = _as_mapping(physics[weight_name], path=f"loss.physics.{weight_name}")
-        target = float(weight_config["target"])
-        if target < 0:
-            msg = f"loss.physics.{weight_name}.target must be non-negative, got {target}."
-            raise ConfigError(msg)
-        weight_config["target"] = target
+        weight_config["target"] = _non_negative_number(weight_config["target"], path=f"loss.physics.{weight_name}.target")
         warmup = _as_mapping(weight_config["warmup"], path=f"loss.physics.{weight_name}.warmup")
         if warmup["kind"] != "linear":
             msg = f"Unknown warmup identifier {warmup['kind']!r} at loss.physics.{weight_name}.warmup.kind. Expected 'linear'."
             raise ConfigError(msg)
-        epochs = int(warmup["epochs"])
-        if epochs < 0:
-            msg = f"loss.physics.{weight_name}.warmup.epochs must be non-negative, got {epochs}."
-            raise ConfigError(msg)
-        warmup["epochs"] = epochs
+        warmup["epochs"] = _non_negative_integer(warmup["epochs"], path=f"loss.physics.{weight_name}.warmup.epochs")
         weight_config["warmup"] = warmup
         physics[weight_name] = weight_config
 
@@ -734,489 +738,37 @@ def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
     return copy.deepcopy(objective)
 
 
-def _ood_datasets(data: Mapping[str, Any], *, path: str, allow_empty: bool = False) -> tuple[str, ...]:
-    """Return configured OOD dataset identifiers, with explicit Optuna absence only."""
-    value = data.get("ood_datasets")
+def _configured_dataset_list(data: Mapping[str, Any], *, path: str, key: str, allow_empty: bool = False) -> tuple[str, ...]:
+    """Return distinct configured Dataset IDs for one task-owned selection key."""
+    value = data.get(key, [] if allow_empty else None)
     if not isinstance(value, list) or (not value and not allow_empty):
-        msg = f"{path}.ood_datasets must contain one or more logical dataset ids."
+        msg = f"{path}.{key} must contain one or more logical dataset ids."
         raise ConfigError(msg)
     try:
-        dataset_ids = tuple(
-            common.paths.validate_logical_name(dataset_id, label=f"{path}.ood_datasets[{index}]") for index, dataset_id in enumerate(value)
-        )
+        dataset_ids = tuple(common.paths.validate_logical_name(dataset_id, label=f"{path}.{key}[{index}]") for index, dataset_id in enumerate(value))
     except ValueError as error:
         raise ConfigError(str(error)) from error
     if len(dataset_ids) != len(set(dataset_ids)):
-        msg = f"{path}.ood_datasets must not contain duplicates."
+        msg = f"{path}.{key} must not contain duplicates."
         raise ConfigError(msg)
     return dataset_ids
 
 
-def _validate_reference_record(value: object, *, path: str) -> dict[str, Any]:
-    """Validate one pinned immutable Dataset-reference record with path context."""
-    try:
-        return datasets.packages.references.validate_dataset_reference_record(value)
-    except (TypeError, ValueError) as error:
-        message = f"{path}: {error}"
-        raise ConfigError(message) from error
-
-
-def _resolve_dataset_selector(
-    value: object,
-    *,
-    task: str,
-    path: str,
-    pinned: object,
-    storage_root: Path | str | None,
-) -> tuple[str, dict[str, Any] | None]:
-    """Resolve one authored exact ID or explicit logical Dataset reference once."""
-    if isinstance(value, str):
-        if pinned is not None:
-            message = f"{path} is an exact Dataset ID but its pinned reference evidence is non-null."
-            raise ConfigError(message)
-        try:
-            return common.paths.validate_logical_name(value, label=path), None
-        except ValueError as error:
-            raise ConfigError(str(error)) from error
-    if not isinstance(value, Mapping):
-        message = f"{path} must be an exact Dataset ID or a mapping with explicit name and revision."
-        raise ConfigError(message)
-    try:
-        reference = datasets.packages.references.DatasetRef.from_mapping(value)
-    except (TypeError, ValueError) as error:
-        message = f"{path} must be an exact Dataset ID or a mapping with explicit name and revision: {error}"
-        raise ConfigError(message) from error
-    if pinned is None:
-        try:
-            record = datasets.packages.references.resolve_dataset_reference_record(
-                task,
-                reference.name,
-                reference.revision,
-                storage_root=storage_root,
-            )
-        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
-            message = f"{path}: unable to resolve Dataset reference {reference.name!r} revision {reference.revision}: {error}"
-            raise ConfigError(message) from error
-    else:
-        record = _validate_reference_record(pinned, path=f"{path}.pinned_reference")
-    if record["task"] != task or record["name"] != reference.name or record["revision"] != reference.revision:
-        message = f"{path} does not match its pinned task, name, and revision evidence."
-        raise ConfigError(message)
-    return record["dataset_id"], record
-
-
-def _resolve_dataset_selections(
-    config: dict[str, Any],
-    *,
-    authored_data: Mapping[str, Any],
-    task: str,
-    storage_root: Path | str | None,
-    pinned_dataset_references: Mapping[str, Any] | None,
-) -> None:
-    """Resolve authored Dataset selections and persist their complete bounded evidence."""
+def _resolve_dataset_selections(config: dict[str, Any], *, authored_data: Mapping[str, Any]) -> None:
+    """Bind exact Dataset IDs and explicit Evaluation assignments before training."""
     data = _as_mapping(config["data"], path="data")
-    raw_ood = authored_data.get("ood_datasets")
-    if not isinstance(raw_ood, list):
-        message = "data.ood_datasets must be a list of exact Dataset IDs or logical references."
-        raise ConfigError(message)
-    if pinned_dataset_references is None:
-        pinned_train = None
-        pinned_ood: list[object] = [None] * len(raw_ood)
-    else:
-        pinned_mapping = _as_mapping(pinned_dataset_references, path="data.dataset_references")
-        if set(pinned_mapping) != {"train", "ood"}:
-            message = "data.dataset_references must contain exactly train and ood evidence."
-            raise ConfigError(message)
-        pinned_train = pinned_mapping["train"]
-        raw_pinned_ood = pinned_mapping["ood"]
-        if not isinstance(raw_pinned_ood, list) or len(raw_pinned_ood) != len(raw_ood):
-            message = "data.dataset_references.ood must align exactly with data.ood_datasets."
-            raise ConfigError(message)
-        pinned_ood = list(raw_pinned_ood)
-    train_id, train_record = _resolve_dataset_selector(
-        authored_data["train_dataset"],
-        task=task,
-        path="data.train_dataset",
-        pinned=pinned_train,
-        storage_root=storage_root,
-    )
-    ood_ids: list[str] = []
-    ood_records: list[dict[str, Any] | None] = []
-    for index, selector in enumerate(raw_ood):
-        dataset_id, record = _resolve_dataset_selector(
-            selector,
-            task=task,
-            path=f"data.ood_datasets[{index}]",
-            pinned=pinned_ood[index],
-            storage_root=storage_root,
-        )
-        ood_ids.append(dataset_id)
-        ood_records.append(record)
-    data["train_dataset"] = train_id
-    data["ood_datasets"] = ood_ids
-    data["dataset_references"] = {"train": train_record, "ood": ood_records}
-    config["data"] = data
-
-
-def _validate_dataset_reference_evidence(config: dict[str, Any]) -> None:
-    """Validate persisted reference evidence without consulting mutable external state."""
-    data = _as_mapping(config["data"], path="data")
-    raw = data.get("dataset_references")
-    if raw is None:
-        return
-    evidence = _as_mapping(raw, path="data.dataset_references")
-    if set(evidence) != {"train", "ood"}:
-        message = "data.dataset_references must contain exactly train and ood evidence."
-        raise ConfigError(message)
-    ood_ids = data.get("ood_datasets")
-    raw_ood = evidence["ood"]
-    if not isinstance(ood_ids, list) or not isinstance(raw_ood, list) or len(raw_ood) != len(ood_ids):
-        message = "data.dataset_references.ood must align exactly with data.ood_datasets."
-        raise ConfigError(message)
-
-    def validate_binding(record: object, *, dataset_id: object, path: str) -> dict[str, Any] | None:
-        if record is None:
-            return None
-        validated = _validate_reference_record(record, path=path)
-        if validated["task"] != config.get("task") or validated["dataset_id"] != dataset_id:
-            message = f"{path} does not bind the configured task and exact Dataset ID."
-            raise ConfigError(message)
-        return validated
-
-    validated_train = validate_binding(
-        evidence["train"],
-        dataset_id=data.get("train_dataset"),
-        path="data.dataset_references.train",
-    )
-    validated_ood = [
-        validate_binding(record, dataset_id=ood_ids[index], path=f"data.dataset_references.ood[{index}]") for index, record in enumerate(raw_ood)
-    ]
-    data["dataset_references"] = {"train": validated_train, "ood": validated_ood}
-    config["data"] = data
-
-
-def audit_resolved_dataset_references(
-    config: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None = None,
-) -> tuple[str, ...]:
-    """Audit present logical references against pinned evidence while allowing removal."""
-    candidate = copy.deepcopy(dict(config))
-    _validate_dataset_reference_evidence(candidate)
-    evidence = candidate["data"].get("dataset_references")
-    if not isinstance(evidence, Mapping):
-        return ()
-    records = [evidence["train"], *evidence["ood"]]
-    missing: list[str] = []
-    for record in records:
-        if record is None:
-            continue
-        label = f"{record['task']}/{record['name']}/r{record['revision']}"
-        try:
-            current = datasets.packages.references.resolve_dataset_reference_record(
-                record["task"],
-                record["name"],
-                record["revision"],
-                storage_root=storage_root,
-            )
-        except FileNotFoundError:
-            missing.append(label)
-            continue
-        except (OSError, TypeError, ValueError) as error:
-            message = f"Pinned Dataset reference audit failed for {label}: {error}"
-            raise ConfigError(message) from error
-        if current != record:
-            message = f"Pinned Dataset reference audit detected identity drift for {label}."
-            raise ConfigError(message)
-    return tuple(missing)
-
-
-def _model_variant(config: Mapping[str, Any]) -> str:
-    """Return the exact human-facing network/loss variant."""
-    model = _as_mapping(config.get("model"), path="model")
-    model_kind = common.paths.validate_logical_name(model.get("kind"), label="model.kind")
-    loss = _as_mapping(config.get("loss"), path="loss")
-    physics = _as_mapping(loss.get("physics"), path="loss.physics")
-    return f"pi-{model_kind}" if bool(physics.get("enabled")) else model_kind
-
-
-_DERIVATIVE_STRATEGY_TOKENS = {
-    ("physical", "none"): "phys",
-    ("spectral", "reflect"): "spec",
-}
-_CONTINUITY_TOKENS = {
-    "div_velocity": "div_vel",
-    "div_eps_velocity": "div_eps_vel",
-}
-_RUN_SUFFIX_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*\Z")
-
-
-def _format_mode_ratio(value: object) -> str:
-    """Format one finite UNO mode ratio with three significant digits."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        msg = f"model.params.mode_ratio must be numeric for run identity, got {value!r}."
-        raise ConfigError(msg)
-    numeric = float(value)
-    if not math.isfinite(numeric):
-        msg = f"model.params.mode_ratio must be finite for run identity, got {value!r}."
-        raise ConfigError(msg)
-    return format(numeric, ".3g").replace(".", "p")
-
-
-def _format_scaling_value(value: float) -> str:
-    """Format one validated scaling injectively, retaining the historic compact form."""
-    if value.is_integer():
-        return str(int(value))
-    rendered = repr(value)
-    if rendered.startswith("0.") and "e" not in rendered:
-        return f"0{rendered[2:]}"
-    return rendered.replace(".", "p").replace("e+", "ep").replace("e-", "em")
-
-
-def _format_uno_scalings(params: Mapping[str, Any]) -> str:
-    """Return the collision-free isotropic or axis-retaining UNO scaling token."""
     try:
-        scalings = model_factory.resolve_uno_scalings(
-            int(params["n_layers"]),
-            params.get("uno_scalings"),
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        msg = f"Cannot derive canonical UNO scaling identity: {error}"
-        raise ConfigError(msg) from error
-
-    layers: list[str] = []
-    for x_scale, y_scale in scalings:
-        x_token = _format_scaling_value(x_scale)
-        y_token = _format_scaling_value(y_scale)
-        layers.append(x_token if x_scale == y_scale else f"{x_token}x{y_token}")
-    return f"s{'-'.join(layers)}"
-
-
-def _format_scientific_weight(value: object, *, path: str) -> str:
-    """Format one non-negative finite weight as normalized scientific notation."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        msg = f"{path} must be numeric for run identity, got {value!r}."
-        raise ConfigError(msg)
-    numeric = float(value)
-    if not math.isfinite(numeric) or numeric < 0:
-        msg = f"{path} must be finite and non-negative for run identity, got {value!r}."
-        raise ConfigError(msg)
-    if numeric == 0:
-        return "0"
-
-    return format(numeric, ".0e")
+        data["train_dataset"] = common.paths.validate_logical_name(authored_data["train_dataset"], label="data.train_dataset")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    key = "additional_evaluation_datasets"
+    data[key] = list(_configured_dataset_list(authored_data, path="data", key=key, allow_empty=True))
+    config["data"] = data
 
 
 def resolved_model_variant(config: Mapping[str, Any]) -> str:
-    """Return the loader-owned resolved architecture and PI identity segment."""
-    task = str(config["task"])
-    model = _as_mapping(config.get("model"), path="model")
-    kind = str(model.get("kind"))
-    params = _as_mapping(model.get("params"), path="model.params")
-    variant = _model_variant(config)
-    if kind == "fno":
-        modes = params["n_modes"]
-        return f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
-    if kind == "uno":
-        scalings = _format_uno_scalings(params)
-        mode_ratio = _format_mode_ratio(params["mode_ratio"])
-        return f"{variant}_m{params['modes_x']}x{params['modes_y']}_h{params['hidden_channels']}_l{params['n_layers']}_{scalings}_r{mode_ratio}"
-    if kind == "rno":
-        modes = params["n_modes"]
-        return f"{variant}_m{modes[0]}x{modes[1]}_h{params['hidden_channels']}_l{params['n_layers']}"
-    domain.tasks.registry.get_task(task)
-    msg = f"Unknown model identifier {kind!r} while generating a run name."
-    raise ConfigError(msg)
-
-
-def _resolved_physics_identity(config: Mapping[str, Any]) -> tuple[str, str, str, str]:
-    """Return validated derivative, continuity, residual, and boundary tokens."""
-    loss = _as_mapping(config.get("loss"), path="loss")
-    physics = _as_mapping(loss.get("physics"), path="loss.physics")
-    derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
-    raw_kind = derivatives.get("kind")
-    raw_extension = derivatives.get("extension")
-    continuity = physics.get("continuity")
-    if not isinstance(raw_kind, str) or not isinstance(raw_extension, str):
-        msg = "PI run identity requires resolved derivative kind and extension identifiers."
-        raise ConfigError(msg)
-    if not isinstance(continuity, str) or not continuity:
-        msg = "PI run identity requires a resolved continuity identifier."
-        raise ConfigError(msg)
-    try:
-        kind, extension = domain.physics.contracts.validate_derivative_kind(
-            raw_kind,
-            extension=raw_extension,
-        )
-        resolved_continuity = domain.physics.contracts.validate_continuity_kind(continuity)
-    except ValueError as error:
-        msg = f"Cannot derive canonical PI scientific variant: {error}"
-        raise ConfigError(msg) from error
-
-    strategy = _DERIVATIVE_STRATEGY_TOKENS.get((kind, extension))
-    if strategy is None:
-        msg = f"Unsupported resolved PI derivative strategy for run identity: kind={kind!r}, extension={extension!r}."
-        raise ConfigError(msg)
-    continuity_token = _CONTINUITY_TOKENS.get(resolved_continuity)
-    if continuity_token is None:
-        msg = f"Unsupported resolved PI continuity for run identity: {resolved_continuity!r}."
-        raise ConfigError(msg)
-
-    residual = _as_mapping(physics.get("residual_weight"), path="loss.physics.residual_weight")
-    boundary = _as_mapping(physics.get("boundary_weight"), path="loss.physics.boundary_weight")
-    residual_token = _format_scientific_weight(
-        residual.get("target"),
-        path="loss.physics.residual_weight.target",
-    )
-    boundary_token = _format_scientific_weight(
-        boundary.get("target"),
-        path="loss.physics.boundary_weight.target",
-    )
-    return strategy, continuity_token, residual_token, boundary_token
-
-
-def resolved_scientific_variant(config: Mapping[str, Any]) -> str | None:
-    """Return the abbreviated PI strategy, continuity, and weight segment."""
-    loss = _as_mapping(config.get("loss"), path="loss")
-    physics = _as_mapping(loss.get("physics"), path="loss.physics")
-    enabled = physics.get("enabled")
-    if type(enabled) is not bool:
-        msg = "Resolved loss.physics.enabled must be boolean while deriving scientific run identity."
-        raise ConfigError(msg)
-    if not enabled:
-        return None
-
-    strategy, continuity, residual, boundary = _resolved_physics_identity(config)
-    return f"{strategy}_{continuity}_lamphys{residual}_lamp{boundary}"
-
-
-def _identity_tokens(value: object) -> tuple[str, ...]:
-    """Split one derived identity at semantic token boundaries."""
-    return tuple(token for token in str(value).lower().replace("-", "_").split("_") if token)
-
-
-def _remove_identity_sequence(tokens: list[str], sequence: tuple[str, ...]) -> bool:
-    """Remove every exact token-bounded occurrence of one derived component."""
-    found = False
-    index = 0
-    while sequence and index <= len(tokens) - len(sequence):
-        if tuple(tokens[index : index + len(sequence)]) == sequence:
-            del tokens[index : index + len(sequence)]
-            found = True
-        else:
-            index += 1
-    return found
-
-
-def _identity_number(value: Any) -> str:
-    """Return a suffix-grammar-safe exact numeric identity token."""
-    numeric = float(value)
-    return repr(numeric).replace(".", "p").replace("+", "p").replace("-", "m")
-
-
-def _derived_suffix_components(
-    config: Mapping[str, Any],
-    *,
-    model_key: str,
-    scientific_variant: str | None,
-) -> list[tuple[str, str]]:
-    """Return token-aware identities forbidden in manual experiment context."""
-    model = _as_mapping(config.get("model"), path="model")
-    params = _as_mapping(model.get("params"), path="model.params")
-    run = _as_mapping(config.get("run"), path="run")
-    data = _as_mapping(config.get("data"), path="data")
-    train_dataset = str(data.get("train_dataset"))
-    components = [
-        ("model architecture", model_key),
-        ("task", str(config.get("task"))),
-        ("model family", _model_variant(config)),
-        ("model kind", str(model.get("kind"))),
-        ("training dataset", train_dataset),
-        ("seed", f"s{run.get('seed')}"),
-        ("seed", f"seed{run.get('seed')}"),
-    ]
-    components.extend(("architecture parameter", token) for token in model_key.split("_")[1:])
-    spatial_stride = data.get("spatial_stride", 1)
-    if config.get("task") == "transient_drying" and spatial_stride != 1:
-        components.append(("spatial stride", f"stride{spatial_stride}"))
-
-    if model.get("kind") == "uno":
-        scaling_token = _format_uno_scalings(params)
-        visible_ratio = _format_mode_ratio(params.get("mode_ratio"))
-        exact_ratio = _identity_number(params.get("mode_ratio"))
-        components.extend(
-            [
-                ("scaling sequence", scaling_token),
-                ("scaling sequence", scaling_token.removeprefix("s")),
-                ("mode ratio", f"r{visible_ratio}"),
-                ("mode ratio", f"mr{visible_ratio}"),
-                ("mode ratio", f"mode_ratio_{exact_ratio}"),
-            ]
-        )
-
-    if scientific_variant is not None:
-        physics = _as_mapping(_as_mapping(config.get("loss"), path="loss").get("physics"), path="loss.physics")
-        derivatives = _as_mapping(physics.get("derivatives"), path="loss.physics.derivatives")
-        strategy, continuity, residual, boundary = _resolved_physics_identity(config)
-        components.extend(
-            [
-                ("scientific variant", scientific_variant),
-                ("derivative strategy", strategy),
-                ("derivative kind", str(derivatives.get("kind"))),
-                ("continuity formulation", continuity),
-                ("continuity formulation", str(physics.get("continuity"))),
-                ("physics residual weight", f"lamphys{residual}"),
-                ("physics residual weight", f"residual_weight_{_identity_number(physics['residual_weight']['target'])}"),
-                ("pressure boundary weight", f"lamp{boundary}"),
-                ("pressure boundary weight", f"boundary_weight_{_identity_number(physics['boundary_weight']['target'])}"),
-            ]
-        )
-        extension = str(derivatives.get("extension"))
-        if extension != "none":
-            components.append(("derivative extension", extension))
-
-    unique: dict[tuple[str, ...], tuple[str, str]] = {}
-    for label, value in components:
-        tokens = _identity_tokens(value)
-        if tokens:
-            unique.setdefault(tokens, (label, value))
-    return sorted(unique.values(), key=lambda item: len(_identity_tokens(item[1])), reverse=True)
-
-
-def _validate_run_context(
-    config: Mapping[str, Any],
-    *,
-    model_key: str | None = None,
-    scientific_variant: str | None = None,
-) -> None:
-    """Require normalized suffix-only context without repeated derived identity."""
-    run = _as_mapping(config.get("run"), path="run")
-    suffix = run.get("suffix")
-    if suffix is None:
-        return
-    if not isinstance(suffix, str) or not suffix:
-        msg = f"run.suffix must be null or a non-empty normalized string, got {suffix!r}."
-        raise ConfigError(msg)
-
-    resolved_model_key = model_key or resolved_model_variant(config)
-    resolved_science = resolved_scientific_variant(config) if scientific_variant is None else scientific_variant
-    remaining = list(_identity_tokens(suffix))
-    duplicated: list[tuple[str, str]] = []
-    for label, value in _derived_suffix_components(
-        config,
-        model_key=resolved_model_key,
-        scientific_variant=resolved_science,
-    ):
-        if _remove_identity_sequence(remaining, _identity_tokens(value)):
-            duplicated.append((label, value))
-    if duplicated:
-        details = ", ".join(f"{label}={value!r}" for label, value in duplicated)
-        suggestion = "_".join(remaining) or "null"
-        msg = f"run.suffix {suffix!r} duplicates canonical derived identity ({details}). Suggested run.suffix: {suggestion}."
-        raise ConfigError(msg)
-    if _RUN_SUFFIX_PATTERN.fullmatch(suffix) is None:
-        msg = f"run.suffix {suffix!r} must be lowercase underscore-separated tokens with no leading, trailing, or repeated underscore."
-        raise ConfigError(msg)
+    """Return the shared architecture label, separately from physics and stage."""
+    return learning.models.naming.architecture_label(config)
 
 
 def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -1229,7 +781,7 @@ def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ConfigError(msg)
 
     task = common.paths.validate_logical_name(config.get("task"), label="task")
-    variant = _model_variant(config)
+    variant = config_naming.model_family(config)
     raw_study = wandb.get("study")
     if raw_study is not None:
         try:
@@ -1289,17 +841,11 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
         path="tracking.wandb",
     )
     metric_schema_version = wandb.get("metric_schema_version")
-    naming_schema_version = _as_mapping(config.get("run"), path="run").get(
-        "naming_schema_version",
-        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
-    )
-    current_identity = naming_schema_version == RUN_NAMING_SCHEMA_VERSION
     if metric_schema_version is None:
-        if require_derived and current_identity:
+        if require_derived:
             msg = "Current resolved configs must persist tracking.wandb.metric_schema_version."
             raise ConfigError(msg)
-        if current_identity:
-            wandb["metric_schema_version"] = config_defaults.WANDB_METRIC_SCHEMA_VERSION
+        wandb["metric_schema_version"] = config_defaults.WANDB_METRIC_SCHEMA_VERSION
     elif (
         isinstance(metric_schema_version, bool)
         or not isinstance(metric_schema_version, int)
@@ -1344,24 +890,17 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
     config["tracking"] = tracking
 
 
-def _validate_current_run_identity_schema(run: Mapping[str, Any], data: Mapping[str, Any]) -> None:
+def _validate_current_run_identity_schema(run: Mapping[str, Any]) -> None:
     """Validate the persisted run-naming schema and its required identity evidence."""
-    naming_schema_version = run.get(
-        "naming_schema_version",
-        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
-    )
-    if (
-        isinstance(naming_schema_version, bool)
-        or not isinstance(naming_schema_version, int)
-        or naming_schema_version not in {_LEGACY_RUN_NAMING_SCHEMA_VERSION, RUN_NAMING_SCHEMA_VERSION}
-    ):
+    if type(run.get("naming_schema_version")) is not int or run["naming_schema_version"] != RUN_NAMING_SCHEMA_VERSION:
         msg = "run.naming_schema_version is unsupported."
         raise ConfigError(msg)
-    if naming_schema_version == RUN_NAMING_SCHEMA_VERSION and "revision" not in run:
-        msg = "Current resolved runs must persist run.revision explicitly."
+
+    if type(run.get("seed")) is not int or run["seed"] < 0:
+        msg = "run.seed must be a non-negative integer."
         raise ConfigError(msg)
-    if naming_schema_version == RUN_NAMING_SCHEMA_VERSION and "dataset_references" not in data:
-        msg = "Current resolved runs must persist data.dataset_references evidence."
+    if type(run.get("deterministic")) is not bool:
+        msg = "run.deterministic must be boolean."
         raise ConfigError(msg)
 
 
@@ -1403,11 +942,9 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if int(training["evaluation_interval"]) <= 0:
         msg = "training.evaluation_interval must be positive."
         raise ConfigError(msg)
-    if int(training["ood_evaluation_interval"]) <= 0:
-        msg = "training.ood_evaluation_interval must be positive."
+    if int(training["additional_evaluation_interval"]) <= 0:
+        msg = "training.additional_evaluation_interval must be positive."
         raise ConfigError(msg)
-    data = _as_mapping(config["data"], path="data")
-    _validate_dataset_reference_evidence(config)
     data = _as_mapping(config["data"], path="data")
     batch_size = data.get("batch_size")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
@@ -1427,15 +964,15 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    tracking = _as_mapping(config["tracking"], path="tracking")
-    wandb = _as_mapping(tracking["wandb"], path="tracking.wandb")
-    _ood_datasets(data, path="data", allow_empty=wandb.get("workflow") == "optuna_trial" or data.get("allow_technical_smoke") is True)
+    _configured_dataset_list(data, path="data", key="additional_evaluation_datasets", allow_empty=True)
+    if config.get("task") == "steady_flow" and set(data) != _STEADY_DATA_KEYS:
+        msg = f"Steady data keys must be exactly {sorted(_STEADY_DATA_KEYS)}; membership comes from the Dataset partition."
+        raise ConfigError(msg)
 
     _validate_tracking(config, require_derived=require_derived_tracking)
 
     run = _as_mapping(config["run"], path="run")
-    _nonnegative_integer(run.get("revision", 0), path="run.revision")
-    _validate_current_run_identity_schema(run, data)
+    _validate_current_run_identity_schema(run)
     try:
         run["device"] = learning.device_policy.validate_device_policy(
             run.get("device"),
@@ -1443,7 +980,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         )
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    for key in ("suffix", "name"):
+    for key in ("name", "revision"):
         value = run.get(key)
         if value is None:
             continue
@@ -1451,156 +988,180 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
             common.paths.validate_logical_name(value, label=f"run.{key}")
         except ValueError as error:
             raise ConfigError(str(error)) from error
-    _validate_run_context(config)
 
 
-RUN_NAMING_SCHEMA_VERSION = 2
-_LEGACY_RUN_NAMING_SCHEMA_VERSION = 1
+RUN_NAMING_SCHEMA_VERSION = 1
 _EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
 
 
-def _nonnegative_integer(value: object, *, path: str) -> int:
-    """Return one exact non-negative integer or raise a config error."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        msg = f"{path} must be an integer >= 0, got {value!r}."
-        raise ConfigError(msg)
-    return value
+def allocation_includes_epochs(config: Mapping[str, Any]) -> bool:
+    """Return whether the epoch budget is part of a run's experiment identity.
+
+    A transient A0 (also as a stage-A-only Optuna trial) schedules its rollout
+    curriculum and budget controller over its epoch budget, so another budget is
+    another experiment. Every Optuna trial (``run.layout.trial`` is set) belongs to
+    a study of one fixed trial budget and never extends it, so its budget is part
+    of its identity too. Every other run treats epochs as training progress that a
+    rerun may extend.
+    """
+    is_trial = config["run"]["layout"]["trial"] is not None
+    return is_trial or (config["task"] == "transient_drying" and config["training"].get("comparison_arm") == "a0")
 
 
-def _dataset_display_name(config: Mapping[str, Any]) -> str:
-    """Return the concise Train Dataset reference label without exact digests."""
-    data = _as_mapping(config.get("data"), path="data")
-    references = data.get("dataset_references")
-    if isinstance(references, Mapping):
-        train_reference = references.get("train")
-        if isinstance(train_reference, Mapping):
-            try:
-                name = common.paths.validate_logical_name(
-                    train_reference.get("name"),
-                    label="data.dataset_references.train.name",
-                )
-            except ValueError as error:
-                raise ConfigError(str(error)) from error
-            revision = _nonnegative_integer(
-                train_reference.get("revision"),
-                path="data.dataset_references.train.revision",
-            )
-            return name if revision == 0 else f"{name}_d{revision}"
+def layout_budget_epochs(config: Mapping[str, Any], *, family: str) -> int | None:
+    """Return the epoch budget that names a config's output unit, else ``None``.
 
-    try:
-        dataset_id = common.paths.validate_logical_name(
-            data.get("train_dataset"),
-            label="data.train_dataset",
-        )
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-    parts = dataset_id.split("__")
-    if parts and parts[0] == config.get("task"):
-        parts.pop(0)
-    if len(parts) > 1 and _EXACT_DATASET_DIGEST_TOKEN.fullmatch(parts[-1]) is not None:
-        parts.pop()
-    display_name = "_".join(parts)
-    try:
-        return common.paths.validate_logical_name(
-            display_name,
-            label="Train Dataset display name",
-        )
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-
-
-def _stage_display_token(config: Mapping[str, Any]) -> str | None:
-    """Return the concise child-stage token when the resolved run is staged."""
-    training = config.get("training")
-    if not isinstance(training, Mapping):
+    An Optuna trial lives in a study directory named after the study's trial epoch
+    budget. Every stage of a transient seed group (A0, B and A1) carries the A0
+    epoch budget, because the A0's curriculum and controller identity depend on it.
+    A steady run has none: its epochs extend the run in place.
+    """
+    if family == common.paths.OPTUNA_FAMILY:
+        return config["training"]["epochs"]
+    if config["task"] != "transient_drying":
         return None
-    stage = training.get("stage")
-    comparison_arm = training.get("comparison_arm")
-    if stage == "a":
-        return "a0" if comparison_arm == "a0" else "a"
-    if stage == "b":
-        return "b"
-    return None
+    schedule = config["training"]["stage_schedule"]
+    return schedule["a0_max_epochs"] if schedule["mode"] == "matched_a1_b" else schedule["total_epochs"]
 
 
-def generate_parent_experiment_label(config: Mapping[str, Any]) -> str:
-    """Generate the canonical concise parent label for a new experiment."""
-    run = _as_mapping(config.get("run"), path="run")
-    data = _as_mapping(config.get("data"), path="data")
-    model_key = resolved_model_variant(config)
-    scientific_variant = resolved_scientific_variant(config)
-    _validate_run_context(
-        config,
-        model_key=model_key,
-        scientific_variant=scientific_variant,
-    )
-    seed = _nonnegative_integer(run.get("seed"), path="run.seed")
-    revision = _nonnegative_integer(run.get("revision", 0), path="run.revision")
-    parts = [model_key]
-    if scientific_variant is not None:
-        parts.append(scientific_variant)
-    spatial_stride = data.get("spatial_stride", 1)
-    if config.get("task") == "transient_drying" and spatial_stride != 1:
-        parts.append(f"stride{spatial_stride}")
-    parts.extend((_dataset_display_name(config), f"s{seed}"))
-    suffix = run.get("suffix")
-    if suffix:
-        parts.append(str(suffix))
-    if revision > 0:
-        parts.append(f"r{revision}")
-    label = "_".join(parts)
+def allocation_digest(config: Mapping[str, Any], *, stage: str | None = None) -> str:
+    """Identify one experiment independently of labels, paths and, where allowed, epochs.
+
+    Equal digests mean the same experiment: a later start may only continue or
+    extend the run that owns it. The first 16 characters are the layout's
+    ``a0_id`` of single runs and A0. An A0 excludes the branch-planning metadata
+    of the B/A1 pairs that may follow it and keeps its epoch budget
+    (:func:`allocation_includes_epochs`); B and A1 include the ``a0_id`` they
+    start from.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Resolved configuration.
+    stage : str | None, optional
+        Layout stage; defaults to ``config["run"]["layout"]["stage"]``.
+
+    Returns
+    -------
+    str
+        Lowercase SHA-256 digest of the scientific identity payload.
+
+    """
+    stage = config["run"]["layout"]["stage"] if stage is None else stage
+    payload = learning.training.checkpoint.effective_config_identity_payload(config, include_epochs=allocation_includes_epochs(config))
+    if stage == "a0":
+        training = payload["training"]
+        training.pop("stage_schedule", None)
+        training.pop("teacher_handoff", None)
+        training.pop("matched_a1_b", None)
+    elif stage in {"b", "a1"}:
+        # A continuation is only the same experiment when it starts from the same A0.
+        payload["a0_id"] = config["run"]["layout"]["a0_id"]
+    return common.serialization.canonical_json_sha256(payload)
+
+
+def _derive_layout(
+    config: Mapping[str, Any],
+    source: config_naming.ConfigSource,
+    *,
+    a0_id: str | None,
+    branch_id: str | None,
+    stage: str | None,
+    pair: str | None,
+    trial: str | None,
+) -> dict[str, Any]:
+    """Derive the complete layout and run name as a pure function of config, source and revision."""
+    resolved = copy.deepcopy(dict(config))
+    run = resolved["run"]
+    stage = "single" if stage is None else stage
+    if source.family == common.paths.OPTUNA_FAMILY and trial is None:
+        # The study's base config is a template; every sampled trial re-finalizes with its own leaf.
+        trial = config_naming.trial_leaf(0, resolved, {})
+    run["layout"] = {
+        "task": resolved["task"],
+        "dataset": resolved["data"]["train_dataset"],
+        "family": source.family,
+        "config_name": source.name,
+        "model_label": config_naming.model_label(resolved),
+        "seed": run["seed"],
+        "revision": run.get("revision"),
+        "budget_epochs": layout_budget_epochs(resolved, family=source.family),
+        "stage": stage,
+        "pair": pair,
+        "trial": trial,
+        "a0_id": a0_id,
+        "branch_id": branch_id,
+    }
+    if a0_id is None:
+        run["layout"]["a0_id"] = allocation_digest(resolved)[:16]
+    run["name"] = config_naming.run_name(run["layout"])
+    return resolved
+
+
+def finalize_run_layout(
+    config: Mapping[str, Any],
+    *,
+    a0_id: str | None = None,
+    branch_id: str | None = None,
+    stage: str | None = None,
+    pair: str | None = None,
+    trial: str | None = None,
+) -> dict[str, Any]:
+    """Re-derive a resolved config's layout and run name, keeping its config source.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Resolved config whose ``run.layout`` already names its source (task, family
+        and config name), as produced by :func:`resolve_config`.
+    a0_id, branch_id : str | None, optional
+        Exact A0 and branch identities. ``a0_id`` defaults to the epoch-free allocation digest.
+    stage : str | None, optional
+        ``single`` (default), ``a0``, ``b`` or ``a1``.
+    pair : str | None, optional
+        Pair key shared by a matched plan's B and A1 stages.
+    trial : str | None, optional
+        Optuna trial leaf; an Optuna-family config defaults to the study template leaf.
+
+    Returns
+    -------
+    dict[str, Any]
+        Independent copy with the re-derived ``run.layout`` and ``run.name``.
+
+    """
+    layout = _as_mapping(_as_mapping(config.get("run"), path="run").get("layout"), path="run.layout")
     try:
-        return common.paths.validate_logical_name(label, label="human experiment label")
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
+        source = config_naming.ConfigSource(layout["task"], layout["family"], layout["config_name"])
+    except KeyError as error:
+        msg = "run.layout must name its config source (task, family, config_name) before it is re-derived."
+        raise ConfigError(msg) from error
+    return _derive_layout(config, source, a0_id=a0_id, branch_id=branch_id, stage=stage, pair=pair, trial=trial)
 
 
-def _generate_legacy_run_name(config: Mapping[str, Any]) -> str:
-    """Regenerate the exact pre-reference run name for legacy saved configs."""
+def _validate_run_layout(config: Mapping[str, Any], *, verify_identity: bool) -> dict[str, Any]:
+    """Share lexical validation while reserving live identity checks for execution."""
     run = _as_mapping(config.get("run"), path="run")
-    data = _as_mapping(config.get("data"), path="data")
-    model_key = resolved_model_variant(config)
-    scientific_variant = resolved_scientific_variant(config)
-    _validate_run_context(
-        config,
-        model_key=model_key,
-        scientific_variant=scientific_variant,
-    )
-    try:
-        train_dataset = common.paths.validate_logical_name(
-            data.get("train_dataset"),
-            label="data.train_dataset",
-        )
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-    seed = _nonnegative_integer(run.get("seed"), path="run.seed")
-    parts = [model_key]
-    if scientific_variant is not None:
-        parts.append(scientific_variant)
-    spatial_stride = data.get("spatial_stride", 1)
-    if config.get("task") == "transient_drying" and spatial_stride != 1:
-        parts.append(f"stride{spatial_stride}")
-    parts.extend((train_dataset, f"s{seed}"))
-    if run.get("suffix"):
-        parts.append(str(run["suffix"]))
-    return "__".join(parts)
-
-
-def generate_run_name(config: Mapping[str, Any]) -> str:
-    """Generate the schema-appropriate persisted run leaf and display name."""
-    run = _as_mapping(config.get("run"), path="run")
-    schema_version = run.get(
-        "naming_schema_version",
-        _LEGACY_RUN_NAMING_SCHEMA_VERSION,
-    )
-    if schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION:
-        return _generate_legacy_run_name(config)
-    if schema_version != RUN_NAMING_SCHEMA_VERSION:
-        msg = f"run.naming_schema_version is unsupported: {schema_version!r}."
+    layout = dict(_as_mapping(run.get("layout"), path="run.layout"))
+    common.paths.resolve_config_run_dir(config)
+    if (
+        layout["task"] != config["task"]
+        or layout["dataset"] != config["data"]["train_dataset"]
+        or layout["seed"] != run["seed"]
+        or layout["revision"] != run.get("revision")
+        or layout["budget_epochs"] != layout_budget_epochs(config, family=layout["family"])
+    ):
+        msg = "Run layout task, dataset, seed, revision and epoch budget must match its saved configuration."
         raise ConfigError(msg)
-    parent = generate_parent_experiment_label(config)
-    stage = _stage_display_token(config)
-    return parent if stage is None else f"{parent}_{stage}"
+    if verify_identity:
+        if layout["model_label"] != config_naming.model_label(config):
+            msg = "Model label contradicts the resolved model and physics-loss settings."
+            raise ConfigError(msg)
+        if layout["stage"] in {"single", "a0"}:
+            expected = allocation_digest(config)[:16]
+            if layout["a0_id"] != expected:
+                msg = "Initial run layout identity does not match its scientific dependencies."
+                raise ConfigError(msg)
+    return layout
 
 
 _TRANSIENT_STATE_CHANNELS = 4
@@ -1641,8 +1202,8 @@ def _validate_transient_loss(config: dict[str, Any]) -> None:
     ):
         _raise_config_error("Transient loss.data.channel_weights must contain four non-negative finite values with positive sum.")
     physics = _as_mapping(loss["physics"], path="loss.physics")
-    if physics != {"enabled": False, "continuity": "none"}:
-        _raise_config_error("Transient physics must be exactly disabled with continuity='none'.")
+    if physics != {"enabled": False}:
+        _raise_config_error("Transient physics must be exactly disabled.")
     config["loss"] = {
         "data": {
             **data,
@@ -1659,46 +1220,31 @@ def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, A
     """Resolve canonical transient epoch-allocation evidence."""
     raw = _as_mapping(schedule, path="training.stage_schedule")
     mode = raw.get("mode")
-    if raw.get("budget_unit") != "epochs" or mode not in {"joint_ab", "stage_a_only"}:
-        _raise_config_error("training.stage_schedule must declare an admitted epoch allocation mode.")
+    if mode == "matched_a1_b":
+        expected_keys = {"mode", "budget_unit", "a0_max_epochs", "b_max_epochs", "a1_max_epochs"}
+        if set(raw) != expected_keys or raw.get("budget_unit") != "train_seconds":
+            _raise_config_error("matched_a1_b stage_schedule requires exact train_seconds and per-stage max epochs.")
+        if any(type(raw[key]) is not int or raw[key] < 1 for key in ("a0_max_epochs", "b_max_epochs", "a1_max_epochs")):
+            _raise_config_error("matched_a1_b max epochs must be positive integers.")
+        return dict(raw)
+    if mode != "stage_a_only" or set(raw) != {"mode", "budget_unit", "total_epochs"} or raw.get("budget_unit") != "epochs":
+        _raise_config_error("training.stage_schedule must be matched_a1_b or exactly {mode: stage_a_only, budget_unit: epochs, total_epochs}.")
     total = raw.get("total_epochs")
-    if type(total) is not int or total < (2 if mode == "joint_ab" else 1):
-        _raise_config_error("training.stage_schedule.total_epochs is invalid for its mode.")
-    if mode == "stage_a_only":
-        expected = {
-            "mode": mode,
-            "budget_unit": "epochs",
-            "total_epochs": total,
-            "stage_a_fraction": None,
-            "stage_b_fraction": None,
-            "stage_a_epochs": total,
-            "stage_b_epochs": 0,
-            "rounding": "not_applicable",
-        }
-    else:
-        fraction = raw.get("stage_a_fraction")
-        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
-            _raise_config_error("training.stage_schedule.stage_a_fraction must be finite.")
-        decimal = Decimal(str(fraction))
-        if not decimal.is_finite() or not Decimal(0) < decimal < Decimal(1):
-            _raise_config_error("training.stage_schedule.stage_a_fraction must be strictly between zero and one.")
-        a = min(max(int((Decimal(total) * decimal).quantize(Decimal(1), rounding=ROUND_HALF_UP)), 1), total - 1)
-        expected = {
-            "mode": mode,
-            "budget_unit": "epochs",
-            "total_epochs": total,
-            "stage_a_fraction": float(decimal),
-            "stage_b_fraction": float(Decimal(1) - decimal),
-            "stage_a_epochs": a,
-            "stage_b_epochs": total - a,
-            "rounding": "half_up_then_exact_remainder",
-        }
-    authored_joint = {key: raw.get(key) for key in ("mode", "budget_unit", "total_epochs", "stage_a_fraction")}
-    if raw != expected and not (
-        mode == "joint_ab" and set(raw) == set(authored_joint) and authored_joint == {key: expected[key] for key in authored_joint}
-    ):
-        _raise_config_error("training.stage_schedule must equal canonical resolved allocation evidence.")
-    return expected
+    if type(total) is not int or total < 1:
+        _raise_config_error("training.stage_schedule.total_epochs must be a positive integer.")
+    return dict(raw)
+
+
+def _resolve_temporal_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve the exact temporal branch of a transient experiment: both explicit Dataset sampling and Learning conditioning choices."""
+    required = {"sampling", "temporal_conditioning"}
+    if set(value) != required:
+        message = f"Transient temporal configuration keys must be exactly {sorted(required)}."
+        raise ValueError(message)
+    return {
+        "sampling": datasets.contracts.transient.TransientSamplingSpec.from_mapping(value["sampling"]).as_dict(),
+        "temporal_conditioning": learning.temporal.TemporalConditioningSpec.from_mapping(value["temporal_conditioning"]).as_dict(),
+    }
 
 
 def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
@@ -1715,7 +1261,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         _raise_config_error("input_profile must be a registered transient profile identifier.")
     try:
         task.input_profile(profile)
-        temporal = config_temporal.resolve_transient_temporal_config(_as_mapping(config["temporal"], path="temporal"))
+        temporal = _resolve_temporal_config(_as_mapping(config["temporal"], path="temporal"))
     except (TypeError, ValueError) as error:
         msg = f"temporal/input_profile: {error}"
         raise ConfigError(msg) from error
@@ -1731,7 +1277,8 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         data["spatial_stride"] = 1
     required_data = {
         "train_dataset",
-        "ood_datasets",
+        "additional_evaluation_datasets",
+        "additional_evaluation_fraction",
         "batch_size",
         "num_workers",
         "pin_memory",
@@ -1740,17 +1287,14 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         "transient_backend_preference",
         "transient_backend_required",
         "hdf5_cache_size",
-        "allow_technical_smoke",
     }
-    allowed_data_keys = (required_data, required_data | {"dataset_references"})
-    if set(data) not in allowed_data_keys:
+    if set(data) != required_data:
         _raise_config_error("Transient data keys do not match the loader contract.")
-    if (
-        data["transient_backend_preference"] not in {"pt_shards", "canonical_hdf5"}
-        or type(data["transient_backend_required"]) is not bool
-        or type(data["allow_technical_smoke"]) is not bool
-    ):
-        _raise_config_error("Transient backend and technical-smoke settings are invalid.")
+    fraction = data["additional_evaluation_fraction"]
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction) or fraction != 1.0:
+        _raise_config_error("Transient data.additional_evaluation_fraction must equal 1; Dataset-owned OOD membership is fixed.")
+    if data["transient_backend_preference"] not in {"pt_shards", "canonical_hdf5"} or type(data["transient_backend_required"]) is not bool:
+        _raise_config_error("Transient backend settings are invalid.")
     if isinstance(data["hdf5_cache_size"], bool) or not isinstance(data["hdf5_cache_size"], int) or data["hdf5_cache_size"] < 0:
         _raise_config_error("data.hdf5_cache_size must be an integer >= 0.")
     try:
@@ -1764,28 +1308,29 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         "epochs",
         "stage_schedule",
         "evaluation_interval",
-        "ood_evaluation_interval",
+        "additional_evaluation_interval",
         "mixed_precision",
         "stage",
         "comparison_arm",
         "gradient_accumulation_steps",
-        "fixed_evaluation_horizon",
         "curriculum",
-        "matched_compute",
         "teacher_handoff",
     }
-    if set(training) != required_training:
+    if set(training) not in (required_training, required_training | {"matched_a1_b"}):
         _raise_config_error("Transient training keys do not match the curriculum contract.")
     schedule = resolve_transient_stage_schedule(_as_mapping(training["stage_schedule"], path="training.stage_schedule"))
     stage, arm = training["stage"], training["comparison_arm"]
-    if stage not in {"a", "b"} or arm not in {"a0", "a_plus", "b"} or (stage == "a" and arm not in {"a0", "a_plus"}) or (stage == "b" and arm != "b"):
+    if stage not in {"a", "b"} or arm not in {"a0", "a1", "b"} or (stage == "a" and arm not in {"a0", "a1"}) or (stage == "b" and arm != "b"):
         _raise_config_error("Transient training stage and comparison_arm are inconsistent.")
-    expected_epochs = schedule["stage_a_epochs"] if stage == "a" else schedule["stage_b_epochs"]
+    matched_protocol = schedule["mode"] == "matched_a1_b"
+    expected_epochs = (
+        schedule[{"a0": "a0_max_epochs", "b": "b_max_epochs", "a1": "a1_max_epochs"}[arm]] if matched_protocol else schedule["total_epochs"]
+    )
     if training["epochs"] != expected_epochs:
         _raise_config_error("training.epochs must equal the resolved stage_schedule allocation.")
-    for key in ("gradient_accumulation_steps", "fixed_evaluation_horizon"):
-        if isinstance(training[key], bool) or not isinstance(training[key], int) or training[key] <= 0:
-            _raise_config_error(f"training.{key} must be a positive integer.")
+    accumulation = training["gradient_accumulation_steps"]
+    if isinstance(accumulation, bool) or not isinstance(accumulation, int) or accumulation <= 0:
+        _raise_config_error("training.gradient_accumulation_steps must be a positive integer.")
     curriculum = _as_mapping(training["curriculum"], path="training.curriculum")
     if (
         set(curriculum) != {"lengths", "milestone_fractions", "seed"}
@@ -1814,23 +1359,19 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         message = f"training.curriculum: {error}"
         raise ConfigError(message) from error
     sampling = temporal["sampling"]
-    rollout_length = sampling.get("rollout_length") if sampling["mode"] == "rollout_window" else 1
-    requires_sequence = stage == "b" or (stage == "a" and config["model"]["kind"] == "rno")
-    if requires_sequence and sampling["mode"] != "rollout_window":
-        _raise_config_error("Stage B and Stage-A RNO require temporal.sampling.mode='rollout_window'.")
-    if resolved_curriculum.lengths[-1] > rollout_length or training["fixed_evaluation_horizon"] > rollout_length:
-        _raise_config_error("training curriculum and fixed_evaluation_horizon must fit temporal.sampling rollout length.")
-    if training["fixed_evaluation_horizon"] not in resolved_curriculum.lengths:
-        _raise_config_error("training.fixed_evaluation_horizon must be one admitted curriculum horizon.")
-    matched = _as_mapping(training["matched_compute"], path="training.matched_compute")
-    matched_keys = {"planned_seconds", "planned_steps", "rollout_reference_seconds", "rollout_reference_steps"}
-    if set(matched) != matched_keys:
-        _raise_config_error("training.matched_compute keys do not match the contract.")
-    for key, value in matched.items():
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0 or not math.isfinite(float(value))
-        ):
-            _raise_config_error(f"training.matched_compute.{key} must be null or positive finite.")
+    recurrent = config["model"]["kind"] == "rno"
+    if recurrent != (sampling["mode"] == "trajectory"):
+        _raise_config_error(
+            "RNO carries its hidden state through whole trajectories and requires temporal.sampling.mode='trajectory'; "
+            "stateless models train on one-step transitions or rollout windows."
+        )
+    if stage == "b" and sampling["mode"] == "one_step_transition":
+        _raise_config_error("Stage B self-feeds rollout windows and cannot use one-step sampling.")
+    if recurrent and sampling.get("rollout_length") is None:
+        _raise_config_error("RNO trajectory sampling requires rollout_length, the window across which its hidden state is carried.")
+    rollout_length = 1 if sampling["mode"] == "one_step_transition" else sampling["rollout_length"]
+    if resolved_curriculum.lengths[-1] > rollout_length:
+        _raise_config_error("training.curriculum lengths must fit the temporal.sampling rollout length.")
     handoff = training["teacher_handoff"]
     if handoff is not None and (
         not isinstance(handoff, Mapping)
@@ -1839,29 +1380,31 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         or not handoff["source_run_name"]
     ):
         _raise_config_error("training.teacher_handoff must be null or contain only source_run_name.")
-    requires_handoff = arm in {"a_plus", "b"}
+    requires_handoff = arm in {"b", "a1"}
     if requires_handoff != (handoff is not None):
-        _raise_config_error("A+ and B require a teacher handoff; A0 forbids one.")
-    values = tuple(matched.values())
-    has_matched_limit = any(value is not None for value in values)
-    if arm == "a0" and has_matched_limit:
-        _raise_config_error("A0 must not declare a matched-compute budget.")
-    epoch_budgeted_b = arm == "b" and not has_matched_limit
-    if epoch_budgeted_b and (schedule["mode"] != "joint_ab" or schedule["budget_unit"] != "epochs"):
-        _raise_config_error("Stage B without a matched-compute limit requires the joint epoch-allocation contract.")
-    seconds_budget = matched["planned_seconds"] is not None
-    steps_budget = matched["planned_steps"] is not None
-    seconds_reference = matched["rollout_reference_seconds"] is not None
-    steps_reference = matched["rollout_reference_steps"] is not None
-    if requires_handoff and not epoch_budgeted_b:
-        if seconds_budget == steps_budget:
-            _raise_config_error("Matched transient arms require exactly one planned budget unit.")
-        if seconds_reference and steps_reference:
-            _raise_config_error("Matched transient arms cannot mix rollout-reference units.")
-        if (seconds_reference and not seconds_budget) or (steps_reference and not steps_budget):
-            _raise_config_error("Matched transient planned and rollout-reference budgets must use one unit.")
-        if arm == "a_plus" and not (seconds_reference or steps_reference):
-            _raise_config_error("A+ requires completed-B rollout-reference matched-compute evidence.")
+        _raise_config_error("B and A1 require a teacher handoff; A0 forbids one.")
+    protocol = training.get("matched_a1_b")
+    if matched_protocol:
+        if (
+            arm not in {"a0", "b", "a1"}
+            or not isinstance(protocol, Mapping)
+            or set(protocol) != {"role", "train_seconds", "receipt_source_run_name", "initialization", "lr_scale", "evaluation_points"}
+        ):
+            _raise_config_error("matched_a1_b requires its exact stage-owned protocol mapping.")
+        if protocol["role"] != arm or protocol["initialization"] != "a0_best_full_common_fresh_controller":
+            _raise_config_error("matched_a1_b role or branch initialization is invalid.")
+        seconds = protocol["train_seconds"]
+        if (arm == "b") != _is_positive_finite(seconds):
+            _raise_config_error("matched_a1_b B requires a positive train_seconds budget; A0/A1 derive no numeric target from YAML.")
+        if (arm == "a1") != (isinstance(protocol["receipt_source_run_name"], str) and bool(protocol["receipt_source_run_name"])):
+            _raise_config_error("matched_a1_b A1 must name its B receipt source, other stages must not.")
+        if (arm != "a0") != _is_positive_finite(protocol["lr_scale"]):
+            _raise_config_error("matched_a1_b B and A1 require a positive continuation lr_scale; A0 must not declare one.")
+        points = protocol["evaluation_points"]
+        if (arm != "a0") != (type(points) is int and points >= 1):
+            _raise_config_error("matched_a1_b B and A1 require positive budget evaluation_points; A0 must not declare them.")
+    elif protocol is not None or arm != "a0":
+        _raise_config_error("Outside matched_a1_b, transient training is the stage-A-only A0 protocol.")
     config["training"] = {
         **training,
         "curriculum": {
@@ -1869,7 +1412,6 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
             "milestone_fractions": [float(item) for item in fractions],
             "seed": curriculum["seed"],
         },
-        "matched_compute": dict(matched),
         "teacher_handoff": None if handoff is None else {"source_run_name": handoff["source_run_name"]},
     }
     config["_transient_tensorizer"] = tensorizer
@@ -1882,12 +1424,98 @@ def _reject_transient_roots_for_steady(config: Mapping[str, Any]) -> None:
         _raise_config_error(f"Steady-flow config does not admit transient root key(s): {unexpected}.")
 
 
+def apply_epoch_budget(raw: Mapping[str, Any], epochs: int | None) -> dict[str, Any]:
+    """Copy an authored request and apply an explicit epoch budget.
+
+    Steady single-stage training uses ``training.epochs``. A stage-A-only A0 run
+    sets ``training.epochs`` and its schedule total together. A matched plan sets
+    A0's epoch budget ``training.a0.max_epochs``; B stops at its measured
+    seconds and A1 at B's receipt, so their caps stay operational bounds.
+    """
+    requested = copy.deepcopy(dict(raw))
+    if epochs is None:
+        return requested
+    if type(epochs) is not int or epochs < 1:
+        msg = "--epochs must be a positive integer."
+        raise ConfigError(msg)
+    training = _as_mapping(requested.get("training"), path="training")
+    schedule = training.get("stage_schedule")
+    if training.get("mode") == "matched_a1_b":
+        training["a0"] = {**_as_mapping(training.get("a0"), path="training.a0"), "max_epochs": epochs}
+    elif isinstance(schedule, Mapping):
+        training["stage_schedule"] = {**schedule, "total_epochs": epochs}
+        training["epochs"] = epochs
+    else:
+        training["epochs"] = epochs
+    requested["training"] = training
+    return requested
+
+
+def apply_training_overrides(
+    raw: Mapping[str, Any],
+    *,
+    epochs: int | None = None,
+    train_dataset: str | None = None,
+    train_seconds: float | None = None,
+    rollout_length: int | None = None,
+    lr_scale: float | None = None,
+    revision: str | None = None,
+) -> dict[str, Any]:
+    """Copy and bind explicit Dataset, matched-protocol, revision and epoch-budget overrides.
+
+    ``rollout_length``, ``train_seconds`` and ``lr_scale`` apply only to an authored
+    matched plan: the B window and its truncated curriculum, B's measured target,
+    and the continuation learning-rate factor shared by B and A1 for a paired sweep.
+    ``revision`` names a deliberately separate output location for otherwise identical
+    science and is stored as ``run.revision``.
+    """
+    requested = copy.deepcopy(dict(raw))
+    if revision is not None:
+        try:
+            validated_revision = common.paths.validate_logical_name(revision, label="--revision")
+        except ValueError as error:
+            raise ConfigError(str(error)) from error
+        requested["run"] = {**_as_mapping(requested.get("run", {}), path="run"), "revision": validated_revision}
+    if train_dataset is not None:
+        requested["data"]["train_dataset"] = common.paths.validate_logical_name(train_dataset, label="--train-dataset")
+    matched = (
+        requested.get("task") == "transient_drying"
+        and isinstance(requested.get("training"), Mapping)
+        and (requested["training"].get("mode") == "matched_a1_b")
+    )
+    if not matched and any(value is not None for value in (rollout_length, train_seconds, lr_scale)):
+        msg = "--rollout-length, --train-seconds and --lr-scale require a transient matched_a1_b plan."
+        raise ConfigError(msg)
+    if rollout_length is not None:
+        if type(rollout_length) is not int or rollout_length not in {1, 2, 4, 8, 16, 32, 64}:
+            msg = "--rollout-length must be an admitted curriculum horizon: 1, 2, 4, 8, 16, 32 or 64."
+            raise ConfigError(msg)
+        stage_b = requested["training"]["b"]
+        stage_b["sampling"] = (
+            {"mode": "trajectory", "rollout_length": rollout_length}
+            if stage_b["sampling"]["mode"] == "trajectory"
+            else {"mode": "rollout_window", "rollout_length": rollout_length, "window_stride": rollout_length, "window_offset": 0}
+        )
+        curriculum = stage_b["curriculum"]
+        lengths = sorted({length for length in curriculum["lengths"] if length <= rollout_length} | {rollout_length})
+        curriculum["lengths"] = lengths
+        curriculum["milestone_fractions"] = [index / len(lengths) for index in range(len(lengths))]
+    # The matched plan resolver validates both values after binding; they are copied unchanged here.
+    if train_seconds is not None:
+        requested["training"]["b"]["train_seconds"] = train_seconds
+    if lr_scale is not None:
+        requested["training"]["b"]["lr_scale"] = lr_scale
+        requested["training"]["a1"]["lr_scale"] = lr_scale
+    return apply_epoch_budget(requested, epochs)
+
+
 def resolve_config(
     user_config: dict[str, Any],
     *,
+    source: config_naming.ConfigSource,
     storage_root: Path | str | None = None,
+    output_root: Path | str | None = None,
     naming_schema_version: int = RUN_NAMING_SCHEMA_VERSION,
-    pinned_dataset_references: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Strictly resolve one semantic experiment configuration.
@@ -1896,12 +1524,15 @@ def resolve_config(
     ----------
     user_config : dict[str, Any]
         Raw semantic experiment mapping.
+    source : config_naming.ConfigSource
+        Task, family and name of the YAML the mapping came from. The task must equal
+        the config task, and an experiment family's name must extend the model label.
     storage_root : Path or str or None, optional
         Explicit Dataset-reference and resolved-path root for controlled callers.
+    output_root : Path or str or None, optional
+        Override the experiments root that run destinations descend from.
     naming_schema_version : int, optional
-        Derived run-label schema selected by fresh or legacy lifecycle owners.
-    pinned_dataset_references : Mapping[str, Any] or None, optional
-        Saved immutable reference evidence used instead of current external aliases.
+        Sole current derived run-label schema.
 
     Returns
     -------
@@ -1911,14 +1542,15 @@ def resolve_config(
     Raises
     ------
     ConfigError
-        If the schema, identifiers, fields, or settings violate the contract.
+        If the schema, identifiers, fields, settings or config name violate the contract.
     ValueError
         If a referenced semantic identifier is not registered.
 
     Notes
     -----
-    Logical Dataset references are resolved once here and persisted as exact IDs
-    plus immutable bounded evidence. Exact Dataset IDs remain accepted.
+    Exact Dataset IDs and resolved Evaluation assignments are persisted before
+    training; manifests and payloads are admitted by the Dataset owner. The layout
+    is a pure function of the resolved config, ``source`` and ``run.revision``.
 
     """
     if not isinstance(user_config, Mapping):
@@ -1934,16 +1566,19 @@ def resolve_config(
     except ValueError as error:
         msg = f"config.task: {error}"
         raise ConfigError(msg) from error
+    if source.task != task_id:
+        msg = (
+            f"Task config path mismatch for {source.family}/{source.name}: source task is {source.task!r}, "
+            f"but config task is {task_id!r}. Move the YAML or set its task to {source.task!r}."
+        )
+        raise ConfigError(msg)
     authored_data = _as_mapping(user_config.get("data"), path="data")
-    missing_dataset_ids = [key for key in ("train_dataset", "ood_datasets") if key not in authored_data]
+    required_selection_keys = ("train_dataset",)
+    missing_dataset_ids = [key for key in required_selection_keys if key not in authored_data]
     if missing_dataset_ids:
         msg = f"Experiment data must explicitly select Dataset identities; missing={missing_dataset_ids}."
         raise ConfigError(msg)
-    if (
-        isinstance(naming_schema_version, bool)
-        or not isinstance(naming_schema_version, int)
-        or naming_schema_version not in {_LEGACY_RUN_NAMING_SCHEMA_VERSION, RUN_NAMING_SCHEMA_VERSION}
-    ):
+    if type(naming_schema_version) is not int or naming_schema_version != RUN_NAMING_SCHEMA_VERSION:
         msg = f"Unsupported requested run naming schema version: {naming_schema_version!r}."
         raise ConfigError(msg)
 
@@ -1955,9 +1590,6 @@ def resolve_config(
     _resolve_dataset_selections(
         effective,
         authored_data=authored_data,
-        task=task_id,
-        storage_root=storage_root,
-        pinned_dataset_references=pinned_dataset_references,
     )
     is_transient = task_id == "transient_drying"
     if is_transient:
@@ -2023,21 +1655,19 @@ def resolve_config(
     effective["paths"] = {
         "project_root": str(common.paths.get_project_root()),
         "storage_root": str(common.paths.get_storage_root(storage_root=storage_root)),
-        "dataset_metadata_root": str(common.paths.get_dataset_metadata_root(storage_root=storage_root)),
-        "dataset_root": str(common.paths.get_dataset_packages_root(storage_root=storage_root)),
+        "dataset_root": str(common.paths.get_datasets_root(storage_root=storage_root)),
         "output_root": str(common.paths.get_experiments_root(storage_root=storage_root)),
     }
-    run = _as_mapping(effective["run"], path="run")
-    run["name"] = generate_run_name(effective)
+    if output_root is not None:
+        effective["paths"]["output_root"] = str(Path(output_root).expanduser())
+    config_naming.validate_config_name(source, effective)
+    effective = _derive_layout(effective, source, a0_id=None, branch_id=None, stage=None, pair=None, trial=None)
+    run = effective["run"]
     try:
         common.paths.validate_logical_name(run["name"], label="run.name")
     except ValueError as error:
         raise ConfigError(str(error)) from error
     effective["run"] = run
-    if naming_schema_version == _LEGACY_RUN_NAMING_SCHEMA_VERSION:
-        effective["run"].pop("revision", None)
-        effective["run"].pop("naming_schema_version", None)
-        effective["data"].pop("dataset_references", None)
     return effective
 
 
@@ -2086,7 +1716,7 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
     return task
 
 
-def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
+def validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identity: bool = True) -> dict[str, Any]:
     """
     Validate and return an isolated canonical resolved experiment config.
 
@@ -2094,6 +1724,11 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     ----------
     config : Mapping[str, Any]
         Fully resolved candidate, commonly loaded from a saved ``config.yaml``.
+    verify_layout_identity : bool, optional
+        Recompute the layout identity (model label, ``a0_id`` against the allocation
+        digest) with the running scientific implementation. ``False`` keeps the
+        structural checks only; use it where the implementation that will execute the
+        config is not yet known, never to admit execution.
 
     Returns
     -------
@@ -2112,6 +1747,41 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     device and never rewrites the supplied mapping.
 
     """
+    return _validate_resolved_config(config, verify_layout_identity=verify_layout_identity)
+
+
+def validate_saved_artifact_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate a persisted configuration for reading already-published predictions.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Saved resolved configuration whose exact bytes are bound by its run bundle.
+
+    Returns
+    -------
+    dict[str, Any]
+        Isolated configuration with admitted task, schema, semantic sections,
+        paths and structural layout. The saved run validator additionally binds
+        the initial layout to the persisted checkpoint identity.
+
+    Raises
+    ------
+    ConfigError
+        If a saved semantic or structural contract is inconsistent.
+
+    Notes
+    -----
+    This entrypoint does not admit model execution. Resume and new inference
+    require the current scientific implementation through validate_resolved_config.
+    No historical implementation digest or run layout is regenerated or rewritten.
+
+    """
+    return _validate_resolved_config(config, verify_layout_identity=False)
+
+
+def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identity: bool) -> dict[str, Any]:
+    """Validate shared saved schema/semantics and, on request, the live layout identity."""
     if not isinstance(config, Mapping):
         msg = "Resolved experiment config must be a mapping."
         raise ConfigError(msg)
@@ -2169,7 +1839,8 @@ def validate_resolved_config(config: Mapping[str, Any]) -> dict[str, Any]:
     _validate_evaluation(effective, task=task)
     _validate_runtime_sections(effective, require_derived_tracking=True)
     get_resolved_objective(effective)
-    expected_run_name = generate_run_name(effective)
+    _validate_run_layout(effective, verify_identity=verify_layout_identity)
+    expected_run_name = config_naming.run_name(effective["run"]["layout"])
     if effective["run"]["name"] != expected_run_name:
         msg = f"Resolved run.name must equal the canonical generated leaf {expected_run_name!r}."
         raise ConfigError(msg)
@@ -2202,14 +1873,17 @@ def load_and_resolve_config(yaml_path: Path | str) -> dict[str, Any]:
         Fully resolved semantic configuration.
 
     """
-    raw = load_yaml(yaml_path)
-    resolved = resolve_config(raw)
-    validate_task_directory_identity(
-        yaml_path,
-        raw_task=raw.get("task"),
-        resolved_task=resolved.get("task"),
-    )
-    return resolved
+    raw = load_authored_config(yaml_path)
+    return resolve_config(raw, source=config_naming.config_source_from_path(yaml_path))
+
+
+def _effective_num_workers(configured: int) -> int:
+    """Cap the configured loader workers at the CPUs this process may use and report the cap once when it applies."""
+    available = len(os.sched_getaffinity(0))
+    effective = min(configured, available)
+    if effective < configured:
+        print(f"data workers {effective} of {configured} configured ({available} CPUs)", flush=True)
+    return effective
 
 
 def create_dataloaders_from_config(
@@ -2219,6 +1893,7 @@ def create_dataloaders_from_config(
     data_processor: Any | None = None,
     seed_plan: Mapping[str, int] | None = None,
     startup_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
+    split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """
     Create current dataloaders after validating the resolved task contract.
@@ -2236,6 +1911,8 @@ def create_dataloaders_from_config(
         ``run.seed`` for isolated direct loader callers.
     startup_callback : Callable or None, optional
         Presentation-owned receiver for bounded semantic startup events.
+    split_persist_callback : Callable or None, optional
+        Persist resolved Experiment membership before fitting train-only scalers.
 
     Returns
     -------
@@ -2257,6 +1934,7 @@ def create_dataloaders_from_config(
     """
     task = validate_resolved_task_contract(config)
     data_cfg = _as_mapping(config.get("data"), path="data")
+    num_workers = _effective_num_workers(data_cfg["num_workers"])
     if task.id == "transient_drying":
         tensorizer = TransientTensorizerSpec.from_mapping(
             {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
@@ -2265,14 +1943,15 @@ def create_dataloaders_from_config(
         run_seed = int(config["run"]["seed"])
         settings = datasets.runtime.factory.LoaderSettings(
             batch_size=data_cfg["batch_size"],
-            num_workers=data_cfg["num_workers"],
+            num_workers=num_workers,
             pin_memory=data_cfg["pin_memory"],
             persistent_workers=data_cfg["persistent_workers"],
             hdf5_cache_size=data_cfg["hdf5_cache_size"],
         )
         loaders = datasets.runtime.transient_training.create_transient_training_loaders(
             train_dataset_id=data_cfg["train_dataset"],
-            ood_dataset_ids=data_cfg["ood_datasets"],
+            additional_evaluation_dataset_ids=data_cfg["additional_evaluation_datasets"],
+            additional_evaluation_fraction=data_cfg["additional_evaluation_fraction"],
             tensorizer=tensorizer,
             train_sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
             loader_settings=settings,
@@ -2281,18 +1960,17 @@ def create_dataloaders_from_config(
             transient_backend_required=data_cfg["transient_backend_required"],
             spatial_stride=data_cfg["spatial_stride"],
             scale_mode=config["scaling"]["mode"],
-            split_seed=seeds.get("split", run_seed),
             loader_seed=seeds.get("loader", run_seed),
             worker_seed=seeds.get("worker", run_seed),
             saved_split=split_indices,
             restored_scaling_artifact=data_processor,
-            allow_technical_smoke=data_cfg["allow_technical_smoke"],
             startup_callback=startup_callback,
+            split_persist_callback=split_persist_callback,
         )
         return {
             "train": loaders.train,
             "eval": loaders.evaluation,
-            "ood": loaders.ood,
+            "additional_evaluation": loaders.additional_evaluation,
             "id_test": loaders.id_test,
             "data_processor": loaders.scaling_artifact,
             "split_indices": loaders.split,
@@ -2301,44 +1979,28 @@ def create_dataloaders_from_config(
             "runtime_provenance": loaders.runtime_provenance,
             "tensorizer": tensorizer,
         }
-    dataset_root = Path(config["paths"]["dataset_root"])
-
-    train_dataset_name = common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset")
-    ood_dataset_names = _ood_datasets(data_cfg, path="data")
-
-    path_train = common.paths.resolve_dataset_path(train_dataset_name, dataset_root=dataset_root)
-    paths_test_ood = tuple(common.paths.resolve_dataset_path(dataset_name, dataset_root=dataset_root) for dataset_name in ood_dataset_names)
     seeds = dict(seed_plan or {})
     run_seed = int(config["run"]["seed"])
-    train_loader, test_loaders, normalizer, split_indices = datasets.runtime.training.create_dataloaders(
-        path_train=str(path_train),
-        path_test_ood=tuple(str(path) for path in paths_test_ood),
+    train_loader, evaluation_loaders, normalizer, split_indices = datasets.runtime.training.create_dataloaders(
+        train_dataset_id=common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset"),
+        additional_evaluation_dataset_ids=tuple(data_cfg["additional_evaluation_datasets"]),
         task=task,
-        train_dataset_id=train_dataset_name,
-        ood_dataset_id=ood_dataset_names,
-        train_ratio=data_cfg["train_ratio"],
-        ood_fraction=data_cfg["ood_fraction"],
+        storage_root=common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]),
         batch_size=data_cfg["batch_size"],
-        num_workers=data_cfg["num_workers"],
+        num_workers=num_workers,
         pin_memory=data_cfg["pin_memory"],
         persistent_workers=data_cfg["persistent_workers"],
-        split_seed=seeds.get("split", run_seed),
         loader_seed=seeds.get("loader", run_seed),
         worker_seed=seeds.get("worker", run_seed),
         split_indices=split_indices,
         data_processor=data_processor,
+        split_persist_callback=split_persist_callback,
     )
-    eval_loader = test_loaders.get("eval")
-    if eval_loader is None:
-        msg = "No evaluation dataloader was created."
-        raise ConfigError(msg)
-    result = {
+    return {
         "train": train_loader,
-        "eval": eval_loader,
-        "ood": test_loaders["ood"],
+        "eval": evaluation_loaders["eval"],
+        "id_test": evaluation_loaders["id_test"],
+        "additional_evaluation": evaluation_loaders["additional_evaluation"],
         "data_processor": normalizer,
         "split_indices": split_indices,
     }
-    if "id_test" in test_loaders:
-        result["id_test"] = test_loaders["id_test"]
-    return result

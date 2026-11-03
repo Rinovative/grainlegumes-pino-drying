@@ -1,7 +1,4 @@
-"""
-evaluation_plot_error_behavior.py
-
-Render predictive-error views from current session reducers.
+"""Render predictive-error views from current session reducers.
 
 Responsibilities:
   - Compare secondary relative L2 and H1 metrics without redefining the objective
@@ -35,6 +32,9 @@ from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_field_maps as field_maps
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -300,6 +300,7 @@ def _map_figure(
     metric_label: str,
     title: str,
     relative_percent: bool = False,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Render one four-row spatial statistic family."""
     dataframe.validate_comparison(datasets)
@@ -311,27 +312,35 @@ def _map_figure(
         {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
     )
     figure, axes = layout.map_subplots(rows=len(fields), columns=len(datasets))
-    for column, (label, frame) in enumerate(datasets.items()):
-        summary = summaries[id(frame)]
-        x_min, x_max, y_min, y_max = summary.grid.extent
-        for row, field in enumerate(fields):
-            values = _full_array(summary, field, attribute)
-            if relative_percent:
-                values = values * 100.0
-            upper = max(float(np.nanpercentile(values, 99.5)), np.finfo(float).eps)
-            displayed = np.ma.masked_greater(values, upper)
+    for row, field in enumerate(fields):
+        full = {
+            label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) for label, frame in datasets.items()
+        }
+        definition = field_maps.build_field_map(
+            np.concatenate([values.ravel() for values in full.values()]),
+            semantic=field_maps.FieldMapSemantic.RELATIVE_ERROR if relative_percent else field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+            field=field.key,
+            unit="%" if relative_percent else field.unit,
+            display_transform=metric_label,
+            comparison_scope="selected Evaluation models",
+            bound_policy="full selected model/case grids",
+        )
+        for column, (label, frame) in enumerate(datasets.items()):
+            summary = summaries[id(frame)]
+            values = full[label]
+            indices = display_grid.display_indices(values.shape, display_spatial_stride)
+            x_grid, y_grid = summary.grid.coordinates
             image = axes[row, column].contourf(
-                np.linspace(x_min, x_max, values.shape[1]),
-                np.linspace(y_min, y_max, values.shape[0]),
-                displayed,
-                levels=np.linspace(0.0, upper, 11),
-                cmap="magma",
+                display_grid.display_sample(x_grid, indices),
+                display_grid.display_sample(y_grid, indices),
+                display_grid.display_sample(values, indices),
+                **definition.contourf_kwargs(),
             )
             heading = count_headings[label] or label
             prefix = f"{heading}\n" if row == 0 else ""
             axes[row, column].set_title(f"{prefix}{field.matplotlib_label} {metric_label}", fontsize=11)
             axes[row, column].set_aspect("equal")
-            layout.add_map_colorbar(figure, image, axes[row, column])
+            layout.add_map_colorbar(figure, image, axes[row, column], label="%" if relative_percent else field.unit)
     first_summary = summaries[id(next(iter(datasets.values())))]
     layout.apply_map_grid_axis_labels(
         axes,
@@ -346,9 +355,12 @@ def plot_mean_error_maps(
     *,
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
-    error_mode: str = "MAE",
+    error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
-    """Plot current MAE or field-RMS-relative mean maps in the fixed layout."""
+    """Plot one selected mean-error representation in the fixed layout."""
+    if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
+        return _plot_normalized_mean_error_maps(datasets=datasets, max_cases=max_cases, display_spatial_stride=display_spatial_stride)
     if error_mode == "MAE":
         return _map_figure(
             datasets=datasets,
@@ -356,6 +368,7 @@ def plot_mean_error_maps(
             attribute="absolute_error_mean",
             metric_label="MAE",
             title="Mean absolute error maps",
+            display_spatial_stride=display_spatial_stride,
         )
     if error_mode == "Relative [%]":
         return _map_figure(
@@ -365,15 +378,77 @@ def plot_mean_error_maps(
             metric_label="relative error [% of reference RMS]",
             title="Mean relative error maps",
             relative_percent=True,
+            display_spatial_stride=display_spatial_stride,
         )
-    msg = "error_mode must be 'MAE' or 'Relative [%]'."
+    msg = f"error_mode must be one of {error_diagnostics.STEADY_ERROR_MODES}."
     raise ValueError(msg)
+
+
+def _plot_normalized_mean_error_maps(
+    *, datasets: Mapping[str, pd.DataFrame], max_cases: int, display_spatial_stride: display_grid.DisplayStride
+) -> Figure:
+    """Use complete-grid mean absolute errors and one common train-only scale."""
+    dataframe.validate_comparison(datasets)
+    fields = _display_fields(datasets)
+    with sessions.scoped_session(datasets) as active_session:
+        summaries = {id(frame): active_session.full_summary(frame, max_cases).require_spatial() for frame in datasets.values()}
+    figure, axes = layout.map_subplots(rows=len(fields), columns=len(datasets))
+    for row, field in enumerate(fields):
+        scales = [
+            error_diagnostics.steady_reference_scale(dataframe.require_complete_provenance(frame), field=field.key, unit=field.unit)
+            for frame in datasets.values()
+        ]
+        reason = next((item for item in scales if isinstance(item, str)), None)
+        if reason is None:
+            try:
+                common_scale = error_diagnostics.require_common_reference_scale(cast("list[error_diagnostics.ReferenceScale]", scales))
+            except ValueError as error:
+                reason = str(error)
+        if reason is None:
+            all_values = [_full_array(summaries[id(other)], field, "absolute_error_mean") / common_scale.value for other in datasets.values()]
+            definition = field_maps.build_field_map(
+                np.concatenate([item.ravel() for item in all_values] + [np.array((0.0, 1.0))]),
+                semantic=field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+                field=field.key,
+                unit="1",
+                display_transform="train_state_std_normalized_absolute_error",
+                comparison_scope=common_scale.dataset_identity,
+                locked_boundaries=np.linspace(0.0, 1.0, 12),
+                bound_policy="fixed 0..1 with extension",
+            )
+        for column, (label, frame) in enumerate(datasets.items()):
+            axis = axes[row, column]
+            axis.set_title(f"{field.matplotlib_label} normalized absolute error [1]" + (f"\n{label}" if row == 0 else ""))
+            if reason is not None:
+                axis.text(0.5, 0.5, f"Unavailable: {reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
+                continue
+            summary = summaries[id(frame)]
+            values = _full_array(summary, field, "absolute_error_mean") / common_scale.value
+            indices = display_grid.display_indices(values.shape, display_spatial_stride)
+            x_grid, y_grid = summary.grid.coordinates
+            image = axis.contourf(
+                display_grid.display_sample(x_grid, indices),
+                display_grid.display_sample(y_grid, indices),
+                display_grid.display_sample(values, indices),
+                **definition.contourf_kwargs(),
+            )
+            axis.set_aspect("equal")
+            layout.add_map_colorbar(figure, image, axis, label="1 (train state std; >1 extended)")
+    first_summary = summaries[id(next(iter(datasets.values())))]
+    layout.apply_map_grid_axis_labels(
+        axes,
+        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
+        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
+    )
+    figure.suptitle("Mean normalized absolute error maps")
+    return figure
 
 
 def plot_std_error_maps(
     *,
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int = _DEFAULT_CASE_LIMIT,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
     """Plot current signed-error standard deviation in the fixed layout."""
     return _map_figure(
@@ -382,6 +457,7 @@ def plot_std_error_maps(
         attribute="signed_error_std",
         metric_label="STD error",
         title="Error standard-deviation maps",
+        display_spatial_stride=display_spatial_stride,
     )
 
 
@@ -490,89 +566,4 @@ def plot_boundary_error_decomposition(
     legend_axis.legend(bar_handles, _BAND_LABELS, title="x-distance from left/right boundary", loc="upper left")
     figure.subplots_adjust(top=0.87, bottom=0.07, left=0.001, right=0.98, wspace=0.25)
     layout.title_over_axes(figure, figure_title, axes, y=0.97)
-    return figure
-
-
-def plot_error_maps(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Retain a compact direct-call four-statistic diagnostic outside panel scope."""
-    dataframe.validate_comparison(datasets)
-    fields = _display_fields(datasets)
-    with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame).require_spatial() for frame in datasets.values()}
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Error map diagnostics",
-        {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
-    )
-    rows = [(label, frame, field) for label, frame in datasets.items() for field in fields]
-    figure, axes = layout.map_subplots(rows=len(rows), columns=4)
-    attributes = (
-        ("signed_error_mean", "mean signed error", "coolwarm"),
-        ("absolute_error_mean", "mean absolute error", "magma"),
-        ("signed_error_std", "signed-error standard deviation", "magma"),
-        ("absolute_error_q90", "q90 absolute error", "magma"),
-    )
-    for row, (label, frame, field) in enumerate(rows):
-        summary = summaries[id(frame)]
-        for column, (attribute, title, cmap) in enumerate(attributes):
-            values = _full_array(summary, field, attribute)
-            limit = max(float(np.max(np.abs(values))), np.finfo(float).eps)
-            low = -limit if attribute == "signed_error_mean" else 0.0
-            image = axes[row, column].imshow(values, origin="lower", extent=summary.grid.extent, aspect="equal", cmap=cmap, vmin=low, vmax=limit)
-            heading = count_headings[label] or label
-            axes[row, column].set_title(f"{heading} — {field.matplotlib_label} {title}", fontsize=8)
-            layout.add_map_colorbar(figure, image, axes[row, column])
-    first_summary = summaries[id(next(iter(datasets.values())))]
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
-        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
-    )
-    figure.suptitle(figure_title)
-    return figure
-
-
-def plot_mean_spatial_fields(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """Retain direct current reference/prediction/bias spatial diagnostics."""
-    dataframe.validate_comparison(datasets)
-    fields = _display_fields(datasets)
-    with sessions.scoped_session(datasets) as active_session:
-        summaries = {id(frame): active_session.full_summary(frame).require_spatial() for frame in datasets.values()}
-    figure_title, count_headings = layout.aggregate_title_context(
-        "Mean spatial fields",
-        {label: summaries[id(frame)].sample_count for label, frame in datasets.items()},
-    )
-    rows = [(label, frame, field) for label, frame in datasets.items() for field in fields]
-    figure, axes = layout.map_subplots(rows=len(rows), columns=3)
-    for row, (label, frame, field) in enumerate(rows):
-        summary = summaries[id(frame)]
-        reference = _full_array(summary, field, "reference_mean")
-        prediction = _full_array(summary, field, "prediction_mean")
-        bias = prediction - reference
-        low = float(min(np.min(reference), np.min(prediction)))
-        high = float(max(np.max(reference), np.max(prediction)))
-        if np.isclose(low, high):
-            high += np.finfo(float).eps
-        for column, values, title, cmap, vmin, vmax in (
-            (0, reference, "mean reference", "viridis", low, high),
-            (1, prediction, "mean prediction", "viridis", low, high),
-            (
-                2,
-                bias,
-                "mean prediction - reference",
-                "coolwarm",
-                -max(np.max(np.abs(bias)), np.finfo(float).eps),
-                max(np.max(np.abs(bias)), np.finfo(float).eps),
-            ),
-        ):
-            image = axes[row, column].imshow(values, origin="lower", extent=summary.grid.extent, aspect="equal", cmap=cmap, vmin=vmin, vmax=vmax)
-            heading = count_headings[label] or label
-            axes[row, column].set_title(f"{heading} — {field.matplotlib_label} {title}", fontsize=8)
-            layout.add_map_colorbar(figure, image, axes[row, column])
-    first_summary = summaries[id(next(iter(datasets.values())))]
-    layout.apply_map_grid_axis_labels(
-        axes,
-        x_label=f"x [{first_summary.grid.coordinate_units[0]}]",
-        y_label=f"y [{first_summary.grid.coordinate_units[1]}]",
-    )
-    figure.suptitle(figure_title)
     return figure

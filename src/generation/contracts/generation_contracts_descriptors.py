@@ -1,15 +1,14 @@
-"""
-generation_contracts_descriptors.py
+"""Expose stable read-only generation schema descriptors across package boundaries.
 
-Expose stable read-only generation schema descriptors across package boundaries.
 Responsibilities:
   - Describe canonical profile fields and units without exposing module layout
-  - Expose supported profile, material, role, regime, and OOD-group vocabulary
-  - Validate source-commit provenance through one public contract boundary
+  - Expose supported profile, regime, and membership vocabulary
+
 Design principles:
   - Descriptors are derived from the authoritative Generation schema owners
   - Dataset consumers depend on immutable contracts rather than implementation files
   - Scientific values and active campaign selections remain resolved configuration
+
 This module does NOT:
   - Load campaigns, generate cases, validate HDF5 payloads, or execute workflows
   - Duplicate configured material roles, counts, seeds, or package requests
@@ -20,13 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypeAlias
 
-from . import generation_contracts_materials as materials
 from . import generation_contracts_profiles as profiles
-from . import generation_contracts_source as source
 from . import generation_contracts_vocabulary as vocabulary
 
-IdMembership: TypeAlias = vocabulary.IdMembership
-EvaluationRegime: TypeAlias = vocabulary.EvaluationRegime
+IdMembership: TypeAlias = vocabulary.IdMembership  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
+EvaluationRegime: TypeAlias = vocabulary.EvaluationRegime  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,26 +113,11 @@ def available_profile_ids() -> tuple[str, ...]:
     return profiles.available_profiles()
 
 
-def available_material_families() -> tuple[str, ...]:
-    """Return the role-neutral configured-material vocabulary."""
-    return materials.available_material_families()
-
-
 def evaluation_regimes() -> tuple[str, ...]:
     """Return the canonical package evaluation-regime vocabulary."""
     return vocabulary.EVALUATION_REGIMES
 
 
-def material_roles() -> tuple[str, ...]:
-    """Return the canonical campaign material-role vocabulary."""
-    return vocabulary.MATERIAL_ROLES
-
-
 def id_memberships() -> tuple[str, ...]:
     """Return the canonical learned in-distribution membership vocabulary."""
     return vocabulary.ID_MEMBERSHIPS
-
-
-def validate_git_commit(value: object) -> str:
-    """Return one exact full lowercase source-commit identifier."""
-    return source.validate_git_commit(value)

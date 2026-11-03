@@ -1,7 +1,4 @@
-"""
-evaluation_presentation.py
-
-Expose small, current-native presentation data shared by evaluation views.
+"""Expose small, current-native presentation data shared by evaluation views.
 
 Responsibilities:
   - Map canonical TaskSpec fields and vector groups to concise display fields
@@ -249,14 +246,6 @@ def case_field(
     return np.sqrt(np.sum(values[np.asarray(indices)] ** 2, axis=0))
 
 
-def case_error(
-    case: EvaluationCase,
-    field: DisplayField,
-) -> np.ndarray:
-    """Return prediction minus reference for one canonical display field."""
-    return case_field(case, field, source="prediction") - case_field(case, field, source="reference")
-
-
 def display_grid(case: EvaluationCase) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return equally spaced 1-D and mesh coordinates from admitted extent/shape."""
     height, width = case.shape
@@ -356,15 +345,6 @@ def metadata_label(column: str) -> str:
         if column.startswith(prefix):
             return column[len(prefix) :]
     return column
-
-
-def metadata_group(column: str) -> str:
-    """Return the canonical scientific generation group for one parameter."""
-    try:
-        return _PARAMETER_BY_COLUMN[column].group
-    except KeyError as error:
-        msg = f"Unsupported metadata parameter {column!r}."
-        raise ValueError(msg) from error
 
 
 def reference_case_position(frame: pd.DataFrame, parameters: Sequence[str] | None = None) -> int:

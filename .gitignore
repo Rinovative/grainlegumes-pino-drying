@@ -4,6 +4,10 @@
 /mlenv/
 /.claude/
 /.codex/
+/.agents/project/
+# Codex reviewer instructions and the human project views stay local.
+/AGENTS.md
+/.project/
 /_llm_workflow/
 
 # ================================
@@ -64,6 +68,8 @@ slurm-*.err
 *.pid
 # ================================
 # Generated data
+# Durable scientific outputs belong in sibling storage, never the checkout.
+/storage/
 # ================================
 
 # ================================

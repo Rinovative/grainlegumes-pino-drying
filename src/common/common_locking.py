@@ -1,10 +1,7 @@
-"""
-common_locking.py
-
-Coordinate exclusive filesystem writers with process-scoped advisory locks.
+"""Coordinate exclusive filesystem writers with process-scoped advisory locks.
 
 Responsibilities:
-  - Acquire re-entrant exclusive locks on persistent lock files
+  - Acquire shared reader locks and re-entrant exclusive writer locks on persistent lock files
   - Support blocking serialization and fail-fast writer leases
   - Release locks automatically on exceptions and process exit
   - Close inherited lock descriptors in forked child processes
@@ -28,12 +25,12 @@ import os
 import stat
 import threading
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from contextlib import AbstractContextManager
 
 
 class FileLockUnavailableError(RuntimeError):
@@ -46,19 +43,11 @@ class FileLockUnavailableError(RuntimeError):
     """
 
 
-@dataclass
-class _HeldLock:
-    """One thread-owned advisory lock and its re-entrant depth."""
-
-    descriptor: int
-    depth: int = 1
-
-
 class _ThreadLockState(threading.local):
     """Per-thread re-entrant lock ownership."""
 
     def __init__(self) -> None:
-        self.locks: dict[Path, _HeldLock] = {}
+        self.locks: set[Path] = set()
 
 
 _THREAD_LOCK_STATE = _ThreadLockState()
@@ -119,9 +108,14 @@ def _open_lock_file(path: Path) -> int:
 
 def file_lock_is_active(path: Path | str) -> bool:
     """Return whether an existing regular lock file is currently held, without creating it."""
-    lock_path = Path(path).expanduser().resolve(strict=False)
-    if not lock_path.is_file():
+    lock_path = Path(path).expanduser().absolute()
+    try:
+        marker_mode = lock_path.lstat().st_mode
+    except FileNotFoundError:
         return False
+    if not stat.S_ISREG(marker_mode):
+        msg = f"Lock path is not a regular file: {lock_path}"
+        raise OSError(msg)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(lock_path, flags)
@@ -132,7 +126,9 @@ def file_lock_is_active(path: Path | str) -> bool:
             msg = f"Lock path is not a regular file: {lock_path}"
             raise OSError(msg)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Every writer lease is exclusive; a shared probe also works on a
+            # readable marker that cannot be opened for writing.
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError as error:
             if error.errno in {errno.EACCES, errno.EAGAIN}:
                 return True
@@ -144,44 +140,39 @@ def file_lock_is_active(path: Path | str) -> bool:
 
 
 @contextmanager
-def shared_file_lock(
+def _hold_file_lock(
     path: Path | str,
     *,
+    operation: int,
     blocking: bool,
+    contention_message: str,
 ) -> Iterator[Path]:
-    """Hold a shared advisory reader lock, optionally failing on an active writer."""
+    """Hold one advisory lock of the given ``flock`` kind; re-entry in the owning thread yields at once."""
     lock_path = Path(path).expanduser().resolve(strict=False)
-    held = _THREAD_LOCK_STATE.locks.get(lock_path)
-    if held is not None:
-        held.depth += 1
-        try:
-            yield lock_path
-        finally:
-            held.depth -= 1
+    if lock_path in _THREAD_LOCK_STATE.locks:
+        yield lock_path
         return
 
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with _OPEN_LOCK_DESCRIPTORS_GUARD:
         descriptor = _open_lock_file(lock_path)
         _OPEN_LOCK_DESCRIPTORS.add(descriptor)
-    operation = fcntl.LOCK_SH if blocking else fcntl.LOCK_SH | fcntl.LOCK_NB
     try:
-        fcntl.flock(descriptor, operation)
+        fcntl.flock(descriptor, operation if blocking else operation | fcntl.LOCK_NB)
     except OSError as error:
         with _OPEN_LOCK_DESCRIPTORS_GUARD:
             _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
             os.close(descriptor)
         if error.errno in {errno.EACCES, errno.EAGAIN}:
-            msg = f"Shared file lock is blocked by an active writer: {lock_path}"
+            msg = f"{contention_message}: {lock_path}"
             raise FileLockUnavailableError(msg) from error
         raise
 
-    held = _HeldLock(descriptor=descriptor)
-    _THREAD_LOCK_STATE.locks[lock_path] = held
+    _THREAD_LOCK_STATE.locks.add(lock_path)
     try:
         yield lock_path
     finally:
-        del _THREAD_LOCK_STATE.locks[lock_path]
+        _THREAD_LOCK_STATE.locks.remove(lock_path)
         with _OPEN_LOCK_DESCRIPTORS_GUARD:
             _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
             try:
@@ -190,12 +181,25 @@ def shared_file_lock(
                 os.close(descriptor)
 
 
-@contextmanager
+def shared_file_lock(
+    path: Path | str,
+    *,
+    blocking: bool,
+) -> AbstractContextManager[Path]:
+    """Hold a shared advisory reader lock, optionally failing on an active writer."""
+    return _hold_file_lock(
+        path,
+        operation=fcntl.LOCK_SH,
+        blocking=blocking,
+        contention_message="Shared file lock is blocked by an active writer",
+    )
+
+
 def exclusive_file_lock(
     path: Path | str,
     *,
     blocking: bool,
-) -> Iterator[Path]:
+) -> AbstractContextManager[Path]:
     """
     Hold an exclusive advisory lock for the duration of one context.
 
@@ -227,41 +231,9 @@ def exclusive_file_lock(
     are released when the context exits, including during exception unwinding.
 
     """
-    lock_path = Path(path).expanduser().resolve(strict=False)
-    held = _THREAD_LOCK_STATE.locks.get(lock_path)
-    if held is not None:
-        held.depth += 1
-        try:
-            yield lock_path
-        finally:
-            held.depth -= 1
-        return
-
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with _OPEN_LOCK_DESCRIPTORS_GUARD:
-        descriptor = _open_lock_file(lock_path)
-        _OPEN_LOCK_DESCRIPTORS.add(descriptor)
-    operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-    try:
-        fcntl.flock(descriptor, operation)
-    except OSError as error:
-        with _OPEN_LOCK_DESCRIPTORS_GUARD:
-            _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
-            os.close(descriptor)
-        if error.errno in {errno.EACCES, errno.EAGAIN}:
-            msg = f"Exclusive file lock is already held: {lock_path}"
-            raise FileLockUnavailableError(msg) from error
-        raise
-
-    held = _HeldLock(descriptor=descriptor)
-    _THREAD_LOCK_STATE.locks[lock_path] = held
-    try:
-        yield lock_path
-    finally:
-        del _THREAD_LOCK_STATE.locks[lock_path]
-        with _OPEN_LOCK_DESCRIPTORS_GUARD:
-            _OPEN_LOCK_DESCRIPTORS.discard(descriptor)
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
+    return _hold_file_lock(
+        path,
+        operation=fcntl.LOCK_EX,
+        blocking=blocking,
+        contention_message="Exclusive file lock is already held",
+    )

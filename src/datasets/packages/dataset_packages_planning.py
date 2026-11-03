@@ -1,923 +1,155 @@
-# ruff: noqa: TRY003, EM101, EM102, TRY004
-"""
-dataset_packages_planning.py
+"""Admit ordered source cases and prepare one role-neutral Dataset package.
 
-Plan Dataset package sources, eligibility, and case membership.
 Responsibilities:
-  - Resolve declared campaign package sources through terminal evidence
-  - Select duplicate physical inputs and deterministic ID membership
-  - Audit steady conditioning and view-specific parameter-OOD eligibility
-  - Reject leakage across ID training and OOD source selections
+  - Resolve exact successful source references through Generation admission
+  - Reject repeated physical cases and incompatible grid or view evidence
+  - Preserve complete source design provenance and selected membership
+  - Bind each contributing Source's replacement policy and all candidate outcomes to the selection
+
 Design principles:
-  - Generation alone admits terminal publication and artifact integrity
-  - Selection is deterministic and independent of payload publication
-  - View relevance comes from immutable Dataset and Generation contracts
+  - Generation alone owns source success, failure, and physical publication
+  - Dataset membership is immutable and independent of experiment roles
+  - Preview and publication use the same admitted plan
+
 This module does NOT:
-  - Build payloads, compute package identities, publish artifacts, or expose a CLI
-  - Load runtime Dataset objects or fit preprocessing
+  - Assign train, validation, test, or OOD roles
+  - Persist package payloads or fit experiment preprocessing
 """
 
 from __future__ import annotations
 
 import copy
 import hashlib
-import json
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
-from src import common, domain, generation
+import h5py
+import numpy as np
+
+from src import common
 from src.datasets.contracts import dataset_contracts_views as views
+from src.generation.publication import generation_publication_catalog as catalog
+
+from . import dataset_packages_selection as selection
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
     from pathlib import Path
 
-_ID_MEMBERSHIP_ROLES: Final = views.ID_MEMBERSHIPS
-_STEADY_PROFILE_CONTRACT: Final = generation.contracts.get_profile_contract("steady_flow")
-_TRANSIENT_PROFILE_CONTRACT: Final = generation.contracts.get_profile_contract("transient_drying")
+_GRID_AXES = 2
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class PreparedPackage:
-    """Hold one completely admitted package before payload publication."""
+    """One exact Dataset selection with validated physical source evidence."""
 
-    plan: dict[str, Any]
-    batch_records: list[dict[str, Any]]
-    candidates: list[dict[str, Any]]
-    excluded: list[dict[str, Any]]
-    membership: dict[str, list[str]]
-    source_decisions: list[dict[str, Any]]
-    steady_conditioning: dict[str, Any] | None
+    request: dict[str, Any]
+    cases: tuple[catalog.AdmittedRawCase, ...]
+    source_case_identities: tuple[dict[str, Any], ...]
+    grid: dict[str, Any]
+    source_outcomes: tuple[dict[str, Any], ...]
 
 
-def package_plan(
-    campaign: generation.cases.config.CampaignConfig,
-    dataset_view: str,
-    evaluation_regime: str,
-) -> dict[str, Any]:
-    """Return one exact declared view/regime package plan."""
-    matches = [
-        copy.deepcopy(package)
-        for package in campaign.dataset_packages
-        if package["dataset_view"] == dataset_view and package["evaluation_regime"] == evaluation_regime
-    ]
-    if len(matches) != 1:
-        message = f"Campaign {campaign.campaign_name!r} must declare exactly one {dataset_view!r}/{evaluation_regime!r} package."
-        raise ValueError(message)
-    return matches[0]
-
-
-def _source_batches(
-    campaign: generation.cases.config.CampaignConfig,
-    plan: Mapping[str, Any],
-) -> tuple[generation.cases.config.GenerationConfig, ...]:
-    """Resolve the exact source batches owned by one package regime."""
-    regime = str(plan["evaluation_regime"])
-    sampling_regime = "parameter_ood" if regime == "parameter_ood" else "natural"
-    return tuple(
-        campaign.require_batch(
-            material_family=str(material_family),
-            sampling_regime=sampling_regime,
-        )
-        for material_family in plan["materials"]
-    )
-
-
-def _global_case_id(batch_name: str, case_id: str) -> str:
-    """Return one readable package-unique source case identifier."""
-    return f"{batch_name}__{case_id}"
-
-
-def _load_candidates(
-    campaign: generation.cases.config.CampaignConfig,
-    plan: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None,
-    composite_receipt: Mapping[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Admit terminal batches or one validated composite source inventory."""
-    if composite_receipt is not None:
-        return _load_composite_candidates(
-            campaign,
-            plan,
-            storage_root=storage_root,
-            composite_receipt=composite_receipt,
-        )
-    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    batch_records: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
-    for batch in _source_batches(campaign, plan):
-        terminal = generation.runtime.admit_terminal_batch(
-            batch.batch_storage_name,
-            storage_root=storage,
-            validation_depth="routine",
-        )
-        manifest = terminal.manifest_payload()
-        if terminal.batch_identity != batch.batch_identity:
-            message = f"Terminal batch identity disagrees with campaign plan: {batch.batch_name}."
-            raise ValueError(message)
-        batch_records.append(
-            {
-                "batch_name": batch.batch_name,
-                "batch_id": batch.batch_id,
-                "batch_identity": batch.batch_identity,
-                "manifest_sha256": terminal.manifest_sha256,
-                "simulation_profile": terminal.simulation_profile,
-                "template": manifest["template"],
-                "scientific_config_digest": terminal.scientific_config_digest,
-                "git_commit": terminal.git_commit,
-                "material_config_digest": batch.scientific_values["material_config_digest"],
-                "material_role": batch.material_role,
-                "evaluation_regime": batch.evaluation_regime,
-                "natural_support_state": batch.scientific_values["natural_support_state"],
-                "operation_config_digest": batch.scientific_values["operation_config_digest"],
-                "airflow_source": terminal.airflow_source,
-                "available_learning_views": list(terminal.available_learning_views),
-                "export_contract_sha256": terminal.export_contract_sha256,
-                "steady_flow_conditioning": copy.deepcopy(batch.scientific_values["steady_flow_conditioning"]),
-            }
-        )
-        for case in terminal.cases:
-            record = case.record_payload()
-            case_payload = case.metadata_payload()
-            expected_source = {
-                "material_family": batch.material_family,
-                "material_role": batch.material_role,
-                "evaluation_regime": str(plan["evaluation_regime"]),
-                "sampling_regime": batch.sampling_regime,
-                "natural_support_state": "natural" if batch.sampling_regime == "natural" else "parameter_ood",
-            }
-            observed_source = {name: case_payload.get(name) for name in expected_source}
-            if (
-                observed_source != expected_source
-                or batch.evaluation_regime != plan["evaluation_regime"]
-                or batch.material_role != plan["source_role"]
-                or case_payload.get("ood", {}).get("natural_support_state") != expected_source["natural_support_state"]
-            ):
-                message = (
-                    f"Case {batch.batch_name}/{case.case_id} disagrees with package source-role/evaluation ownership: "
-                    f"expected={expected_source}, actual={observed_source}."
-                )
-                raise ValueError(message)
-            candidates.append(
-                {
-                    "batch": batch,
-                    "terminal_evidence": terminal,
-                    "case_evidence": case,
-                    "manifest": manifest,
-                    "record": record,
-                    "case_payload": case_payload,
-                    "batch_id": batch.batch_id,
-                    "batch_name": batch.batch_name,
-                    "case_id": case.case_id,
-                    "package_case_id": _global_case_id(batch.batch_name, case.case_id),
-                    "material_family": case.material_family,
-                    "simulation_profile": terminal.simulation_profile,
-                    "case_input_id": case.case_input_id,
-                    "simulation_case_id": case.simulation_case_id,
-                    "case_hdf5_relative": case.hdf5_path.relative_to(storage).as_posix(),
-                    "case_hdf5_sha256": case.case_hdf5_sha256,
-                }
-            )
-    return batch_records, candidates
-
-
-@dataclass(frozen=True, slots=True)
-class _CompositeBatchEvidence:
-    """Present one admitted partial parent through the generated-batch consumer contract."""
-
-    simulation_profile: str
-    available_learning_views: tuple[str, ...]
-    airflow_source: str
-    batch_id: str
-    sampling_regime: str
-    template_sha256: str
-    git_commit: str
-    cases: tuple[Any, ...]
-    _scientific_config_json: str
-
-    def case(self, case_id: str) -> Any:
-        """Return one exact case from the immutable partial-parent membership."""
-        matches = tuple(case for case in self.cases if case.case_id == case_id)
-        if len(matches) != 1:
-            raise ValueError(f"Partial batch {self.batch_id!r} has no unique case {case_id!r}.")
-        return matches[0]
-
-    def scientific_config_payload(self) -> dict[str, Any]:
-        """Return an independent mutable copy of the admitted parent science."""
-        payload = json.loads(self._scientific_config_json)
-        if not isinstance(payload, dict):
-            raise TypeError(f"Admitted scientific configuration for {self.batch_id!r} is no longer an object.")
-        return payload
-
-
-@dataclass(frozen=True, slots=True)
-class _CompositeMemberEvidence:
-    """Bind one re-admitted composite case to its actual terminal batch when present."""
-
-    case: Any
-    terminal_evidence: Any | None
-
-
-def _composite_member_evidence(
-    member: Mapping[str, Any],
-    batch: generation.cases.config.GenerationConfig,
-    *,
-    storage_root: Path,
-) -> _CompositeMemberEvidence:
-    """Re-admit one case and retain its actual terminal source owner when present."""
-    source_kind = member.get("source_kind")
-    source_run_id = common.paths.validate_logical_name(member.get("source_run_id"), label="source_run_id")
-    source_manifest_path = generation.publication.campaign_evidence.campaign_run_manifest_path(
-        source_run_id,
-        storage_root=storage_root,
-    )
-    source_manifest = generation.publication.campaign_evidence.load_campaign_run(
-        source_run_id,
-        storage_root=storage_root,
-    )
-    if source_manifest.get("git_commit") != member.get("source_git_commit") or common.serialization.file_sha256(source_manifest_path) != member.get(
-        "source_campaign_manifest_sha256"
-    ):
-        raise RuntimeError("Composite source campaign manifest conflicts with the immutable receipt.")
-    case_index = member.get("case_index")
-    if isinstance(case_index, bool) or not isinstance(case_index, int):
-        raise ValueError("Composite case membership has an invalid case index.")
-    terminal = None
-    if source_kind == "parent_partial":
-        case = generation.runtime.admit_completed_case(
-            batch,
-            case_index,
-            storage_root=storage_root,
-            validation_depth="routine",
-            git_commit=source_manifest["git_commit"],
-        )
-    elif source_kind == "replacement":
-        storage_name = member.get("terminal_batch_storage_name")
-        manifest_sha256 = member.get("terminal_manifest_sha256")
-        if not isinstance(storage_name, str) or not storage_name or not isinstance(manifest_sha256, str):
-            raise ValueError("Replacement composite membership lacks terminal batch storage evidence.")
-        terminal = generation.runtime.admit_terminal_batch(
-            storage_name,
-            storage_root=storage_root,
-            validation_depth="routine",
-        )
-        if terminal.manifest_sha256 != manifest_sha256 or terminal.batch_id != member.get("terminal_batch_id"):
-            raise RuntimeError("Replacement terminal batch evidence conflicts with the composite receipt.")
-        case = terminal.case(str(member.get("case_id")))
-    else:
-        raise ValueError("Composite membership has an unsupported source kind.")
-    expected = {
-        "case_id": case.case_id,
-        "case_input_id": case.case_input_id,
-        "simulation_case_id": case.simulation_case_id,
-        "success_sha256": case.success_sha256,
-        "provenance_sha256": case.provenance_sha256,
-        "case_hdf5_sha256": case.case_hdf5_sha256,
-    }
-    observed = {key: member.get(key) for key in expected}
-    case_commit = source_manifest["git_commit"] if terminal is None else terminal.git_commit
-    if observed != expected or case_commit != member.get("source_git_commit"):
-        raise RuntimeError(f"Composite receipt conflicts with re-admitted case evidence: {case.case_id!r}.")
-    return _CompositeMemberEvidence(case=case, terminal_evidence=terminal)
-
-
-def _composite_member_case(
-    member: Mapping[str, Any],
-    batch: generation.cases.config.GenerationConfig,
-    *,
-    storage_root: Path,
-) -> Any:
-    """Return one re-admitted composite case for callers that do not need source ownership."""
-    return _composite_member_evidence(member, batch, storage_root=storage_root).case
-
-
-def _composite_template_relative_path(cases: Sequence[Any]) -> str:
-    """Return the one immutable template path shared by admitted composite cases."""
-    relative_paths: set[str] = set()
-    for case in cases:
-        template = case.metadata_payload().get("template")
-        if not isinstance(template, dict):
-            message = f"Composite case {case.case_id!r} lacks immutable template metadata."
-            raise ValueError(message)
-        relative_path = template.get("relative_path")
-        if not isinstance(relative_path, str) or not relative_path:
-            message = f"Composite case {case.case_id!r} has an invalid immutable template path."
-            raise ValueError(message)
-        if template.get("sha256") != case.hdf5_identity.template_sha256:
-            message = f"Composite case {case.case_id!r} has conflicting template SHA-256 evidence."
-            raise RuntimeError(message)
-        relative_paths.add(relative_path)
-    if len(relative_paths) != 1:
-        message = f"Composite batch cases have incompatible template paths: {sorted(relative_paths)}."
-        raise RuntimeError(message)
-    return next(iter(relative_paths))
-
-
-def _load_composite_candidates(
-    campaign: generation.cases.config.CampaignConfig,
-    plan: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None,
-    composite_receipt: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Enumerate a complete parent-plus-replacement receipt through normal package selection."""
-    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    receipt = generation.publication.completion_composite.load_composite_receipt(
-        str(composite_receipt.get("completion_id", "")), storage_root=storage
-    )
-    if receipt != dict(composite_receipt):
-        raise RuntimeError("Composite receipt changed after caller admission.")
-    expected_batches = _source_batches(campaign, plan)
-    expected_ids = {batch.batch_id for batch in expected_batches}
-    members = receipt.get("source_membership")
-    if not isinstance(members, list):
-        raise ValueError("Composite receipt source membership is malformed.")
-    selected = [member for member in members if isinstance(member, dict) and member.get("batch_id") in expected_ids]
-    if len(selected) != sum(int(receipt["targets"].get(batch.batch_id, 0)) for batch in expected_batches):
-        raise ValueError("Composite receipt does not provide exact package-target membership.")
-    batch_records: list[dict[str, Any]] = []
-    candidates: list[dict[str, Any]] = []
-    for batch in expected_batches:
-        batch_members = [member for member in selected if member["batch_id"] == batch.batch_id]
-        if not batch_members:
-            raise ValueError(f"Composite receipt has no source cases for batch {batch.batch_id!r}.")
-        admitted_members = tuple(_composite_member_evidence(member, batch, storage_root=storage) for member in batch_members)
-        cases = tuple(admitted.case for admitted in admitted_members)
-        template_relative_path = _composite_template_relative_path(cases)
-        first = cases[0].hdf5_identity
-        shared_identity = (
-            first.simulation_profile,
-            first.template_sha256,
-            first.export_contract_sha256,
-            first.available_learning_views,
-            first.airflow_source,
-            first.retention_policy,
-        )
-        if any(
-            (
-                case.hdf5_identity.simulation_profile,
-                case.hdf5_identity.template_sha256,
-                case.hdf5_identity.export_contract_sha256,
-                case.hdf5_identity.available_learning_views,
-                case.hdf5_identity.airflow_source,
-                case.hdf5_identity.retention_policy,
-            )
-            != shared_identity
-            for case in cases
-        ):
-            raise RuntimeError(f"Composite cases have incompatible HDF5 identities for batch {batch.batch_id!r}.")
-        member_commits = tuple(sorted({str(member["source_git_commit"]) for member in batch_members}))
-        parent_pairs = tuple(
-            (member, admitted) for member, admitted in zip(batch_members, admitted_members, strict=True) if member["source_kind"] == "parent_partial"
-        )
-        parent_commits = {str(member["source_git_commit"]) for member, _admitted in parent_pairs}
-        if len(parent_commits) > 1:
-            raise RuntimeError(f"Partial parent cases have conflicting source commits for batch {batch.batch_id!r}.")
-        parent_evidence = (
-            _CompositeBatchEvidence(
-                simulation_profile=first.simulation_profile,
-                available_learning_views=first.available_learning_views,
-                airflow_source=first.airflow_source,
-                batch_id=batch.batch_id,
-                sampling_regime=batch.sampling_regime,
-                template_sha256=first.template_sha256,
-                git_commit=next(iter(parent_commits)),
-                cases=tuple(admitted.case for _member, admitted in parent_pairs),
-                _scientific_config_json=json.dumps(
-                    batch.scientific_values,
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-            )
-            if parent_pairs
-            else None
-        )
-        batch_records.append(
-            {
-                "batch_name": batch.batch_name,
-                "batch_id": batch.batch_id,
-                "batch_identity": batch.batch_identity,
-                "manifest_sha256": common.serialization.canonical_json_sha256(list(batch_members)),
-                "simulation_profile": first.simulation_profile,
-                "template": {"relative_path": template_relative_path, "sha256": first.template_sha256},
-                "scientific_config_digest": first.scientific_config_digest,
-                "git_commits": list(member_commits),
-                "material_config_digest": batch.scientific_values["material_config_digest"],
-                "material_role": batch.material_role,
-                "evaluation_regime": batch.evaluation_regime,
-                "natural_support_state": batch.scientific_values["natural_support_state"],
-                "operation_config_digest": batch.scientific_values["operation_config_digest"],
-                "airflow_source": first.airflow_source,
-                "available_learning_views": list(first.available_learning_views),
-                "export_contract_sha256": first.export_contract_sha256,
-                "steady_flow_conditioning": copy.deepcopy(batch.scientific_values["steady_flow_conditioning"]),
-            }
-        )
-        for member, admitted in zip(batch_members, admitted_members, strict=True):
-            case = admitted.case
-            payload = case.metadata_payload()
-            observed_ownership = (
-                payload.get("material_family"),
-                payload.get("material_role"),
-                payload.get("evaluation_regime"),
-                payload.get("sampling_regime"),
-            )
-            expected_ownership = (
-                batch.material_family,
-                batch.material_role,
-                plan["evaluation_regime"],
-                batch.sampling_regime,
-            )
-            if observed_ownership != expected_ownership:
-                raise ValueError(f"Composite case {case.case_id!r} disagrees with its parent package ownership.")
-            source_evidence = admitted.terminal_evidence if member["source_kind"] == "replacement" else parent_evidence
-            if source_evidence is None:
-                raise RuntimeError(f"Composite case {case.case_id!r} has no admitted source-batch evidence.")
-            candidates.append(
-                {
-                    "batch": batch,
-                    "terminal_evidence": source_evidence,
-                    "case_evidence": case,
-                    "manifest": source_evidence,
-                    "record": case.record_payload(),
-                    "case_payload": payload,
-                    "batch_id": batch.batch_id,
-                    "batch_name": batch.batch_name,
-                    "case_id": case.case_id,
-                    "package_case_id": _global_case_id(batch.batch_name, case.case_id),
-                    "material_family": case.material_family,
-                    "simulation_profile": first.simulation_profile,
-                    "case_input_id": case.case_input_id,
-                    "simulation_case_id": case.simulation_case_id,
-                    "case_hdf5_relative": case.hdf5_path.relative_to(storage).as_posix(),
-                    "case_hdf5_sha256": case.case_hdf5_sha256,
-                    "composite_source_kind": member["source_kind"],
-                    "source_run_id": member["source_run_id"],
-                    "source_git_commit": member["source_git_commit"],
-                    "source_campaign_manifest_sha256": member["source_campaign_manifest_sha256"],
-                    "completion_receipt_sha256": common.serialization.canonical_json_sha256(receipt),
-                }
-            )
-    return batch_records, candidates
-
-
-def resolve_duplicate_case_inputs(
-    candidates: Sequence[Mapping[str, Any]],
-    *,
-    dataset_view: str,
-    policy: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Resolve repeated physical inputs with one explicit profile source policy."""
-    if policy not in {"prefer_transient_source", "prefer_steady_source", "reject_duplicates"}:
-        message = f"Unsupported duplicate case-input policy: {policy!r}."
-        raise ValueError(message)
-    normalized = [dict(candidate) for candidate in candidates]
-    simulation_ids = [str(candidate["simulation_case_id"]) for candidate in normalized]
-    if len(simulation_ids) != len(set(simulation_ids)):
-        message = f"Dataset view {dataset_view!r} contains duplicate simulation-case identities."
-        raise ValueError(message)
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for candidate in normalized:
-        grouped[str(candidate["case_input_id"])].append(candidate)
-    selected: list[dict[str, Any]] = []
-    decisions: list[dict[str, Any]] = []
-    preferred_profile = {
-        "prefer_transient_source": _TRANSIENT_PROFILE_CONTRACT.id,
-        "prefer_steady_source": _STEADY_PROFILE_CONTRACT.id,
-    }
-    for case_input_id in sorted(grouped):
-        group = grouped[case_input_id]
-        if len(group) == 1:
-            selected.append(group[0])
-            continue
-        sources = [
-            {
-                "package_case_id": candidate["package_case_id"],
-                "simulation_case_id": candidate["simulation_case_id"],
-                "simulation_profile": candidate["simulation_profile"],
-            }
-            for candidate in sorted(group, key=lambda item: str(item["simulation_case_id"]))
-        ]
-        if policy == "reject_duplicates":
-            message = f"Repeated case_input_id {case_input_id!r} requires an explicit source preference; candidates={sources}."
-            raise ValueError(message)
-        preferred = preferred_profile[policy]
-        matches = [candidate for candidate in group if candidate["simulation_profile"] == preferred]
-        if len(matches) != 1:
-            message = (
-                f"Duplicate policy {policy!r} requires exactly one {preferred!r} source for case_input_id {case_input_id!r}; candidates={sources}."
-            )
-            raise ValueError(message)
-        chosen = matches[0]
-        selected.append(chosen)
-        decisions.append(
-            {
-                "case_input_id": case_input_id,
-                "policy": policy,
-                "candidates": sources,
-                "selected_simulation_case_id": chosen["simulation_case_id"],
-                "excluded_simulation_case_ids": sorted(str(candidate["simulation_case_id"]) for candidate in group if candidate is not chosen),
-            }
-        )
-    selected.sort(key=lambda candidate: (str(candidate["material_family"]), str(candidate["case_input_id"])))
-    return selected, decisions
-
-
-def _membership_rank(seed: int, material_family: str, case_input_id: str) -> str:
-    """Return one stable family-local physical-input membership rank."""
-    payload = f"{seed}|{material_family}|{case_input_id}".encode()
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _shared_id_membership(
-    plan: Mapping[str, Any],
-    candidates: Sequence[Mapping[str, Any]],
-) -> dict[str, str]:
-    """Assign deterministic material-stratified membership to physical case IDs."""
-    membership = plan.get("membership")
-    if not isinstance(membership, dict):
-        message = "ID package membership must use the resolved nested membership contract."
-        raise ValueError(message)
-    seed = membership.get("seed")
-    counts = membership.get("per_seen_material")
-    if (
-        isinstance(seed, bool)
-        or not isinstance(seed, int)
-        or not isinstance(counts, dict)
-        or any(isinstance(counts.get(role), bool) or not isinstance(counts.get(role), int) for role in _ID_MEMBERSHIP_ROLES)
-    ):
-        message = "ID package membership seed and per-material counts must be resolved."
-        raise ValueError(message)
-    assignments: dict[str, str] = {}
-    for material_family in plan["materials"]:
-        family_by_input: dict[str, Mapping[str, Any]] = {}
-        for candidate in candidates:
-            if candidate["material_family"] != material_family:
-                continue
-            case_input_id = str(candidate["case_input_id"])
-            if case_input_id in family_by_input:
-                message = f"ID membership candidate pool duplicates physical input {case_input_id!r}."
-                raise ValueError(message)
-            family_by_input[case_input_id] = candidate
-        family = sorted(
-            family_by_input.values(),
-            key=lambda candidate: _membership_rank(
-                seed,
-                str(material_family),
-                str(candidate["case_input_id"]),
-            ),
-        )
-        required = sum(int(counts[role]) for role in _ID_MEMBERSHIP_ROLES)
-        if len(family) < required:
-            message = f"ID package requires {required} {material_family!r} cases but only {len(family)} are terminal."
-            raise ValueError(message)
-        offset = 0
-        for role in _ID_MEMBERSHIP_ROLES:
-            role_count = int(counts[role])
-            for candidate in family[offset : offset + role_count]:
-                assignments[str(candidate["case_input_id"])] = role
-            offset += role_count
-    if len(assignments) != len(set(assignments)):
-        message = "ID train, validation, and id_test membership must be disjoint."
-        raise RuntimeError(message)
-    return assignments
-
-
-def audit_steady_flow_conditioning(
-    batch_records: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Require complete task-compatible airflow dependencies for every source."""
-    task = domain.tasks.registry.get_task("steady_flow")
-    task_model_inputs = tuple(field.name for field in task.inputs if field.role != "coordinate")
-    contracts: list[dict[str, Any]] = []
-    contract_digests: set[str] = set()
-    contract_ids: set[str] = set()
-    profiles_found: set[str] = set()
-    for record in batch_records:
-        raw_contract = record.get("steady_flow_conditioning")
-        if not isinstance(raw_contract, dict) or raw_contract.get("exhaustive") is not True:
-            message = f"Source profile {record.get('simulation_profile')!r} has no exhaustive steady-flow conditioning audit."
-            raise ValueError(message)
-        contract = copy.deepcopy(raw_contract)
-        dependencies = contract.get("dependencies")
-        if not isinstance(dependencies, list):
-            message = "Steady-flow conditioning dependencies are malformed."
-            raise TypeError(message)
-        admitted_model_inputs = tuple(
-            str(dependency.get("name")) for dependency in dependencies if isinstance(dependency, dict) and dependency.get("owner") == "model_input"
-        )
-        if admitted_model_inputs != task_model_inputs:
-            message = (
-                "Hidden steady-flow conditioning detected: admitted ordered model-input dependencies "
-                f"{list(admitted_model_inputs)} do not equal the authoritative steady TaskSpec fields {list(task_model_inputs)}."
-            )
-            raise ValueError(message)
-        dependency_by_name = {str(dependency.get("name")): dependency for dependency in dependencies if isinstance(dependency, dict)}
-        for name, dependency in dependency_by_name.items():
-            owner = dependency.get("owner")
-            if owner == "model_input" and dependency.get("affects_stationary_solution") is not True:
-                message = f"Steady-flow model input {name!r} is not declared as affecting the stationary solution."
-                raise ValueError(message)
-            if dependency.get("affects_stationary_solution") is not True:
-                continue
-            if owner == "model_input" and name not in task.input_names:
-                message = (
-                    f"Hidden steady-flow conditioning detected: case-varying dependency {name!r} "
-                    "affects the reference solution but is absent from the TaskSpec inputs."
-                )
-                raise ValueError(message)
-            if owner not in {"model_input", "package_fixed"}:
-                message = f"Steady-flow dependency {name!r} has no admissible model-input or package-fixed owner."
-                raise ValueError(message)
-        additional = contract.get("additional_case_varying_solver_scalars")
-        if not isinstance(additional, list) or any(name not in task.input_names for name in additional):
-            message = f"Hidden steady-flow conditioning detected in additional_case_varying_solver_scalars={additional!r}."
-            raise ValueError(message)
-        contract_id = contract.get("stationary_solution_contract_id")
-        if not isinstance(contract_id, str) or not contract_id:
-            message = "Steady-flow conditioning lacks a stationary-solution compatibility identity."
-            raise ValueError(message)
-        digest = common.serialization.canonical_json_sha256(contract)
-        contract_ids.add(contract_id)
-        contract_digests.add(digest)
-        profiles_found.add(str(record["simulation_profile"]))
-        contracts.append(contract)
-    if len(contract_ids) != 1 or len(contract_digests) != 1:
-        message = (
-            "Steady-flow sources have incompatible stationary-solution conditioning contracts; "
-            f"contract_ids={sorted(contract_ids)}, digests={sorted(contract_digests)}."
-        )
-        raise ValueError(message)
-    contract = contracts[0]
-    dependencies = contract["dependencies"]
-    fixed = [
+def _package_case_id(source_identity: Mapping[str, Any]) -> str:
+    """Return one stable short case ID without losing exact source evidence."""
+    digest = common.serialization.canonical_json_sha256(
         {
-            "name": dependency["name"],
-            "unit": dependency["unit"],
-            "value": dependency["fixed_value"],
+            "campaign_digest": source_identity["campaign_digest"],
+            "case_input_id": source_identity["case_input_id"],
+            "simulation_case_id": source_identity["simulation_case_id"],
         }
-        for dependency in dependencies
-        if dependency["owner"] == "package_fixed"
-    ]
-    fixed_by_name = {item["name"]: item for item in fixed}
-    expected_fixed_units = {field.name: field.unit for field in _STEADY_PROFILE_CONTRACT.stationary_fixed_fields}
-    observed_fixed_units = {name: item["unit"] for name, item in fixed_by_name.items()}
-    if observed_fixed_units != expected_fixed_units:
-        message = "Steady-flow package-fixed field names or units violate the Generation profile contract."
-        raise ValueError(message)
-    unused = [dependency["name"] for dependency in dependencies if dependency["owner"] == "not_used"]
-    return {
-        "audit_schema_version": 1,
-        "stationary_solution_contract_id": next(iter(contract_ids)),
-        "conditioning_contract_digest": next(iter(contract_digests)),
-        "source_profiles": sorted(profiles_found),
-        "model_inputs": list(task.input_names),
-        "package_fixed_physics": fixed,
-        "unused_dependencies": unused,
-        "T_flow_ref_owner": next(dependency["owner"] for dependency in dependencies if dependency["name"] == "T_flow_ref"),
-        "hidden_conditioning": False,
-    }
-
-
-def _parameter_evidence(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    """Return scalar or complete-record OOD support and distance evidence."""
-    case_payload = candidate["case_payload"]
-    ood = case_payload.get("ood")
-    if not isinstance(ood, dict):
-        message = f"Case {candidate['package_case_id']!r} has malformed OOD provenance."
-        raise TypeError(message)
-    selected = ood.get("selected_units")
-    selection_details = ood.get("selections")
-    if not isinstance(selected, list) or not all(isinstance(name, str) for name in selected) or not isinstance(selection_details, dict):
-        message = f"Case {candidate['package_case_id']!r} has malformed OOD selections."
-        raise TypeError(message)
-    material = candidate["batch"].scientific_values["material"]
-    registry = material["parameter_registry"]
-    coupled_contracts = material["coupled_ood_records"]
-    sampled_values = case_payload.get("sampled_values")
-    coupled = case_payload.get("coupled_selections")
-    if not isinstance(sampled_values, dict) or not isinstance(coupled, dict):
-        message = f"Case {candidate['package_case_id']!r} lacks sampled OOD evidence."
-        raise TypeError(message)
-    parameters: list[dict[str, Any]] = []
-    for name in selected:
-        entry = registry.get(name)
-        if isinstance(entry, dict):
-            block = entry.get("block")
-            detail = selection_details.get(name)
-            transform: Any
-            id_support = {key: copy.deepcopy(entry[key]) for key in ("lower", "upper", "sets") if key in entry}
-            ood_support = copy.deepcopy(entry.get("ood", entry.get("ood_values", entry.get("ood_sets"))))
-            transform = entry.get("transform")
-            parameters.append(
-                {
-                    "name": name,
-                    "group": entry.get("ood_group"),
-                    "block": block,
-                    "kind": entry.get("kind"),
-                    "transform": transform,
-                    "unit": entry.get("unit"),
-                    "id_support": id_support,
-                    "ood_support": ood_support,
-                    "sampled_value": copy.deepcopy(sampled_values.get(name)),
-                    "coupled_selection": coupled.get(name),
-                    "transformed_coordinate_evidence": copy.deepcopy(detail),
-                    "ood_provenance": copy.deepcopy(entry.get("ood_provenance")),
-                }
-            )
-            continue
-        contract = coupled_contracts.get(name)
-        if not isinstance(contract, dict):
-            message = f"OOD unit {name!r} is absent from scalar and coupled material contracts."
-            raise TypeError(message)
-        components = list(contract["components"])
-        parameters.append(
-            {
-                "name": name,
-                "group": contract["ood_group"],
-                "block": contract["block"],
-                "kind": "complete_coupled_record",
-                "transform": "component_owned",
-                "unit": copy.deepcopy(contract["units"]),
-                "id_support": {
-                    component: {key: copy.deepcopy(registry[component][key]) for key in ("lower", "upper", "value") if key in registry[component]}
-                    for component in components
-                },
-                "ood_support": copy.deepcopy(contract["records"]),
-                "sampled_value": {component: copy.deepcopy(sampled_values[component]) for component in components},
-                "coupled_selection": coupled.get(name),
-                "transformed_coordinate_evidence": copy.deepcopy(selection_details.get(name)),
-                "ood_provenance": copy.deepcopy(contract.get("ood_provenance")),
-            }
-        )
-    return {
-        "group": ood.get("group"),
-        "selected_units": list(selected),
-        "units_per_case": ood.get("units_per_case"),
-        "parameters": parameters,
-    }
-
-
-def _ood_eligibility(
-    candidate: dict[str, Any],
-    *,
-    view: views.DatasetViewSpec,
-) -> tuple[bool, tuple[str, ...], dict[str, Any], str | None]:
-    """Return view-specific eligibility from registry-owned dependency blocks."""
-    evidence = _parameter_evidence(candidate)
-    selected = evidence["parameters"]
-    relevant = (
-        tuple(str(parameter["name"]) for parameter in selected if parameter["block"] in view.parameter_ood_blocks)
-        if view.parameter_ood_blocks
-        else tuple(str(parameter["name"]) for parameter in selected)
     )
-    if not relevant:
-        reason = f"No selected parameter belongs to the {view.id!r} dependency blocks {list(view.parameter_ood_blocks)}."
-        return False, (), evidence, reason
-    return True, relevant, evidence, None
+    return f"{source_identity['material_family']}__{source_identity['case_id']}__{digest[:12]}"
 
 
-def _excluded_case(candidate: Mapping[str, Any], *, reason: str) -> dict[str, Any]:
-    """Return compact excluded-source evidence with one actionable reason."""
-    ood = candidate["case_payload"].get("ood", {})
-    return {
-        "package_case_id": candidate["package_case_id"],
-        "case_input_id": candidate["case_input_id"],
-        "simulation_case_id": candidate["simulation_case_id"],
-        "simulation_profile": candidate["simulation_profile"],
-        "material_family": candidate["material_family"],
-        "ood_group": ood.get("group") if isinstance(ood, dict) else None,
-        "ood_parameters": ood.get("selected_units", []) if isinstance(ood, dict) else [],
-        "reason": reason,
-    }
+def _grid_identity(path: Path) -> dict[str, Any]:
+    """Bind physical coordinate axes without tensorizing a source case."""
+    with h5py.File(path, "r") as handle:
+        x = np.asarray(handle["coords/x"], dtype=np.float64)
+        y = np.asarray(handle["coords/y"], dtype=np.float64)
+    if x.ndim != 1 or y.ndim != 1 or x.size < _GRID_AXES or y.size < _GRID_AXES or not np.isfinite(x).all() or not np.isfinite(y).all():
+        msg = f"Source case coordinate axes are invalid: {path}."
+        raise ValueError(msg)
+    digest = hashlib.sha256()
+    for axis in (x, y):
+        digest.update(len(axis).to_bytes(8, "big"))
+        digest.update(np.ascontiguousarray(axis).tobytes())
+    return {"shape": [int(y.size), int(x.size)], "axes_sha256": digest.hexdigest()}
 
 
-def prepare_campaign_packages(
-    campaign: generation.cases.config.CampaignConfig,
+def prepare_dataset_selection(
+    request: Mapping[str, Any],
     *,
-    storage_root: Path | str | None,
-    selected_plans: Sequence[Mapping[str, Any]] | None = None,
-    composite_receipt: Mapping[str, Any] | None = None,
-) -> tuple[PreparedPackage, ...]:
-    """Admit selected packages together so membership and leakage are global."""
-    plans = [copy.deepcopy(dict(plan)) for plan in (campaign.dataset_packages if selected_plans is None else selected_plans)]
-    source_by_regime: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
-    for plan in plans:
-        regime = str(plan["evaluation_regime"])
-        if regime not in source_by_regime:
-            source_by_regime[regime] = _load_candidates(campaign, plan, storage_root=storage_root, composite_receipt=composite_receipt)
-    id_plans = [plan for plan in plans if plan["evaluation_regime"] == "id"]
-    shared_membership: dict[str, str] = {}
-    technical_smoke = campaign.campaign_purpose == "technical_runtime_smoke"
-    if id_plans:
-        _id_records, id_candidates = source_by_regime["id"]
-        physical_id_candidates, _id_decisions = resolve_duplicate_case_inputs(
-            id_candidates,
-            dataset_view="shared_id_membership",
-            policy=campaign.duplicate_case_input_policy,
-        )
-        if technical_smoke:
-            shared_membership = {str(candidate["case_input_id"]): views.TECHNICAL_SMOKE_MEMBERSHIP for candidate in physical_id_candidates}
-        else:
-            shared_membership = _shared_id_membership(id_plans[0], physical_id_candidates)
-    elif campaign.campaign_purpose == "family_generalization":
-        message = "Family-generalization campaigns must declare an ID package."
-        raise ValueError(message)
-    prepared: list[PreparedPackage] = []
-    for plan in plans:
-        dataset_view = str(plan["dataset_view"])
-        regime = str(plan["evaluation_regime"])
-        view = views.get_view(dataset_view)
-        batch_records, raw_candidates = source_by_regime[regime]
-        candidates, decisions = resolve_duplicate_case_inputs(
-            raw_candidates,
-            dataset_view=dataset_view,
-            policy=campaign.duplicate_case_input_policy,
-        )
-        for candidate in candidates:
-            views.validate_view_for_profile(dataset_view, str(candidate["simulation_profile"]))
-        steady_conditioning = audit_steady_flow_conditioning(batch_records) if dataset_view == "steady_flow" else None
-        included: list[dict[str, Any]] = []
-        excluded: list[dict[str, Any]] = []
-        membership: dict[str, list[str]] = (
-            {views.TECHNICAL_SMOKE_MEMBERSHIP: []}
-            if regime == "id" and technical_smoke
-            else {role: [] for role in _ID_MEMBERSHIP_ROLES}
-            if regime == "id"
-            else {regime: []}
-        )
-        for candidate in candidates:
-            if regime == "id":
-                assigned = shared_membership.get(str(candidate["case_input_id"]))
-                if assigned is None:
-                    excluded.append(
-                        _excluded_case(
-                            candidate,
-                            reason="Physical case was not selected by the declared material-stratified ID membership counts.",
-                        )
-                    )
-                    continue
-                candidate["dataset_membership"] = assigned
-                candidate["task_relevant_ood_parameters"] = []
-                candidate["ood_evidence"] = {}
-            else:
-                candidate["dataset_membership"] = regime
-                candidate["task_relevant_ood_parameters"] = []
-                candidate["ood_evidence"] = {}
-                if regime == "parameter_ood":
-                    eligible, relevant, evidence, reason = _ood_eligibility(candidate, view=view)
-                    if not eligible:
-                        excluded.append(_excluded_case(candidate, reason=str(reason)))
-                        continue
-                    candidate["task_relevant_ood_parameters"] = list(relevant)
-                    candidate["ood_evidence"] = evidence
-            included.append(candidate)
-            membership[str(candidate["dataset_membership"])].append(str(candidate["package_case_id"]))
-        if not included:
-            message = f"Declared package {dataset_view!r}/{regime!r} has no scientifically eligible source cases."
-            raise ValueError(message)
-        prepared.append(
-            PreparedPackage(
-                plan=plan,
-                batch_records=copy.deepcopy(batch_records),
-                candidates=included,
-                excluded=excluded,
-                membership=membership,
-                source_decisions=decisions,
-                steady_conditioning=steady_conditioning,
-            )
-        )
-    _validate_no_id_ood_overlap(prepared)
-    return tuple(prepared)
-
-
-def _validate_no_id_ood_overlap(prepared: Sequence[PreparedPackage]) -> None:
-    """Reject simulation or physical-input reuse from ID train into any OOD package."""
-    id_train_simulation_ids = {
-        str(candidate["simulation_case_id"])
-        for package in prepared
-        if package.plan["evaluation_regime"] == "id"
-        for candidate in package.candidates
-        if candidate["dataset_membership"] == "train"
-    }
-    id_train_input_ids = {
-        str(candidate["case_input_id"])
-        for package in prepared
-        if package.plan["evaluation_regime"] == "id"
-        for candidate in package.candidates
-        if candidate["dataset_membership"] == "train"
-    }
-    for package in prepared:
-        if package.plan["evaluation_regime"] == "id":
-            continue
-        simulation_overlap = id_train_simulation_ids.intersection(str(candidate["simulation_case_id"]) for candidate in package.candidates)
-        input_overlap = id_train_input_ids.intersection(str(candidate["case_input_id"]) for candidate in package.candidates)
-        if simulation_overlap or input_overlap:
-            message = (
-                "ID training and OOD package source overlap detected: "
-                f"simulation_case_ids={sorted(simulation_overlap)}, case_input_ids={sorted(input_overlap)}."
-            )
-            raise ValueError(message)
+    storage_root: Path | str | None = None,
+) -> PreparedPackage:
+    """Admit every requested successful case and bind one exact ordered pool."""
+    authored = selection.materialize_selection_request(request, storage_root=storage_root)
+    source_task = authored["source_task"]
+    dataset_view = authored["dataset_view"]
+    cases: list[catalog.AdmittedRawCase] = []
+    identities: list[dict[str, Any]] = []
+    physical_inputs: set[str] = set()
+    simulations: set[str] = set()
+    package_ids: set[str] = set()
+    first_grid: dict[str, Any] | None = None
+    steady_conditioning_digest: str | None = None
+    for reference in authored["source_cases"]:
+        admitted = catalog.resolve_raw_case_reference(source_task, reference, storage_root=storage_root)
+        identity = admitted.source_identity
+        design = admitted.design_provenance
+        if any(identity.get(key) != expected for key, expected in reference.items()):
+            msg = "Generation admitted case differs from the exact Dataset source reference."
+            raise ValueError(msg)
+        if identity.get("task") != source_task or not isinstance(design, dict):
+            msg = "Generation admitted case lacks its source task or design provenance."
+            raise ValueError(msg)
+        views.validate_view_for_profile(dataset_view, source_task)
+        payload = admitted.case.metadata_payload()
+        if dataset_view not in payload["available_learning_views"]:
+            msg = f"Source case does not provide Dataset view {dataset_view!r}."
+            raise ValueError(msg)
+        if payload.get("material_role") is not None or payload.get("evaluation_regime") is not None:
+            msg = "Historical role-bearing source case is unsupported by the current Dataset contract."
+            raise ValueError(msg)
+        if dataset_view == "steady_flow":
+            conditioning = payload.get("steady_flow_conditioning")
+            declared_digest = payload.get("steady_flow_conditioning_digest")
+            if not isinstance(conditioning, dict) or declared_digest != common.serialization.canonical_json_sha256(conditioning):
+                msg = "Admitted steady source lacks its exact stationary-conditioning contract."
+                raise ValueError(msg)
+            if steady_conditioning_digest is None:
+                steady_conditioning_digest = declared_digest
+            elif declared_digest != steady_conditioning_digest:
+                msg = "Steady Dataset sources have incompatible package-fixed stationary conditioning."
+                raise ValueError(msg)
+        case_input_id = str(identity["case_input_id"])
+        simulation_case_id = str(identity["simulation_case_id"])
+        if case_input_id in physical_inputs or simulation_case_id in simulations:
+            msg = "Dataset selection repeats a physical source input or simulation through an alias."
+            raise ValueError(msg)
+        physical_inputs.add(case_input_id)
+        simulations.add(simulation_case_id)
+        package_id = _package_case_id(identity)
+        if package_id in package_ids:
+            msg = "Dataset source case IDs collide."
+            raise ValueError(msg)
+        package_ids.add(package_id)
+        grid = _grid_identity(admitted.hdf5_path)
+        if first_grid is None:
+            first_grid = grid
+        elif grid != first_grid:
+            msg = "Dataset source cases have incompatible physical coordinate grids."
+            raise ValueError(msg)
+        identities.append({"package_case_id": package_id, "source": copy.deepcopy(identity), "design": copy.deepcopy(design)})
+        cases.append(admitted)
+    if first_grid is None:
+        msg = "Dataset selection has no admitted source cases."
+        raise ValueError(msg)
+    source_names = dict.fromkeys(entry["source"]["source_name"] for entry in identities)
+    return PreparedPackage(
+        request=authored,
+        cases=tuple(cases),
+        source_case_identities=tuple(identities),
+        grid=first_grid,
+        source_outcomes=tuple(catalog.source_outcome_evidence(source_task, name, storage_root=storage_root) for name in source_names),
+    )

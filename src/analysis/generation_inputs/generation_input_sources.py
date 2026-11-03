@@ -1,19 +1,26 @@
-"""
-generation_input_sources.py
+"""Group canonical input-generated batches into scientific datasets.
 
-Group canonical input-generated batches into scientific datasets.
 Responsibilities:
   - Discover manifest-admitted input batches without exposing completed raw
   - Group sources by canonical batch identity and deduplicate exact cases
   - Fail closed when one case-input identity binds conflicting persisted bytes
   - Admit selected cases lazily and cache empirical dataset diagnostics
+
 Design principles:
   - Dataset identity is independent of storage location
   - Dataset means always use every unique discovered case in the dataset
   - Visible labels remain concise while selector values retain canonical keys
+
 This module does NOT:
   - Refresh sources, generate inputs, or inspect completed simulation output
   - Compute scientific formulas, render plots, or resample persisted inputs
+
+Notes:
+  Discovery products:
+    - GenerationInputDatasetCatalog groups admitted input publications and loads case diagnostics lazily for selected views.
+    - CampaignOutcomeCatalog is a separate candidate-lifecycle view joined to admitted input metadata; its rows do not change canonical input-dataset
+      membership.
+
 """
 
 from __future__ import annotations
@@ -22,24 +29,32 @@ import json
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Final, TypeAlias
+from typing import TYPE_CHECKING, Any, Final, TypeAlias
+
+import numpy as np
+import pandas as pd
 
 from src import common
 from src.generation.cases import generation_cases_admission as admission
+from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.publication import generation_publication_catalog as campaign_catalog
 
 from . import generation_input_diagnostics as diagnostics
 from . import generation_input_labels as labels
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
-DatasetKey: TypeAlias = tuple[str, str]
-CaseKey: TypeAlias = tuple[str, str, str]
+DatasetKey: TypeAlias = tuple[str, str]  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
+CaseKey: TypeAlias = tuple[str, str, str]  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 
 DEFAULT_MAX_CACHED_CASES: Final = 24
 DEFAULT_MAX_CACHED_DATASETS: Final = 2
 CASE_KEY_PARTS: Final = 3
+_CANDIDATE_COLUMNS: Final = ("material_family", "domain_profile", "case_id", "origin", "outcome", "selected", "design_key", "duration_seconds")
+# Leading columns of the campaign outcome table; every sampled parameter of a candidate follows as its own column.
+CAMPAIGN_OUTCOME_COLUMNS: Final = (*_CANDIDATE_COLUMNS, "attempts", "failure_stage", "failure_class", "reason_code", "input_admission")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,7 +131,7 @@ def _persisted_case_fingerprint(
         if not isinstance(filename, str) or not isinstance(identity, dict):
             msg = "Duplicate input-generated file identity is malformed."
             raise TypeError(msg)
-        source = reference.input_directory / filename
+        source = reference.case_directory / filename
         if not source.is_file():
             msg = f"Duplicate input-generated file is missing: {source}"
             raise ValueError(msg)
@@ -244,6 +259,7 @@ class GenerationInputDatasetCatalog:
         *,
         max_cached_cases: int = DEFAULT_MAX_CACHED_CASES,
         max_cached_datasets: int = DEFAULT_MAX_CACHED_DATASETS,
+        outcomes: CampaignOutcomeCatalog | None = None,
     ) -> None:
         """
         Group one manifest-first input discovery into scientific datasets.
@@ -273,6 +289,7 @@ class GenerationInputDatasetCatalog:
         for source in input_sources:
             key = (source.profile_id, source.batch_identity)
             grouped.setdefault(key, []).append(source)
+        self.outcomes = outcomes or CampaignOutcomeCatalog(())
         self._datasets = tuple(_build_dataset(tuple(publications)) for publications in grouped.values())
         keys = tuple(dataset_key(dataset) for dataset in self._datasets)
         if len(keys) != len(set(keys)):
@@ -433,14 +450,163 @@ def discover_generation_input_datasets(
     Discovery is performed when the notebook cell executes. It never refreshes,
     generates inputs, or admits completed-raw publications.
     """
-    root = None if storage_root is None else Path(storage_root).expanduser()
+    root = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
     discovery = admission.discover_input_batches(
         root,
         max_sources=None,
         max_cases_per_source=None,
+        validation_depth="evidence",
     )
     return GenerationInputDatasetCatalog(
         discovery,
         max_cached_cases=max_cached_cases,
         max_cached_datasets=max_cached_datasets,
+        outcomes=discover_campaign_outcomes(root, discovery),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignOutcomeCatalog:
+    """Retain one bounded discovery checkpoint without payload-array reads."""
+
+    rows: tuple[dict[str, Any], ...]
+    issues: tuple[str, ...] = ()
+
+
+def discover_campaign_outcomes(storage_root: Path, discovery: admission.InputSourceDiscovery) -> CampaignOutcomeCatalog:
+    """Join immutable candidate decisions to already admitted input metadata."""
+    references = {
+        str((reference.case_directory / "case.json").relative_to(storage_root)): reference
+        for source in discovery.sources
+        for reference in source.cases
+        if reference.case_directory.is_relative_to(storage_root)
+    }
+    rows: list[dict[str, Any]] = []
+    issues: list[str] = []
+    for task in profiles.available_profiles():
+        try:
+            campaigns = campaign_catalog.list_campaigns(task, storage_root=storage_root)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            issues.append(f"{task}: {error}")
+            continue
+        for campaign in campaigns:
+            name = campaign["source_name"]
+            try:
+                candidates = campaign_catalog.list_campaign_cases(task, name, storage_root=storage_root)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                issues.append(f"{task}/{name}: {error}")
+                continue
+            for candidate in candidates:
+                row = dict(candidate)
+                input_locator = row.get("input_case_relative")
+                reference = references.get(input_locator) if isinstance(input_locator, str) else None
+                if reference is not None:
+                    payload = reference.case_payload()
+                    row["parameters"] = payload["sampled_values"]
+                    row["parameter_units"] = payload["sampled_units"]
+                    row["case_input_id"] = reference.case_input_id
+                    row["simulation_case_id"] = reference.simulation_case_id
+                    row["input_admission"] = "metadata admitted; adapter bytes checked when selected"
+                else:
+                    row["input_admission"] = "no admitted input metadata at this checkpoint"
+                rows.append(row)
+    return CampaignOutcomeCatalog(tuple(rows), tuple(issues))
+
+
+def query_campaign_outcomes(
+    catalog: CampaignOutcomeCatalog,
+    *,
+    task: str,
+    source_name: str,
+    material_family: str | None = None,
+    outcome: str | None = None,
+    origin: str | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Select exact candidate evidence without changing success membership."""
+    if outcome not in {None, "pending", "successful", "failed"}:
+        message = "Outcome filter must be pending, successful, failed, or None."
+        raise ValueError(message)
+    filters = {"task": task, "source_name": source_name, "material_family": material_family, "outcome": outcome, "origin": origin}
+    return tuple(row for row in catalog.rows if all(value is None or row.get(key) == value for key, value in filters.items()))
+
+
+def campaign_outcome_table(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+    """Project attempts and scientific outcomes separately for human inspection, then every sampled parameter as its own column."""
+    records = []
+    for row in rows:
+        failure = row.get("failure") or {}
+        parameters = row.get("parameters")
+        records.append(
+            {
+                **{key: row.get(key) for key in _CANDIDATE_COLUMNS},
+                "attempts": len(row.get("attempts", ())),
+                "failure_stage": failure.get("stage"),
+                "failure_class": failure.get("class"),
+                "reason_code": failure.get("reason_code"),
+                "input_admission": row.get("input_admission"),
+                **(dict(parameters) if isinstance(parameters, Mapping) else {}),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def campaign_outcome_parameters(table: pd.DataFrame) -> tuple[str, ...]:
+    """Return the sampled-parameter columns of a campaign outcome table in table order."""
+    return tuple(str(column) for column in table.columns if column not in CAMPAIGN_OUTCOME_COLUMNS)
+
+
+def campaign_outcome_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+    """Use all terminal candidates as the rate denominator; keep pending visible."""
+    grouped: dict[tuple[str, str, str, str], dict[str, int]] = {}
+    keys = ("material_family", "domain_profile", "origin", "design_key")
+    for row in rows:
+        key = (str(row["material_family"]), str(row["domain_profile"]), str(row["origin"]), str(row["design_key"]))
+        counts = grouped.setdefault(key, {"successful": 0, "failed": 0, "pending": 0})
+        counts[str(row["outcome"])] += 1
+    values = []
+    for key, counts in sorted(grouped.items()):
+        terminal = counts["successful"] + counts["failed"]
+        values.append(
+            dict(zip(keys, key, strict=True)) | counts | {"success_fraction_terminal": counts["successful"] / terminal if terminal else None}
+        )
+    return pd.DataFrame(values)
+
+
+def campaign_failure_rates(rows: Iterable[Mapping[str, Any]]) -> pd.DataFrame:
+    """Count terminal reasons against all terminal candidates in the same group."""
+    candidates = tuple(rows)
+    keys = ("material_family", "domain_profile", "origin", "design_key")
+    totals: dict[tuple[str, ...], int] = {}
+    failures: dict[tuple[str, ...], int] = {}
+    for row in candidates:
+        group = tuple(str(row[key]) for key in keys)
+        outcome = row["outcome"]
+        if outcome in {"successful", "failed"}:
+            totals[group] = totals.get(group, 0) + 1
+        if outcome == "failed":
+            failure = row.get("failure") or {}
+            reason = tuple(str(failure.get(key) or "unrecorded") for key in ("stage", "class", "reason_code"))
+            key = group + reason
+            failures[key] = failures.get(key, 0) + 1
+    records = []
+    for key, count in sorted(failures.items()):
+        group = key[: len(keys)]
+        records.append(
+            dict(zip((*keys, "failure_stage", "failure_class", "reason_code"), key, strict=True))
+            | {"failed": count, "terminal_candidates": totals[group], "reason_fraction_terminal": count / totals[group]}
+        )
+    return pd.DataFrame(records)
+
+
+def outcome_parameter_values(rows: Iterable[Mapping[str, Any]], name: str, unit: str) -> dict[str, np.ndarray]:
+    """Return actual finite scalar parameters grouped by observed candidate outcome."""
+    groups: dict[str, list[float]] = {"successful": [], "failed": [], "pending": []}
+    for row in rows:
+        parameters = row.get("parameters")
+        units = row.get("parameter_units")
+        if not isinstance(parameters, Mapping) or not isinstance(units, Mapping) or units.get(name) != unit:
+            continue
+        value = parameters.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+            groups[str(row["outcome"])].append(float(value))
+    return {outcome: np.asarray(values, dtype=np.float64) for outcome, values in groups.items()}

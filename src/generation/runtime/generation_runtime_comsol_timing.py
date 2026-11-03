@@ -1,8 +1,4 @@
-# ruff: noqa: EM101, EM102, TRY003
-"""
-generation_runtime_comsol_timing.py
-
-Parse and validate COMSOL-reported scientific solver timing evidence.
+"""Parse and validate COMSOL-reported scientific solver timing evidence.
 
 Responsibilities:
   - Parse structural COMSOL batch-log block boundaries and Solution time records
@@ -497,23 +493,28 @@ def parse_comsol_batch_log(
 def _finite_non_negative(value: Any, *, label: str) -> float:
     """Require one finite non-negative numeric persisted value."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{label} must be a real scalar.")
+        msg = f"{label} must be a real scalar."
+        raise TypeError(msg)
     result = float(value)
     if not math.isfinite(result) or result < 0.0:
-        raise ValueError(f"{label} must be finite and non-negative.")
+        msg = f"{label} must be finite and non-negative."
+        raise ValueError(msg)
     return result
 
 
 def _candidate_from_payload(value: Any, *, phase: str) -> SolutionTimeRecord:
     """Validate one persisted phase candidate."""
     if not isinstance(value, dict) or set(value) != {"seconds", "block", "line_number"}:
-        raise ValueError(f"Persisted {phase} timing candidate has invalid fields.")
+        msg = f"Persisted {phase} timing candidate has invalid fields."
+        raise ValueError(msg)
     block = value["block"]
     line_number = value["line_number"]
     if not isinstance(block, str) or _BLOCK_PATTERNS[phase].fullmatch(block) is None:
-        raise ValueError(f"Persisted {phase} timing candidate has an invalid solver block.")
+        msg = f"Persisted {phase} timing candidate has an invalid solver block."
+        raise ValueError(msg)
     if isinstance(line_number, bool) or not isinstance(line_number, int) or line_number < 1:
-        raise ValueError(f"Persisted {phase} timing candidate has an invalid line number.")
+        msg = f"Persisted {phase} timing candidate has an invalid line number."
+        raise ValueError(msg)
     return SolutionTimeRecord(
         seconds=_finite_non_negative(value["seconds"], label=f"persisted {phase} seconds"),
         block=block,
@@ -525,22 +526,27 @@ def _phase_from_payload(value: Any, *, phase: str, applicable: bool) -> SolverPh
     """Validate one persisted phase status and bounded candidate set."""
     expected = {"status", "occurrence_count", "seconds", "block", "line_number", "candidates"}
     if not isinstance(value, dict) or set(value) != expected:
-        raise ValueError(f"Persisted {phase} timing evidence has invalid fields.")
+        msg = f"Persisted {phase} timing evidence has invalid fields."
+        raise ValueError(msg)
     status = value["status"]
     if status not in {"complete", "missing", "ambiguous", "not_applicable"}:
-        raise ValueError(f"Persisted {phase} timing has an invalid status.")
+        msg = f"Persisted {phase} timing has an invalid status."
+        raise ValueError(msg)
     occurrence_count = value["occurrence_count"]
     if isinstance(occurrence_count, bool) or not isinstance(occurrence_count, int) or occurrence_count < 0:
-        raise ValueError(f"Persisted {phase} timing has an invalid occurrence count.")
+        msg = f"Persisted {phase} timing has an invalid occurrence count."
+        raise ValueError(msg)
     raw_candidates = value["candidates"]
     if not isinstance(raw_candidates, list) or len(raw_candidates) > _MAX_RETAINED_CANDIDATES:
-        raise ValueError(f"Persisted {phase} timing candidates are invalid or unbounded.")
+        msg = f"Persisted {phase} timing candidates are invalid or unbounded."
+        raise ValueError(msg)
     candidates = tuple(_candidate_from_payload(item, phase=phase) for item in raw_candidates)
     expected_status: PhaseStatus
     if not applicable:
         expected_status = "not_applicable"
         if occurrence_count != 0 or candidates:
-            raise ValueError(f"Persisted {phase} timing is not applicable but contains candidates.")
+            msg = f"Persisted {phase} timing is not applicable but contains candidates."
+            raise ValueError(msg)
     elif occurrence_count == 0:
         expected_status = "missing"
     elif occurrence_count == 1:
@@ -548,7 +554,8 @@ def _phase_from_payload(value: Any, *, phase: str, applicable: bool) -> SolverPh
     else:
         expected_status = "ambiguous"
     if status != expected_status or len(candidates) != min(occurrence_count, _MAX_RETAINED_CANDIDATES):
-        raise ValueError(f"Persisted {phase} timing status disagrees with its candidates.")
+        msg = f"Persisted {phase} timing status disagrees with its candidates."
+        raise ValueError(msg)
     timing = SolverPhaseTiming(
         status=expected_status,
         occurrence_count=occurrence_count,
@@ -561,7 +568,8 @@ def _phase_from_payload(value: Any, *, phase: str, applicable: bool) -> SolverPh
         None if record is None else record.line_number,
     )
     if (value["seconds"], value["block"], value["line_number"]) != expected_direct:
-        raise ValueError(f"Persisted {phase} direct timing fields disagree with candidate evidence.")
+        msg = f"Persisted {phase} direct timing fields disagree with candidate evidence."
+        raise ValueError(msg)
     return timing
 
 
@@ -588,7 +596,8 @@ def admit_persisted_solver_timing(
     if not evidence_present and not present_top_fields:
         return None
     if not evidence_present or present_top_fields != top_fields:
-        raise ValueError("Case timing contains incomplete COMSOL solver-timing fields.")
+        msg = "Case timing contains incomplete COMSOL solver-timing fields."
+        raise ValueError(msg)
     payload = timing["comsol_solver_timing"]
     expected_keys = {
         "schema_kind",
@@ -606,7 +615,8 @@ def admit_persisted_solver_timing(
         "diagnostics",
     }
     if not isinstance(payload, dict) or set(payload) != expected_keys:
-        raise ValueError("Persisted COMSOL solver-timing evidence has invalid fields.")
+        msg = "Persisted COMSOL solver-timing evidence has invalid fields."
+        raise ValueError(msg)
     if (
         payload["schema_kind"] != SOLVER_TIMING_SCHEMA_KIND
         or payload["schema_version"] != SOLVER_TIMING_SCHEMA_VERSION
@@ -616,10 +626,12 @@ def admit_persisted_solver_timing(
         or payload["simulation_profile"] != simulation_profile
         or payload["required_phases"] != list(required)
     ):
-        raise ValueError("Persisted COMSOL solver-timing identity or method is invalid.")
+        msg = "Persisted COMSOL solver-timing identity or method is invalid."
+        raise ValueError(msg)
     phases_payload = payload["phases"]
     if not isinstance(phases_payload, dict) or set(phases_payload) != set(_PHASES):
-        raise ValueError("Persisted COMSOL solver-timing phases are invalid.")
+        msg = "Persisted COMSOL solver-timing phases are invalid."
+        raise ValueError(msg)
     stationary = _phase_from_payload(
         phases_payload[_PHASE_STATIONARY],
         phase=_PHASE_STATIONARY,
@@ -640,7 +652,8 @@ def admit_persisted_solver_timing(
     else:
         expected_status = "missing"
     if payload["status"] != expected_status:
-        raise ValueError("Persisted COMSOL solver-timing status is inconsistent.")
+        msg = "Persisted COMSOL solver-timing status is inconsistent."
+        raise ValueError(msg)
     scientific = payload["scientific_solver_seconds"]
     if expected_status == "complete":
         expected_scientific = sum(float(phase.seconds) for phase in selected if phase.seconds is not None)
@@ -649,10 +662,12 @@ def admit_persisted_solver_timing(
             label="persisted scientific solver seconds",
         )
         if not math.isclose(scientific_value, expected_scientific, rel_tol=0.0, abs_tol=1.0e-12):
-            raise ValueError("Persisted scientific solver timing disagrees with required phase timings.")
+            msg = "Persisted scientific solver timing disagrees with required phase timings."
+            raise ValueError(msg)
         scientific = scientific_value
     elif scientific is not None:
-        raise ValueError("Unavailable persisted COMSOL solver timing cannot contain a scientific sum.")
+        msg = "Unavailable persisted COMSOL solver timing cannot contain a scientific sum."
+        raise ValueError(msg)
     record_count = payload["solution_time_record_count"]
     ignored_count = payload["ignored_non_scientific_timing_count"]
     if (
@@ -663,17 +678,20 @@ def admit_persisted_solver_timing(
         or not isinstance(ignored_count, int)
         or not 0 <= ignored_count <= record_count
     ):
-        raise ValueError("Persisted COMSOL Solution time record counts are invalid.")
+        msg = "Persisted COMSOL Solution time record counts are invalid."
+        raise ValueError(msg)
     accounted_record_count = stationary.occurrence_count + transient.occurrence_count + ignored_count
     if accounted_record_count > record_count:
-        raise ValueError("Persisted COMSOL phase and ignored timing counts exceed the total record count.")
+        msg = "Persisted COMSOL phase and ignored timing counts exceed the total record count."
+        raise ValueError(msg)
     diagnostics_value = payload["diagnostics"]
     if (
         not isinstance(diagnostics_value, list)
         or len(diagnostics_value) > _MAX_DIAGNOSTICS
         or any(not isinstance(item, str) or len(item) > _MAX_DIAGNOSTIC_CHARS for item in diagnostics_value)
     ):
-        raise ValueError("Persisted COMSOL solver-timing diagnostics are invalid or unbounded.")
+        msg = "Persisted COMSOL solver-timing diagnostics are invalid or unbounded."
+        raise ValueError(msg)
     result = ComsolSolverTiming(
         simulation_profile=simulation_profile,
         status=expected_status,
@@ -690,5 +708,6 @@ def admit_persisted_solver_timing(
         "comsol_scientific_solver_seconds": result.scientific_solver_seconds,
     }
     if any(timing[field] != expected for field, expected in expected_top.items()):
-        raise ValueError("Case timing COMSOL solver fields disagree with structural evidence.")
+        msg = "Case timing COMSOL solver fields disagree with structural evidence."
+        raise ValueError(msg)
     return result

@@ -4,8 +4,8 @@ Strict experiment defaults and YAML configuration services.
 Provides:
 - defaults: canonical experiment defaults
 - loader: YAML admission, resolution, and semantic validation
+- naming: config sources, model labels, pair keys, trial leaves, and run names
 - preflight: resolved configuration and runtime-device preflight
-- temporal: explicit transient sampling and time-conditioning composition
 """
 
 from __future__ import annotations
@@ -16,16 +16,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import experiments_config_defaults as defaults
     from . import experiments_config_loader as loader
+    from . import experiments_config_naming as naming
     from . import experiments_config_preflight as preflight
-    from . import experiments_config_temporal as temporal
 
 _MODULES = {
     "defaults": "experiments_config_defaults",
     "loader": "experiments_config_loader",
+    "naming": "experiments_config_naming",
     "preflight": "experiments_config_preflight",
-    "temporal": "experiments_config_temporal",
 }
-__all__ = ["defaults", "loader", "preflight", "temporal"]
+__all__ = ["defaults", "loader", "naming", "preflight"]
 
 
 def __getattr__(name: str) -> object:

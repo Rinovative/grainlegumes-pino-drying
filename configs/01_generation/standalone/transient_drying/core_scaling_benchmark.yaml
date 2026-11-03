@@ -1,0 +1,40 @@
+# Role: CPU core-scaling benchmark that informs cores_per_case in execution.yaml. Edit: only before a new benchmark.
+# Measures node throughput per core count k exactly as production runs: one node job per node-job slot, floor(32/k) concurrent case steps of k cores.
+schema_kind: generation_core_scaling_benchmark_suite
+schema_version: 3
+suite_name: transient_core_scaling
+benchmark_mode: core_selection
+# Candidate cases of one authored campaign batch, tried in case-index order by every variant (one material, so variants compare like with like).
+# A variant runs candidates until target_successful_cases succeeded; a failed case (timeout, stall, solver failure) is replaced by the next candidate,
+# so failures cost node time and lower the measured throughput exactly as in production.
+case_pool:
+  campaign_config: configs/01_generation/standalone/transient_drying/lentil_chickpea_kidney_bean.yaml
+  material_family: lentil
+  sampling_regime: natural
+  first_case_index: 1
+  case_count: 48
+target_successful_cases: 16
+# One sweep per node-job slot; each sweep runs every variant on its own node in this order, so core counts are compared within one node; opposite orders balance drift.
+sweeps:
+- {sweep_id: sweep_1, order: ascending}
+- {sweep_id: sweep_2, order: descending}
+# A variant whose node job is interrupted (node failure, time limit, cancellation) is measured again in a new node job of the same sweep, at most this many times.
+retry:
+  maximum_variant_attempts: 2
+# Sweep node jobs run on the production node type and partition; sweep_wall_time must hold all variants of one sweep (estimate 10 to 12 h).
+resources:
+  partition: null  # null uses the production partition from execution.yaml
+  sweep_wall_time: "18:00:00"
+  scheduler_options: []
+# Names the ordinary campaign and execution settings used when interpreting resource results.
+production_interpretation:
+  campaign_config: configs/01_generation/standalone/transient_drying/lentil_chickpea_kidney_bean.yaml
+  cores_config: configs/01_generation/execution.yaml
+  cores_key: cluster.cores_per_case
+# Resource-only variants in increasing cores_per_case order; each must divide site.cores_per_node, and floor(32/k) cases run concurrently.
+variants:
+- {variant_id: cores_02, cores_per_case: 2}
+- {variant_id: cores_04, cores_per_case: 4}
+- {variant_id: cores_08, cores_per_case: 8}
+- {variant_id: cores_16, cores_per_case: 16}
+- {variant_id: cores_32, cores_per_case: 32}

@@ -1,4 +1,15 @@
-# ruff: noqa: S101, D100, D103, PLR2004
+"""Protect histogram bins and exact-constant count, weight, and density rendering.
+
+Responsibilities:
+  - Check caller bins and exact-constant count, weight, and density rendering
+
+Design principles:
+  - Near-constant unequal values retain normal histogram bins
+
+This module does NOT:
+  - Estimate scientific distribution parameters or test notebook controls
+"""
+
 from __future__ import annotations
 
 import matplotlib.pyplot as plt

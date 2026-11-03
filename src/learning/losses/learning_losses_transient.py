@@ -1,7 +1,4 @@
-"""
-learning_losses_transient.py
-
-Compute transient drying loss over scaled state increments.
+"""Compute transient drying loss over scaled state increments.
 
 Responsibilities:
   - Apply configurable Huber or mean-squared error by output channel
@@ -51,7 +48,6 @@ class TransientIncrementLoss(nn.Module):
     """Compose scaled-increment data loss and optional state auxiliary loss."""
 
     physics_enabled = False
-    continuity = "none"
     component_names = ("total", "data", "data_T", "data_phi", "data_w_surf", "data_w_int", "state_aux")
 
     def __init__(

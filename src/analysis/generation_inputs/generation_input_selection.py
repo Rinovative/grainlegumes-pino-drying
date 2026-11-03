@@ -1,16 +1,16 @@
-"""
-generation_input_selection.py
+"""Own canonical shared A/B selection state for generation-input analysis.
 
-Own canonical shared A/B selection state for generation-input analysis.
 Responsibilities:
   - Store immutable Dataset A/B and Case A/B canonical keys
   - Reconcile dataset changes against admitted sparse case inventories
   - Notify view-local controls through one guarded session-scoped state owner
   - Resolve deterministic admitted-catalog defaults and optional preferences
+
 Design principles:
   - Canonical keys remain authoritative over labels, paths, and widget positions
   - Dataset changes retain valid case numbers before deterministic fallback
   - State remains in memory and never becomes a durable user preference
+
 This module does NOT:
   - Construct widgets, discover storage, or render scientific diagnostics
   - Modify completed-output EDA or evaluation selection behavior

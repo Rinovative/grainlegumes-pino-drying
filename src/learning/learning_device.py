@@ -1,7 +1,4 @@
-"""
-learning_device.py
-
-Resolve the exact runtime device policy shared by every execution service.
+"""Resolve the exact runtime device policy shared by every execution service.
 
 Responsibilities:
   - Consume the dependency-free auto, cuda, and cpu policy contract

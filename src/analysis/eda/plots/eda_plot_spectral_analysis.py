@@ -1,7 +1,4 @@
-"""
-eda_plot_spectral_analysis.py
-
-Compare bounded dataset spectra without loading model activations or artifacts.
+"""Compare bounded dataset spectra without loading model activations or artifacts.
 
 Responsibilities:
   - Compute Hann-windowed isotropic and x/y directional power spectra
@@ -31,6 +28,7 @@ import numpy as np
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.presentation import analysis_display_labels as display_labels
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation import visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as plot_layout
 
@@ -103,16 +101,6 @@ def _case_row(frame: pd.DataFrame, case_number: int) -> pd.Series:
             return row
     msg = f"Requested case {case_number} is unavailable in this dataset. Choose a shared case number."
     raise ValueError(msg)
-
-
-def available_spectral_channels(
-    datasets: dict[str, pd.DataFrame],
-) -> tuple[str, ...]:
-    """Return the semantically ordered spectral capability union."""
-    return capabilities.resolve_fields(
-        datasets,
-        view="spectral",
-    ).fields
 
 
 def _is_transient(frame: pd.DataFrame) -> bool:
@@ -536,20 +524,6 @@ def _spectral_evolution_case_map(
     return frequency, position, fractions, "m"
 
 
-def _vertical_case_map(
-    frame: pd.DataFrame,
-    row: pd.Series,
-    field: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
-    """Retain the original cross-stream-along-flow reducer for internal callers."""
-    return _spectral_evolution_case_map(
-        frame,
-        row,
-        field,
-        orientation=_CROSS_STREAM_ALONG_FLOW,
-    )
-
-
 def _spectral_evolution_map(
     frame: pd.DataFrame,
     field: str,
@@ -583,21 +557,6 @@ def _spectral_evolution_map(
     return reference_frequency, reference_position, np.median(np.stack(spectra), axis=0), len(selected), coordinate_unit
 
 
-def _vertical_spectral_map(
-    frame: pd.DataFrame,
-    field: str,
-    *,
-    max_cases: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, str]:
-    """Retain the original aggregate reducer for internal callers."""
-    return _spectral_evolution_map(
-        frame,
-        field,
-        max_cases=max_cases,
-        orientation=_CROSS_STREAM_ALONG_FLOW,
-    )
-
-
 def _orientation_labels(orientation: SpectralEvolutionOrientation, coordinate_unit: str) -> tuple[str, str, str]:
     """Return figure title and explicit frequency/position axis labels."""
     if orientation == _CROSS_STREAM_ALONG_FLOW:
@@ -616,9 +575,19 @@ def _orientation_labels(orientation: SpectralEvolutionOrientation, coordinate_un
     raise ValueError(msg)
 
 
-def _log_power_fraction(fractions: np.ndarray) -> np.ndarray:
-    """Apply the documented fixed floor used by both evolution orientations."""
-    return np.log10(np.maximum(fractions, _POWER_FRACTION_FLOOR))
+def _power_fraction_scale() -> field_maps.FieldMapDefinition:
+    """Reuse eleven logarithmic bands for the documented fixed power fraction range."""
+    limits = np.asarray((_POWER_FRACTION_FLOOR, 1.0))
+    return field_maps.build_field_map(
+        limits,
+        semantic=field_maps.FieldMapSemantic.LOG_POSITIVE,
+        field="row_normalized_power_fraction",
+        unit="1",
+        comparison_scope="all_spectral_evolution_views",
+        locked_boundaries=np.geomspace(_POWER_FRACTION_FLOOR, 1.0, field_maps.N_COLOR_BINS + 1),
+        bound_policy="fixed_numerical_floor_1e-12_to_one",
+        colormap_name="magma",
+    )
 
 
 def _band(axis: Axes, k_values: np.ndarray, energy: np.ndarray, *, label: str, color: object) -> None:
@@ -646,6 +615,7 @@ def _set_log_frequency_axis(axis: Axes) -> None:
     axis.xaxis.set_minor_formatter(mticker.NullFormatter())
 
 
+@plot_layout.eda_typography()
 def plot_isotropic_spectral_summary(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -755,6 +725,7 @@ def plot_isotropic_spectral_summary(
     return figure
 
 
+@plot_layout.eda_typography()
 def plot_isotropic_spectral_case(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -903,6 +874,7 @@ def _directional_axis(
     return [*handles, *cumulative_handles], [*labels, *cumulative_labels]
 
 
+@plot_layout.eda_typography()
 def plot_directional_spectral_summary(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -995,6 +967,7 @@ def plot_directional_spectral_summary(
     return figure
 
 
+@plot_layout.eda_typography()
 def plot_directional_spectral_case(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -1055,6 +1028,7 @@ def plot_directional_spectral_case(
     return figure
 
 
+@plot_layout.eda_typography()
 def plot_vertical_spectral_evolution(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -1145,15 +1119,13 @@ def plot_vertical_spectral_evolution(
                 max_cases=max_cases,
                 orientation=orientation,
             )
-            log_fraction = _log_power_fraction(fractions)
+            scale = _power_fraction_scale()
             image = axis.pcolormesh(
                 frequency,
                 position,
-                log_fraction,
+                np.maximum(fractions, _POWER_FRACTION_FLOOR),
                 shading="auto",
-                cmap="magma",
-                vmin=np.log10(_POWER_FRACTION_FLOOR),
-                vmax=0.0,
+                **scale.pcolormesh_kwargs(),
             )
             _set_log_frequency_axis(axis)
             if field_index == 0:
@@ -1175,7 +1147,8 @@ def plot_vertical_spectral_evolution(
                     va="center",
                     color="white",
                 )
-            colorbar = figure.colorbar(image, ax=axis)
+            colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
+            colorbar.set_ticks(scale.ticks.tolist(), labels=[f"{value:g}" for value in np.log10(scale.ticks)])
             colorbar.set_label("log10 row-normalized power fraction [-]" if dataset_index == rightmost_compatible_index else "")
         _label_matrix_row(
             axes[field_index, 0],
@@ -1196,6 +1169,7 @@ def plot_vertical_spectral_evolution(
     return figure
 
 
+@plot_layout.eda_typography()
 def plot_vertical_spectral_case(
     *,
     datasets: dict[str, pd.DataFrame],
@@ -1248,15 +1222,13 @@ def plot_vertical_spectral_case(
                 field,
                 orientation=orientation,
             )
-            log_fraction = _log_power_fraction(fractions)
+            scale = _power_fraction_scale()
             image = axis.pcolormesh(
                 frequency,
                 position,
-                log_fraction,
+                np.maximum(fractions, _POWER_FRACTION_FLOOR),
                 shading="auto",
-                cmap="magma",
-                vmin=np.log10(_POWER_FRACTION_FLOOR),
-                vmax=0.0,
+                **scale.pcolormesh_kwargs(),
             )
             _set_log_frequency_axis(axis)
             if field_index == 0:
@@ -1278,7 +1250,8 @@ def plot_vertical_spectral_case(
                     va="center",
                     color="white",
                 )
-            colorbar = figure.colorbar(image, ax=axis)
+            colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
+            colorbar.set_ticks(scale.ticks.tolist(), labels=[f"{value:g}" for value in np.log10(scale.ticks)])
             colorbar.set_label("log10 row-normalized power fraction [-]" if dataset_index == rightmost_compatible_index else "")
         _label_matrix_row(
             axes[field_index, 0],

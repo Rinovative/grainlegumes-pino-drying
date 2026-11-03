@@ -1,7 +1,4 @@
-"""
-eda_panel.py
-
-Compose one capability-adaptive lazy EDA panel from generated-output views.
+"""Compose one capability-adaptive lazy EDA panel from generated-output views.
 
 Responsibilities:
   - Bind one panel-level dataset selector to the shared selection state
@@ -22,11 +19,13 @@ This module does NOT:
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
 import ipywidgets as widgets
 
 from src.analysis import ui
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import registry as presentation
 
 from . import eda_controls as controls
@@ -73,6 +72,7 @@ def _cached_factory(
 def _view_factories(
     catalog: selection.GeneratedOutputEDACatalog,
     selection_state: selection.GeneratedOutputSelectionState,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Mapping[str, Callable[..., widgets.Widget]]:
     """Bind every maintained semantic registry key to one cached factory."""
 
@@ -138,6 +138,7 @@ def _view_factories(
     ) -> viewers.ActivatableView:
         """Build shared steady/transient retained spatial-field maps."""
         return viewers.make_spatial_case_view(
+            display_spatial_stride=display_spatial_stride,
             catalog=catalog,
             selection_state=selection_state,
             export_state=export_state,
@@ -156,6 +157,7 @@ def _view_factories(
         ) -> viewers.ActivatableView:
             """Build one task-native transient case view."""
             return viewers.make_transient_case_view(
+                display_spatial_stride=display_spatial_stride,
                 catalog=catalog,
                 selection_state=selection_state,
                 kind=kind,
@@ -201,7 +203,7 @@ def _view_factories(
             flex=f"0 0 {_ORIENTATION_SELECTOR_WIDTH_PX}px",
         ),
     )
-    return {
+    factories = {
         "metadata_statistics": statistics(
             plots.case_statistics.plot_meta_statistics,
             required_capabilities=("generated_output",),
@@ -232,6 +234,13 @@ def _view_factories(
         "transient_state_trajectories": transient_case("trajectory"),
         "transient_completion_target": _cached_factory(completion_target),
     }
+    if any(isinstance(view, selection.PublishedDatasetEDAView) for view in catalog.views):
+        factories["published_tensors"] = _cached_factory(
+            partial(
+                viewers.make_published_tensor_view, catalog=catalog, selection_state=selection_state, display_spatial_stride=display_spatial_stride
+            )
+        )
+    return factories
 
 
 def _sections_for_capabilities(
@@ -243,6 +252,15 @@ def _sections_for_capabilities(
     """Build lazy numbered sections for one selected-dataset capability union."""
     sections: list[widgets.Widget] = []
     titles: list[str] = []
+    if "published_tensors" in factories:
+        sections.append(
+            ui.notebook.make_dropdown_section(
+                [("Model inputs and targets", factories["published_tensors"], "published_tensors")],
+                export_state=export_state,
+                select_first=True,
+            )
+        )
+        titles.append("Model inputs and targets")
     visible = presentation.eda_sections_for_capabilities(capabilities)
     for _section, section_label, numbered_plots in presentation.numbered_registry(visible):
         entries = []
@@ -281,6 +299,7 @@ def build_eda_panel(
     catalog: selection.GeneratedOutputEDACatalog,
     selection_state: selection.GeneratedOutputSelectionState,
     title: str = "Generated-output EDA",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> widgets.Widget:
     """Build the sole capability-adaptive generated-output EDA outer panel."""
     if not isinstance(catalog, selection.GeneratedOutputEDACatalog):
@@ -295,7 +314,7 @@ def build_eda_panel(
     if not isinstance(title, str) or not title.strip():
         message = "EDA panel title must be non-empty text."
         raise ValueError(message)
-    factories = _view_factories(catalog, selection_state)
+    factories = _view_factories(catalog, selection_state, display_spatial_stride=display_spatial_stride)
     export_state: dict[str, Any] = {
         "fig": None,
         "figures": (),
@@ -316,7 +335,7 @@ def build_eda_panel(
         tab_titles=tab_titles,
         open_btn_text=f"{title.strip()} - Open",
         close_btn_text="Close",
-        panel_controls=(dataset_control.widget,),
+        panel_controls=(dataset_control.widget, widgets.HTML(f"Map display stride: {display_spatial_stride}; full-grid statistics.")),
         export_state=export_state,
         export_dir="",
         export_btn_text="Export PDF",

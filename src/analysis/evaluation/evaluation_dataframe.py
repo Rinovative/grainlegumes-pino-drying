@@ -1,19 +1,17 @@
-"""
-evaluation_dataframe.py
-
-Build and compare evaluation DataFrames from the current artifact contract.
+"""Build and compare evaluation DataFrames from the current artifact contract.
 
 Responsibilities:
   - Admit only exact current artifact tables and provenance metadata
   - Preserve exact normalized_group_macro_rmse sufficient-statistic aggregates
   - Flatten source metadata without colliding with authoritative columns
   - Validate task, objective, units, formulas, role, and membership before plots
+  - Own the per-case NPZ file name, which is the Dataset package case ID
 
 Design principles:
   - DataFrames carry validated provenance in attrs
   - Plot modules consume this module instead of recreating scientific identities
   - Per-case relative metrics remain secondary to the runtime primary objective
-  - Architecture, physics enablement, and training continuity are dimensions
+  - Architecture and physics enablement are comparison dimensions
 
 This module does NOT:
   - Generate, repair, or publish artifact payloads
@@ -24,7 +22,8 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -33,6 +32,9 @@ import numpy as np
 import pandas as pd
 
 from src.analysis.artifacts import contracts
+from src.analysis.presentation import analysis_display_grid as display_grid
+
+from . import evaluation_case as cases
 
 COMPLETED_RUN_CONFIG_ATTR = "completed_run_config"
 RUNTIME_COMPARISON_ATTR = "runtime_comparison"
@@ -47,8 +49,7 @@ PRIMARY_OBJECTIVE_DEFINITION = {
 }
 STEADY_PHYSICS_METRICS = (
     "momentum_residual_mse",
-    "div_velocity_mse",
-    "div_eps_velocity_mse",
+    "flux_balance_mse",
     "pressure_boundary_mse",
 )
 PRESSURE_BOUNDARY_METRICS = (
@@ -71,7 +72,10 @@ _BASE_ARTIFACT_COLUMNS = frozenset(
     }
 )
 _MAX_FLATTENED_SEQUENCE_LENGTH = 4
+_EXACT_GRID_CACHE_ENTRY_LENGTH = 3
+_MINIMUM_DIRECT_MODEL_COMPARISON = 2
 _OUTPUT_GROUP_ENTRY_LENGTH = 2
+_PACKAGE_CASE_ID = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*__case_[0-9]{4,}__[0-9a-f]{12}")
 _STEADY_PHYSICS_COLUMNS = frozenset(
     {
         *STEADY_PHYSICS_METRICS,
@@ -89,6 +93,36 @@ class ComparisonCompatibilityError(ValueError):
     identities. It is distinct from malformed raw value errors, which retain
     ``TypeError`` or ``ValueError`` during individual artifact admission.
     """
+
+
+def case_payload_filename(case_id: str) -> str:
+    """
+    Return ``<package case id>.npz`` for one exact Dataset package case ID.
+
+    Raises
+    ------
+    ValueError
+        If the ID is not ``<material>__case_<NNNN>__<12 hex>``.
+
+    """
+    if _PACKAGE_CASE_ID.fullmatch(case_id) is None:
+        msg = f"Case payload names require a package case ID '<material>__case_NNNN__<12 hex>', got {case_id!r}."
+        raise ValueError(msg)
+    return f"{case_id}.npz"
+
+
+def dataset_case_payload_filenames(sample_ids: Sequence[str]) -> tuple[str, ...]:
+    """
+    Return unique NPZ names for ordered steady Dataset sample IDs.
+
+    A combined evaluation Dataset qualifies package case IDs as ``<dataset>::<case ID>``.
+    The file keeps the package case ID alone, so a case repeated across components is rejected.
+    """
+    names = tuple(case_payload_filename(sample_id.rpartition("::")[2]) for sample_id in sample_ids)
+    if len(names) != len(set(names)):
+        msg = "Dataset sample IDs map to duplicate case payload names."
+        raise ValueError(msg)
+    return names
 
 
 def output_group_fields(frame: pd.DataFrame, *, group_id: str) -> tuple[str, ...]:
@@ -517,8 +551,8 @@ def _validated_provenance(
         raise ComparisonCompatibilityError(msg)
 
     split_role = payload.get("split_role")
-    if split_role not in {"eval", "ood"}:
-        msg = f"Artifact split_role must be explicit eval or ood, got {split_role!r}."
+    if split_role not in {"eval", "additional_evaluation"}:
+        msg = f"Artifact split_role must be explicit eval or additional_evaluation, got {split_role!r}."
         raise ComparisonCompatibilityError(msg)
     selection = _mapping(payload.get("selection"), label="provenance.selection")
     effective_count = selection.get("effective_case_count")
@@ -694,33 +728,6 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def load_and_build_eval_df(parquet_path: str | Path) -> pd.DataFrame:
-    """
-    Load and validate one explicit raw current-schema Parquet table.
-
-    Parameters
-    ----------
-    parquet_path : str | pathlib.Path
-        Exact table path. No sibling provenance file is inferred or scanned.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Table-only evaluation frame with ``provenance_complete=False``.
-
-    Raises
-    ------
-    OSError, KeyError, TypeError, ValueError
-        If Parquet loading or the current table contract fails.
-
-    Notes
-    -----
-    Use :func:`load_evaluation_artifact` for comparison-ready provenance.
-
-    """
-    return build_eval_df(pd.read_parquet(Path(parquet_path)))
-
-
 def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
     """
     Load one explicit artifact root and its declared Parquet payload.
@@ -784,14 +791,13 @@ def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
         contracts.resolve_case_payload_path(
             root,
             stored_path,
-            expected_filename=f"case_{int(case_index):04d}.npz",
+            expected_filename=case_payload_filename(Path(str(stored_path)).stem),
         )
-        for case_index, stored_path in zip(
-            frame["case_index"].tolist(),
-            frame["npz_path"].tolist(),
-            strict=True,
-        )
+        for stored_path in frame["npz_path"].tolist()
     ]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        msg = "Artifact Parquet rows share one NPZ payload."
+        raise ValueError(msg)
     frame.loc[:, "npz_path"] = [str(path) for path in resolved_paths]
     return frame
 
@@ -852,8 +858,8 @@ def dataset_role(frame: pd.DataFrame) -> str:
     role = frame.attrs.get("dataset_role")
     if role == "eval":
         return "ID"
-    if role == "ood":
-        return "OOD"
+    if role == "additional_evaluation":
+        return "Additional evaluation"
     return "unspecified"
 
 
@@ -864,7 +870,7 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
     Task/objective/schema/field/unit and dataset/effective-membership evidence
     always participate. When ``physics`` is requested, residual equations,
     derivative/crop settings, boundary semantics, and array definitions join the
-    identity. Architecture and training continuity deliberately do not.
+    identity. Architecture and physics-loss settings deliberately do not.
     """
     evaluator = _mapping(provenance.get("evaluator"), label="provenance.evaluator")
     identity: dict[str, Any] = {
@@ -890,7 +896,9 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
         identity["physics"] = {
             "residual_schema_version": raw_physics.get("residual_schema_version"),
             "equation_kind": raw_physics.get("equation_kind"),
+            "continuity_kind": raw_physics.get("continuity_kind"),
             "boundary_condition_kind": raw_physics.get("boundary_condition_kind"),
+            "scales": raw_physics.get("scales"),
             "derivatives": raw_physics.get("derivatives"),
             "interior_crop": raw_physics.get("interior_crop"),
             "scalar_definitions": raw_physics.get("scalar_definitions"),
@@ -900,10 +908,75 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
     return identity
 
 
+def _require_one_artifact_grid(members: tuple[tuple[int, int, int], ...], grids: tuple[display_grid.SpatialGridIdentity, ...]) -> None:
+    """Reject a mixed representation within one artifact, even for one model."""
+    reference = grids[0]
+    for member, grid in zip(members[1:], grids[1:], strict=True):
+        try:
+            display_grid.require_common_grid(reference, grid)
+        except ValueError as error:
+            msg = f"One Evaluation artifact mixes incompatible grids between its first case and case {member}: {error}"
+            raise ComparisonCompatibilityError(msg) from error
+
+
+def _exact_comparison_grids(frame: pd.DataFrame) -> tuple[tuple[tuple[int, int, int], ...], tuple[display_grid.SpatialGridIdentity, ...]]:
+    """Read each exact coordinate member once, caching against payload witnesses."""
+    paths = tuple(Path(value).resolve() for value in frame["npz_path"])
+    witnesses = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
+    members = tuple(
+        (int(case), int(source), int(split))
+        for case, source, split in zip(frame["case_index"], frame["source_index"], frame["split_local_index"], strict=True)
+    )
+    cached = frame.attrs.get("_exact_comparison_grid_cache")
+    if cached is not None:
+        if not isinstance(cached, tuple) or len(cached) != _EXACT_GRID_CACHE_ENTRY_LENGTH:
+            msg = "Evaluation exact-grid cache is malformed; reload the artifact."
+            raise ComparisonCompatibilityError(msg)
+        cached_witnesses, cached_members, cached_grids = cached
+        if (
+            cached_witnesses != witnesses
+            or cached_members != members
+            or not isinstance(cached_grids, tuple)
+            or len(cached_grids) != len(paths)
+            or not all(isinstance(grid, display_grid.SpatialGridIdentity) for grid in cached_grids)
+        ):
+            msg = "Evaluation payloads or case membership changed after exact grid admission; reload the artifact."
+            raise ComparisonCompatibilityError(msg)
+        _require_one_artifact_grid(cached_members, cached_grids)
+        return cached_members, cached_grids
+    grids: list[display_grid.SpatialGridIdentity] = []
+    coordinate_units = cases._coordinate_units(frame)  # noqa: SLF001
+    field_order = tuple(frame.attrs["output_fields"])
+    for path, witness in zip(paths, witnesses, strict=True):
+        try:
+            with np.load(path, allow_pickle=False) as payload:
+                if "coordinates" not in payload.files:
+                    msg = f"Current Evaluation artifact {path} lacks its exact coordinate member; rebuild the artifact."
+                    raise ComparisonCompatibilityError(msg)
+                coordinates = payload["coordinates"]
+            current = path.stat()
+            if (str(path), current.st_size, current.st_mtime_ns) != witness:
+                msg = f"Evaluation payload changed during exact grid admission: {path}"
+                raise ComparisonCompatibilityError(msg)
+        except (OSError, ValueError) as error:
+            msg = f"Evaluation coordinate member cannot be admitted from {path}: {error}"
+            raise ComparisonCompatibilityError(msg) from error
+        try:
+            grids.append(display_grid.spatial_grid_identity(coordinates, coordinate_units=coordinate_units, field_order=field_order))
+        except ValueError as error:
+            msg = f"Evaluation coordinate member has an invalid grid in {path}: {error}"
+            raise ComparisonCompatibilityError(msg) from error
+    result = (members, tuple(grids))
+    _require_one_artifact_grid(*result)
+    frame.attrs["_exact_comparison_grid_cache"] = (witnesses, *result)
+    return result
+
+
 def validate_comparison(
     datasets: Mapping[str, pd.DataFrame],
     *,
     require_physics: bool = False,
+    verify_grid: bool = True,
 ) -> None:
     """
     Reject incompatible artifact groups before plotting or aggregation.
@@ -915,6 +988,9 @@ def validate_comparison(
     require_physics : bool, optional
         Also require the maintained steady-flow residual schema and exact physics
         equation, derivative, crop, boundary, and array definitions.
+    verify_grid : bool, optional
+        Compare every matched steady case's exact coordinate member before a
+        numerical comparison. Panel construction may defer this payload work.
 
     Raises
     ------
@@ -927,14 +1003,15 @@ def validate_comparison(
     -----
     ID and OOD roles may coexist. Within each role, dataset fingerprint and saved
     effective membership must match. Across roles, task/objective/schema/field/
-    unit semantics still agree. Architecture, hyperparameters, physics enablement,
-    and selected training continuity remain comparison dimensions, not blockers.
+    unit semantics still agree. Architecture, hyperparameters, and physics
+    enablement remain comparison dimensions, not blockers.
 
     """
     if not datasets:
         msg = "At least one evaluation dataset is required."
         raise ValueError(msg)
     grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    frames_by_role: dict[str, list[tuple[str, pd.DataFrame]]] = {}
     for label, frame in datasets.items():
         if not isinstance(label, str) or not label:
             msg = "Evaluation dataset labels must be non-empty strings."
@@ -954,6 +1031,7 @@ def validate_comparison(
                 raise ComparisonCompatibilityError(msg)
         role = str(provenance.get("split_role"))
         grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))
+        frames_by_role.setdefault(role, []).append((label, frame))
 
     reference_global: dict[str, Any] | None = None
     for role, entries in grouped.items():
@@ -985,6 +1063,22 @@ def validate_comparison(
         elif common != reference_global:
             msg = "ID and OOD artifact groups use incompatible task/objective/schema/field/unit contracts."
             raise ComparisonCompatibilityError(msg)
+    if verify_grid and all(frame.attrs.get("artifact_kind") != "transient_sequence" for frame in datasets.values()):
+        for role, role_frames in frames_by_role.items():
+            admitted = [(name, *_exact_comparison_grids(frame)) for name, frame in role_frames]
+            if len(admitted) < _MINIMUM_DIRECT_MODEL_COMPARISON:
+                continue
+            reference_name, reference_members, reference_grids = admitted[0]
+            for name, members, grids in admitted[1:]:
+                if members != reference_members:
+                    msg = f"Models {reference_name!r} and {name!r} have different exact {role!r} case/source membership."
+                    raise ComparisonCompatibilityError(msg)
+                for member, left, right in zip(members, reference_grids, grids, strict=True):
+                    try:
+                        display_grid.require_common_grid(left, right)
+                    except ValueError as error:
+                        msg = f"Models {reference_name!r} and {name!r} have incompatible grid for case {member}: {error}"
+                        raise ComparisonCompatibilityError(msg) from error
 
 
 def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:

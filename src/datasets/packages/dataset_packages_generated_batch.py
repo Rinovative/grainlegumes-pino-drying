@@ -1,15 +1,14 @@
-"""
-dataset_packages_generated_batch.py
+"""Interpret exact admitted Generation source cases as task-owned analysis views.
 
-Interpret admitted Generation HDF5 cases as task-owned analysis views.
 Responsibilities:
   - Preserve the established steady-flow tensor and fingerprint representation
   - Materialize canonical transient case trajectories without Dataset publication
-  - Load bounded manifest prefixes with terminal provenance and runtime evidence
+
 Design principles:
-  - Generation alone admits manifests, publications, artifacts, and HDF5 identity
+  - Generation alone admits source cases, artifacts, and HDF5 identity
   - Dataset trajectory contracts own transient field, time, and handoff semantics
   - Complete trajectories remain nested case evidence rather than flattened samples
+
 This module does NOT:
   - Validate Generation publication schemas, membership, or artifact hashes
   - Publish Dataset packages, derive target increments, or fit preprocessing state
@@ -18,14 +17,13 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 import h5py
 import numpy as np
 import torch
-from tqdm import tqdm
 
-from src import domain, generation
+from src import generation
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
@@ -37,58 +35,6 @@ if TYPE_CHECKING:
 
     from src.domain.tasks.domain_task_spec import TaskSpec
     from src.generation.runtime.generation_runtime_batch import TerminalCaseEvidence
-
-
-class _CompletedBatchEvidence(Protocol):
-    """Describe an admitted complete or partial batch case collection."""
-
-    @property
-    def simulation_profile(self) -> str:
-        """Return the canonical simulation profile."""
-        ...
-
-    @property
-    def available_learning_views(self) -> tuple[str, ...]:
-        """Return task views declared by the Generation profile."""
-        ...
-
-    @property
-    def airflow_source(self) -> str:
-        """Return the admitted airflow source identity."""
-        ...
-
-    @property
-    def batch_id(self) -> str:
-        """Return the immutable scientific batch identity."""
-        ...
-
-    @property
-    def sampling_regime(self) -> str:
-        """Return the configured sampling regime."""
-        ...
-
-    @property
-    def template_sha256(self) -> str:
-        """Return the admitted solver-template digest."""
-        ...
-
-    @property
-    def git_commit(self) -> str:
-        """Return the persisted source commit."""
-        ...
-
-    @property
-    def cases(self) -> tuple[TerminalCaseEvidence, ...]:
-        """Return ordered admitted completed cases."""
-        ...
-
-    def case(self, case_id: str) -> TerminalCaseEvidence:
-        """Return one exact admitted case member."""
-        ...
-
-    def scientific_config_payload(self) -> dict[str, Any]:
-        """Return independent resolved scientific configuration."""
-        ...
 
 
 def _hdf5_dataset(handle: h5py.File, name: str) -> h5py.Dataset:
@@ -165,74 +111,6 @@ def _steady_flow_fields(
     )
 
 
-def interpret_generated_case(
-    batch: _CompletedBatchEvidence,
-    case: TerminalCaseEvidence,
-    *,
-    task: TaskSpec,
-) -> tuple[tuple[int, int], torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any], str]:
-    """Interpret one admitted canonical case as a steady-flow TaskSpec view."""
-    if case.case_id not in {item.case_id for item in batch.cases} or batch.case(case.case_id) != case:
-        msg = f"Case {case.case_id!r} is not bound to admitted batch {batch.batch_id!r}."
-        raise ValueError(msg)
-    if "steady_flow" not in batch.available_learning_views:
-        msg = f"Batch {batch.batch_id!r} does not advertise a steady_flow view."
-        raise ValueError(msg)
-    hdf5_artifact = case.artifact_evidence("processed", "case.h5")
-    with h5py.File(hdf5_artifact.path, "r") as handle:
-        x_axis = np.asarray(_hdf5_dataset(handle, "coords/x"), dtype=np.float64)
-        y_axis = np.asarray(_hdf5_dataset(handle, "coords/y"), dtype=np.float64)
-        static_dataset = _hdf5_dataset(handle, "static/fields")
-        static_values = np.asarray(static_dataset, dtype=np.float32)
-        names = _string_list_attribute(static_dataset, "field_names")
-    profile = generation.contracts.get_profile_contract(batch.simulation_profile)
-    if names != [field.name for field in profile.static_fields]:
-        msg = f"Canonical static HDF5 field order is invalid for {case.case_id}."
-        raise ValueError(msg)
-    static = {name: static_values[index] for index, name in enumerate(names)}
-    case_inputs, case_outputs = _steady_flow_fields(static, x_axis=x_axis, y_axis=y_axis, task=task)
-    inputs = torch.stack([torch.from_numpy(case_inputs[name]) for name in task.input_names])
-    outputs = torch.stack([torch.from_numpy(case_outputs[name]) for name in task.output_names])
-    case_payload = case.metadata_payload()
-    metadata = {
-        "case_id": case.case_id,
-        "case_index": case.case_index,
-        "case_input_id": case.case_input_id,
-        "simulation_case_id": case.simulation_case_id,
-        "material_family": case.material_family,
-        "sampling_regime": batch.sampling_regime,
-        "ood": case_payload["ood"],
-        "simulation_profile": batch.simulation_profile,
-        "available_learning_views": list(batch.available_learning_views),
-        "airflow_source": batch.airflow_source,
-        "template_sha256": batch.template_sha256,
-        "generator_version": case_payload["generator_version"],
-        "seed": case_payload["seed_evidence"]["case_seed"],
-        "parameters": case_payload["sampled_values"],
-        "parameter_units": case_payload["sampled_units"],
-        "geometry": case_payload["spatial_diagnostics"]["geometry"],
-        "schedule_class": (case_payload["schedule_diagnostics"]["schedule_class"] if "schedule_diagnostics" in case_payload else None),
-    }
-    source = {
-        "case_id": case.case_id,
-        "case_input_id": case.case_input_id,
-        "simulation_case_id": case.simulation_case_id,
-        "simulation_profile": batch.simulation_profile,
-        "template_sha256": batch.template_sha256,
-        "airflow_source": batch.airflow_source,
-        "case_hdf5": hdf5_artifact.as_dict(),
-    }
-    fingerprint = identity.compute_case_fingerprint(
-        task=task,
-        case_id=case.case_id,
-        source_identity=source,
-        source_metadata=metadata,
-        inputs=inputs,
-        outputs=outputs,
-    )
-    return (y_axis.size, x_axis.size), inputs, outputs, metadata, source, fingerprint
-
-
 def _required_named_array(
     handle: h5py.File,
     name: str,
@@ -259,71 +137,82 @@ def _required_named_array(
     return np.ascontiguousarray(values)
 
 
-def _transient_case_metadata(
-    batch: _CompletedBatchEvidence,
-    case: TerminalCaseEvidence,
-) -> dict[str, Any]:
-    """Return stable completed-case metadata shared by transient EDA views."""
-    payload = case.metadata_payload()
-    seed_evidence = payload.get("seed_evidence")
-    seed = seed_evidence.get("case_seed") if isinstance(seed_evidence, dict) else None
-    spatial = payload.get("spatial_diagnostics")
-    geometry = spatial.get("geometry") if isinstance(spatial, dict) else None
-    schedule = payload.get("schedule_diagnostics")
-    return {
+def interpret_admitted_transient_source_case(admitted: Any, *, task: TaskSpec) -> dict[str, Any]:
+    """Interpret an exact successful Generation source without a composed batch."""
+    case = admitted.case
+    source_identity = admitted.source_identity
+    case_payload = case.metadata_payload()
+    if task.id != transient_contract.TRANSIENT_PROFILE_ID:
+        message = f"Transient source interpretation requires transient_drying, got {task.id!r}."
+        raise ValueError(message)
+    if source_identity["case_id"] != case.case_id or source_identity["case_hdf5_sha256"] != case.case_hdf5_sha256:
+        msg = "Admitted transient source identity disagrees with Generation evidence."
+        raise ValueError(msg)
+    if task.id not in case_payload["available_learning_views"]:
+        msg = "Admitted source case does not expose the transient learning view."
+        raise ValueError(msg)
+    hdf5_artifact = case.artifact("processed", "case.h5")
+    if admitted.hdf5_path != hdf5_artifact.path:
+        msg = "Admitted transient HDF5 path disagrees with exact case evidence."
+        raise ValueError(msg)
+    seed_evidence = case_payload.get("seed_evidence")
+    spatial = case_payload.get("spatial_diagnostics")
+    schedule = case_payload.get("schedule_diagnostics")
+    metadata = {
         "case_id": case.case_id,
         "case_index": case.case_index,
         "case_input_id": case.case_input_id,
         "simulation_case_id": case.simulation_case_id,
         "material_family": case.material_family,
-        "material_role": payload.get("material_role"),
-        "evaluation_regime": payload.get("evaluation_regime"),
-        "natural_support_state": payload.get("natural_support_state"),
-        "dataset_role": payload.get("dataset_role"),
-        "case_family": payload.get("case_family", payload.get("evaluation_regime")),
-        "sampling_regime": batch.sampling_regime,
-        "ood": payload.get("ood"),
-        "simulation_profile": batch.simulation_profile,
-        "available_learning_views": list(batch.available_learning_views),
-        "airflow_source": batch.airflow_source,
-        "template_sha256": batch.template_sha256,
-        "generator_version": payload.get("generator_version"),
-        "seed": seed,
-        "parameters": payload.get("sampled_values"),
-        "parameter_units": payload.get("sampled_units"),
-        "geometry": geometry,
-        "schedule_class": (schedule.get("schedule_class") if isinstance(schedule, dict) else None),
+        "domain_profile": source_identity["domain_profile"],
+        "sampling_regime": case_payload["sampling_regime"],
+        "simulation_profile": case_payload["simulation_profile"],
+        "available_learning_views": list(case_payload["available_learning_views"]),
+        "airflow_source": case_payload["airflow_source"],
+        "template_sha256": case_payload["template"]["sha256"],
+        "generator_version": case_payload["generator_version"],
+        "seed": seed_evidence.get("case_seed") if isinstance(seed_evidence, dict) else None,
+        "parameters": case_payload.get("sampled_values"),
+        "parameter_units": case_payload.get("sampled_units"),
+        "geometry": spatial.get("geometry") if isinstance(spatial, dict) else None,
+        "schedule_class": schedule.get("schedule_class") if isinstance(schedule, dict) else None,
     }
+    return _interpret_transient_case(
+        case,
+        task=task,
+        hdf5_path=admitted.hdf5_path,
+        profile_name=case_payload["simulation_profile"],
+        metadata=metadata,
+        source={**source_identity, "case_hdf5": hdf5_artifact.as_dict(), "design_provenance": admitted.design_provenance},
+        timing=admitted.load_timing().as_dict(),
+    )
 
 
-def interpret_generated_transient_case(
-    batch: _CompletedBatchEvidence,
+def _interpret_transient_case(
     case: TerminalCaseEvidence,
     *,
     task: TaskSpec,
+    hdf5_path: Path,
+    profile_name: str,
+    metadata: dict[str, Any],
+    source: dict[str, Any],
+    timing: dict[str, Any],
 ) -> dict[str, Any]:
-    """Interpret one admitted canonical case as complete transient EDA evidence."""
-    if case.case_id not in {item.case_id for item in batch.cases} or batch.case(case.case_id) != case:
-        msg = f"Case {case.case_id!r} is not bound to admitted batch {batch.batch_id!r}."
-        raise ValueError(msg)
+    """Check complete physical trajectory, protocol, and admitted timing evidence."""
     if task.id != transient_contract.TRANSIENT_PROFILE_ID:
-        msg = f"Transient generated-case interpretation requires transient_drying, got {task.id!r}."
+        msg = "Transient case interpretation requires transient_drying."
         raise ValueError(msg)
-    if task.id not in batch.available_learning_views:
-        msg = f"Batch {batch.batch_id!r} does not advertise a {task.id} view."
-        raise ValueError(msg)
-    profile = generation.contracts.get_profile_contract(batch.simulation_profile)
+    profile = generation.contracts.get_profile_contract(profile_name)
     if profile.id != transient_contract.TRANSIENT_PROFILE_ID:
-        msg = f"Batch {batch.batch_id!r} is not a canonical transient_drying source."
+        msg = f"Case {case.case_id!r} is not a canonical transient_drying source."
         raise ValueError(msg)
     state_names = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
     state_units = tuple(field.unit for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
     boundary_names = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning)
-    hdf5_artifact = case.artifact("processed", "case.h5")
-    with h5py.File(hdf5_artifact.path, "r") as handle:
+    with h5py.File(hdf5_path, "r") as handle:
         layout = trajectory.resolve_transient_case_layout(
             handle,
-            hdf5_artifact.path,
+            hdf5_path,
             sample_id_prefix=case.case_id,
         )
         case_index = {
@@ -332,7 +221,7 @@ def interpret_generated_transient_case(
         }
         arrays = trajectory.read_transient_case_arrays(
             handle,
-            hdf5_artifact.path,
+            hdf5_path,
             case_index,
             layout.samples,
             expected_regular_horizon=layout.configured_horizon,
@@ -412,7 +301,6 @@ def interpret_generated_transient_case(
             "state": {name: np.ascontiguousarray(arrays.exact_stop_state[index]) for index, name in enumerate(state_names)},
             "usage": "diagnostic_only_no_training_transition_or_rollout",
         }
-    timing = generation.runtime.timing.load_case_timing(case, batch=batch).as_dict()
     expected_duration = float(arrays.time[-1]) if arrays.exact_stop_time is None else arrays.exact_stop_time
     if not np.isclose(
         timing["physical_duration_hours"],
@@ -476,16 +364,8 @@ def interpret_generated_transient_case(
             "target_moisture_wb": scalar_conditioning["X_target_wb"],
         },
         "runtime": timing,
-        "meta": _transient_case_metadata(batch, case),
-        "source": {
-            "case_id": case.case_id,
-            "case_input_id": case.case_input_id,
-            "simulation_case_id": case.simulation_case_id,
-            "simulation_profile": batch.simulation_profile,
-            "template_sha256": batch.template_sha256,
-            "airflow_source": batch.airflow_source,
-            "case_hdf5": hdf5_artifact.as_dict(),
-        },
+        "meta": metadata,
+        "source": source,
         "contracts": {
             "state_names": state_names,
             "state_units": state_units,
@@ -505,68 +385,62 @@ def interpret_generated_transient_case(
     }
 
 
-def load_generated_batch(
-    batch_name: str,
+def interpret_admitted_source_case(
+    admitted: Any,
     *,
-    task_id: str = "steady_flow",
-    storage_root: Path | str | None = None,
-    show_progress: bool = False,
-    max_cases: int | None = None,
-) -> dict[str, Any]:
-    """Load a validated generated-batch prefix without publishing tensors."""
-    task = domain.tasks.registry.get_task(task_id)
-    if task.id not in {"steady_flow", transient_contract.TRANSIENT_PROFILE_ID}:
-        msg = f"Generated analysis views do not support task {task.id!r}."
+    package_case_id: str,
+    task: TaskSpec,
+) -> tuple[tuple[int, int], torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any], str]:
+    """Convert one exact admitted source case without fabricating a Generation batch."""
+    case = admitted.case
+    source = admitted.source_identity
+    if source["case_id"] != case.case_id or source["case_hdf5_sha256"] != case.case_hdf5_sha256:
+        msg = "Admitted source case identity disagrees with Generation evidence."
         raise ValueError(msg)
-    if max_cases is not None and (isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 1):
-        msg = f"max_cases must be a positive integer or None, got {max_cases!r}."
+    case_payload = case.metadata_payload()
+    if "steady_flow" not in case_payload["available_learning_views"]:
+        msg = "Source case does not expose the steady-flow learning view."
         raise ValueError(msg)
-    batch = generation.runtime.admit_terminal_batch(
-        batch_name,
-        storage_root=storage_root,
-        validation_depth="routine",
-    )
-    selected = batch.cases if max_cases is None else batch.cases[:max_cases]
-    generated_identity = identity.build_generated_batch_identity(batch.manifest_payload())
-    rows: list[dict[str, Any]] = []
-    iterator = tqdm(
-        selected,
-        desc=f"Loading {batch_name}",
-        unit="case",
-        disable=not show_progress,
-    )
-    for case in iterator:
-        if task.id == "steady_flow":
-            _shape, inputs, outputs, metadata, _source, _fingerprint = interpret_generated_case(
-                batch,
-                case,
-                task=task,
-            )
-            rows.append(
-                {
-                    **{name: inputs[index].numpy() for index, name in enumerate(task.input_names)},
-                    **{name: outputs[index].numpy() for index, name in enumerate(task.output_names)},
-                    "meta": metadata,
-                }
-            )
-        else:
-            rows.append(
-                interpret_generated_transient_case(
-                    batch,
-                    case,
-                    task=task,
-                )
-            )
-    return {
-        "batch_name": batch_name,
-        "generation_root": batch.generation_root,
-        "manifest_path": batch.manifest_path,
-        "manifest_sha256": batch.manifest_sha256,
-        "generated_batch_identity": generated_identity,
-        "sample_ids": [case.case_id for case in selected],
-        "available_case_count": len(batch.cases),
-        "rows": rows,
-        "task": task,
-        "analysis_representation": ("steady_field_rows" if task.id == "steady_flow" else "transient_complete_case_rows"),
-        "dataset_backend": "canonical_generation_hdf5",
+    with h5py.File(admitted.hdf5_path, "r") as handle:
+        x_axis = np.asarray(_hdf5_dataset(handle, "coords/x"), dtype=np.float64)
+        y_axis = np.asarray(_hdf5_dataset(handle, "coords/y"), dtype=np.float64)
+        static_dataset = _hdf5_dataset(handle, "static/fields")
+        static_values = np.asarray(static_dataset, dtype=np.float32)
+        names = _string_list_attribute(static_dataset, "field_names")
+    profile = generation.contracts.get_profile_contract(case_payload["simulation_profile"])
+    if names != [field.name for field in profile.static_fields]:
+        msg = "Canonical steady-flow static HDF5 fields have invalid order."
+        raise ValueError(msg)
+    static = {name: static_values[index] for index, name in enumerate(names)}
+    case_inputs, case_outputs = _steady_flow_fields(static, x_axis=x_axis, y_axis=y_axis, task=task)
+    inputs = torch.stack([torch.from_numpy(case_inputs[name]) for name in task.input_names])
+    outputs = torch.stack([torch.from_numpy(case_outputs[name]) for name in task.output_names])
+    metadata = {
+        "case_id": package_case_id,
+        "source_case_id": case.case_id,
+        "case_input_id": case.case_input_id,
+        "simulation_case_id": case.simulation_case_id,
+        "material_family": case.material_family,
+        "sampling_regime": case_payload["sampling_regime"],
+        "simulation_profile": case_payload["simulation_profile"],
+        "domain_profile": source["domain_profile"],
+        "available_learning_views": list(case_payload["available_learning_views"]),
+        "airflow_source": case_payload["airflow_source"],
+        "template_sha256": case_payload["template"]["sha256"],
+        "generator_version": case_payload["generator_version"],
+        "seed": case_payload["seed_evidence"]["case_seed"],
+        "parameters": case_payload["sampled_values"],
+        "parameter_units": case_payload["sampled_units"],
+        "geometry": case_payload["spatial_diagnostics"]["geometry"],
+        "schedule_class": case_payload.get("schedule_diagnostics", {}).get("schedule_class"),
     }
+    physical_source = {"package_case_id": package_case_id, **source}
+    fingerprint = identity.compute_case_fingerprint(
+        task=task,
+        case_id=package_case_id,
+        source_identity=physical_source,
+        source_metadata=metadata,
+        inputs=inputs,
+        outputs=outputs,
+    )
+    return (y_axis.size, x_axis.size), inputs, outputs, metadata, physical_source, fingerprint

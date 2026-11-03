@@ -1,15 +1,14 @@
-"""
-dataset_runtime_package_validation.py
+"""Inspect immutable Dataset tensor samples through the unified runtime.
 
-Inspect and smoke-load immutable Dataset packages through the unified runtime.
 Responsibilities:
   - Bind validated manifests to typed runtime Dataset requests
   - Report representative tensor and source identities
-  - Exercise bounded DataLoader worker settings for package smoke checks
+
 Design principles:
   - Runtime inspection uses the same factory as training consumers
   - Manifest and payload admission precede every Dataset read
   - Transient HDF5 handles are closed after bounded inspection
+
 This module does NOT:
   - Build or publish Dataset packages
   - Implement the supported command-line interface
@@ -20,10 +19,7 @@ from __future__ import annotations
 import copy
 from typing import TYPE_CHECKING, Any, cast
 
-import torch
-
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
-from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_manifest as package_manifest
 
 from . import dataset_runtime_factory as factory
@@ -32,29 +28,25 @@ from . import dataset_runtime_transient as transient
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
-    from typing import Literal
+
+    import torch
 
 
 def _runtime_request(
     manifest: Mapping[str, Any],
     *,
     storage_root: Path | str | None,
-    membership: str | None = None,
-    ood_group: str | None = None,
-    allow_technical_smoke: bool = False,
+    case_ids: tuple[str, ...] | None = None,
 ) -> Any:
     """Build one typed factory request from a validated package manifest."""
     return factory.DatasetRequest(
         dataset_id=str(manifest["dataset_id"]),
-        dataset_view=cast("views.DatasetViewId", manifest["dataset_view"]),
-        evaluation_regime=cast("views.PackageRegime", manifest["evaluation_regime"]),
-        membership=cast("views.IdMembership | None", membership),
-        ood_group=ood_group,
+        dataset_view=manifest["dataset_view"],
+        case_ids=case_ids,
         transient_sampling=(
             transient_contract.TransientSamplingSpec(mode="one_step_transition") if manifest["dataset_view"] == "transient_drying" else None
         ),
         storage_root=storage_root,
-        allow_technical_smoke=allow_technical_smoke,
     )
 
 
@@ -76,7 +68,6 @@ def _inspect_dataset_package(
     request = _runtime_request(
         manifest,
         storage_root=storage_root,
-        allow_technical_smoke=manifest["campaign_purpose"] == "technical_runtime_smoke",
     )
     runtime = factory._create_dataset_from_manifest(  # noqa: SLF001 -- shared admitted evidence
         request,
@@ -97,12 +88,10 @@ def _inspect_dataset_package(
                 "dataset_id",
                 "simulation_case_id",
                 "case_input_id",
-                "source_batch_id",
-                "source_simulation_profile",
+                "source_case_id",
+                "simulation_profile",
                 "material_family",
-                "evaluation_regime",
-                "dataset_membership",
-                "source_hdf5_sha256",
+                "domain_profile",
             )
         }
     else:
@@ -115,29 +104,17 @@ def _inspect_dataset_package(
         sample_identity = dict(sample["metadata"])
         if isinstance(runtime, transient.TransientPhysicalDataset):
             runtime.close()
-    regime = str(manifest["evaluation_regime"])
-    if regime == "id" and manifest["campaign_purpose"] == "technical_runtime_smoke":
-        selectors = [views.TECHNICAL_SMOKE_MEMBERSHIP]
-    elif regime == "id":
-        selectors = [f"id/{membership}" for membership in views.ID_MEMBERSHIPS]
-    elif regime == "parameter_ood":
-        selectors = ["parameter_ood/all", *[f"parameter_ood/{group}" for group in manifest["available_ood_groups"]]]
-    else:
-        selectors = [regime]
+    materials = list(manifest["materials"])
     return {
         "dataset_name": manifest["dataset_name"],
         "dataset_id": manifest["dataset_id"],
         "dataset_view": manifest["dataset_view"],
         "registered_task_id": manifest["registered_task_id"],
-        "evaluation_regime": regime,
-        "available_selectors": selectors,
-        "available_ood_groups": manifest["available_ood_groups"],
-        "membership_counts": manifest["membership_counts"],
+        "case_ids": [entry["package_case_id"] for entry in manifest["source_case_identities"]],
         "source_case_count": manifest["source_case_count"],
         "transition_count": manifest["transition_count"],
         "sample_count": manifest["sample_count"],
-        "material_counts": manifest["material_counts"],
-        "source_profile_counts": manifest["source_profile_counts"],
+        "materials": materials,
         "tensors": tensor_report,
         "sample_identity": sample_identity,
         "storage_backend": storage_backend,
@@ -146,130 +123,15 @@ def _inspect_dataset_package(
 
 
 def inspect_dataset_package(
+    task: str,
     dataset_id: str,
     *,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
     """Inspect one package through its validated manifest and runtime object."""
     manifest = package_manifest.load_package_manifest(
+        task,
         dataset_id,
         storage_root=storage_root,
     )
     return _inspect_dataset_package(manifest, storage_root=storage_root)
-
-
-def _smoke_dataset_package(
-    manifest: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None = None,
-    membership: str | None = None,
-    ood_group: str | None = None,
-    num_workers: int = 0,
-    persistent_workers: bool = False,
-    prefetch_factor: int | None = None,
-    hdf5_cache_size: int = 1,
-) -> dict[str, Any]:
-    """Smoke-load one runtime from package evidence admitted by its caller."""
-    request = _runtime_request(
-        manifest,
-        storage_root=storage_root,
-        membership=membership,
-        ood_group=ood_group,
-        allow_technical_smoke=manifest["campaign_purpose"] == "technical_runtime_smoke",
-    )
-    settings = factory.LoaderSettings(
-        batch_size=1,
-        num_workers=num_workers,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        hdf5_cache_size=hdf5_cache_size,
-    )
-    dataset = factory._create_dataset_from_manifest(  # noqa: SLF001 -- shared admitted evidence
-        request,
-        manifest,
-        hdf5_cache_size=settings.hdf5_cache_size,
-    )
-    loader = factory.make_data_loader(dataset, settings)
-    storage_backend = getattr(loader.dataset, "storage_backend", "canonical_tensor")
-    batch = next(iter(loader))
-    tensor_keys = ("x", "y") if manifest["dataset_view"] == "steady_flow" else ("state", "static", "boundary", "scalars", "target")
-    shapes: dict[str, Any] = {key: list(value.shape) for key in tensor_keys if isinstance((value := batch.get(key)), torch.Tensor)}
-    if manifest["dataset_view"] == "transient_drying":
-        shapes["time"] = {name: list(value.shape) for name, value in batch["time"].items() if isinstance(value, torch.Tensor)}
-    return {
-        "dataset_id": manifest["dataset_id"],
-        "dataset_view": manifest["dataset_view"],
-        "evaluation_regime": manifest["evaluation_regime"],
-        "membership": membership,
-        "ood_group": ood_group,
-        "num_workers": num_workers,
-        "persistent_workers": persistent_workers,
-        "batch_shapes": shapes,
-        "storage_backend": storage_backend,
-        "training_payload_ready": (storage_backend == "pt_shards" if manifest["dataset_view"] == "transient_drying" else None),
-        "status": "loaded",
-    }
-
-
-def smoke_dataset_package(
-    dataset_id: str,
-    *,
-    storage_root: Path | str | None = None,
-    membership: str | None = None,
-    ood_group: str | None = None,
-    num_workers: int = 0,
-    persistent_workers: bool = False,
-    prefetch_factor: int | None = None,
-    hdf5_cache_size: int = 1,
-) -> dict[str, Any]:
-    """Load one batch through the unified factory with requested worker settings."""
-    manifest = package_manifest.load_package_manifest(
-        dataset_id,
-        storage_root=storage_root,
-    )
-    return _smoke_dataset_package(
-        manifest,
-        storage_root=storage_root,
-        membership=membership,
-        ood_group=ood_group,
-        num_workers=num_workers,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        hdf5_cache_size=hdf5_cache_size,
-    )
-
-
-def package_runtime_evidence(
-    dataset_id: str,
-    *,
-    storage_root: Path | str | None = None,
-    validation_depth: Literal["evidence", "full"] = "full",
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Admit payload once, then reuse exact evidence for runtime checks."""
-    if validation_depth == "full":
-        loader = package_manifest.load_package_manifest
-    elif validation_depth == "evidence":
-        loader = package_manifest.load_package_manifest_evidence
-    else:
-        message = f"Unsupported package runtime validation depth: {validation_depth!r}."
-        raise ValueError(message)
-    manifest = loader(
-        dataset_id,
-        storage_root=storage_root,
-    )
-    membership = "train" if manifest["evaluation_regime"] == "id" and manifest["training_eligible"] is True else None
-    inspection = _inspect_dataset_package(
-        manifest,
-        storage_root=storage_root,
-    )
-    smoke = {
-        f"workers_{num_workers}": _smoke_dataset_package(
-            manifest,
-            storage_root=storage_root,
-            membership=membership,
-            num_workers=num_workers,
-            hdf5_cache_size=1,
-        )
-        for num_workers in (0, 2)
-    }
-    return manifest, inspection, smoke

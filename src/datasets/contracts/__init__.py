@@ -4,6 +4,7 @@ Dataset view, identity, metadata, and transient channel contracts.
 Provides:
 - identity: deterministic Dataset and membership identities
 - metadata: persisted Dataset metadata admission
+- partition: immutable Dataset case roles and exact fixed membership
 - transient: canonical transient sample-data contract
 - views: typed buildable Dataset-view registry
 """
@@ -16,16 +17,18 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import dataset_contracts_identity as identity
     from . import dataset_contracts_metadata as metadata
+    from . import dataset_contracts_partition as partition
     from . import dataset_contracts_transient as transient
     from . import dataset_contracts_views as views
 
 _MODULES = {
     "identity": "dataset_contracts_identity",
     "metadata": "dataset_contracts_metadata",
+    "partition": "dataset_contracts_partition",
     "transient": "dataset_contracts_transient",
     "views": "dataset_contracts_views",
 }
-__all__ = ["identity", "metadata", "transient", "views"]
+__all__ = ["identity", "metadata", "partition", "transient", "views"]
 
 
 def __getattr__(name: str) -> object:

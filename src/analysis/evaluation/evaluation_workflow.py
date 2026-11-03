@@ -1,7 +1,4 @@
-"""
-evaluation_workflow.py
-
-Prepare portable evaluation sessions and panels from concise run selections.
+"""Prepare portable evaluation sessions and panels from concise run selections.
 
 Responsibilities:
   - Normalize explicit current run paths and optional presentation labels
@@ -33,6 +30,9 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import pandas as pd
 
 from src import analysis, common
+from src.analysis.evaluation.evaluation_artifact_loader import _transient_physical_membership
+from src.analysis.presentation import analysis_compute as compute
+from src.experiments import experiments_matched_budget as matched_budget
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -44,8 +44,9 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_session import EvaluationSession
     from src.analysis.evaluation.evaluation_transient_comparison import LineageComparison
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
+    from src.analysis.presentation.analysis_compute import AnalysisComputePreference
 
-ArtifactSelectionRole = Literal["id", "ood"]
+ArtifactSelectionRole = Literal["id", "additional_evaluation"]
 _TRAINING_COMPARISON_ARM_COUNT = 3
 _MINIMUM_COMPARISON_RUNS = 2
 
@@ -80,7 +81,7 @@ class EvaluationContextSpec:
         Stable panel-local context key.
     label : str
         User-facing dataset context label.
-    artifact_role : {"id", "ood"}
+    artifact_role : {"id", "additional_evaluation"}
         Selected run artifact role supplying each model frame.
 
     """
@@ -102,6 +103,7 @@ class PreparedEvaluationWorkflow:
     report: tuple[dict[str, Any], ...]
     summary_text: str
     transient_lineage: LineageComparison | None = None
+    matched_stage_unavailable_reason: str | None = None
     _transient_performance_loader: Callable[[], pd.DataFrame | None] | None = None
 
     @property
@@ -146,7 +148,7 @@ def _normalized_selections(
             msg = f"run_selections[{position}].label must be non-blank text or None."
             raise ValueError(msg)
         roots = {} if selection.artifact_roots is None else dict(selection.artifact_roots)
-        if set(roots).difference({"id", "ood"}):
+        if set(roots).difference({"id", "additional_evaluation"}):
             msg = f"run_selections[{position}].artifact_roots contains an unsupported role."
             raise ValueError(msg)
         normalized.append(
@@ -193,7 +195,7 @@ def _selected_artifact(
     role: ArtifactSelectionRole,
 ) -> LoadedEvaluationArtifact:
     """Return one role guaranteed by artifact preparation."""
-    artifact = loaded.id_artifact if role == "id" else loaded.ood_artifact
+    artifact = loaded.id_artifact if role == "id" else loaded.additional_artifact
     if artifact is None:
         msg = f"Prepared run is missing its selected {role!r} artifact: {loaded.run_dir}"
         raise RuntimeError(msg)
@@ -204,9 +206,8 @@ def _display_label(
     selection: EvaluationRunSelection,
     loaded: LoadedRunArtifacts,
 ) -> str:
-    """Return the presentation label with truthful provisional status."""
-    base_label = selection.label.strip() if selection.label is not None else loaded.storage_alias
-    return f"{base_label} [provisional]" if loaded.is_provisional else base_label
+    """Return the presentation label: the selection label or the run's storage alias."""
+    return selection.label.strip() if selection.label is not None else loaded.storage_alias
 
 
 def _required_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -248,7 +249,7 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
     lineage = _required_mapping(provenance.get("lineage"), label="transient lineage")
     stage = _required_mapping(lineage.get("stage_identity"), label="transient stage identity")
     arm_id = _required_text(stage.get("comparison_arm"), label="transient comparison arm")
-    arm = {"a0": "A0", "a_plus": "A+", "b": "B"}.get(arm_id)
+    arm = {"a0": "A0", "a1": "A1", "b": "B"}.get(arm_id)
     if arm is None:
         msg = f"Unsupported transient comparison arm {arm_id!r}."
         raise ValueError(msg)
@@ -274,17 +275,26 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
     matched = _required_mapping(lineage.get("matched_compute_manifest"), label="transient matched-compute manifest")
     controller = _required_mapping(matched.get("actual"), label="transient terminal controller")
     clock_kind = _required_text(controller.get("clock_kind"), label="transient compute clock")
+    receipt_evidence = matched.get("b_train_budget_receipt")
+    receipt = (
+        matched_budget.validate_b_receipt(dict(_required_mapping(receipt_evidence, label="B train budget receipt")))
+        if receipt_evidence is not None
+        else None
+    )
+    if arm != "A0" and receipt is None:
+        msg = "B/A1 lineage comparison requires the validated immutable matched_a1_b B budget receipt."
+        raise ValueError(msg)
     expected_controller = {
         "A0": ("A0", "stage_a_teacher_forcing", "stage_epochs"),
-        "A+": ("A+", "stage_a_teacher_forcing", "matched_compute"),
-        "B": ("B", "stage_b_self_fed", "matched_compute"),
+        "A1": ("A1", "stage_a_teacher_forcing", "train_seconds"),
+        "B": ("B", "stage_b_self_fed", "train_seconds"),
     }[arm]
     observed_controller = (
         controller.get("arm"),
         controller.get("stage"),
         controller.get("budget_control"),
     )
-    if observed_controller != expected_controller:
+    if observed_controller != expected_controller or stage.get("stage") not in ({"b"} if arm == "B" else {"a"}):
         msg = f"{arm} terminal controller identity is incompatible."
         raise ValueError(msg)
     best_epoch = _required_nonnegative_int(
@@ -295,7 +305,7 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         msg = f"{arm} selected checkpoint does not match completed best-within-budget evidence."
         raise ValueError(msg)
     best_checkpoint_id = f"{loaded.selected_checkpoint_sha256}@epoch={loaded.selected_checkpoint_epoch}"
-    if arm == "A0":
+    if receipt is None:
         planned_epochs = _required_nonnegative_int(
             controller.get("planned_stage_epochs"),
             label="A0 planned stage epochs",
@@ -311,10 +321,28 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         actual = 0.0
         overrun = 0.0
     else:
-        planned_key = "planned_teacher_forcing_budget_seconds" if clock_kind == "cuda_device_seconds" else "planned_teacher_forcing_budget_steps"
-        actual_key = "post_handoff_optimizer_device_seconds" if clock_kind == "cuda_device_seconds" else "successful_optimizer_steps"
-        planned = _required_number(controller.get(planned_key), label=f"{arm} planned compute")
-        actual = _required_number(controller.get(actual_key), label=f"{arm} actual compute")
+        run = _required_mapping(provenance.get("run"), label="transient run provenance")
+        parent_experiment = _required_mapping(run.get("parent_experiment"), label="matched parent experiment provenance")
+        parent_experiment_sha256 = _required_text(parent_experiment.get("parent_identity_sha256"), label="matched parent experiment identity")
+        if (
+            parent_experiment.get("kind") != "grouped"
+            or parent_experiment_sha256 != receipt["parent_identity_sha256"]
+            or matched.get("parent_experiment_sha256") != parent_experiment_sha256
+            or parent.get("source_run_name") != receipt["a0_run_name"]
+        ):
+            msg = "Matched B/A1 receipt contradicts the common A0 parent experiment."
+            raise ValueError(msg)
+        planned = _required_number(controller.get("planned_train_seconds"), label=f"{arm} planned train_seconds")
+        actual = _required_number(controller.get("train_seconds"), label=f"{arm} committed train_seconds")
+        if (
+            clock_kind != "train_seconds"
+            or planned <= 0.0
+            or actual < planned
+            or (arm == "B" and (actual != receipt["budget_value"] or loaded.selected_checkpoint_sha256 != receipt["best_checkpoint_sha256"]))
+            or (arm == "A1" and (planned != receipt["budget_value"] or controller.get("matched_receipt_sha256") != receipt["receipt_sha256"]))
+        ):
+            msg = f"{arm} committed budget contradicts the immutable B receipt."
+            raise ValueError(msg)
         overrun = actual - planned
     budget_complete = True
     comparison = analysis.evaluation.transient_comparison
@@ -333,12 +361,7 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
                 "source_dataset_ids": dataset.get("source_dataset_ids"),
             }
         ),
-        split_id=common.serialization.canonical_json_sha256(
-            {
-                "source_identities": dataset.get("source_identities"),
-                "membership_digests": dataset.get("membership_digests"),
-            }
-        ),
+        split_id=common.serialization.canonical_json_sha256(_transient_physical_split_identity(artifact)),
         input_profile_id=_required_text(identity.get("input_profile"), label="transient input profile"),
         scaling_id=_required_text(scaling.get("semantic_digest"), label="transient scaling digest"),
         boundary_representation_id=_required_text(
@@ -352,7 +375,36 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         clock_kind=clock_kind,
         budget_complete=budget_complete,
         best_within_budget_checkpoint_id=best_checkpoint_id,
+        parent_experiment_sha256=(
+            _required_text(matched.get("parent_experiment_sha256"), label="matched parent experiment identity")
+            if matched.get("parent_experiment_sha256") is not None
+            else None
+        ),
+        receipt_sha256=(str(receipt["receipt_sha256"]) if receipt is not None else None),
+        a0_handoff_sha256=(str(receipt["a0_handoff_sha256"]) if receipt is not None else None),
     )
+
+
+def _transient_physical_split_identity(artifact: LoadedEvaluationArtifact) -> dict[str, Any]:
+    """Require the loader's admitted complete physical split, including unevaluated roles."""
+    split = _required_mapping(artifact.frame.attrs.get("transient_physical_split"), label="transient physical split")
+    roles = {"train", "validation", "id_test", "scaling_train_one_step", "additional_evaluation"}
+    if set(split) != roles:
+        message = "Transient physical split lacks exact saved roles."
+        raise ValueError(message)
+    result: dict[str, Any] = {}
+    for role in sorted(roles):
+        evidence = _required_mapping(split[role], label=f"transient physical {role}")
+        if set(evidence) != {"source_dataset_ids", "source_identities", "case_ids_by_source"}:
+            message = "Transient physical split has malformed role evidence."
+            raise ValueError(message)
+        result[role] = _transient_physical_membership(
+            evidence.get("source_dataset_ids"),
+            evidence.get("source_identities"),
+            evidence.get("case_ids_by_source"),
+            allow_empty=role == "additional_evaluation",
+        )
+    return result
 
 
 def _transient_role_membership(artifact: LoadedEvaluationArtifact) -> Any:
@@ -391,10 +443,22 @@ def _transient_role_membership(artifact: LoadedEvaluationArtifact) -> Any:
     else:
         msg = "Transient artifact has no admitted sequence inventory."
         raise ValueError(msg)
+    physical = _transient_physical_membership(
+        source_dataset_ids,
+        dataset.get("source_identities"),
+        dataset.get("case_ids_by_source"),
+    )
+    if case_ids != tuple(sorted(case for group in physical["case_ids_by_source"] for case in group)):
+        message = "Transient physical dataset membership contradicts admitted sequence cases."
+        raise ValueError(message)
+    physical_digests = tuple(
+        common.serialization.canonical_json_sha256({"source_identity": identity, "case_ids": group})
+        for identity, group in zip(physical["source_identities"], physical["case_ids_by_source"], strict=True)
+    )
     return analysis.evaluation.transient_comparison.SharedRoleMembership(
         dataset_name=_required_text(dataset.get("name"), label="transient dataset name"),
         source_dataset_ids=tuple(source_dataset_ids),
-        membership_digests=tuple(membership_digests),
+        membership_digests=physical_digests,
         case_ids=case_ids,
     )
 
@@ -416,18 +480,14 @@ def _validate_transient_shared_membership(
 
 
 def _transient_lineage(loaded_runs: Sequence[LoadedRunArtifacts]) -> Any | None:
-    """Validate an exact selected A0/A+/B set while leaving other comparisons generic."""
+    """Validate an exact selected A0/A1/B set while leaving other comparisons generic."""
     if len(loaded_runs) != _TRAINING_COMPARISON_ARM_COUNT:
         return None
     arms = tuple(_transient_arm_evidence(loaded) for loaded in loaded_runs)
     by_name = {arm.arm: arm for arm in arms}
-    if set(by_name) != {"A0", "A+", "B"}:
-        return None
-    return analysis.evaluation.transient_comparison.validate_lineage_comparison(
-        a0=by_name["A0"],
-        a_plus=by_name["A+"],
-        b=by_name["B"],
-    )
+    if set(by_name) == {"A0", "A1", "B"}:
+        return analysis.evaluation.transient_comparison.validate_matched_a1_b_lineage_comparison(a0=by_name["A0"], a1=by_name["A1"], b=by_name["B"])
+    return None
 
 
 def _transient_performance_frame(
@@ -452,6 +512,7 @@ def _transient_performance_frame(
         selected["training_strategy"] = evidence.strategy
         selected["planned_post_handoff_compute"] = evidence.planned_post_handoff_compute
         selected["optimizer_device_compute"] = evidence.actual_post_handoff_compute
+        selected["training_compute"] = evidence.actual_post_handoff_compute
         selected["safe_boundary_overrun"] = evidence.safe_boundary_overrun
         selected["compute_clock"] = evidence.clock_kind
         selected["checkpoint_role"] = "stage_a_handoff" if evidence.arm == "A0" else "best_within_budget"
@@ -500,9 +561,6 @@ def _report_row(
         "scientific_run_name": loaded.scientific_run_name,
         "storage_alias": loaded.storage_alias,
         "run_dir": str(loaded.run_dir),
-        "lifecycle_status": loaded.lifecycle_status,
-        "is_completed": loaded.is_completed,
-        "is_provisional": loaded.is_provisional,
         "selected_checkpoint_role": loaded.selected_checkpoint_role,
         "selected_checkpoint_epoch": loaded.selected_checkpoint_epoch,
         "selected_checkpoint_sha256": loaded.selected_checkpoint_sha256,
@@ -567,25 +625,29 @@ def prepare_evaluation_workflow(
     run_selections: Sequence[EvaluationRunSelection],
     context_specs: Sequence[EvaluationContextSpec],
     *,
-    artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     dataset_root: Path | str | None = None,
-    metadata_root: Path | str | None = None,
     auto_build_missing: bool = True,
     rebuild_incompatible: bool = False,
     device_policy: str = "cpu",
+    evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare one steady or transient Evaluation workflow through task-owned sessions."""
+    requested_device = (
+        evaluation_compute_device.requested if isinstance(evaluation_compute_device, compute.AnalysisComputePreference) else evaluation_compute_device
+    )
+    compute.resolve_analysis_device(requested_device)
     normalized_selections = _normalized_selections(run_selections)
-    requested_roles = tuple(artifact_roles)
+    requested_roles = None if artifact_roles is None else tuple(artifact_roles)
     prepared_runs = tuple(
         analysis.artifacts.service.load_or_build_run_artifacts(
             path,
             artifact_roles=requested_roles,
             artifact_root_overrides=selection.artifact_roots,
             dataset_root=dataset_root,
-            metadata_root=metadata_root,
             auto_build_missing=auto_build_missing,
             rebuild_incompatible=rebuild_incompatible,
             device_policy=device_policy,
@@ -602,9 +664,14 @@ def prepare_evaluation_workflow(
         msg = f"Unsupported Evaluation task {task!r}."
         raise ValueError(msg)
 
+    selected_roles: tuple[ArtifactSelectionRole, ...] = requested_roles if requested_roles is not None else ("id", "additional_evaluation")
+    allowed_roles = {"id", "additional_evaluation"}
+    if set(selected_roles).difference(allowed_roles):
+        msg = f"Selected Evaluation roles contradict task {task!r}."
+        raise ValueError(msg)
     effective_roles: list[ArtifactSelectionRole] = []
-    for role in requested_roles:
-        available = tuple((loaded.id_artifact if role == "id" else loaded.ood_artifact) is not None for loaded in loaded_runs)
+    for role in selected_roles:
+        available = tuple((loaded.id_artifact if role == "id" else loaded.additional_artifact) is not None for loaded in loaded_runs)
         if any(available) and not all(available):
             msg = f"Selected runs disagree on {role!r} artifact-role availability."
             raise ValueError(msg)
@@ -618,7 +685,7 @@ def prepare_evaluation_workflow(
 
     display_labels = tuple(_display_label(selection, loaded) for (selection, _path), loaded in zip(normalized_selections, loaded_runs, strict=True))
     if len(display_labels) != len(set(display_labels)):
-        msg = "Evaluation presentation labels must be unique after provisional labelling."
+        msg = "Evaluation presentation labels must be unique."
         raise ValueError(msg)
     artifacts: dict[tuple[Path, ArtifactSelectionRole], LoadedEvaluationArtifact] = {
         (loaded.run_dir, role): _selected_artifact(loaded, role) for loaded in loaded_runs for role in roles
@@ -636,6 +703,7 @@ def prepare_evaluation_workflow(
     )
 
     lineage = None
+    matched_stage_unavailable_reason = None
     transient_performance_loader: Callable[[], pd.DataFrame | None] | None = None
     session: EvaluationSession | TransientEvaluationSession
     if task == "transient_drying":
@@ -654,7 +722,10 @@ def prepare_evaluation_workflow(
         if task == "transient_drying":
             transient_session = cast("TransientEvaluationSession", session)
             _validate_transient_shared_membership(loaded_runs, roles=roles)
-            lineage = _transient_lineage(loaded_runs)
+            try:
+                lineage = _transient_lineage(loaded_runs)
+            except (ValueError, TypeError, KeyError) as error:
+                matched_stage_unavailable_reason = str(error)
             transient_performance_loader = _lazy_transient_performance(
                 transient_session,
                 loaded_runs=loaded_runs,
@@ -700,7 +771,10 @@ def prepare_evaluation_workflow(
                 sections=sections,
                 comparison=len(loaded_runs) > 1,
                 training_performance=transient_performance_loader,
+                matched_stage_unavailable_reason=matched_stage_unavailable_reason,
                 selection_state=selection_state,
+                evaluation_compute_device=evaluation_compute_device,
+                export_dir=export_dir,
             )
         elif len(loaded_runs) == 1:
             if selection_state is not None:
@@ -710,6 +784,7 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
+                export_dir=export_dir,
             )
         else:
             if selection_state is not None:
@@ -719,6 +794,7 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
+                export_dir=export_dir,
             )
         report = tuple(
             _report_row(prepared, artifact_roles=roles, display_label=display_label)
@@ -736,6 +812,7 @@ def prepare_evaluation_workflow(
         report=report,
         summary_text="",
         transient_lineage=lineage,
+        matched_stage_unavailable_reason=matched_stage_unavailable_reason,
         _transient_performance_loader=transient_performance_loader,
     )
 
@@ -745,7 +822,7 @@ def _workflow_summary(workflow: PreparedEvaluationWorkflow) -> str:
     roles = ", ".join(workflow.report[0]["artifact_roles"])
     rows = [
         f"- {row['display_label']}: scientific run {row['scientific_run_name']}; "
-        f"{row['lifecycle_status']}; checkpoint {row['selected_checkpoint_role']}; actions {row['artifact_actions']}"
+        f"checkpoint {row['selected_checkpoint_role']}; actions {row['artifact_actions']}"
         for row in workflow.report
     ]
     header = (
@@ -763,10 +840,10 @@ def _validated_expected_task(expected_task: str) -> str:
 
 
 def _default_context_specs() -> tuple[EvaluationContextSpec, EvaluationContextSpec]:
-    """Return the task-owned ID and optional OOD notebook contexts."""
+    """Return the ID and optional additional evaluation notebook contexts."""
     return (
         EvaluationContextSpec("id", "ID", "id"),
-        EvaluationContextSpec("ood", "OOD", "ood"),
+        EvaluationContextSpec("additional_evaluation", "Additional evaluation", "additional_evaluation"),
     )
 
 
@@ -787,15 +864,16 @@ def prepare_single_model_evaluation_workspace(
     *,
     label: str | None = None,
     expected_task: str = "transient_drying",
-    artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     artifact_roots: Mapping[ArtifactSelectionRole, Path | str] | None = None,
     dataset_root: Path | str | None = None,
-    metadata_root: Path | str | None = None,
     auto_build_missing: bool = True,
     rebuild_incompatible: bool = False,
     device_policy: str = "cpu",
+    evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare one notebook-facing Evaluation workspace with task-owned contexts."""
     task = _validated_expected_task(expected_task)
@@ -810,12 +888,13 @@ def prepare_single_model_evaluation_workspace(
         _default_context_specs(),
         artifact_roles=artifact_roles,
         dataset_root=dataset_root,
-        metadata_root=metadata_root,
         auto_build_missing=auto_build_missing,
         rebuild_incompatible=rebuild_incompatible,
         device_policy=device_policy,
+        evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
+        export_dir=export_dir,
     )
     return _with_expected_task(workflow, expected_task=task)
 
@@ -825,14 +904,15 @@ def prepare_model_comparison_evaluation_workspace(
     *,
     labels: Sequence[str | None] | None = None,
     expected_task: str = "transient_drying",
-    artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     dataset_root: Path | str | None = None,
-    metadata_root: Path | str | None = None,
     auto_build_missing: bool = True,
     rebuild_incompatible: bool = False,
     device_policy: str = "cpu",
+    evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare an ordered multi-run notebook workspace with task-owned contexts."""
     task = _validated_expected_task(expected_task)
@@ -852,11 +932,12 @@ def prepare_model_comparison_evaluation_workspace(
         _default_context_specs(),
         artifact_roles=artifact_roles,
         dataset_root=dataset_root,
-        metadata_root=metadata_root,
         auto_build_missing=auto_build_missing,
         rebuild_incompatible=rebuild_incompatible,
         device_policy=device_policy,
+        evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
+        export_dir=export_dir,
     )
     return _with_expected_task(workflow, expected_task=task)

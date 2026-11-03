@@ -1,7 +1,4 @@
-"""
-evaluation_plot_layout.py
-
-Define shared current-native layout contracts for evaluation field maps.
+"""Define shared current-native layout contracts for evaluation field maps.
 
 Responsibilities:
   - Keep equivalent evaluation maps at one readable notebook-native scale

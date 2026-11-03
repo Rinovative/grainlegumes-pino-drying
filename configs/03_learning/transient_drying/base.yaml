@@ -1,0 +1,94 @@
+# Role: shared defaults of every transient_drying matched A0 -> {B, A1} experiment. Edit: rarely; any config overrides them.
+# Optuna A0 studies under optuna/ are self-contained because their single-stage training keys differ.
+# An experiment names this file with base: and overrides any value by setting it itself.
+
+run:
+  seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
+  deterministic: false  # Request deterministic kernels where supported; may reduce performance or reject unsupported operations.
+  device: cuda  # Requested compute device; auto selects an available supported device.
+
+data:
+  train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
+  additional_evaluation_datasets: []  # Optional built datasets evaluated in addition to the primary validation/test assignments.
+  batch_size: 2  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
+  transient_backend_preference: pt_shards  # Preferred transient storage backend: pt_shards or canonical_hdf5.
+  transient_backend_required: true  # Fail if the preferred backend is unavailable instead of falling back.
+  hdf5_cache_size: 0  # Maximum open HDF5 handles retained; zero disables this handle cache.
+  spatial_stride: 2  # Spatial subsampling step; larger strides reduce the effective grid resolution.
+  num_workers: 0  # Matched B/A1 resume restores the exact partial-epoch sample cursor, which requires main-process loading.
+  persistent_workers: false  # No worker processes exist to keep alive.
+input_profile: canonical_physics_complete_v1  # Selects the versioned transient input/state profile expected by the dataset and model.
+
+temporal:
+  temporal_conditioning:
+    kind: none  # Choose whether normalized current time is appended as an input channel; none adds no time channel.
+
+scaling:
+  mode: state_std  # Selects the state/increment scaling rule used by transient training and evaluation.
+
+model:
+  params:
+    positional_embedding: null  # Optional positional embedding configuration; null disables it.
+
+loss:
+  data:
+    kind: huber  # Select the supervised error formulation; valid choices depend on the task contract.
+    space: scaled_increment  # Space in which supervised error is measured, such as normalized state or scaled increment.
+    weight: 1.0  # Multiplier on the supervised data-loss term.
+    beta: 1.0  # Huber transition scale between quadratic and linear error behavior.
+    channel_weights: [1.0, 1.0, 1.0, 1.0]  # Per-channel multipliers for the supervised loss; order follows the task state channels.
+    state_aux_weight: 0.0  # Weight of the optional auxiliary state-prediction term; zero disables it.
+  physics:
+    enabled: false  # Enable the physics residual and boundary loss terms.
+
+evaluation:
+  objective:
+    id: normalized_drying_group_macro_rmse  # Metric used to compare trials/checkpoints and drive the scheduler or study objective.
+
+optimizer:
+  kind: adamw  # Optimizer implementation; current training contract supports AdamW.
+  weight_decay: 0.0001  # AdamW decoupled weight-decay coefficient.
+
+scheduler:
+  kind: reduce_on_plateau  # Learning-rate schedule policy.
+  factor: 0.5  # Multiplicative learning-rate reduction after a plateau.
+  patience: 10  # Validation checks without improvement before reducing the learning rate; A0 checks every epoch, B and A1 at their budget points.
+  min_lr: 1.0e-06  # Lower bound for the scheduled learning rate.
+
+training:
+  mode: matched_a1_b  # A0 -> {B, A1}: B self-feeds rollouts, A1 stays teacher-forced; both start from A0's selected checkpoint.
+  mixed_precision: false  # Enable mixed-precision arithmetic when supported.
+  continuation_evaluations: 20  # B and A1 select checkpoints at epoch ends crossing each 1/20 of their measured budget, so both get equal chances.
+  a0:
+    max_epochs: 100  # A0 epoch budget; the best validation checkpoint is handed to B and A1. --epochs overrides it.
+    evaluation_interval: 1  # Roll out the whole validation trajectories every this many epochs; this selects the stage checkpoint.
+    additional_evaluation_interval: 1  # Evaluate additional configured datasets at this stage interval.
+    gradient_accumulation_steps: 1  # Number of batches accumulated before each optimizer update; increases effective batch size.
+    curriculum:
+      seed: 9  # Seed controlling curriculum length/order sampling.
+  b:
+    max_epochs: 100  # Operational epoch cap; B stops at train_seconds and ends as budget_unmet if this cap comes first.
+    train_seconds: null  # Measured B optimisation budget in seconds, set per experiment or via --train-seconds: A0's measured optimisation time on the same GPU type.
+    lr_scale: 1.0  # Factor on the learning rate and plateau floor restored from A0; 1 continues with A0's state unchanged.
+    evaluation_interval: 1  # Epoch-end gate for B's selection checks; B validates only where it crossed a new budget point (continuation_evaluations).
+    additional_evaluation_interval: 1  # Evaluate additional configured datasets at this stage interval.
+    gradient_accumulation_steps: 1  # Number of batches accumulated before each optimizer update; increases effective batch size.
+    sampling:
+      rollout_length: 32  # Number of consecutive transitions in each sampled rollout window.
+    curriculum:
+      lengths: [2, 4, 8, 16, 32]  # Self-fed rollout lengths of this stage's curriculum; they must fit the sampling rollout length.
+      milestone_fractions: [0.0, 0.2, 0.4, 0.6, 0.8]  # Fractions of the stage budget at which curriculum lengths advance.
+      seed: 9  # Seed controlling curriculum length/order sampling.
+  a1:
+    max_epochs: 100  # Operational epoch cap of the teacher-forced continuation; it takes A0's sampling, curriculum and cadence.
+    match_to: b.train_seconds  # A1 trains for B's measured seconds from the same A0 checkpoint.
+    lr_scale: 1.0  # Factor on the learning rate restored from A0; keep equal to B's unless a sweep selected otherwise.
+
+tracking:
+  wandb:
+    mode: online  # W&B logging mode, such as online or offline.
+    workflow: train  # Workflow label attached to tracking metadata.
+    monitor:
+      enabled: false  # Enable periodic qualitative/diagnostic monitoring.
+      interval: 1  # Monitoring interval in epochs.
+      max_cases: 1  # Maximum cases sampled for each monitoring pass.

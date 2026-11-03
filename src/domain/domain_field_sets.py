@@ -1,7 +1,4 @@
-"""
-domain_field_sets.py
-
-Validate exact ordered field contracts.
+"""Validate exact ordered field contracts.
 
 Responsibilities:
   - Reject duplicate, missing, unexpected, or misordered fields

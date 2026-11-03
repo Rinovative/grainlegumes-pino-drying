@@ -1,15 +1,17 @@
-"""
-cli_generation.py
+"""Expose the profile-qualified generation services through one thin command line.
 
-Expose the profile-qualified generation services through one thin command line.
 Responsibilities:
-  - Parse explicit configuration, case, campaign, pilot, and publication commands
+  - Parse explicit configuration, case, campaign, and publication commands
   - Dispatch reusable generation services without duplicating their domain logic
-  - Emit machine-readable command results and propagate terminal failures
+  - Emit machine-readable command results to their callers and one plain line per case and node-worker outcome to the node log
+  - Link a campaign node job's own logs into its campaign when the node worker starts
+  - Propagate terminal failures
+
 Design principles:
   - Scientific, execution, and storage choices remain explicit command inputs
   - Validation and lifecycle authority stay in the responsible source services
   - Destructive cleanup requires the service-owned identity and confirmation gates
+
 This module does NOT:
   - Define scientific values, sampling behavior, COMSOL mappings, or data schemas
   - Implement simulation, scheduling, persistence, or cleanup domain logic
@@ -24,37 +26,50 @@ import shlex
 import signal
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src import common
-from src.generation import generation_background as background_service
 from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_benchmark_config as benchmark_config
 from src.generation import generation_campaign as campaign_runtime
-from src.generation import generation_campaign_completion as completion_service
 from src.generation import generation_campaign_status as campaign_status_service
 from src.generation import generation_readiness as readiness_service
 from src.generation import generation_run as run_service
-from src.generation import generation_smoke as smoke_service
-from src.generation import generation_workflow as workflow_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_descriptors as contracts_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
-from src.generation.publication import generation_publication_inventory as inventory_service
+from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
 from src.generation.runtime import generation_runtime_comsol as comsol_service
+from src.generation.runtime import generation_runtime_host as host_service
+from src.generation.runtime import generation_runtime_node as node_service
 from src.generation.runtime import generation_runtime_preflight as preflight_service
 from src.generation.runtime import generation_runtime_workspace as workspace_service
-from src.generation.validation import generation_validation_pilot as pilot_service
 from src.generation.validation import generation_validation_sentinels as sentinel_service
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+_PROCESS_STARTED = time.monotonic()  # one command is one process, so this is the start of a case step
+
+
+def _case_label(args: argparse.Namespace) -> str:
+    """Return ``<material> <case id>`` of the campaign case a command runs, from its ``<profile>__<material>__<regime>[__...]`` batch name."""
+    parts = args.batch_name.split("__")
+    material = parts[1] if len(parts) > 2 else args.batch_name  # noqa: PLR2004 -- the material is the second of at least three name parts
+    return f"{material} case_{args.case_index:04d}"
+
+
+def _case_end_line(args: argparse.Namespace, status: str) -> str:
+    """Return the one searchable line that ends a case step in the node log."""
+    duration = campaign_status_service.format_duration(time.monotonic() - _PROCESS_STARTED)
+    return f"CASE END {_case_label(args)} {status} {duration}"
 
 
 def _add_storage_arguments(parser: argparse.ArgumentParser, *, include_work: bool = False) -> None:
@@ -120,33 +135,55 @@ def _print_workflow_progress(event: Mapping[str, Any]) -> None:
     )
 
 
-def _add_case_range(parser: argparse.ArgumentParser) -> None:
-    """Add inclusive configured case-range selection arguments."""
-    parser.add_argument("--case-start", type=int)
-    parser.add_argument("--case-stop", type=int)
-
-
 def _add_batch_selection(parser: argparse.ArgumentParser, *, required: bool = True) -> None:
     """Add selection of one predeclared campaign batch."""
     parser.add_argument("--only-batch", required=required)
 
 
-def _add_local_resources(parser: argparse.ArgumentParser) -> None:
-    """Add genuine local-development core and concurrency controls."""
-    parser.add_argument("--cores-per-case", type=int, required=True)
-    parser.add_argument("--max-parallel-cases", type=int, required=True)
+def _add_scientific_overrides(parser: argparse.ArgumentParser) -> None:
+    """Expose finite original-design and physical-duration overrides and the Source revision."""
+    parser.add_argument("--materials", nargs="+")
+    parser.add_argument("--cases-per-material", type=int)
+    parser.add_argument("--duration-hours", type=float)
+    parser.add_argument("--revision")
+
+
+def _add_execution_overrides(parser: argparse.ArgumentParser) -> None:
+    """Expose explicit ordinary concurrency, CPU and failure-budget controls."""
+    parser.add_argument("--node-jobs", type=int)
+    parser.add_argument("--max-admission-cases", type=int)
+    parser.add_argument("--cores-per-case", type=int)
+    parser.add_argument("--case-timeout-seconds", type=float)
+    parser.add_argument("--no-retry", action="store_true")
+
+
+def _execution_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Return requested resource values separately from scientific overrides."""
+    result = {
+        key: getattr(args, key)
+        for key in ("node_jobs", "max_admission_cases", "cores_per_case", "case_timeout_seconds")
+        if getattr(args, key, None) is not None
+    }
+    if getattr(args, "no_retry", False):
+        result["no_retry"] = True
+    return result
+
+
+def _scientific_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Return explicitly supplied scientific values without inventing defaults."""
+    return {
+        key: getattr(args, key) for key in ("materials", "cases_per_material", "duration_hours", "revision") if getattr(args, key, None) is not None
+    }
 
 
 def _add_campaign_execution_arguments(parser: argparse.ArgumentParser) -> None:
     """Add exact campaign selection and source-identity arguments."""
     parser.add_argument("config", type=Path)
+    parser.add_argument("--authored-value-json", type=json.loads)
     _add_batch_selection(parser, required=False)
-    parser.add_argument(
-        "--skip-extreme-family-ood",
-        action="store_true",
-        help="skip the canonical extreme-family batches for this execution only",
-    )
     parser.add_argument("--git-commit", required=True)
+    _add_scientific_overrides(parser)
+    _add_execution_overrides(parser)
     _add_storage_arguments(parser)
 
 
@@ -155,132 +192,33 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     parser = argparse.ArgumentParser(description="Generate and run isolated profile-qualified COMSOL cases")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    create_background = subparsers.add_parser(
-        "create-background-session",
-        help="create durable host workflow-session evidence and command",
-    )
-    create_background.add_argument("--source-commit", required=True)
-    create_background.add_argument("--storage-root", type=Path, required=True)
-    create_background.add_argument(
-        "--host-paths-json",
-        required=True,
-        help="JSON object carrying host workflow, Python runner, and storage paths",
-    )
-    create_background.add_argument("--active-tmux-session", action="append", default=[])
-    create_background.add_argument("workflow_arguments", nargs=argparse.REMAINDER)
-
-    complete_background = subparsers.add_parser(
-        "complete-background-session",
-        help="atomically record one background workflow exit result",
-    )
-    complete_background.add_argument("workflow_session_id")
-    complete_background.add_argument("--exit-code", type=int, required=True)
-    complete_background.add_argument("--storage-root", type=Path, required=True)
-
-    inspect_background = subparsers.add_parser(
-        "inspect-background-session",
-        help="read one durable background workflow session",
-    )
-    inspect_background.add_argument("workflow_session_id")
-    inspect_background.add_argument("--storage-root", type=Path, required=True)
-    inspect_background.add_argument("--active-tmux-session", action="append", default=[])
-
-    list_background = subparsers.add_parser(
-        "list-background-sessions",
-        help="list current-user background workflow sessions",
-    )
-    list_background.add_argument("--storage-root", type=Path, required=True)
-    list_background.add_argument("--active-tmux-session", action="append", default=[])
-
     resolve_run = subparsers.add_parser(
         "resolve-generation-run",
-        help="resolve one campaign, benchmark, or ordered workflow into the common immutable run plan",
+        help="resolve one campaign or benchmark into the common immutable run plan",
     )
     resolve_run.add_argument("config", type=Path)
+    resolve_run.add_argument("--authored-value-json", type=json.loads)
     resolve_run.add_argument("--git-commit", required=True)
     resolve_run.add_argument("--allow-incomplete", action="store_true")
+    _add_scientific_overrides(resolve_run)
+    _add_execution_overrides(resolve_run)
 
     validate = subparsers.add_parser("validate-config", help="validate one generation configuration")
     validate.add_argument("config", type=Path)
+    validate.add_argument("--authored-value-json", type=json.loads)
     _add_batch_selection(validate, required=False)
+    _add_scientific_overrides(validate)
+    _add_execution_overrides(validate)
     validate.add_argument(
         "--allow-incomplete",
         action="store_true",
         help="validate structure and report unresolved launch gates without executing",
     )
-    validate.add_argument(
-        "--inspect-parameter",
-        action="append",
-        default=[],
-        help="include complete resolved evidence for one canonical parameter or atomic record",
-    )
 
-    campaign_catalog = subparsers.add_parser(
+    subparsers.add_parser(
         "list-campaigns",
         help="discover Generation campaigns by schema kind without relying on filenames",
     )
-    campaign_catalog.add_argument(
-        "--workflow",
-        action="store_true",
-        help="require the unique primary and technical-smoke profile pairs used by the host workflow",
-    )
-
-    static_sentinels = subparsers.add_parser(
-        "static-sentinels",
-        help="run configured-family and all-OOD-group generator checks without COMSOL",
-    )
-    static_sentinels.add_argument("steady_campaign", type=Path)
-    static_sentinels.add_argument("transient_campaign", type=Path)
-
-    readiness = subparsers.add_parser(
-        "readiness-report",
-        help="report exact missing launch values, mappings, and runtime evidence",
-    )
-    readiness.add_argument("steady_primary", type=Path)
-    readiness.add_argument("transient_primary", type=Path)
-    readiness.add_argument("--run-static-sentinels", action="store_true")
-    readiness.add_argument("--real-runtime-receipt", type=Path)
-    readiness.add_argument("--storage-root", type=Path)
-    readiness.add_argument("--comsol-version-output")
-
-    compatible_smoke = subparsers.add_parser(
-        "find-compatible-technical-smoke-run",
-        help="find one dependency-compatible completed technical-smoke child",
-    )
-    compatible_smoke.add_argument("config", type=Path)
-    compatible_smoke.add_argument("--storage-root", type=Path, required=True)
-
-    smoke_evidence = subparsers.add_parser(
-        "technical-smoke-evidence-status",
-        help="query successful technical-smoke evidence for one selected profile",
-    )
-    smoke_evidence.add_argument("config", type=Path)
-    smoke_evidence.add_argument("--storage-root", type=Path, required=True)
-    smoke_evidence.add_argument("--comsol-version-output", required=True)
-
-    finalize_profile_smoke = subparsers.add_parser(
-        "finalize-technical-smoke-evidence",
-        help="publish profile-scoped evidence after a complete technical smoke",
-    )
-    finalize_profile_smoke.add_argument("campaign_run_id")
-    finalize_profile_smoke.add_argument("--comsol-version-output", required=True)
-    finalize_profile_smoke.add_argument("--storage-root", type=Path, required=True)
-
-    finalize_smoke = subparsers.add_parser(
-        "finalize-real-smoke",
-        help="write one immutable paired native runtime-smoke receipt",
-    )
-    finalize_smoke.add_argument("steady_campaign_run_id")
-    finalize_smoke.add_argument("transient_campaign_run_id")
-    finalize_smoke.add_argument("--comsol-version-output", required=True)
-    finalize_smoke.add_argument("--storage-root", type=Path, required=True)
-
-    validate_smoke = subparsers.add_parser(
-        "validate-real-smoke",
-        help="revalidate one immutable runtime-smoke receipt against current source",
-    )
-    validate_smoke.add_argument("receipt", type=Path, nargs="?")
-    validate_smoke.add_argument("--storage-root", type=Path, required=True)
 
     inspect_benchmark = subparsers.add_parser(
         "inspect-core-benchmark",
@@ -362,7 +300,9 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="run one isolated, identity-checked benchmark representative case",
     )
     run_benchmark.add_argument("benchmark_run_id")
+    run_benchmark.add_argument("sweep_id")
     run_benchmark.add_argument("variant_id")
+    run_benchmark.add_argument("variant_attempt", type=int)
     run_benchmark.add_argument("case_role")
     run_benchmark.add_argument("--storage-root", type=Path, required=True)
     run_benchmark.add_argument("--work-root", type=Path, required=True)
@@ -399,59 +339,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     finalize_benchmark.add_argument("benchmark_run_id")
     finalize_benchmark.add_argument("--storage-root", type=Path, required=True)
 
-    benchmark_transfer = subparsers.add_parser(
-        "core-benchmark-transfer-plan",
-        help="print the terminal benchmark evidence directory",
-    )
-    benchmark_transfer.add_argument("benchmark_run_id")
-    benchmark_transfer.add_argument("--format", choices=("json", "tsv"), default="json")
-    benchmark_transfer.add_argument("--storage-root", type=Path, required=True)
-
-    publish_benchmark = subparsers.add_parser(
-        "publish-transferred-core-benchmark",
-        help="validate and atomically publish staged benchmark evidence",
-    )
-    publish_benchmark.add_argument("benchmark_run_id")
-    publish_benchmark.add_argument("--staging-root", type=Path, required=True)
-    publish_benchmark.add_argument("--destination-root", type=Path, required=True)
-    publish_benchmark.add_argument("--source-host", required=True)
-    publish_benchmark.add_argument("--source-storage-root", required=True)
-    publish_benchmark.add_argument("--expected-inventory-sha256", required=True)
-    publish_benchmark.add_argument("--expected-file-count", type=int, required=True)
-    publish_benchmark.add_argument("--expected-size-bytes", type=int, required=True)
-
-    benchmark_cleanup_authorization = subparsers.add_parser(
-        "core-benchmark-cleanup-authorization",
-        help="authorize cleanup from a validated host benchmark publication",
-    )
-    benchmark_cleanup_authorization.add_argument("benchmark_run_id")
-    benchmark_cleanup_authorization.add_argument("--format", choices=("json", "tsv"), default="json")
-    benchmark_cleanup_authorization.add_argument("--storage-root", type=Path, required=True)
-
-    cleanup_benchmark = subparsers.add_parser(
-        "cleanup-core-benchmark-source",
-        help="plan or execute one authorized benchmark CPU-source cleanup",
-    )
-    cleanup_benchmark.add_argument("benchmark_run_id")
-    cleanup_benchmark.add_argument("--source-host", required=True)
-    cleanup_benchmark.add_argument("--destination-storage-root", required=True)
-    cleanup_benchmark.add_argument("--expected-inventory-sha256", required=True)
-    cleanup_benchmark.add_argument("--expected-file-count", type=int, required=True)
-    cleanup_benchmark.add_argument("--expected-size-bytes", type=int, required=True)
-    cleanup_benchmark.add_argument("--authorization-sha256", required=True)
-    cleanup_benchmark.add_argument("--confirm", action="store_true")
-    cleanup_benchmark.add_argument("--storage-root", type=Path, required=True)
-
-    record_benchmark_cleanup = subparsers.add_parser(
-        "record-core-benchmark-cleanup",
-        help="bind a verified remote benchmark cleanup to host evidence",
-    )
-    record_benchmark_cleanup.add_argument("benchmark_run_id")
-    record_benchmark_cleanup.add_argument("--authorization-sha256", required=True)
-    record_benchmark_cleanup.add_argument("--cleanup-receipt-sha256", required=True)
-    record_benchmark_cleanup.add_argument("--reclaimed-bytes", type=int, required=True)
-    record_benchmark_cleanup.add_argument("--storage-root", type=Path, required=True)
-
     benchmark_source_status = subparsers.add_parser(
         "core-benchmark-source-status",
         help="report benchmark CPU source and cleanup state",
@@ -485,7 +372,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     preflight.add_argument("--storage-root", type=Path, required=True)
     preflight.add_argument("--work-root", type=Path, required=True)
     preflight.add_argument("--venv-path", type=Path, required=True)
-    preflight.add_argument("--environment-only", action="store_true")
 
     worker_init = subparsers.add_parser(
         "initialize-worker-workspace",
@@ -502,22 +388,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     worker_cleanup.add_argument("directory", type=Path)
     worker_cleanup.add_argument("--campaign-run-id", required=True)
     worker_cleanup.add_argument("--storage-root", type=Path, required=True)
-
-    transfer_stage = subparsers.add_parser(
-        "create-transfer-staging",
-        help="create one marked local transfer staging root",
-    )
-    transfer_stage.add_argument("campaign_run_id")
-    transfer_stage.add_argument("--storage-root", type=Path, required=True)
-
-    cleanup_staging = subparsers.add_parser(
-        "cleanup-transfer-staging",
-        help="list marked transfer staging; delete only with --confirm",
-    )
-    cleanup_staging.add_argument("--campaign-run-id")
-    cleanup_staging.add_argument("--directory", type=Path)
-    cleanup_staging.add_argument("--storage-root", type=Path, required=True)
-    cleanup_staging.add_argument("--confirm", action="store_true")
 
     generate = subparsers.add_parser("generate-case", help="generate one case input bundle")
     generate.add_argument("config", type=Path)
@@ -569,23 +439,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     validate_case.add_argument("case_index", type=int)
     _add_storage_arguments(validate_case)
 
-    batch = subparsers.add_parser("run-batch", help="run a local multi-worker development batch")
-    batch.add_argument("config", type=Path)
-    _add_batch_selection(batch, required=True)
-    _add_local_resources(batch)
-    _add_case_range(batch)
-    _add_storage_arguments(batch, include_work=True)
-
-    finalize = subparsers.add_parser("finalize-batch", help="validate and terminally publish one batch")
-    finalize.add_argument("config", type=Path)
-    _add_batch_selection(finalize, required=True)
-    _add_storage_arguments(finalize)
-
-    transfer = subparsers.add_parser("validate-transfer", help="validate one transferred terminal batch")
-    transfer.add_argument("config", type=Path)
-    _add_batch_selection(transfer, required=True)
-    _add_storage_arguments(transfer)
-
     campaign_case = subparsers.add_parser(
         "run-campaign-case",
         help="run one exact campaign case in its persisted Slurm job",
@@ -606,22 +459,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="prepare or reuse exact canonical inputs before submission",
     )
     _add_campaign_execution_arguments(prepare_campaign_inputs)
-    prepare_campaign_inputs.add_argument(
-        "--quiet-progress",
-        action="store_true",
-        help="suppress bounded batch and case progress lines on stderr",
-    )
 
     submit_campaign = subparsers.add_parser(
         "submit-campaign",
         help="submit and persist one exact-commit campaign run",
     )
     _add_campaign_execution_arguments(submit_campaign)
-    submit_campaign.add_argument(
-        "--quiet-progress",
-        action="store_true",
-        help="suppress bounded scheduler submission progress lines on stderr",
-    )
+    submit_campaign.add_argument("--metadata-only", action="store_true", help="feed prepared metadata and report compute-required before heavy work")
     submit_campaign.add_argument(
         "--inputs-prepared",
         action="store_true",
@@ -631,7 +475,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     campaign_status = subparsers.add_parser("campaign-status", help="reconstruct persistent campaign and scheduler status")
     campaign_status.add_argument("campaign_run_id")
     campaign_status.add_argument("--no-scheduler", action="store_true")
-    campaign_status.add_argument("--format", choices=("json", "state", "summary", "monitor", "workflow-monitor"), default="json")
+    campaign_status.add_argument("--format", choices=("json", "state", "summary", "monitor"), default="json")
     campaign_status.add_argument("--max-active-cases", type=int)
     _add_storage_arguments(campaign_status)
 
@@ -652,22 +496,39 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     feed = subparsers.add_parser(
         "feed-campaign",
-        help="reconcile exact jobs and restore at most one pending case job",
+        help="reconcile node jobs and dispatches and dispatch pending cases into node jobs",
     )
     feed.add_argument("campaign_run_id")
     _add_storage_arguments(feed)
+
+    declare_failure = subparsers.add_parser(
+        "declare-candidate-failure",
+        help="explicitly terminalize one exhausted scientific candidate after scheduler reconciliation",
+    )
+    declare_failure.add_argument("campaign_run_id")
+    declare_failure.add_argument("material")
+    declare_failure.add_argument("case_id")
+    declare_failure.add_argument("--reason-code", required=True)
+    declare_failure.add_argument("--detail", required=True)
+    _add_storage_arguments(declare_failure)
+
+    amend_replacements = subparsers.add_parser(
+        "amend-replacement-pool",
+        help="explicitly raise one original batch's replacement capacity, with its reason",
+    )
+    amend_replacements.add_argument("campaign_run_id")
+    amend_replacements.add_argument("--material", required=True)
+    amend_replacements.add_argument("--regime", required=True)
+    amend_replacements.add_argument("--capacity", type=int, required=True, help="total replacement candidates the batch may use")
+    amend_replacements.add_argument("--reason", required=True)
+    _add_storage_arguments(amend_replacements)
 
     resume = subparsers.add_parser(
         "resume-campaign",
         help="advance one case through the campaign resume matrix",
     )
     resume.add_argument("campaign_run_id")
-    resume.add_argument(
-        "--format",
-        choices=("json", "workflow-monitor"),
-        default="json",
-    )
-    resume.add_argument("--max-active-cases", type=int)
+    resume.add_argument("--metadata-only", action="store_true", help="defer input generation or batch admission and report compute-required")
     _add_storage_arguments(resume)
 
     interruption = subparsers.add_parser(
@@ -679,379 +540,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     interruption.add_argument("--exit-code", type=int, required=True)
     _add_storage_arguments(interruption)
 
-    publish_transfer = subparsers.add_parser(
-        "publish-transferred-campaign",
-        help="validate staged bytes and atomically mark local transfer complete",
+    node_worker = subparsers.add_parser(
+        "run-node-worker",
+        help="run the generic ticket worker inside one Slurm node job",
     )
-    publish_transfer.add_argument("campaign_run_id")
-    publish_transfer.add_argument("--staging-root", type=Path, required=True)
-    publish_transfer.add_argument("--destination-root", type=Path, required=True)
-    publish_transfer.add_argument("--source-host", required=True)
-    publish_transfer.add_argument("--source-storage-root", required=True)
-    publish_transfer.add_argument("--partial", action="store_true")
-    publish_transfer.add_argument(
-        "--quiet-progress",
-        action="store_true",
-        help="suppress bounded file and byte progress lines on stderr",
-    )
+    node_worker.add_argument("node_directory", type=Path)
+    node_worker.add_argument("--cores", type=int, required=True)
 
-    campaign_terminal = subparsers.add_parser("validate-campaign-terminal", help="validate and publish terminal campaign evidence")
-    campaign_terminal.add_argument("campaign_run_id")
-    _add_storage_arguments(campaign_terminal)
-
-    transfer_plan = subparsers.add_parser("campaign-transfer-plan", help="print terminally validated collection directories")
-    transfer_plan.add_argument("campaign_run_id")
-    transfer_plan.add_argument("--format", choices=("json", "tsv"), default="json")
-    transfer_plan.add_argument("--partial", action="store_true")
-    _add_storage_arguments(transfer_plan)
-
-    transfer_authority = subparsers.add_parser(
-        "campaign-transfer-authority",
-        help="report canonical CPU terminal and transfer-inventory identity",
-    )
-    transfer_authority.add_argument("campaign_run_id")
-    transfer_authority.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(transfer_authority)
-
-    repair_transfer = subparsers.add_parser(
-        "repair-transferred-campaign",
-        help="reconstruct transfer evidence for an exact canonical host copy",
-    )
-    repair_transfer.add_argument("campaign_run_id")
-    repair_transfer.add_argument("--source-host", required=True)
-    repair_transfer.add_argument("--source-storage-root", required=True)
-    repair_transfer.add_argument("--authority-json", required=True)
-    _add_storage_arguments(repair_transfer)
-
-    repair_partial = subparsers.add_parser(
-        "repair-partial-campaign-publication",
-        help="bind a terminal partial campaign already present in shared storage",
-    )
-    repair_partial.add_argument("campaign_run_id")
-    repair_partial.add_argument("--source-host", required=True)
-    repair_partial.add_argument("--source-storage-root", required=True)
-    _add_storage_arguments(repair_partial)
-
-    validate_publication = subparsers.add_parser(
-        "validate-published-campaign",
-        help="validate an exact GPU generation publication and transfer receipt",
-    )
-    validate_publication.add_argument("campaign_run_id")
-    validate_publication.add_argument("--partial", action="store_true")
-    _add_storage_arguments(validate_publication)
-
-    pilot_source_inventory = subparsers.add_parser(
-        "record-pilot-source-inventory",
-        help="record exact terminal pilot CPU bytes before transfer or cleanup",
-    )
-    pilot_source_inventory.add_argument("campaign_run_id")
-    _add_storage_arguments(pilot_source_inventory)
-
-    pilot_staging_inventory = subparsers.add_parser(
-        "record-pilot-staging-inventory",
-        help="record exact transfer-staging bytes before publication or cleanup",
-    )
-    pilot_staging_inventory.add_argument("campaign_run_id")
-    pilot_staging_inventory.add_argument("--staging-root", type=Path, required=True)
-
-    shared_pilot_staging = subparsers.add_parser(
-        "record-shared-pilot-staging",
-        help="record a marked pilot accounting workspace without copying campaign data",
-    )
-    shared_pilot_staging.add_argument("campaign_run_id")
-    _add_storage_arguments(shared_pilot_staging)
-
-    validate_pilot_staging = subparsers.add_parser(
-        "validate-pilot-staging-inventory",
-        help="validate and report the retained pilot transfer staging",
-    )
-    validate_pilot_staging.add_argument("campaign_run_id")
-    validate_pilot_staging.add_argument("--require-present", action="store_true")
-    validate_pilot_staging.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(validate_pilot_staging)
-
-    cleanup_pilot_staging = subparsers.add_parser(
-        "cleanup-pilot-staging",
-        help="transactionally remove the exact authorized pilot transfer staging",
-    )
-    cleanup_pilot_staging.add_argument("campaign_run_id")
-    cleanup_pilot_staging.add_argument("--confirm", action="store_true")
-    cleanup_pilot_staging.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(cleanup_pilot_staging)
-
-    prepare_pilot = subparsers.add_parser(
-        "prepare-pilot-check",
-        help="analyze pilot evidence and persist the immutable pre-cleanup receipt",
-    )
-    prepare_pilot.add_argument("campaign_run_id")
-    prepare_pilot.add_argument("--production-campaign", type=Path, required=True)
-    prepare_pilot.add_argument("--keep-cpu-source", action="store_true")
-    _add_storage_arguments(prepare_pilot)
-
-    record_pilot_cleanup = subparsers.add_parser(
-        "record-pilot-cleanup",
-        help="finalize verified CPU and transfer-staging cleanup in the pilot receipt",
-    )
-    record_pilot_cleanup.add_argument("campaign_run_id")
-    record_pilot_cleanup.add_argument("--cpu-source-removed", action="store_true")
-    record_pilot_cleanup.add_argument("--cpu-bytes-reclaimed", type=int, required=True)
-    record_pilot_cleanup.add_argument("--cpu-cleanup-receipt-sha256")
-    record_pilot_cleanup.add_argument("--transfer-staging-removed", action="store_true")
-    record_pilot_cleanup.add_argument("--staging-bytes-reclaimed", type=int, required=True)
-    record_pilot_cleanup.add_argument("--staging-cleanup-receipt-sha256")
-    _add_storage_arguments(record_pilot_cleanup)
-
-    validate_pilot = subparsers.add_parser(
-        "validate-pilot-check",
-        help="revalidate and display one canonical pilot receipt",
-    )
-    validate_pilot.add_argument("campaign_run_id")
-    validate_pilot.add_argument("--require-cleanup-complete", action="store_true")
-    validate_pilot.add_argument(
-        "--if-present",
-        action="store_true",
-        help="return successfully without output when the canonical receipt is absent",
-    )
-    validate_pilot.add_argument("--format", choices=("json", "summary"), default="json")
-    _add_storage_arguments(validate_pilot)
-
-    compatible_campaign = subparsers.add_parser(
-        "find-compatible-campaign-source",
-        help="find one exact completed campaign for package-only continuation",
-    )
-    compatible_campaign.add_argument("config", type=Path)
-    compatible_campaign.add_argument("--storage-root", type=Path, required=True)
-
-    completion_parent = subparsers.add_parser(
-        "find-completion-parent",
-        help="resolve zero or one structurally compatible campaign completion parent",
-    )
-    completion_parent.add_argument("config", type=Path)
-    completion_parent.add_argument("--parent-run-id")
-    completion_parent.add_argument("--allow-untransferred", action="store_true")
-    _add_storage_arguments(completion_parent)
-
-    initialize_completion = subparsers.add_parser(
-        "initialize-campaign-completion",
-        help="create or extend one bounded replacement completion owner",
-    )
-    initialize_completion.add_argument("config", type=Path)
-    initialize_completion.add_argument("--parent-run-id", required=True)
-    initialize_completion.add_argument("--parent-partial", type=Path, required=True)
-    initialize_completion.add_argument("--parent-partial-sha256", required=True)
-    initialize_completion.add_argument("--replacement-pool-size", type=int)
-    _add_storage_arguments(initialize_completion)
-
-    advance_completion = subparsers.add_parser(
-        "advance-campaign-completion",
-        help="reconcile and advance exact replacement rounds through normal campaigns",
-    )
-    advance_completion.add_argument("config", type=Path)
-    advance_completion.add_argument("completion_id")
-    advance_completion.add_argument("--git-commit", required=True)
-    _add_storage_arguments(advance_completion)
-
-    completion_status = subparsers.add_parser(
-        "campaign-completion-status",
-        help="report exact replacement successes, failures, reservations, and deficits",
-    )
-    completion_status.add_argument("completion_id")
-    completion_status.add_argument(
-        "--if-present",
-        action="store_true",
-        help="report an absent state without creating or mutating a completion owner",
-    )
-    completion_status.add_argument("--config", type=Path, help="include named targets and resolved normal execution settings")
-    _add_storage_arguments(completion_status)
-
-    completion_transfer = subparsers.add_parser(
-        "campaign-completion-transfer-plan",
-        help="report the completed state and successful replacement runs to transfer",
-    )
-    completion_transfer.add_argument("completion_id")
-    _add_storage_arguments(completion_transfer)
-
-    completion_composite = subparsers.add_parser(
-        "build-campaign-completion-composite",
-        help="admit transferred parent and replacement successes into one exact composite",
-    )
-    completion_composite.add_argument("completion_id")
-    _add_storage_arguments(completion_composite)
-
-    completion_lifecycle = subparsers.add_parser(
-        "build-campaign-completion-lifecycle",
-        help="build composite Dataset packages, PT shards, smoke, readiness, and cleanup plan",
-    )
-    completion_lifecycle.add_argument("parent_run_id")
-    completion_lifecycle.add_argument("completion_id")
-    _add_storage_arguments(completion_lifecycle)
-
-    validate_completion_lifecycle = subparsers.add_parser(
-        "validate-campaign-completion-lifecycle",
-        help="revalidate one completion-owned Dataset and cleanup gate",
-    )
-    validate_completion_lifecycle.add_argument("parent_run_id")
-    validate_completion_lifecycle.add_argument("completion_id")
-    _add_storage_arguments(validate_completion_lifecycle)
-
-    completion_cleanup = subparsers.add_parser(
-        "campaign-completion-cleanup-plan",
-        help="report successful replacement-only cleanup eligibility",
-    )
-    completion_cleanup.add_argument("parent_run_id")
-    completion_cleanup.add_argument("completion_id")
-    _add_storage_arguments(completion_cleanup)
-
-    build_datasets = subparsers.add_parser(
-        "build-campaign-datasets",
-        help="build the launch packages or only missing additive extensions",
-    )
-    build_datasets.add_argument("campaign_run_id")
-    build_datasets.add_argument("--partial", action="store_true")
-    _add_storage_arguments(build_datasets)
-
-    prepare_gpu_datasets = subparsers.add_parser(
-        "prepare-gpu-datasets",
-        help="prepare missing Dataset packages and transient PT shards from terminal GPU data",
-    )
-    prepare_gpu_datasets.add_argument("campaign_run_id")
-    prepare_gpu_datasets.add_argument(
-        "--quiet-progress",
-        action="store_true",
-        help="suppress bounded progress lines on stderr",
-    )
-    _add_storage_arguments(prepare_gpu_datasets)
-
-    validate_package_state = subparsers.add_parser(
-        "validate-campaign-package-state",
-        help="validate the immutable base and all current package extensions",
-    )
-    validate_package_state.add_argument("campaign_run_id")
-    validate_package_state.add_argument(
-        "--full-content",
-        action="store_true",
-        help="rehash package and derived payload bytes for explicit diagnostics",
-    )
-    _add_storage_arguments(validate_package_state)
-
-    prepare_all = subparsers.add_parser(
-        "prepare-all-workflow",
-        help="persist every completed local gate before optional CPU cleanup",
-    )
-    prepare_all.add_argument("campaign_run_id")
-    prepare_all.add_argument("--keep-cpu-source", action="store_true")
-    prepare_all.add_argument("--partial", action="store_true")
-    _add_storage_arguments(prepare_all)
-
-    validate_all = subparsers.add_parser(
-        "validate-all-workflow",
-        help="require one terminally successful all-workflow receipt",
-    )
-    validate_all.add_argument("campaign_run_id")
-    validate_all.add_argument("--partial", action="store_true")
-    _add_storage_arguments(validate_all)
-
-    cleanup_authorization = subparsers.add_parser(
-        "cpu-cleanup-authorization",
-        help="issue compact CPU cleanup authorization after every local gate",
-    )
-    cleanup_authorization.add_argument("campaign_run_id")
-    cleanup_authorization.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(cleanup_authorization)
-
-    cleanup_source = subparsers.add_parser(
-        "cleanup-campaign-source",
-        help="dry-run or execute one GPU-authorized CPU campaign cleanup",
-    )
-    cleanup_source.add_argument("campaign_run_id")
-    cleanup_source.add_argument("--source-host", required=True)
-    cleanup_source.add_argument("--destination-storage-root", required=True)
-    cleanup_source.add_argument("--transfer-receipt-sha256", required=True)
-    cleanup_source.add_argument("--dataset-receipt-sha256", required=True)
-    cleanup_source.add_argument("--workflow-gate-sha256", required=True)
-    cleanup_source.add_argument("--source-inventory-sha256", required=True)
-    cleanup_source.add_argument("--source-file-count", type=int, required=True)
-    cleanup_source.add_argument("--source-bytes", type=int, required=True)
-    cleanup_source.add_argument("--authorization-sha256", required=True)
-    cleanup_source.add_argument("--confirm", action="store_true")
-    cleanup_source.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(cleanup_source)
-
-    record_cleanup = subparsers.add_parser(
-        "record-cpu-cleanup",
-        help="bind one authorized remote cleanup receipt to the local workflow",
-    )
-    record_cleanup.add_argument("campaign_run_id")
-    record_cleanup.add_argument("--authorization-sha256", required=True)
-    record_cleanup.add_argument("--cleanup-receipt-sha256", required=True)
-    record_cleanup.add_argument("--reclaimed-bytes", type=int, required=True)
-    _add_storage_arguments(record_cleanup)
-
-    source_status = subparsers.add_parser(
-        "campaign-source-status",
-        help="report one host's campaign source and cleanup state",
-    )
-    source_status.add_argument("campaign_run_id")
-    source_status.add_argument("--query-scheduler", action="store_true")
-    source_size_mode = source_status.add_mutually_exclusive_group()
-    source_size_mode.add_argument(
-        "--metadata-only",
-        action="store_true",
-        help="report exact lifecycle state without recursive source sizing (default)",
-    )
-    source_size_mode.add_argument(
-        "--include-sizes",
-        action="store_true",
-        help="explicitly perform recursive source sizing",
-    )
-    source_status.add_argument("--format", choices=("json", "tsv"), default="json")
-    _add_storage_arguments(source_status)
-
-    storage_status = subparsers.add_parser(
-        "storage-status",
-        help="report generation, datasets, staging, packages, runs, and cleanup",
-    )
-    storage_status.add_argument("--role", choices=("gpu", "cpu"), required=True)
-    storage_status.add_argument("--campaign-run-id")
-    storage_status.add_argument("--query-scheduler", action="store_true")
-    storage_size_mode = storage_status.add_mutually_exclusive_group()
-    storage_size_mode.add_argument(
-        "--metadata-only",
-        action="store_true",
-        help="skip recursive size and payload inspection work (default)",
-    )
-    storage_size_mode.add_argument(
-        "--include-sizes",
-        action="store_true",
-        help="explicitly perform recursive size and payload inspection work",
-    )
-    storage_status.add_argument(
-        "--omit-run-status",
-        action="store_true",
-        help="omit campaign reconciliation already reported by another snapshot",
-    )
-    _add_storage_arguments(storage_status)
-
-    shared_setup_idle = subparsers.add_parser(
-        "assert-shared-setup-idle",
-        help="refuse shared CPU setup while persisted Generation jobs are active",
-    )
-    shared_setup_idle.add_argument("--storage-root", type=Path, required=True)
-
-    workflow_failure = subparsers.add_parser(
-        "record-workflow-failure",
-        help="persist one compact workflow failure record with continuation guidance",
-    )
-    workflow_failure.add_argument("campaign_run_id")
-    workflow_failure.add_argument("--stage", required=True)
-    workflow_failure.add_argument("--continuation-command", required=True)
-    workflow_failure.add_argument("--cpu-bytes-retained", type=int, required=True)
-    workflow_failure.add_argument(
-        "--format",
-        choices=("path", "json", "tsv"),
-        default="path",
-    )
-    _add_storage_arguments(workflow_failure)
     return parser
 
 
@@ -1064,36 +559,12 @@ def _load(args: argparse.Namespace) -> config_service.GenerationConfig:
     )
 
 
-def _selected(config: config_service.GenerationConfig, args: argparse.Namespace) -> tuple[int, ...]:
-    """Resolve one parsed inclusive case range."""
-    return cluster_service.select_case_indices(config, case_start=args.case_start, case_stop=args.case_stop)
-
-
-def _remaining(config: config_service.GenerationConfig, selected: tuple[int, ...], *, storage_root: Path | None) -> int:
-    """Count selection members that are not valid completed cases."""
-    return sum(not runtime_service.completed_case_is_valid(config, case_index, storage_root=storage_root) for case_index in selected)
-
-
-def _plan(
-    config: config_service.GenerationConfig,
-    args: argparse.Namespace,
-    selected: tuple[int, ...],
-) -> cluster_service.LocalResourcePlan:
-    """Build one local-development plan from explicit local controls."""
-    return cluster_service.build_local_resource_plan(
-        cores_per_case=args.cores_per_case,
-        max_parallel_cases=args.max_parallel_cases,
-        remaining_cases=_remaining(config, selected, storage_root=args.storage_root),
-    )
-
-
 def _summary(config: config_service.GenerationConfig) -> dict[str, Any]:
     """Return one concise configuration preflight summary."""
     return {
         "simulation_profile": config.profile.id,
         "material_family": config.material_family,
-        "material_role": config.material_role,
-        "evaluation_regime": config.evaluation_regime,
+        "domain_profile": config.scientific_values["domain_profile"],
         "sampling_regime": config.sampling_regime,
         "batch_name": config.batch_name,
         "batch_id": config.batch_id,
@@ -1145,33 +616,9 @@ def _campaign_seed_plan(campaign: config_service.CampaignConfig) -> dict[str, An
         }
     return {
         "campaign_seed": first_batch.scientific_values["campaign_seed"],
-        "membership_seed": campaign.membership.get("seed"),
-        "paired_equivalence_seed": campaign.paired_equivalence_seed,
         "batches": batch_seeds,
         "case_seed_derivation": "batch_seed_and_case_identity",
     }
-
-
-def _dataset_package_requests(campaign: config_service.CampaignConfig) -> list[dict[str, str | int]]:
-    """Return unique revision-bearing package intents represented by resolved packages."""
-    requests: list[dict[str, str | int]] = []
-    seen: set[tuple[str, str, int]] = set()
-    for package in campaign.dataset_packages:
-        key = (
-            str(package["evaluation_regime"]),
-            str(package["source_role"]),
-            int(package["dataset_revision"]),
-        )
-        if key not in seen:
-            seen.add(key)
-            requests.append(
-                {
-                    "evaluation_regime": key[0],
-                    "source_role": key[1],
-                    "dataset_revision": key[2],
-                }
-            )
-    return requests
 
 
 def _parameter_ood_summary(campaign: config_service.CampaignConfig) -> dict[str, Any]:
@@ -1208,20 +655,18 @@ def _campaign_summary(
 ) -> dict[str, Any]:
     """Return the complete resolved campaign inspection view."""
     case_counts = _campaign_case_counts(campaign)
-    package_inventory = list(campaign.dataset_packages)
-    material_inventory = [material_family for role in config_service.MATERIAL_ROLES for material_family in campaign.material_roles[role]]
+    material_inventory = list(campaign.material_inventory)
     summary: dict[str, Any] = {
         "campaign_name": campaign.campaign_name,
+        "source_name": campaign.source_name,
         "campaign_id": campaign.campaign_id,
         "campaign_digest": campaign.campaign_digest,
         "campaign_purpose": campaign.campaign_purpose,
         "simulation_profile": campaign.profile.id,
         "source_path": str(campaign.source_path),
         "material_inventory": material_inventory,
-        "material_roles": {role: list(families) for role, families in campaign.material_roles.items()},
-        "material_memberships": {membership: list(families) for membership, families in campaign.material_memberships.items()},
-        "membership": campaign.membership,
-        "evaluation_regimes": list(campaign.evaluation_regimes),
+        "domain_profile": campaign.domain_profile,
+        "original_design_sizes": dict(campaign.selected_targets),
         "case_counts": case_counts,
         "total_case_count": campaign.total_case_count,
         "counts": case_counts["by_batch"],
@@ -1230,9 +675,6 @@ def _campaign_summary(
         "sampling_method": campaign.batches[0].scientific_values["sampling"]["method"],
         "parameter_ood": _parameter_ood_summary(campaign),
         "selected_batches": [_summary(batch) for batch in campaign.batches],
-        "dataset_package_requests": _dataset_package_requests(campaign),
-        "dataset_package_inventory": package_inventory,
-        "dataset_packages": package_inventory,
         "profile": {
             "id": campaign.profile.id,
             "available_learning_views": list(campaign.profile.available_learning_views),
@@ -1246,46 +688,17 @@ def _campaign_summary(
             "submission": campaign.execution_values["submission"],
             "cluster": campaign.execution_values["cluster"],
             "retention_policy": campaign.execution_values["retention_policy"],
-            "retention_profiles": campaign.execution_values["retention_profiles"],
         },
         "unresolved_readiness_gates": unresolved_gates,
         "executable": not any(unresolved_gates.values()),
-        "cases_per_material": None,
-        "pilot_plan": None,
-        "technical_smoke_plan": None,
         "static_sentinel_workload": None,
     }
-    if campaign.campaign_purpose == "family_generalization":
+    if campaign.campaign_purpose == "source_generation":
         summary["static_sentinel_workload"] = sentinel_service.inspect_sentinel_workload(campaign)
-    elif campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
-        pilot = campaign.batches[0].scientific_values["pilot_check"]
-        summary["cases_per_material"] = pilot["cases_per_material"]
-        summary["pilot_plan"] = {
-            "material_inventory": material_inventory,
-            "cases_per_material": pilot["cases_per_material"],
-            "total_case_count": campaign.total_case_count,
-            "campaign_seed": campaign.batches[0].scientific_values["campaign_seed"],
-            "seed_namespace": campaign.batches[0].scientific_values["campaign_seed"],
-            "case_semantics": pilot["case_semantics"],
-            "case_kinds": pilot["case_kinds"],
-            "training_membership": "none",
-            "dataset_package_count": len(campaign.dataset_packages),
-            "evaluation_regime": config_service.NO_EVALUATION_REGIME,
-        }
-    elif campaign.campaign_purpose == "technical_runtime_smoke":
-        summary["technical_smoke_plan"] = {
-            "material_inventory": material_inventory,
-            "case_counts": case_counts["by_material"],
-            "total_case_count": campaign.total_case_count,
-            "campaign_seed": campaign.batches[0].scientific_values["campaign_seed"],
-            "paired_equivalence_seed": campaign.paired_equivalence_seed,
-            "learning_membership": "none",
-            "dataset_package_count": len(campaign.dataset_packages),
-        }
     return summary
 
 
-def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
+def _campaign_catalog() -> dict[str, Any]:
     """Return discovered campaign metadata and an optional unique workflow view."""
     repository = common.paths.get_project_root().resolve()
     campaigns = config_service.discover_campaign_configs(
@@ -1301,6 +714,7 @@ def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
                 "source_path": str(campaign.source_path),
                 "repository_path": campaign.source_path.relative_to(repository).as_posix(),
                 "campaign_name": campaign.campaign_name,
+                "source_name": campaign.source_name,
                 "campaign_purpose": campaign.campaign_purpose,
                 "simulation_profile": campaign.profile.id,
                 "profile_kind": profile_kind,
@@ -1312,40 +726,6 @@ def _campaign_catalog(*, require_workflow: bool) -> dict[str, Any]:
         "schema_version": 1,
         "campaigns": records,
     }
-    if not require_workflow:
-        return result
-    workflow: dict[str, dict[str, dict[str, Any]]] = {}
-    smoke_records = [record for record in records if record["campaign_purpose"] == "technical_runtime_smoke"]
-    smoke: dict[str, dict[str, Any]] = {}
-    for profile_kind in ("stationary", "transient"):
-        matches = [record for record in smoke_records if record["profile_kind"] == profile_kind]
-        if len(matches) != 1:
-            message = f"Host workflow requires exactly one technical_runtime_smoke {profile_kind} campaign; discovered {len(matches)}."
-            raise ValueError(message)
-        smoke[profile_kind] = matches[0]
-    workflow["technical_runtime_smoke"] = smoke
-    primary_purposes = {
-        "stationary": config_service.STEADY_FLOW_ID_DATASET_PURPOSE,
-        "transient": "family_generalization",
-    }
-    primary: dict[str, dict[str, Any]] = {}
-    for profile_kind, purpose in primary_purposes.items():
-        matches = [record for record in records if record["campaign_purpose"] == purpose and record["profile_kind"] == profile_kind]
-        if len(matches) != 1:
-            message = f"Host workflow requires exactly one primary {profile_kind} campaign with purpose {purpose!r}; discovered {len(matches)}."
-            raise ValueError(message)
-        primary[profile_kind] = matches[0]
-    workflow["primary"] = primary
-    selected_sites = {
-        common.serialization.canonical_json_sha256(record["execution_site"]): record["execution_site"]
-        for purpose_records in workflow.values()
-        for record in purpose_records.values()
-    }
-    if len(selected_sites) != 1:
-        message = "Host workflow campaign pairs must resolve one shared execution site."
-        raise ValueError(message)
-    result["workflow"] = workflow
-    result["shared_execution_site"] = next(iter(selected_sites.values()))
     return result
 
 
@@ -1354,128 +734,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "resolve-generation-run":
         run_plan = run_service.resolve_generation_run(
             args.config,
+            authored_value=args.authored_value_json,
             source_commit=args.git_commit,
             require_executable=not args.allow_incomplete,
+            scientific_overrides=_scientific_overrides(args),
+            execution_overrides=_execution_overrides(args),
         )
         print(json.dumps(run_plan.to_payload(), sort_keys=True))
         return 0
-    if args.command == "create-background-session":
-        arguments = list(args.workflow_arguments)
-        if arguments and arguments[0] == "--":
-            arguments = arguments[1:]
-        if not arguments:
-            message = "create-background-session requires workflow argv after --."
-            raise ValueError(message)
-        host_paths = json.loads(args.host_paths_json)
-        if not isinstance(host_paths, dict) or set(host_paths) != {
-            "stable_script",
-            "python_executable",
-            "storage_root",
-            "host",
-        }:
-            message = "Background host paths JSON must contain exactly stable_script, python_executable, storage_root, and host."
-            raise ValueError(message)
-        session = background_service.create_background_session(
-            arguments[0],
-            arguments=arguments,
-            source_commit=args.source_commit,
-            storage_root=args.storage_root,
-            stable_script=host_paths["stable_script"],
-            python_executable=host_paths["python_executable"],
-            host_storage_root=host_paths["storage_root"],
-            host_name=host_paths["host"],
-            active_tmux_sessions=args.active_tmux_session,
-        )
-        print(json.dumps(session, sort_keys=True))
-        return 0
-    if args.command == "complete-background-session":
-        result = background_service.complete_background_session(
-            args.workflow_session_id,
-            exit_code=args.exit_code,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    if args.command == "inspect-background-session":
-        status = background_service.inspect_background_session(
-            args.workflow_session_id,
-            storage_root=args.storage_root,
-            active_tmux_sessions=args.active_tmux_session,
-        )
-        print(json.dumps(status, sort_keys=True))
-        return 0
-    if args.command == "list-background-sessions":
-        sessions = background_service.list_background_sessions(
-            storage_root=args.storage_root,
-            active_tmux_sessions=args.active_tmux_session,
-        )
-        print(json.dumps({"sessions": sessions}, sort_keys=True))
-        return 0
     if args.command == "list-campaigns":
-        print(json.dumps(_campaign_catalog(require_workflow=args.workflow), sort_keys=True))
-        return 0
-    if args.command == "static-sentinels":
-        report = sentinel_service.run_static_sentinels(
-            args.steady_campaign,
-            args.transient_campaign,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0 if report["status"] == "pass" else 2
-    if args.command == "readiness-report":
-        report = readiness_service.build_readiness_report(
-            args.steady_primary,
-            args.transient_primary,
-            run_static_sentinels=args.run_static_sentinels,
-            real_runtime_receipt=args.real_runtime_receipt,
-            storage_root=args.storage_root,
-            comsol_version_output=args.comsol_version_output,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0 if report["production_ready_for_user_launch"] else 2
-    if args.command == "find-compatible-technical-smoke-run":
-        report = smoke_service.find_compatible_completed_technical_smoke_run(
-            args.config,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "technical-smoke-evidence-status":
-        report = smoke_service.technical_smoke_evidence_status(
-            args.config,
-            storage_root=args.storage_root,
-            comsol_version_output=args.comsol_version_output,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0 if report["status"] == "technical_smoke_evidence_valid" else 2
-    if args.command == "finalize-technical-smoke-evidence":
-        path = smoke_service.finalize_technical_smoke_evidence(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            comsol_version_output=args.comsol_version_output,
-        )
-        print(path)
-        return 0
-    if args.command == "finalize-real-smoke":
-        path = smoke_service.finalize_real_smoke(
-            args.steady_campaign_run_id,
-            args.transient_campaign_run_id,
-            comsol_version_output=args.comsol_version_output,
-            storage_root=args.storage_root,
-        )
-        print(path)
-        return 0
-    if args.command == "validate-real-smoke":
-        report = (
-            smoke_service.validate_current_real_smoke_receipts(
-                storage_root=args.storage_root,
-            )
-            if args.receipt is None
-            else smoke_service.validate_real_smoke_receipt(
-                args.receipt,
-                storage_root=args.storage_root,
-            )
-        )
-        print(json.dumps(report, sort_keys=True))
+        print(json.dumps(_campaign_catalog(), sort_keys=True))
         return 0
     if args.command == "inspect-core-benchmark":
         inspection = benchmark_config.inspect_core_benchmark(
@@ -1539,7 +807,9 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
     if args.command == "run-core-benchmark-case":
         result = benchmark_service.run_core_benchmark_case(
             args.benchmark_run_id,
+            args.sweep_id,
             args.variant_id,
+            args.variant_attempt,
             args.case_role,
             storage_root=args.storage_root,
             work_root=args.work_root,
@@ -1583,90 +853,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
         )
         print(json.dumps(summary, sort_keys=True))
-        return 0
-    if args.command == "core-benchmark-transfer-plan":
-        transfer_plan = benchmark_service.core_benchmark_transfer_plan(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-        )
-        if args.format == "json":
-            print(json.dumps(transfer_plan, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "benchmark",
-                        str(transfer_plan["benchmark_run_id"]),
-                        str(transfer_plan["git_commit"]),
-                        str(transfer_plan["relative_directory"]),
-                        str(transfer_plan["inventory"]["inventory_sha256"]),
-                        str(transfer_plan["inventory"]["file_count"]),
-                        str(transfer_plan["inventory"]["size_bytes"]),
-                    )
-                )
-            )
-        return 0
-    if args.command == "publish-transferred-core-benchmark":
-        receipt = benchmark_service.publish_transferred_core_benchmark(
-            args.benchmark_run_id,
-            staging_root=args.staging_root,
-            destination_root=args.destination_root,
-            source_host=args.source_host,
-            source_storage_root=args.source_storage_root,
-            expected_inventory_sha256=args.expected_inventory_sha256,
-            expected_file_count=args.expected_file_count,
-            expected_size_bytes=args.expected_size_bytes,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "core-benchmark-cleanup-authorization":
-        authorization = benchmark_service.core_benchmark_cleanup_authorization(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-        )
-        if args.format == "json":
-            print(json.dumps(authorization, sort_keys=True))
-        else:
-            inventory = authorization["inventory"]
-            print(
-                "\t".join(
-                    (
-                        "benchmark-cleanup-authorization",
-                        authorization["benchmark_run_id"],
-                        authorization["source_host"],
-                        authorization["source_storage_root"],
-                        authorization["destination_storage_root"],
-                        inventory["inventory_sha256"],
-                        str(inventory["file_count"]),
-                        str(inventory["size_bytes"]),
-                        authorization["authorization_sha256"],
-                    )
-                )
-            )
-        return 0
-    if args.command == "cleanup-core-benchmark-source":
-        receipt = benchmark_service.cleanup_core_benchmark_source(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            source_host=args.source_host,
-            destination_storage_root=args.destination_storage_root,
-            expected_inventory_sha256=args.expected_inventory_sha256,
-            expected_file_count=args.expected_file_count,
-            expected_size_bytes=args.expected_size_bytes,
-            authorization_sha256=args.authorization_sha256,
-            confirm=args.confirm,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "record-core-benchmark-cleanup":
-        receipt = benchmark_service.record_core_benchmark_cleanup(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            authorization_sha256=args.authorization_sha256,
-            cleanup_receipt_sha256=args.cleanup_receipt_sha256,
-            reclaimed_bytes=args.reclaimed_bytes,
-        )
-        print(json.dumps(receipt, sort_keys=True))
         return 0
     if args.command == "core-benchmark-source-status":
         status = benchmark_service.core_benchmark_source_status(
@@ -1721,9 +907,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             venv_path=args.venv_path,
         )
         print(json.dumps(report, sort_keys=True))
-        if report["production_configuration_ready"] or args.environment_only:
-            return 0
-        return 2
+        return 0 if report["production_configuration_ready"] else 2
     if args.command == "initialize-worker-workspace":
         marker = workspace_service.initialize_worker_workspace(
             args.directory,
@@ -1733,62 +917,23 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(marker)
         return 0
     if args.command == "cleanup-worker-workspace":
-        reclaimed = workspace_service.cleanup_worker_workspace(
+        workspace_service.cleanup_worker_workspace(
             args.directory,
             run_id=args.campaign_run_id,
             storage_root=args.storage_root,
             allow_active_job_id=os.environ.get("SLURM_JOB_ID"),
         )
-        print(json.dumps({"reclaimed_bytes": reclaimed}, sort_keys=True))
-        return 0
-    if args.command == "create-transfer-staging":
-        directory = workspace_service.create_transfer_staging(
-            storage_root=args.storage_root,
-            run_id=args.campaign_run_id,
-        )
-        print(directory)
-        return 0
-    if args.command == "cleanup-transfer-staging":
-        candidates = workspace_service.transfer_staging_candidates(
-            storage_root=args.storage_root,
-            run_id=args.campaign_run_id,
-        )
-        if args.directory is not None:
-            expected = str(args.directory.expanduser().resolve())
-            candidates = tuple(candidate for candidate in candidates if candidate["path"] == expected)
-            if not candidates:
-                message = f"Requested transfer staging is not a valid candidate: {expected}"
-                raise ValueError(message)
-        cleanup_results = [dict(candidate, removed=False) for candidate in candidates]
-        if args.confirm:
-            for result in cleanup_results:
-                reclaimed = workspace_service.cleanup_transfer_staging(
-                    result["path"],
-                    storage_root=args.storage_root,
-                    run_id=result["run_id"],
-                )
-                result["removed"] = True
-                result["reclaimed_bytes"] = reclaimed
-        print(
-            json.dumps(
-                {
-                    "mode": "delete" if args.confirm else "dry-run",
-                    "candidates": cleanup_results,
-                },
-                sort_keys=True,
-            )
-        )
         return 0
     if args.command == "validate-config" and args.only_batch is None:
         campaign = config_service.load_campaign_config(
             args.config,
+            authored_value=args.authored_value_json,
             require_executable=not args.allow_incomplete,
+            scientific_overrides=_scientific_overrides(args),
+            execution_overrides=_execution_overrides(args),
         )
-        gates = readiness_service.campaign_unresolved_gates(args.config)
-        summary = _campaign_summary(campaign, unresolved_gates=gates)
-        if args.inspect_parameter:
-            summary["parameter_inspection"] = [inventory_service.inspect_campaign_parameter(campaign, name) for name in args.inspect_parameter]
-        print(json.dumps(summary, sort_keys=True))
+        gates = readiness_service.campaign_unresolved_gates(args.config, authored_value=args.authored_value_json)
+        print(json.dumps(_campaign_summary(campaign, unresolved_gates=gates), sort_keys=True))
         return 0
     if args.command == "campaign-status":
         status = campaign_runtime.campaign_status(
@@ -1796,8 +941,8 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
             query_scheduler=not args.no_scheduler,
         )
-        if args.max_active_cases is not None and args.format not in {"summary", "monitor", "workflow-monitor"}:
-            message = "--max-active-cases requires --format summary, monitor, or workflow-monitor."
+        if args.max_active_cases is not None and args.format not in {"summary", "monitor"}:
+            message = "--max-active-cases requires --format summary or monitor."
             raise ValueError(message)
         if args.format == "state":
             print(status["campaign_state"])
@@ -1812,19 +957,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             print(
                 campaign_status_service.format_campaign_monitor(
                     status,
-                    max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
-                )
-            )
-        elif args.format == "workflow-monitor":
-            source_status = workflow_service.campaign_source_status_from_snapshot(
-                args.campaign_run_id,
-                campaign_status=status,
-                storage_root=args.storage_root,
-            )
-            print(
-                campaign_status_service.format_workflow_monitor(
-                    status,
-                    source_status,
                     max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
                 )
             )
@@ -1853,35 +985,35 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0
+    if args.command == "declare-candidate-failure":
+        path = campaign_runtime.declare_candidate_failure(
+            args.campaign_run_id,
+            args.material,
+            args.case_id,
+            reason_code=args.reason_code,
+            detail=args.detail,
+            storage_root=args.storage_root,
+        )
+        print(path)
+        return 0
+    if args.command == "amend-replacement-pool":
+        amendment = campaign_runtime.amend_replacement_capacity(
+            args.campaign_run_id,
+            args.material,
+            args.regime,
+            capacity=args.capacity,
+            reason=args.reason,
+            storage_root=args.storage_root,
+        )
+        print(json.dumps(amendment, sort_keys=True))
+        return 0
     if args.command == "resume-campaign":
-        if args.max_active_cases is not None and args.format != "workflow-monitor":
-            message = "--max-active-cases requires --format workflow-monitor."
-            raise ValueError(message)
-        if args.format == "workflow-monitor":
-            snapshot = campaign_runtime.resume_campaign_monitor_snapshot(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-                progress=_print_workflow_progress,
-            )
-            status = snapshot["status"]
-            source_status = workflow_service.campaign_source_status_from_snapshot(
-                args.campaign_run_id,
-                campaign_status=status,
-                storage_root=args.storage_root,
-            )
-            print(
-                campaign_status_service.format_workflow_monitor(
-                    status,
-                    source_status,
-                    max_active_cases=(8 if args.max_active_cases is None else args.max_active_cases),
-                )
-            )
-        else:
-            manifest = campaign_runtime.resume_campaign(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            print(json.dumps(manifest, sort_keys=True))
+        manifest = campaign_runtime.resume_campaign(
+            args.campaign_run_id,
+            storage_root=args.storage_root,
+            metadata_only=args.metadata_only,
+        )
+        print(json.dumps(manifest, sort_keys=True))
         return 0
     if args.command == "record-worker-interruption":
         path = campaign_runtime.record_worker_interruption(
@@ -1892,556 +1024,14 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         )
         print(path)
         return 0
-    if args.command == "publish-transferred-campaign":
-        receipt = campaign_runtime.publish_transferred_campaign(
-            args.campaign_run_id,
-            staging_root=args.staging_root,
-            destination_root=args.destination_root,
-            source_host=args.source_host,
-            source_storage_root=args.source_storage_root,
-            partial=args.partial,
-            progress=(None if args.quiet_progress else _print_workflow_progress),
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "validate-campaign-terminal":
-        terminal = campaign_runtime.validate_terminal_campaign(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(terminal, sort_keys=True))
-        return 0
-    if args.command == "campaign-transfer-plan":
-        transfer_plan = (
-            campaign_runtime.partial_campaign_transfer_plan(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-                refresh=True,
-            )
-            if args.partial
-            else campaign_runtime.campaign_transfer_plan(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-        )
-        if args.format == "json":
-            print(json.dumps(transfer_plan, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "campaign",
-                        transfer_plan["campaign_name"],
-                        transfer_plan["git_commit"],
-                        transfer_plan["campaign_directory"],
-                        transfer_plan["campaign_config"],
-                    )
-                )
-            )
-            for batch in transfer_plan["batches"]:
-                print(
-                    "\t".join(
-                        (
-                            "batch",
-                            batch["batch_name"],
-                            batch["batch_id"],
-                            str(batch["case_count"]),
-                            batch["meta_directory"],
-                            batch["raw_directory"],
-                            batch["processed_directory"],
-                        )
-                    )
-                )
-                for attempt_directory in batch["attempt_directories"]:
-                    print(
-                        "\t".join(
-                            (
-                                "attempt",
-                                batch["batch_name"],
-                                attempt_directory,
-                            )
-                        )
-                    )
-        return 0
-    if args.command == "campaign-transfer-authority":
-        authority = campaign_runtime.campaign_transfer_authority(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        if args.format == "json":
-            print(json.dumps(authority, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "transfer-authority",
-                        authority["campaign_run_id"],
-                        authority["campaign_id"],
-                        authority["git_commit"],
-                        str(authority["file_count"]),
-                        str(authority["size_bytes"]),
-                        authority["inventory_sha256"],
-                    )
-                )
-            )
-        return 0
-    if args.command == "repair-transferred-campaign":
-        authority = json.loads(args.authority_json)
-        if not isinstance(authority, dict):
-            message = "Transfer authority JSON must contain one object."
-            raise TypeError(message)
-        receipt = campaign_runtime.repair_transferred_campaign(
-            args.campaign_run_id,
-            source_host=args.source_host,
-            source_storage_root=args.source_storage_root,
-            authority=authority,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "repair-partial-campaign-publication":
-        receipt = campaign_runtime.repair_partial_campaign_publication(
-            args.campaign_run_id,
-            source_host=args.source_host,
-            source_storage_root=args.source_storage_root,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "validate-published-campaign":
-        receipt = (
-            campaign_runtime.validate_partially_transferred_campaign(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            if args.partial
-            else campaign_runtime.validate_transferred_campaign(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "record-pilot-source-inventory":
-        inventory = pilot_service.record_cpu_source_inventory(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(inventory, sort_keys=True))
-        return 0
-    if args.command == "record-pilot-staging-inventory":
-        inventory = pilot_service.record_transfer_staging_inventory(
-            args.campaign_run_id,
-            staging_root=args.staging_root,
-        )
-        print(json.dumps(inventory, sort_keys=True))
-        return 0
-    if args.command == "record-shared-pilot-staging":
-        inventory = pilot_service.record_shared_staging_inventory(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(inventory, sort_keys=True))
-        return 0
-    if args.command == "validate-pilot-staging-inventory":
-        inventory = pilot_service.validate_transfer_staging_inventory(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            require_staging_present=args.require_present,
-        )
-        if args.format == "json":
-            print(json.dumps(inventory, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "pilot-staging",
-                        inventory["transfer_staging_path"],
-                        str(inventory["transfer_staging_bytes_before_cleanup"]),
-                        str(inventory["transfer_staging_file_count"]),
-                    )
-                )
-            )
-        return 0
-    if args.command == "cleanup-pilot-staging":
-        receipt = pilot_service.cleanup_recorded_transfer_staging(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            confirm=args.confirm,
-        )
-        if args.format == "json":
-            print(json.dumps(receipt, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "pilot-staging-cleanup",
-                        str(receipt["status"]),
-                        str(receipt["removed"]),
-                        str(receipt["reclaimed_bytes"]),
-                        (
-                            common.serialization.file_sha256(
-                                pilot_service.pilot_check_directory(
-                                    args.campaign_run_id,
-                                    storage_root=args.storage_root,
-                                )
-                                / pilot_service.PILOT_STAGING_CLEANUP_FILENAME
-                            )
-                            if receipt["status"] == "complete"
-                            else "-"
-                        ),
-                    )
-                )
-            )
-        return 0
-    if args.command == "prepare-pilot-check":
-        receipt = pilot_service.prepare_pilot_receipt(
-            args.campaign_run_id,
-            production_campaign=args.production_campaign,
-            storage_root=args.storage_root,
-            cleanup_requested=not args.keep_cpu_source,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "record-pilot-cleanup":
-        receipt = workflow_service.record_pilot_cleanup_result(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            cpu_source_removed=args.cpu_source_removed,
-            cpu_bytes_reclaimed=args.cpu_bytes_reclaimed,
-            cpu_cleanup_receipt_sha256=args.cpu_cleanup_receipt_sha256,
-            transfer_staging_removed=args.transfer_staging_removed,
-            staging_bytes_reclaimed=args.staging_bytes_reclaimed,
-            staging_cleanup_receipt_sha256=args.staging_cleanup_receipt_sha256,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "validate-pilot-check":
-        receipt_path = pilot_service.pilot_receipt_path(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        if args.if_present and not receipt_path.is_file():
-            return 0
-        receipt = (
-            workflow_service.validate_completed_pilot_receipt(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            if args.require_cleanup_complete
-            else pilot_service.validate_pilot_receipt(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-        )
-        if args.format == "json":
-            print(json.dumps(receipt, sort_keys=True))
-        else:
-            print(pilot_service.terminal_summary(receipt))
-        return 0
-    if args.command == "find-completion-parent":
-        campaign = config_service.load_campaign_config(args.config)
-        report = completion_service.find_compatible_completion_parent(
-            campaign,
-            parent_run_id=args.parent_run_id,
-            storage_root=args.storage_root,
-            require_transferred=not args.allow_untransferred,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "initialize-campaign-completion":
-        campaign = config_service.load_campaign_config(args.config)
-        state = completion_service.create_completion_from_partial_path(
-            parent_campaign=campaign,
-            parent_run_id=args.parent_run_id,
-            parent_partial_path=args.parent_partial,
-            parent_partial_sha256=args.parent_partial_sha256,
-            replacement_pool_size=args.replacement_pool_size,
-            storage_root=args.storage_root,
-        )
-        report = completion_service.completion_status_for_id(
-            state["completion_id"],
-            storage_root=args.storage_root,
-            parent_campaign=campaign,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "advance-campaign-completion":
-        campaign = config_service.load_campaign_config(args.config)
-        state = completion_service.load_completion(
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        report = completion_service.advance_completion_campaigns(
-            state,
-            parent_campaign=campaign,
-            git_commit=args.git_commit,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "campaign-completion-status":
-        parent_campaign = None if args.config is None else config_service.load_campaign_config(args.config)
-        report = completion_service.completion_status_for_id(
-            args.completion_id,
-            storage_root=args.storage_root,
-            if_present=args.if_present,
-            parent_campaign=parent_campaign,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "campaign-completion-transfer-plan":
-        plan = completion_service.completion_transfer_plan(
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(plan, sort_keys=True))
-        return 0
-    if args.command == "build-campaign-completion-composite":
-        receipt = completion_service.build_completion_composite(
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "build-campaign-completion-lifecycle":
-        receipt = workflow_service.build_composite_completion_lifecycle(
-            args.parent_run_id,
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "validate-campaign-completion-lifecycle":
-        receipt = workflow_service.validate_composite_completion_lifecycle(
-            args.parent_run_id,
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "campaign-completion-cleanup-plan":
-        plan = workflow_service.composite_replacement_cleanup_plan(
-            args.parent_run_id,
-            args.completion_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(plan, sort_keys=True))
-        return 0
-    if args.command == "find-compatible-campaign-source":
-        report = workflow_service.find_compatible_completed_campaign_source(
-            args.config,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(report, sort_keys=True))
-        return 0
-    if args.command == "build-campaign-datasets":
-        receipt = (
-            workflow_service.record_incomplete_campaign_datasets(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            if args.partial
-            else workflow_service.build_campaign_datasets(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "prepare-gpu-datasets":
-        result = workflow_service.prepare_gpu_datasets(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            progress=None if args.quiet_progress else _print_workflow_progress,
-        )
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    if args.command == "validate-campaign-package-state":
-        state = workflow_service.validate_campaign_package_state(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            validation_depth=("full" if args.full_content else "evidence"),
-        )
-        print(json.dumps(state, sort_keys=True))
-        return 0
-    if args.command == "prepare-all-workflow":
-        receipt = (
-            workflow_service.prepare_partial_completion_receipt(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            if args.partial
-            else workflow_service.prepare_all_workflow_receipt(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-                cleanup_requested=not args.keep_cpu_source,
-            )
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "validate-all-workflow":
-        receipt = (
-            workflow_service.validate_partial_completion_receipt(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-            if args.partial
-            else workflow_service.validate_completed_workflow(
-                args.campaign_run_id,
-                storage_root=args.storage_root,
-            )
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "cpu-cleanup-authorization":
-        authorization = workflow_service.cpu_cleanup_authorization(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-        )
-        if args.format == "json":
-            print(json.dumps(authorization, sort_keys=True))
-        else:
-            print(
-                "	".join(
-                    (
-                        "authorization",
-                        authorization["authorization_sha256"],
-                        authorization["source_host"],
-                        authorization["source_storage_root"],
-                        authorization["destination_storage_root"],
-                        authorization["transfer_receipt_sha256"],
-                        authorization["dataset_receipt_sha256"],
-                        authorization["workflow_gate_sha256"],
-                        authorization["source_inventory_sha256"],
-                        str(authorization["source_file_count"]),
-                        str(authorization["source_bytes"]),
-                    )
-                )
-            )
-        return 0
-    if args.command == "cleanup-campaign-source":
-        result = workflow_service.cleanup_cpu_campaign_source(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            source_host=args.source_host,
-            destination_storage_root=args.destination_storage_root,
-            transfer_receipt_sha256=args.transfer_receipt_sha256,
-            dataset_receipt_sha256=args.dataset_receipt_sha256,
-            workflow_gate_sha256=args.workflow_gate_sha256,
-            source_inventory_sha256=args.source_inventory_sha256,
-            source_file_count=args.source_file_count,
-            source_bytes=args.source_bytes,
-            authorization_sha256=args.authorization_sha256,
-            confirm=args.confirm,
-        )
-        if args.format == "json":
-            print(json.dumps(result, sort_keys=True))
-        else:
-            print(
-                "	".join(
-                    (
-                        "cleanup",
-                        str(result["status"]),
-                        str(result.get("mode", "complete")),
-                        str(result["authorization_sha256"]),
-                        str(result.get("reclaimable_bytes", result.get("source_bytes_reclaimed", 0))),
-                        str(result.get("receipt_sha256", "-")),
-                    )
-                )
-            )
-        return 0
-    if args.command == "record-cpu-cleanup":
-        receipt = workflow_service.record_cpu_cleanup_complete(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            authorization_sha256=args.authorization_sha256,
-            cleanup_receipt_sha256=args.cleanup_receipt_sha256,
-            reclaimed_bytes=args.reclaimed_bytes,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "campaign-source-status":
-        status = workflow_service.campaign_source_status(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            query_scheduler=args.query_scheduler,
-            include_sizes=args.include_sizes,
-        )
-        if args.format == "json":
-            print(json.dumps(status, sort_keys=True))
-        else:
-            print(
-                "	".join(
-                    (
-                        "source-status",
-                        str(status["campaign_run_id"]),
-                        str(status["campaign_state"]),
-                        str(status["source_state"]),
-                        "unavailable" if status["reclaimable_bytes"] is None else str(status["reclaimable_bytes"]),
-                        str(status["cleanup_eligibility"]),
-                        str(status["active_slurm"]),
-                    )
-                )
-            )
-        return 0
-    if args.command == "storage-status":
-        status = workflow_service.storage_status(
-            storage_root=args.storage_root,
-            role=args.role,
-            run_id=args.campaign_run_id,
-            query_scheduler=args.query_scheduler,
-            include_sizes=args.include_sizes,
-            include_runs=not args.omit_run_status,
-        )
-        print(json.dumps(status, sort_keys=True))
-        return 0
-    if args.command == "assert-shared-setup-idle":
-        try:
-            status = workflow_service.assert_shared_setup_idle(
-                storage_root=args.storage_root,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
-            print(str(error), file=sys.stderr)
-            return 1
-        print(json.dumps(status, sort_keys=True))
-        return 0
-    if args.command == "record-workflow-failure":
-        path = workflow_service.record_workflow_failure(
-            args.campaign_run_id,
-            storage_root=args.storage_root,
-            stage=args.stage,
-            continuation_command=args.continuation_command,
-            cpu_bytes_retained=args.cpu_bytes_retained,
-        )
-        storage = workspace_service.resolve_storage_root(
-            args.storage_root,
-            create=False,
-        )
-        canonical_path = path.relative_to(storage).as_posix()
-        if args.format == "json":
-            print(
-                json.dumps(
-                    {
-                        "canonical_storage_path": canonical_path,
-                        "container_visible_path": str(path),
-                    },
-                    sort_keys=True,
-                )
-            )
-        elif args.format == "tsv":
-            print(
-                "	".join(
-                    (
-                        "workflow-failure",
-                        canonical_path,
-                        str(path),
-                    )
-                )
-            )
-        else:
-            print(canonical_path)
-        return 0
+    if args.command == "run-node-worker":
+        campaign_directory = campaign_evidence.node_job_campaign_directory(args.node_directory)
+        if campaign_directory is not None:
+            templates = cluster_service.node_job_log_templates(common.paths.get_runtime_root().resolve())
+            host_service.link_job_logs(campaign_directory, host_service.job_log_files(templates))
+        node_result = node_service.run_node_worker(args.node_directory, cores=args.cores)
+        print(f"Node worker ended: {node_result.detail} ({node_result.reason}); steps started {node_result.started}, finished {node_result.finished}")
+        return node_result.exit_code
     if args.command == "run-campaign-case":
         outcome = campaign_runtime.run_campaign_case_job(
             args.campaign_run_id,
@@ -2450,30 +1040,16 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             storage_root=args.storage_root,
             work_root=args.work_root,
         )
-        print(
-            json.dumps(
-                {
-                    "status": outcome.status,
-                    "case_id": outcome.case_id,
-                    "directory": str(outcome.processed_directory),
-                },
-                sort_keys=True,
-            )
-        )
+        print(_case_end_line(args, outcome.status))
         return 0
     if args.command in {"plan-campaign", "prepare-campaign-inputs", "submit-campaign"}:
-        if args.skip_extreme_family_ood and args.only_batch is not None:
-            message = "--skip-extreme-family-ood cannot be combined with --only-batch."
-            raise ValueError(message)
-        campaign = config_service.load_campaign_config(args.config)
-        if campaign.campaign_purpose == config_service.PILOT_CAMPAIGN_PURPOSE:
-            if args.skip_extreme_family_ood or args.only_batch is not None:
-                message = "Pilot-check campaigns do not support extreme-family skipping or batch selection."
-                raise ValueError(message)
-        else:
-            if args.skip_extreme_family_ood:
-                campaign = campaign.without_extreme_family_ood()
-            campaign = campaign.select_batches(None if args.only_batch is None else (args.only_batch,))
+        campaign = config_service.load_campaign_config(
+            args.config,
+            authored_value=args.authored_value_json,
+            scientific_overrides=_scientific_overrides(args),
+            execution_overrides=_execution_overrides(args),
+        )
+        campaign = campaign.select_batches(None if args.only_batch is None else (args.only_batch,))
         if args.command == "plan-campaign":
             campaign_plan = campaign_runtime.plan_campaign(
                 campaign,
@@ -2487,7 +1063,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 campaign,
                 git_commit=args.git_commit,
                 storage_root=args.storage_root,
-                progress=(None if args.quiet_progress else _print_workflow_progress),
+                progress=_print_workflow_progress,
             )
             print(f"canonical-inputs\t{readiness['generated_case_count']}\t{readiness['reused_case_count']}")
             return 0
@@ -2495,8 +1071,10 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             campaign,
             git_commit=args.git_commit,
             storage_root=args.storage_root,
-            progress=(None if args.quiet_progress else _print_workflow_progress),
+            progress=_print_workflow_progress,
             inputs_prepared=args.inputs_prepared,
+            max_admission_cases=args.max_admission_cases,
+            metadata_only=args.metadata_only,
         )
         print(json.dumps(manifest, sort_keys=True))
         return 0
@@ -2587,43 +1165,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             )
         )
         return 0
-    if args.command == "run-batch":
-        selected = _selected(config, args)
-        node_plan = _plan(config, args, selected)
-        results = cluster_service.run_local_batch(
-            config,
-            selected,
-            plan=node_plan,
-            storage_root=args.storage_root,
-            work_root=args.work_root,
-        )
-        print(
-            json.dumps(
-                {
-                    "case_outcomes": len(results),
-                    "effective_parallel_cases": node_plan.effective_parallel_cases,
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
-    if args.command == "finalize-batch":
-        print(runtime_service.finalize_batch(config, storage_root=args.storage_root))
-        return 0
-    if args.command == "validate-transfer":
-        manifest = runtime_service.validate_terminal_batch(config, storage_root=args.storage_root)
-        print(
-            json.dumps(
-                {
-                    "status": "valid",
-                    "batch_id": manifest["batch_id"],
-                    "batch_storage_name": manifest["batch_storage_name"],
-                    "case_count": len(manifest["cases"]),
-                },
-                sort_keys=True,
-            )
-        )
-        return 0
     message = f"Unsupported generation command: {args.command!r}."
     raise ValueError(message)
 
@@ -2685,14 +1226,23 @@ def main(argv: list[str] | None = None) -> int:
             details = config_service.validation_error_details(args.config, error)
             print(json.dumps(details, sort_keys=True), file=sys.stderr)
         else:
-            print(
-                json.dumps(
-                    _cli_error_payload(args, error),
-                    ensure_ascii=True,
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-            )
+            classified = False
+            if args.command == "run-campaign-case":
+                # Nothing parses this step's output. The reason is stated in words, and a stop the runtime classified itself
+                # (stall, timeout, solver error) is fully stated by that line and gets no JSON error event.
+                reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+                print(f"{_case_label(args)} stopped: {reason}", file=sys.stderr)
+                print(_case_end_line(args, "failed"))
+                classified = getattr(error, "runtime_reason", None) is not None
+            if not classified:
+                print(
+                    json.dumps(
+                        _cli_error_payload(args, error),
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                )
         return 2
     finally:
         if previous_term is not None:

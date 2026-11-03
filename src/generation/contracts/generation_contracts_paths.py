@@ -1,14 +1,14 @@
-"""
-generation_contracts_paths.py
+"""Validate persistent Generation storage roots and shared workspace path bounds.
 
-Validate persistent Generation storage roots and shared workspace path bounds.
 Responsibilities:
   - Resolve the sole persistent Generation storage root
   - Require absolute, user-owned, writable filesystem boundaries
   - Provide containment checks shared by runtime workspace services
+
 Design principles:
   - Persistent roots are rejected inside repositories and home/root boundaries
   - Symlink and ownership checks precede creation or use
+
 This module does NOT:
   - Create disposable workspaces, staging directories, or publications
 """

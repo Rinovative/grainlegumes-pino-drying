@@ -1,16 +1,16 @@
-"""
-generation_input_plot_spatial.py
+"""Render coordinated A/B/B-minus-A blocks for generation-input fields.
 
-Render coordinated A/B/B-minus-A blocks for generation-input fields.
 Responsibilities:
   - Group maintained channels as rows under three fixed map columns
   - Use independent A/B physical scales unless the local scale lock is enabled
   - Give every map its own axes-coupled colorbar
   - Compose two-column distributions, pressure lines, and embedded summaries
+
 Design principles:
   - B-minus-A remains physical, symmetric, and exactly centred at zero
   - Distribution axes never participate in map colorbar geometry
   - Incompatible grids are reported without interpolation or resampling
+
 This module does NOT:
   - Render single-case alternatives, derive fields, or load input files
   - Pool unrelated fields or display dataset-mean maps
@@ -26,6 +26,7 @@ import pandas as pd
 from matplotlib.transforms import Bbox
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.ui import tables
 
@@ -281,6 +282,7 @@ def _draw_comparison_map_row(
     quantity: str,
     *,
     lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> None:
     """Draw one actual-case A/B/difference row with independent colorbars."""
     difference = diagnostics.compatible_field_difference(
@@ -301,6 +303,7 @@ def _draw_comparison_map_row(
         quantity,
         title=(f"Case {first.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
         norm=first_norm,
+        display_spatial_stride=display_spatial_stride,
     )
     second_image = layout.draw_map(
         axes[1],
@@ -308,6 +311,7 @@ def _draw_comparison_map_row(
         quantity,
         title=(f"Case {second.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
         norm=second_norm,
+        display_spatial_stride=display_spatial_stride,
     )
     difference_image = layout.draw_array_map(
         axes[2],
@@ -316,6 +320,7 @@ def _draw_comparison_map_row(
         difference,
         title=(f"Case {second.case.case_index} - Case {first.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
         norm=difference_norm,
+        display_spatial_stride=display_spatial_stride,
     )
     if lock_scale and first_image.norm is not second_image.norm:
         msg = "Locked A/B maps must share the exact normalization object."
@@ -451,6 +456,7 @@ def basic_comparison(
     mean_b: diagnostics.DatasetDiagnostics,
     *,
     lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """Render a porosity map row, compact distribution, pressure line, and table."""
     quantities = ("eps_bed", "p_in_bc")
@@ -479,6 +485,7 @@ def basic_comparison(
         second,
         "eps_bed",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
     )
     _apply_map_axis_labels((map_axes,))
     same_dataset = mean_a.batch_identity == mean_b.batch_identity
@@ -535,6 +542,7 @@ def comparison_block(
     lock_scale: bool,
     include_distributions: bool = True,
     side_plot: Callable[[Axes, Axes], None] | None = None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """
     Render A/B/difference maps above two-column distributions and a summary.
@@ -568,6 +576,7 @@ def comparison_block(
             second,
             quantity,
             lock_scale=lock_scale,
+            display_spatial_stride=display_spatial_stride,
         )
     _apply_map_axis_labels(map_axes)
     lower_start = len(selected)

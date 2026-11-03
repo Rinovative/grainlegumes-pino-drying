@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Config-owned COMSOL template locator and byte-identity contracts."""
+"""Config-owned COMSOL template locator and byte-identity contracts.
+
+Responsibilities:
+  - Check configured template locators, exact byte digests, and unsafe/missing path rejection
+
+Design principles:
+  - Template bytes bind simulation identity while locator paths remain provenance
+
+This module does NOT:
+  - Modify template binaries or solve a model
+"""
 
 from __future__ import annotations
 

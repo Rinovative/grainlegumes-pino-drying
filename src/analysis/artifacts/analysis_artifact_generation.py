@@ -1,7 +1,4 @@
-"""
-analysis_artifact_generation.py
-
-Create persistent evaluation artifacts from trained neural-operator runs.
+"""Create persistent evaluation artifacts from trained neural-operator runs.
 
 Responsibilities:
   - Run inference over explicit evaluation loaders in saved membership order
@@ -20,86 +17,73 @@ This module does NOT:
   - Reuse, rebuild, lock, or upload an existing artifact cache target
   - Render interactive or curated scientific figures
 
-Artifact contract:
-  Artifact contents:
-    - Parquet stores case-level scalar metrics, artifact paths and JSON-safe metadata
-    - NPZ stores predictions, targets, errors, kappa fields, raw tensors and residual fields
-    - residual metrics use the same canonical evaluation crop for model comparability
-  Schema:
-    Artifacts
-    ---------
-    Parquet (global, per case):
-        - case_index        : stable one-based source case id
-        - source_index      : zero-based original final-dataset index
-        - split_local_index : zero-based position in the saved split
-        - npz_path          : path to the corresponding NPZ artifact
-
-        # Relative field errors (dimensionless, channel-balanced)
+Notes:
+  Artifact contract:
+    Artifact contents:
+      - Parquet stores case-level scalar metrics, artifact paths and JSON-safe metadata
+      - NPZ stores predictions, targets, errors, kappa fields, raw tensors and residual fields
+      - every NPZ is named <package case id>.npz; case_index stays the one-based Dataset position
+      - residual metrics use the same canonical evaluation crop for model comparability
+    Parquet case table:
+      - case_index        : stable one-based source case id
+      - source_index      : zero-based original final-dataset index
+      - split_local_index : zero-based position in the saved split
+      - npz_path          : path to the corresponding NPZ artifact
+      Relative field errors (dimensionless, channel-balanced):
         - rel_l2            : channel-balanced mean relative L2 over TaskSpec outputs on the full domain
         - rel_h1            : channel-balanced mean relative H1 over TaskSpec outputs on the cropped interior
-
-        # Physical diagnostics
+      Physical diagnostics:
         - physical_rmse_<field> : per-field RMSE over the full domain
         - physical_velocity_vector_rmse : vector RMSE over velocity components
         - physical_rmse_speed_magnitude : RMSE of velocity-group speed magnitude |u|
-
-        # Physics residual metrics (interior-cropped by EVAL_PAD)
-        - momentum_residual_mse : mean(Rx**2 + Ry**2), unit (Pa/m)^2
-        - div_velocity_mse      : mean(div(u)**2), unit 1/s^2
-        - div_eps_velocity_mse  : mean(div(eps*u)**2), unit 1/s^2
-
-        # Boundary metrics (full-grid inlet/outlet masks, unit Pa^2)
-        - pressure_inlet_mse            : mean_inlet((p-p_in_bc)**2)
-        - pressure_outlet_mean_square   : mean_outlet(p)**2
+      Dimensionless physics residual metrics (scales from inputs only):
+        - momentum_residual_mse : mean(Rx**2 + Ry**2) over the EVAL_PAD-cropped interior
+        - flux_balance_mse      : mean(flux_balance**2) over every grid row
+      Dimensionless boundary metrics (full-grid inlet/outlet masks):
+        - pressure_inlet_mse            : mean_inlet((p-p_in_bc)**2) / dp**2
+        - pressure_outlet_mean_square   : (mean_outlet(p) / dp)**2
         - pressure_boundary_mse         : sum of the preceding two terms
-
-        # Global-reduction evidence (one pair of triplets per TaskSpec output)
+      Global-reduction evidence (one pair of triplets per TaskSpec output):
         - physical_sse_<field>     : float64 per-case physical squared-error sum
         - physical_count_<field>   : exact selected physical element count
         - physical_rmse_<field>    : per-case physical diagnostic
         - normalized_sse_<field>   : float64 per-case normalized squared-error sum
         - normalized_count_<field> : exact selected normalized element count
         - normalized_rmse_<field>  : per-case normalized diagnostic
-
-        # Diagnostics
+      Diagnostics:
         - kappa_names       : list of available permeability tensor components
         - meta              : JSON-safe metadata dictionary (stored as JSON string)
-
-    NPZ (local, full fields per case):
-        - case_index   : stable one-based source case id
-        - source_index : zero-based original final-dataset index
-        - split_local_index : zero-based position in the saved split
-        - pred         : (C_artifact, H, W) prediction aligned with artifact_fields
-        - gt           : (C_artifact, H, W) ground truth aligned with artifact_fields
-        - err          : (C_artifact, H, W) prediction error (pred - gt)
-        - artifact_fields : list[str] names aligned with pred/gt/err
-        - artifact_units  : list[str] physical units aligned with artifact_fields
-
-        - kappa_encoded: (C_kappa, H, W) task-stored permeability representations
-        - kappa        : (C_kappa, H, W) physical permeability components
-        - kappa_names  : list[str], same order as kappa channels
-        - p_in_bc         : (1, H, W) pressure boundary condition
-        - coordinates  : (2, H, W) physical x/y coordinate fields
-
-        # Declared inputs and targets retained for downstream analysis
+    NPZ case fields:
+      - case_index   : stable one-based source case id
+      - source_index : zero-based original final-dataset index
+      - split_local_index : zero-based position in the saved split
+      - pred         : (C_artifact, H, W) prediction aligned with artifact_fields
+      - gt           : (C_artifact, H, W) ground truth aligned with artifact_fields
+      - err          : (C_artifact, H, W) prediction error (pred - gt)
+      - artifact_fields : list[str] names aligned with pred/gt/err
+      - artifact_units  : list[str] physical units aligned with artifact_fields
+      - kappa_encoded: (C_kappa, H, W) task-stored permeability representations
+      - kappa        : (C_kappa, H, W) physical permeability components
+      - kappa_names  : list[str], same order as kappa channels
+      - p_in_bc         : (1, H, W) pressure boundary condition
+      - coordinates  : (2, H, W) physical x/y coordinate fields
+      Declared inputs and targets retained for downstream analysis:
         - x_raw        : (C_in, H, W) raw input tensor (physical units)
         - y_raw        : (C_out, H, W) raw target tensor (physical units)
         - input_fields : list[str] canonical input channel names
         - output_fields: list[str] canonical learned-output names aligned with y_raw
         - output_units : list[str] physical units aligned with output_fields
-
-        # Physics diagnostic fields (full fields, not cropped)
-        - Rx           : (H, W) x-momentum residual field
-        - Ry           : (H, W) y-momentum residual field
-        - div_u        : (H, W) divergence field div(u)
-        - div_eps_u    : (H, W) divergence field div(eps u)
-
+      Dimensionless physics diagnostic fields (full grid, not cropped):
+        - Rx           : (H, W) x-momentum residual divided by dp / L_y
+        - Ry           : (H, W) y-momentum residual divided by dp / L_y
+        - flux_balance : (H,) per-row cross-section flux deviation divided by U L_x
         - meta         : JSON string with full metadata
+    Completion provenance:
+      Provenance publishes last and contains the scientific identity, exact output
+      digests, saved train-fitted output scales, task-owned output groups, and the
+      aggregate normalized_group_macro_rmse finalized once from global physical
+      SSE/count evidence.
 
-    Provenance publishes last and contains the scientific identity, exact output
-    digests, saved train-fitted output scales, task-owned output groups, and the
-    aggregate normalized_group_macro_rmse finalized once from global physical
-    SSE/count evidence.
 """
 
 from __future__ import annotations
@@ -115,6 +99,7 @@ import pandas as pd
 import torch
 
 from src import common, domain
+from src.analysis.evaluation import evaluation_dataframe as dataframe
 
 from . import contracts, timing
 
@@ -911,29 +896,24 @@ def infer_current_run_dir(save_root: Path) -> Path:
 # =============================================================================
 
 
-def _timing_case_ids(
+def _artifact_case_ids(
     *,
+    case_ids: Sequence[str],
     timing_cases: list[dict[str, Any]] | None,
-    timing_case_ids: Sequence[str] | None,
     expected_case_count: int,
-) -> tuple[str, ...] | None:
-    """Validate the optional direct-forward collector and authoritative IDs."""
-    if timing_cases is None and timing_case_ids is None:
-        return None
-    if timing_cases is None or timing_case_ids is None:
-        msg = "Artifact timing requires both a collector and authoritative case IDs."
-        raise ValueError(msg)
+) -> tuple[str, ...]:
+    """Validate the authoritative case IDs and the optional empty timing collector."""
     if timing_cases:
         msg = "Artifact timing collector must be empty at generation start."
         raise ValueError(msg)
-    case_ids = tuple(timing_case_ids)
-    if len(case_ids) != expected_case_count or len(case_ids) != len(set(case_ids)):
-        msg = "Artifact timing case IDs must exactly match unique effective membership."
+    ids = tuple(case_ids)
+    if len(ids) != expected_case_count or len(ids) != len(set(ids)):
+        msg = "Artifact case IDs must exactly match unique effective membership."
         raise ValueError(msg)
-    if any(not isinstance(case_id, str) or not case_id for case_id in case_ids):
-        msg = "Artifact timing case IDs must be non-empty strings."
+    if any(not isinstance(case_id, str) or not case_id for case_id in ids):
+        msg = "Artifact case IDs must be non-empty strings."
         raise TypeError(msg)
-    return case_ids
+    return ids
 
 
 def _generate_steady_flow_artifacts(  # noqa: PLR0915
@@ -946,17 +926,17 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
+    case_ids: Sequence[str],
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
-    timing_case_ids: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, Path]:
     """
     Generate steady-Brinkman evaluation artifacts from saved-membership batches.
 
     Complete loader batches are preprocessed and inferred exactly once before
     their case views are evaluated for channel-balanced relative errors, normalized
-    sufficient statistics, dual continuity, momentum, and pressure-boundary
-    diagnostics. One NPZ is written per case and one Parquet row per membership.
+    sufficient statistics, and dimensionless momentum, flux-balance, and
+    pressure-boundary diagnostics. One NPZ is written per case and one Parquet row per membership.
 
     Parameters
     ----------
@@ -975,14 +955,14 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     dataset_name : str
         Logical dataset name used for the Parquet filename.
     provenance : Mapping[str, Any]
-        Versioned request evidence, including selected training continuity and
-        exact complete membership digest.
+        Versioned request evidence, including the physics contract and exact
+        complete membership digest.
+    case_ids : Sequence[str]
+        Authoritative Dataset case IDs aligned with complete saved membership; they name the NPZ files.
     publication_root : str | pathlib.Path | None, optional
         Final target recorded in Parquet NPZ paths while writing a sibling stage.
     timing_cases : list[dict[str, Any]] | None, optional
         Empty collector populated with amortized shares of complete-batch forwards.
-    timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -1019,36 +999,24 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         msg = f"Task velocity-group fields must share one physical unit, got {sorted(velocity_units)}."
         raise ValueError(msg)
     velocity_unit = next(iter(velocity_units))
-    authoritative_timing_ids = _timing_case_ids(
+    authoritative_case_ids = _artifact_case_ids(
+        case_ids=case_ids,
         timing_cases=timing_cases,
-        timing_case_ids=timing_case_ids,
         expected_case_count=expected_case_count,
     )
+    case_files = dataframe.dataset_case_payload_filenames(authoritative_case_ids)
     _ensure_artifact_targets_absent(save_root, dataset_name)
     model.eval()
 
     # Infer run_dir from save_root for logging/metadata only.
     run_dir = infer_current_run_dir(save_root)
     run_name = run_dir.name
-    physics_provenance = provenance.get("physics")
-    if not isinstance(physics_provenance, Mapping):
-        msg = "Steady-flow artifact provenance must contain a physics mapping."
-        raise TypeError(msg)
-    raw_training_continuity = physics_provenance.get("selected_training_continuity")
-    if not isinstance(raw_training_continuity, str):
-        msg = "Steady-flow physics provenance selected_training_continuity must be a string."
-        raise TypeError(msg)
-    selected_training_continuity = domain.physics.contracts.validate_continuity_kind(raw_training_continuity)
-    physics_variant = f"dual-continuity-{contracts.ARTIFACT_DERIVATIVE_KIND}-{contracts.ARTIFACT_DERIVATIVE_EXTENSION}"
+    if provenance.get("physics") != contracts.steady_physics_provenance(task):
+        msg = "Steady-flow artifact provenance must carry the current steady-Brinkman physics contract."
+        raise ValueError(msg)
+    physics_variant = f"{task.physics.continuity}-{contracts.ARTIFACT_DERIVATIVE_KIND}-{contracts.ARTIFACT_DERIVATIVE_EXTENSION}"
 
-    print(
-        "[ARTIFACTS]",
-        f"save_root={save_root}",
-        f"run_dir={run_dir}",
-        f"run_name={run_name}",
-        f"variant={physics_variant}",
-        sep="\n  - ",
-    )
+    print(f"artifacts {run_name} | physics {task.physics.kind} {physics_variant} pad {contracts.EVAL_PAD} | into {save_root.name}/")
 
     # --------------------------------------------------
     # Build domain-owned residual diagnostics
@@ -1057,10 +1025,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     derivative_operator = domain.physics.derivatives.build_derivative_operator(
         contracts.ARTIFACT_DERIVATIVE_KIND,
         extension=contracts.ARTIFACT_DERIVATIVE_EXTENSION,
-    )
-    print(
-        f"[ARTIFACTS] Using domain physics diagnostics kind={task.physics.kind} "
-        f"derivatives={contracts.ARTIFACT_DERIVATIVE_KIND}/{contracts.ARTIFACT_DERIVATIVE_EXTENSION} pad={contracts.EVAL_PAD}"
     )
 
     npz_dir = save_root / "npz"
@@ -1125,7 +1089,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
                 input_fields=task.input_names,
                 output_fields=task.output_names,
                 derivatives=derivative_operator,
-                continuity=selected_training_continuity,
                 boundary=task.physics.boundary,
                 interior_crop=contracts.EVAL_PAD,
             ).as_dict()
@@ -1136,15 +1099,13 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             )
 
         momentum_residual_mse = float(diag["momentum_residual_mse"].detach().cpu().item())
-        div_velocity_mse = float(diag["div_velocity_mse"].detach().cpu().item())
-        div_eps_velocity_mse = float(diag["div_eps_velocity_mse"].detach().cpu().item())
+        flux_balance_mse = float(diag["flux_balance_mse"].detach().cpu().item())
         pressure_boundary_mse = float(diag["pressure_boundary_mse"].detach().cpu().item())
         pressure_inlet_mse = float(diag["pressure_inlet_mse"].detach().cpu().item())
         pressure_outlet_mean_square = float(diag["pressure_outlet_mean_square"].detach().cpu().item())
         Rx_np = diag["Rx"].detach().cpu().squeeze(0).squeeze(0).numpy()
         Ry_np = diag["Ry"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        divu_np = diag["div_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
-        divepsu_np = diag["div_eps_u"].detach().cpu().squeeze(0).squeeze(0).numpy()
+        flux_balance_np = diag["flux_balance"].detach().cpu().squeeze(0).numpy()
 
         # --------------------------------------------------
         # Outputs (de-normalised, physical units)
@@ -1235,8 +1196,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             rel_l2,
             rel_h1,
             momentum_residual_mse,
-            div_velocity_mse,
-            div_eps_velocity_mse,
+            flux_balance_mse,
             pressure_boundary_mse,
             pressure_inlet_mse,
             pressure_outlet_mean_square,
@@ -1251,7 +1211,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         # --------------------------------------------------
         # Write NPZ artifact
         # --------------------------------------------------
-        npz_path = npz_dir / f"case_{case_id:04d}.npz"
+        npz_path = npz_dir / case_files[idx]
         if npz_path.exists():
             msg = f"Refusing to overwrite an existing NPZ artifact: {npz_path}"
             raise FileExistsError(msg)
@@ -1282,8 +1242,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
             "output_units": np.asarray(tuple(field.unit for field in task.outputs)),
             "Rx": Rx_np,
             "Ry": Ry_np,
-            "div_u": divu_np,
-            "div_eps_u": divepsu_np,
+            "flux_balance": flux_balance_np,
         }
 
         def write_npz(temp_path: Path, content: dict[str, Any] = npz_payload) -> None:
@@ -1312,8 +1271,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
                 "physical_rmse_speed_magnitude": physical_rmse_speed_magnitude,
                 "kappa_names": kappa_names,
                 "momentum_residual_mse": momentum_residual_mse,
-                "div_velocity_mse": div_velocity_mse,
-                "div_eps_velocity_mse": div_eps_velocity_mse,
+                "flux_balance_mse": flux_balance_mse,
                 "pressure_boundary_mse": pressure_boundary_mse,
                 "pressure_inlet_mse": pressure_inlet_mse,
                 "pressure_outlet_mean_square": pressure_outlet_mean_square,
@@ -1323,12 +1281,12 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
                 "meta": json.dumps(meta_clean),
             }
         )
-        if authoritative_timing_ids is not None and timing_cases is not None:
+        if timing_cases is not None:
             timing_cases.append(
                 {
-                    "case_id": authoritative_timing_ids[idx],
+                    "case_id": authoritative_case_ids[idx],
                     "source_index": source_index,
-                    "neural_operator_forward_s": forward_s,
+                    "batch_amortized_neural_operator_forward_s": forward_s,
                 }
             )
 
@@ -1370,9 +1328,9 @@ def _generate_generic_artifacts(
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
+    case_ids: Sequence[str],
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
-    timing_case_ids: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, Path]:
     """
     Generate artifacts without assuming concrete output fields or physics.
@@ -1400,12 +1358,12 @@ def _generate_generic_artifacts(
         Logical name used for the single Parquet payload.
     provenance : Mapping[str, Any]
         Request identity and expected membership evidence.
+    case_ids : Sequence[str]
+        Authoritative Dataset case IDs aligned with complete saved membership; they name the NPZ files.
     publication_root : str | pathlib.Path | None, optional
         Final target persisted in NPZ path columns during staged generation.
     timing_cases : list[dict[str, Any]] | None, optional
         Empty collector populated with amortized shares of complete-batch forwards.
-    timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -1435,11 +1393,12 @@ def _generate_generic_artifacts(
         processor=processor,
         provenance=provenance,
     )
-    authoritative_timing_ids = _timing_case_ids(
+    authoritative_case_ids = _artifact_case_ids(
+        case_ids=case_ids,
         timing_cases=timing_cases,
-        timing_case_ids=timing_case_ids,
         expected_case_count=expected_case_count,
     )
+    case_files = dataframe.dataset_case_payload_filenames(authoritative_case_ids)
     _ensure_artifact_targets_absent(root, dataset_name)
     model.eval()
     npz_dir = root / "npz"
@@ -1484,7 +1443,7 @@ def _generate_generic_artifacts(
         prediction_cpu = prediction.squeeze(0).detach().cpu()
         target_cpu = targets.squeeze(0).detach().cpu()
         error_cpu = prediction_cpu - target_cpu
-        npz_path = npz_dir / f"case_{case_index:04d}.npz"
+        npz_path = npz_dir / case_files[iteration]
         payload = {
             "case_index": np.int64(case_index),
             "source_index": np.int64(source_index),
@@ -1554,12 +1513,12 @@ def _generate_generic_artifacts(
             **group_metrics,
         }
         rows.append(row)
-        if authoritative_timing_ids is not None and timing_cases is not None:
+        if timing_cases is not None:
             timing_cases.append(
                 {
-                    "case_id": authoritative_timing_ids[iteration],
+                    "case_id": authoritative_case_ids[iteration],
                     "source_index": source_index,
-                    "neural_operator_forward_s": forward_s,
+                    "batch_amortized_neural_operator_forward_s": forward_s,
                 }
             )
 
@@ -1599,9 +1558,9 @@ def generate_artifacts(
     save_root: str | Path,
     dataset_name: str,
     provenance: Mapping[str, Any],
+    case_ids: Sequence[str],
     publication_root: str | Path | None = None,
     timing_cases: list[dict[str, Any]] | None = None,
-    timing_case_ids: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame, Path]:
     """
     Generate artifacts through the TaskSpec-driven storage contract.
@@ -1625,12 +1584,12 @@ def generate_artifacts(
     provenance : Mapping[str, Any]
         Exact cache request identity. Generated aggregate and output digests are
         appended only after all case payloads succeed.
+    case_ids : Sequence[str]
+        Authoritative Dataset case IDs aligned with complete saved membership; they name the NPZ files.
     publication_root : str | pathlib.Path | None, optional
         Final target recorded in Parquet NPZ paths while payloads are staged.
     timing_cases : list[dict[str, Any]] | None, optional
         Empty collector populated with amortized shares of complete-batch forwards.
-    timing_case_ids : Sequence[str] | None, optional
-        Authoritative case IDs aligned with complete saved membership.
 
     Returns
     -------
@@ -1645,7 +1604,7 @@ def generate_artifacts(
 
     Notes
     -----
-    The maintained steady-flow task uses its dual-continuity diagnostic adapter.
+    The maintained steady-flow task uses its Brinkman diagnostic adapter.
     TaskSpecs without that physics selector use generic named field/unit storage. This function
     creates payloads only: cache locking and target replacement belong to the
     artifact service. Provenance is always the final completion marker.
@@ -1662,9 +1621,9 @@ def generate_artifacts(
             save_root=save_root,
             dataset_name=dataset_name,
             provenance=provenance,
+            case_ids=case_ids,
             publication_root=publication_root,
             timing_cases=timing_cases,
-            timing_case_ids=timing_case_ids,
         )
     return _generate_generic_artifacts(
         task=task,
@@ -1675,7 +1634,7 @@ def generate_artifacts(
         save_root=save_root,
         dataset_name=dataset_name,
         provenance=provenance,
+        case_ids=case_ids,
         publication_root=publication_root,
         timing_cases=timing_cases,
-        timing_case_ids=timing_case_ids,
     )

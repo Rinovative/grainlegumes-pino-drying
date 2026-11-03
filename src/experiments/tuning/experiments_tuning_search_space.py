@@ -1,7 +1,4 @@
-"""
-experiments_tuning_search_space.py
-
-Parse YAML-defined Optuna search spaces and apply trial overrides.
+"""Parse YAML-defined Optuna search spaces and apply trial overrides.
 
 Responsibilities:
   - Parse exact categorical, float, integer, and fixed parameter schemas
@@ -33,7 +30,6 @@ _COMMON_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
     "optimizer.lr": frozenset({"categorical", "float"}),
     "optimizer.weight_decay": frozenset({"categorical", "float"}),
     "training.gradient_accumulation_steps": frozenset({"categorical", "int"}),
-    "training.stage_schedule.stage_a_fraction": frozenset({"float"}),
 }
 _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
     "fno": {
@@ -57,11 +53,12 @@ _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
     },
 }
 _PHYSICS_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
-    "loss.physics.residual_weight.target": frozenset({"categorical", "float"}),
-    "loss.physics.residual_weight.warmup.epochs": frozenset({"categorical", "int"}),
+    "loss.physics.momentum_weight.target": frozenset({"categorical", "float"}),
+    "loss.physics.momentum_weight.warmup.epochs": frozenset({"categorical", "int"}),
+    "loss.physics.continuity_weight.target": frozenset({"categorical", "float"}),
+    "loss.physics.continuity_weight.warmup.epochs": frozenset({"categorical", "int"}),
     "loss.physics.boundary_weight.target": frozenset({"categorical", "float"}),
     "loss.physics.boundary_weight.warmup.epochs": frozenset({"categorical", "int"}),
-    "loss.physics.continuity": frozenset({"categorical"}),
 }
 
 
@@ -474,19 +471,6 @@ def validate_search_space_paths(
         base_value = _resolved_path_value(config, parameter.path)
         if not _parameter_contains_value(parameter, base_value):
             msg = f"Search-space parameter {parameter.path!r} must contain its resolved base value {base_value!r}."
-            raise ValueError(msg)
-
-    continuity = next(
-        (parameter for parameter in search_space if parameter.path == "loss.physics.continuity"),
-        None,
-    )
-    if continuity is not None:
-        task_contract = _require_mapping(config.get("task_contract"), label="config.task_contract")
-        physics_contract = _require_mapping(task_contract.get("physics"), label="config.task_contract.physics")
-        allowed_continuities = tuple(physics_contract.get("allowed_continuities", ()))
-        unsupported = sorted(set(continuity.values).difference(allowed_continuities))
-        if unsupported:
-            msg = f"Search-space continuity choices are unsupported by the task contract: {unsupported}."
             raise ValueError(msg)
 
 

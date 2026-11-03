@@ -1,11 +1,13 @@
-# ruff: noqa: S101
-"""
-Protect deterministic, content-bound dataset and saved-membership identity.
+"""Protect deterministic, content-bound dataset and saved-membership identity.
 
-The tests vary case order, tensors, metadata, sample IDs, and split indices to
-show that equivalent content is stable and tampering fails strict verification.
-Direct-builder transactions are protected by the profile integration smoke. Large
-production tensors are deliberately not loaded.
+Responsibilities:
+  - Check content fingerprints, ordered membership, saved splits, normalizers, and partial batches
+
+Design principles:
+  - Operational provenance cannot replace scientific content identity
+
+This module does NOT:
+  - Load production-sized tensors or test direct-builder transactions
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
-from support.synthetic_task import build_synthetic_generated_batch_identity
+from support.synthetic_task import build_synthetic_selection_provenance, save_steady_package
 
 from src import datasets, domain
 
@@ -38,38 +40,26 @@ def _reordered_payload(
     Rebuild a payload after applying one order to every sample-aligned component.
 
     Tensors, source evidence, metadata, and case fingerprints stay paired while
-    generated-batch identity follows the reordered manifest membership.
+    Dataset source selection follows the reordered exact membership.
     """
+    provenance = copy.deepcopy(payload["source_provenance"])
+    provenance["source_case_identities"] = [provenance["source_case_identities"][index] for index in order]
     return datasets.contracts.identity.build_training_dataset_payload(
         task=task,
         dataset_id=payload["dataset_id"],
         sample_ids=[payload["sample_ids"][index] for index in order],
-        generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_id=payload["generated_batch_identity"]["batch_id"],
-            sample_ids=[payload["sample_ids"][index] for index in order],
-        ),
+        source_selection_identity={
+            "schema_kind": "dataset_source_selection",
+            "schema_version": 1,
+            "source_cases": provenance["source_case_identities"],
+        },
         source_identities=[payload["source_identities"][index] for index in order],
         source_metadata=[payload["source_metadata"][index] for index in order],
-        source_provenance=payload["source_provenance"],
+        source_provenance=provenance,
         case_fingerprints=[payload["case_fingerprints"][index] for index in order],
         inputs=payload["inputs"][order],
         outputs=payload["outputs"][order],
     )
-
-
-def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
-    """
-    Save one strict payload below its logical dataset directory.
-
-    This test helper intentionally uses direct ``torch.save`` rather than the
-    production atomic publisher because callers exercise read-time identity only.
-    """
-    dataset_id = payload["dataset_id"]
-    directory = root / dataset_id
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{dataset_id}.pt"
-    torch.save(payload, path)
-    return path
 
 
 def test_creation_computes_stable_content_identity(
@@ -126,7 +116,7 @@ def test_source_metadata_is_aligned_and_fingerprint_bound(
         task=steady_task,
         dataset_id=original["dataset_id"],
         sample_ids=original["sample_ids"],
-        generated_batch_identity=original["generated_batch_identity"],
+        source_selection_identity=original["source_selection_identity"],
         source_identities=original["source_identities"],
         source_metadata=changed_metadata,
         source_provenance=original["source_provenance"],
@@ -173,17 +163,20 @@ def test_ordered_membership_changes_fingerprint(
         order=[1, 0, 2, 3],
         task=steady_task,
     )
+    missing_provenance = copy.deepcopy(original["source_provenance"])
+    missing_provenance["source_case_identities"] = missing_provenance["source_case_identities"][:-1]
     missing = datasets.contracts.identity.build_training_dataset_payload(
         task=steady_task,
         dataset_id="tiny",
         sample_ids=original["sample_ids"][:-1],
-        generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_id=original["generated_batch_identity"]["batch_id"],
-            sample_ids=original["sample_ids"][:-1],
-        ),
+        source_selection_identity={
+            "schema_kind": "dataset_source_selection",
+            "schema_version": 1,
+            "source_cases": missing_provenance["source_case_identities"],
+        },
         source_identities=original["source_identities"][:-1],
         source_metadata=original["source_metadata"][:-1],
-        source_provenance=original["source_provenance"],
+        source_provenance=missing_provenance,
         case_fingerprints=original["case_fingerprints"][:-1],
         inputs=original["inputs"][:-1],
         outputs=original["outputs"][:-1],
@@ -237,49 +230,84 @@ def test_duplicate_sample_id_is_rejected(
         datasets.contracts.identity.validate_training_dataset_payload(payload, task=steady_task)
 
 
-def test_multiple_ood_packages_form_one_ordered_identity_bound_loader(
+def _publish(root: Path, payload: dict[str, Any]) -> Path:
+    """Publish one synthetic steady package with its manifest below ``02_datasets``."""
+    return save_steady_package(root / "02_datasets", payload)
+
+
+def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additional: tuple[str, ...], **kwargs: Any) -> tuple[Any, ...]:
+    """Build steady loaders from published Dataset partitions."""
+    return datasets.runtime.training.create_dataloaders(
+        train_dataset_id=train,
+        additional_evaluation_dataset_ids=additional,
+        task=task,
+        storage_root=root,
+        num_workers=0,
+        pin_memory=False,
+        persistent_workers=False,
+        **kwargs,
+    )
+
+
+def test_multiple_additional_evaluation_packages_form_one_ordered_identity_bound_loader(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Combine independent OOD packages without losing their exact ordered identities."""
-    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("combined_train"))
-    first_path = _save_dataset(tmp_path, training_dataset_payload_factory("parameter_ood"))
-    second_path = _save_dataset(tmp_path, training_dataset_payload_factory("family_ood"))
-    _train_loader, _test_loaders, _processor, split_info = datasets.runtime.training.create_dataloaders(
-        path_train=str(train_path),
-        path_test_ood=(str(first_path), str(second_path)),
-        task=steady_task,
-        train_dataset_id="combined_train",
-        ood_dataset_id=("parameter_ood", "family_ood"),
+    """Combine declared OOD cases of independent packages without losing exact ordered identities."""
+    _publish(tmp_path, training_dataset_payload_factory("combined_train", material_role="id"))
+    _publish(tmp_path, training_dataset_payload_factory("parameter_ood", material_family="chickpea", material_role="ood"))
+    _publish(tmp_path, training_dataset_payload_factory("family_ood", material_family="kidney_bean", material_role="ood"))
+    _train_loader, _test_loaders, _processor, split_info = _loaders(
+        tmp_path,
+        steady_task,
+        "combined_train",
+        ("parameter_ood", "family_ood"),
         batch_size=2,
-        train_ratio=0.5,
-        ood_fraction=1.0,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
-        split_seed=9,
     )
 
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_info)
-    assert split_contract.role("eval").source is split_contract.role("train").source
-    assert split_contract.role("train").source.dataset_id == "combined_train"
-    assert split_contract.role("ood").count == _COMBINED_OOD_SAMPLE_COUNT
-    isolated_indices = split_contract.role("ood").indices
+    assert split_contract.validation.source is split_contract.train.source
+    assert split_contract.train.source.dataset_id == "combined_train"
+    assert split_contract.role("additional_evaluation").count == _COMBINED_OOD_SAMPLE_COUNT
+    isolated_indices = split_contract.role("additional_evaluation").indices
     isolated_indices.fill_(-1)
-    assert min(split_contract.role("ood").index_values) >= 0
+    assert min(split_contract.role("additional_evaluation").index_values) >= 0
     rebuilt = split_contract.as_payload()
     assert list(rebuilt) == list(split_info)
     assert rebuilt["metadata"] == split_info["metadata"]
-    for key in ("train_indices", "eval_indices", "ood_indices"):
+    for key in ("train_indices", "validation_indices", "id_test_indices", "additional_evaluation_indices"):
         assert torch.equal(rebuilt[key], split_info[key])
         assert rebuilt[key].data_ptr() != split_info[key].data_ptr()
 
     expected_id = datasets.contracts.identity.combined_dataset_id(("parameter_ood", "family_ood"))
-    assert split_info["metadata"]["datasets"]["ood"]["dataset_id"] == expected_id
+    assert split_info["metadata"]["datasets"]["additional_evaluation"]["dataset_id"] == expected_id
     assert expected_id != datasets.contracts.identity.combined_dataset_id(("family_ood", "parameter_ood"))
-    assert split_info["ood_indices"].numel() == _COMBINED_OOD_SAMPLE_COUNT
-    assert len(set(split_info["metadata"]["datasets"]["ood"]["sample_ids"])) == _COMBINED_OOD_SAMPLE_COUNT
+    assert split_info["additional_evaluation_indices"].numel() == _COMBINED_OOD_SAMPLE_COUNT
+    assert len(set(split_info["metadata"]["datasets"]["additional_evaluation"]["sample_ids"])) == _COMBINED_OOD_SAMPLE_COUNT
+
+
+def test_family_holdout_must_not_reuse_a_training_material(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    training_dataset_payload_factory: Callable[..., dict[str, Any]],
+) -> None:
+    """Reject an evaluation Dataset whose declared holdout repeats a training material."""
+    _publish(tmp_path, training_dataset_payload_factory("holdout_train", material_role="id"))
+    _publish(tmp_path, training_dataset_payload_factory("same_family_ood", material_role="ood"))
+    with pytest.raises(ValueError, match="reuses a training material"):
+        _loaders(tmp_path, steady_task, "holdout_train", ("same_family_ood",), batch_size=2)
+
+
+def test_steady_training_requires_a_dataset_partition(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    training_dataset_payload_factory: Callable[..., dict[str, Any]],
+) -> None:
+    """Refuse a role-neutral steady Dataset instead of drawing a run-seeded split."""
+    _publish(tmp_path, training_dataset_payload_factory("unpartitioned_train"))
+    with pytest.raises(ValueError, match="no fixed case partition"):
+        _loaders(tmp_path, steady_task, "unpartitioned_train", (), batch_size=2)
 
 
 def test_saved_split_rejects_replaced_same_name_count_dataset(
@@ -293,28 +321,12 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     Reusing the original split must fail by fingerprint so path and cardinality
     cannot masquerade as the dataset identity used for training.
     """
-    train_payload = training_dataset_payload_factory("train")
-    ood_payload = training_dataset_payload_factory("ood")
-    train_path = _save_dataset(tmp_path, train_payload)
-    ood_path = _save_dataset(tmp_path, ood_payload)
-    loader_args = {
-        "path_train": str(train_path),
-        "path_test_ood": str(ood_path),
-        "task": steady_task,
-        "train_dataset_id": "train",
-        "ood_dataset_id": "ood",
-        "batch_size": 1,
-        "train_ratio": 0.5,
-        "ood_fraction": 0.5,
-        "num_workers": 0,
-        "pin_memory": False,
-        "persistent_workers": False,
-        "split_seed": 9,
-    }
-    *_, split_info = datasets.runtime.training.create_dataloaders(**loader_args)
+    train_path = _publish(tmp_path, training_dataset_payload_factory("train", material_role="id"))
+    _publish(tmp_path, training_dataset_payload_factory("ood", material_family="chickpea", material_role="ood"))
+    *_, split_info = _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1)
     assert split_info["task_contract_digest"] == steady_task.contract_digest
     assert split_info["metadata"]["datasets"]["train"]["data_contract_digest"] == steady_task.data_contract_digest
-    assert split_info["metadata"]["datasets"]["ood"]["data_contract_digest"] == steady_task.data_contract_digest
+    assert split_info["metadata"]["datasets"]["additional_evaluation"]["data_contract_digest"] == steady_task.data_contract_digest
     stale_header = copy.deepcopy(split_info)
     stale_header["task_contract_digest"] = "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a"
     with pytest.raises(ValueError, match="current registered task"):
@@ -323,13 +335,12 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     replaced = training_dataset_payload_factory(
         "train",
         source_tokens=("same", "same", "replacement", "same"),
+        material_role="id",
     )
-    torch.save(replaced, train_path)
+    train_path.unlink()
+    save_steady_package(tmp_path / "02_datasets", replaced)
     with pytest.raises(ValueError, match="identity does not match"):
-        datasets.runtime.training.create_dataloaders(
-            **loader_args,
-            split_indices=split_info,
-        )
+        _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1, split_indices=split_info)
 
 
 def _valid_normalizer_state() -> dict[str, torch.Tensor]:
@@ -407,22 +418,8 @@ def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
     """Reject raw or stale normalizers whose training data identity changed."""
-    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_train"))
-    ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("normalizer_ood"))
-    _train_loader, _test_loaders, processor, split_info = datasets.runtime.training.create_dataloaders(
-        path_train=str(train_path),
-        path_test_ood=str(ood_path),
-        task=steady_task,
-        train_dataset_id="normalizer_train",
-        ood_dataset_id="normalizer_ood",
-        batch_size=2,
-        train_ratio=0.5,
-        ood_fraction=0.5,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
-        split_seed=17,
-    )
+    _publish(tmp_path, training_dataset_payload_factory("normalizer_train", material_role="id"))
+    _train_loader, _test_loaders, processor, split_info = _loaders(tmp_path, steady_task, "normalizer_train", (), batch_size=2)
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_info)
     artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
         processor,
@@ -484,23 +481,9 @@ def test_training_loader_retains_a_partial_batch(
     The loader must retain one partial batch. Dropping it would turn a valid
     dataset into an empty training lifecycle.
     """
-    train_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_train"))
-    ood_path = _save_dataset(tmp_path, training_dataset_payload_factory("partial_ood"))
+    _publish(tmp_path, training_dataset_payload_factory("partial_train", material_role="id"))
 
-    train_loader, *_rest = datasets.runtime.training.create_dataloaders(
-        path_train=str(train_path),
-        path_test_ood=str(ood_path),
-        task=steady_task,
-        train_dataset_id="partial_train",
-        ood_dataset_id="partial_ood",
-        batch_size=8,
-        train_ratio=0.5,
-        ood_fraction=0.5,
-        num_workers=0,
-        pin_memory=False,
-        persistent_workers=False,
-        split_seed=13,
-    )
+    train_loader, *_rest = _loaders(tmp_path, steady_task, "partial_train", (), batch_size=8)
 
     batch = next(iter(train_loader))
     assert 0 < batch["x"].shape[0] < train_loader.batch_size
@@ -511,65 +494,33 @@ def test_operational_provenance_is_excluded_from_scientific_fingerprint(
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
     """Changing paths/timestamps/exact operational hashes must not change science."""
-    first = training_dataset_payload_factory(
-        source_provenance={
-            "batch_manifest_sha256": "2" * 64,
-            "diagnostic_path": r"C:\\Users\\first\\OneDrive\\batch",
-            "conversion_timestamp": "2026-01-01T00:00:00Z",
-        },
-    )
-    second = training_dataset_payload_factory(
-        source_provenance={
-            "batch_manifest_sha256": "3" * 64,
-            "diagnostic_path": "/cluster/other/batch",
-            "conversion_timestamp": "2030-02-03T04:05:06Z",
-        },
-    )
+    base_provenance = training_dataset_payload_factory()["source_provenance"]
+    first_provenance = copy.deepcopy(base_provenance)
+    first_provenance.update(diagnostic_path=r"C:\\Users\\first\\OneDrive\\dataset", conversion_timestamp="2026-01-01T00:00:00Z")
+    second_provenance = copy.deepcopy(base_provenance)
+    second_provenance.update(diagnostic_path="/cluster/other/dataset", conversion_timestamp="2030-02-03T04:05:06Z")
+    first = training_dataset_payload_factory(source_provenance=first_provenance)
+    second = training_dataset_payload_factory(source_provenance=second_provenance)
 
     assert first["dataset_fingerprint"] == second["dataset_fingerprint"]
     datasets.contracts.identity.validate_training_dataset_payload(second, task=domain.tasks.registry.get_task("steady_flow"), verify_content=True)
 
 
-def test_generated_source_identity_ignores_locator_and_receipt_provenance() -> None:
-    """Bind template and HDF5 bytes while excluding paths and success receipts."""
-    cases = [
-        {
-            "case_id": "case_0001",
-            "material_family": "lentil",
-            "case_input_id": "1" * 64,
-            "simulation_case_id": "2" * 64,
-            "case_hdf5_sha256": "3" * 64,
-            "success_sha256": "4" * 64,
-            "provenance_sha256": "5" * 64,
-        }
-    ]
+def test_dataset_selection_identity_binds_exact_ordered_source_evidence() -> None:
+    """Change exact source evidence and order to obtain distinct Dataset digests."""
+    original = build_synthetic_selection_provenance(dataset_name="selected-source", sample_ids=("case_0001", "case_0002"))
+    original_id, original_digest = datasets.contracts.identity.package_identity_from_provenance(original)
+    assert datasets.contracts.identity.package_identity_from_provenance(original) == (original_id, original_digest)
 
-    def build(*, path: str, template_sha256: str = "6" * 64, source_cases: list[dict[str, Any]] = cases) -> dict[str, Any]:
-        return datasets.contracts.identity.build_generated_package_identity(
-            dataset_name="generated-source",
-            simulation_profile="steady_flow",
-            campaign_digest="7" * 64,
-            template={"relative_path": path, "sha256": template_sha256},
-            export_contract_sha256="8" * 64,
-            available_learning_views=("steady_flow",),
-            airflow_source="comsol_steady_reference",
-            cases=source_cases,
-        )
+    for changed in (
+        {"case_hdf5_relative": "relocated/case.h5"},
+        {"case_hdf5_sha256": "c" * 64},
+        {"decision_sha256": "d" * 64},
+    ):
+        candidate = copy.deepcopy(original)
+        candidate["source_case_identities"][0]["source"].update(changed)
+        assert datasets.contracts.identity.package_identity_from_provenance(candidate)[1] != original_digest
 
-    original = build(path="templates/original.mph")
-    relocated = build(path="relocated/reference.mph")
-    assert relocated["batch_identity"] == original["batch_identity"]
-    assert relocated["batch_manifest_identity_sha256"] == original["batch_manifest_identity_sha256"]
-
-    receipt_only_cases = copy.deepcopy(cases)
-    receipt_only_cases[0]["success_sha256"] = "9" * 64
-    receipt_only_cases[0]["provenance_sha256"] = "a" * 64
-    receipt_only = build(path="templates/original.mph", source_cases=receipt_only_cases)
-    assert receipt_only["batch_manifest_identity_sha256"] == original["batch_manifest_identity_sha256"]
-
-    changed_template = build(path="templates/original.mph", template_sha256="b" * 64)
-    assert changed_template["batch_identity"] != original["batch_identity"]
-    changed_hdf5_cases = copy.deepcopy(cases)
-    changed_hdf5_cases[0]["case_hdf5_sha256"] = "c" * 64
-    changed_hdf5 = build(path="templates/original.mph", source_cases=changed_hdf5_cases)
-    assert changed_hdf5["batch_identity"] != original["batch_identity"]
+    reordered = copy.deepcopy(original)
+    reordered["source_case_identities"].reverse()
+    assert datasets.contracts.identity.package_identity_from_provenance(reordered)[1] != original_digest

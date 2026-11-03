@@ -6,6 +6,7 @@ Provides:
 - eda: exploratory generated-data analysis and visualization
 - evaluation: persisted prediction evaluation and scientific plots
 - generation_inputs: production generation-input discovery and EDA
+- physics_diagnostics: residual, derivative, and balance diagnostics of reference fields
 - presentation: ordered and curated scientific presentation services
 - ui: reusable notebook controls, panels, and viewers
 """
@@ -16,13 +17,14 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import artifacts, eda, evaluation, generation_inputs, presentation, ui
+    from . import artifacts, eda, evaluation, generation_inputs, physics_diagnostics, presentation, ui
 
 _MODULES = {
     "artifacts": "artifacts",
     "eda": "eda",
     "evaluation": "evaluation",
     "generation_inputs": "generation_inputs",
+    "physics_diagnostics": "physics_diagnostics",
     "presentation": "presentation",
     "ui": "ui",
 }
@@ -31,6 +33,7 @@ __all__ = [
     "eda",
     "evaluation",
     "generation_inputs",
+    "physics_diagnostics",
     "presentation",
     "ui",
 ]

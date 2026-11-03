@@ -1,5 +1,15 @@
-# ruff: noqa: S101, PLR2004, SLF001
-"""Temporary COMSOL floating-license capacity retry contracts."""
+"""Temporary COMSOL floating-license capacity retry contracts.
+
+Responsibilities:
+  - Check capacity classification, bounded waits, recovery receipts, cancellation, and retry
+    retention
+
+Design principles:
+  - License acquisition stays separate from scientific attempts and solver failure
+
+This module does NOT:
+  - Acquire real licenses or suppress genuine solver errors
+"""
 
 from __future__ import annotations
 
@@ -7,7 +17,8 @@ import json
 import signal
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from queue import Queue
 from typing import TYPE_CHECKING, Any, cast
 
@@ -15,8 +26,10 @@ import pytest
 import yaml
 
 from src import common, generation
+from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.publication import generation_publication_attempt as attempt_service
 from src.generation.runtime import generation_runtime_batch as batch_runtime
+from src.generation.runtime import generation_runtime_dispatch_identity as dispatch_identity
 from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_stop as stop_service
 
@@ -77,6 +90,29 @@ def _capacity_error(work_directory: Path) -> license_service.TemporaryLicenseCap
         exit_code=0,
         evidence=evidence,
     )
+
+
+def _source_run_id(config: Any) -> str:
+    """Return the current source campaign identity for one resolved batch."""
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    return generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
+
+
+def _dispatch_environment(monkeypatch: pytest.MonkeyPatch, allocation_id: str, submission_index: int, *, step_id: str = "0") -> str:
+    """Bind the process to one campaign case dispatch and return its key."""
+    key = dispatch_identity.dispatch_key(allocation_id, submission_index)
+    monkeypatch.setenv("SLURM_JOB_ID", allocation_id)
+    monkeypatch.setenv("SLURM_STEP_ID", step_id)
+    monkeypatch.setenv("GENERATION_SUBMISSION_INDEX", str(submission_index))
+    monkeypatch.setenv("GENERATION_DISPATCH_KEY", key)
+    return key
+
+
+def _prepare_current_source_inputs(config: Any, count: int, storage: Path) -> Any:
+    """Admit the original design before running a bounded candidate fixture."""
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    return generation.cases.input_generation.generate_input_cases(config, count, storage_root=storage)
 
 
 def test_license_capacity_classifier_is_strong_and_conservative() -> None:
@@ -166,7 +202,7 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     execution_path = config_path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["temporary_license_retry"]["in_allocation_retry"] = {
+    execution["runtime"]["license_wait"]["in_allocation_retry"] = {
         "enabled": True,
         "maximum_window_seconds": 17.0,
         "pause_after_capacity_failure_seconds": 3.0,
@@ -178,7 +214,7 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
     )
     evidence = license_service.classify_temporary_license_capacity(_OBSERVED_CAPACITY_TEXT)
     assert evidence is not None
-    started_at = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    started_at = datetime(2026, 1, 2, tzinfo=UTC)
     summaries = tuple(
         license_service.InAllocationLicenseCheckoutSummary(
             checkout_index=index,
@@ -195,8 +231,8 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
     result = license_service.in_allocation_license_window_result(
         config,
         1,
-        campaign_run_id="window-receipt__0123456789abcdef",
-        job_id="1201",
+        campaign_run_id="source~transient_drying~window-receipt__0123456789abcdef",
+        dispatch_key="1201-4",
         hostname="test-host",
         window_started_at=started_at,
         window_ended_at=started_at + timedelta(seconds=17),
@@ -217,10 +253,10 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
         config,
         1,
         campaign_run_id=result.campaign_run_id,
-        job_id="1201",
+        dispatch_key="1201-4",
         storage_root=tmp_path / "storage",
     )
-    assert receipt_path.name == "1201.json"
+    assert receipt_path.name == "1201-4.json"
     assert receipt is not None
     assert receipt["controller_retry_increment"] is True
     assert receipt["checkout_attempt_count"] == 10
@@ -230,11 +266,42 @@ def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
     assert [summary["checkout_index"] for summary in receipt["recent_checkout_summaries"]] == list(range(3, 11))
     assert all(summary["duration_seconds"] == 1.0 for summary in receipt["recent_checkout_summaries"])
     assert receipt_path.stat().st_size < 20_000
+    assert receipt["dispatch_key"] == "1201-4"
     with pytest.raises(FileExistsError, match="already exists"):
         license_service.record_in_allocation_license_window(
             config,
             1,
             result,
+            storage_root=tmp_path / "storage",
+        )
+
+    sibling_path = license_service.record_in_allocation_license_window(
+        config,
+        1,
+        replace(result, dispatch_key="1201-5"),
+        storage_root=tmp_path / "storage",
+    )
+    assert sibling_path.parent == receipt_path.parent
+    assert sibling_path.name == "1201-5.json"
+    # A writer killed during publication leaves only an owned atomic temporary, which readers skip; nothing else is tolerated.
+    (receipt_path.parent / ".1201-6.json.abc123.tmp").write_text("{", encoding="utf-8")
+    assert not any(path.name.endswith(".tmp") and not path.name.startswith(".1201-6") for path in receipt_path.parent.iterdir())
+    for key in ("1201-4", "1201-5"):
+        loaded = license_service.load_in_allocation_license_window(
+            config,
+            1,
+            campaign_run_id=result.campaign_run_id,
+            dispatch_key=key,
+            storage_root=tmp_path / "storage",
+        )
+        assert loaded is not None
+        assert loaded["dispatch_key"] == key
+    with pytest.raises(ValueError, match="dispatch key"):
+        license_service.load_in_allocation_license_window(
+            config,
+            1,
+            campaign_run_id=result.campaign_run_id,
+            dispatch_key="1201",
             storage_root=tmp_path / "storage",
         )
 
@@ -271,15 +338,15 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     )
     assert artifact is not None
     assert classification is not None
-    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
     ended_at = started_at + timedelta(seconds=1)
 
     with pytest.raises(ValueError, match="must be timezone-aware"):
         license_service.record_in_allocation_status_artifact_recovery(
             config,
             1,
-            campaign_run_id="status-recovery__0123456789abcdef",
-            job_id="633014",
+            campaign_run_id="source~transient_drying~status-recovery__0123456789abcdef",
+            dispatch_key="633014-2",
             checkout_started_at=started_at.replace(tzinfo=None),
             checkout_ended_at=ended_at,
             hostname="synthetic-node",
@@ -292,8 +359,8 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     receipt_path = license_service.record_in_allocation_status_artifact_recovery(
         config,
         1,
-        campaign_run_id="status-recovery__0123456789abcdef",
-        job_id="633014",
+        campaign_run_id="source~transient_drying~status-recovery__0123456789abcdef",
+        dispatch_key="633014-2",
         checkout_started_at=started_at,
         checkout_ended_at=ended_at,
         hostname="synthetic-node",
@@ -312,8 +379,8 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     license_service.record_in_allocation_status_artifact_recovery(
         config,
         1,
-        campaign_run_id="status-recovery__0123456789abcdef",
-        job_id="633014",
+        campaign_run_id="source~transient_drying~status-recovery__0123456789abcdef",
+        dispatch_key="633014-2",
         checkout_started_at=started_at,
         checkout_ended_at=ended_at,
         hostname="synthetic-node",
@@ -325,12 +392,13 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     records = license_service.load_in_allocation_status_artifact_recoveries(
         config,
         1,
-        campaign_run_id="status-recovery__0123456789abcdef",
-        job_id="633014",
+        campaign_run_id="source~transient_drying~status-recovery__0123456789abcdef",
+        dispatch_key="633014-2",
         storage_root=tmp_path / "storage",
     )
     assert not status_path.exists()
     assert len(records) == 1
+    assert records[0]["dispatch_key"] == "633014-2"
     assert records[0]["cleanup_state"] == "complete"
     assert records[0]["checkout_index"] == 3
     assert records[0]["solver_progress_started"] is False
@@ -377,13 +445,13 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    run_id = "concurrent_status_recovery__0123456789abcdef"
-    job_id = "638283"
+    run_id = "source~transient_drying~concurrent_status_recovery__0123456789abcdef"
+    dispatch_key = "638283-1"
     artifact, classification = _status_recovery_artifact(
         tmp_path / "status-work",
         checkout_index=3,
     )
-    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
     ended_at = started_at + timedelta(seconds=1)
     staged: Queue[Path] = Queue()
     releases: Queue[None] = Queue()
@@ -397,7 +465,7 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
     monkeypatch.setattr(common.serialization, "_fsync_file", gated_fsync)
     publication = {
         "campaign_run_id": run_id,
-        "job_id": job_id,
+        "dispatch_key": dispatch_key,
         "checkout_started_at": started_at,
         "checkout_ended_at": ended_at,
         "hostname": "synthetic-node",
@@ -408,9 +476,9 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
     expected = (
         license_service.in_allocation_status_recovery_directory(
             run_id,
-            config.batch_id,
+            config.batch_storage_name,
             config.case_id(1),
-            job_id,
+            dispatch_key,
             storage_root=storage,
         )
         / "checkout_0003.json"
@@ -434,7 +502,7 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
                     config,
                     1,
                     campaign_run_id=run_id,
-                    job_id=job_id,
+                    dispatch_key=dispatch_key,
                     storage_root=storage,
                 )
                 == ()
@@ -447,7 +515,7 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
             config,
             1,
             campaign_run_id=run_id,
-            job_id=job_id,
+            dispatch_key=dispatch_key,
             storage_root=storage,
         )
         assert [record["cleanup_state"] for record in pending_records] == ["pending"]
@@ -468,7 +536,7 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
                 config,
                 1,
                 campaign_run_id=run_id,
-                job_id=job_id,
+                dispatch_key=dispatch_key,
                 storage_root=storage,
             )
             assert [record["cleanup_state"] for record in during_completion] == ["pending"]
@@ -480,7 +548,7 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
         config,
         1,
         campaign_run_id=run_id,
-        job_id=job_id,
+        dispatch_key=dispatch_key,
         storage_root=storage,
     )
     assert [record["cleanup_state"] for record in complete_records] == ["complete"]
@@ -509,18 +577,18 @@ def test_status_recovery_directory_remains_fail_closed(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    run_id = f"fail_closed_{mutation}__0123456789abcdef"
-    job_id = "638284"
+    run_id = f"source~transient_drying~fail_closed_{mutation}__0123456789abcdef"
+    dispatch_key = "638284-1"
     artifact, classification = _status_recovery_artifact(
         tmp_path / "status-work",
         checkout_index=3,
     )
-    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
     receipt = license_service.record_in_allocation_status_artifact_recovery(
         config,
         1,
         campaign_run_id=run_id,
-        job_id=job_id,
+        dispatch_key=dispatch_key,
         checkout_started_at=started_at,
         checkout_ended_at=started_at + timedelta(seconds=1),
         hostname="synthetic-node",
@@ -550,7 +618,7 @@ def test_status_recovery_directory_remains_fail_closed(
             config,
             1,
             campaign_run_id=run_id,
-            job_id=job_id,
+            dispatch_key=dispatch_key,
             storage_root=storage,
         )
 
@@ -570,19 +638,19 @@ def test_concurrent_status_recovery_directories_remain_independent(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    run_id = "parallel_status_recovery__0123456789abcdef"
-    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc)
+    run_id = "source~transient_drying~parallel_status_recovery__0123456789abcdef"
+    started_at = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
     classification = license_service.classify_temporary_license_capacity(
         _OBSERVED_CAPACITY_TEXT,
     )
     assert classification is not None
     publications: list[tuple[int, str, Any]] = []
-    for case_index, job_id in ((1, "638285"), (2, "638286")):
+    for case_index, dispatch_key in ((1, "638285-1"), (2, "638286-2")):
         artifact, _classification = _status_recovery_artifact(
             tmp_path / f"status-work-{case_index}",
             checkout_index=1,
         )
-        publications.append((case_index, job_id, artifact))
+        publications.append((case_index, dispatch_key, artifact))
 
     staged: Queue[Path] = Queue()
     releases: Queue[None] = Queue()
@@ -601,7 +669,7 @@ def test_concurrent_status_recovery_directories_remain_independent(
                 config,
                 case_index,
                 campaign_run_id=run_id,
-                job_id=job_id,
+                dispatch_key=dispatch_key,
                 checkout_started_at=started_at,
                 checkout_ended_at=started_at + timedelta(seconds=1),
                 hostname=f"synthetic-node-{case_index}",
@@ -610,29 +678,29 @@ def test_concurrent_status_recovery_directories_remain_independent(
                 cleanup_state="pending",
                 storage_root=storage,
             )
-            for case_index, job_id, artifact in publications
+            for case_index, dispatch_key, artifact in publications
         ]
         try:
             temporary_paths = {staged.get(timeout=10.0), staged.get(timeout=10.0)}
             expected_destinations = {
                 license_service.in_allocation_status_recovery_directory(
                     run_id,
-                    config.batch_id,
+                    config.batch_storage_name,
                     config.case_id(case_index),
-                    job_id,
+                    dispatch_key,
                     storage_root=storage,
                 )
                 / "checkout_0001.json"
-                for case_index, job_id, _artifact in publications
+                for case_index, dispatch_key, _artifact in publications
             }
             assert {common.serialization.atomic_write_temporary_destination(path) for path in temporary_paths} == expected_destinations
-            for case_index, job_id, _artifact in publications:
+            for case_index, dispatch_key, _artifact in publications:
                 assert (
                     license_service.load_in_allocation_status_artifact_recoveries(
                         config,
                         case_index,
                         campaign_run_id=run_id,
-                        job_id=job_id,
+                        dispatch_key=dispatch_key,
                         storage_root=storage,
                     )
                     == ()
@@ -642,17 +710,17 @@ def test_concurrent_status_recovery_directories_remain_independent(
             releases.put(None)
         assert {future.result(timeout=10.0) for future in futures} == expected_destinations
 
-    for case_index, job_id, _artifact in publications:
+    for case_index, dispatch_key, _artifact in publications:
         records = license_service.load_in_allocation_status_artifact_recoveries(
             config,
             case_index,
             campaign_run_id=run_id,
-            job_id=job_id,
+            dispatch_key=dispatch_key,
             storage_root=storage,
         )
         assert len(records) == 1
         assert records[0]["case_id"] == config.case_id(case_index)
-        assert records[0]["slurm_job_id"] == job_id
+        assert records[0]["dispatch_key"] == dispatch_key
 
 
 def test_temporary_license_wait_loader_admits_atomic_update(
@@ -667,9 +735,9 @@ def test_temporary_license_wait_loader_admits_atomic_update(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    run_id = "concurrent_license_wait__0123456789abcdef"
+    run_id = "source~transient_drying~concurrent_license_wait__0123456789abcdef"
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "638287")
+    _dispatch_environment(monkeypatch, "638287", 1)
     staged: Queue[Path] = Queue()
     releases: Queue[None] = Queue()
     original_fsync = common.serialization._fsync_file
@@ -693,11 +761,11 @@ def test_temporary_license_wait_loader_admits_atomic_update(
             expected = (
                 license_service.temporary_license_wait_directory(
                     run_id,
-                    config.batch_id,
+                    config.batch_storage_name,
                     config.case_id(1),
                     storage_root=storage,
                 )
-                / "license_wait.json"
+                / "wait.json"
             )
             assert temporary_path.is_file()
             assert common.serialization.atomic_write_temporary_destination(temporary_path) == expected
@@ -721,7 +789,7 @@ def test_temporary_license_wait_loader_admits_atomic_update(
         storage_root=storage,
     )
     assert wait is not None
-    assert wait["latest_job_id"] == "638287"
+    assert wait["latest_dispatch_key"] == "638287-1"
     assert wait["retry_count"] == 1
 
 
@@ -794,14 +862,10 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     )
     storage = tmp_path / "storage"
     work = tmp_path / "work"
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        1,
-        storage_root=storage,
-    )
-    run_id = "license-retry__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "701")
+    _dispatch_environment(monkeypatch, "701", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
     monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Error")
 
@@ -829,9 +893,9 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         storage_root=storage,
     )
     assert wait is not None
-    retry_policy = config.execution_values["runtime"]["temporary_license_retry"]
-    assert wait["latest_job_id"] == "701"
-    assert wait["recent_job_ids"] == ["701"]
+    retry_policy = config.execution_values["runtime"]["license_wait"]
+    assert wait["latest_dispatch_key"] == "701-1"
+    assert wait["recent_dispatch_keys"] == ["701-1"]
     assert wait["retry_count"] == 1
     assert wait["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
     assert wait["retry_budget_remaining"] is True
@@ -848,7 +912,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         config,
         1,
         campaign_run_id=run_id,
-        job_id="701",
+        dispatch_key="701-1",
         storage_root=storage,
     )
     assert window is not None
@@ -863,7 +927,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         config,
         1,
         campaign_run_id=run_id,
-        job_id="701",
+        dispatch_key="701-1",
         storage_root=storage,
     )
     assert status_recoveries
@@ -871,19 +935,11 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     assert all(record["cleanup_state"] == "complete" for record in status_recoveries)
     assert not (blocked.processed_directory / "_SUCCESS").exists()
     assert not (blocked.processed_directory / "case.h5").exists()
-    assert (
-        attempt_service.latest_case_attempt(
-            config,
-            1,
-            run_id,
-            storage_root=storage,
-        )
-        is None
-    )
+    assert attempt_service.latest_case_attempt(config, 1, storage_root=storage) is None
 
     monkeypatch.delenv("FAKE_COMSOL_MODE")
     monkeypatch.delenv("FAKE_COMSOL_CAPACITY_STATUS_STATE")
-    monkeypatch.setenv("SLURM_JOB_ID", "702")
+    _dispatch_environment(monkeypatch, "702", 2)
     outcome = generation.runtime.run_case(
         config,
         1,
@@ -893,17 +949,9 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         work_root=work,
     )
     assert outcome.status == "completed"
-    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    timing = json.loads((outcome.processed_directory / "evidence" / "timing.json").read_text(encoding="utf-8"))
     assert timing["license_wait_seconds"] == retry_policy["initial_delay_seconds"]
-    assert (
-        attempt_service.latest_case_attempt(
-            config,
-            1,
-            run_id,
-            storage_root=storage,
-        )
-        is None
-    )
+    assert attempt_service.latest_case_attempt(config, 1, storage_root=storage) is None
     assert generation.runtime.completed_case_is_valid(
         config,
         1,
@@ -940,10 +988,10 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
-    run_id = "silent-deadline__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "703")
+    _dispatch_environment(monkeypatch, "703", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "silent_startup")
 
     blocked = generation.runtime.run_case(
@@ -958,7 +1006,7 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
     assert blocked.status == "license_blocked"
     assert blocked.message == "in_allocation_license_window_exhausted"
     assert not generation.runtime.case_failure_is_recorded(config, 1, storage_root=storage)
-    assert attempt_service.latest_case_attempt(config, 1, run_id, storage_root=storage) is None
+    assert attempt_service.latest_case_attempt(config, 1, storage_root=storage) is None
     assert not generation.runtime.completed_case_is_valid(config, 1, storage_root=storage)
     wait = license_service.load_temporary_license_wait(
         config,
@@ -975,7 +1023,7 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
         config,
         1,
         campaign_run_id=run_id,
-        job_id="703",
+        dispatch_key="703-1",
         storage_root=storage,
     )
     assert window is not None
@@ -1016,10 +1064,10 @@ def test_cancellation_between_capacity_checkouts_remains_cancelled(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
-    run_id = "cancelled-checkout__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "705")
+    _dispatch_environment(monkeypatch, "705", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
     pauses: list[float] = []
     real_sleep = batch_runtime.time.sleep
@@ -1056,7 +1104,7 @@ def test_cancellation_between_capacity_checkouts_remains_cancelled(
         )
         is None
     )
-    attempt = attempt_service.latest_case_attempt(config, 1, run_id, storage_root=storage)
+    attempt = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
     assert attempt is not None
     assert attempt.payload["case_state"] == "cancelled"
 
@@ -1079,10 +1127,10 @@ def test_unowned_sigterm_remains_a_genuine_solver_failure(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
-    run_id = "external-term__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "704")
+    _dispatch_environment(monkeypatch, "704", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "external_sigterm")
 
     with pytest.raises(generation.runtime.CaseExecutionError) as caught:
@@ -1127,10 +1175,10 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
-    run_id = "license-acquired__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "711")
+    _dispatch_environment(monkeypatch, "711", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity_twice_then_success")
     monkeypatch.setenv("FAKE_COMSOL_CAPACITY_STATUS_STATE", "Error")
     monkeypatch.setenv("FAKE_COMSOL_DELAY", "0.5")
@@ -1149,7 +1197,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
         config,
         1,
         campaign_run_id=run_id,
-        job_id="711",
+        dispatch_key="711-1",
         storage_root=storage,
     )
     assert receipt is not None
@@ -1162,7 +1210,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
         config,
         1,
         campaign_run_id=run_id,
-        job_id="711",
+        dispatch_key="711-1",
         storage_root=storage,
     )
     assert [record["checkout_index"] for record in status_recoveries] == [1, 2]
@@ -1176,7 +1224,7 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
         )
         is None
     )
-    timing = json.loads((outcome.processed_directory / "timing.json").read_text(encoding="utf-8"))
+    timing = json.loads((outcome.processed_directory / "evidence" / "timing.json").read_text(encoding="utf-8"))
     assert timing["in_allocation_checkout_attempt_count"] == 3
     assert timing["status_artifact_recovery_count"] == 2
     assert timing["in_allocation_capacity_pause_seconds"] == pytest.approx(0.02)
@@ -1196,7 +1244,7 @@ def test_two_workers_search_for_capacity_without_a_global_launch_gate(
         executable=fake_comsol,
         scheduler_kind="slurm",
         natural_count=2,
-        in_allocation_maximum_window_seconds=0.35,
+        in_allocation_maximum_window_seconds=0.6,
         in_allocation_pause_after_capacity_failure_seconds=0.01,
     )
     config = generation.cases.config.load_generation_config(
@@ -1204,7 +1252,7 @@ def test_two_workers_search_for_capacity_without_a_global_launch_gate(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(config, 2, storage_root=storage)
+    _prepare_current_source_inputs(config, 2, storage)
     prepared = tuple(
         generation.runtime.prepare_case_work_directory(
             config,
@@ -1241,7 +1289,15 @@ def test_two_workers_search_for_capacity_without_a_global_launch_gate(
     assert tracker_payload["maximum"] == 2
     assert tracker_payload["active"] == 0
     assert tracker_payload["starts"] >= 4
-    assert not any(generation.runtime.case_failure_is_recorded(config, case_index, storage_root=storage) for case_index in (1, 2))
+    assert not any(
+        generation.runtime.case_failure_is_recorded(
+            config,
+            case_index,
+            storage_root=storage,
+            execution_run_id=_source_run_id(config),
+        )
+        for case_index in (1, 2)
+    )
     for item in prepared:
         generation.runtime.workspace.cleanup_case_workspace(
             item.work_directory,
@@ -1263,20 +1319,17 @@ def test_valid_success_overrides_an_earlier_license_warning(
     config_path, _template = generation_config_factory(
         executable=fake_comsol,
         scheduler_kind="slurm",
+        in_allocation_maximum_window_seconds=2.0,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        1,
-        storage_root=storage,
-    )
-    run_id = "license-warning__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "751")
+    _dispatch_environment(monkeypatch, "751", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "success_with_license_warning")
 
     outcome = generation.runtime.run_case(
@@ -1318,15 +1371,15 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
         config_path,
         only_batch="transient_drying__lentil__natural",
     )
-    policy = config.execution_values["runtime"]["temporary_license_retry"]
-    run_id = "license-budget__0123456789abcdef"
+    policy = config.execution_values["runtime"]["license_wait"]
+    run_id = _source_run_id(config)
     storage = tmp_path / "storage"
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
     error = _capacity_error(tmp_path)
-    next_job = 801
+    submission_index = 1
     observed: list[dict[str, Any]] = []
     for _retry in range(100):
-        monkeypatch.setenv("SLURM_JOB_ID", str(next_job))
+        _dispatch_environment(monkeypatch, "801", submission_index)
         license_service.record_temporary_license_wait(
             config,
             1,
@@ -1343,7 +1396,7 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
         observed.append(dict(wait))
         if not wait["retry_budget_remaining"]:
             break
-        next_job += 1
+        submission_index += 1
     else:
         pytest.fail("Synthetic retry policy did not exhaust within 100 attempts")
 
@@ -1353,15 +1406,60 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     assert observed[-1]["cumulative_wait_seconds"] == policy["maximum_wait_seconds"]
     assert observed[-1]["retry_budget_remaining"] is False
     assert observed[-1]["next_retry_at"] is None
-    latest = license_service.latest_wait_for_job(
+    assert wait["recent_dispatch_keys"][-1] == f"801-{submission_index}"
+    latest = license_service.latest_wait_for_dispatch(
         config,
         1,
         campaign_run_id=run_id,
-        job_id=wait["latest_job_id"],
+        dispatch_key=wait["latest_dispatch_key"],
         storage_root=storage,
     )
     assert latest is not None
     assert latest["first_blocked_at"] == observed[0]["first_blocked_at"]
+    assert (
+        license_service.latest_wait_for_dispatch(
+            config,
+            1,
+            campaign_run_id=run_id,
+            dispatch_key="801-1",
+            storage_root=storage,
+        )
+        is None
+    )
+
+
+def test_wait_uniqueness_is_per_dispatch_key_within_one_allocation(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept two dispatches of one allocation, but never the same dispatch twice."""
+    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config = generation.cases.config.load_generation_config(
+        config_path,
+        only_batch="transient_drying__lentil__natural",
+    )
+    run_id = _source_run_id(config)
+    storage = tmp_path / "storage"
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    error = _capacity_error(tmp_path)
+
+    _dispatch_environment(monkeypatch, "900", 4, step_id="2")
+    license_service.record_temporary_license_wait(config, 1, error, storage_root=storage)
+    _dispatch_environment(monkeypatch, "900", 7, step_id="3")
+    license_service.record_temporary_license_wait(config, 1, error, storage_root=storage)
+
+    wait = license_service.load_temporary_license_wait(config, 1, campaign_run_id=run_id, storage_root=storage)
+    assert wait is not None
+    assert wait["retry_count"] == 2
+    assert wait["recent_dispatch_keys"] == ["900-4", "900-7"]
+    assert wait["latest_dispatch_key"] == "900-7"
+    with pytest.raises(FileExistsError, match="900-7"):
+        license_service.record_temporary_license_wait(config, 1, error, storage_root=storage)
+
+    monkeypatch.delenv("GENERATION_CAMPAIGN_RUN_ID")
+    with pytest.raises(ValueError, match="campaign_run_id"):
+        license_service.record_temporary_license_wait(config, 1, error, storage_root=storage)
 
 
 @pytest.mark.integration
@@ -1381,14 +1479,10 @@ def test_license_retry_cleanup_failure_becomes_terminal(
         only_batch="transient_drying__lentil__natural",
     )
     storage = tmp_path / "storage"
-    generation.cases.input_generation.generate_input_cases(
-        config,
-        1,
-        storage_root=storage,
-    )
-    run_id = "license-cleanup__0123456789abcdef"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    monkeypatch.setenv("SLURM_JOB_ID", "991")
+    _dispatch_environment(monkeypatch, "991", 1)
     monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
 
     def fail_cleanup(*_args: Any, **_kwargs: Any) -> int:

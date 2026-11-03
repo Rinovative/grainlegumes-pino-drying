@@ -1,14 +1,11 @@
-# ruff: noqa: EM101, EM102, TRY003
-"""
-generation_runtime_timing.py
-
-Load validated runtime and physical-duration evidence from completed cases.
+"""Load validated runtime and physical-duration evidence from completed cases.
 
 Responsibilities:
   - Read hash-admitted timing and status sidecars from completed-case evidence
   - Bind runtime values to the admitted case and batch identities
   - Preserve physical duration, target attainment, and censoring separately from runtime
   - Expose persisted solver timing and explicit component availability without parsing logs
+  - Expose when a case first reached the stall rule's minimum simulated time, with absence kept explicit
 
 Design principles:
   - Completed-case evidence remains the sole authority for artifact admission
@@ -28,6 +25,8 @@ import math
 from dataclasses import dataclass
 from numbers import Real
 from typing import TYPE_CHECKING, Any, Protocol
+
+from src import common
 
 from . import generation_runtime_comsol_timing as comsol_timing
 
@@ -95,6 +94,8 @@ class CaseTimingEvidence:
     stationary_airflow_solver_seconds: float | None
     transient_drying_solver_seconds: float | None
     scientific_solver_seconds: float | None
+    stall_minimum_simulated_seconds: float | None
+    stall_minimum_reached_after_seconds: float | None
     queue_wait_seconds: None
     generation_compute_end_to_end_seconds: None
     comsol_solver_timing: comsol_timing.ComsolSolverTiming | None
@@ -123,6 +124,8 @@ class CaseTimingEvidence:
             "stationary_airflow_solver_seconds": self.stationary_airflow_solver_seconds,
             "transient_drying_solver_seconds": self.transient_drying_solver_seconds,
             "scientific_solver_seconds": self.scientific_solver_seconds,
+            "stall_minimum_simulated_seconds": self.stall_minimum_simulated_seconds,
+            "stall_minimum_reached_after_seconds": self.stall_minimum_reached_after_seconds,
             "queue_wait_seconds": None,
             "generation_compute_end_to_end_seconds": None,
             "comsol_solver_timing": None if self.comsol_solver_timing is None else self.comsol_solver_timing.as_dict(),
@@ -136,26 +139,31 @@ def _load_artifact_payload(case: TerminalCaseEvidence, relative_path: str) -> di
     try:
         payload = json.loads(artifact.path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"Admitted {relative_path} for case {case.case_id!r} is not a readable JSON object.") from error
+        msg = f"Admitted {relative_path} for case {case.case_id!r} is not a readable JSON object."
+        raise RuntimeError(msg) from error
     if not isinstance(payload, dict):
-        raise TypeError(f"Admitted {relative_path} for case {case.case_id!r} must contain one JSON object.")
+        msg = f"Admitted {relative_path} for case {case.case_id!r} must contain one JSON object."
+        raise TypeError(msg)
     return payload
 
 
 def _finite_non_negative(value: Any, *, label: str) -> float:
     """Require one finite non-negative real scalar."""
     if isinstance(value, bool) or not isinstance(value, Real):
-        raise TypeError(f"{label} must be a real scalar.")
+        msg = f"{label} must be a real scalar."
+        raise TypeError(msg)
     result = float(value)
     if not math.isfinite(result) or result < 0.0:
-        raise ValueError(f"{label} must be finite and non-negative.")
+        msg = f"{label} must be finite and non-negative."
+        raise ValueError(msg)
     return result
 
 
 def _require_unit(units: Any, *, field: str, expected: str) -> None:
     """Require one exact persisted unit."""
     if not isinstance(units, dict) or units.get(field) != expected:
-        raise ValueError(f"Case status must declare {field!r} in {expected!r}.")
+        msg = f"Case status must declare {field!r} in {expected!r}."
+        raise ValueError(msg)
 
 
 def _target_limit(batch: _CompletedTimingBatch) -> tuple[float | None, str]:
@@ -170,11 +178,14 @@ def _target_limit(batch: _CompletedTimingBatch) -> tuple[float | None, str]:
 def _validate_batch_binding(case: TerminalCaseEvidence, batch: _CompletedTimingBatch) -> None:
     """Require the case to be one of the exact admitted batch members."""
     if batch.case(case.case_id) != case:
-        raise ValueError(f"Case {case.case_id!r} is not the supplied batch's admitted case object.")
+        msg = f"Case {case.case_id!r} is not the supplied batch's admitted case object."
+        raise ValueError(msg)
     if case.hdf5_identity.simulation_profile != batch.simulation_profile:
-        raise ValueError(f"Case {case.case_id!r} profile disagrees with admitted batch evidence.")
+        msg = f"Case {case.case_id!r} profile disagrees with admitted batch evidence."
+        raise ValueError(msg)
     if case.hdf5_identity.git_commit not in {None, batch.git_commit}:
-        raise ValueError(f"Case {case.case_id!r} HDF5 commit disagrees with admitted batch evidence.")
+        msg = f"Case {case.case_id!r} HDF5 commit disagrees with admitted batch evidence."
+        raise ValueError(msg)
 
 
 def _physical_status(
@@ -182,18 +193,22 @@ def _physical_status(
 ) -> tuple[float | None, float | None, bool | None, bool | None, float | None, str, float]:
     """Validate physical-duration values while keeping non-transient evidence explicit."""
     if status.get("solver_success") is not True or status.get("case_state") != "successful":
-        raise ValueError("Completed case status does not represent a successful solver outcome.")
+        msg = "Completed case status does not represent a successful solver outcome."
+        raise ValueError(msg)
     stages = status.get("stages")
     if not isinstance(stages, dict) or any(stages.get(stage) != "succeeded" for stage in ("solver", "exports", "conversion", "publication")):
-        raise ValueError("Completed case status lacks successful terminal stages.")
+        msg = "Completed case status lacks successful terminal stages."
+        raise ValueError(msg)
     if status.get("contains_nan_or_inf") is not False or status.get("field_shape_valid") is not True:
-        raise ValueError("Completed case status does not admit finite validated output fields.")
+        msg = "Completed case status does not admit finite validated output fields."
+        raise ValueError(msg)
     units = status.get("units")
     _require_unit(units, field="runtime_s", expected="s")
     status_runtime = _finite_non_negative(status.get("runtime_s"), label="case status runtime_s")
     if simulation_profile != "transient_drying":
         if any(status.get(field) is not None for field in ("t_stop_exact", "f_wet_dm_final", "target_reached")):
-            raise ValueError("Non-transient case status unexpectedly persists transient physical-duration values.")
+            msg = "Non-transient case status unexpectedly persists transient physical-duration values."
+            raise ValueError(msg)
         return None, None, None, None, None, _UNAVAILABLE_NOT_APPLICABLE, status_runtime
     _require_unit(units, field="t_stop_exact", expected="h")
     _require_unit(units, field="f_wet_dm_final", expected="1")
@@ -201,8 +216,33 @@ def _physical_status(
     final_wet = _finite_non_negative(status.get("f_wet_dm_final"), label="case status f_wet_dm_final")
     target_reached = status.get("target_reached")
     if not isinstance(target_reached, bool):
-        raise TypeError("Transient case status target_reached must be boolean.")
+        msg = "Transient case status target_reached must be boolean."
+        raise TypeError(msg)
     return duration, duration if target_reached else None, target_reached, not target_reached, final_wet, "available", status_runtime
+
+
+def _stall_progress(timing: dict[str, Any]) -> tuple[float | None, float | None, str]:
+    """Validate the persisted stall-rule progress record and keep its absence explicit."""
+    if "stall_progress" not in timing:
+        return None, None, _UNAVAILABLE_NOT_PERSISTED
+    record = timing["stall_progress"]
+    if record is None:
+        return None, None, _UNAVAILABLE_NOT_APPLICABLE
+    if not isinstance(record, dict):
+        msg = "Case timing stall_progress must be null or one JSON object."
+        raise TypeError(msg)
+    if set(record) != {"minimum_simulated_seconds", "reached_after_seconds"}:
+        msg = "Case timing stall_progress must contain exactly minimum_simulated_seconds and reached_after_seconds."
+        raise ValueError(msg)
+    minimum = _finite_non_negative(record["minimum_simulated_seconds"], label="case timing stall_progress minimum_simulated_seconds")
+    if minimum <= 0.0:
+        msg = "Case timing stall_progress minimum_simulated_seconds must be positive."
+        raise ValueError(msg)
+    reached_value = record["reached_after_seconds"]
+    if reached_value is None:
+        return minimum, None, _UNAVAILABLE_MISSING
+    reached = _finite_non_negative(reached_value, label="case timing stall_progress reached_after_seconds")
+    return minimum, reached, _AVAILABLE
 
 
 def _phase_availability(status: comsol_timing.PhaseStatus) -> str:
@@ -234,10 +274,11 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
 
     """
     _validate_batch_binding(case, batch)
-    timing = _load_artifact_payload(case, "timing.json")
-    status = _load_artifact_payload(case, "status.json")
+    timing = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/timing.json")
+    status = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/status.json")
     if timing.get("schema_kind") != _TIMING_SCHEMA_KIND or timing.get("schema_version") != _SCHEMA_VERSION:
-        raise ValueError("Case timing does not use the current simulation_case_timing schema.")
+        msg = "Case timing does not use the current simulation_case_timing schema."
+        raise ValueError(msg)
     expected = {
         "batch_id": batch.batch_id,
         "case_id": case.case_id,
@@ -247,17 +288,21 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         "git_commit": batch.git_commit,
     }
     if any(timing.get(field) != value for field, value in expected.items()):
-        raise ValueError("Case timing identity disagrees with admitted completed-case or batch evidence.")
+        msg = "Case timing identity disagrees with admitted completed-case or batch evidence."
+        raise ValueError(msg)
     if timing.get("exit_code") != 0 or timing.get("timed_out") is not False:
-        raise ValueError("Case timing does not represent a successful completed COMSOL process.")
+        msg = "Case timing does not represent a successful completed COMSOL process."
+        raise ValueError(msg)
     if status.get("schema_kind") != _STATUS_SCHEMA_KIND or status.get("schema_version") != _SCHEMA_VERSION:
-        raise ValueError("Case status does not use the current simulation_case_status schema.")
+        msg = "Case status does not use the current simulation_case_status schema."
+        raise ValueError(msg)
     physical_duration, time_to_target, target_reached, right_censored, final_wet, physical_availability, status_runtime = _physical_status(
         status, simulation_profile=batch.simulation_profile
     )
     target_limit, target_limit_availability = _target_limit(batch)
     if target_limit is not None and final_wet is not None and target_reached is not None and target_reached != (final_wet <= target_limit):
-        raise ValueError("Case status target_reached disagrees with the admitted wet-fraction limit.")
+        msg = "Case status target_reached disagrees with the admitted wet-fraction limit."
+        raise ValueError(msg)
     values = {
         "comsol_process_seconds": _finite_non_negative(timing.get("comsol_process_seconds"), label="case timing comsol_process_seconds"),
         "runtime_seconds": _finite_non_negative(timing.get("runtime_s"), label="case timing runtime_s"),
@@ -266,11 +311,14 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         "licence_wait_seconds": _finite_non_negative(timing.get("license_wait_seconds"), label="case timing license_wait_seconds"),
     }
     if not math.isclose(values["comsol_process_seconds"], values["runtime_seconds"], rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("Case timing COMSOL process and runtime values disagree.")
+        msg = "Case timing COMSOL process and runtime values disagree."
+        raise ValueError(msg)
     if not math.isclose(status_runtime, values["runtime_seconds"], rel_tol=0.0, abs_tol=1e-12):
-        raise ValueError("Case status and timing runtime values disagree.")
+        msg = "Case status and timing runtime values disagree."
+        raise ValueError(msg)
     if values["complete_execution_seconds"] < values["comsol_process_seconds"]:
-        raise ValueError("Case complete execution time cannot be shorter than COMSOL process time.")
+        msg = "Case complete execution time cannot be shorter than COMSOL process time."
+        raise ValueError(msg)
     solver_timing = comsol_timing.admit_persisted_solver_timing(
         timing,
         simulation_profile=batch.simulation_profile,
@@ -300,8 +348,10 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
             ("transient_drying_solver_seconds", _phase_availability(solver_timing.transient_drying.status)),
             ("scientific_solver_seconds", scientific_availability),
         )
+    stall_minimum, stall_reached_after, stall_availability = _stall_progress(timing)
     components = (
         *solver_components,
+        ("stall_progress", stall_availability),
         ("queue_wait_seconds", _UNAVAILABLE_NOT_PERSISTED),
         ("generation_compute_end_to_end_seconds", _UNAVAILABLE_NOT_PERSISTED),
     )
@@ -321,6 +371,8 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         stationary_airflow_solver_seconds=stationary_seconds,
         transient_drying_solver_seconds=transient_seconds,
         scientific_solver_seconds=scientific_seconds,
+        stall_minimum_simulated_seconds=stall_minimum,
+        stall_minimum_reached_after_seconds=stall_reached_after,
         queue_wait_seconds=None,
         generation_compute_end_to_end_seconds=None,
         comsol_solver_timing=solver_timing,

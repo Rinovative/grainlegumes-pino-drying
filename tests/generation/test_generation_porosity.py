@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Fixed Kozeny-Carman coupling and bounded packing-scatter invariants."""
+"""Fixed Kozeny-Carman coupling and bounded packing-scatter invariants.
+
+Responsibilities:
+  - Check invalid support rejection and bounded packing-scatter quantiles
+
+Design principles:
+  - One uniform draw preserves mirrored truncated-scatter coupling
+
+This module does NOT:
+  - Fit packing distributions or solve permeability fields
+"""
 
 from __future__ import annotations
 
@@ -21,7 +30,7 @@ def test_empty_or_invalid_supports_fail_closed() -> None:
         porosity.resolve_porosity_coupling(
             material_family="empty",
             material_kappa_nominal=permeability(0.52),
-            eps_bed_cal_ref=0.52,
+            eps_bed_ref=0.52,
             authored_permeability_support={
                 "lower": permeability(0.50),
                 "upper": permeability(0.55),
@@ -35,7 +44,7 @@ def test_empty_or_invalid_supports_fail_closed() -> None:
         porosity.resolve_porosity_coupling(
             material_family="bad_tail",
             material_kappa_nominal=1.0e-8,
-            eps_bed_cal_ref=0.42,
+            eps_bed_ref=0.42,
             authored_permeability_support={
                 "lower": permeability(0.40),
                 "upper": permeability(0.46),
@@ -58,7 +67,7 @@ def test_empty_or_invalid_supports_fail_closed() -> None:
         porosity.resolve_porosity_coupling(
             material_family="outside_guard",
             material_kappa_nominal=1.0e-8,
-            eps_bed_cal_ref=0.42,
+            eps_bed_ref=0.42,
             authored_permeability_support={
                 "lower": permeability(0.40),
                 "upper": permeability(0.46),

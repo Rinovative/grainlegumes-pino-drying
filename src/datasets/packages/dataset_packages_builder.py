@@ -1,47 +1,44 @@
-"""
-dataset_packages_builder.py
-
-Build immutable dual-view Dataset packages from terminal simulation evidence.
+"""Publish immutable Dataset selections from exact admitted source cases.
 
 Responsibilities:
-  - Assemble content-bound steady payloads and transient indexes
-  - Compute package identities and publish exact payloads atomically
-  - Reuse valid packages and recover incomplete same-identity publications
+  - Build steady tensor payloads or transient trajectory indexes from prepared plans
+  - Bind content-derived Dataset identities to complete source provenance
+  - Publish or reuse exact immutable payload and manifest pairs under writer locks
+  - Keep identical content from being published under a second name
 
 Design principles:
-  - Package identity is independent of operational source locations
-  - One combined parameter-OOD package owns compact group and parameter indexes
-  - Valid conflicting identities fail closed without replacement
+  - Source admission and compatibility remain owned by package planning
+  - Immutable publication rejects conflicting content instead of overwriting it
+  - Publication completes only after payload and manifest evidence agree
+  - The shared identity registry binds a content digest to its one Dataset directory
 
 This module does NOT:
-  - Provide the supported Dataset package CLI
-  - Inspect or smoke-load published runtime Dataset objects
+  - Assign Train, validation, test or OOD membership
+  - Fit preprocessing or generate new physical Source cases
+  - Register reconstruction output, which lies outside canonical storage
 """
 
 from __future__ import annotations
 
-import copy
+import contextlib
 import json
 import shutil
 import tempfile
-import uuid
-from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import torch
 
-from src import common, domain, generation
+from src import common, domain
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
-from src.generation import generation_campaign_completion as campaign_completion
-from src.generation.contracts import generation_contracts_source as source_service
 
 from . import dataset_packages_generated_batch as generated
 from . import dataset_packages_manifest as package_manifest
 from . import dataset_packages_planning as planning
-from . import dataset_packages_references as references
+from . import dataset_packages_reproduction as reproduction
+from . import dataset_packages_selection as selection
 from . import dataset_packages_trajectory as trajectory
 
 if TYPE_CHECKING:
@@ -49,11 +46,10 @@ if TYPE_CHECKING:
 
 DATASET_PACKAGE_SCHEMA_KIND: Final = package_manifest.DATASET_PACKAGE_SCHEMA_KIND
 DATASET_PACKAGE_SCHEMA_VERSION: Final = package_manifest.DATASET_PACKAGE_SCHEMA_VERSION
-_TRANSIENT_PROFILE_CONTRACT: Final = generation.contracts.get_profile_contract("transient_drying")
+_REGISTRY_KIND: Final = "dataset"
 
 
 def _channel_contract(dataset_view: str) -> dict[str, Any]:
-    """Return one authoritative physical-unit tensor contract for the manifest."""
     if dataset_view == "transient_drying":
         return transient_contract.transient_contract_payload()
     task = domain.tasks.registry.get_task("steady_flow")
@@ -64,756 +60,330 @@ def _channel_contract(dataset_view: str) -> dict[str, Any]:
     }
 
 
-def _case_indexes(
+def _provenance(
     prepared: planning.PreparedPackage,
-) -> tuple[list[str], dict[str, list[str]], dict[str, list[str]], list[str]]:
-    """Build compact included, OOD-group, and OOD-parameter case indexes."""
-    included = [str(candidate["package_case_id"]) for candidate in prepared.candidates]
-    groups: dict[str, list[str]] = defaultdict(list)
-    parameters: dict[str, list[str]] = defaultdict(list)
-    relevant: set[str] = set()
-    for candidate in prepared.candidates:
-        case_id = str(candidate["package_case_id"])
-        evidence = candidate.get("ood_evidence")
-        if isinstance(evidence, dict):
-            group = evidence.get("group")
-            if isinstance(group, str):
-                groups[group].append(case_id)
-        for parameter in candidate.get("task_relevant_ood_parameters", []):
-            name = str(parameter)
-            parameters[name].append(case_id)
-            relevant.add(name)
-    return (
-        included,
-        dict(sorted(groups.items())),
-        dict(sorted(parameters.items())),
-        sorted(relevant),
-    )
-
-
-def _schema_identity(dataset_view: str) -> dict[str, int | str]:
-    """Return view-specific payload schema identity in the package-v1 envelope."""
-    if dataset_view == "transient_drying":
-        payload_schema_version = trajectory.TRANSIENT_INDEX_SCHEMA_VERSION
-    elif dataset_view == "steady_flow":
-        payload_schema_version = identity.TRAINING_DATASET_SCHEMA_VERSION
-    else:
-        message = f"Unsupported Dataset view {dataset_view!r}."
-        raise ValueError(message)
-    return {
-        "package": DATASET_PACKAGE_SCHEMA_VERSION,
-        "case_hdf5": storage_schema_version(),
-        "generation_case": generation.cases.case.CASE_CONTRACT_DIGEST,
-        "transient_index": payload_schema_version,
-    }
-
-
-def _package_provenance(
-    campaign: generation.cases.config.CampaignConfig,
-    prepared: planning.PreparedPackage,
+    *,
+    storage_root: Path | str | None = None,
+    producer_evidence: Mapping[str, Any] | None = None,
+    case_partition: Mapping[str, Any] | None = None,
+    partition_spec: Mapping[str, Any] | None = None,
+    plan_invocation: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Return complete portable provenance before dataset identity binding."""
-    plan = prepared.plan
-    view = views.get_view(str(plan["dataset_view"]))
-    included, group_indexes, parameter_indexes, relevant_parameters = _case_indexes(prepared)
-    profiles_found = sorted({str(record["simulation_profile"]) for record in prepared.batch_records})
-    template_digests = sorted({str(record["template"]["sha256"]) for record in prepared.batch_records})
-    airflow = sorted({str(record["airflow_source"]) for record in prepared.batch_records})
-    operation_digests = sorted({str(record["operation_config_digest"]) for record in prepared.batch_records})
-    git_commits: set[str] = set()
-    for record in prepared.batch_records:
-        record_commits = record.get("git_commits")
-        if isinstance(record_commits, list):
-            git_commits.update(str(value) for value in record_commits)
-        else:
-            git_commits.add(str(record["git_commit"]))
-    git_commits.update(
-        str(candidate["source_git_commit"]) for candidate in prepared.candidates if isinstance(candidate.get("source_git_commit"), str)
-    )
-    sorted_git_commits = sorted(git_commits)
-    case_membership = {str(candidate["package_case_id"]): str(candidate["dataset_membership"]) for candidate in prepared.candidates}
-    material_by_batch_name = {batch.batch_name: batch.material_family for batch in campaign.batches}
-    material_counts: dict[str, int] = defaultdict(int)
-    profile_counts: dict[str, int] = defaultdict(int)
-    for candidate in prepared.candidates:
-        material_counts[str(candidate["material_family"])] += 1
-        profile_counts[str(candidate["simulation_profile"])] += 1
+    request = prepared.request
+    view = views.get_view(request["dataset_view"])
+    materials = list(dict.fromkeys(case["source"]["material_family"] for case in prepared.source_case_identities))
+    from src.datasets.contracts import dataset_contracts_partition as partition_contract  # noqa: PLC0415
+
+    case_ids = [entry["package_case_id"] for entry in prepared.source_case_identities]
+    material_by_case = {entry["package_case_id"]: entry["source"]["material_family"] for entry in prepared.source_case_identities}
+    if partition_spec is not None:
+        if case_partition is not None:
+            msg = "Supply a partition recipe or fixed membership, never both."
+            raise ValueError(msg)
+        case_partition = partition_contract.build_fixed_partition(case_ids, material_by_case=material_by_case, **dict(partition_spec))
+    if case_partition is not None:
+        case_partition = partition_contract.validate_fixed_partition(case_partition, case_ids=case_ids, material_by_case=material_by_case)
     return {
         "schema_kind": DATASET_PACKAGE_SCHEMA_KIND,
         "schema_version": DATASET_PACKAGE_SCHEMA_VERSION,
-        "dataset_name": plan["dataset_name"],
+        "dataset_name": request["dataset_name"],
         "dataset_view": view.id,
         "registered_task_id": view.registered_task_id,
-        "evaluation_regime": plan["evaluation_regime"],
-        "materials": list(plan["materials"]),
+        "source_task": request["source_task"],
+        "materials": materials,
         "channel_contract": _channel_contract(view.id),
         "channel_contract_digest": view.contract_digest,
-        "source_simulation_profiles": profiles_found,
-        "source_batches": prepared.batch_records,
-        "source_batch_ids": [record["batch_id"] for record in prepared.batch_records],
-        "source_template_digests": template_digests,
-        "source_git_commits": sorted_git_commits,
-        "source_case_identities": [
-            {
-                "package_case_id": candidate["package_case_id"],
-                "batch_id": candidate["batch_id"],
-                "source_case_id": candidate["case_id"],
-                "source_relative_path": candidate["case_hdf5_relative"],
-                "case_input_id": candidate["case_input_id"],
-                "simulation_case_id": candidate["simulation_case_id"],
-                "case_hdf5_sha256": candidate["case_hdf5_sha256"],
-                "material_family": candidate["material_family"],
-                "material_role": candidate["case_payload"]["material_role"],
-                "evaluation_regime": candidate["case_payload"]["evaluation_regime"],
-                "natural_support_state": candidate["case_payload"]["natural_support_state"],
-                "simulation_profile": candidate["simulation_profile"],
-                "membership": candidate["dataset_membership"],
-                "ood_group": candidate.get("ood_evidence", {}).get("group"),
-                "ood_parameters": candidate.get("ood_evidence", {}).get("selected_units", []),
-                "task_relevant_ood_parameters": candidate.get("task_relevant_ood_parameters", []),
-                "ood_evidence": copy.deepcopy(candidate.get("ood_evidence", {})),
-                **(
-                    {
-                        "composite_source_kind": candidate["composite_source_kind"],
-                        "source_run_id": candidate["source_run_id"],
-                        "source_git_commit": candidate["source_git_commit"],
-                        "source_campaign_manifest_sha256": candidate["source_campaign_manifest_sha256"],
-                        "completion_receipt_sha256": candidate["completion_receipt_sha256"],
-                    }
-                    if candidate.get("completion_receipt_sha256") is not None
-                    else {}
-                ),
-            }
-            for candidate in prepared.candidates
-        ],
-        "included_source_cases": included,
-        "excluded_source_cases": prepared.excluded,
-        "source_selection_decisions": prepared.source_decisions,
-        "matched_case_input_ids": sorted(
-            str(candidate["case_input_id"]) for candidate in prepared.candidates if candidate["simulation_profile"] == _TRANSIENT_PROFILE_CONTRACT.id
-        ),
-        "airflow_provenance": airflow if view.id == "steady_flow" else [],
-        "steady_flow_conditioning": prepared.steady_conditioning,
-        "material_file_identities": {
-            material_by_batch_name[str(record["batch_name"])]: record["material_config_digest"] for record in prepared.batch_records
+        "selection": request["selection"],
+        "case_partition": case_partition,
+        "plan_invocation": plan_invocation,
+        "grid": prepared.grid,
+        "source_case_identities": list(prepared.source_case_identities),
+        "source_outcomes": list(prepared.source_outcomes),
+        "builder_identity": {
+            **identity.dataset_conversion_contract_identity(view.id),
+            "implementation_sha256": reproduction.conversion_implementation_sha256(view.id),
         },
-        "operation_config_digests": operation_digests,
-        "campaign_name": campaign.campaign_name,
-        "campaign_id": campaign.campaign_id,
-        "campaign_digest": campaign.campaign_digest,
-        "campaign_purpose": campaign.campaign_purpose,
-        "material_roles": {name: list(values) for name, values in campaign.material_roles.items()},
-        "evaluation_regimes": list(campaign.evaluation_regimes),
-        "material_memberships": {name: list(values) for name, values in campaign.material_memberships.items()},
-        "source_role": plan["source_role"],
-        "training_eligible": bool(plan["split_eligibility"]["train"]),
-        "duplicate_case_input_policy": campaign.duplicate_case_input_policy,
-        "case_membership": case_membership,
-        "split_membership": copy.deepcopy(prepared.membership),
-        "membership_counts": {name: len(case_ids) for name, case_ids in prepared.membership.items()},
-        "available_ood_groups": sorted(group_indexes),
-        "ood_group_indexes": group_indexes,
-        "ood_parameter_indexes": parameter_indexes,
-        "task_relevant_ood_parameters": relevant_parameters,
-        "material_counts": dict(sorted(material_counts.items())),
-        "source_profile_counts": dict(sorted(profile_counts.items())),
-        "candidate_source_case_count": len(prepared.candidates) + len(prepared.excluded),
-        "builder_identity": identity.dataset_conversion_contract_identity(view.id),
-        "schema_identity": _schema_identity(view.id),
+        "producer_evidence": dict(producer_evidence)
+        if producer_evidence is not None
+        else reproduction.capture_producer_evidence(storage_root=storage_root),
     }
 
 
-def admit_package_composite_sources(
-    dataset_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> planning.PreparedPackage | None:
-    """Re-admit one published package through its immutable completion composite."""
-    storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    manifest = package_manifest.load_package_manifest(dataset_id, storage_root=storage)
-    source_identities = manifest.get("source_case_identities")
-    if not isinstance(source_identities, list) or not source_identities:
-        message = f"Dataset package {dataset_id!r} has no source-case identities."
-        raise ValueError(message)
-    if not all(isinstance(source, dict) for source in source_identities):
-        message = f"Dataset package {dataset_id!r} has malformed source-case identities."
-        raise TypeError(message)
-    receipt_values = [source.get("completion_receipt_sha256") for source in source_identities]
-    if all(value is None for value in receipt_values):
-        return None
-    if not all(isinstance(value, str) and value for value in receipt_values) or len(set(receipt_values)) != 1:
-        message = f"Dataset package {dataset_id!r} does not bind one completion receipt."
-        raise ValueError(message)
-    parent_run_ids = {str(source["source_run_id"]) for source in source_identities if source.get("composite_source_kind") == "parent_partial"}
-    if len(parent_run_ids) != 1:
-        message = f"Dataset package {dataset_id!r} does not identify one composite parent run."
-        raise ValueError(message)
-    parent_run_id = next(iter(parent_run_ids))
-    partial_path = (
-        generation.publication.campaign_evidence.campaign_run_directory(
-            parent_run_id,
-            storage_root=storage,
-        )
-        / "campaign_partial.json"
-    )
-    parent_partial_sha256 = common.serialization.file_sha256(partial_path)
-    completion_id = campaign_completion.completion_id(
-        parent_run_id=parent_run_id,
-        parent_partial_sha256=parent_partial_sha256,
-    )
-    receipt = generation.publication.completion_composite.load_composite_receipt(
-        completion_id,
-        storage_root=storage,
-    )
-    receipt_sha256 = common.serialization.canonical_json_sha256(receipt)
-    if receipt_sha256 != receipt_values[0]:
-        message = f"Dataset package {dataset_id!r} conflicts with its completion receipt."
-        raise RuntimeError(message)
-    generation.workflow.validate_composite_completion_lifecycle(
-        parent_run_id,
-        completion_id,
-        storage_root=storage,
-    )
-    campaign = generation.publication.campaign_evidence.campaign_for_run(
-        parent_run_id,
-        storage_root=storage,
-    )
-    dataset_view = str(manifest["dataset_view"])
-    evaluation_regime = str(manifest["evaluation_regime"])
-    requested_plan = planning.package_plan(campaign, dataset_view, evaluation_regime)
-    selected_plans = [requested_plan]
-    if evaluation_regime != "id":
-        selected_plans.insert(0, planning.package_plan(campaign, dataset_view, "id"))
-    prepared = planning.prepare_campaign_packages(
-        campaign,
-        storage_root=storage,
-        selected_plans=selected_plans,
-        composite_receipt=receipt,
-    )
-    matches = [
-        package for package in prepared if package.plan["dataset_view"] == dataset_view and package.plan["evaluation_regime"] == evaluation_regime
-    ]
-    if len(matches) != 1:
-        message = f"Composite package admission is ambiguous for {dataset_view!r}/{evaluation_regime!r}."
-        raise RuntimeError(message)
-    admitted = matches[0]
-    provenance = _package_provenance(campaign, admitted)
-    if provenance["source_case_identities"] != source_identities:
-        message = f"Dataset package {dataset_id!r} conflicts with re-admitted composite source evidence."
-        raise RuntimeError(message)
-    admitted_id, admitted_digest = identity.package_identity_from_provenance(provenance)
-    if admitted_id != dataset_id or admitted_digest != manifest.get("dataset_digest"):
-        message = f"Dataset package {dataset_id!r} is not reproduced by its admitted composite evidence."
-        raise RuntimeError(message)
-    return admitted
-
-
-def storage_schema_version() -> int:
-    """Return the canonical source-case HDF5 schema identity."""
-    return generation.publication.storage.HDF5_SCHEMA_VERSION
-
-
-def _aggregate_generated_identity(
-    campaign: generation.cases.config.CampaignConfig,
-    prepared: planning.PreparedPackage,
-) -> dict[str, Any]:
-    """Build the steady payload's compatibility identity from exact source provenance."""
-    profiles_found = {str(record["simulation_profile"]) for record in prepared.batch_records}
-    conditioning_profiles = set(prepared.steady_conditioning.get("source_profiles", [])) if isinstance(prepared.steady_conditioning, dict) else set()
-    if not profiles_found or conditioning_profiles != profiles_found:
-        message = "Steady aggregate sources are not bound to one complete compatible conditioning audit."
-        raise ValueError(message)
-    representatives = [record for record in prepared.batch_records if record["simulation_profile"] == campaign.profile.id]
-    representative_pool = representatives or prepared.batch_records
-    first = min(
-        representative_pool,
-        key=lambda record: (str(record["simulation_profile"]), str(record["batch_id"])),
-    )
-    cases = [
-        {
-            "case_id": candidate["package_case_id"],
-            "material_family": candidate["material_family"],
-            "case_input_id": candidate["record"]["case_input_id"],
-            "simulation_case_id": candidate["record"]["simulation_case_id"],
-            "case_hdf5_sha256": candidate["record"]["case_hdf5_sha256"],
-            "success_sha256": candidate["record"]["success_sha256"],
-            "provenance_sha256": candidate["record"]["provenance_sha256"],
-        }
-        for candidate in prepared.candidates
-    ]
-    return identity.build_generated_package_identity(
-        dataset_name=str(prepared.plan["dataset_name"]),
-        simulation_profile=str(first["simulation_profile"]),
-        campaign_digest=campaign.campaign_digest,
-        template=first["template"],
-        export_contract_sha256=str(first["export_contract_sha256"]),
-        available_learning_views=first["available_learning_views"],
-        airflow_source=str(first["airflow_source"]),
-        cases=cases,
-    )
-
-
 def _build_steady_payload(
-    campaign: generation.cases.config.CampaignConfig,
     prepared: planning.PreparedPackage,
     *,
     dataset_id: str,
     provenance: Mapping[str, Any],
     destination: Path,
-) -> None:
-    """Build one eager steady tensor payload from admitted canonical HDF5 views."""
+) -> dict[str, int]:
     task = domain.tasks.registry.get_task("steady_flow")
-    source_identities: list[dict[str, Any]] = []
-    source_metadata: list[dict[str, Any]] = []
-    fingerprints: list[str] = []
     inputs: list[torch.Tensor] = []
     outputs: list[torch.Tensor] = []
-    for candidate in prepared.candidates:
-        _shape, case_inputs, case_outputs, metadata, source, _fingerprint = generated.interpret_generated_case(
-            candidate["terminal_evidence"],
-            candidate["case_evidence"],
+    metadata: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
+    fingerprints: list[str] = []
+    sample_ids: list[str] = []
+    for admitted, entry in zip(prepared.cases, prepared.source_case_identities, strict=True):
+        if common.serialization.file_sha256(admitted.hdf5_path) != entry["source"]["case_hdf5_sha256"]:
+            msg = "Source HDF5 changed after Dataset admission."
+            raise ValueError(msg)
+        package_case_id = entry["package_case_id"]
+        _shape, case_inputs, case_outputs, case_metadata, source, fingerprint = generated.interpret_admitted_source_case(
+            admitted,
+            package_case_id=package_case_id,
             task=task,
         )
-        metadata.update(
-            {
-                "dataset_id": dataset_id,
-                "evaluation_regime": prepared.plan["evaluation_regime"],
-                "dataset_membership": candidate["dataset_membership"],
-                "source_batch_id": candidate["batch_id"],
-                "source_case_id": candidate["case_id"],
-                "source_simulation_profile": candidate["simulation_profile"],
-                "source_hdf5_sha256": candidate["case_hdf5_sha256"],
-                "task_relevant_ood_parameters": candidate.get("task_relevant_ood_parameters", []),
-            }
-        )
-        source.update(
-            {
-                "source_batch_id": candidate["batch_id"],
-                "source_case_id": candidate["case_id"],
-                "case_id": candidate["package_case_id"],
-            }
-        )
-        fingerprint = identity.compute_case_fingerprint(
-            task=task,
-            case_id=candidate["package_case_id"],
-            source_identity=source,
-            source_metadata=metadata,
-            inputs=case_inputs,
-            outputs=case_outputs,
-        )
-        source_identities.append(source)
-        source_metadata.append(metadata)
-        fingerprints.append(fingerprint)
+        sample_ids.append(package_case_id)
         inputs.append(case_inputs)
         outputs.append(case_outputs)
+        metadata.append(case_metadata)
+        sources.append(source)
+        fingerprints.append(fingerprint)
+    selection_identity = {
+        "schema_kind": "dataset_source_selection",
+        "schema_version": 1,
+        "source_cases": list(prepared.source_case_identities),
+    }
     payload = identity.build_training_dataset_payload(
         task=task,
         dataset_id=dataset_id,
-        sample_ids=[candidate["package_case_id"] for candidate in prepared.candidates],
-        generated_batch_identity=_aggregate_generated_identity(campaign, prepared),
-        source_identities=source_identities,
-        source_metadata=source_metadata,
+        sample_ids=sample_ids,
+        source_selection_identity=selection_identity,
+        source_identities=sources,
+        source_metadata=metadata,
         source_provenance=provenance,
         case_fingerprints=fingerprints,
         inputs=torch.stack(inputs),
         outputs=torch.stack(outputs),
     )
     common.serialization.atomic_torch_save(payload, destination)
+    return {"sample_count": len(sample_ids), "transition_count": 0}
 
 
 def _transient_sources(prepared: planning.PreparedPackage) -> tuple[trajectory.TransientSourceCase, ...]:
-    """Convert admitted candidates into typed transient index sources."""
-    sources: list[trajectory.TransientSourceCase] = []
-    for candidate in prepared.candidates:
-        case = candidate["case_evidence"]
-        artifact = case.artifact_evidence("processed", "case.h5")
-        if artifact.sha256 != case.case_hdf5_sha256:
-            message = f"Admitted transient HDF5 evidence disagrees for {case.case_id!r}."
-            raise RuntimeError(message)
-        sources.append(
-            trajectory.TransientSourceCase(
-                path=artifact.path,
-                package_case_id=str(candidate["package_case_id"]),
-                source_batch_id=str(candidate["batch_id"]),
-                membership=str(candidate["dataset_membership"]),
-                evaluation_regime=str(prepared.plan["evaluation_regime"]),
-                expected_sha256=artifact.sha256,
-                expected_case_input_id=case.case_input_id,
-                expected_simulation_case_id=case.simulation_case_id,
-                material_family=case.material_family,
-                ood_group=(str(candidate["ood_evidence"]["group"]) if candidate.get("ood_evidence", {}).get("group") is not None else None),
-                ood_parameters=tuple(str(name) for name in candidate.get("task_relevant_ood_parameters", [])),
-                ood_evidence=copy.deepcopy(candidate.get("ood_evidence", {})),
-            )
+    return tuple(
+        trajectory.TransientSourceCase(
+            path=admitted.hdf5_path,
+            package_case_id=entry["package_case_id"],
+            source_batch_id=entry["source"]["source_batch_id"],
+            expected_sha256=entry["source"]["case_hdf5_sha256"],
+            expected_case_input_id=entry["source"]["case_input_id"],
+            expected_simulation_case_id=entry["source"]["simulation_case_id"],
+            material_family=entry["source"]["material_family"],
         )
-    return tuple(sources)
-
-
-def _remove_stale_publication_attempts(state_root: Path, dataset_id: str) -> None:
-    """Remove only inactive attempt paths for one locked Dataset identity."""
-    if not state_root.exists():
-        return
-    prefix = f".{dataset_id}."
-    suffixes = (".tmp", ".payload.backup", ".metadata.backup")
-    for path in state_root.iterdir():
-        if not path.name.startswith(prefix) or not path.name.endswith(suffixes):
-            continue
-        if path.is_symlink() or not path.is_dir():
-            path.unlink()
-        else:
-            shutil.rmtree(path)
-
-
-def _admit_existing_package(
-    *,
-    dataset_id: str,
-    destination_dir: Path,
-    metadata_dir: Path,
-    destination: Path,
-    manifest_path: Path,
-    requested_prefix: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Return an exact existing package or classify it as recoverable."""
-    for directory, label in (
-        (destination_dir, "payload"),
-        (metadata_dir, "metadata"),
-    ):
-        if directory.exists() and (directory.is_symlink() or not directory.is_dir()):
-            message = f"Existing Dataset package {label} destination is unsafe: {directory}."
-            raise FileExistsError(message)
-    for artifact, label in (
-        (destination, "payload"),
-        (manifest_path, "manifest"),
-    ):
-        if artifact.exists() and (artifact.is_symlink() or not artifact.is_file()):
-            message = f"Existing Dataset package {label} is unsafe: {artifact}."
-            raise FileExistsError(message)
-    if not manifest_path.is_file():
-        return None
-    try:
-        candidate_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(candidate_manifest, dict):
-        return None
-    conflicting = any(key in candidate_manifest and candidate_manifest[key] != value for key, value in requested_prefix.items())
-    if conflicting:
-        message = f"Existing package content conflicts with {dataset_id!r}."
-        raise FileExistsError(message)
-    if not destination.is_file():
-        return None
-    try:
-        return package_manifest.validate_manifest_content(
-            candidate_manifest,
-            dataset_id=dataset_id,
-            payload_path=destination,
-        )
-    except (FileNotFoundError, TypeError, ValueError):
-        return None
-
-
-def _require_matching_published_manifest(
-    dataset_id: str,
-    published_manifest: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None,
-) -> dict[str, Any]:
-    """Load the published manifest and require the staged content identity."""
-    admitted_manifest = package_manifest.load_package_manifest_evidence(
-        dataset_id,
-        storage_root=storage_root,
+        for admitted, entry in zip(prepared.cases, prepared.source_case_identities, strict=True)
     )
-    if admitted_manifest != published_manifest:
-        message = f"Published package manifest changed during admission: {dataset_id!r}."
-        raise RuntimeError(message)
-    return admitted_manifest
 
 
-def _replace_package_publication(
-    *,
-    dataset_id: str,
-    destination_dir: Path,
-    metadata_dir: Path,
-    staged_payload_dir: Path,
-    staged_metadata_dir: Path,
-    payload_backup: Path,
-    metadata_backup: Path,
-    published_manifest: Mapping[str, Any],
-    storage_root: Path | str | None,
-) -> dict[str, Any]:
-    """Replace recoverable same-identity state with rollback on interruption."""
-    published_payload = False
-    published_metadata = False
-    source_service.validate_admitted_source_before_publication()
-    try:
-        if destination_dir.exists():
-            destination_dir.replace(payload_backup)
-        if metadata_dir.exists():
-            metadata_dir.replace(metadata_backup)
-        staged_payload_dir.replace(destination_dir)
-        published_payload = True
-        staged_metadata_dir.replace(metadata_dir)
-        published_metadata = True
-        admitted_manifest = _require_matching_published_manifest(
-            dataset_id,
-            published_manifest,
-            storage_root=storage_root,
-        )
-    except BaseException:
-        if published_metadata and metadata_dir.exists():
-            shutil.rmtree(metadata_dir)
-        if published_payload and destination_dir.exists():
-            shutil.rmtree(destination_dir)
-        if metadata_backup.exists() and not metadata_dir.exists():
-            metadata_backup.replace(metadata_dir)
-        if payload_backup.exists() and not destination_dir.exists():
-            payload_backup.replace(destination_dir)
-        raise
-    if metadata_backup.exists():
-        shutil.rmtree(metadata_backup)
-    if payload_backup.exists():
-        shutil.rmtree(payload_backup)
-    return admitted_manifest
+def _dataset_registry(storage_root: Path | str | None) -> common.identity_registry.IdentityRegistry:
+    """Scope the identity registry to the Dataset area of a storage root."""
+    return common.identity_registry.IdentityRegistry(common.paths.get_datasets_root(storage_root=storage_root), {_REGISTRY_KIND})
+
+
+def _identical_content_error(registry: common.identity_registry.IdentityRegistry) -> Callable[[Path, Path], FileExistsError]:
+    """Build the refusal for identical content that already lives under another Dataset name."""
+
+    def conflict(existing: Path, _requested: Path) -> FileExistsError:
+        return FileExistsError(f"Identical Dataset content already exists as {existing.relative_to(registry.root).as_posix()}; use that name.")
+
+    return conflict
 
 
 def _publish(
     *,
+    task: str,
     dataset_id: str,
-    payload_filename: str,
-    manifest_prefix: Mapping[str, Any],
+    prefix: Mapping[str, Any],
     build_payload: Callable[[Path], Mapping[str, int]],
+    selection_request: Mapping[str, Any],
     storage_root: Path | str | None,
+    validate_ranked_claim: bool = True,
+    verify_producer: Callable[[], None] | None = None,
+    expected_payload_sha256: str | None = None,
+    output_directory: Path | None = None,
 ) -> tuple[Path, Path, bool, dict[str, Any]]:
-    """Atomically publish, integrity-reuse, or recover one locked immutable package."""
-    payload_root = common.paths.get_dataset_packages_root(storage_root=storage_root)
-    metadata_root = common.paths.get_dataset_metadata_root(storage_root=storage_root)
-    destination_dir = payload_root / dataset_id
-    metadata_dir = metadata_root / dataset_id
-    destination = destination_dir / payload_filename
-    manifest_path = metadata_dir / "dataset_manifest.json"
-    lock_path = common.paths.resolve_dataset_build_lock_path(dataset_id, storage_root=storage_root)
-    requested_prefix = dict(manifest_prefix)
-    with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        existing_manifest = _admit_existing_package(
-            dataset_id=dataset_id,
-            destination_dir=destination_dir,
-            metadata_dir=metadata_dir,
-            destination=destination,
-            manifest_path=manifest_path,
-            requested_prefix=requested_prefix,
-        )
+    """Publish once under a lock; incomplete or conflicting identities fail closed."""
+    registry = _dataset_registry(storage_root) if output_directory is None else None
+    content_digest = identity.package_content_digest(prefix)
+    if output_directory is None:
+        payload_dir = common.paths.resolve_dataset_dir(task, dataset_id, dataset_root=common.paths.get_datasets_root(storage_root=storage_root))
         state_root = common.paths.get_dataset_state_root(storage_root=storage_root)
-        if existing_manifest is not None:
-            _remove_stale_publication_attempts(state_root, dataset_id)
-            return destination, manifest_path, True, existing_manifest
+        lock = common.paths.resolve_dataset_build_lock_path(task, dataset_id, storage_root=storage_root)
+    else:
+        payload_dir = Path(output_directory).absolute()
+        dependency_root = common.paths.get_storage_root(storage_root=storage_root).resolve()
+        source_root = common.paths.get_project_root().resolve()
+        if (
+            payload_dir.is_symlink()
+            or payload_dir.exists()
+            or payload_dir.resolve().is_relative_to(dependency_root)
+            or payload_dir.resolve().is_relative_to(source_root)
+        ):
+            message = "Reconstruction output must be a new directory outside producing source and dependency storage."
+            raise ValueError(message)
+        state_root = payload_dir.parent
+        lock = payload_dir.parent / f".{payload_dir.name}.dataset-build.lock"
 
+    payload_filename = common.paths.get_dataset_payload_filename(task)
+    payload_path = payload_dir / payload_filename
+    manifest_path = payload_dir / common.paths.DATASET_MANIFEST_FILENAME
+    with common.locking.exclusive_file_lock(lock, blocking=False):
+        if payload_dir.exists() or payload_dir.is_symlink():
+            if output_directory is not None:
+                message = "Reconstruction output appeared before acquiring its build lock."
+                raise FileExistsError(message)
+            if not payload_dir.is_dir() or payload_dir.is_symlink():
+                msg = "Dataset publication is incomplete or unsafe; inspect it without automatic repair."
+                raise FileExistsError(msg)
+            existing = package_manifest.load_package_manifest(task, dataset_id, storage_root=storage_root)
+            if identity.package_semantic_identity_payload(existing) != identity.package_semantic_identity_payload(prefix):
+                msg = "Dataset name already binds different immutable content; pass --revision <label> for a deliberately separate Dataset."
+                raise FileExistsError(msg)
+            if validate_ranked_claim and selection_request["selection"] != existing["selection"]:
+                selection.validate_ranked_publication_claim(selection_request, storage_root=storage_root)
+            if registry is not None:
+                registry.ensure_bound(content_digest, payload_dir, kind=_REGISTRY_KIND, conflict=_identical_content_error(registry))
+            return payload_path, manifest_path, True, existing
+        if verify_producer is not None:
+            verify_producer()
+        if validate_ranked_claim:
+            selection.validate_ranked_publication_claim(selection_request, storage_root=storage_root)
+        if registry is not None:
+            registry.ensure_available(content_digest, payload_dir, conflict=_identical_content_error(registry))
         state_root.mkdir(parents=True, exist_ok=True)
-        attempt = uuid.uuid4().hex
-        staging = Path(tempfile.mkdtemp(prefix=f".{dataset_id}.", suffix=".tmp", dir=state_root))
-        staged_payload_dir = staging / "payload"
-        staged_metadata_dir = staging / "metadata"
-        staged_payload_dir.mkdir()
-        staged_metadata_dir.mkdir()
-        payload_backup = state_root / f".{dataset_id}.{attempt}.payload.backup"
-        metadata_backup = state_root / f".{dataset_id}.{attempt}.metadata.backup"
+        staging = Path(tempfile.mkdtemp(prefix=f".{common.paths.dataset_state_key(task, dataset_id)}.", suffix=".tmp", dir=state_root))
         try:
+            staged_payload_dir = staging / "payload"
+            staged_payload_dir.mkdir()
             staged_payload = staged_payload_dir / payload_filename
-            payload_metadata = dict(build_payload(staged_payload))
-            if set(payload_metadata) != {"sample_count", "transition_count"}:
-                message = "Dataset payload builder returned invalid manifest metadata."
-                raise RuntimeError(message)
-            published_manifest = {
-                **requested_prefix,
-                **payload_metadata,
-                "payload_sha256": common.serialization.file_sha256(staged_payload),
-            }
-            package_manifest.validate_manifest_content(
-                published_manifest,
-                dataset_id=dataset_id,
-                payload_path=staged_payload,
-                validate_payload_hash=False,
+            counts = dict(build_payload(staged_payload))
+            if set(counts) != {"sample_count", "transition_count"}:
+                msg = "Dataset representation returned invalid count metadata."
+                raise RuntimeError(msg)
+            manifest = {**prefix, **counts, "payload_sha256": common.serialization.file_sha256(staged_payload)}
+            if expected_payload_sha256 is not None and manifest["payload_sha256"] != expected_payload_sha256:
+                failed = staging.with_name(staging.name.removesuffix(".tmp") + ".rebuild-mismatch")
+                common.serialization.atomic_write_json(staged_payload_dir / common.paths.DATASET_MANIFEST_FILENAME, manifest)
+                staging.rename(failed)
+                message = f"Rebuilt payload bytes differ from the producing manifest; unpublished evidence retained at {failed}."
+                raise ValueError(message)
+            package_manifest.validate_manifest_content(manifest, task=task, dataset_id=dataset_id, payload_path=staged_payload)
+            common.serialization.atomic_write_json(staged_payload_dir / common.paths.DATASET_MANIFEST_FILENAME, manifest)
+            if verify_producer is not None:
+                verify_producer()
+            payload_dir.parent.mkdir(parents=True, exist_ok=True)
+            binding = (
+                contextlib.nullcontext()
+                if registry is None
+                else registry.reserve(content_digest, payload_dir, kind=_REGISTRY_KIND, conflict=_identical_content_error(registry))
             )
-            common.serialization.atomic_write_json(
-                staged_metadata_dir / "dataset_manifest.json",
-                published_manifest,
-            )
-            destination_dir.parent.mkdir(parents=True, exist_ok=True)
-            metadata_dir.parent.mkdir(parents=True, exist_ok=True)
-            admitted_manifest = _replace_package_publication(
-                dataset_id=dataset_id,
-                destination_dir=destination_dir,
-                metadata_dir=metadata_dir,
-                staged_payload_dir=staged_payload_dir,
-                staged_metadata_dir=staged_metadata_dir,
-                payload_backup=payload_backup,
-                metadata_backup=metadata_backup,
-                published_manifest=published_manifest,
-                storage_root=storage_root,
-            )
+            with binding:
+                if payload_dir.exists() or payload_dir.is_symlink():
+                    msg = "Dataset publication appeared while holding its build lock."
+                    raise FileExistsError(msg)
+                staged_payload_dir.rename(payload_dir)
+                admitted = (
+                    package_manifest.load_package_manifest(task, dataset_id, storage_root=storage_root)
+                    if output_directory is None
+                    else package_manifest.validate_manifest_content(
+                        json.loads(manifest_path.read_text()),
+                        task=task,
+                        dataset_id=dataset_id,
+                        payload_path=payload_path,
+                    )
+                )
+                if admitted != manifest:
+                    msg = "Dataset publication no longer matches staged immutable evidence."
+                    raise RuntimeError(msg)
+            return payload_path, manifest_path, False, admitted
         finally:
             shutil.rmtree(staging, ignore_errors=True)
-        _remove_stale_publication_attempts(state_root, dataset_id)
-        return destination, manifest_path, False, admitted_manifest
 
 
-def _logical_reference_name(dataset_name: str, dataset_view: str) -> str:
-    """Derive one concise task-local logical name from the canonical package name."""
-    prefix = f"{dataset_view}__"
-    if not dataset_name.startswith(prefix):
-        message = f"Dataset package name {dataset_name!r} is not owned by view {dataset_view!r}."
-        raise ValueError(message)
-    logical_name = dataset_name[len(prefix) :].replace("__", "_")
-    return references.DatasetRef(logical_name, 0).name
-
-
-def _publish_prepared(
-    campaign: generation.cases.config.CampaignConfig,
-    prepared: planning.PreparedPackage,
+def build_dataset_selection(
+    request: Mapping[str, Any],
     *,
-    storage_root: Path | str | None,
+    storage_root: Path | str | None = None,
+    reproduction_manifest: Mapping[str, Any] | None = None,
+    output_directory: Path | None = None,
+    partition_spec: Mapping[str, Any] | None = None,
+    plan_invocation: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build or exactly reuse one fully prepared package payload."""
-    provenance = _package_provenance(campaign, prepared)
+    """Build one authored ordered Dataset selection from independent source cases."""
+    prepared = planning.prepare_dataset_selection(request, storage_root=storage_root)
+    producer_evidence = None
+    if reproduction_manifest is not None:
+        reproduction.verify_current_producer(reproduction_manifest["producer_evidence"], storage_root=storage_root)
+        producer_evidence = reproduction_manifest["producer_evidence"]
+    provenance = _provenance(
+        prepared,
+        storage_root=storage_root,
+        producer_evidence=producer_evidence,
+        partition_spec=partition_spec,
+        case_partition=reproduction_manifest["case_partition"] if reproduction_manifest is not None else None,
+        plan_invocation=reproduction_manifest["plan_invocation"] if reproduction_manifest is not None else plan_invocation,
+    )
     dataset_id, dataset_digest = identity.package_identity_from_provenance(provenance)
-    dataset_view = str(prepared.plan["dataset_view"])
+    if reproduction_manifest is not None and provenance["source_outcomes"] != reproduction_manifest["source_outcomes"]:
+        message = "Retained Source candidate outcomes differ from the reconstruction manifest."
+        raise ValueError(message)
+    if reproduction_manifest is not None and (
+        dataset_id != reproduction_manifest["dataset_id"]
+        or identity.package_semantic_identity_payload(provenance) != identity.package_semantic_identity_payload(reproduction_manifest)
+    ):
+        message = "Restored producing source or selected Source evidence differs from the reconstruction manifest."
+        raise ValueError(message)
+    dataset_view = prepared.request["dataset_view"]
     if dataset_view == "steady_flow":
-        payload_filename = f"{dataset_id}.pt"
 
         def build_payload(path: Path) -> Mapping[str, int]:
-            _build_steady_payload(
-                campaign,
-                prepared,
-                dataset_id=dataset_id,
-                provenance=provenance,
-                destination=path,
-            )
-            return {
-                "sample_count": len(prepared.candidates),
-                "transition_count": 0,
-            }
+            return _build_steady_payload(prepared, dataset_id=dataset_id, provenance=provenance, destination=path)
 
     elif dataset_view == "transient_drying":
-        payload_filename = f"{dataset_id}.json"
 
         def build_payload(path: Path) -> Mapping[str, int]:
-            source_root = common.paths.get_storage_root(storage_root=storage_root)
-            preview = trajectory.build_transient_index(
+            index = trajectory.build_transient_index(
                 _transient_sources(prepared),
                 None,
-                dataset_name=str(prepared.plan["dataset_name"]),
+                dataset_name=prepared.request["dataset_name"],
                 dataset_id=dataset_id,
-                evaluation_regime=str(prepared.plan["evaluation_regime"]),
-                source_root=source_root,
+                source_root=common.paths.get_storage_root(storage_root=storage_root),
             )
-            serialized = json.dumps(
-                preview,
-                ensure_ascii=True,
-                indent=2,
-                sort_keys=True,
-            )
-            common.serialization.atomic_write_text(path, f"{serialized}\n")
-            return {
-                "sample_count": int(preview["sample_count"]),
-                "transition_count": int(preview["transition_count"]),
-            }
+            common.serialization.atomic_write_text(path, json.dumps(index, ensure_ascii=True, indent=2, sort_keys=True) + "\n")
+            return {"sample_count": index["sample_count"], "transition_count": index["transition_count"]}
 
     else:
-        message = f"Unsupported dataset view: {dataset_view!r}."
-        raise ValueError(message)
-    manifest_prefix = {
+        msg = f"Unsupported Dataset view {dataset_view!r}."
+        raise ValueError(msg)
+    prefix = {
         **provenance,
         "dataset_id": dataset_id,
         "dataset_digest": dataset_digest,
-        "payload_filename": payload_filename,
-        "source_case_count": len(prepared.candidates),
+        "payload_filename": common.paths.get_dataset_payload_filename(dataset_view),
+        "source_case_count": len(prepared.cases),
     }
-    if dataset_view == "steady_flow":
-        manifest_prefix.update(
-            {
-                "sample_count": len(prepared.candidates),
-                "transition_count": 0,
-            }
-        )
-    destination, manifest_path, reused, manifest = _publish(
+    payload_path, manifest_path, reused, manifest = _publish(
+        task=dataset_view,
         dataset_id=dataset_id,
-        payload_filename=payload_filename,
-        manifest_prefix=manifest_prefix,
+        prefix=prefix,
         build_payload=build_payload,
+        selection_request=prepared.request,
         storage_root=storage_root,
+        validate_ranked_claim=reproduction_manifest is None,
+        verify_producer=lambda: reproduction.verify_current_producer(provenance["producer_evidence"], storage_root=storage_root),
+        expected_payload_sha256=reproduction_manifest["payload_sha256"] if reproduction_manifest is not None else None,
+        output_directory=output_directory,
     )
-    admitted_manifest = package_manifest.load_package_manifest(
-        dataset_id,
-        storage_root=storage_root,
-    )
-    if admitted_manifest != manifest:
-        message = f"Fully admitted package manifest changed after publication: {dataset_id!r}."
-        raise RuntimeError(message)
-    dataset_reference = references.publish_dataset_reference(
-        dataset_view,
-        _logical_reference_name(str(prepared.plan["dataset_name"]), dataset_view),
-        int(prepared.plan["dataset_revision"]),
-        dataset_id,
-        storage_root=storage_root,
-    )
-    if reused and dataset_view == "transient_drying":
-        existing_index = trajectory.load_transient_index(destination)
-        if (
-            existing_index["dataset_id"] != dataset_id
-            or existing_index["sample_count"] != manifest["sample_count"]
-            or existing_index["source_case_count"] != manifest["source_case_count"]
-            or existing_index["transition_count"] != manifest["transition_count"]
-        ):
-            message = f"Existing package content conflicts with {dataset_id!r}."
-            raise FileExistsError(message)
     return {
-        "dataset_name": prepared.plan["dataset_name"],
+        "dataset_name": prepared.request["dataset_name"],
         "dataset_id": dataset_id,
         "dataset_view": dataset_view,
-        "evaluation_regime": prepared.plan["evaluation_regime"],
-        "payload_path": destination,
+        "payload_path": payload_path,
         "manifest_path": manifest_path,
-        "dataset_reference": dataset_reference,
-        "sample_count": int(manifest["sample_count"]),
-        "source_case_count": len(prepared.candidates),
-        "transition_count": int(manifest["transition_count"]),
+        "sample_count": manifest["sample_count"],
+        "source_case_count": manifest["source_case_count"],
+        "transition_count": manifest["transition_count"],
         "status": "reused" if reused else "complete",
+        "dependency_storage_root": str(common.paths.get_storage_root(storage_root=storage_root)),
+        "independent_source_bytes": False if output_directory is not None else None,
     }
-
-
-def build_dataset_package(
-    campaign: generation.cases.config.CampaignConfig,
-    dataset_view: str,
-    evaluation_regime: str,
-    *,
-    storage_root: Path | str | None = None,
-    composite_receipt: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Build one declared package with its required ID leakage companion."""
-    requested_plan = planning.package_plan(campaign, dataset_view, evaluation_regime)
-    selected_plans = [requested_plan]
-    if evaluation_regime != "id":
-        selected_plans.insert(0, planning.package_plan(campaign, dataset_view, "id"))
-    prepared = planning.prepare_campaign_packages(
-        campaign,
-        storage_root=storage_root,
-        selected_plans=selected_plans,
-        composite_receipt=composite_receipt,
-    )
-    matches = [
-        package for package in prepared if package.plan["dataset_view"] == dataset_view and package.plan["evaluation_regime"] == evaluation_regime
-    ]
-    if len(matches) != 1:
-        message = f"Prepared package selection is ambiguous for {dataset_view!r}/{evaluation_regime!r}."
-        raise RuntimeError(message)
-    return _publish_prepared(campaign, matches[0], storage_root=storage_root)
-
-
-def build_campaign_packages(
-    campaign: generation.cases.config.CampaignConfig,
-    *,
-    storage_root: Path | str | None = None,
-    composite_receipt: Mapping[str, Any] | None = None,
-) -> tuple[dict[str, Any], ...]:
-    """Build every declared package after one shared membership/leakage preflight."""
-    prepared = planning.prepare_campaign_packages(campaign, storage_root=storage_root, composite_receipt=composite_receipt)
-    return tuple(_publish_prepared(campaign, package, storage_root=storage_root) for package in prepared)

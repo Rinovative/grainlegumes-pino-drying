@@ -1,318 +1,808 @@
-# ruff: noqa: PLR2004, S101, SLF001
-"""Fast core-selection benchmark contracts and compact evidence."""
+"""Core-selection benchmark contracts on node-job sweeps.
+
+Responsibilities:
+  - Check suite v2 resolution, sweep tickets, node-job submission and recovery, and variant-attempt classification
+  - Check the abort and retry rules, runner binding, measured-throughput reporting, summary binding, cancel, and status
+
+Design principles:
+  - Use the real suite loader on a small test-owned campaign (4 node cores, k = 1, 2, 4, three cases)
+  - Fake only Slurm and the solver; tickets, receipts, and manifests are real files
+
+This module does NOT:
+  - Run COMSOL, real Slurm jobs, or the node worker process
+"""
 
 from __future__ import annotations
 
 import json
-import shlex
-import shutil
-import subprocess
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from types import SimpleNamespace
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-import yaml
 
 from src import common, generation
 from src.generation import generation_benchmark_config as benchmark_config
 from src.generation import generation_benchmark_report as benchmark_report
+from src.generation import generation_campaign_status as status_service
+from src.generation.runtime import generation_runtime_node as node_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from pathlib import Path
 
 _COMMIT = "a" * 40
+_FINGERPRINT = "f" * 64
 _RUN_ID = "core_scaling_transient__0123456789abcdef"
+_ORIGIN = datetime(2026, 10, 27, 20, 0, tzinfo=UTC)
+
+benchmark = generation.benchmark
 
 
-def test_resume_repairs_missing_input_with_current_node_scratch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resumed benchmark must not reuse a prior node's deleted TMPDIR."""
-    benchmark = generation.benchmark
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    scratch = tmp_path / "current-node-scratch"
-    scratch.mkdir()
-    old_scratch = tmp_path / "old-node-scratch"
-    manifest_path = storage / "benchmark_manifest.json"
-    manifest = {"git_commit": _COMMIT, "state": "input_preparation_failed"}
-    suite = SimpleNamespace(representative_cases=(SimpleNamespace(case_role="nominal"),))
-    observed: list[Path] = []
-    monkeypatch.setattr(benchmark.workspace_service, "resolve_storage_root", lambda *_a, **_k: storage)
-    monkeypatch.setattr(benchmark, "_manifest_path", lambda *_a, **_k: manifest_path)
-    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (manifest, suite))
-    monkeypatch.setattr(benchmark, "_require_current_checkout", lambda *_a: None)
-    monkeypatch.setattr(benchmark, "_canonical_case_proof_path", lambda *_a: storage / "missing-proof.json")
-    monkeypatch.setattr(
-        benchmark,
-        "_load_core_benchmark_preflight",
-        lambda *_a, **_k: {"storage_capabilities": {"scratch": {"path": str(old_scratch)}}},
-    )
-    monkeypatch.setattr(benchmark, "_probe_directory_capability", lambda path, **_k: observed.append(Path(path)))
-    monkeypatch.setattr(
-        benchmark,
-        "_materialize_core_benchmark_inputs",
-        lambda *_a, **kwargs: observed.append(Path(kwargs["work_root"])),
-    )
-    monkeypatch.setattr(benchmark, "_persist_manifest", lambda *_a: None)
-    monkeypatch.setattr(benchmark, "_submit_pending", lambda current, *_a, **_k: current)
-
-    assert (
-        benchmark.resume_core_benchmark(
-            _RUN_ID,
-            storage_root=storage,
-            scratch_root=scratch,
-        )["state"]
-        == "inputs_ready"
-    )
-    assert observed == [scratch, scratch]
+def _exact_node_type_exclusions(*_args: Any, match: str, **_kwargs: Any) -> list[str]:
+    """Fake sinfo exclusions that require the benchmark's exact node-type rule."""
+    assert match == "exact", "the benchmark measures per node type"
+    return ["hpc111"]
 
 
-def _synthetic_suite(
-    generation_config_factory: Any,
-) -> benchmark_config.CoreBenchmarkSuite:
-    """Return two representative cases and four resource-only variants."""
+def _suite(generation_config_factory: Any, **overrides: Any) -> benchmark_config.CoreBenchmarkSuite:
+    """Write and load one small v3 suite (three-case pool, every case needed) over a test-owned transient campaign."""
     config_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         scheduler_kind="slurm",
-        natural_count=2,
+        natural_count=3,
+        cores_per_case=2,
+        cores_per_node=4,
     )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    case_config = campaign.require_batch(
-        material_family="lentil",
-        sampling_regime="natural",
-    )
-    variants = tuple(
-        benchmark_config.CoreBenchmarkVariant(
-            source_path=config_path.parent / f"cores_{cores:02d}.yaml",
-            variant_id=f"cores_{cores:02d}",
-            cores_per_case=cores,
-        )
-        for cores in (4, 8, 16, 32)
-    )
-    return benchmark_config.CoreBenchmarkSuite(
-        source_path=config_path.parent / "suite.yaml",
-        suite_name="synthetic_core_selection",
-        suite_digest="c" * 64,
-        case_campaign_path=config_path,
-        case_campaign=campaign,
-        case_config=case_config,
-        representative_cases=(
-            benchmark_config.CoreBenchmarkRepresentativeCase(
-                case_role="nominal",
-                case_index=1,
-            ),
-            benchmark_config.CoreBenchmarkRepresentativeCase(
-                case_role="natural",
-                case_index=2,
-            ),
-        ),
-        maximum_work_unit_attempts=2,
-        variants=variants,
-        cores_per_node=32,
-        partition="test",
-        wall_time="00:30:00",
-        scheduler_options=(),
-        production_campaign_path=config_path,
-        production_cores_config_path=config_path.parent / "execution.yaml",
-        production_cores_key="cluster.cores_per_case",
-        production_cores_per_case=16,
-    )
-
-
-def _test_owned_pilot_campaign(
-    generation_config_factory: Any,
-    *,
-    cases_per_material: int,
-) -> Path:
-    """Return a valid mutable pilot configuration owned entirely by one test."""
-    path, _template = generation_config_factory(
-        simulation_profile="transient_drying",
-        natural_count=cases_per_material,
-        campaign_purpose="technical_runtime_smoke",
-    )
-    campaign = yaml.safe_load(path.read_text(encoding="utf-8"))
-    campaign["campaign_purpose"] = "pilot_check"
-    campaign.pop("paired_equivalence_seed")
-    campaign["sampling"] = {
-        "method": "lhs",
-        "seed_base": 123456,
-        "cases_per_material": cases_per_material,
-        "case_semantics": {
-            "first": "nominal_reference",
-            "remaining": "natural_pilot",
+    project_root = common.paths.get_project_root().resolve()
+    launcher = project_root / "scripts" / "generation_node.sh"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text("#!/bin/bash\n", encoding="utf-8")
+    campaign = config_path.resolve().relative_to(project_root).as_posix()
+    suite = {
+        "schema_kind": benchmark_config.BENCHMARK_SUITE_SCHEMA_KIND,
+        "schema_version": 3,
+        "suite_name": "small_core_selection",
+        "benchmark_mode": "core_selection",
+        "case_pool": {
+            "campaign_config": campaign,
+            "material_family": "lentil",
+            "sampling_regime": "natural",
+            "first_case_index": 1,
+            "case_count": 3,
         },
+        "target_successful_cases": 3,
+        "sweeps": [{"sweep_id": "sweep_1", "order": "ascending"}, {"sweep_id": "sweep_2", "order": "descending"}],
+        "retry": {"maximum_variant_attempts": 2},
+        "resources": {"partition": None, "sweep_wall_time": "02:00:00", "scheduler_options": []},
+        "production_interpretation": {
+            "campaign_config": campaign,
+            "cores_config": (config_path.parent / "execution.yaml").resolve().relative_to(project_root).as_posix(),
+            "cores_key": "cluster.cores_per_case",
+        },
+        "variants": [{"variant_id": f"cores_{cores:02d}", "cores_per_case": cores} for cores in (1, 2, 4)],
     }
-    campaign["dataset_packages"] = []
-    path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
-
-    execution_path = path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["retention"]["pilot_check"] = "full"
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
-    return path
+    suite.update(overrides)
+    suite_path = config_path.parent / "suite.yaml"
+    suite_path.write_text(json.dumps(suite), encoding="utf-8")
+    return benchmark_config.load_core_benchmark_suite(suite_path, require_executable=False)
 
 
-def _production() -> dict[str, Any]:
-    """Return compact production interpretation for summary tests."""
-    return {
-        "campaign_config": "configs/generation/campaigns/transient.yaml",
-        "campaign_total_cases": 600,
-        "current_production_cores_per_case": 16,
-        "current_estimated_cases_per_node": 2,
-        "current_max_running_cases": None,
-        "cores_config": "configs/generation/execution/cluster_cpu.yaml",
-        "cores_key": "cluster.cores_per_case",
-    }
-
-
-def _success_records(
-    suite: benchmark_config.CoreBenchmarkSuite,
-    runtimes: Mapping[int, tuple[float, float]],
-    *,
-    queue_seconds: float = 0.0,
-    license_wait_seconds: float = 0.0,
-    license_probe_seconds: float = 0.0,
-    license_blocks: int = 0,
-    overlap: bool = True,
-    peak_memory_bytes: int = 20,
-    peak_scratch_bytes: int = 10,
-) -> list[dict[str, Any]]:
-    """Return eight small successful measurement records."""
-    records: list[dict[str, Any]] = []
-    origin = datetime(2026, 8, 19, tzinfo=timezone.utc)
-    for wave, variant in enumerate(suite.variants):
-        values = runtimes[variant.cores_per_case]
-        first_start = origin + timedelta(hours=wave)
-        first_end = first_start + timedelta(seconds=values[0])
-        second_start = first_start + timedelta(seconds=1) if overlap else first_end + timedelta(seconds=1)
-        starts = (first_start, second_start)
-        for case_position, runtime in enumerate(values, start=1):
-            representative = suite.representative_case(case_position)
-            start = starts[case_position - 1]
-            end = start + timedelta(seconds=runtime)
-            records.append(
+def _write_receipt(node_directory: Path, seq: int, *, started: datetime, ended: datetime | None, exit_code: int = 0) -> None:
+    """Write the worker receipts of one ticket."""
+    receipts = node_directory / node_service.RECEIPTS_DIRECTORY
+    receipts.mkdir(parents=True, exist_ok=True)
+    (receipts / f"{seq:06d}.started.json").write_text(
+        json.dumps(
+            {
+                "schema": node_service.STARTED_RECEIPT_SCHEMA,
+                "schema_version": 1,
+                "seq": seq,
+                "started_at": started.isoformat(),
+                "host": "hpc117",
+                "worker_pid": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if ended is not None:
+        (receipts / f"{seq:06d}.finished.json").write_text(
+            json.dumps(
                 {
-                    "status": "success",
-                    "variant_id": variant.variant_id,
-                    "cores_per_case": variant.cores_per_case,
-                    "case_position": case_position,
-                    "case_role": representative.case_role,
-                    "work_unit_id": suite.work_unit_id(variant, case_position),
-                    "timings_seconds": {
-                        "scheduler_queue_seconds": queue_seconds,
-                        "license_wait_seconds": license_wait_seconds,
-                        "license_probe_seconds": license_probe_seconds,
-                        "canonical_input_preparation_seconds": 0.25,
-                        "comsol_process_seconds": runtime,
-                        "export_conversion_seconds": 1.0,
-                        "publication_seconds": 0.5,
-                        "total_controller_elapsed_seconds": (runtime + queue_seconds + license_wait_seconds + license_probe_seconds + 1.75),
-                    },
-                    "solver_interval": {
-                        "started_at": start.isoformat(),
-                        "ended_at": end.isoformat(),
-                    },
-                    "resource": {
-                        "peak_memory_bytes": peak_memory_bytes,
-                        "peak_scratch_bytes": peak_scratch_bytes,
-                        "slurm_job_id": str(1000 + len(records)),
-                        "node": "node-a",
-                        "requested_cpus": variant.cores_per_case,
-                    },
-                    "license": {
-                        "license_blocked_submission_count": license_blocks,
-                        "license_wait_seconds": license_wait_seconds,
-                        "license_probe_seconds": license_probe_seconds,
-                        "scheduler_queue_seconds_before_success": 0.0,
-                        "detected_feature": "COMSOL" if license_blocks else None,
-                        "detected_error_code": "-4" if license_blocks else None,
-                        "matched_signatures": (["licensed number of users already reached"] if license_blocks else []),
-                        "raw_excerpt": "temporary capacity" if license_blocks else None,
-                        "successful_artifacts_override_prior_warning": True,
-                    },
+                    "schema": node_service.FINISHED_RECEIPT_SCHEMA,
+                    "schema_version": 1,
+                    "seq": seq,
+                    "started_at": started.isoformat(),
+                    "ended_at": ended.isoformat(),
+                    "exit_code": exit_code,
+                    "host": "hpc117",
+                    "outcome": "exited",
                 }
-            )
-    return records
+            ),
+            encoding="utf-8",
+        )
 
 
-def _pending_records(
-    suite: benchmark_config.CoreBenchmarkSuite,
-    *,
-    successful: frozenset[tuple[str, str]] = frozenset(),
-) -> list[dict[str, Any]]:
-    """Return one compact result-state record for each benchmark work unit."""
-    return [
-        {
-            "status": ("success" if (variant.variant_id, suite.representative_case(case_position).case_role) in successful else "pending"),
-            "variant_id": variant.variant_id,
-            "case_position": case_position,
-            "case_role": suite.representative_case(case_position).case_role,
-            "work_unit_id": suite.work_unit_id(variant, case_position),
-            "cores_per_case": variant.cores_per_case,
+class _Bench:
+    """One synthetic benchmark directory, manifest, and fake Slurm submission around a real suite."""
+
+    def __init__(self, suite: benchmark_config.CoreBenchmarkSuite, storage: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.suite = suite
+        self.storage = storage
+        self.directory = benchmark.core_benchmark_directory(_RUN_ID, storage_root=storage)
+        self.directory.mkdir(parents=True)
+        self.manifest_path = self.directory / "benchmark_manifest.json"
+        self.manifest: dict[str, Any] = {
+            "benchmark_run_id": _RUN_ID,
+            "git_commit": _COMMIT,
+            "suite_config": "configs/suite.yaml",
+            "state": "inputs_ready",
+            "measured_job_ids": [],
+            "node_jobs": [],
+            "node_job_intent": None,
         }
-        for variant in suite.variants
-        for case_position in range(1, suite.representative_case_count + 1)
+        self.next_job = 5000
+        self.submitted: list[list[str]] = []
+        self.outcomes: dict[str, tuple[str, str]] = {}
+        monkeypatch.setenv("GENERATION_GIT_COMMIT", _COMMIT)
+        monkeypatch.setenv("GENERATION_SOURCE_SHA256", _FINGERPRINT)
+        monkeypatch.setenv("GENERATION_NATIVE_VENV", str(common.paths.get_runtime_root().resolve() / "venvs" / "native"))
+        monkeypatch.setattr(benchmark.cluster_service, "standard_node_exclusions", _exact_node_type_exclusions)
+        monkeypatch.setattr(benchmark.cluster_service, "lease_executing_tree", lambda *_a: None)
+        monkeypatch.setattr(benchmark.source_service, "validate_admitted_source_before_publication", lambda: None)
+        monkeypatch.setattr(benchmark, "_submit", self._submit)
+        monkeypatch.setattr(benchmark, "_unit_record", self._unit_record)
+        for representative in suite.representative_cases:
+            proof = benchmark._canonical_case_proof_path(self.directory, representative)
+            proof.parent.mkdir(parents=True, exist_ok=True)
+            proof.write_text("{}\n", encoding="utf-8")
+
+    def _submit(self, command: list[str], **_kwargs: Any) -> str:
+        assert json.loads(self.manifest_path.read_text(encoding="utf-8"))["node_job_intent"] is not None
+        self.submitted.append(command)
+        self.next_job += 1
+        return str(self.next_job)
+
+    def _unit_record(self, _directory: Path, suite: benchmark_config.CoreBenchmarkSuite, unit: Any) -> dict[str, Any]:
+        unit_id = benchmark._unit_id(suite, unit)
+        record = benchmark._pending_record(suite, unit)
+        if unit_id not in self.outcomes:
+            return record
+        status, job_id = self.outcomes[unit_id]
+        return {
+            **record,
+            "status": status,
+            "resource": {"slurm_job_id": job_id, "peak_memory_bytes": 2**30},
+            "timings_seconds": {"comsol_process_seconds": 100.0},
+        }
+
+    def submit(self, sweep_index: int, attempts: dict[int, int] | None = None) -> dict[str, Any]:
+        sweep = self.suite.sweeps[sweep_index]
+        variant_attempts = [(variant, (attempts or {}).get(variant.cores_per_case, 1)) for variant in self.suite.sweep_variants(sweep)]
+        benchmark._submit_sweep_node_job(
+            self.manifest,
+            self.suite,
+            storage=self.storage,
+            directory=self.directory,
+            manifest_path=self.manifest_path,
+            sweep=sweep,
+            variant_attempts=variant_attempts,
+        )
+        return self.manifest["node_jobs"][-1]
+
+    def node_directory(self, record: dict[str, Any]) -> Path:
+        return benchmark._node_directory(self.directory, record)
+
+    def finish_variant(self, record: dict[str, Any], cores: int, *, failures: int = 0, offset_minutes: int = 0, seconds: float = 600.0) -> None:
+        """Mark every unit of one variant of a node job finished: receipts plus success or failure evidence."""
+        tickets = [ticket for ticket in record["tickets"] if self.suite.variant(ticket["variant_id"]).cores_per_case == cores]
+        for index, ticket in enumerate(tickets):
+            started = _ORIGIN + timedelta(minutes=offset_minutes)
+            _write_receipt(self.node_directory(record), ticket["seq"], started=started, ended=started + timedelta(seconds=seconds))
+            self.outcomes[ticket["work_unit_id"]] = ("failed" if index < failures else "success", str(record["job_id"]))
+
+    def settle(self, record: dict[str, Any]) -> None:
+        """Pretend the driver saw this node job leave the queue long enough ago."""
+        record["terminal_observed_at"] = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+
+
+@pytest.fixture
+def bench(generation_config_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Bench:
+    """Return a synthetic benchmark around the small real suite."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    return _Bench(_suite(generation_config_factory), storage, monkeypatch)
+
+
+# -- suite and tickets --
+
+
+def test_suite_derives_node_resources_sweeps_and_work_unit_ids(generation_config_factory: Any) -> None:
+    """Concurrency and node memory come from the execution resolver per k; sweeps order the variants."""
+    suite = _suite(generation_config_factory)
+    resources = {variant.cores_per_case: suite.resources(variant) for variant in suite.variants}
+    assert {cores: item.concurrent_cases for cores, item in resources.items()} == {1: 4, 2: 2, 4: 1}
+    assert {cores: item.node_job_memory for cores, item in resources.items()} == {1: "5G", 2: "3G", 4: "2G"}
+    assert suite.sweep_node_job_memory() == "5G"
+    assert [[variant.cores_per_case for variant in suite.sweep_variants(sweep)] for sweep in suite.sweeps] == [[1, 2, 4], [4, 2, 1]]
+    variant = suite.variants[1]
+    assert suite.work_unit_id(suite.sweeps[1], variant, 2, 3) == f"sweep_2__a02__{suite.execution_id(variant)}__case_03"
+    with pytest.raises(ValueError, match="variant attempt"):
+        suite.work_unit_id(suite.sweeps[0], variant, 0, 1)
+    contract = suite.resource_contract()
+    assert (contract["node_jobs"], contract["node_job_memory"], contract["node_job_wall_time"]) == (2, "5G", "02:00:00")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"schema_version": 1}, "no earlier version is read"),
+        ({"variants": [{"variant_id": "cores_02", "cores_per_case": 2}, {"variant_id": "cores_03", "cores_per_case": 3}]}, "must divide"),
+        ({"sweeps": [{"sweep_id": "a", "order": "ascending"}, {"sweep_id": "b", "order": "ascending"}]}, "distinct orders"),
+        ({"resources": {"partition": None, "sweep_wall_time": "25:00:00", "scheduler_options": []}}, "must not exceed 24:00:00"),
+        ({"resources": {"partition": None, "sweep_wall_time": "02:00:00", "scheduler_options": ["--exclude=hpc111"]}}, "owned by the launcher"),
+        ({"target_successful_cases": 4}, "must not exceed the case pool"),
+    ],
+)
+def test_suite_rejects_unsupported_schema_pool_and_resources(generation_config_factory: Any, overrides: dict[str, Any], message: str) -> None:
+    """The loader fails closed on an old schema, a target above the pool, non-dividing k, duplicate orders, long sweeps, launcher options."""
+    with pytest.raises(ValueError, match=message):
+        _suite(generation_config_factory, **overrides)
+
+
+def test_sweep_tickets_group_variants_in_order_and_end_with_stop(bench: _Bench) -> None:
+    """One group per variant in sweep order, one step per case with k cores, then the stop ticket."""
+    suite = bench.suite
+    sweep = suite.sweeps[1]
+    tickets = benchmark._sweep_tickets(
+        suite, run_id=_RUN_ID, sweep=sweep, variant_attempts=[(variant, 1) for variant in suite.sweep_variants(sweep)], token="t" * 16
+    )
+    steps = [ticket for ticket in tickets if ticket.kind == node_service.STEP_KIND]
+    assert [(ticket.group, ticket.cores) for ticket in steps] == [(0, 4)] * 3 + [(1, 2)] * 3 + [(2, 1)] * 3
+    assert tickets[-1].kind == node_service.STOP_KIND
+    assert [ticket.seq for ticket in tickets] == list(range(1, 11))
+    assert len({ticket.label for ticket in steps}) == len(steps)
+    timeout = int(suite.case_config.execution_values["runtime"]["timeout_seconds"])
+    first = steps[0]
+    assert first.argv[2:] == ("benchmark-case", _RUN_ID, "sweep_2", "cores_04", "1", "case_01")
+    assert (first.memory, first.required_seconds, dict(first.env)) == (
+        "1G",
+        timeout + 720,
+        {"GENERATION_BENCHMARK_RUN_ID": _RUN_ID, "GENERATION_NODE_TOKEN": "t" * 16},
+    )
+
+
+# -- benchmark-owned inputs --
+
+
+def test_inputs_are_benchmark_owned_and_never_enter_the_production_campaign(bench: _Bench, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Materialization needs no campaign plan, writes bundles and proofs into the run, and reuses both."""
+    suite = bench.suite
+    proofs = [benchmark._canonical_case_proof_path(bench.directory, representative) for representative in suite.representative_cases]
+    for proof in proofs:
+        proof.unlink()
+    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (bench.manifest, suite))
+    monkeypatch.setattr(benchmark, "_require_current_checkout", lambda _manifest: None)
+    work = tmp_path / "work"
+
+    paths = benchmark._materialize_core_benchmark_inputs(_RUN_ID, storage_root=bench.storage, work_root=work)
+
+    assert list(paths) == proofs
+    roles = sorted(representative.case_role for representative in suite.representative_cases)
+    assert sorted(path.name for path in (bench.directory / "inputs").iterdir()) == roles
+    for position, representative in enumerate(suite.representative_cases, start=1):
+        assert (benchmark._benchmark_input_directory(bench.directory, representative) / "case.json").is_file()
+        assert benchmark._load_case_proof(_RUN_ID, suite, position, storage_root=bench.storage)["case_role"] == representative.case_role
+    parts = common.paths.campaign_batch_parts(suite.case_config.batch_storage_name)
+    assert parts is not None
+    campaign = common.paths.resolve_generation_campaign_directory(parts[0], parts[1], storage_root=bench.storage)
+    assert not campaign.exists()
+    assert not list(work.iterdir())
+
+    def forbid_generation(*_args: Any, **_kwargs: Any) -> None:
+        message = "benchmark inputs must be reused"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(benchmark.case_service, "generate_case_input_bundle", forbid_generation)
+    before = {path: path.read_bytes() for path in proofs}
+    assert benchmark._materialize_core_benchmark_inputs(_RUN_ID, storage_root=bench.storage, work_root=work) == paths
+    assert {path: path.read_bytes() for path in proofs} == before
+    proofs[0].unlink()
+    benchmark._materialize_core_benchmark_inputs(_RUN_ID, storage_root=bench.storage, work_root=work)
+    first = json.loads(proofs[0].read_text(encoding="utf-8"))
+    assert first["case_payload_sha256"] == json.loads(before[proofs[0]])["case_payload_sha256"]
+
+
+# -- node-job submission and recovery --
+
+
+def test_node_job_submission_persists_intent_and_tickets_before_sbatch(bench: _Bench) -> None:
+    """Intent and every ticket exist before sbatch; the job id, token, and seat are recorded afterwards."""
+    record = bench.submit(0)
+    assert record["status"] == "submitted"
+    assert record["job_id"] == "5001"
+    assert bench.manifest["measured_job_ids"] == ["5001"]
+    assert bench.manifest["node_job_intent"] is None
+    assert record["seat"] == 1
+    assert (bench.node_directory(record) / "tickets" / f"{record['stop_ticket_seq']:06d}.json").is_file()
+    command = bench.submitted[0]
+    assert "--job-name=gen-seat-1" in command
+    assert "--dependency=singleton" in command
+    assert f"--comment={record['token']}" in command
+    assert "--exclude=hpc111" in command
+    benchmark._validated_node_job_ids(bench.manifest)
+
+
+def test_failed_sbatch_marks_submission_failed_and_clears_intent(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused submission leaves an explicit failed record and no unresolved intent."""
+
+    def refuse(*_args: Any, **_kwargs: Any) -> str:
+        raise benchmark.subprocess.CalledProcessError(1, ["sbatch"], stderr="refused")
+
+    monkeypatch.setattr(benchmark, "_submit", refuse)
+    with pytest.raises(benchmark.subprocess.CalledProcessError):
+        bench.submit(0)
+    assert bench.manifest["node_jobs"][0]["status"] == "submission_failed"
+    assert bench.manifest["node_job_intent"] is None
+    assert bench.manifest["measured_job_ids"] == []
+
+
+@pytest.mark.parametrize("source", ["queue", "worker_record", "absent"])
+def test_intent_recovery_uses_queue_comment_then_worker_record(bench: _Bench, monkeypatch: pytest.MonkeyPatch, source: str) -> None:
+    """A submission interrupted after sbatch is recovered by its token, else by node.json, else marked failed."""
+    record = bench.submit(0)
+    record.update(status="submitting", job_id=None, submitted_at=None, recorded_at=(datetime.now(UTC) - timedelta(minutes=10)).isoformat())
+    bench.manifest["measured_job_ids"] = []
+    bench.manifest["node_job_intent"] = record["token"]
+    queue = {"777": record["token"], "778": "other-token"} if source == "queue" else {"778": "other-token"}
+    seat_jobs = {job_id: (1, "RUNNING", comment) for job_id, comment in queue.items()}
+    monkeypatch.setattr(benchmark.cluster_service, "query_seat_jobs", lambda _seats: seat_jobs)
+    if source == "worker_record":
+        (bench.node_directory(record) / "node.json").write_text(
+            json.dumps({"schema": node_service.NODE_RECORD_SCHEMA, "schema_version": 1, "job_id": "779"}), encoding="utf-8"
+        )
+    benchmark._recover_node_job_intent(bench.manifest, directory=bench.directory, manifest_path=bench.manifest_path)
+    expected = {"queue": ("submitted", "777"), "worker_record": ("submitted", "779"), "absent": ("submission_failed", None)}[source]
+    assert (record["status"], record["job_id"]) == expected
+    assert bench.manifest["node_job_intent"] is None
+    benchmark._validated_node_job_ids(bench.manifest)
+
+
+# -- variant and sweep classification --
+
+
+def _variant(bench: _Bench, sweep_index: int, cores: int, active: frozenset[str]) -> dict[str, Any]:
+    suite = bench.suite
+    variant = next(item for item in suite.variants if item.cores_per_case == cores)
+    return benchmark._variant_state(bench.manifest, suite, bench.directory, suite.sweeps[sweep_index], variant, active)
+
+
+def test_variant_attempt_states_follow_evidence_receipts_and_liveness(bench: _Bench) -> None:
+    """Measured, running, interrupted (a started case), and not started (no case started) are distinguished."""
+    record = bench.submit(0)
+    bench.finish_variant(record, 1)
+    one_case = next(ticket for ticket in record["tickets"] if ticket["variant_id"] == "cores_02")
+    _write_receipt(bench.node_directory(record), one_case["seq"], started=_ORIGIN, ended=None)
+    active = frozenset({record["job_id"]})
+    assert _variant(bench, 0, 1, active)["state"] == "measured"
+    assert _variant(bench, 0, 2, active)["state"] == "running"
+    gone: frozenset[str] = frozenset()
+    assert _variant(bench, 0, 2, gone)["state"] == "running", "a node job not yet observed outside the queue is still judged running"
+    bench.settle(record)
+    assert _variant(bench, 0, 2, gone)["state"] == "interrupted"
+    assert _variant(bench, 0, 4, gone)["state"] == "not_started"
+    state = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], gone)
+    assert state["state"] == "ready_to_submit"
+    assert [(variant.cores_per_case, attempt) for variant, attempt in state["next_variant_attempts"]] == [(2, 2), (4, 2)], (
+        "a new node job gives every variant a new attempt"
+    )
+
+
+def test_failed_step_without_evidence_is_a_terminal_case_failure(bench: _Bench) -> None:
+    """A step that exits non-zero without writing evidence ends its unit as failed_without_evidence."""
+    record = bench.submit(0)
+    tickets = [ticket for ticket in record["tickets"] if ticket["variant_id"] == "cores_01"]
+    for ticket in tickets[:-1]:
+        bench.outcomes[ticket["work_unit_id"]] = ("success", str(record["job_id"]))
+        _write_receipt(bench.node_directory(record), ticket["seq"], started=_ORIGIN, ended=_ORIGIN + timedelta(minutes=5))
+    _write_receipt(bench.node_directory(record), tickets[-1]["seq"], started=_ORIGIN, ended=_ORIGIN + timedelta(minutes=1), exit_code=137)
+    state = _variant(bench, 0, 1, frozenset({record["job_id"]}))
+    assert state["state"] == "measured"
+    assert [item["outcome"] for item in state["units"]] == ["success", "success", "failed_without_evidence"]
+
+
+def test_failed_candidates_are_replaced_and_the_rest_skipped_after_the_target(
+    generation_config_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a target below the pool, tickets carry it; a failure never stops the sweep, and skipped candidates complete the variant."""
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    bench = _Bench(_suite(generation_config_factory, target_successful_cases=1), storage, monkeypatch)
+    record = bench.submit(0)
+    tickets = [ticket for ticket in record["tickets"] if bench.suite.variant(ticket["variant_id"]).cores_per_case == 1]
+    ticket_files = [
+        json.loads(node_service.ticket_path(bench.node_directory(record), ticket["seq"]).read_text(encoding="utf-8")) for ticket in tickets
     ]
-
-
-def _minimal_manifest(run_id: str = _RUN_ID) -> dict[str, Any]:
-    """Return mutable orchestration state needed by synthetic submit steps."""
-    return {
-        "benchmark_run_id": run_id,
-        "git_commit": _COMMIT,
-        "measured_job_ids": [],
-        "submission_history": [],
-        "state": "inputs_ready",
-    }
-
-
-def _prepare_submission_test(
-    suite: benchmark_config.CoreBenchmarkSuite,
-    storage: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Path:
-    """Create proof placeholders and isolate submission from external Slurm."""
-    directory = generation.benchmark.core_benchmark_directory(
-        _RUN_ID,
-        storage_root=storage,
+    assert {payload["success_target"] for payload in ticket_files} == {1}
+    # The first candidate fails, the second succeeds and reaches the target, the worker skips the third.
+    first, second, third = tickets
+    _write_receipt(bench.node_directory(record), first["seq"], started=_ORIGIN, ended=_ORIGIN + timedelta(minutes=9), exit_code=2)
+    bench.outcomes[first["work_unit_id"]] = ("failed", str(record["job_id"]))
+    _write_receipt(bench.node_directory(record), second["seq"], started=_ORIGIN, ended=_ORIGIN + timedelta(minutes=10))
+    bench.outcomes[second["work_unit_id"]] = ("success", str(record["job_id"]))
+    receipts = bench.node_directory(record) / node_service.RECEIPTS_DIRECTORY
+    (receipts / f"{third['seq']:06d}.finished.json").write_text(
+        json.dumps(
+            {
+                "schema": node_service.FINISHED_RECEIPT_SCHEMA,
+                "schema_version": 1,
+                "seq": third["seq"],
+                "started_at": None,
+                "ended_at": (_ORIGIN + timedelta(minutes=10)).isoformat(),
+                "exit_code": None,
+                "host": "hpc117",
+                "outcome": "skipped",
+            }
+        ),
+        encoding="utf-8",
     )
-    for representative in suite.representative_cases:
-        proof = directory / "canonical_cases" / f"{representative.case_role}.json"
-        proof.parent.mkdir(parents=True, exist_ok=True)
-        proof.write_text("{}\n", encoding="utf-8")
+    variant = _variant(bench, 0, 1, frozenset({record["job_id"]}))
+    assert variant["state"] == "measured"
+    assert [item["outcome"] for item in variant["units"]] == ["failed", "success", "skipped"]
+    sweep = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], frozenset({record["job_id"]}))
+    assert sweep["state"] == "running"
+    measurement = benchmark._measurement_input(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], variant)
+    row = benchmark_report.summarize_core_benchmark_results(bench.suite, [measurement])["measurements"][0]
+    assert (row["cases"], row["successful_cases"], row["reached_target"], row["failed_case_roles"]) == (2, 1, True, ["case_01"])
+    assert row["makespan_seconds"] == 600.0, "the skipped candidate adds no time; the failed one counts"
+
+
+def test_exhausted_variant_attempts_fail_the_sweep(bench: _Bench) -> None:
+    """Two started but interrupted attempts exhaust the variant; an attempt that never started does not count."""
+    first = bench.submit(0)
+    bench.settle(first)
+    state = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], frozenset())
+    assert state["state"] == "ready_to_submit", "a node job that started nothing consumes no attempt"
+    for record in (bench.submit(0, attempts={1: 2, 2: 2, 4: 2}), bench.submit(0, attempts={1: 3, 2: 3, 4: 3})):
+        _write_receipt(bench.node_directory(record), record["tickets"][0]["seq"], started=_ORIGIN, ended=None)
+        bench.settle(record)
+    state = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], frozenset())
+    assert (state["state"], state["failed_variant_id"]) == ("variant_failed", "cores_01")
+
+
+def test_evidence_from_another_job_is_refused(bench: _Bench) -> None:
+    """A unit's evidence must come from the node job that held its ticket."""
+    record = bench.submit(0)
+    bench.finish_variant(record, 1)
+    record["job_id"] = "9999"
+    bench.manifest["measured_job_ids"] = ["9999"]
+    with pytest.raises(ValueError, match="not its node job"):
+        _variant(bench, 0, 1, frozenset())
+
+
+def test_advance_submits_due_sweeps_and_derives_the_benchmark_state(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both sweeps get a node job once; a fully measured run is complete."""
+    queue: dict[str, str] = {}
     monkeypatch.setattr(
-        generation.benchmark,
-        "_load_case_proofs",
-        lambda *_args, **_kwargs: {"nominal": {}, "natural": {}},
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_validate_records_against_proof",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
+        benchmark,
         "_scheduler_evidence",
-        lambda _job_ids: {
-            "squeue": {"output": "", "error": None},
+        lambda job_ids: {
+            "squeue": {"output": "\n".join(f"{job}|RUNNING|None|hpc117|1:00" for job in job_ids if job in queue), "error": None},
             "sacct": {"output": "", "error": None},
         },
     )
+    manifest = benchmark._advance_sweeps(bench.manifest, bench.suite, storage=bench.storage)
+    assert manifest["state"] == "running"
+    assert [record["seat"] for record in manifest["node_jobs"]] == [1, 2]
+    queue.update({record["job_id"]: "" for record in manifest["node_jobs"]})
+    assert benchmark._advance_sweeps(manifest, bench.suite, storage=bench.storage)["state"] == "running"
+    assert len(manifest["node_jobs"]) == 2
+    for record in manifest["node_jobs"]:
+        for cores in (1, 2, 4):
+            bench.finish_variant(record, cores)
+    queue.clear()
+    manifest = benchmark._advance_sweeps(manifest, bench.suite, storage=bench.storage)
+    assert all(record.get("terminal_observed_at") for record in manifest["node_jobs"])
+    assert manifest["state"] == "running", "receipts may still be in flight right after the node jobs left the queue"
+    for record in manifest["node_jobs"]:
+        bench.settle(record)
+    manifest = benchmark._advance_sweeps(manifest, bench.suite, storage=bench.storage)
+    assert manifest["state"] == "complete"
+    assert len(manifest["node_jobs"]) == 2
+    measurements = benchmark._measurements(manifest, bench.suite, bench.directory, frozenset())
+    assert [(item["sweep_id"], item["cores_per_case"]) for item in measurements] == [
+        ("sweep_1", 1),
+        ("sweep_1", 2),
+        ("sweep_1", 4),
+        ("sweep_2", 4),
+        ("sweep_2", 2),
+        ("sweep_2", 1),
+    ]
+
+
+# -- runner binding --
+
+
+def test_runner_requires_a_step_of_its_node_job(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A work unit runs only as a step (SLURM_STEP_ID) of the node job that holds its ticket."""
+    record = bench.submit(0)
+    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (bench.manifest, bench.suite))
+    monkeypatch.setattr(benchmark, "_require_current_checkout", lambda _manifest: None)
+    monkeypatch.setattr(benchmark.workspace_service, "resolve_storage_root", lambda *_a, **_k: bench.storage)
+    monkeypatch.setenv("SLURM_JOB_ID", str(record["job_id"]))
+    monkeypatch.setenv("SLURM_CPUS_PER_TASK", "1")
+    monkeypatch.delenv("SLURM_STEP_ID", raising=False)
+    with pytest.raises(RuntimeError, match="SLURM_STEP_ID"):
+        benchmark.run_core_benchmark_case(_RUN_ID, "sweep_1", "cores_01", 1, "case_01", storage_root=bench.storage, work_root=bench.storage)
+    monkeypatch.setenv("SLURM_STEP_ID", "3")
+    with pytest.raises(RuntimeError, match="GENERATION_NODE_TOKEN"):
+        benchmark.run_core_benchmark_case(_RUN_ID, "sweep_1", "cores_01", 1, "case_01", storage_root=bench.storage, work_root=bench.storage)
+    monkeypatch.setenv("GENERATION_NODE_TOKEN", record["token"])
+    monkeypatch.setattr(benchmark, "_BINDING_WAIT_SECONDS", 0)
+    with pytest.raises(RuntimeError, match="does not hold exactly one ticket"):
+        benchmark.run_core_benchmark_case(_RUN_ID, "sweep_2", "cores_01", 1, "case_01", storage_root=bench.storage, work_root=bench.storage)
+
+
+def test_dispatch_binds_by_token_before_the_driver_acknowledged_the_job(bench: _Bench) -> None:
+    """A step may start before the driver persisted its job ID; the ticket's token binds it to the submitting record."""
+    record = bench.submit(0)
+    unit_id = record["tickets"][0]["work_unit_id"]
+    record.update(status="submitting", job_id=None)
+    with pytest.raises(RuntimeError, match="exactly one ticket"):
+        benchmark._dispatched_ticket(bench.manifest, job_id="5001", unit_id=unit_id)
+    bound, ticket = benchmark._dispatched_ticket(bench.manifest, job_id="5001", unit_id=unit_id, token=record["token"])
+    assert (bound["token"], ticket["work_unit_id"]) == (record["token"], unit_id)
+
+
+@pytest.mark.parametrize(
+    ("record", "finished", "step", "known", "expected"),
+    [
+        ({"status": "failed", "error": {"type": "CaseInterruptedError"}}, None, None, True, "pending"),
+        ({"status": "failed", "error": {"type": "SolverError"}}, None, None, True, "failed"),
+        ({"status": "pending"}, {"exit_code": 1, "outcome": "exited"}, None, True, "pending"),
+        ({"status": "pending"}, {"exit_code": 143, "outcome": "exited"}, {"state": "CANCELLED by 1"}, True, "pending"),
+        ({"status": "pending"}, {"exit_code": 137, "outcome": "exited"}, {"state": "OUT_OF_MEMORY"}, True, "failed_without_evidence"),
+        ({"status": "pending"}, {"exit_code": -1, "outcome": "launch_failed"}, None, False, "pending"),
+    ],
+)
+def test_interruptions_and_launch_failures_are_not_case_failures(
+    record: dict[str, Any], finished: dict[str, Any] | None, step: dict[str, Any] | None, known: bool, expected: str
+) -> None:
+    """Cancelled, never-started, or launch-failed steps keep the unit pending; a step that ran and failed is a case failure."""
+    assert benchmark._unit_outcome(record, finished, step, step_rows_known=known) == expected
+
+
+def test_unresolved_submission_waits_for_its_grace_and_blocks_ownership_queries(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh intent without queue or worker evidence stays unresolved, and job ownership fails closed meanwhile."""
+    record = bench.submit(0)
+    record.update(status="submitting", job_id=None, submitted_at=None, recorded_at=datetime.now(UTC).isoformat())
+    bench.manifest["measured_job_ids"] = []
+    bench.manifest["node_job_intent"] = record["token"]
+    monkeypatch.setattr(benchmark.cluster_service, "query_seat_jobs", lambda _seats: {})
+    benchmark._recover_node_job_intent(bench.manifest, directory=bench.directory, manifest_path=bench.manifest_path)
+    assert (record["status"], bench.manifest["node_job_intent"]) == ("submitting", record["token"])
+    bench.manifest.update(schema_kind=benchmark.BENCHMARK_RUN_SCHEMA_KIND, schema_version=benchmark.BENCHMARK_SCHEMA_VERSION)
+    bench.manifest_path.write_text(json.dumps(bench.manifest), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unresolved node-job submission"):
+        benchmark.load_core_benchmark_scheduler_job_ids(_RUN_ID, storage_root=bench.storage)
+
+
+# -- report, summary binding --
+
+
+def _measurement(suite: benchmark_config.CoreBenchmarkSuite, sweep_id: str, cores: int, case_seconds: float, *, failed: int = 0) -> dict[str, Any]:
+    """Return one synthetic measured sweep variant whose cases run in rounds of the variant's concurrency."""
+    variant = next(item for item in suite.variants if item.cores_per_case == cores)
+    concurrency = suite.resources(variant).concurrent_cases
+    units = []
+    for index in range(suite.representative_case_count):
+        started = _ORIGIN + timedelta(seconds=case_seconds * (index // concurrency))
+        outcome = "failed" if index < failed else "success"
+        units.append(
+            {
+                "work_unit_id": f"{sweep_id}-{cores}-{index}",
+                "case_role": f"case_0{index + 1}",
+                "outcome": outcome,
+                "started_at": started.isoformat(),
+                "ended_at": (started + timedelta(seconds=case_seconds)).isoformat(),
+                "step_exit_code": 0,
+                "record": {
+                    "timings_seconds": {"comsol_process_seconds": case_seconds - 10.0},
+                    "resource": {"peak_memory_bytes": 2**30, "node": "hpc117", "cpu_model": "Xeon", "slurm_job_id": "1", "slurm_step_id": str(index)},
+                    "error": {"type": "SolverError"} if outcome == "failed" else None,
+                },
+            }
+        )
+    return {
+        "sweep_id": sweep_id,
+        "order": "ascending",
+        "variant_id": variant.variant_id,
+        "cores_per_case": cores,
+        "variant_attempt": 1,
+        "node_job_id": "1",
+        "node": "hpc117",
+        "cpu_model": "Xeon",
+        "foreign_jobs_at_start": [],
+        "foreign_jobs_at_end": [],
+        "units": units,
+    }
+
+
+def test_report_measures_node_throughput_and_recommends_the_fastest_feasible_k(generation_config_factory: Any) -> None:
+    """Throughput is successful cases per node-hour over the group makespan; a variant below the target is not recommendable."""
+    suite = _suite(generation_config_factory)
+    seconds = {1: 1200.0, 2: 500.0, 4: 300.0}
+    measurements = [
+        _measurement(suite, sweep, cores, seconds[cores], failed=1 if (sweep, cores) == ("sweep_2", 4) else 0)
+        for sweep in ("sweep_1", "sweep_2")
+        for cores in (1, 2, 4)
+    ]
+    summary = benchmark_report.summarize_core_benchmark_results(suite, measurements)
+    by_key = {(row["sweep_id"], row["cores_per_case"]): row for row in summary["measurements"]}
+    assert by_key[("sweep_1", 1)]["makespan_seconds"] == 1200.0
+    assert by_key[("sweep_1", 1)]["throughput_cases_per_node_hour"] == pytest.approx(9.0)
+    assert by_key[("sweep_1", 2)]["throughput_cases_per_node_hour"] == pytest.approx(3 * 3600 / 1000)
+    assert by_key[("sweep_1", 4)]["throughput_cases_per_node_hour"] == pytest.approx(3 * 3600 / 900)
+    assert by_key[("sweep_2", 4)]["failed_case_roles"] == ["case_01"]
+    variants = {item["cores_per_case"]: item for item in summary["variants"]}
+    assert variants[4]["recommendable"] is False
+    assert (summary["recommended_cores_per_case"], summary["complete"]) == (2, True)
+    assert by_key[("sweep_1", 1)]["node_peak_memory_upper_bound_bytes"] == 4 * 2**30
+    assert benchmark_report.results_csv(measurements).count("\n") == 1 + 6 * 3
+    markdown = benchmark_report.core_benchmark_markdown(summary)
+    assert markdown == benchmark_report.core_benchmark_markdown(benchmark_report.summarize_core_benchmark_results(suite, measurements))
+    assert "Recommended cores_per_case: 2" in markdown
+
+
+def test_report_treats_a_case_failing_everywhere_as_shared(generation_config_factory: Any) -> None:
+    """A case that fails in every measurement is shared; with the target reached, its node time only lowers throughput."""
+    suite = _suite(generation_config_factory, target_successful_cases=2)
+    measurements = [_measurement(suite, sweep, cores, 400.0, failed=1) for sweep in ("sweep_1", "sweep_2") for cores in (1, 2, 4)]
+    summary = benchmark_report.summarize_core_benchmark_results(suite, measurements)
+    assert all(item["recommendable"] for item in summary["variants"])
+    assert all(item["variant_specific_failed_case_roles"] == [] for item in summary["variants"])
+    assert summary["recommended_cores_per_case"] == 1
+
+
+def test_report_recommends_nothing_when_no_case_succeeded(generation_config_factory: Any) -> None:
+    """A variant that never reached its success target is never recommended."""
+    suite = _suite(generation_config_factory)
+    measurements = [_measurement(suite, sweep, cores, 400.0, failed=3) for sweep in ("sweep_1", "sweep_2") for cores in (1, 2, 4)]
+    summary = benchmark_report.summarize_core_benchmark_results(suite, measurements)
+    assert summary["recommended_cores_per_case"] is None
+
+
+def test_launch_claims_without_execution_do_not_consume_attempts(bench: _Bench) -> None:
+    """With step accounting, an attempt counts only when a scheduler step or case evidence shows it executed."""
+    for attempt in (1, 2):
+        record = bench.submit(0, attempts={1: attempt, 2: attempt, 4: attempt})
+        _write_receipt(bench.node_directory(record), record["tickets"][0]["seq"], started=_ORIGIN, ended=_ORIGIN, exit_code=1)
+        bench.settle(record)
+    state = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], frozenset(), {})
+    assert state["state"] == "ready_to_submit"
+    executed = {(str(record["job_id"]), str(record["tickets"][0]["label"])): {"state": "FAILED"} for record in bench.manifest["node_jobs"]}
+    state = benchmark._sweep_state(bench.manifest, bench.suite, bench.directory, bench.suite.sweeps[0], frozenset(), executed)
+    assert (state["state"], state["failed_variant_id"]) == ("variant_failed", "cores_01")
+
+
+def test_terminal_step_accounting_is_captured_once_and_then_read_from_the_snapshot(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finalization captures sacct steps once; later validation reads the snapshot even when accounting changed."""
+    record = bench.submit(0)
+    label = record["tickets"][0]["label"]
+    output = {"value": f"{record['job_id']}.0|{label}|COMPLETED|0:0|s|s|e|1|hpc117|4|standard|2G"}
     monkeypatch.setattr(
-        generation.benchmark,
-        "build_core_benchmark_slurm_command",
-        lambda *_args, variant, case_position, **_kwargs: [
-            "sbatch",
-            variant.variant_id,
-            str(case_position),
-        ],
+        benchmark, "_scheduler_evidence", lambda _ids: {"squeue": {"output": "", "error": None}, "sacct": {"output": output["value"], "error": None}}
     )
-    return directory
+    first = benchmark._terminal_step_rows(bench.directory, bench.manifest, capture=True)
+    assert first[(str(record["job_id"]), label)]["max_rss_bytes"] == 2 * 1024**3
+    output["value"] = ""
+    assert benchmark._terminal_step_rows(bench.directory, bench.manifest, capture=True) == first
+    assert benchmark._terminal_step_rows(bench.directory, bench.manifest, capture=False) == first
+
+
+def test_report_keeps_unknown_makespan_unknown(generation_config_factory: Any) -> None:
+    """A unit without a finished receipt leaves makespan and throughput unavailable instead of guessing."""
+    suite = _suite(generation_config_factory)
+    measurement = _measurement(suite, "sweep_1", 2, 400.0)
+    measurement["units"][0]["ended_at"] = None
+    summary = benchmark_report.summarize_core_benchmark_results(suite, [measurement])
+    row = summary["measurements"][0]
+    assert (row["makespan_seconds"], row["throughput_cases_per_node_hour"], summary["complete"]) == (None, None, False)
+    assert summary["recommended_cores_per_case"] is None
+
+
+def test_summary_identity_binds_the_measurements(generation_config_factory: Any) -> None:
+    """A summary is refused when the terminal measurements changed after it was written."""
+    suite = _suite(generation_config_factory)
+    measurements = [_measurement(suite, "sweep_1", 2, 400.0)]
+    proofs = {
+        representative.case_role: {"case_input_id": "1" * 64, "simulation_case_id": "2" * 64, "case_payload_sha256": "3" * 64}
+        for representative in suite.representative_cases
+    }
+    manifest = {"git_commit": _COMMIT, "source_fingerprint_sha256": _FINGERPRINT, "preflight": {"receipt_sha256": "4" * 64}}
+    summary = {
+        **benchmark_report.summarize_core_benchmark_results(suite, measurements),
+        "benchmark_run_id": _RUN_ID,
+        "git_commit": _COMMIT,
+        "source_fingerprint_sha256": _FINGERPRINT,
+        "template_sha256": suite.case_config.template_sha256,
+        "representative_case_identities": benchmark._proof_identities(suite, proofs),
+        "preflight": manifest["preflight"],
+        "result_set_digest": common.serialization.canonical_json_sha256(measurements),
+        "generated_at": _ORIGIN.isoformat(),
+    }
+    benchmark._validate_summary_identity(summary, run_id=_RUN_ID, suite=suite, manifest=manifest, proofs=proofs, measurements=measurements)
+    measurements[0]["units"][0]["outcome"] = "failed"
+    with pytest.raises(ValueError, match="not bound"):
+        benchmark._validate_summary_identity(summary, run_id=_RUN_ID, suite=suite, manifest=manifest, proofs=proofs, measurements=measurements)
+
+
+# -- cancel and status --
+
+
+def test_cancel_marks_active_node_jobs_and_signals_only_their_batch_shells(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graceful cancel writes control/cancel, cancels pending node jobs, and sends TERM to running batch shells."""
+    running = bench.submit(0)
+    pending = bench.submit(1)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (bench.manifest, bench.suite))
+    monkeypatch.setattr(benchmark.workspace_service, "resolve_storage_root", lambda *_a, **_k: bench.storage)
+    monkeypatch.setattr(
+        benchmark,
+        "_scheduler_evidence",
+        lambda _ids: {"squeue": {"output": f"{running['job_id']}|RUNNING|None\n{pending['job_id']}|PENDING|Priority", "error": None}},
+    )
+    monkeypatch.setattr(
+        benchmark.subprocess, "run", lambda command, **_k: (commands.append(command), benchmark.subprocess.CompletedProcess(command, 0, "", ""))[1]
+    )
+    benchmark.cancel_core_benchmark(_RUN_ID, storage_root=bench.storage)
+    assert commands == [["scancel", pending["job_id"]], ["scancel", "--signal=TERM", "--batch", running["job_id"]]]
+    assert all((bench.node_directory(record) / "control" / "cancel").is_file() for record in (running, pending))
+    assert bench.manifest["state"] == "cancel_requested"
+
+
+def test_status_and_formatter_report_sweeps(bench: _Bench, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Status lists each sweep's progress and the formatter shows it without scheduler access."""
+    record = bench.submit(0)
+    bench.finish_variant(record, 1)
+    monkeypatch.setattr(benchmark, "load_core_benchmark_manifest", lambda *_a, **_k: (bench.manifest, bench.suite))
+    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: {"current_production_cores_per_case": 2})
+    status = benchmark.core_benchmark_status(_RUN_ID, storage_root=bench.storage, query_scheduler=False)
+    sweeps = {item["sweep_id"]: item for item in status["sweeps"]}
+    assert (sweeps["sweep_1"]["state"], sweeps["sweep_1"]["measured_variants"], sweeps["sweep_1"]["current_cores_per_case"]) == ("running", 1, 2)
+    assert sweeps["sweep_2"]["state"] == "ready_to_submit"
+    assert status["state"] == "running"
+    assert status["successful_work_units"] == 3
+    assert status["partial_evaluation"]["measurements"][0]["cores_per_case"] == 1
+    text = status_service.format_benchmark_status_summary(status)
+    assert "sweep_1 (ascending): state=running variants=1/3" in text
+
+
+def test_benchmark_scheduler_footprint_reports_sweep_node_jobs(generation_config_factory: Any) -> None:
+    """The dry-run footprint of a benchmark comes from its suite: one node job per sweep plus the driver."""
+    suite = _suite(generation_config_factory)
+    footprint = generation.controller.benchmark_scheduler_footprint(suite.resource_contract(), driver_time="14:00:00")
+    assert footprint == {
+        "node_jobs": 2,
+        "cores_per_node_job": 4,
+        "node_job_memory": "5G",
+        "node_job_wall_time": "02:00:00",
+        "driver_cpus": 2,
+        "driver_time": "14:00:00",
+    }
+
+
+def test_attempt_chain_is_append_only_and_hash_chained(tmp_path: Path) -> None:
+    """A gap or a rewritten predecessor breaks the attempt chain."""
+    first = tmp_path / "attempt-0001.json"
+    first.write_text(json.dumps({"attempt": 1, "previous_attempt": None}), encoding="utf-8")
+    second = tmp_path / "attempt-0002.json"
+    second.write_text(
+        json.dumps({"attempt": 2, "previous_attempt": {"attempt": 1, "receipt_sha256": common.serialization.file_sha256(first)}}),
+        encoding="utf-8",
+    )
+    benchmark._validate_benchmark_attempt_chain((first, second))
+    first.write_text(json.dumps({"attempt": 1, "previous_attempt": None, "changed": True}), encoding="utf-8")
+    with pytest.raises(ValueError, match="predecessor chain"):
+        benchmark._validate_benchmark_attempt_chain((first, second))
 
 
 @pytest.mark.parametrize(
@@ -321,1329 +811,30 @@ def _prepare_submission_test(
         (None, "unavailable", None),
         ("1787097600", "available", "2026-08-19T00:00:00+00:00"),
         ("not-a-timestamp", "invalid", None),
-        ("0", "invalid", None),
     ],
 )
 def test_slurm_start_time_environment_is_optional_bounded_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-    value: str | None,
-    status: str,
-    started_at: str | None,
+    monkeypatch: pytest.MonkeyPatch, value: str | None, status: str, started_at: str | None
 ) -> None:
-    """Keep worker execution independent of optional Slurm start-time environment."""
+    """SLURM_JOB_START_TIME is recorded when valid and never trusted when malformed."""
     if value is None:
         monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
     else:
         monkeypatch.setenv("SLURM_JOB_START_TIME", value)
-    evidence = generation.benchmark._slurm_scheduler_start_time_evidence()
-    assert evidence["status"] == status
-    assert evidence["started_at"] == started_at
-    assert evidence["raw_value"] == value
-
-
-def test_oversized_numeric_slurm_start_time_is_bounded_invalid_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject arbitrarily long numeric environment text without aborting the worker."""
-    monkeypatch.setenv("SLURM_JOB_START_TIME", "9" * 10000)
-    evidence = generation.benchmark._slurm_scheduler_start_time_evidence()
-    assert evidence["status"] == "invalid"
-    assert evidence["started_at"] is None
-    assert evidence["raw_value"] == "9" * generation.benchmark._MAX_SLURM_ENV_VALUE_CHARACTERS
-
-
-def test_summary_successful_measurements_reject_tampering_and_truncation(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bind optional controller evidence exactly to terminal success records."""
-    suite = _synthetic_suite(generation_config_factory)
-    records = [
-        {
-            "status": "success",
-            "work_unit_id": "unit-1",
-            "variant_id": "cores_04",
-            "case_role": "nominal",
-            "resource": {
-                "slurm_job_id": "101",
-                "node": "node01",
-                "requested_cpus": 4,
-            },
-            "timings_seconds": {
-                "comsol_process_seconds": 12.5,
-                "license_wait_seconds": 0.0,
-                "export_conversion_seconds": 1.0,
-                "publication_seconds": 0.5,
-            },
-        }
-    ]
-    manifest = {
-        "git_commit": _COMMIT,
-        "preflight": {"receipt_sha256": "b" * 64},
-        "submission_history": [
-            {"role": "measure", "variant_id": "cores_04", "case_role": "nominal", "job_id": "100"},
-            {"role": "measure", "variant_id": "cores_04", "case_role": "nominal", "job_id": "101"},
-        ],
-    }
-    scheduler_accounting = {
-        "output": ("100|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:03\n101|COMPLETED|0:0|2026-08-19T00:01:00|2026-08-19T00:01:05"),
-        "error": None,
-    }
-    measurements = generation.benchmark._controller_scheduler_queue_accounting(
-        manifest,
-        records,
-        {"sacct": scheduler_accounting},
-    )
-    monkeypatch.setattr(generation.benchmark, "_proof_identities", lambda *_args: [])
-    summary = {
-        "schema_kind": generation.benchmark.BENCHMARK_SUMMARY_SCHEMA_KIND,
-        "schema_version": 1,
-        "benchmark_run_id": _RUN_ID,
-        "git_commit": _COMMIT,
-        "template_sha256": suite.case_config.template_sha256,
-        "representative_case_identities": [],
-        "preflight": manifest["preflight"],
-        "result_set_digest": common.serialization.canonical_json_sha256(records),
-        "scheduler_accounting": scheduler_accounting,
-        "successful_measurements": measurements,
-        "generated_at": "2026-08-19T00:00:00+00:00",
-    }
-    generation.benchmark._validate_summary_identity(
-        summary,
-        run_id=_RUN_ID,
-        suite=suite,
-        manifest=manifest,
-        proofs={},
-        records=records,
-    )
-    tampered = {**summary, "successful_measurements": [dict(measurements[0])]}
-    tampered["successful_measurements"][0]["comsol_process_seconds"] = 99.0
-    with pytest.raises(ValueError, match="stale or incomplete"):
-        generation.benchmark._validate_summary_identity(
-            tampered,
-            run_id=_RUN_ID,
-            suite=suite,
-            manifest=manifest,
-            proofs={},
-            records=records,
-        )
-    truncated = {**summary, "successful_measurements": []}
-    with pytest.raises(ValueError, match="stale or incomplete"):
-        generation.benchmark._validate_summary_identity(
-            truncated,
-            run_id=_RUN_ID,
-            suite=suite,
-            manifest=manifest,
-            proofs={},
-            records=records,
-        )
-
-
-def test_summary_accounting_reconciliation_only_upgrades_availability() -> None:
-    """Upgrade derived queue evidence without regressing or inventing history."""
-    unavailable = [{"work_unit_id": "unit-1", "scheduler_queue_availability": "unavailable"}]
-    available = [{"work_unit_id": "unit-1", "scheduler_queue_availability": "available"}]
-    assert generation.benchmark._has_strictly_more_available_queue_measurements(
-        unavailable,
-        available,
-    )
-    assert not generation.benchmark._has_strictly_more_available_queue_measurements(
-        available,
-        unavailable,
-    )
-    assert not generation.benchmark._has_strictly_more_available_queue_measurements(
-        None,
-        available,
-    )
-
-
-def test_finalize_same_result_refreshes_only_improved_queue_accounting(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Refresh derived evidence when terminal accounting becomes more complete."""
-    suite = _synthetic_suite(generation_config_factory)
-    records = _success_records(
-        suite,
-        {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)},
-    )
-    submissions: list[dict[str, Any]] = []
-    for index, record in enumerate(records, start=1):
-        job_id = str(100 + index)
-        record["resource"].update(
-            {
-                "slurm_job_id": job_id,
-                "node": "node01",
-                "requested_cpus": record["cores_per_case"],
-            }
-        )
-        submissions.append(
-            {
-                "role": "measure",
-                "variant_id": record["variant_id"],
-                "case_role": record["case_role"],
-                "job_id": job_id,
-            }
-        )
-    manifest = {
-        "benchmark_run_id": _RUN_ID,
-        "git_commit": _COMMIT,
-        "preflight": {"receipt_sha256": "a" * 64},
-        "measured_job_ids": [item["job_id"] for item in submissions],
-        "submission_history": submissions,
-        "state": "running",
-    }
-    directory = generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=tmp_path)
-    directory.mkdir(parents=True)
-    immutable_success = directory / "runs" / "immutable-success.json"
-    immutable_success.parent.mkdir()
-    immutable_success.write_text('{"immutable": true}\n', encoding="utf-8")
-    unavailable_scheduler = {"sacct": {"output": "", "error": "not yet available"}}
-    unavailable_measurements = generation.benchmark._controller_scheduler_queue_accounting(
-        manifest,
-        records,
-        unavailable_scheduler,
-    )
-    initial = benchmark_report.summarize_core_benchmark_results(suite, records)
-    generation.benchmark._apply_controller_queue_to_summary(
-        initial,
-        unavailable_measurements,
-    )
-    initial.update(
-        {
-            "schema_kind": generation.benchmark.BENCHMARK_SUMMARY_SCHEMA_KIND,
-            "schema_version": 1,
-            "benchmark_run_id": _RUN_ID,
-            "git_commit": _COMMIT,
-            "template_sha256": suite.case_config.template_sha256,
-            "representative_case_identities": [],
-            "preflight": manifest["preflight"],
-            "scheduler_accounting": unavailable_scheduler["sacct"],
-            "successful_measurements": unavailable_measurements,
-            "result_set_digest": common.serialization.canonical_json_sha256(records),
-            "generated_at": "2026-08-19T00:00:00+00:00",
-        }
-    )
-    common.serialization.atomic_write_json(directory / "summary.json", initial)
-    common.serialization.atomic_write_text(
-        directory / "runs.csv",
-        benchmark_report.results_csv(
-            records,
-            queue_by_work_unit=generation.benchmark._controller_queue_by_work_unit(
-                unavailable_measurements,
-            ),
-        ),
-    )
-    common.serialization.atomic_write_text(
-        directory / "summary.md",
-        benchmark_report.core_benchmark_markdown(initial),
-    )
-    scheduler_rows = "\n".join(f"{item['job_id']}|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05" for item in submissions)
-    scheduler = {
-        "squeue": {"output": "", "error": None},
-        "sacct": {"output": scheduler_rows, "error": None},
-    }
-    monkeypatch.setattr(
-        generation.benchmark,
-        "load_core_benchmark_manifest",
-        lambda *_args, **_kwargs: (manifest, suite),
-    )
-    monkeypatch.setattr(generation.benchmark, "_scheduler_evidence", lambda *_args: scheduler)
-    monkeypatch.setattr(generation.benchmark, "_load_case_proofs", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args: records)
-    monkeypatch.setattr(generation.benchmark, "_validate_records_against_proof", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(generation.benchmark, "_validate_summary_identity", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(generation.benchmark, "_persist_manifest", lambda *_args, **_kwargs: None)
-    refreshed = generation.benchmark.finalize_core_benchmark(_RUN_ID, storage_root=tmp_path)
-    persisted = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
-    assert refreshed == persisted
-    assert all(item["scheduler_queue_availability"] == "available" for item in persisted["successful_measurements"])
-    assert persisted["result_set_digest"] == initial["result_set_digest"]
-    assert persisted["schema_version"] == 1
-    assert immutable_success.read_bytes() == b'{"immutable": true}\n'
-    for before, after in zip(initial["variants"], persisted["variants"], strict=True):
-        assert {key: value for key, value in before.items() if key != "scheduler_queue_seconds"} == {
-            key: value for key, value in after.items() if key != "scheduler_queue_seconds"
-        }
-    history = directory / "summary_history" / "revision-0001"
-    assert (history / "summary.json").is_file()
-    assert (history / "runs.csv").is_file()
-    assert (history / "summary.md").is_file()
-    stable_bytes = (directory / "summary.json").read_bytes()
-    scheduler["sacct"] = {"output": "", "error": "temporarily unavailable"}
-    assert generation.benchmark.finalize_core_benchmark(_RUN_ID, storage_root=tmp_path) == persisted
-    assert (directory / "summary.json").read_bytes() == stable_bytes
-    assert len(list((directory / "summary_history").iterdir())) == 1
-
-
-def test_controller_accounting_includes_prior_license_submission_queues() -> None:
-    """Derive queue duration only from exact root accounting rows."""
-    scheduler = {
-        "sacct": {
-            "error": None,
-            "output": (
-                "101|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05|2026-08-19T00:01:00\n"
-                "102|COMPLETED|0:0|2026-08-19T00:02:00|2026-08-19T00:02:07|2026-08-19T00:03:00\n"
-                "102.batch|COMPLETED|0:0|2026-08-19T00:02:00|2026-08-19T00:02:07|2026-08-19T00:03:00\n"
-                "103|RUNNING|0:0|2026-08-19T00:04:00|2026-08-19T00:04:02|Unknown"
-            ),
-        }
-    }
-    assert generation.benchmark._accounted_queue_seconds(scheduler, ["101", "102"]) == 12.0
-    assert generation.benchmark._accounted_queue_seconds(scheduler, ["101", "999"]) is None
-    assert generation.benchmark._accounted_queue_seconds(scheduler, ["103"]) is None
-
-
-def test_historical_success_attempt_without_success_record_remains_pending(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Require published success evidence before counting a terminal attempt as success."""
-    suite = _synthetic_suite(generation_config_factory)
-    variant = suite.canary_variant()
-    directory = generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=tmp_path)
-    attempt = directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, 1) / "attempt-0001.json"
-    attempt.parent.mkdir(parents=True)
-    attempt.write_text('{"status": "success"}\n', encoding="utf-8")
-    monkeypatch.setattr(generation.benchmark, "_validate_success_result", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(generation.benchmark, "_load_benchmark_license_wait", lambda *_args, **_kwargs: None)
-    records = generation.benchmark._result_records(directory, suite)
-    record = next(item for item in records if item["work_unit_id"] == suite.work_unit_id(variant, 1))
-    assert record["status"] == "pending"
-
-
-def test_benchmark_worker_calls_shared_executor_and_keeps_its_duration(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Admit a successful measurement without a Slurm start-time environment."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    variant = suite.canary_variant()
-    representative = suite.representative_case(1)
-    proof = {
-        "case_input_id": "d" * 64,
-        "simulation_case_id": "e" * 64,
-        "scientific_config_digest": suite.case_config.scientific_config_digest,
-        "canonical_input_preparation_seconds": 0.25,
-    }
-    manifest = {
-        "benchmark_run_id": _RUN_ID,
-        "git_commit": _COMMIT,
-        "preflight": {"receipt_sha256": "f" * 64},
-        "submission_history": [
-            {
-                "role": "measure",
-                "job_id": "123",
-                "variant_id": variant.variant_id,
-                "case_role": representative.case_role,
-                "work_unit_id": suite.work_unit_id(variant, 1),
-                "submitted_at": "2026-08-19T00:00:00+00:00",
-            }
-        ],
-    }
-    output = tmp_path / "case.h5"
-    output.write_bytes(b"synthetic")
-    log = tmp_path / "solver.log"
-    log.write_text("solver completed\n", encoding="utf-8")
-    prepared = SimpleNamespace(work_directory=tmp_path / "work")
-    result = SimpleNamespace(
-        canonical_case=SimpleNamespace(path=output),
-        command=("comsol", "-np", str(variant.cores_per_case)),
-        timing={
-            "runtime_s": 99.0,
-            "comsol_process_seconds": 12.5,
-            "export_conversion_s": 7.0,
-            "export_conversion_seconds": 1.0,
-            "scratch_peak_bytes": 2,
-            "started_at": "2026-08-19T00:00:10+00:00",
-            "ended_at": "2026-08-19T00:00:22+00:00",
-        },
-        solver_log=log,
-    )
-    calls: list[object] = []
-    monkeypatch.delenv("SLURM_JOB_START_TIME", raising=False)
-    monkeypatch.setenv("SLURM_JOB_ID", "123")
-    monkeypatch.setenv("SLURM_CPUS_PER_TASK", str(variant.cores_per_case))
-    monkeypatch.setattr(generation.benchmark, "load_core_benchmark_manifest", lambda *_args, **_kwargs: (manifest, suite))
-    monkeypatch.setattr(generation.benchmark, "_require_current_checkout", lambda *_args: None)
-    monkeypatch.setattr(generation.benchmark.source_service, "required_git_commit", lambda: _COMMIT)
-    monkeypatch.setattr(generation.benchmark, "_load_case_proof", lambda *_args, **_kwargs: proof)
-    monkeypatch.setattr(generation.benchmark.preparation_service, "prepare_case_work_directory", lambda *_args, **_kwargs: prepared)
-    monkeypatch.setattr(generation.benchmark, "_proof_payload", lambda *_args, **_kwargs: proof)
-    monkeypatch.setattr(generation.benchmark, "_validate_materialized_case_proof", lambda *_args: None)
-    monkeypatch.setattr(generation.benchmark.runtime_service, "execute_prepared_case", lambda *_args, **_kwargs: calls.append(1) or result)
-    monkeypatch.setattr(generation.benchmark.storage_service, "validate_case_hdf5", lambda *_args, **_kwargs: dict(proof))
-    monkeypatch.setattr(generation.benchmark, "_validate_hdf5_scientific_identity", lambda *_args: None)
-    monkeypatch.setattr(generation.benchmark, "_benchmark_peak_child_memory_bytes", lambda: 0)
-    monkeypatch.setattr(generation.benchmark, "_cleanup_prepared", lambda *_args, **_kwargs: 0)
-    record = generation.benchmark.run_core_benchmark_case(
-        _RUN_ID,
-        variant.variant_id,
-        representative.case_role,
-        storage_root=storage,
-        work_root=tmp_path / "work-root",
-    )
-    assert calls == [1]
-    assert record["timings_seconds"]["comsol_process_seconds"] == 12.5
-    assert record["timings_seconds"]["export_conversion_seconds"] == 1.0
-    assert record["timings_seconds"]["scheduler_queue_seconds"] is None
-    accounting = generation.benchmark._controller_scheduler_queue_accounting(
-        manifest,
-        [record],
-        {"sacct": {"error": None, "output": "123|COMPLETED|0:0|2026-08-19T00:00:00|2026-08-19T00:00:05"}},
-    )
-    assert accounting[0]["slurm_job_id"] == "123"
-    assert record["worker_interval"]["slurm_job_start_time"]["status"] == "unavailable"
-
-
-def test_resource_change_preserves_both_case_identities(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """Keep resource variants outside both canonical scientific identities."""
-    suite = _synthetic_suite(generation_config_factory)
-    baseline_variant = suite.variant("cores_04")
-    changed_variant = replace(baseline_variant, cores_per_case=8)
-    for position, representative in enumerate(suite.representative_cases, start=1):
-        baseline = generation.cases.case.generate_case_input_bundle(
-            suite.case_config,
-            representative.case_index,
-            tmp_path / f"baseline-{position}",
-        )
-        changed = generation.cases.case.generate_case_input_bundle(
-            suite.case_config,
-            representative.case_index,
-            tmp_path / f"changed-{position}",
-        )
-        assert changed.case_input_id == baseline.case_input_id
-        assert changed.simulation_case_id == baseline.simulation_case_id
-        assert changed.case_payload == baseline.case_payload
-    assert suite.execution_id(changed_variant) != suite.execution_id(baseline_variant)
-
-
-@pytest.mark.parametrize("cases_per_material", [1, 3, 5])
-def test_maintained_benchmark_is_independent_of_mutable_pilot_count(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-    cases_per_material: int,
-) -> None:
-    """Resolve the same benchmark owner around valid test-owned pilot counts."""
-    test_project_root = common.paths.get_project_root()
-    repository = Path(__file__).resolve().parents[2]
-    suite_path = repository / "configs/generation/benchmarks/transient_core_scaling/suite.yaml"
-    monkeypatch.setenv("PROJECT_ROOT", str(repository))
-    before = benchmark_config.load_core_benchmark_suite(
-        suite_path,
-        require_executable=False,
-    )
-    pilot_path = _test_owned_pilot_campaign(
-        generation_config_factory,
-        cases_per_material=cases_per_material,
-    )
-    monkeypatch.setenv("PROJECT_ROOT", str(test_project_root))
-    pilot = generation.cases.config.load_campaign_config(
-        pilot_path,
-        require_executable=False,
-    )
-    monkeypatch.setenv("PROJECT_ROOT", str(repository))
-    after = benchmark_config.load_core_benchmark_suite(
-        suite_path,
-        require_executable=False,
-    )
-
-    assert pilot.total_case_count == cases_per_material
-    assert before.suite_digest == after.suite_digest
-    assert before.case_campaign_path == after.case_campaign_path
-    assert before.case_campaign_path != pilot.source_path
-    assert [case.case_index for case in after.representative_cases] == [1, 2]
-
-
-def test_sequence_and_slurm_jobs_use_same_cases_in_each_wave(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Order both production cases first and encode readable case-role jobs."""
-    suite = _synthetic_suite(generation_config_factory)
-    sequence = generation.benchmark._measured_sequence(suite)
-    assert [variant.cores_per_case for variant, _position in sequence] == [
-        16,
-        16,
-        4,
-        4,
-        8,
-        8,
-        32,
-        32,
-    ]
-    assert [position for _variant, position in sequence] == [1, 2] * 4
-    project_root = common.paths.get_project_root()
-    runtime = common.paths.get_runtime_root().resolve()
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", "a" * 40)
-    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "b" * 64)
-    monkeypatch.setenv("GENERATION_NATIVE_VENV", str(runtime / "venvs" / "native"))
-    launcher = project_root / "scripts/generation_node.sh"
-    source_launcher = Path(__file__).resolve().parents[2] / "scripts/generation_node.sh"
-    launcher.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_launcher, launcher)
-    command = generation.benchmark.build_core_benchmark_slurm_command(
-        suite,
-        run_id=_RUN_ID,
-        storage_root=tmp_path.resolve(),
-        log_directory=(tmp_path / "logs").resolve(),
-        variant=suite.canary_variant(),
-        case_position=2,
-    )
-    assert any(value.startswith("--job-name=td-bench-c16-nat-") for value in command)
-    assert not any(value.startswith("--licenses") for value in command)
-    assert f"--output={runtime}/logs/generation/slurm-%j.out" in command
-    wrapped = shlex.split(command[-1].removeprefix("--wrap="))
-    assert f"STORAGE_ROOT={tmp_path.resolve()}" in wrapped
-    assert "GENERATION_SOURCE_SHA256=" + "b" * 64 in wrapped
-    assert wrapped[-6:] == [
-        str(launcher),
-        str(project_root),
-        "benchmark-case",
-        _RUN_ID,
-        "cores_16",
-        "natural",
-    ]
-
-
-def test_benchmark_attempt_history_is_append_only_and_hash_chained(
-    tmp_path: Path,
-) -> None:
-    """Bind scientific retries to the immutable immediately preceding receipt."""
-    stable = {
-        "schema_version": 1,
-        "benchmark_run_id": _RUN_ID,
-        "suite_digest": "1" * 64,
-        "variant_id": "cores_16",
-        "execution_id": "execution-16",
-        "case_position": 1,
-        "case_role": "nominal",
-        "work_unit_id": "work-unit",
-        "git_commit": _COMMIT,
-        "case_input_id": "2" * 64,
-        "simulation_case_id": "3" * 64,
-        "scientific_config_digest": "4" * 64,
-        "template_sha256": "5" * 64,
-        "benchmark_preflight_sha256": "6" * 64,
-        "cores_per_case": 16,
-    }
-    first_path = common.serialization.atomic_write_json(
-        tmp_path / "attempt-0001.json",
-        {**stable, "attempt": 1, "previous_attempt": None},
-    )
-    second_path = common.serialization.atomic_write_json(
-        tmp_path / "attempt-0002.json",
-        {
-            **stable,
-            "attempt": 2,
-            "previous_attempt": {
-                "attempt": 1,
-                "receipt_sha256": common.serialization.file_sha256(first_path),
-            },
-        },
-    )
-    generation.benchmark._validate_benchmark_attempt_chain((first_path, second_path))
-    changed = json.loads(second_path.read_text(encoding="utf-8"))
-    changed["case_input_id"] = "9" * 64
-    common.serialization.atomic_write_json(second_path, changed)
-    with pytest.raises(ValueError, match="identity changed"):
-        generation.benchmark._validate_benchmark_attempt_chain((first_path, second_path))
-
-
-def test_preflight_is_standalone_and_plans_eight_commands(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Run benchmark-owned preflight without Smoke or a preparation job."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    scratch = tmp_path / "scratch"
-    storage.mkdir()
-    scratch.mkdir()
-    executable = tmp_path / "comsol"
-    executable.write_text("synthetic", encoding="utf-8")
-    executable.chmod(0o700)
-    monkeypatch.setattr(generation.benchmark, "_repository_commit", lambda: _COMMIT)
-    monkeypatch.setattr(generation.benchmark, "_require_clean_repository", lambda: None)
-    monkeypatch.setattr(
-        benchmark_config,
-        "load_core_benchmark_suite",
-        lambda *_args, **_kwargs: suite,
-    )
-    planned_commands: list[tuple[str, int]] = []
-
-    def command(
-        *_args: Any,
-        variant: Any,
-        case_position: int,
-        **_kwargs: Any,
-    ) -> list[str]:
-        planned_commands.append((variant.variant_id, case_position))
-        return ["sbatch", variant.variant_id, str(case_position)]
-
-    monkeypatch.setattr(
-        generation.benchmark,
-        "build_core_benchmark_slurm_command",
-        command,
-    )
-    receipt = generation.benchmark.preflight_core_benchmark(
-        suite.source_path,
-        git_commit=_COMMIT,
-        storage_root=storage,
-        scratch_root=scratch,
-        comsol_version_output="COMSOL Multiphysics 6.4",
-        comsol_executable_path=executable,
-    )
-    assert receipt["checks"]["clean_exact_source"] == "pass"
-    assert len(planned_commands) == 8
-    assert len(set(planned_commands)) == 8
-    assert not (storage / "01_generation/meta/real_smoke").exists()
-
-
-def test_input_preparation_creates_two_proofs_and_submits_nothing(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Materialize both canonical inputs before measured-case submission."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    wave_order = suite.variant_wave_order()
-    plan = {
-        "benchmark_run_id": _RUN_ID,
-        "git_commit": _COMMIT,
-        "preflight": {},
-        "variant_wave_order": [variant.variant_id for variant in wave_order],
-        "canary_wave": {},
-        "measurement_waves": [],
-        "required_successful_measurements": 8,
-    }
-    monkeypatch.setattr(generation.benchmark, "plan_core_benchmark", lambda *_args, **_kwargs: plan)
-    monkeypatch.setattr(
-        benchmark_config,
-        "load_core_benchmark_suite",
-        lambda *_args, **_kwargs: suite,
-    )
-    monkeypatch.setattr(benchmark_config, "repository_relative", lambda path: path.name)
-
-    def materialize(
-        observed_run_id: str,
-        *,
-        storage_root: Path,
-        work_root: Path,
-    ) -> tuple[Path, ...]:
-        assert observed_run_id == _RUN_ID
-        assert Path(work_root) == tmp_path / "scratch"
-        directory = generation.benchmark.core_benchmark_directory(
-            observed_run_id,
-            storage_root=storage_root,
-        )
-        paths = []
-        for representative in suite.representative_cases:
-            target = directory / "canonical_cases" / f"{representative.case_role}.json"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text("{}\n", encoding="utf-8")
-            paths.append(target)
-        return tuple(paths)
-
-    monkeypatch.setattr(generation.benchmark, "_materialize_core_benchmark_inputs", materialize)
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_submit",
-        lambda *_args, **_kwargs: pytest.fail("input preparation submitted Slurm work"),
-    )
-    manifest = generation.benchmark.prepare_core_benchmark(
-        suite.source_path,
-        git_commit=_COMMIT,
-        storage_root=storage,
-        scratch_root=tmp_path / "scratch",
-        comsol_version_output="COMSOL Multiphysics 6.4",
-        comsol_executable_path=tmp_path / "comsol",
-    )
-    assert manifest["state"] == "inputs_ready"
-    assert manifest["measured_job_ids"] == []
-    assert manifest["submission_history"] == []
-    assert not (generation.benchmark.core_benchmark_directory(_RUN_ID, storage_root=storage) / "scheduler").exists()
-    assert len(tuple((storage / "01_generation/meta/performance_benchmarks/core_scaling" / _RUN_ID / "canonical_cases").glob("*.json"))) == 2
-
-
-def test_submitter_runs_two_cases_concurrently_and_holds_later_waves(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Submit both canary cases, then only the next wave after both succeed."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    _prepare_submission_test(suite, storage, monkeypatch)
-    records = _pending_records(suite)
-    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args: records)
-    job_ids = iter(("501", "502", "503", "504"))
-    monkeypatch.setattr(generation.benchmark, "_submit", lambda *_args, **_kwargs: next(job_ids))
-    manifest = generation.benchmark._submit_pending(
-        _minimal_manifest(),
-        suite,
-        storage=storage,
-    )
-    assert [item["case_role"] for item in manifest["submission_history"]] == [
-        "nominal",
-        "natural",
-    ]
-    assert {item["variant_id"] for item in manifest["submission_history"]} == {"cores_16"}
-    successful = frozenset({("cores_16", "nominal"), ("cores_16", "natural")})
-    records[:] = _pending_records(suite, successful=successful)
-    manifest = generation.benchmark._submit_pending(manifest, suite, storage=storage)
-    assert [item["variant_id"] for item in manifest["submission_history"]] == [
-        "cores_16",
-        "cores_16",
-        "cores_04",
-        "cores_04",
-    ]
-
-
-def test_partial_wave_resume_submits_only_missing_case(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reuse a valid success and submit no duplicate work unit."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    _prepare_submission_test(suite, storage, monkeypatch)
-    successful = frozenset({("cores_16", "nominal")})
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_result_records",
-        lambda *_args: _pending_records(suite, successful=successful),
-    )
-    submitted: list[str] = []
-
-    def submit(command: list[str], **_kwargs: Any) -> str:
-        submitted.append(command[-1])
-        return "701"
-
-    monkeypatch.setattr(generation.benchmark, "_submit", submit)
-    manifest = _minimal_manifest()
-    nominal = suite.representative_case(1)
-    manifest["measured_job_ids"] = ["700"]
-    manifest["submission_history"] = [
-        {
-            "submitted_at": datetime.now(timezone.utc).isoformat(),
-            "role": "measure",
-            "variant_id": "cores_16",
-            "case_position": 1,
-            "case_role": nominal.case_role,
-            "work_unit_id": suite.work_unit_id(suite.canary_variant(), 1),
-            "command": ["sbatch"],
-            "job_id": "700",
-        }
-    ]
-    result = generation.benchmark._submit_pending(manifest, suite, storage=storage)
-    assert submitted == ["2"]
-    assert [item["case_role"] for item in result["submission_history"]] == [
-        "nominal",
-        "natural",
-    ]
-
-
-def test_first_wave_failure_is_canary_failure_without_extra_solve(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Block later waves after either final canary measurement exhausts attempts."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    directory = _prepare_submission_test(suite, storage, monkeypatch)
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_result_records",
-        lambda *_args: _pending_records(suite),
-    )
-    failed = directory / "runs" / suite.execution_id(suite.canary_variant()) / suite.work_unit_id(suite.canary_variant(), 1) / "attempt-0001.json"
-    failed.parent.mkdir(parents=True, exist_ok=True)
-    failed.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_scientific_failure_count",
-        lambda attempts: suite.maximum_work_unit_attempts if attempts else 0,
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_submit",
-        lambda *_args, **_kwargs: pytest.fail("submitted work after canary failure"),
-    )
-    manifest = generation.benchmark._submit_pending(
-        _minimal_manifest(),
-        suite,
-        storage=storage,
-    )
-    assert manifest["state"] == "canary_failed"
-    assert manifest["submission_history"] == []
-
-
-def test_source_admission_failure_does_not_exhaust_benchmark_scientific_retries(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A changed source remains operational evidence and permits resubmission."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    directory = _prepare_submission_test(suite, storage, monkeypatch)
-    variant = suite.canary_variant()
-    representative = suite.representative_case(1)
-    attempt_path = directory / "runs" / suite.execution_id(variant) / suite.work_unit_id(variant, 1) / "attempt-0001.json"
-    attempt_path.parent.mkdir(parents=True, exist_ok=True)
-    attempt_path.write_text(
-        json.dumps(
-            {
-                "attempt": 1,
-                "previous_attempt": None,
-                "status": "failed",
-                "error": {"type": "SourceAdmissionError", "message": "source changed"},
-            }
-        ),
-        encoding="utf-8",
-    )
-    records = _pending_records(suite)
-    records[0]["status"] = "failed"
-    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args: records)
-    submitted: list[str] = []
-
-    def submit(command: list[str], **_kwargs: Any) -> str:
-        submitted.append(command[-1])
-        return str(800 + len(submitted))
-
-    monkeypatch.setattr(generation.benchmark, "_submit", submit)
-    manifest = generation.benchmark._submit_pending(_minimal_manifest(), suite, storage=storage)
-
-    assert generation.benchmark._scientific_failure_count((attempt_path,)) == 0
-    assert manifest["state"] == "running"
-    assert representative.case_role in [record["case_role"] for record in manifest["submission_history"]]
-    assert submitted
-
-
-def test_license_block_waits_and_retries_without_manual_variant(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep capacity waits operational and retry both eligible work units."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    storage.mkdir()
-    _prepare_submission_test(suite, storage, monkeypatch)
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_result_records",
-        lambda *_args: _pending_records(suite),
-    )
-    wait = {"retry_budget_remaining": True}
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_load_benchmark_license_wait",
-        lambda *_args, **_kwargs: wait,
-    )
-    monkeypatch.setattr(
-        generation.benchmark.license_service,
-        "wait_record_is_eligible",
-        lambda _wait: False,
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_submit",
-        lambda *_args, **_kwargs: pytest.fail("submitted before license wait elapsed"),
-    )
-    manifest = generation.benchmark._submit_pending(
-        _minimal_manifest(),
-        suite,
-        storage=storage,
-    )
-    assert manifest["state"] == "license_blocked"
-    monkeypatch.setattr(
-        generation.benchmark.license_service,
-        "wait_record_is_eligible",
-        lambda _wait: True,
-    )
-    job_ids = iter(("801", "802"))
-    monkeypatch.setattr(generation.benchmark, "_submit", lambda *_args, **_kwargs: next(job_ids))
-    resumed = generation.benchmark._submit_pending(manifest, suite, storage=storage)
-    assert [item["case_role"] for item in resumed["submission_history"]] == [
-        "nominal",
-        "natural",
-    ]
-
-
-def test_license_only_attempt_retains_wait_not_runtime_attempt(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Retain probe and queue time without creating a successful observation."""
-    suite = _synthetic_suite(generation_config_factory)
-    directory = generation.benchmark.core_benchmark_directory(
-        _RUN_ID,
-        storage_root=tmp_path,
-    )
-    work_unit = directory / "runs" / suite.execution_id(suite.canary_variant()) / suite.work_unit_id(suite.canary_variant(), 1)
-    work_unit.mkdir(parents=True)
-    monkeypatch.setattr(
-        generation.benchmark.license_service,
-        "bounded_retry_delay_seconds",
-        lambda _policy, **_kwargs: 0.0,
-    )
-    evidence = generation.runtime.license.TemporaryLicenseCapacityClassification(
-        classification=generation.runtime.license.TEMPORARY_LICENSE_CAPACITY,
-        feature="COMSOL",
-        license_code="-4",
-        matched_signatures=("licensed number of users already reached",),
-        raw_excerpt="temporary capacity",
-    )
-    error = generation.runtime.license.TemporaryLicenseCapacityError(
-        "capacity unavailable",
-        work_directory=tmp_path / "work",
-        command=("comsol",),
-        evidence=evidence,
-        exit_code=1,
-        solver_progress_started=False,
-        expected_exports_exist=False,
-    )
-    wait = generation.benchmark._record_benchmark_license_wait(
-        directory,
-        suite,
-        suite.canary_variant(),
-        1,
-        error,
-        run_id=_RUN_ID,
-        job_id="1234",
-        license_probe_seconds=2.5,
-        scheduler_queue_seconds=7.0,
-    )
-    assert wait["cumulative_probe_seconds"] == 2.5
-    assert wait["cumulative_scheduler_queue_seconds"] == 7.0
-    assert wait["retry_budget_remaining"] is False
-    assert not tuple(work_unit.glob("attempt-*.json"))
-
-
-def test_summary_uses_only_successful_comsol_runtime_for_ranking(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep queue, license, conversion, and publication out of recommendation."""
-    suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
-    runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    baseline = benchmark_report.summarize_core_benchmark_results(
-        suite,
-        _success_records(suite, runtimes),
-    )
-    delayed = benchmark_report.summarize_core_benchmark_results(
-        suite,
-        _success_records(
-            suite,
-            runtimes,
-            queue_seconds=10000.0,
-            license_wait_seconds=5000.0,
-            license_probe_seconds=100.0,
-            license_blocks=3,
-        ),
-    )
-    assert baseline["fastest_single_case_cores"] == 32
-    assert baseline["lowest_core_hours_cores"] == 4
-    assert baseline["recommended_cores_per_case"] == 4
-    assert baseline["recommended_estimated_cases_per_node"] == 8
-    assert delayed["recommended_cores_per_case"] == baseline["recommended_cores_per_case"]
-    four = baseline["variants"][0]
-    assert four["median_core_hours_per_case"] == pytest.approx(4 * 100 / 3600)
-    assert four["estimated_cases_per_node_hour"] == pytest.approx(8 * 3600 / 100)
-    assert four["resource_feasibility"] == "operator_review_required"
-
-
-def test_resource_infeasible_variant_cannot_be_recommended(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Exclude projected node packing that exceeds an authoritative limit."""
-    suite = replace(
-        _synthetic_suite(generation_config_factory),
-        node_memory_limit_bytes=100,
-        node_scratch_limit_bytes=1000,
-    )
-    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
-    runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = benchmark_report.summarize_core_benchmark_results(
-        suite,
-        _success_records(suite, runtimes, peak_memory_bytes=20),
-    )
-    assert summary["variants"][0]["memory_feasibility"] == "fail"
-    assert summary["recommended_cores_per_case"] == 8
-
-
-def test_five_percent_tie_is_deterministic(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Break exact throughput and core-hour ties toward fewer cores."""
-    suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
-    runtimes = {4: (100.0, 100.0), 8: (50.0, 50.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = benchmark_report.summarize_core_benchmark_results(
-        suite,
-        _success_records(suite, runtimes),
-    )
-    assert summary["variants"][0]["estimated_cases_per_node_hour"] == summary["variants"][1]["estimated_cases_per_node_hour"]
-    assert summary["variants"][0]["median_core_hours_per_case"] == summary["variants"][1]["median_core_hours_per_case"]
-    assert summary["recommended_cores_per_case"] == 4
-
-
-def test_license_overlap_qualification_does_not_change_compute_metrics(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Report absent overlap separately from compute-only performance."""
-    suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
-    runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    summary = benchmark_report.summarize_core_benchmark_results(
-        suite,
-        _success_records(
-            suite,
-            runtimes,
-            license_blocks=1,
-            license_wait_seconds=30.0,
-            overlap=False,
-        ),
-    )
-    assert summary["recommended_cores_per_case"] == 4
-    assert summary["license_qualification"] == ("compute recommendation valid; concurrent-license observation incomplete")
-    assert all(record["observed_peak_solver_concurrency"] == 1 for record in summary["variants"])
-
-
-def test_markdown_summary_loader_reads_only_persisted_canonical_bytes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Print the validated Markdown artifact and fail closed on drift or absence."""
-    directory = generation.benchmark.core_benchmark_directory(
-        _RUN_ID,
-        storage_root=tmp_path,
-    )
-    directory.mkdir(parents=True)
-    summary = {"benchmark_run_id": _RUN_ID}
-    expected = "# Persisted benchmark summary\n"
-    monkeypatch.setattr(
-        generation.benchmark,
-        "load_core_benchmark_summary",
-        lambda *_args, **_kwargs: summary,
-    )
-    monkeypatch.setattr(
-        benchmark_report,
-        "core_benchmark_markdown",
-        lambda _summary: expected,
-    )
-    summary_path = directory / "summary.md"
-    summary_path.write_text(expected, encoding="utf-8")
-
-    assert (
-        generation.benchmark.load_core_benchmark_markdown(
-            _RUN_ID,
-            storage_root=tmp_path,
-        )
-        == expected
-    )
-
-    summary_path.write_text("# Drifted summary\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="inconsistent"):
-        generation.benchmark.load_core_benchmark_markdown(
-            _RUN_ID,
-            storage_root=tmp_path,
-        )
-    summary_path.unlink()
-    with pytest.raises(ValueError, match="missing or unsafe"):
-        generation.benchmark.load_core_benchmark_markdown(
-            _RUN_ID,
-            storage_root=tmp_path,
-        )
-
-
-def test_completed_status_exposes_the_persisted_validated_summary(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Project final persisted benchmark evidence through read-only status."""
-    suite = _synthetic_suite(generation_config_factory)
-    storage = tmp_path / "storage"
-    directory = generation.benchmark.core_benchmark_directory(
-        _RUN_ID,
-        storage_root=storage,
-    )
-    for representative in suite.representative_cases:
-        proof = generation.benchmark._canonical_case_proof_path(
-            directory,
-            representative,
-        )
-        proof.parent.mkdir(parents=True, exist_ok=True)
-        proof.write_text("{}\n", encoding="utf-8")
-    markdown = "# Validated benchmark\n\nRecommended: 4 cores.\n"
-    (directory / "summary.md").write_text(markdown, encoding="utf-8")
-    records = _success_records(
-        suite,
-        {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)},
-    )
-    manifest = {
-        **_minimal_manifest(),
-        "state": "complete",
-        "suite_config": str(suite.source_path),
-    }
-    summary = {
-        "fastest_single_case_cores": 32,
-        "lowest_core_hours_cores": 4,
-        "recommended_cores_per_case": 4,
-        "recommended_production": {
-            "estimated_cases_per_node": 8,
-            "estimated_cases_per_node_hour": 288.0,
-        },
-        "license_qualification": "concurrent-license execution observed",
-    }
-    monkeypatch.setattr(
-        generation.benchmark,
-        "load_core_benchmark_manifest",
-        lambda *_args, **_kwargs: (manifest, suite),
-    )
-    monkeypatch.setattr(generation.benchmark, "_result_records", lambda *_args, **_kwargs: records)
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_benchmark_work_unit_views",
-        lambda *_args, **_kwargs: [{**record, "state": "successful", "runtime_progress": None} for record in records],
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_controller_scheduler_queue_accounting",
-        lambda *_args, **_kwargs: [],
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_completed_wave_evaluation",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "load_core_benchmark_summary",
-        lambda *_args, **_kwargs: summary,
-    )
-    monkeypatch.setattr(
-        benchmark_report,
-        "core_benchmark_markdown",
-        lambda _summary: markdown,
-    )
-
-    status = generation.benchmark.core_benchmark_status(
-        _RUN_ID,
-        storage_root=storage,
-        query_scheduler=False,
-    )
-
-    assert status["state"] == "complete"
-    assert status["final_summary"] == {
-        "path": str(directory / "summary.md"),
-        "markdown": markdown,
-        "fastest_single_case_cores": 32,
-        "lowest_core_hours_cores": 4,
-        "recommended_cores_per_case": 4,
-        "estimated_cases_per_node": 8,
-        "estimated_compute_only_cases_per_node_hour": 288.0,
-        "license_qualification": "concurrent-license execution observed",
-    }
-
-    (directory / "summary.md").unlink()
-    with pytest.raises(ValueError, match="missing or unsafe"):
-        generation.benchmark.core_benchmark_status(
-            _RUN_ID,
-            storage_root=storage,
-            query_scheduler=False,
-        )
-
-
-def test_valid_success_evidence_overrides_prior_license_warning() -> None:
-    """Admit bounded warning evidence only when terminal success is authoritative."""
-    result = {
-        "solver_interval": {
-            "started_at": "2026-08-19T00:00:00+00:00",
-            "ended_at": "2026-08-19T00:00:01+00:00",
-        },
-        "license": {
-            "license_blocked_submission_count": 1,
-            "license_wait_seconds": 60.0,
-            "license_probe_seconds": 1.0,
-            "scheduler_queue_seconds_before_success": 2.0,
-            "detected_feature": "COMSOL",
-            "detected_error_code": "-4",
-            "matched_signatures": ["licensed number of users already reached"],
-            "raw_excerpt": "temporary capacity",
-            "successful_artifacts_override_prior_warning": True,
-        },
-        "solver_log": {
-            "sha256": "a" * 64,
-            "size_bytes": 10,
-            "excerpt": "warning then success",
-            "excerpt_truncated": False,
-        },
-    }
-    generation.benchmark._validate_success_support_evidence(
-        result,
-        work_unit_id="synthetic",
-    )
-    result["license"]["successful_artifacts_override_prior_warning"] = False
-    with pytest.raises(ValueError, match="success precedence"):
-        generation.benchmark._validate_success_support_evidence(
-            result,
-            work_unit_id="synthetic",
-        )
-
-
-def test_benchmark_cancellation_targets_only_owned_active_jobs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Persist cancellation before targeting exact pending and running jobs."""
-    storage = tmp_path / "storage"
-    directory = generation.benchmark.core_benchmark_directory(
-        _RUN_ID,
-        storage_root=storage,
-    )
-    directory.mkdir(parents=True)
-    manifest = _minimal_manifest()
-    manifest["measured_job_ids"] = ["501", "502"]
-    monkeypatch.setattr(
-        generation.benchmark,
-        "load_core_benchmark_manifest",
-        lambda *_args, **_kwargs: (manifest, object()),
-    )
-    monkeypatch.setattr(
-        generation.benchmark,
-        "_scheduler_evidence",
-        lambda _job_ids: {
-            "squeue": {
-                "output": "501|PENDING|Resources\n502|RUNNING|node01",
-                "error": None,
-            },
-            "sacct": {"output": "", "error": None},
-        },
-    )
-    commands: list[list[str]] = []
-
-    def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        commands.append(command)
-        assert (directory / "cancellations.json").is_file()
-        assert manifest["state"] == "cancel_requested"
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(generation.benchmark.subprocess, "run", run)
-    generation.benchmark.cancel_core_benchmark(_RUN_ID, storage_root=storage)
-    assert commands == [
-        ["scancel", "501"],
-        ["scancel", "--signal=TERM", "--batch", "502"],
-    ]
-
-
-def test_benchmark_work_units_use_disjoint_scheduler_and_submission_states(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """Separate running jobs, Slurm PENDING jobs, and unsubmitted future waves."""
-    suite = _synthetic_suite(generation_config_factory)
-    records = _pending_records(suite)
-    current = suite.variant_wave_order()[0]
-    submissions = []
-    rows = []
-    for position, job_id in enumerate(("501", "502"), start=1):
-        representative = suite.representative_case(position)
-        submissions.append(
-            {
-                "role": "measure",
-                "job_id": job_id,
-                "variant_id": current.variant_id,
-                "case_role": representative.case_role,
-                "work_unit_id": suite.work_unit_id(current, position),
-            }
-        )
-        state = "RUNNING" if position == 1 else "PENDING"
-        rows.append(f"{job_id}|{state}|None|node-a|00:01:00")
-    manifest = {"benchmark_run_id": _RUN_ID, "submission_history": submissions}
-    scheduler = {"squeue": {"output": "\n".join(rows), "error": None}, "sacct": {"output": "", "error": None}}
-    directory = tmp_path / "benchmark"
-    directory.mkdir()
-
-    views = generation.benchmark._benchmark_work_unit_views(manifest, records, scheduler, directory=directory, suite=suite)
-    counts = {
-        state: sum(view["state"] == state for view in views)
-        for state in ("successful", "running", "scheduler_pending", "license_blocked", "never_started", "failed")
-    }
-    assert counts == {
-        "successful": 0,
-        "running": 1,
-        "scheduler_pending": 1,
-        "license_blocked": 0,
-        "never_started": 6,
-        "failed": 0,
-    }
-    assert sum(counts.values()) == len(views) == 8
-    running = next(view for view in views if view["state"] == "running")
-    assert running["runtime_progress"]["reason"] == "not_reported"
-
-
-def test_partial_evaluation_uses_only_complete_waves(
-    generation_config_factory: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep incomplete waves out of provisional and final recommendations."""
-    suite = _synthetic_suite(generation_config_factory)
-    monkeypatch.setattr(benchmark_report, "_production_interpretation", lambda _suite: _production())
-    runtimes = {4: (100.0, 100.0), 8: (60.0, 60.0), 16: (40.0, 40.0), 32: (30.0, 30.0)}
-    successes = _success_records(suite, runtimes, queue_seconds=999.0, license_wait_seconds=888.0)
-    successful_by_unit = {record["work_unit_id"]: record for record in successes}
-    pending = _pending_records(suite)
-    manifest = {"submission_history": []}
-    scheduler = {"squeue": {"output": "", "error": None}, "sacct": {"output": "", "error": None}}
-    assert generation.benchmark._completed_wave_evaluation(suite, manifest, pending, scheduler) is None
-
-    first_two = {variant.variant_id for variant in suite.variant_wave_order()[:2]}
-    one_complete = [
-        successful_by_unit[record["work_unit_id"]] if record["variant_id"] == suite.variant_wave_order()[0].variant_id else record
-        for record in pending
-    ]
-    one = generation.benchmark._completed_wave_evaluation(suite, manifest, one_complete, scheduler)
-    assert one is not None
-    assert one["completed_wave_count"] == 1
-    assert len(one["variants"]) == 1
-    assert one["final_recommendation_available"] is False
-
-    two_complete = [successful_by_unit[record["work_unit_id"]] if record["variant_id"] in first_two else record for record in pending]
-    two = generation.benchmark._completed_wave_evaluation(suite, manifest, two_complete, scheduler)
-    assert two is not None
-    assert two["completed_wave_count"] == 2
-    assert {record["variant_id"] for record in two["variants"]} == first_two
-    assert two["recommended_cores_per_case"] in {variant.cores_per_case for variant in suite.variant_wave_order()[:2]}
-    assert two["final_recommendation_available"] is False
-
-    complete = generation.benchmark._completed_wave_evaluation(suite, manifest, successes, scheduler)
-    assert complete is not None
-    assert complete["completed_wave_count"] == 4
-    assert complete["final_recommendation_available"] is True
+    evidence = benchmark._slurm_scheduler_start_time_evidence()
+    assert (evidence["status"], evidence["started_at"]) == (status, started_at)
+
+
+def test_unit_success_needs_evidence_and_a_zero_exit_like_the_worker_target() -> None:
+    """Evidence then a failed exit is a failure the worker replaced; a zero exit without evidence fails after the grace."""
+    now = datetime.now(UTC)
+
+    def receipt(exit_code: int, seconds_ago: float) -> dict[str, Any]:
+        return {"outcome": "exited", "exit_code": exit_code, "ended_at": (now - timedelta(seconds=seconds_ago)).isoformat()}
+
+    success = {"status": "success", "work_unit_id": "u"}
+    pending = {"status": "pending", "work_unit_id": "u"}
+    assert benchmark._unit_outcome(success, receipt(0, 5), None, step_rows_known=True) == "success"
+    assert benchmark._unit_outcome(success, receipt(1, 5), None, step_rows_known=True) == "failed"
+    assert benchmark._unit_outcome(pending, receipt(0, 10), None, step_rows_known=True) == "pending"
+    assert benchmark._unit_outcome(pending, receipt(0, 600), None, step_rows_known=True) == "failed_without_evidence"

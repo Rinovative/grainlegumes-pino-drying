@@ -1,7 +1,4 @@
-"""
-learning_transient_contracts.py
-
-Define immutable transient model-input contracts.
+"""Define immutable transient model-input contracts.
 
 Responsibilities:
   - Bind tensorization to the registered transient task and Dataset contract

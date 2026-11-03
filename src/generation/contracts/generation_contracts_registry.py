@@ -1,15 +1,15 @@
-"""
-generation_contracts_registry.py
+"""Validate and resolve the typed scientific parameter registry.
 
-Validate and resolve the typed scientific parameter registry.
 Responsibilities:
   - Validate exact schemas for all supported parameter kinds
   - Enforce finite domains, units, coupled-set integrity, and OOD separation
   - Resolve the narrow maintained derivation identifiers
+
 Design principles:
   - Every scientific value has one typed owner
   - Unknown keys and executable expressions fail closed
   - Unresolved values are admitted only while inspecting non-executable templates
+
 This module does NOT:
   - Define material-family roles or VP2 block membership
   - Sample designs, generate fields, or evaluate arbitrary expressions
@@ -551,11 +551,6 @@ def _choice_identity(value: Any) -> str:
         message = f"Categorical choices must be non-empty strings or finite numbers, got {value!r}."
         raise ValueError(message)
     return f"number:{float(value):.17g}"
-
-
-def ood_separation_fractions() -> tuple[float, float]:
-    """Return minimum transformed gap and width fractions for OOD tails."""
-    return _MINIMUM_OOD_GAP_FRACTION, _MINIMUM_OOD_WIDTH_FRACTION
 
 
 def validate_parameter_registry(value: Any, *, allow_unresolved: bool = False) -> dict[str, dict[str, Any]]:

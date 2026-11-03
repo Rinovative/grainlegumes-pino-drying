@@ -1,0 +1,46 @@
+# Role: shared defaults of every steady_flow experiment and Optuna study. Edit: rarely; any config overrides them.
+# A config names this file with base: and overrides any value by setting it itself.
+
+run:
+  seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
+  device: auto  # Requested compute device; auto selects an available supported device.
+
+data:
+  train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
+  additional_evaluation_datasets: []  # Optional built Datasets whose declared OOD cases are evaluated in addition to validation and ID-test.
+  batch_size: 32  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
+
+loss:
+  data:
+    kind: relative_h1  # Select the supervised error formulation; valid choices depend on the task contract.
+    space: normalized  # Space in which supervised error is measured, such as normalized state or scaled increment.
+    weight: 1.0  # Multiplier on the supervised data-loss term.
+
+evaluation:
+  objective:
+    id: normalized_group_macro_rmse  # Metric used to compare trials/checkpoints and drive the scheduler or study objective.
+
+optimizer:
+  kind: adamw  # Optimizer implementation; current training contract supports AdamW.
+  weight_decay: 1.0e-4  # AdamW decoupled weight-decay coefficient.
+  betas: [0.9, 0.999]  # AdamW first- and second-moment decay coefficients.
+  second_moment_floor: 1.0e-6  # Lower bound used for AdamW’s second-moment denominator epsilon.
+
+scheduler:
+  kind: reduce_on_plateau  # Learning-rate schedule policy.
+  factor: 0.5  # Multiplicative learning-rate reduction after a plateau.
+  patience: 20  # Validation checks without improvement before reducing the learning rate; at evaluation_interval 5 this is 100 epochs.
+  min_lr: 1.0e-5  # Lower bound for the scheduled learning rate.
+
+training:
+  epochs: 600  # Maximum training epochs for steady-flow runs.
+  evaluation_interval: 5  # Validate every this many epochs; validation selects the checkpoint and drives the scheduler.
+  additional_evaluation_interval: 5  # Evaluate the additional evaluation Datasets every this many epochs.
+  mixed_precision: false  # Enable mixed-precision arithmetic when supported.
+
+tracking:
+  wandb:
+    mode: online  # W&B logging mode, such as online or offline.
+    workflow: train  # Workflow label attached to tracking metadata.
+    monitor:
+      interval: 5  # Monitoring interval in epochs.

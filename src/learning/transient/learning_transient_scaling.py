@@ -1,12 +1,9 @@
-"""
-learning_transient_scaling.py
-
-Fit and admit train-only transient scaling evidence.
+"""Fit and admit train-only transient scaling evidence.
 
 Responsibilities:
   - Fit deduplicated absolute-state and zero-preserving increment statistics
   - Persist task, Dataset, membership, profile, and channel identities
-  - Encode and decode state, increment, spatial, scalar, and boundary values
+  - Encode state, spatial, scalar, and boundary values and encode or decode increments
   - Produce device-independent serialized evidence and identity digests
 
 Design principles:
@@ -19,6 +16,15 @@ This module does NOT:
   - Load HDF5 or select Dataset memberships
   - Assemble complete model channels or execute model inference
   - Reuse the steady rank-four neuraloperator data processor
+
+Notes:
+  Fit counting:
+    - Cases remain grouped and hourly transitions consecutive; an adjacent duplicate is collapsed only when its direct state and target tensors match
+      exactly.
+    - State population moments and zero-centered target RMS use unique transition evidence, with one reconstructed terminal state added per case.
+    - Static, scalar, and selected omega-boundary moments accumulate from every admitted Train item.
+    - ``increment_scale`` selects ``state_std`` or ``delta_rms`` by ``scale_mode`` and then applies the positive numerical floor.
+
 """
 
 from __future__ import annotations
@@ -731,26 +737,6 @@ class TransientScalingArtifact:
             channels=_STATE_CHANNELS,
         )
         return (tensor - mean) / scale
-
-    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
-        """Decode standardized absolute-state channels."""
-        tensor = _validate_runtime_value(
-            value,
-            label="encoded state",
-            device=self.device,
-            dtype=self.dtype,
-        )
-        mean = _channel_view(
-            self.state_mean,
-            tensor,
-            channels=_STATE_CHANNELS,
-        )
-        scale = _channel_view(
-            _operational_scale(self.state_std, floor=self.numerical_floor),
-            tensor,
-            channels=_STATE_CHANNELS,
-        )
-        return tensor * scale + mean
 
     def encode_delta(self, value: torch.Tensor) -> torch.Tensor:
         """Scale increments without centering so exact zeros remain zero."""

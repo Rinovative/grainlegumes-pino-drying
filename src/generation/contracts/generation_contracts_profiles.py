@@ -1,15 +1,15 @@
-"""
-generation_contracts_profiles.py
+"""Define the authoritative reference-simulation profile contracts.
 
-Define the authoritative reference-simulation profile contracts.
 Responsibilities:
   - Register the exact supported logical simulation profiles
   - Declare canonical input, export-role, unit, and learning-view contracts
   - Expose profile-owned downstream interpretation invariants
+
 Design principles:
   - Logical fields are stable while concrete templates remain configuration
   - Profile selection is explicit and never inferred from filenames or tasks
   - The registered steady-flow TaskSpec shares the canonical field names
+
 This module does NOT:
   - Own concrete template or sidecar paths
   - Load YAML, generate fields, execute COMSOL, or register transient learning
@@ -49,7 +49,7 @@ STATIONARY_FIXED_FIELDS: Final = ("T_flow_ref", "p_ref", "p_out")
 STATIONARY_FIXED_UNITS: Final = ("K", "Pa", "Pa")
 TRANSIENT_SCALAR_INPUT_FIELDS: Final = (
     "T_amb",
-    "eps_bed_cal_ref",
+    "eps_bed_ref",
     "rho_bu_dry_ref",
     "k_gr",
     "cp_gr_dry",
@@ -167,11 +167,6 @@ class SimulationProfile:
     export_roles: tuple[ExportRoleSpec, ...]
     available_learning_views: tuple[str, ...]
     airflow_source: str
-
-    @property
-    def required_export_roles(self) -> tuple[str, ...]:
-        """Return required export-role identifiers in profile order."""
-        return tuple(spec.role for spec in self.export_roles if spec.required)
 
     def export_role(self, role: str) -> ExportRoleSpec:
         """Resolve one exact export role owned by this profile."""

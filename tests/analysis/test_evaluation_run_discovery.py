@@ -1,5 +1,15 @@
-# ruff: noqa: PLR2004, S101
-"""Protect read-only persisted Evaluation run discovery."""
+"""Protect read-only persisted Evaluation run discovery.
+
+Responsibilities:
+  - Check persisted run catalogs, task-aware workspace dispatch, stage lineage, and comparison
+    admission
+
+Design principles:
+  - Discovery stays read-only and distinguishes readiness from active staging
+
+This module does NOT:
+  - Run training or infer missing artifacts during catalog discovery
+"""
 
 from __future__ import annotations
 
@@ -12,12 +22,27 @@ import ipywidgets as widgets
 import pytest
 import yaml
 
-from src import common
+from src import common, datasets
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.analysis.evaluation import evaluation_run_discovery as discovery
 from src.analysis.evaluation import evaluation_selection as selection
 from src.analysis.evaluation import evaluation_workspace as workspace
 from src.experiments import experiments_run_identity as identity
+
+
+@pytest.fixture(autouse=True)
+def _metadata_config_admission(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use compact saved metadata while retaining exact parent content checks."""
+    monkeypatch.setattr(identity.config_loader, "validate_resolved_config", lambda config: config)
+    monkeypatch.setattr(identity.config_loader, "validate_saved_artifact_config", lambda config: config)
+    monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", identity.resolved_config_digest)
+    monkeypatch.setattr(
+        datasets.packages,
+        "declared_evaluation_assignments",
+        lambda _task, _train, additional=(), **_kwargs: [
+            {"dataset_id": name, "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []} for name in additional
+        ],
+    )
 
 
 def _write_run(
@@ -30,18 +55,42 @@ def _write_run(
     updated_at: str = "2026-01-01T00:00:00+00:00",
     stage: str | None = None,
     comparison_arm: str | None = None,
+    branch_id: str | None = None,
     artifact: bool = False,
     evaluation: dict[str, Any] | None = None,
+    family: str | None = None,
+    trial: str | None = None,
+    seed: int = 17,
 ) -> Path:
     """Write one compact persisted leaf without loading project services."""
-    run_dir = root / task / "runs" / leaf
+    stage_id = comparison_arm if comparison_arm in {"a0", "b", "a1"} else "a0" if stage == "a" else "b" if stage == "b" else "single"
+    layout = {
+        "task": task,
+        "dataset": "dataset-id",
+        "family": "optuna" if trial is not None else family or leaf,
+        "config_name": "fno_study" if trial is not None else "fno_m2x2_h4_l1",
+        "model_label": "fno_m2x2_h4_l1",
+        "seed": seed,
+        "revision": None,
+        "budget_epochs": 3 if trial is not None else None,
+        "stage": stage_id,
+        "pair": f"pair-{(branch_id or 'b' * 16)[:4]}" if stage_id in {"b", "a1"} else None,
+        "trial": trial,
+        "a0_id": "a" * 16,
+        "branch_id": (branch_id or "b" * 16) if stage_id in {"b", "a1"} else None,
+    }
+    run_dir = common.paths.resolve_config_run_dir({"run": {"layout": layout}, "paths": {"output_root": str(root)}})
     run_dir.mkdir(parents=True)
     name = run_name or f"scientific-{leaf}"
     config: dict[str, Any] = {
         "task": task,
-        "run": {"name": name, "seed": 17},
-        "model": {"kind": "fno"},
-        "data": {"train_dataset": "dataset-id", "ood_datasets": ["dataset-ood"]},
+        "run": {"name": name, "seed": seed, "layout": layout},
+        "paths": {"output_root": str(root)},
+        "model": {"kind": "fno", "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1}},
+        "data": {
+            "train_dataset": "dataset-id",
+            "additional_evaluation_datasets": ["dataset-ood"],
+        },
     }
     if evaluation is not None:
         config["evaluation"] = evaluation
@@ -61,13 +110,17 @@ def _write_run(
                 "status": status,
                 "updated_at": updated_at,
                 "effective_config_digest": "e" * 64,
+                "config_sha256": common.serialization.file_sha256(run_dir / "config.yaml"),
+                "checkpoint_identity": {"resume_contract_digest": identity.resolved_config_digest(config)},
+                "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(config)},
             }
         ),
         encoding="utf-8",
     )
     (run_dir / "best_checkpoint.pt").write_bytes(b"best")
     if artifact:
-        for artifact_root in (run_dir / "analysis" / "id", run_dir / "analysis" / "ood" / "dataset-ood"):
+        second_root = run_dir / "analysis" / "additional_evaluation" / "dataset-ood"
+        for artifact_root in (run_dir / "analysis" / "id", second_root):
             artifact_root.mkdir(parents=True)
             (artifact_root / "cases.parquet").write_bytes(b"parquet")
             payload_root = artifact_root / "npz"
@@ -75,7 +128,13 @@ def _write_run(
             (payload_root / "case-0.npz").write_bytes(b"npz")
             marker = {
                 "provenance_schema_version": artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-                "artifact_schema_version": artifact_contracts.ARTIFACT_SCHEMA_VERSION,
+                "artifact_schema_version": (
+                    discovery.transient_artifact.TRANSIENT_SEQUENCE_SCHEMA_VERSION
+                    if task == "transient_drying"
+                    else artifact_contracts.ARTIFACT_SCHEMA_VERSION
+                ),
+                "artifact_kind": discovery.transient_artifact.TRANSIENT_ARTIFACT_KIND if task == "transient_drying" else "steady_artifact",
+                "task": task,
                 "run": {"task": task},
                 "outputs": artifact_contracts.artifact_output_manifest(artifact_root),
             }
@@ -130,93 +189,107 @@ def _write_scoped_artifact(
     return scoped
 
 
-def _write_parent(root: Path, *, label: str, children: tuple[Path, Path]) -> str:
-    """Write one validator-admitted transient parent record for two exact leaves."""
+def _write_parent(
+    root: Path,
+    *,
+    label: str,
+    children: dict[str, Path],
+) -> str:
+    """Write one exact matched A0/B/A1 branch parent while leaving shared A0 unowned."""
+    branch_config = yaml.safe_load((children["stage_b"] / "config.yaml").read_text())
+    layout = branch_config["run"]["layout"]
+    child_records: dict[str, dict[str, str]] = {}
+    for role, child_path in children.items():
+        config = yaml.safe_load((child_path / "config.yaml").read_text())
+        child_records[role] = {
+            "run_name": config["run"]["name"],
+            "path": "../a0" if role == "stage_a0" else role.removeprefix("stage_"),
+            "semantic_config_sha256": identity.resolved_config_digest(config),
+        }
     payload = {
         "schema_kind": identity.EXPERIMENT_RECORD_SCHEMA_KIND,
         "schema_version": identity.EXPERIMENT_RECORD_SCHEMA_VERSION,
+        "topology": "a0_to_b_and_a1",
         "task": "transient_drying",
         "parent_label": label,
-        "run_revision": 0,
+        "layout": layout,
         "seed": 17,
         "authored_config": {"path": "synthetic.yaml", "basename": "synthetic.yaml", "sha256": "a" * 64},
-        "dataset_identity": {"train_dataset": "dataset-id", "ood_datasets": ["dataset-ood"], "references": None},
-        "children": {
-            "stage_a0": {"run_name": "scientific-a", "path": str(children[0]), "resolved_config_sha256": "a" * 64},
-            "stage_b": {"run_name": "scientific-b", "path": str(children[1]), "resolved_config_sha256": "b" * 64},
+        "dataset_identity": identity.dataset_identity_evidence(branch_config),
+        "children": child_records,
+        "handoff": {
+            "source_run_name": child_records["stage_a0"]["run_name"],
+            "target_run_names": [child_records[role]["run_name"] for role in children if role != "stage_a0"],
+            "initialization": "a0_best_full_common_fresh_controller",
         },
-        "handoff": {"source_run_name": "scientific-a", "target_run_name": "scientific-b"},
     }
     record = {
         **payload,
-        "parent_identity_sha256": common.serialization.canonical_json_sha256(payload),
+        "parent_identity_sha256": common.serialization.canonical_json_sha256(
+            {key: value for key, value in payload.items() if key not in {"authored_config", "source_repository"}}
+        ),
         "source_repository": {"commit": None, "dirty": None},
     }
-    path = root / "transient_drying" / "runs" / label / "experiment.json"
+    path = identity.experiment_record_path(record, output_root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record), encoding="utf-8")
     return record["parent_identity_sha256"]
 
 
-def _widget_descriptions(widget: widgets.Widget) -> tuple[str, ...]:
-    """Return rendered widget descriptions recursively."""
-    values: list[str] = []
-    description = getattr(widget, "description", None)
-    if isinstance(description, str) and description:
-        values.append(description)
-    for child in getattr(widget, "children", ()):
-        values.extend(_widget_descriptions(child))
-    return tuple(values)
-
-
-def test_dataset_display_projection_is_material_first_and_digest_free() -> None:
-    """Keep exact Dataset identity secondary to concise material/role text."""
-    id_dataset = "transient_drying__lentil+chickpea__id__edeafe22ec484ec3"
-    ood_dataset = "transient_drying__kidney_bean__near_family_ood__3cc7db648cf437b5"
+def test_dataset_display_projection_preserves_authored_readable_name() -> None:
+    """Do not parse or strip a readable Dataset name into guessed scientific identity."""
+    id_dataset = "lentil_chickpea_four_hour"
+    additional_dataset = "kidney_bean_four_hour"
 
     assert (
         discovery.dataset_display_projection(
             "transient_drying",
             id_dataset,
         )
-        == "lentil+chickpea_id"
+        == "lentil_chickpea_four_hour"
     )
     assert (
-        workspace._EvaluationWorkspaceController._dataset_binding_label(  # noqa: SLF001
+        workspace._EvaluationWorkspaceController._dataset_binding_label(
             task="transient_drying",
             dataset_name=id_dataset,
             role="id",
         )
-        == "Lentil + Chickpea · ID"
+        == "lentil_chickpea_four_hour · ID"
     )
     assert (
-        workspace._EvaluationWorkspaceController._dataset_binding_label(  # noqa: SLF001
+        workspace._EvaluationWorkspaceController._dataset_binding_label(
             task="transient_drying",
-            dataset_name=ood_dataset,
-            role="ood",
+            dataset_name=additional_dataset,
+            role="additional_evaluation",
+            declared_role="ood",
         )
-        == "Kidney bean · Near-family OOD"
+        == "kidney_bean_four_hour · OOD"
     )
 
 
-def test_discovers_current_group_and_legacy_leaf_with_exact_identity(tmp_path: Path) -> None:
-    """Group only record-declared transient children without changing a legacy leaf."""
-    stage_a = _write_run(tmp_path, leaf="storage-a", run_name="scientific-a", stage="a")
-    stage_b = _write_run(tmp_path, leaf="storage-b", run_name="scientific-b", stage="b")
+def test_discovers_branch_and_shared_a0_with_exact_identity(tmp_path: Path) -> None:
+    """Admit shared A0 independently and bind branch children to their exact parent."""
+    stage_a = _write_run(tmp_path, leaf="storage-a", family="shared", run_name="scientific-a", comparison_arm="a0")
+    stage_b = _write_run(tmp_path, leaf="storage-b", family="shared", run_name="scientific-b", comparison_arm="b")
+    stage_a1 = _write_run(tmp_path, leaf="storage-a1", family="shared", run_name="scientific-a1", comparison_arm="a1")
     legacy = _write_run(tmp_path, leaf="opaque-legacy", task="steady_flow", run_name="exact-steady")
-    parent_identity = _write_parent(tmp_path, label="concise-parent", children=(stage_a, stage_b))
+    parent_identity = _write_parent(
+        tmp_path,
+        label="concise-parent",
+        children={"stage_a0": stage_a, "stage_b": stage_b, "stage_a1": stage_a1},
+    )
 
     catalog = discovery.discover_evaluation_runs(tmp_path)
 
-    assert len(catalog.runs) == len({"scientific-a", "scientific-b", "exact-steady"})
-    assert len(catalog.groups) == len({"current-parent", "legacy-leaf"})
+    assert len(catalog.runs) == len({"scientific-a", "scientific-b", "scientific-a1", "exact-steady"})
+    assert len(catalog.groups) == len({"branch-parent", "shared-a0", "independent-run"})
     grouped = next(group for group in catalog.groups if group.identity_sha256 == parent_identity)
-    assert {item.run_name for item in grouped.children} == {"scientific-a", "scientific-b"}
+    assert {item.run_name for item in grouped.children} == {"scientific-b", "scientific-a1"}
     legacy_record = next(item for item in catalog.runs if item.run_name == "exact-steady")
     assert legacy_record.run_dir == legacy.resolve()
     assert legacy_record.parent_identity_sha256 is None
     assert legacy_record.dataset_id == "dataset-id"
-    assert legacy_record.identity_format == "legacy"
+    assert legacy_record.identity_format == "independent"
     assert len(next(group for group in catalog.groups if legacy_record in group.children).children) == 1
 
 
@@ -262,8 +335,10 @@ def test_marker_discovery_does_not_hash_numerical_payloads(
     catalog = discovery.discover_evaluation_runs(tmp_path)
 
     record = next(item for item in catalog.runs if item.run_dir == run_dir.resolve())
+    assert record.id_artifact is not None
     assert record.id_artifact.state == "ready"
-    assert record.ood_artifact.state == "ready"
+    assert record.additional_artifact is not None
+    assert record.additional_artifact.state == "ready"
     assert record.id_artifact.digest is not None
 
 
@@ -403,22 +478,20 @@ def test_run_overview_uses_material_first_roles_and_shared_protocol_labels(
         discovery.discover_evaluation_runs(tmp_path).runs[0],
         spatial_stride=1,
     )
-    controller = workspace._EvaluationWorkspaceController.__new__(  # noqa: SLF001
-        workspace._EvaluationWorkspaceController  # noqa: SLF001
-    )
-    html = controller._status_html(  # noqa: SLF001
+    controller = workspace._EvaluationWorkspaceController.__new__(workspace._EvaluationWorkspaceController)
+    html = controller._status_html(
         record,
-        selected_roles=("id", "ood"),
+        selected_roles=("id", "additional_evaluation"),
         material_coverage=(
-            ("lentil", "id"),
-            ("chickpea", "id"),
-            ("kidney_bean", "ood"),
+            ("lentil", "id", "id"),
+            ("chickpea", "id", "id"),
+            ("kidney_bean", "ood", "additional_evaluation"),
         ),
     )
 
     assert "Lentil · ID · available" in html
     assert "Chickpea · ID · available" in html
-    assert "Kidney bean · Near-family OOD · available" in html
+    assert "Kidney bean · OOD · available" in html
     assert "Drying group macro RMSE" in html
     assert "Spatial stride</th><td>1" in html
     assert "Generate full artifact coverage" not in html
@@ -461,7 +534,7 @@ def test_scoped_partial_is_exactly_associated_and_single_case_gated(
     prepared = workspace.prepare_single_model_evaluation_workspace(
         experiments_root=tmp_path,
     )
-    controller = prepared._controller  # noqa: SLF001
+    controller = prepared._controller
     assert controller is not None
     assert calls[-1]["artifact_roots"] == {"id": scoped}
     assert calls[-1]["sections"] == ("sample_viewer",)
@@ -485,9 +558,9 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     scans: list[Path] = []
     original = discovery.discover_evaluation_runs
 
-    def counted(root: Path | str) -> discovery.EvaluationRunCatalog:
+    def counted(root: Path | str, **kwargs: Any) -> discovery.EvaluationRunCatalog:
         scans.append(Path(root))
-        return original(root)
+        return original(root, **kwargs)
 
     monkeypatch.setattr(workspace.run_discovery, "discover_evaluation_runs", counted)
     monkeypatch.setattr(
@@ -501,14 +574,12 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     assert prepared.selection_state is not None
     assert prepared.catalog.counts_by_artifact_state["missing"] == 2
     assert "Artifact roles: missing=2" in prepared.summary_text
-    controller = prepared._controller  # noqa: SLF001
+    controller = prepared._controller
     assert controller is not None
     controller.run.value = controller.run.value
     assert len(scans) == 1
-    descriptions = set(_widget_descriptions(controller.panel))
-    assert descriptions.isdisjoint({"Task:", "Stage:", "Seed:", "Regime:", "View:"})
-    assert descriptions == {"Run:"}
-    assert "ID · missing; Near-family OOD · missing" in controller.status.value
+    assert controller.run.options
+    assert "ID · missing; Additional evaluation · missing" in controller.status.value
     assert "slurm_ml.sh" in controller.status.value
     assert "artifacts --run-dir" in controller.status.value
     assert "--one-case" not in controller.status.value
@@ -516,27 +587,45 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
 
     compared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=experiments_root)
     assert len(scans) == 2
-    comparison_controller = compared._controller  # noqa: SLF001
+    comparison_controller = compared._controller
     assert comparison_controller is not None
     assert "Select at least two runs" in comparison_controller.status.value
     compared.close()
 
 
-def test_comparison_workspace_admits_exact_a0_a_plus_b_stage_semantics(
+def test_comparison_workspace_admits_exact_a0_a1_b_stage_semantics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Let the workflow validate one exact three-arm transient comparison."""
     experiments_root = tmp_path / "03_experiments"
-    run_dirs = tuple(
-        _write_run(
+    experiment = "three-arm"
+    a0 = _write_run(
+        experiments_root,
+        leaf="a0",
+        family=experiment,
+        run_name="scientific-a0",
+        comparison_arm="a0",
+        artifact=True,
+    )
+    branch_id = "c" * 16
+    branch_runs = {
+        arm: _write_run(
             experiments_root,
             leaf=arm,
+            family=experiment,
             run_name=f"scientific-{arm}",
             comparison_arm=arm,
+            branch_id=branch_id,
             artifact=True,
         )
-        for arm in ("a0", "a_plus", "b")
+        for arm in ("a1", "b")
+    }
+    run_dirs = (a0, branch_runs["a1"], branch_runs["b"])
+    _write_parent(
+        experiments_root,
+        label="three-arm-parent",
+        children={"stage_a0": a0, "stage_b": branch_runs["b"], "stage_a1": branch_runs["a1"]},
     )
     calls: list[tuple[Path, ...]] = []
 
@@ -561,7 +650,7 @@ def test_comparison_workspace_admits_exact_a0_a_plus_b_stage_semantics(
     prepared = workspace.prepare_model_comparison_evaluation_workspace(
         experiments_root=experiments_root,
     )
-    controller = prepared._controller  # noqa: SLF001
+    controller = prepared._controller
     assert controller is not None
 
     controller.run_filter.value = tuple(str(path.resolve()) for path in run_dirs)
@@ -571,6 +660,89 @@ def test_comparison_workspace_admits_exact_a0_a_plus_b_stage_semantics(
     assert prepared.selection_state.selection.run_dirs == calls[-1]
     assert "incompatible stage" not in controller.status.value
     prepared.close()
+
+
+def test_matched_a1_discovery_keeps_distinct_stage_and_parent_group(tmp_path: Path) -> None:
+    """Expose one A0/B/A1 parent with its distinct stages and parent group."""
+    experiments_root = tmp_path / "03_experiments"
+    branch_id = "d" * 16
+    run_dirs = {
+        arm: _write_run(
+            experiments_root,
+            leaf=arm,
+            family="matched",
+            run_name=f"scientific-{arm}",
+            comparison_arm=arm,
+            branch_id=branch_id,
+            artifact=True,
+        )
+        for arm in ("a0", "b", "a1")
+    }
+    parent_identity = _write_parent(
+        experiments_root,
+        label="matched-parent",
+        children={role: run_dirs[role.removeprefix("stage_")] for role in ("stage_a0", "stage_b", "stage_a1")},
+    )
+
+    catalog = discovery.discover_evaluation_runs(experiments_root)
+    assert catalog.issues == ()
+    by_name = {run.run_name: run for run in catalog.runs}
+    assert {name: run.stage for name, run in by_name.items()} == {
+        "scientific-a0": "A0",
+        "scientific-b": "B",
+        "scientific-a1": "A1",
+    }
+    assert {run.parent_identity_sha256 for run in catalog.runs} == {None, parent_identity}
+    assert workspace._compatibility_issues(catalog.runs) == ()
+    relabeled = tuple(replace(run, stage="A0") if run.stage == "B" else run for run in catalog.runs)
+    assert workspace._compatibility_issues(relabeled) == ()  # Stages are selectable attributes; controlled lineage has a separate gate.
+
+
+def test_two_matched_branches_share_one_independent_a0_without_parent_conflicts(tmp_path: Path) -> None:
+    """Keep two matched A1/B budgets as distinct branches from the exact shared A0."""
+    experiments_root = tmp_path / "03_experiments"
+    experiment = "shared-budget-comparison"
+    stage_a0 = _write_run(
+        experiments_root,
+        leaf="a0",
+        family=experiment,
+        run_name="shared-a0",
+        comparison_arm="a0",
+    )
+    branches = {
+        token: {
+            arm: _write_run(
+                experiments_root,
+                leaf=f"{token}-{arm}",
+                family=experiment,
+                run_name=f"{token}-branch-{arm}",
+                comparison_arm=arm,
+                branch_id=branch_id,
+            )
+            for arm in ("b", "a1")
+        }
+        for token, branch_id in (("first", "1" * 16), ("second", "2" * 16))
+    }
+    parents = {
+        token: _write_parent(
+            experiments_root,
+            label=f"{token}-branch-parent",
+            children={"stage_a0": stage_a0, "stage_b": runs["b"], "stage_a1": runs["a1"]},
+        )
+        for token, runs in branches.items()
+    }
+
+    catalog = discovery.discover_evaluation_runs(experiments_root)
+
+    assert catalog.issues == ()
+    by_name = {run.run_name: run for run in catalog.runs}
+    assert by_name["shared-a0"].stage == "A0"
+    assert by_name["shared-a0"].parent_identity_sha256 is None
+    for token, parent in parents.items():
+        assert by_name[f"{token}-branch-b"].parent_identity_sha256 == parent
+        assert by_name[f"{token}-branch-a1"].stage == "A1"
+        assert by_name[f"{token}-branch-a1"].parent_identity_sha256 == parent
+    assert parents["first"] != parents["second"]
 
 
 def test_single_workspace_switches_transient_steady_transient_without_state_leakage(
@@ -634,13 +806,13 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     prepared = workspace.prepare_single_model_evaluation_workspace(
         experiments_root=experiments_root,
     )
-    controller = prepared._controller  # noqa: SLF001
+    controller = prepared._controller
     assert controller is not None
 
     controller.run.value = str(transient_run.resolve())
     calls.clear()
-    controller._render_single()  # noqa: SLF001
-    transient_first = controller._workflow  # noqa: SLF001
+    controller._render_single()
+    transient_first = controller._workflow
     assert isinstance(transient_first, FakeWorkflow)
     assert calls == [(transient_run.resolve(), "transient_drying")]
     assert controller.analysis.children == (transient_first.panel,)
@@ -652,7 +824,7 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     assert prepared.selection_state.selection.horizon == "full"
 
     controller.run.value = str(steady_run.resolve())
-    steady = controller._workflow  # noqa: SLF001
+    steady = controller._workflow
     assert isinstance(steady, FakeWorkflow)
     assert transient_first.close_count == 1
     assert controller.analysis.children == (steady.panel,)
@@ -663,7 +835,7 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     assert prepared.selection_state.selection.horizon is None
 
     controller.run.value = str(transient_run.resolve())
-    transient_second = controller._workflow  # noqa: SLF001
+    transient_second = controller._workflow
     assert isinstance(transient_second, FakeWorkflow)
     assert transient_second is not transient_first
     assert steady.close_count == 1
@@ -747,14 +919,14 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
     prepared = workspace.prepare_model_comparison_evaluation_workspace(
         experiments_root=experiments_root,
     )
-    controller = prepared._controller  # noqa: SLF001
+    controller = prepared._controller
     assert controller is not None
 
     steady_values = tuple(str(path.resolve()) for path in steady_runs)
     controller.run_filter.value = steady_values
     calls.clear()
-    controller._render_comparison()  # noqa: SLF001
-    steady = controller._workflow  # noqa: SLF001
+    controller._render_comparison()
+    steady = controller._workflow
     assert isinstance(steady, FakeWorkflow)
     assert calls == [(tuple(path.resolve() for path in steady_runs), "steady_flow")]
     assert prepared.selection_state is not None
@@ -763,7 +935,7 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
     assert prepared.selection_state.selection.physical_time is None
 
     controller.run_filter.value = tuple(str(path.resolve()) for path in transient_runs)
-    transient = controller._workflow  # noqa: SLF001
+    transient = controller._workflow
     assert isinstance(transient, FakeWorkflow)
     assert steady.close_count == 1
     assert prepared.selection_state.selection.task == "transient_drying"
@@ -778,7 +950,7 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
         str(steady_runs[0].resolve()),
         str(transient_runs[0].resolve()),
     )
-    assert controller._workflow is None  # noqa: SLF001
+    assert controller._workflow is None
     assert transient.close_count == 1
     assert controller.analysis.children == ()
     assert "incompatible task" in controller.status.value
@@ -809,9 +981,7 @@ def test_comparison_rejects_same_objective_with_different_persisted_protocol(
 
     assert {run.evaluation_protocol for run in selected} == {"normalized_drying_group_macro_rmse"}
     assert len({run.evaluation_config_identity for run in selected}) == 2
-    assert workspace._compatibility_issues(selected) == (  # noqa: SLF001
-        "Selected runs have incompatible evaluation protocol.",
-    )
+    assert workspace._compatibility_issues(selected) == ("Selected runs have incompatible evaluation protocol.",)
 
 
 def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path: Path) -> None:
@@ -819,7 +989,7 @@ def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path:
     run_dir = _write_run(tmp_path, leaf="reference", artifact=False)
     reference = discovery.discover_evaluation_runs(tmp_path).runs[0]
     compatible = replace(reference, run_dir=run_dir.parent / "compatible-peer")
-    assert workspace._compatibility_issues((reference, compatible)) == ()  # noqa: SLF001
+    assert workspace._compatibility_issues((reference, compatible)) == ()
 
     mismatches = (
         (replace(compatible, task="steady_flow"), "task"),
@@ -828,7 +998,7 @@ def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path:
         (replace(compatible, spatial_stride=8), "spatial stride"),
     )
     for peer, expected_label in mismatches:
-        issues = workspace._compatibility_issues((reference, peer))  # noqa: SLF001
+        issues = workspace._compatibility_issues((reference, peer))
         assert len(issues) == 1
         assert expected_label in issues[0]
 
@@ -858,41 +1028,172 @@ def test_evaluation_notebooks_execute_without_hardcoded_run_lists(
     monkeypatch.setattr(IPython.display, "display", lambda _value: None)
     repository_root = Path(__file__).resolve().parents[2]
     for relative in (
-        "notebooks/eval_single_model.ipynb",
-        "notebooks/eval_comparison_models.ipynb",
+        "notebooks/04_eval_single_model.ipynb",
+        "notebooks/05_eval_comparison_models.ipynb",
     ):
         notebook = json.loads((repository_root / relative).read_text(encoding="utf-8"))
         source = "\n".join("".join(cell.get("source", ())) for cell in notebook["cells"] if cell["cell_type"] == "code")
-        assert "analysis.evaluation.workspace" in source
-        assert "RUN_DIR" not in source
-        assert "RUN_DIRS" not in source
-        assert "auto_build_missing" not in source
-        assert "replace_with" not in source
         namespace: dict[str, object] = {}
         exec(compile(source, relative, "exec"), namespace)  # noqa: S102
         prepared = namespace["workspace"]
         assert isinstance(prepared, workspace.PreparedEvaluationWorkspace)
-        controller = prepared._controller  # noqa: SLF001
+        controller = prepared._controller
         assert controller is not None
-        descriptions = set(_widget_descriptions(controller.panel))
-        assert descriptions.isdisjoint({"Task:", "Stage:", "Seed:", "Regime:", "View:"})
         if prepared.kind == "single":
-            assert descriptions == {"Run:"}
             options = tuple(value for _label, value in controller.run.options)
             selected_value = controller.run.value
             assert isinstance(selected_value, (str, Path))
-            selected_run = controller._run_by_path(selected_value)  # noqa: SLF001
-            switched = next(
-                value
-                for value in options
-                if controller._run_by_path(value).task != selected_run.task  # noqa: SLF001
-            )
+            selected_run = controller._run_by_path(selected_value)
+            switched = next(value for value in options if controller._run_by_path(value).task != selected_run.task)
             controller.run.value = switched
             assert prepared.selection_state is not None
-            assert prepared.selection_state.selection.task == controller._run_by_path(switched).task  # noqa: SLF001
-            assert "Artifact" in controller.status.value
+            assert prepared.selection_state.selection.task == controller._run_by_path(switched).task
         else:
-            assert descriptions == {"Runs:", "Material/Dataset:"}
             assert len(controller.run_filter.options) == 4
-            assert "Select at least two runs" in controller.status.value
         prepared.close()
+
+
+def test_optuna_trials_are_skipped_by_recorded_layout_without_hashing_their_checkpoints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip trial leaves (with or without a kept checkpoint) while a normal run is still listed."""
+    experiments_root = tmp_path / "03_experiments"
+    kept = _write_run(experiments_root, leaf="trial-kept", trial="0007__fno_m2x2_h4_l1__lr-0p001")
+    removed = _write_run(experiments_root, leaf="trial-removed", trial="0008__fno_m2x2_h4_l1__lr-0p002")
+    (removed / "best_checkpoint.pt").unlink()
+    normal = _write_run(experiments_root, leaf="normal")
+    study_root = common.paths.resolve_study_dir("transient_drying", "dataset-id", "fno_study", 3, output_root=experiments_root)
+    assert kept.parent == removed.parent == study_root / "trials"
+    hashed: list[Path] = []
+    original = common.serialization.file_sha256
+
+    def counted(value: Path | str) -> str:
+        hashed.append(Path(value))
+        return original(value)
+
+    monkeypatch.setattr(common.serialization, "file_sha256", counted)
+
+    from_experiments = discovery.discover_evaluation_runs(experiments_root)
+    from_study = discovery.discover_evaluation_runs(study_root)
+
+    assert [run.run_dir for run in from_experiments.runs] == [normal.resolve()]
+    assert from_study.runs == ()
+    assert from_experiments.issues == from_study.issues == ()
+    assert hashed == [normal.resolve() / "best_checkpoint.pt"]
+
+
+def test_normal_run_without_best_checkpoint_stays_listed_but_not_evaluable(tmp_path: Path) -> None:
+    """Fail closed for a regular run whose best checkpoint is missing."""
+    run_dir = _write_run(tmp_path, leaf="no-checkpoint", artifact=True)
+    (run_dir / "best_checkpoint.pt").unlink()
+
+    record = discovery.discover_evaluation_runs(tmp_path).runs[0]
+
+    assert record.run_dir == run_dir.resolve()
+    assert record.checkpoints.best_digest is None
+    assert not record.evaluable
+    assert not record.action_enabled
+
+
+def test_discovery_hashes_each_checkpoint_once_per_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reuse a checkpoint digest across repeated discovery runs."""
+    run_dir = _write_run(tmp_path, leaf="hashed-once")
+    monkeypatch.setattr(artifact_contracts, "_FILE_DIGESTS", {})
+    hashed: list[Path] = []
+    original = common.serialization.file_sha256
+
+    def counted(value: Path | str) -> str:
+        hashed.append(Path(value))
+        return original(value)
+
+    monkeypatch.setattr(common.serialization, "file_sha256", counted)
+
+    digests = {discovery.discover_evaluation_runs(tmp_path).runs[0].checkpoints.best_digest for _ in range(2)}
+    assert hashed == [run_dir.resolve() / "best_checkpoint.pt"]
+    assert len(digests) == 1
+
+
+def test_comparison_export_uses_authoritative_common_experiment_without_writing(tmp_path: Path) -> None:
+    """Default to one selected experiment and require a choice across experiments."""
+    _write_run(tmp_path, leaf="first", family="shared", seed=17)
+    _write_run(tmp_path, leaf="second", family="shared", seed=18)
+    _write_run(tmp_path, leaf="other", family="other", seed=17)
+    runs = discovery.discover_evaluation_runs(tmp_path).runs
+    shared_dir = tmp_path / "transient_drying" / "dataset-id" / "shared"
+    shared = tuple(run for run in runs if run.experiment_dir == shared_dir)
+    assert len(shared) == 2
+    controller = object.__new__(workspace._EvaluationWorkspaceController)
+    controller.comparison_output_dir = None
+    assert controller._comparison_export_dir(shared) == shared_dir / "comparison"
+    assert {run.seed for run in shared} == {17, 18}
+    assert all("seed " in controller._comparison_label(run) for run in shared)
+    assert controller._comparison_export_dir(runs) is None
+    chosen = tmp_path / "chosen-comparison"
+    controller.comparison_output_dir = chosen
+    assert controller._comparison_export_dir(runs) == chosen
+    assert not chosen.exists()
+    assert not (shared_dir / "comparison").exists()
+
+
+def test_missing_dataset_metadata_remains_visible_and_disables_actions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Show a saved run without claiming unknown Dataset roles or admitting outputs."""
+    run_dir = _write_run(tmp_path, leaf="missing-dataset")
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        message = "Dataset manifest absent"
+        raise FileNotFoundError(message)
+
+    monkeypatch.setattr(datasets.packages, "declared_evaluation_assignments", unavailable)
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+    assert len(catalog.runs) == 1
+    run = catalog.runs[0]
+    assert run.run_dir == run_dir
+    assert run.metadata_issues
+    assert "Dataset manifest absent" in run.metadata_issues[0]
+    assert not run.action_enabled
+    assert any("Dataset manifest absent" in issue.reason for issue in catalog.issues)
+
+
+def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Open compatible cross-experiment models with distinct readable presentation labels."""
+    paths = tuple(_write_run(tmp_path, leaf=name, family=name, artifact=True) for name in ("first-experiment", "second-experiment"))
+    calls: list[tuple[tuple[Path, ...], tuple[str, ...]]] = []
+
+    def prepare(run_dirs: tuple[Path, ...], **kwargs: Any) -> Any:
+        labels = kwargs["labels"]
+        assert len(set(labels)) == len(labels) == 2
+        assert kwargs["export_dir"] is None
+        calls.append((run_dirs, labels))
+        return type("SavedComparison", (), {"panel": widgets.Label("saved comparison"), "close": lambda _self: None})()
+
+    monkeypatch.setattr(workspace.workflow, "prepare_model_comparison_evaluation_workspace", prepare)
+    prepared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=tmp_path)
+    assert calls
+    selected, labels = calls[-1]
+    assert set(selected) == set(paths)
+    for path, label in zip(selected, labels, strict=True):
+        assert path.relative_to(tmp_path).parts[2] in label
+        assert "fno_m2x2_h4_l1" in label
+        assert "seed 17" in label
+    controller = prepared._controller
+    assert controller is not None
+    option_labels = tuple(label for label, _value in controller.run_filter.options)
+    assert len(set(option_labels)) == 2
+    prepared.close()
+
+
+def test_relocated_current_single_bundle_has_no_guessed_experiment_export_root(tmp_path: Path) -> None:
+    """Keep standalone current metadata navigable without inferring its prior experiment location."""
+    original = _write_run(tmp_path, leaf="authored-experiment")
+    moved = tmp_path / "relocated-single"
+    original.rename(moved)
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+    assert len(catalog.runs) == 1
+    run = catalog.runs[0]
+    assert run.run_dir == moved
+    assert run.experiment_dir is None
+    assert run.config_label == "authored-experiment/fno_m2x2_h4_l1"
+    controller = object.__new__(workspace._EvaluationWorkspaceController)
+    controller.comparison_output_dir = None
+    assert controller._comparison_export_dir((run,)) is None

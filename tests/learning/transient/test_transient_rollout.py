@@ -1,12 +1,27 @@
-# ruff: noqa: S101, ANN202
-"""Protect explicit transient teacher-forced and autonomous rollout behavior."""
+"""Protect explicit transient teacher-forced and autonomous rollout behavior.
+
+Responsibilities:
+  - Check RNO hidden-state boundaries and differentiable autonomous feedback
+  - Check carried, detached RNO state across truncated windows and per-sample state assembly
+
+Design principles:
+  - Hidden state persists within a rollout, continues only from an explicit carried state
+
+This module does NOT:
+  - Select training budgets or publish evaluation artifacts
+"""
 
 from __future__ import annotations
 
+from typing import Any, cast
+
+import pytest
 import torch
 from torch import nn
 
 from src.learning.transient.learning_transient_rollout import (
+    detach_hidden,
+    select_hidden_per_sample,
     self_fed_rollout,
     teacher_forced_rollout,
 )
@@ -56,7 +71,7 @@ class _RNO(nn.Module):
         self.weight = nn.Parameter(torch.tensor(1.0))
         self.hidden_inputs: list[object | None] = []
 
-    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool):
+    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool) -> Any:
         assert value.shape[1] == 1
         assert return_hidden_states is True
         self.hidden_inputs.append(init_hidden_states)
@@ -98,4 +113,67 @@ def test_self_fed_rollout_keeps_feedback_differentiable() -> None:
     assert torch.allclose(rollout.scaled_delta[:, 1], torch.full((1, 4, 1, 1), 1.5))
     rollout.physical_prediction[:, -1].sum().backward()
     assert model.weight.grad is not None
-    assert model.weight.grad.item() != 0.0
+    # With w = 0.5 and c0 = 0 each channel runs d_i = w * c_i + 1 and c_{i+1} = c_i + d_i, so c = (0, 1, 2.5), and the
+    # terminal state is d_0 + d_1 + d_2. Differentiating through the fed-back state gives dc_1/dw = 0,
+    # dd_1/dw = c_1 + w * dc_1/dw = 1, dc_2/dw = 1 and dd_2/dw = c_2 + w * dc_2/dw = 3, so 0 + 1 + 3 = 4 per channel
+    # and 16 over four channels. Detached feedback would give dd_2/dw = c_2 = 2.5 and 14.
+    assert model.weight.grad.item() == pytest.approx(16.0)
+
+
+def _slice(batch: TransientBatch, start: int, length: int) -> TransientBatch:
+    """Return one consecutive window whose initial state is the reference state at ``start``."""
+    stop = start + length
+    return TransientBatch(
+        state=batch.state + batch.target[:, :start].sum(dim=1),
+        target=batch.target[:, start:stop],
+        static=batch.static,
+        boundary=batch.boundary[:, start:stop],
+        scalars=batch.scalars,
+        t_n=batch.t_n[:, start:stop],
+        t_n_plus_1=batch.t_n_plus_1[:, start:stop],
+        dt=batch.dt[:, start:stop],
+        step_input=batch.sequence_input[:, start],
+        sequence_input=batch.sequence_input[:, start:stop],
+        scaled_target=batch.scaled_target[:, start:stop],
+    )
+
+
+class _StateRNO(nn.Module):
+    """Accumulate weighted inputs in a one-layer tensor state; each prediction is the new state."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool) -> Any:
+        assert return_hidden_states is True
+        step = value[:, 0, :4] * self.weight
+        state = step if init_hidden_states is None else cast("list[torch.Tensor]", init_hidden_states)[0] + step
+        return state, [state]
+
+
+def test_rno_state_carries_across_windows_with_truncated_gradients() -> None:
+    """Continuing the captured state reproduces one long pass while the carried state has no history."""
+    model = _StateRNO()
+    full = teacher_forced_rollout(model, _batch(4), _Tensorizer(), model_kind="rno")
+    first = teacher_forced_rollout(model, _slice(_batch(4), 0, 2), _Tensorizer(), model_kind="rno", capture=(2,))
+    carried = detach_hidden(first.captured_hidden[2])
+    second = teacher_forced_rollout(model, _slice(_batch(4), 2, 2), _Tensorizer(), model_kind="rno", initial_hidden=carried)
+
+    assert torch.allclose(torch.cat((first.scaled_delta, second.scaled_delta), dim=1), full.scaled_delta)
+    assert all(not layer.requires_grad for layer in cast("list[torch.Tensor]", carried))
+    second.scaled_delta.sum().backward()
+    assert model.weight.grad is not None
+    # Outputs c + w*x2 and c + w*x2 + w*x3 over four channels with inputs 2 and 3 give 4 * (2*2 + 3) = 28;
+    # an untruncated state c = w*(0 + 1) would add 8.
+    assert model.weight.grad.item() == pytest.approx(28.0)
+
+
+def test_per_sample_states_come_from_their_own_positions_and_never_mix_with_the_initial_state() -> None:
+    """Assemble one batch state from different capture positions and reject the unrepresentable mix."""
+    snapshots: dict[int, object | None] = {0: None, 1: [torch.zeros(2, 1)], 2: [torch.ones(2, 1)]}
+    state = cast("list[torch.Tensor]", select_hidden_per_sample(snapshots, torch.tensor([2, 1])))
+    assert state[0].flatten().tolist() == [1.0, 0.0]
+    assert select_hidden_per_sample(snapshots, torch.tensor([0, 0])) is None
+    with pytest.raises(ValueError, match="mix the initial"):
+        select_hidden_per_sample(snapshots, torch.tensor([0, 1]))

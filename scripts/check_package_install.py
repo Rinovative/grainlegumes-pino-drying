@@ -1,7 +1,4 @@
-"""
-check_package_install.py
-
-Verify editable and wheel installation contracts from unrelated directories.
+"""Verify editable and wheel installation contracts from unrelated directories.
 
 Responsibilities:
   - Build isolated editable and wheel installations from a scoped source copy
@@ -94,7 +91,6 @@ import src
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.analysis.eda import eda_dataframe
 from src.experiments import config as experiment_config
-from src.experiments.config import experiments_config_temporal
 from src.generation import contracts as generation_contracts
 from src.generation.contracts import generation_contracts_scalar_handoff
 from src.learning import learning_temporal
@@ -114,7 +110,7 @@ from src.datasets.packages import (
     dataset_packages_generated_batch,
     dataset_packages_manifest,
     dataset_packages_planning,
-    dataset_packages_references,
+    dataset_packages_selection,
     dataset_packages_transient_shards,
 )
 from src.datasets.preprocessing import (
@@ -152,7 +148,7 @@ modules = (
     dataset_packages_generated_batch,
     dataset_packages_manifest,
     dataset_packages_planning,
-    dataset_packages_references,
+    dataset_packages_selection,
     dataset_packages_transient_shards,
     dataset_preprocessing_normalization,
     dataset_preprocessing_splits,
@@ -163,7 +159,6 @@ modules = (
     dataset_runtime_transient,
     eda_dataframe,
     experiment_config,
-    experiments_config_temporal,
     generation_contracts,
     generation_contracts_scalar_handoff,
     learning_temporal,
@@ -172,48 +167,37 @@ for module in modules:
     path = Path(module.__file__).resolve()
     assert path.is_relative_to(expected), (module.__name__, path, expected)
 assert datasets.runtime.factory.create_dataset is dataset_runtime_factory.create_dataset
-assert datasets.packages.generated_batch.load_generated_batch is dataset_packages_generated_batch.load_generated_batch
+assert datasets.packages.generated_batch.interpret_admitted_source_case is dataset_packages_generated_batch.interpret_admitted_source_case
+assert (
+    datasets.packages.generated_batch.interpret_admitted_transient_source_case
+    is dataset_packages_generated_batch.interpret_admitted_transient_source_case
+)
 assert datasets.contracts.identity.DatasetIdentity is dataset_contracts_identity.DatasetIdentity
 assert datasets.contracts.metadata.load_dataset_metadata is dataset_contracts_metadata.load_dataset_metadata
 assert datasets.preprocessing.normalization.build_normalizer_artifact is dataset_preprocessing_normalization.build_normalizer_artifact
-assert datasets.packages.build_campaign_packages is dataset_packages.build_campaign_packages
+assert datasets.packages.build_dataset_selection is dataset_packages.build_dataset_selection
+assert datasets.packages.discover_source_collections is dataset_packages_selection.discover_source_collections
+assert datasets.packages.select_exact_cases is dataset_packages_selection.select_exact_cases
+assert datasets.packages.select_ranked_cases is dataset_packages_selection.select_ranked_cases
 assert datasets.preprocessing.splits.admit_split_contract is dataset_preprocessing_splits.admit_split_contract
 assert datasets.runtime.steady.SteadyFlowDataset is dataset_runtime_steady.SteadyFlowDataset
 assert datasets.runtime.training.create_dataloaders is dataset_runtime_training.create_dataloaders
 assert datasets.runtime.transient.TransientPhysicalDataset is dataset_runtime_transient.TransientPhysicalDataset
 assert datasets.contracts.transient.transient_contract_digest is dataset_contracts_transient.transient_contract_digest
 assert datasets.contracts.views.inspect_contract is dataset_contracts_views.inspect_contract
-assert dataset_contracts.identity.DatasetIdentity is dataset_contracts_identity.DatasetIdentity
-assert dataset_contracts.metadata.load_dataset_metadata is dataset_contracts_metadata.load_dataset_metadata
-assert dataset_contracts.transient.transient_contract_digest is dataset_contracts_transient.transient_contract_digest
-assert dataset_contracts.views.inspect_contract is dataset_contracts_views.inspect_contract
-assert dataset_package_services.builder.build_campaign_packages is dataset_packages_builder.build_campaign_packages
-assert dataset_package_services.generated_batch.load_generated_batch is dataset_packages_generated_batch.load_generated_batch
+assert dataset_package_services.builder.build_dataset_selection is dataset_packages_builder.build_dataset_selection
 assert dataset_package_services.manifest.load_package_manifest is dataset_packages_manifest.load_package_manifest
-assert dataset_package_services.planning.prepare_campaign_packages is dataset_packages_planning.prepare_campaign_packages
-assert dataset_package_services.references is dataset_packages_references
-assert dataset_package_services.publish_dataset_reference is dataset_packages.publish_dataset_reference
-assert dataset_package_services.resolve_dataset_reference is dataset_packages.resolve_dataset_reference
+assert dataset_package_services.planning.prepare_dataset_selection is dataset_packages_planning.prepare_dataset_selection
 assert dataset_package_services.transient_shards is dataset_packages_transient_shards
 assert dataset_package_services.transient_shards.build_transient_shards is dataset_packages_transient_shards.build_transient_shards
 assert dataset_package_services.inspect_dataset_package is dataset_packages.inspect_dataset_package
-assert dataset_preprocessing.normalization.build_normalizer_artifact is dataset_preprocessing_normalization.build_normalizer_artifact
-assert dataset_preprocessing.splits.admit_split_contract is dataset_preprocessing_splits.admit_split_contract
-assert dataset_runtime.factory.create_dataset is dataset_runtime_factory.create_dataset
 assert dataset_runtime.package_validation.inspect_dataset_package is dataset_runtime_package_validation.inspect_dataset_package
-assert dataset_runtime.steady.SteadyFlowDataset is dataset_runtime_steady.SteadyFlowDataset
-assert dataset_runtime.training.create_dataloaders is dataset_runtime_training.create_dataloaders
-assert dataset_runtime.transient.TransientPhysicalDataset is dataset_runtime_transient.TransientPhysicalDataset
 assert dataset_packages.DATASET_PACKAGE_SCHEMA_KIND == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_KIND
 assert dataset_packages.DATASET_PACKAGE_SCHEMA_VERSION == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_VERSION
-assert dataset_packages.build_campaign_packages.__module__ == "src.datasets.dataset_packages"
-assert not hasattr(datasets, "base")
+assert dataset_packages.build_dataset_selection.__module__ == "src.datasets.dataset_packages"
 assert datasets.contracts.views.inspect_contract("steady_flow").contract_digest
 assert generation.contracts.get_profile_contract("transient_drying").id == "transient_drying"
-assert experiments.config.temporal is experiments_config_temporal
-assert experiment_config.temporal is experiments_config_temporal
 assert generation.contracts.scalar_handoff is generation_contracts_scalar_handoff
-assert generation_contracts.scalar_handoff is generation_contracts_scalar_handoff
 assert learning.temporal is learning_temporal
 assert h5py.version.version
 print(src.__file__)
@@ -233,9 +217,9 @@ print(eda_dataframe.__file__)
         "runpy.run_module('src.datasets.dataset_packages', run_name='__main__')"
     )
     completed = _run([str(python), "-S", "-B", "-c", help_probe], cwd=cwd)
-    commands = "{build,inspect,smoke,refs,resolve,inspect-ref}"
+    commands = "{run,inspect,rebuild}"
     if commands not in completed.stdout:
-        message = "Dataset package help did not expose the maintained package and reference commands."
+        message = "Dataset package help did not expose the maintained package commands."
         raise RuntimeError(message)
 
 

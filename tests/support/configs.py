@@ -1,4 +1,16 @@
-"""Build compact artificial configuration requests owned by the tests."""
+"""Build compact artificial configuration requests owned by the tests.
+
+Responsibilities:
+  - Build direct, matched transient, stage-A-only transient, steady and transient-A0 Optuna requests and write temporary YAML files
+  - Derive the test-owned config source whose name equals a request's model label and resolve requests with it
+
+Design principles:
+  - Each builder returns explicit test-owned values independently of production experiment files
+  - Resolution helpers only supply the source; the production loader owns every other decision
+
+This module does NOT:
+  - Allocate runs or start training
+"""
 
 from __future__ import annotations
 
@@ -6,9 +18,16 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from src.experiments.config import experiments_config_defaults as config_defaults
+from src.experiments.config import experiments_config_loader as config_loader
+from src.experiments.config import experiments_config_naming as config_naming
+from src.experiments.config import experiments_config_transient_plan as transient_plan
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
+
+TEST_FAMILY = "tests"
 
 
 def direct_config(
@@ -18,7 +37,6 @@ def direct_config(
     device: str = "cpu",
     wandb_mode: str = "disabled",
     workflow: str = "train",
-    suffix: str | None = "fixture",
 ) -> dict[str, Any]:
     """Return a complete, artificial direct-training request owned by the tests."""
     if model_kind == "fno":
@@ -45,9 +63,12 @@ def direct_config(
             "enabled": True,
             "derivatives": {"kind": "physical", "extension": "none"},
             "interior_crop": 1,
-            "continuity": "div_velocity",
-            "residual_weight": {
+            "momentum_weight": {
                 "target": 2.0e-3,
+                "warmup": {"kind": "linear", "epochs": 2},
+            },
+            "continuity_weight": {
+                "target": 4.0e-3,
                 "warmup": {"kind": "linear", "epochs": 2},
             },
             "boundary_weight": {
@@ -62,11 +83,10 @@ def direct_config(
             "seed": 17,
             "deterministic": True,
             "device": device,
-            "suffix": suffix,
         },
         "data": {
             "train_dataset": "synthetic_train",
-            "ood_datasets": ["synthetic_ood"],
+            "additional_evaluation_datasets": ["synthetic_ood"],
             "batch_size": 2,
             "num_workers": 0,
         },
@@ -81,7 +101,7 @@ def direct_config(
         "training": {
             "epochs": 3,
             "evaluation_interval": 1,
-            "ood_evaluation_interval": 1,
+            "additional_evaluation_interval": 1,
             "mixed_precision": False,
         },
         "tracking": {
@@ -95,15 +115,10 @@ def direct_config(
     }
 
 
-def transient_two_stage_config(
-    *,
-    model_kind: str = "fno",
-    revision: int = 0,
-    seed: int = 17,
-) -> dict[str, Any]:
-    """Return a compact artificial transient A0-to-B plan owned by the tests."""
+def _transient_model_params(model_kind: str) -> dict[str, Any]:
+    """Return the tiny test-owned transient architecture parameters."""
     if model_kind == "fno":
-        model_params: dict[str, Any] = {
+        return {
             "n_modes": [4, 5],
             "hidden_channels": 8,
             "n_layers": 2,
@@ -114,8 +129,8 @@ def transient_two_stage_config(
             "implementation": "factorized",
             "positional_embedding": None,
         }
-    elif model_kind == "rno":
-        model_params = {
+    if model_kind == "rno":
+        return {
             "n_modes": [4, 5],
             "hidden_channels": 8,
             "n_layers": 2,
@@ -127,49 +142,30 @@ def transient_two_stage_config(
             "return_sequences": False,
             "positional_embedding": None,
         }
-    elif model_kind == "uno":
-        model_params = {
+    if model_kind == "uno":
+        return {
             "modes_x": 4,
             "modes_y": 5,
             "hidden_channels": 8,
             "n_layers": 5,
             "mode_ratio": 0.5,
         }
-    else:
-        message = f"Unsupported synthetic transient model kind: {model_kind!r}"
-        raise ValueError(message)
-    stage_a_sampling: dict[str, Any] = {"mode": "one_step_transition"}
-    stage_a_horizon = 1
-    stage_a_curriculum: dict[str, Any] = {
-        "lengths": [1],
-        "milestone_fractions": [0.0],
-        "seed": seed,
-    }
-    if model_kind == "rno":
-        stage_a_sampling = {
-            "mode": "rollout_window",
-            "rollout_length": 4,
-            "window_stride": 4,
-            "window_offset": 0,
-        }
-        stage_a_horizon = 4
-        stage_a_curriculum = {
-            "lengths": [2, 4],
-            "milestone_fractions": [0.0, 0.5],
-            "seed": seed,
-        }
+    message = f"Unsupported synthetic transient model kind: {model_kind!r}"
+    raise ValueError(message)
+
+
+def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> dict[str, Any]:
+    """Return the transient sections shared by the matched and stage-A-only builders."""
     return {
         "task": "transient_drying",
         "run": {
-            "revision": revision,
             "seed": seed,
             "deterministic": True,
             "device": "cpu",
-            "suffix": "fixture",
         },
         "data": {
             "train_dataset": "synthetic_transient_train",
-            "ood_datasets": ["synthetic_transient_ood"],
+            "additional_evaluation_datasets": ["synthetic_transient_ood"],
             "batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
@@ -177,10 +173,9 @@ def transient_two_stage_config(
             "transient_backend_preference": "pt_shards",
             "transient_backend_required": True,
             "hdf5_cache_size": 0,
-            "allow_technical_smoke": False,
         },
         "input_profile": "canonical_physics_complete_v1",
-        "temporal": {"temporal_conditioning": {"kind": "none"}},
+        "temporal": temporal,
         "scaling": {"mode": "state_std"},
         "loss": {
             "data": {
@@ -191,7 +186,7 @@ def transient_two_stage_config(
                 "channel_weights": [1.0, 1.0, 1.0, 1.0],
                 "state_aux_weight": 0.0,
             },
-            "physics": {"enabled": False, "continuity": "none"},
+            "physics": {"enabled": False},
         },
         "evaluation": {
             "objective": {
@@ -205,46 +200,6 @@ def transient_two_stage_config(
             "patience": 2,
             "min_lr": 1.0e-6,
         },
-        "training": {
-            "mixed_precision": False,
-            "stage_schedule": {
-                "mode": "joint_ab",
-                "budget_unit": "epochs",
-                "total_epochs": 7,
-                "stage_a_fraction": 0.5,
-            },
-            "stage_a": {
-                "evaluation_interval": 1,
-                "ood_evaluation_interval": 1,
-                "gradient_accumulation_steps": 1,
-                "sampling": stage_a_sampling,
-                "fixed_evaluation_horizon": stage_a_horizon,
-                "curriculum": stage_a_curriculum,
-            },
-            "stage_b": {
-                "evaluation_interval": 1,
-                "ood_evaluation_interval": 1,
-                "gradient_accumulation_steps": 1,
-                "sampling": {
-                    "mode": "rollout_window",
-                    "rollout_length": 4,
-                    "window_stride": 4,
-                    "window_offset": 0,
-                },
-                "fixed_evaluation_horizon": 4,
-                "curriculum": {
-                    "lengths": [2, 4],
-                    "milestone_fractions": [0.0, 0.5],
-                    "seed": seed,
-                },
-                "matched_compute": {
-                    "planned_seconds": None,
-                    "planned_steps": None,
-                    "rollout_reference_seconds": None,
-                    "rollout_reference_steps": None,
-                },
-            },
-        },
         "tracking": {
             "wandb": {
                 "mode": "disabled",
@@ -254,9 +209,88 @@ def transient_two_stage_config(
         },
         "model": {
             "kind": model_kind,
-            "params": model_params,
+            "params": _transient_model_params(model_kind),
         },
     }
+
+
+def _teacher_forced_stage(*, model_kind: str, seed: int) -> dict[str, Any]:
+    """Return the A0 sampling and curriculum that A1 inherits."""
+    if model_kind == "rno":
+        return {
+            "sampling": {"mode": "trajectory", "rollout_length": 4},
+            "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5], "seed": seed},
+        }
+    return {
+        "sampling": {"mode": "one_step_transition"},
+        "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": seed},
+    }
+
+
+def transient_matched_config(
+    *,
+    model_kind: str = "fno",
+    seed: int = 17,
+) -> dict[str, Any]:
+    """Return a compact artificial authored matched A0 -> {B, A1} plan owned by the tests."""
+    a0 = {
+        "max_epochs": 4,
+        "evaluation_interval": 1,
+        "additional_evaluation_interval": 1,
+        "gradient_accumulation_steps": 1,
+        **_teacher_forced_stage(model_kind=model_kind, seed=seed),
+    }
+    b_sampling: dict[str, Any] = {"mode": "rollout_window", "rollout_length": 4, "window_stride": 4, "window_offset": 0}
+    if model_kind == "rno":
+        b_sampling = {"mode": "trajectory", "rollout_length": 4}
+    b = {
+        "max_epochs": 3,
+        "train_seconds": 0.25,
+        "lr_scale": 1.0,
+        "evaluation_interval": 1,
+        "additional_evaluation_interval": 1,
+        "gradient_accumulation_steps": 1,
+        "sampling": b_sampling,
+        "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5], "seed": seed},
+    }
+    config = _transient_base(model_kind=model_kind, seed=seed, temporal={"temporal_conditioning": {"kind": "none"}})
+    config["training"] = {
+        "mode": "matched_a1_b",
+        "mixed_precision": False,
+        "continuation_evaluations": 4,
+        "a0": a0,
+        "b": b,
+        "a1": {"max_epochs": 3, "match_to": "b.train_seconds", "lr_scale": 1.0},
+    }
+    return config
+
+
+def transient_stage_a_only_config(
+    *,
+    model_kind: str = "fno",
+    seed: int = 17,
+) -> dict[str, Any]:
+    """Return a compact artificial single-stage A0 request, as an Optuna study base owns it."""
+    a0 = _teacher_forced_stage(model_kind=model_kind, seed=seed)
+    epochs = 4
+    config = _transient_base(
+        model_kind=model_kind,
+        seed=seed,
+        temporal={"sampling": a0["sampling"], "temporal_conditioning": {"kind": "none"}},
+    )
+    config["training"] = {
+        "epochs": epochs,
+        "stage_schedule": {"mode": "stage_a_only", "budget_unit": "epochs", "total_epochs": epochs},
+        "evaluation_interval": 1,
+        "additional_evaluation_interval": 1,
+        "mixed_precision": False,
+        "stage": "a",
+        "comparison_arm": "a0",
+        "gradient_accumulation_steps": 1,
+        "curriculum": a0["curriculum"],
+        "teacher_handoff": None,
+    }
+    return config
 
 
 def optuna_config(
@@ -268,7 +302,6 @@ def optuna_config(
 ) -> dict[str, Any]:
     """Return a compact artificial Optuna request with explicit search semantics."""
     study: dict[str, Any] = {
-        "name": f"synthetic_{model_kind}_study",
         "seed": 29,
         "n_trials": 2,
         "sampler": {"kind": "tpe", "multivariate": multivariate},
@@ -286,7 +319,6 @@ def optuna_config(
         model_kind=model_kind,
         physics_enabled=physics_enabled,
         workflow="optuna_trial",
-        suffix="optuna",
     )
     return {
         "study": study,
@@ -306,6 +338,52 @@ def optuna_config(
             },
         },
     }
+
+
+def optuna_transient_a0_config() -> dict[str, Any]:
+    """Return a compact artificial transient A0 Optuna request: the stage_a_only study mode over a single-stage base."""
+    request = optuna_config()
+    request["study"]["mode"] = "stage_a_only"
+    request["experiment"] = transient_stage_a_only_config()
+    request["experiment"]["data"]["additional_evaluation_datasets"] = []
+    request["experiment"]["tracking"]["wandb"]["workflow"] = "optuna_trial"
+    return request
+
+
+def source_for(raw: Mapping[str, Any]) -> config_naming.ConfigSource:
+    """Return the test-family source named exactly like the request's model label.
+
+    A request too incomplete to label gets a placeholder source: the resolver reports
+    that request's own schema error before it ever checks the config name.
+    """
+    task = raw.get("task")
+    try:
+        effective = config_loader.deep_merge(config_defaults.get_task_defaults(str(task)), raw)
+        return config_naming.ConfigSource(str(task), TEST_FAMILY, config_naming.model_label(effective))
+    except (KeyError, TypeError, ValueError):
+        return config_naming.ConfigSource(str(task), TEST_FAMILY, "unlabelled")
+
+
+def resolve(raw: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    """Resolve a test request under its test-family source."""
+    return config_loader.resolve_config(raw, source=source_for(raw), **kwargs)
+
+
+def resolve_plan(raw: Mapping[str, Any], **kwargs: Any) -> transient_plan.MatchedA1BPlan:
+    """Resolve a test matched plan under its test-family source."""
+    return transient_plan.resolve_matched_a1_b_plan(raw, source=source_for(raw), **kwargs)
+
+
+def write_config(directory: Path, payload: Mapping[str, Any], *, canonical_root: Path | None = None) -> Path:
+    """Write an executable request into ``directory`` under its model-label file name.
+
+    With ``canonical_root`` the file lands in that root's canonical
+    ``configs/03_learning/<task>/experiments/tests/`` tree instead.
+    """
+    source = source_for(payload)
+    if canonical_root is not None:
+        directory = canonical_root / "configs" / "03_learning" / source.task / "experiments" / source.family
+    return write_yaml(directory / f"{source.name}.yaml", payload)
 
 
 def write_yaml(path: Path, payload: Mapping[str, Any]) -> Path:

@@ -1,13 +1,15 @@
-"""
-dataset_runtime_transient_training.py
-
-Construct storage-neutral transient training loaders from published packages.
+"""Construct storage-neutral transient training loaders from published packages.
 
 Responsibilities:
-  - Select package-owned transient case roles without splitting transitions
-  - Persist and replay strict case and item membership evidence
+  - Resolve experiment-owned transient case roles before expanding transitions
+  - Build and replay strict case and item membership evidence
   - Fit transient scaling from one-step Train evidence only
   - Build deterministically seeded training and evaluation DataLoaders
+
+Design principles:
+  - Complete case roles are selected before transitions or rollout windows expand
+  - Scaling uses one-step Train evidence and exact restored or cache-bound state
+  - Storage backend choices preserve the same membership and sample contract
 
 This module does NOT:
   - Read HDF5 directly or create an alternative transient storage runtime
@@ -32,9 +34,9 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from src import common, domain
+from src.datasets import packages
+from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
-from src.datasets.contracts import dataset_contracts_views as views
-from src.datasets.packages import dataset_packages_manifest as package_manifest
 from src.datasets.runtime import dataset_runtime_factory as factory
 from src.datasets.runtime import dataset_runtime_transient as transient
 from src.learning.transient import learning_transient_scaling as scaling
@@ -43,13 +45,16 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 if TYPE_CHECKING:
     from pathlib import Path
 
-_SPLIT_SCHEMA_KIND: Final = "transient_drying_training_split"
-_SPLIT_SCHEMA_VERSION: Final = 2
-_LEGACY_SPLIT_SCHEMA_VERSION: Final = 1
+SPLIT_SCHEMA_KIND: Final = "experiment_transient_case_split"
+SPLIT_SCHEMA_VERSION: Final = 2
+# Every evaluation role yields whole trajectories: checkpoint selection rolls each one out autonomously from its start.
+EVALUATION_SAMPLING: Final = transient_contract.TransientSamplingSpec(mode="trajectory")
+_TASK: Final = "transient_drying"
 _SCALER_CACHE_SCHEMA_KIND: Final = "transient_drying_scaler_cache"
 _SCALER_CACHE_SCHEMA_VERSION: Final = 1
 _SHA256_LENGTH: Final = 64
 _MINIMUM_SPATIAL_AXIS_LENGTH: Final = 2
+_MINIMUM_SPLIT_CASES: Final = 3
 StartupCallback = Callable[[str, Mapping[str, Any]], None]
 
 
@@ -59,7 +64,7 @@ class TransientTrainingLoaders:
 
     train: DataLoader[Any]
     evaluation: DataLoader[Any]
-    ood: DataLoader[Any]
+    additional_evaluation: DataLoader[Any] | None
     id_test: DataLoader[Any]
     scaling_artifact: scaling.TransientScalingArtifact
     split: dict[str, Any]
@@ -137,9 +142,9 @@ def _admit_spatial_view(
 
 
 def _require_fraction(value: float) -> float:
-    """Validate the requested case-owned OOD selection fraction."""
+    """Validate the requested case-owned additional evaluation selection fraction."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0:
-        message = "ood_fraction must be one finite fraction in (0, 1]."
+        message = "additional_evaluation_fraction must be one finite fraction in (0, 1]."
         raise ValueError(message)
     return float(value)
 
@@ -245,24 +250,21 @@ def _validate_scaling_artifact(
     *,
     tensorizer: TransientTensorizerSpec,
     dataset_identity: Mapping[str, Any],
-    legacy_dataset_identity: Mapping[str, Any],
     train_membership_digest: str,
     scale_mode: scaling.TransientScaleMode,
     spatial_view: Mapping[str, int],
     horizon: float,
-    allow_legacy_stride_one: bool,
 ) -> None:
-    """Require exact scaler semantics, optionally admitting legacy stride one."""
+    """Require exact current scaler identity and Train membership."""
     expected_identity = dict(dataset_identity)
     identity_matches = artifact.dataset_identity == expected_identity
-    legacy_matches = allow_legacy_stride_one and spatial_view["spatial_stride"] == 1 and artifact.dataset_identity == dict(legacy_dataset_identity)
     expected_shape = (
         spatial_view["effective_ny"],
         spatial_view["effective_nx"],
     )
     if (
         artifact.tensorizer != tensorizer
-        or not (identity_matches or legacy_matches)
+        or not identity_matches
         or artifact.train_membership_digest != train_membership_digest
         or artifact.scale_mode != scale_mode
         or artifact.spatial_shape != expected_shape
@@ -279,7 +281,6 @@ def _load_scaler_cache_entry(
     cache_digest: str,
     tensorizer: TransientTensorizerSpec,
     dataset_identity: Mapping[str, Any],
-    legacy_dataset_identity: Mapping[str, Any],
     train_membership_digest: str,
     scale_mode: scaling.TransientScaleMode,
     spatial_view: Mapping[str, int],
@@ -323,12 +324,10 @@ def _load_scaler_cache_entry(
         artifact,
         tensorizer=tensorizer,
         dataset_identity=dataset_identity,
-        legacy_dataset_identity=legacy_dataset_identity,
         train_membership_digest=train_membership_digest,
         scale_mode=scale_mode,
         spatial_view=spatial_view,
         horizon=horizon,
-        allow_legacy_stride_one=False,
     )
     return artifact
 
@@ -385,7 +384,6 @@ def _fit_or_load_scaling_artifact(
     *,
     tensorizer: TransientTensorizerSpec,
     dataset_identity: Mapping[str, Any],
-    legacy_dataset_identity: Mapping[str, Any],
     train_membership_digest: str,
     scale_mode: scaling.TransientScaleMode,
     spatial_view: Mapping[str, int],
@@ -437,7 +435,6 @@ def _fit_or_load_scaling_artifact(
                     cache_digest=cache_digest,
                     tensorizer=tensorizer,
                     dataset_identity=dataset_identity,
-                    legacy_dataset_identity=legacy_dataset_identity,
                     train_membership_digest=train_membership_digest,
                     scale_mode=scale_mode,
                     spatial_view=spatial_view,
@@ -592,11 +589,11 @@ def admit_transient_training_split(
     *,
     tensorizer: TransientTensorizerSpec,
     sampling: transient_contract.TransientSamplingSpec,
-    ood_fraction: float,
-    split_seed: int,
+    additional_evaluation_fraction: float,
+    split_seed: int | None = None,
     spatial_stride: int = 1,
 ) -> dict[str, Any]:
-    """Admit one current or stride-one legacy transient training split."""
+    """Admit Dataset fixed membership and the run-owned Train and evaluation item expansion evidence."""
     base_required = {
         "schema_kind",
         "schema_version",
@@ -605,85 +602,97 @@ def admit_transient_training_split(
         "data_contract_digest",
         "tensorizer",
         "sampling",
+        "evaluation_sampling",
         "dataset_identity",
-        "ood_fraction",
+        "additional_evaluation_fraction",
         "split_seed",
+        "source_case_ids",
+        "source_case_materials",
+        "case_partition",
+        "case_partition_digest",
+        "evaluation_assignments",
+        "spatial_view",
         "roles",
         "runtime_provenance",
     }
     if not isinstance(value, Mapping):
         message = "Transient training split must be a mapping."
         raise TypeError(message)
-    version = value.get("schema_version")
-    if version == _LEGACY_SPLIT_SCHEMA_VERSION:
-        if transient_contract.validate_spatial_stride(spatial_stride) != 1:
-            message = "Legacy transient split evidence is valid only for spatial_stride=1."
-            raise ValueError(message)
-        required = base_required
-        admitted_spatial_view = None
-    elif version == _SPLIT_SCHEMA_VERSION:
-        required = base_required.union({"spatial_view"})
-        admitted_spatial_view = _admit_spatial_view(
-            value.get("spatial_view"),
-            expected_stride=spatial_stride,
-        )
-    else:
-        message = f"Transient training split schema version {version!r} is unsupported."
-        raise ValueError(message)
-    if set(value) != required:
-        message = "Transient training split keys do not match the schema."
-        raise ValueError(message)
+    if (
+        value.get("schema_kind") != SPLIT_SCHEMA_KIND
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != SPLIT_SCHEMA_VERSION
+        or set(value) != base_required
+    ):
+        msg = "Historical or malformed transient split contract is unsupported."
+        raise ValueError(msg)
+    effective_seed = value["case_partition"]["seed"]
+    if split_seed is not None and split_seed != effective_seed:
+        msg_0 = "Expected split seed disagrees with Dataset fixed partition."
+        raise ValueError(msg_0)
+    split_seed = effective_seed
+    admitted_spatial_view = _admit_spatial_view(value["spatial_view"], expected_stride=spatial_stride)
     task = domain.tasks.registry.get_task("transient_drying")
     expected_static = {
-        "schema_kind": _SPLIT_SCHEMA_KIND,
-        "schema_version": version,
+        "schema_kind": SPLIT_SCHEMA_KIND,
+        "schema_version": SPLIT_SCHEMA_VERSION,
         "task": task.id,
         "task_contract_digest": task.contract_digest,
         "data_contract_digest": task.data_contract_digest,
         "tensorizer": tensorizer.selection_dict(),
         "sampling": sampling.as_dict(),
-        "ood_fraction": _require_fraction(ood_fraction),
+        "evaluation_sampling": EVALUATION_SAMPLING.as_dict(),
+        "additional_evaluation_fraction": _require_fraction(additional_evaluation_fraction),
         "split_seed": split_seed,
+        "source_case_ids": list(value["source_case_ids"]),
+        "source_case_materials": dict(value["source_case_materials"]),
+        "case_partition": copy.deepcopy(dict(value["case_partition"])),
+        "case_partition_digest": partition_contract.partition_digest(value["case_partition"]),
+        "evaluation_assignments": copy.deepcopy(list(value["evaluation_assignments"])),
     }
     mismatches = [key for key, expected in expected_static.items() if value[key] != expected]
     if mismatches:
         message = f"Transient training split identity mismatch at {sorted(mismatches)}."
         raise ValueError(message)
     identity = value["dataset_identity"]
-    if not isinstance(identity, Mapping) or set(identity) != {"train", "ood"}:
+    if not isinstance(identity, Mapping) or set(identity) != {"train", "additional_evaluation"}:
         message = "Transient split dataset_identity has unexpected fields."
         raise ValueError(message)
     train_identity = _admit_dataset_identity(
         identity["train"],
         label="train",
     )
-    raw_ood_identity = identity["ood"]
-    if not isinstance(raw_ood_identity, list) or not raw_ood_identity:
-        message = "Transient split requires OOD package identities."
-        raise ValueError(message)
-    ood_identity = [_admit_dataset_identity(item, label=f"ood[{index}]") for index, item in enumerate(raw_ood_identity)]
+    raw_additional_evaluation_identity = identity["additional_evaluation"]
+    if not isinstance(raw_additional_evaluation_identity, list):
+        message = "Transient split additional evaluation Dataset identities must be a list."
+        raise TypeError(message)
+    additional_evaluation_identity = [
+        _admit_dataset_identity(item, label=f"additional_evaluation[{index}]") for index, item in enumerate(raw_additional_evaluation_identity)
+    ]
 
     runtime_provenance = value["runtime_provenance"]
-    expected_provenance_keys = {"train", "scaling_train_one_step", "evaluation", "id_test", "ood"}
+    expected_provenance_keys = {"train", "scaling_train_one_step", "validation", "id_test", "additional_evaluation"}
     if not isinstance(runtime_provenance, Mapping) or set(runtime_provenance) != expected_provenance_keys:
         message = "Transient split runtime_provenance has unexpected fields."
         raise ValueError(message)
-    scalar_roles = ("train", "scaling_train_one_step", "evaluation", "id_test")
+    scalar_roles = ("train", "scaling_train_one_step", "validation", "id_test")
     if any(runtime_provenance[role] not in {"canonical_hdf5", "pt_shards"} for role in scalar_roles):
         message = "Transient split runtime backend provenance is invalid."
         raise ValueError(message)
-    ood_backends = runtime_provenance["ood"]
-    if not isinstance(ood_backends, list) or not ood_backends or any(backend not in {"canonical_hdf5", "pt_shards"} for backend in ood_backends):
-        message = "Transient split OOD backend provenance is invalid."
+    additional_evaluation_backends = runtime_provenance["additional_evaluation"]
+    if not isinstance(additional_evaluation_backends, list) or any(
+        backend not in {"canonical_hdf5", "pt_shards"} for backend in additional_evaluation_backends
+    ):
+        message = "Transient split additional evaluation backend provenance is invalid."
         raise ValueError(message)
 
     roles = value["roles"]
     role_keys = {
         "train",
         "scaling_train_one_step",
-        "evaluation",
+        "validation",
         "id_test",
-        "ood",
+        "additional_evaluation",
     }
     if not isinstance(roles, Mapping) or set(roles) != role_keys:
         message = "Transient split role evidence has unexpected fields."
@@ -693,51 +702,67 @@ def admit_transient_training_split(
         for role in (
             "train",
             "scaling_train_one_step",
-            "evaluation",
+            "validation",
             "id_test",
         )
     }
-    raw_ood = roles["ood"]
-    if not isinstance(raw_ood, Mapping) or set(raw_ood) != {"parts"}:
-        message = "Transient split OOD role evidence is invalid."
+    raw_additional_evaluation = roles["additional_evaluation"]
+    if not isinstance(raw_additional_evaluation, Mapping) or set(raw_additional_evaluation) != {"parts"}:
+        message = "Transient split additional evaluation role evidence is invalid."
         raise ValueError(message)
-    raw_parts = raw_ood["parts"]
-    if not isinstance(raw_parts, list) or len(raw_parts) != len(ood_identity):
-        message = "Transient split OOD role/package counts disagree."
+    raw_parts = raw_additional_evaluation["parts"]
+    if not isinstance(raw_parts, list) or len(raw_parts) != len(additional_evaluation_identity):
+        message = "Transient split additional evaluation role/Dataset counts disagree."
         raise ValueError(message)
-    admitted_ood = [_admit_role_evidence(item, label=f"ood.parts[{index}]") for index, item in enumerate(raw_parts)]
+    admitted_additional_evaluation = [
+        _admit_role_evidence(item, label=f"additional_evaluation.parts[{index}]") for index, item in enumerate(raw_parts)
+    ]
     if admitted_roles["train"]["case_ids"] != admitted_roles["scaling_train_one_step"]["case_ids"]:
         message = "Transient split Train and scaling case memberships differ."
         raise ValueError(message)
-    id_case_sets = [set(admitted_roles[role]["case_ids"]) for role in ("train", "evaluation", "id_test")]
+    expected_partition = partition_contract.validate_fixed_partition(
+        value["case_partition"],
+        case_ids=value["source_case_ids"],
+        material_by_case=value["source_case_materials"],
+    )
+    if expected_partition["seed"] != split_seed:
+        msg_0 = "Saved split seed disagrees with Dataset fixed partition."
+        raise ValueError(msg_0)
+    if (
+        admitted_roles["train"]["case_ids"] != list(expected_partition["train"])
+        or admitted_roles["validation"]["case_ids"] != list(expected_partition["validation"])
+        or admitted_roles["id_test"]["case_ids"] != list(expected_partition["id_test"])
+    ):
+        msg = "Transient split roles disagree with the declared case partition."
+        raise ValueError(msg)
+    _admit_evaluation_assignments(
+        value["evaluation_assignments"],
+        [item["dataset_id"] for item in additional_evaluation_identity],
+    )
+    id_case_sets = [set(admitted_roles[role]["case_ids"]) for role in ("train", "validation", "id_test")]
     if any(left.intersection(right) for index, left in enumerate(id_case_sets) for right in id_case_sets[index + 1 :]):
-        message = "Transient Train/evaluation/ID-test case memberships overlap."
+        message = "Transient Train/validation/ID-test case memberships overlap."
         raise ValueError(message)
     result = {
         **expected_static,
         "dataset_identity": {
             "train": train_identity,
-            "ood": ood_identity,
+            "additional_evaluation": additional_evaluation_identity,
         },
         "roles": {
             **admitted_roles,
-            "ood": {"parts": admitted_ood},
+            "additional_evaluation": {"parts": admitted_additional_evaluation},
         },
-        "runtime_provenance": {role: runtime_provenance[role] for role in (*scalar_roles, "ood")},
+        "runtime_provenance": {role: runtime_provenance[role] for role in (*scalar_roles, "additional_evaluation")},
     }
-    if admitted_spatial_view is not None:
-        result["spatial_view"] = admitted_spatial_view
+    result["spatial_view"] = admitted_spatial_view
     return result
 
 
 def _scientific_split(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Return replay evidence normalized across legacy stride-one storage."""
+    """Exclude only runtime backend choice from replay-scientific identity."""
     result = dict(value)
     result.pop("runtime_provenance", None)
-    spatial_view = result.get("spatial_view")
-    if isinstance(spatial_view, Mapping) and spatial_view.get("spatial_stride") == 1:
-        result.pop("spatial_view")
-        result["schema_version"] = _LEGACY_SPLIT_SCHEMA_VERSION
     return result
 
 
@@ -762,7 +787,7 @@ def _admit_saved_split(saved: Mapping[str, Any], current: Mapping[str, Any]) -> 
         saved,
         tensorizer=tensorizer,
         sampling=sampling,
-        ood_fraction=current["ood_fraction"],
+        additional_evaluation_fraction=current["additional_evaluation_fraction"],
         split_seed=current["split_seed"],
         spatial_stride=stride,
     )
@@ -770,7 +795,7 @@ def _admit_saved_split(saved: Mapping[str, Any], current: Mapping[str, Any]) -> 
         current,
         tensorizer=tensorizer,
         sampling=sampling,
-        ood_fraction=current["ood_fraction"],
+        additional_evaluation_fraction=current["additional_evaluation_fraction"],
         split_seed=current["split_seed"],
         spatial_stride=stride,
     )
@@ -778,6 +803,21 @@ def _admit_saved_split(saved: Mapping[str, Any], current: Mapping[str, Any]) -> 
         message = "Saved transient split does not exactly match current package, sampling, or membership evidence."
         raise ValueError(message)
     return materialized
+
+
+def _batch_keys(dataset: Dataset[Any]) -> tuple[tuple[int, int], ...] | None:
+    """Return per-item ``(part, transitions)`` keys when batches must not mix them, else ``None``."""
+    trajectories = isinstance(dataset, transient.TransientPhysicalDataset) and dataset.sampling.mode == "trajectory"
+    if not isinstance(dataset, ConcatDataset) and not trajectories:
+        return None
+    parts = dataset.datasets if isinstance(dataset, ConcatDataset) else (dataset,)
+    keys: list[tuple[int, int]] = []
+    for index, part in enumerate(parts):
+        if not isinstance(part, transient.TransientPhysicalDataset):
+            msg = "Grouped transient batches require transient Dataset parts."
+            raise TypeError(msg)
+        keys.extend((index, count) for count in part.item_transition_counts())
+    return tuple(keys)
 
 
 def _loader(
@@ -788,49 +828,97 @@ def _loader(
     loader_seed: int,
     worker_seed: int,
 ) -> DataLoader[Any]:
-    """Build one deterministic runtime loader using the shared factory."""
+    """Build one deterministic runtime loader whose batches never mix trajectory lengths or evaluation parts."""
+    keys = _batch_keys(dataset)
     configured = factory.LoaderSettings(
         batch_size=settings.batch_size,
         num_workers=settings.num_workers,
         pin_memory=settings.pin_memory,
         persistent_workers=settings.persistent_workers if settings.num_workers else False,
-        prefetch_factor=settings.prefetch_factor if settings.num_workers else None,
-        shuffle=shuffle,
-        drop_last=settings.drop_last if shuffle else False,
+        # Grouped batches own their shuffling.
+        shuffle=shuffle and keys is None,
         hdf5_cache_size=settings.hdf5_cache_size,
     )
+    generator = torch.Generator().manual_seed(loader_seed)
+    # Whole trajectories end at their own drying stop, so only equal lengths of one part share a batch.
+    batches: list[list[int]] | factory.GroupedBatchSampler | None = None
+    if keys is not None:
+        batches = (
+            factory.GroupedBatchSampler(keys, configured.batch_size, generator)
+            if shuffle
+            else factory.group_batches(range(len(keys)), keys, configured.batch_size)
+        )
     return factory.make_data_loader(
         dataset,
         configured,
-        generator=torch.Generator().manual_seed(loader_seed),
+        batches=batches,
+        generator=generator,
         worker_init_fn=_worker_initializer(worker_seed),
     )
 
 
-def _ood_package_regime(
-    dataset_id: str,
-    *,
-    storage_root: str | None,
-) -> views.PackageRegime:
-    """Return the immutable non-ID regime owned by one transient package manifest."""
-    manifest = package_manifest.load_package_manifest(
-        dataset_id,
-        storage_root=storage_root,
+def _admit_evaluation_assignments(
+    assignments: Sequence[Mapping[str, Any]],
+    dataset_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Admit explicit experiment evaluation roles without inferring roles from Dataset names."""
+    if len(assignments) != len(dataset_ids):
+        msg = "Experiment evaluation assignments must align with selected Datasets."
+        raise ValueError(msg)
+    allowed = {"ood", "id", "near_family_ood", "far_family_ood", "parameter_ood", "schedule_ood", "stress"}
+    result: list[dict[str, Any]] = []
+    for index, (assignment, dataset_id) in enumerate(zip(assignments, dataset_ids, strict=True)):
+        if not isinstance(assignment, Mapping) or set(assignment) != {"dataset_id", "role", "relation", "assumptions"}:
+            msg = f"Experiment evaluation assignment {index} has invalid keys."
+            raise ValueError(msg)
+        if assignment["dataset_id"] != dataset_id or assignment["role"] not in allowed:
+            msg = f"Experiment evaluation assignment {index} disagrees with selected Dataset."
+            raise ValueError(msg)
+        if not isinstance(assignment["relation"], str) or not assignment["relation"].strip():
+            msg = "Experiment evaluation relation must explain the declared comparison."
+            raise ValueError(msg)
+        assumptions = assignment["assumptions"]
+        if not isinstance(assumptions, list) or any(not isinstance(item, str) or not item.strip() for item in assumptions):
+            msg = "Experiment evaluation assumptions must be a list of non-empty statements."
+            raise ValueError(msg)
+        result.append({"dataset_id": dataset_id, "role": assignment["role"], "relation": assignment["relation"], "assumptions": list(assumptions)})
+    return result
+
+
+def _validate_material_holdouts(
+    train_dataset: transient.TransientPhysicalDataset,
+    assignments: Sequence[Mapping[str, Any]],
+    parts: Sequence[transient.TransientPhysicalDataset],
+) -> None:
+    """Reject same-material cases falsely declared as a material holdout."""
+    train_materials = {
+        str(case["material_family"]) for case in train_dataset.payload["cases"] if case["package_case_id"] in _case_positions(train_dataset)
+    }
+    for assignment, part in zip(assignments, parts, strict=True):
+        if assignment["role"] in {"ood", "near_family_ood", "far_family_ood"}:
+            materials = {str(case["material_family"]) for case in part.payload["cases"] if case["package_case_id"] in _case_positions(part)}
+            if train_materials.intersection(materials):
+                msg = "Declared family-OOD evaluation reuses a training material family."
+                raise ValueError(msg)
+
+
+def _dataset_fixed_partition(dataset: transient.TransientPhysicalDataset) -> dict[str, Any]:
+    """Require the manifest-owned partition before expanding runtime items."""
+    fixed = dataset.dataset_case_partition
+    if fixed is None or not fixed["train"]:
+        msg = "Training requires a Dataset-owned fixed ID partition; build the normal Dataset plan first."
+        raise ValueError(msg)
+    return partition_contract.validate_fixed_partition(
+        fixed,
+        case_ids=tuple(_case_positions(dataset)),
+        material_by_case={str(case["package_case_id"]): str(case["material_family"]) for case in dataset.payload["cases"]},
     )
-    if manifest["dataset_view"] != "transient_drying":
-        message = f"Transient Training OOD dataset {dataset_id!r} has incompatible view {manifest['dataset_view']!r}."
-        raise ValueError(message)
-    regime = cast("views.PackageRegime", manifest["evaluation_regime"])
-    if regime == "id":
-        message = f"Transient Training OOD dataset {dataset_id!r} resolves to an ID package."
-        raise ValueError(message)
-    return regime
 
 
 def create_transient_training_loaders(
     *,
     train_dataset_id: str,
-    ood_dataset_ids: str | Sequence[str],
+    additional_evaluation_dataset_ids: Sequence[str],
     tensorizer: TransientTensorizerSpec,
     train_sampling: transient_contract.TransientSamplingSpec,
     loader_settings: factory.LoaderSettings,
@@ -839,20 +927,22 @@ def create_transient_training_loaders(
     transient_backend_required: bool = False,
     spatial_stride: int = 1,
     scale_mode: scaling.TransientScaleMode = "state_std",
-    ood_fraction: float = 1.0,
-    split_seed: int = 9,
+    additional_evaluation_fraction: float = 1.0,
     loader_seed: int | None = None,
     worker_seed: int | None = None,
     saved_split: Mapping[str, Any] | None = None,
     restored_scaling_artifact: scaling.TransientScalingArtifact | None = None,
-    allow_technical_smoke: bool = False,
     startup_callback: StartupCallback | None = None,
+    split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> TransientTrainingLoaders:
     """
-    Create package-role loaders and exact reusable Train-only scaling evidence.
+    Create experiment-role loaders and exact reusable Train-only scaling evidence.
 
-    The Train, validation, and ID-test roles are selected by package case before
-    either one-step transitions or rollout windows are expanded. OOD fractions
+    The Train, validation, and ID-test roles use immutable Dataset cases before
+    their items are expanded. Train items follow ``train_sampling``; validation,
+    ID-test, and additional-evaluation items are whole trajectories
+    (``EVALUATION_SAMPLING``), so checkpoint selection does not depend on the
+    training sample shape. Additional evaluation fractions
     likewise choose complete cases before runtime item expansion. Saved split
     evidence is replayed exactly. A restored scaler or integrity-bound cache hit
     avoids recomputing identical Train-only statistics.
@@ -863,12 +953,12 @@ def create_transient_training_loaders(
     if not isinstance(train_sampling, transient_contract.TransientSamplingSpec):
         message = "train_sampling must be a TransientSamplingSpec."
         raise TypeError(message)
-    if isinstance(split_seed, bool) or not isinstance(split_seed, int):
-        message = "split_seed must be an integer."
-        raise TypeError(message)
     resolved_spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
-    fraction = _require_fraction(ood_fraction)
-    resolved_loader_seed = split_seed if loader_seed is None else loader_seed
+    fraction = _require_fraction(additional_evaluation_fraction)
+    if fraction != 1.0:
+        msg = "Dataset-owned OOD membership is fixed; additional_evaluation_fraction must remain 1.0."
+        raise ValueError(msg)
+    resolved_loader_seed = 9 if loader_seed is None else loader_seed
     resolved_worker_seed = resolved_loader_seed if worker_seed is None else worker_seed
     if isinstance(resolved_loader_seed, bool) or not isinstance(resolved_loader_seed, int):
         message = "loader_seed must be an integer."
@@ -877,91 +967,82 @@ def create_transient_training_loaders(
         message = "worker_seed must be an integer."
         raise TypeError(message)
 
-    def request(
+    def dataset_for(
         dataset_id: str,
-        regime: views.PackageRegime,
-        membership: str | None = None,
         *,
         sampling: transient_contract.TransientSamplingSpec | None = None,
-    ) -> factory.DatasetRequest:
-        return factory.DatasetRequest(
+    ) -> transient.TransientPhysicalDataset:
+        request = factory.DatasetRequest(
             dataset_id=dataset_id,
-            dataset_view="transient_drying",
-            evaluation_regime=regime,
-            membership=membership,  # type: ignore[arg-type]
+            dataset_view=_TASK,
             transient_sampling=train_sampling if sampling is None else sampling,
             storage_root=storage_root,
-            allow_technical_smoke=allow_technical_smoke,
             transient_backend_preference=transient_backend_preference,
             transient_backend_required=transient_backend_required,
             spatial_stride=resolved_spatial_stride,
         )
-
-    def dataset_for(
-        dataset_id: str,
-        regime: views.PackageRegime,
-        membership: str | None = None,
-        *,
-        sampling: transient_contract.TransientSamplingSpec | None = None,
-    ) -> transient.TransientPhysicalDataset:
-        value = factory.create_dataset(
-            request(
-                dataset_id,
-                regime,
-                membership,
-                sampling=sampling,
-            ),
-            hdf5_cache_size=loader_settings.hdf5_cache_size,
-        )
+        value = factory.create_dataset(request, hdf5_cache_size=loader_settings.hdf5_cache_size)
         if not isinstance(value, transient.TransientPhysicalDataset):
-            message = "Transient Dataset factory returned a non-transient Dataset."
-            raise TypeError(message)
+            msg = "Transient Dataset factory returned a non-transient Dataset."
+            raise TypeError(msg)
         return value
 
-    train_dataset = dataset_for(train_dataset_id, "id", "train")
-    evaluation_dataset = dataset_for(train_dataset_id, "id", "validation")
-    id_test_dataset = dataset_for(train_dataset_id, "id", "id_test")
-    ood_ids = (ood_dataset_ids,) if isinstance(ood_dataset_ids, str) else tuple(ood_dataset_ids)
-    if not ood_ids:
-        message = "ood_dataset_ids must be non-empty."
-        raise ValueError(message)
-    ood_parts = [
-        dataset_for(
-            dataset_id,
-            _ood_package_regime(dataset_id, storage_root=storage_root),
+    full_training_dataset = dataset_for(train_dataset_id)
+    full_evaluation_dataset = dataset_for(train_dataset_id, sampling=EVALUATION_SAMPLING)
+    source_case_materials = {str(case["package_case_id"]): str(case["material_family"]) for case in full_training_dataset.payload["cases"]}
+    fixed = _dataset_fixed_partition(full_training_dataset)
+    split_seed = fixed["seed"]
+    case_partition = fixed
+    partition = {role: tuple(fixed[role]) for role in ("train", "validation", "id_test")}
+    train_dataset = _select_cases(full_training_dataset, partition["train"])
+    # A Train case without any item would stay declared Train while never being trained on.
+    uncovered = train_dataset.cases_without_items()
+    if uncovered:
+        msg = (
+            f"Train cases {list(uncovered)} are shorter than the training sampling {train_sampling.as_dict()} and would be "
+            "silently excluded; choose a sampling that fits them or exclude them explicitly in the Dataset plan."
         )
-        for dataset_id in ood_ids
-    ]
-    selected_ood_parts: list[transient.TransientPhysicalDataset] = []
-    for offset, source in enumerate(ood_parts):
-        case_ids = tuple(_case_positions(source))
-        count = int(len(case_ids) * fraction)
-        if count < 1:
-            message = "ood_fraction selects no complete OOD cases."
-            raise ValueError(message)
-        shuffled = list(case_ids)
-        random.Random(split_seed + offset).shuffle(shuffled)  # noqa: S311 -- reproducible experimental case selection
-        selected_ood_parts.append(_select_cases(source, tuple(shuffled[:count])))
-    ood_dataset: Dataset[Any] = selected_ood_parts[0] if len(selected_ood_parts) == 1 else ConcatDataset(selected_ood_parts)
+        raise ValueError(msg)
+    evaluation_dataset = _select_cases(full_evaluation_dataset, partition["validation"])
+    id_test_dataset = _select_cases(full_evaluation_dataset, partition["id_test"])
+    additional_evaluation_ids = tuple(additional_evaluation_dataset_ids)
+    if len(additional_evaluation_ids) != len(set(additional_evaluation_ids)):
+        msg = "Experiment evaluation Dataset IDs must be unique."
+        raise ValueError(msg)
+    admitted_assignments = packages.declared_evaluation_assignments(_TASK, train_dataset_id, additional_evaluation_ids, storage_root=storage_root)
+    additional_evaluation_parts = [dataset_for(dataset_id, sampling=EVALUATION_SAMPLING) for dataset_id in additional_evaluation_ids]
+    selected_additional_evaluation_parts: list[transient.TransientPhysicalDataset] = []
+    for source in additional_evaluation_parts:
+        declared = source.dataset_case_partition
+        if declared is None or not declared["ood"]:
+            msg_0 = "Additional evaluation Dataset must declare its fixed OOD cases in the Dataset plan."
+            raise ValueError(msg_0)
+        selected_additional_evaluation_parts.append(_select_cases(source, declared["ood"]))
+    if fixed["ood"]:
+        selected_additional_evaluation_parts.append(_select_cases(full_evaluation_dataset, fixed["ood"]))
+    _reject_role_leakage(train_dataset, evaluation_dataset, id_test_dataset, selected_additional_evaluation_parts)
+    _validate_material_holdouts(train_dataset, admitted_assignments, selected_additional_evaluation_parts)
+    additional_evaluation_dataset: Dataset[Any] | None = (
+        selected_additional_evaluation_parts[0]
+        if len(selected_additional_evaluation_parts) == 1
+        else ConcatDataset(selected_additional_evaluation_parts)
+        if selected_additional_evaluation_parts
+        else None
+    )
 
     one_step = transient_contract.TransientSamplingSpec(mode="one_step_transition")
     fitting_dataset = (
         train_dataset
         if train_sampling.mode == "one_step_transition"
-        else dataset_for(
-            train_dataset_id,
-            "id",
-            "train",
-            sampling=one_step,
-        )
+        else _select_cases(dataset_for(train_dataset_id, sampling=one_step), partition["train"])
     )
 
     spatial_view = _spatial_view_evidence(train_dataset)
     view_datasets = (
-        ("evaluation", evaluation_dataset),
+        ("validation", evaluation_dataset),
         ("id_test", id_test_dataset),
         ("scaling_train_one_step", fitting_dataset),
-        *((f"ood[{index}]", part) for index, part in enumerate(selected_ood_parts)),
+        *((f"additional_evaluation[{index}]", part) for index, part in enumerate(selected_additional_evaluation_parts)),
     )
     for label, dataset in view_datasets:
         if _spatial_view_evidence(dataset) != spatial_view:
@@ -980,7 +1061,7 @@ def create_transient_training_loaders(
         effective_grid=f"{spatial_view['effective_ny']}x{spatial_view['effective_nx']}",
         roles="train,validation,id_test",
     )
-    for part in selected_ood_parts:
+    for part in selected_additional_evaluation_parts:
         _emit_startup(
             startup_callback,
             "dataset_resolved",
@@ -991,43 +1072,58 @@ def create_transient_training_loaders(
             canonical_grid=f"{spatial_view['canonical_ny']}x{spatial_view['canonical_nx']}",
             spatial_stride=spatial_view["spatial_stride"],
             effective_grid=f"{spatial_view['effective_ny']}x{spatial_view['effective_nx']}",
-            roles="ood",
+            roles="additional_evaluation",
         )
 
     train_identity = _dataset_identity(train_dataset)
-    ood_identities = [_dataset_identity(part) for part in selected_ood_parts]
+    additional_evaluation_identities = [_dataset_identity(part) for part in selected_additional_evaluation_parts]
     identity: dict[str, Any] = {
         "train": train_identity,
-        "ood": ood_identities,
+        "additional_evaluation": additional_evaluation_identities,
     }
     current_split: dict[str, Any] = {
-        "schema_kind": _SPLIT_SCHEMA_KIND,
-        "schema_version": _SPLIT_SCHEMA_VERSION,
+        "schema_kind": SPLIT_SCHEMA_KIND,
+        "schema_version": SPLIT_SCHEMA_VERSION,
         "task": "transient_drying",
         "task_contract_digest": domain.tasks.registry.get_task("transient_drying").contract_digest,
         "data_contract_digest": domain.tasks.registry.get_task("transient_drying").data_contract_digest,
         "tensorizer": tensorizer.selection_dict(),
         "sampling": train_sampling.as_dict(),
+        "evaluation_sampling": EVALUATION_SAMPLING.as_dict(),
         "dataset_identity": identity,
-        "ood_fraction": fraction,
+        "additional_evaluation_fraction": fraction,
         "split_seed": split_seed,
+        "source_case_ids": list(_case_positions(full_training_dataset)),
+        "source_case_materials": source_case_materials,
+        "case_partition": copy.deepcopy(dict(case_partition)),
+        "case_partition_digest": partition_contract.partition_digest(case_partition),
+        "evaluation_assignments": admitted_assignments,
         "spatial_view": spatial_view,
         "runtime_provenance": {
             "train": train_dataset.storage_backend,
             "scaling_train_one_step": fitting_dataset.storage_backend,
-            "evaluation": evaluation_dataset.storage_backend,
+            "validation": evaluation_dataset.storage_backend,
             "id_test": id_test_dataset.storage_backend,
-            "ood": [part.storage_backend for part in selected_ood_parts],
+            "additional_evaluation": [part.storage_backend for part in selected_additional_evaluation_parts],
         },
         "roles": {
             "train": _role_evidence(train_dataset),
             "scaling_train_one_step": _role_evidence(fitting_dataset),
-            "evaluation": _role_evidence(evaluation_dataset),
+            "validation": _role_evidence(evaluation_dataset),
             "id_test": _role_evidence(id_test_dataset),
-            "ood": {"parts": [_role_evidence(part) for part in selected_ood_parts]},
+            "additional_evaluation": {"parts": [_role_evidence(part) for part in selected_additional_evaluation_parts]},
         },
     }
-    split = current_split if saved_split is None else _admit_saved_split(saved_split, current_split)
+    split = admit_transient_training_split(
+        current_split if saved_split is None else _admit_saved_split(saved_split, current_split),
+        tensorizer=tensorizer,
+        sampling=train_sampling,
+        additional_evaluation_fraction=fraction,
+        split_seed=split_seed,
+        spatial_stride=resolved_spatial_stride,
+    )
+    if saved_split is None and split_persist_callback is not None:
+        split_persist_callback(split)
 
     train_digest = str(current_split["roles"]["scaling_train_one_step"]["membership_digest"])
     scaling_identity = _scaling_dataset_identity(fitting_dataset, spatial_view)
@@ -1036,7 +1132,6 @@ def create_transient_training_loaders(
             fitting_dataset,
             tensorizer=tensorizer,
             dataset_identity=scaling_identity,
-            legacy_dataset_identity=train_identity,
             train_membership_digest=train_digest,
             scale_mode=scale_mode,
             spatial_view=spatial_view,
@@ -1049,12 +1144,10 @@ def create_transient_training_loaders(
             artifact,
             tensorizer=tensorizer,
             dataset_identity=scaling_identity,
-            legacy_dataset_identity=train_identity,
             train_membership_digest=train_digest,
             scale_mode=scale_mode,
             spatial_view=spatial_view,
             horizon=fitting_dataset.configured_regular_horizon,
-            allow_legacy_stride_one=True,
         )
         _emit_startup(
             startup_callback,
@@ -1078,12 +1171,16 @@ def create_transient_training_loaders(
         loader_seed=resolved_loader_seed + 1,
         worker_seed=resolved_worker_seed + 1,
     )
-    ood_loader = _loader(
-        ood_dataset,
-        loader_settings,
-        shuffle=False,
-        loader_seed=resolved_loader_seed + 2,
-        worker_seed=resolved_worker_seed + 2,
+    additional_evaluation_loader = (
+        _loader(
+            additional_evaluation_dataset,
+            loader_settings,
+            shuffle=False,
+            loader_seed=resolved_loader_seed + 2,
+            worker_seed=resolved_worker_seed + 2,
+        )
+        if additional_evaluation_dataset is not None
+        else None
     )
     id_test_loader = _loader(
         id_test_dataset,
@@ -1103,7 +1200,7 @@ def create_transient_training_loaders(
     return TransientTrainingLoaders(
         train=train_loader,
         evaluation=evaluation_loader,
-        ood=ood_loader,
+        additional_evaluation=additional_evaluation_loader,
         id_test=id_test_loader,
         scaling_artifact=artifact,
         split=split,
@@ -1111,3 +1208,35 @@ def create_transient_training_loaders(
         spatial_view=copy.deepcopy(spatial_view),
         runtime_provenance=copy.deepcopy(current_split["runtime_provenance"]),
     )
+
+
+_resolve_case_partition = partition_contract.resolve_case_partition
+
+
+def _physical_case_ids(dataset: transient.TransientPhysicalDataset) -> set[tuple[str, str]]:
+    """Bind selected cases to physical inputs and simulations across aliases."""
+    selected = set(_case_positions(dataset))
+    return {(str(case["case_input_id"]), str(case["simulation_case_id"])) for case in dataset.payload["cases"] if case["package_case_id"] in selected}
+
+
+def _reject_role_leakage(
+    train: transient.TransientPhysicalDataset,
+    validation: transient.TransientPhysicalDataset,
+    test: transient.TransientPhysicalDataset,
+    additional_evaluation: Sequence[transient.TransientPhysicalDataset],
+) -> None:
+    """Reject any repeated physical source case across experiment roles."""
+    seen: set[str] = set()
+    role_datasets = (
+        ("train", train),
+        ("validation", validation),
+        ("id_test", test),
+        *((f"additional_evaluation[{index}]", item) for index, item in enumerate(additional_evaluation)),
+    )
+    for label, dataset in role_datasets:
+        identities = _physical_case_ids(dataset)
+        tokens = {token for pair in identities for token in pair}
+        if seen.intersection(tokens):
+            msg = f"Experiment {label} reuses a physical source case from another role."
+            raise ValueError(msg)
+        seen.update(tokens)

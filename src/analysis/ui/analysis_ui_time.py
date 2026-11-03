@@ -1,7 +1,4 @@
-"""
-analysis_ui_time.py
-
-Provide reusable stored-time navigation and physical-time axis presentation.
+"""Provide reusable stored-time navigation and physical-time axis presentation.
 
 Responsibilities:
   - Navigate canonical irregular time coordinates by stored position
@@ -67,7 +64,6 @@ class PhysicalTimeDisplay:
     minimum_hours: float
     maximum_hours: float
     major_interval_hours: float | None = None
-    minor_interval_hours: float | None = None
 
     def values(self, physical_hours: Iterable[float]) -> np.ndarray:
         """Convert finite authoritative hours for display without resampling."""
@@ -120,17 +116,8 @@ class PhysicalTimeDisplay:
         else:
             target_axis.set_major_locator(mticker.MaxNLocator(nbins=6, min_n_ticks=3))
 
-        if self.minor_interval_hours is None:
-            target_axis.set_minor_locator(mticker.NullLocator())
-        else:
-            target_axis.set_minor_locator(
-                mticker.MultipleLocator(
-                    self.minor_interval_hours / self.divisor_hours,
-                )
-            )
+        target_axis.set_minor_locator(mticker.NullLocator())
         axis.grid(axis=dimension, which="major", alpha=0.25)
-        if self.minor_interval_hours is not None:
-            axis.grid(axis=dimension, which="minor", alpha=0.10)
 
 
 def format_terminal_physical_time_hours(
@@ -160,7 +147,6 @@ def physical_time_display(
     include_zero: bool = False,
     right_margin_hours: float = 0.0,
     major_interval_hours: float | None = None,
-    minor_interval_hours: float | None = None,
 ) -> PhysicalTimeDisplay:
     """Resolve one display contract from finite authoritative physical hours."""
     values = np.asarray(
@@ -180,13 +166,11 @@ def physical_time_display(
     if not np.isfinite(margin) or margin < 0.0:
         message = "right_margin_hours must be finite and non-negative."
         raise ValueError(message)
-    for label, interval in (
-        ("major_interval_hours", major_interval_hours),
-        ("minor_interval_hours", minor_interval_hours),
+    if major_interval_hours is not None and (
+        isinstance(major_interval_hours, bool) or not np.isfinite(float(major_interval_hours)) or float(major_interval_hours) <= 0.0
     ):
-        if interval is not None and (isinstance(interval, bool) or not np.isfinite(float(interval)) or float(interval) <= 0.0):
-            message = f"{label} must be positive finite hours or None."
-            raise ValueError(message)
+        message = "major_interval_hours must be positive finite hours or None."
+        raise ValueError(message)
     minimum = float(np.min(values))
     if include_zero:
         minimum = min(0.0, minimum)
@@ -199,31 +183,7 @@ def physical_time_display(
         minimum_hours=minimum,
         maximum_hours=maximum,
         major_interval_hours=(None if major_interval_hours is None else float(major_interval_hours)),
-        minor_interval_hours=(None if minor_interval_hours is None else float(minor_interval_hours)),
     )
-
-
-def configure_physical_time_axis(
-    axis: Axes,
-    physical_hours: Iterable[float],
-    *,
-    preferred_unit: str = "auto",
-    include_zero: bool = False,
-    right_margin_hours: float = 0.0,
-    major_interval_hours: float | None = None,
-    minor_interval_hours: float | None = None,
-) -> PhysicalTimeDisplay:
-    """Configure one axis and return its display-only transform."""
-    display = physical_time_display(
-        physical_hours,
-        preferred_unit=preferred_unit,
-        include_zero=include_zero,
-        right_margin_hours=right_margin_hours,
-        major_interval_hours=major_interval_hours,
-        minor_interval_hours=minor_interval_hours,
-    )
-    display.configure(axis)
-    return display
 
 
 def _validated_times(values: Iterable[float]) -> tuple[float, ...]:
@@ -234,20 +194,6 @@ def _validated_times(values: Iterable[float]) -> tuple[float, ...]:
         message = "Time-step navigation requires finite, strictly increasing physical times."
         raise ValueError(message)
     return times
-
-
-def ordered_time_intersection(
-    time_coordinates: Sequence[Iterable[float]],
-) -> tuple[float, ...]:
-    """Return the exact ordered intersection of canonical physical-time grids."""
-    grids = tuple(_validated_times(values) for values in time_coordinates)
-    if not grids:
-        message = "Physical-time intersection requires at least one coordinate grid."
-        raise ValueError(message)
-    shared = set(grids[0])
-    for grid in grids[1:]:
-        shared.intersection_update(grid)
-    return tuple(value for value in grids[0] if value in shared)
 
 
 def ordered_time_union(

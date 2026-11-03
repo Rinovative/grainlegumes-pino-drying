@@ -1,15 +1,16 @@
-"""
-generation_runtime_progress.py
+"""Persist non-authoritative incremental COMSOL runtime progress for campaign cases.
 
-Persist non-authoritative incremental COMSOL runtime progress for campaign cases.
 Responsibilities:
   - Parse supported English COMSOL 6.4 stdout progress incrementally
-  - Bind progress records to exact campaign submission identities
-  - Atomically persist bounded operational progress receipts
+  - Bind progress records to exact campaign dispatch identities (submission index, allocation, and case)
+  - Atomically persist bounded operational progress receipts keyed by dispatch key
+  - Extract the complete transient time-stepping history of a finished solver log
+
 Design principles:
   - Observability never controls solver, publication, or admission behavior
   - Persisted identities fail closed against unsafe or conflicting records
   - Parser evidence reports only values explicitly emitted by COMSOL
+
 This module does NOT:
   - Classify solver convergence, health, or failure
   - Modify campaign manifests, case data, or publication state
@@ -21,17 +22,20 @@ import json
 import math
 import re
 import socket
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
+from . import generation_runtime_dispatch_identity as dispatch_identity
 
-PROGRESS_POLL_INTERVAL_SECONDS: Final = 20.0
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
+
+    from src.generation.cases import generation_cases_config as config_service
+
 PROGRESS_HEARTBEAT_SECONDS: Final = 300.0
 PROGRESS_STALE_AFTER_SECONDS: Final = 600.0
 _MAX_COMSOL_PROGRESS_PERCENT: Final = 100
@@ -84,25 +88,6 @@ _COMMON_RECORD_KEYS: Final = frozenset(
         *_OPTIONAL_KEYS,
     }
 )
-_RECORD_KEYS: Final = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "campaign_run_id",
-        "batch_name",
-        "batch_id",
-        "case_index",
-        "case_id",
-        "slurm_job_id",
-        "hostname",
-        "started_at",
-        "updated_at",
-        "elapsed_seconds",
-        "phase",
-        "terminal",
-        *_OPTIONAL_KEYS,
-    }
-)
 _TRANSIENT_COLUMNS: Final = (
     "Step",
     "Time",
@@ -132,14 +117,18 @@ _PROGRESS_PATTERN: Final = re.compile(r"Current Progress:\s*([0-9]+)\s*%")
 _INTEGER_PATTERN: Final = re.compile(r"[+-]?[0-9]+")
 
 
+class RuntimeProgressIdentityError(ValueError):
+    """Report a progress identity that is not bound to its exact campaign dispatch."""
+
+
 def _utc_now() -> datetime:
     """Return the current timezone-aware UTC time."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _timestamp(value: datetime) -> str:
     """Serialize one UTC timestamp with portable second precision."""
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _parse_timestamp(value: object) -> datetime | None:
@@ -147,19 +136,15 @@ def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))  # noqa: FURB162 -- retain exact persisted timestamp input normalization and rejection behavior
     except ValueError:
         return None
     return parsed if parsed.tzinfo is not None else None
 
 
-def _numeric_job_id(value: str | int) -> str:
-    """Normalize one numeric Slurm job identifier."""
-    text = str(value)
-    if not text or not text.isascii() or not text.isdigit():
-        message = "Runtime progress requires a numeric Slurm job ID."
-        raise ValueError(message)
-    return text
+def _is_numeric_id(value: object) -> bool:
+    """Return whether a value is one numeric Slurm identifier text."""
+    return isinstance(value, str) and bool(value) and value.isascii() and value.isdigit()
 
 
 def _path_uses_symbolic_link(path: Path) -> bool:
@@ -169,17 +154,18 @@ def _path_uses_symbolic_link(path: Path) -> bool:
 
 def _progress_receipt_path(
     run_id: str,
-    job_id: str,
+    dispatch_key: str,
     *,
     storage_root: Path | str | None,
     create_directory: bool,
 ) -> Path:
-    """Resolve one symlink-free operational progress receipt path."""
-    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root)
-    if run_directory.is_symlink() or not run_directory.is_dir() or _path_uses_symbolic_link(run_directory):
-        message = f"Campaign run directory is missing or unsafe: {run_directory}"
+    """Resolve one symlink-free operational progress receipt path of one dispatch."""
+    dispatch_identity.parse_dispatch_key(dispatch_key)
+    execution_directory = campaign_evidence.campaign_execution_directory(run_id, storage_root=storage_root)
+    if execution_directory.is_symlink() or not execution_directory.is_dir() or _path_uses_symbolic_link(execution_directory):
+        message = f"Campaign execution directory is missing or unsafe: {execution_directory}"
         raise FileNotFoundError(message)
-    progress_directory = run_directory / campaign_evidence.RUNTIME_PROGRESS_DIRECTORY_NAME
+    progress_directory = common.paths.resolve_generation_slurm_directory(execution_directory)
     if (
         progress_directory.is_symlink()
         or (progress_directory.exists() and not progress_directory.is_dir())
@@ -192,34 +178,51 @@ def _progress_receipt_path(
         if progress_directory.is_symlink() or not progress_directory.is_dir() or _path_uses_symbolic_link(progress_directory):
             message = f"Campaign progress directory is unsafe: {progress_directory}"
             raise ValueError(message)
-    path = progress_directory / f"{job_id}.json"
+    path = progress_directory / f"{dispatch_key}.json"
     if path.is_symlink() or (path.exists() and not path.is_file()):
         message = f"Campaign progress receipt is unsafe: {path}"
         raise ValueError(message)
     return path
 
 
+def _record_binds_dispatch(
+    record: object,
+    *,
+    allocation_id: str,
+    submission_index: int,
+    expected_case: Mapping[str, Any],
+) -> bool:
+    """Return whether one run.json dispatch record carries the exact submission index, allocation, and case."""
+    if not isinstance(record, dict):
+        return False
+    recorded_index = record.get("submission_index")
+    return (
+        isinstance(recorded_index, int)
+        and not isinstance(recorded_index, bool)
+        and recorded_index == submission_index
+        and record.get("job_id") == allocation_id
+        and record.get("case") == expected_case
+    )
+
+
 def _bound_identity(
     manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
     *,
     run_id: str,
     batch_name: str,
     batch_id: str,
     case_index: int,
     case_id: str,
-    job_id: str,
+    dispatch_key: str,
     hostname: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and return the immutable identity for one job-bound case."""
-    batches = manifest.get("batches")
-    batch_matches = (
-        [record for record in batches if isinstance(record, dict) and record.get("batch_name") == batch_name and record.get("batch_id") == batch_id]
-        if isinstance(batches, list)
-        else []
-    )
+    """Validate and return the immutable identity for one dispatch-bound case of a frozen execution batch."""
+    allocation_id, submission_index = dispatch_identity.parse_dispatch_key(dispatch_key)
+    batch_matches = [batch for batch in campaign.batches if batch.batch_name == batch_name and batch.batch_id == batch_id]
     if len(batch_matches) != 1:
         message = "Runtime progress batch identity is not bound to the campaign run."
-        raise ValueError(message)
+        raise RuntimeProgressIdentityError(message)
     expected_case = {
         "batch_name": batch_name,
         "batch_id": batch_id,
@@ -228,19 +231,24 @@ def _bound_identity(
     }
     submissions = manifest.get("submissions")
     matches = (
-        [record for record in submissions if isinstance(record, dict) and record.get("job_id") == job_id and record.get("case") == expected_case]
+        [
+            record
+            for record in submissions
+            if _record_binds_dispatch(record, allocation_id=allocation_id, submission_index=submission_index, expected_case=expected_case)
+        ]
         if isinstance(submissions, list)
         else []
     )
     if len(matches) != 1:
-        message = "Runtime progress job is not bound to this exact campaign case."
-        raise ValueError(message)
+        message = "Runtime progress dispatch is not bound to this exact campaign case."
+        raise RuntimeProgressIdentityError(message)
     identity: dict[str, Any] = {
         "schema_kind": _PROGRESS_SCHEMA_KIND,
         "schema_version": _PROGRESS_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         **expected_case,
-        "slurm_job_id": job_id,
+        "dispatch_key": dispatch_key,
+        "slurm_job_id": allocation_id,
     }
     if hostname is not None:
         identity["hostname"] = hostname
@@ -271,6 +279,60 @@ def _parse_float(token: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
+TRANSIENT_STEP_HISTORY_COLUMNS: Final = (
+    "step",
+    "time_s",
+    "step_size_s",
+    "residual_evaluations",
+    "jacobian_evaluations",
+    "linear_solves",
+    "order",
+    "time_failures",
+    "nonlinear_failures",
+    "linear_error",
+    "linear_residual",
+)
+
+
+def _transient_row(tokens: list[str]) -> tuple[int | float, ...] | None:
+    """Parse one complete numeric time-stepping row in COMSOL column order (times in seconds)."""
+    if len(tokens) != len(_TRANSIENT_COLUMNS):
+        return None
+    values = [_parse_float(token) if index in {1, 2, 9, 10} else _parse_integer(token) for index, token in enumerate(tokens)]
+    if any(value is None for value in values):
+        return None
+    return tuple(value for value in values if value is not None)
+
+
+def transient_step_history(lines: Iterable[str]) -> list[tuple[int | float, ...]]:
+    """
+    Return every complete transient time-stepping row of one solver log in log order.
+
+    Parameters
+    ----------
+    lines : Iterable[str]
+        Solver stdout lines, complete or partial.
+
+    Returns
+    -------
+    list[tuple[int | float, ...]]
+        Rows in ``TRANSIENT_STEP_HISTORY_COLUMNS`` order; COMSOL reports time and
+        step size in seconds. Rows of other solver tables are ignored.
+
+    """
+    rows: list[tuple[int | float, ...]] = []
+    table: str | None = None
+    for line in lines:
+        tokens = line.split()
+        if tuple(tokens) == _TRANSIENT_COLUMNS:
+            table = "transient"
+        elif tuple(tokens) == _STATIONARY_COLUMNS:
+            table = "stationary"
+        elif table == "transient" and (row := _transient_row(tokens)) is not None:
+            rows.append(row)
+    return rows
+
+
 class ComsolProgressParser:
     """Incrementally parse complete supported English COMSOL stdout lines."""
 
@@ -290,25 +352,22 @@ class ComsolProgressParser:
 
     def _consume_transient_row(self, tokens: list[str]) -> None:
         """Consume one complete supported time-stepping row when numeric."""
-        if len(tokens) != len(_TRANSIENT_COLUMNS):
-            return
-        integers = [_parse_integer(tokens[index]) for index in (0, 3, 4, 5, 6, 7, 8)]
-        floating = [_parse_float(tokens[index]) for index in (1, 2, 9, 10)]
-        if any(value is None for value in (*integers, *floating)):
+        row = _transient_row(tokens)
+        if row is None:
             return
         self._state.update(
             {
                 "parser_state": "available",
                 "comsol_section": "transient_drying",
-                "step_index": integers[0],
-                "simulated_time_seconds": floating[0],
-                "step_size_seconds": floating[1],
-                "residual_evaluations": integers[1],
-                "jacobian_evaluations": integers[2],
-                "linear_solves": integers[3],
-                "order": integers[4],
-                "time_failures": integers[5],
-                "nonlinear_failures": integers[6],
+                "step_index": row[0],
+                "simulated_time_seconds": row[1],
+                "step_size_seconds": row[2],
+                "residual_evaluations": row[3],
+                "jacobian_evaluations": row[4],
+                "linear_solves": row[5],
+                "order": row[6],
+                "time_failures": row[7],
+                "nonlinear_failures": row[8],
             }
         )
 
@@ -417,19 +476,19 @@ class RuntimeProgressReporter:
         batch_id: str,
         case_index: int,
         case_id: str,
-        slurm_job_id: str | int,
+        dispatch: dispatch_identity.CaseDispatch,
         storage_root: Path | str | None = None,
         stdout_path: Path | str | None = None,
         hostname: str | None = None,
     ) -> RuntimeProgressReporter:
-        """Create one strict job-bound runtime progress reporter."""
+        """Create one strict dispatch-bound runtime progress reporter."""
         return create_runtime_progress_reporter(
             run_id,
             batch_name=batch_name,
             batch_id=batch_id,
             case_index=case_index,
             case_id=case_id,
-            slurm_job_id=slurm_job_id,
+            dispatch=dispatch,
             storage_root=storage_root,
             stdout_path=stdout_path,
             hostname=hostname,
@@ -544,23 +603,25 @@ def create_runtime_progress_reporter(
     batch_id: str,
     case_index: int,
     case_id: str,
-    slurm_job_id: str | int,
+    dispatch: dispatch_identity.CaseDispatch,
     storage_root: Path | str | None = None,
     stdout_path: Path | str | None = None,
     hostname: str | None = None,
 ) -> RuntimeProgressReporter:
     """
-    Create a strict job-bound runtime progress reporter.
+    Create a strict dispatch-bound runtime progress reporter.
 
     Raises
     ------
     FileNotFoundError
         If the campaign-run metadata directory is absent or unsafe.
+    RuntimeProgressIdentityError
+        If the run.json dispatch record of the submission index, allocation, and case is not
+        unique, or an existing receipt carries another identity.
     ValueError
-        If the job/case identity, hostname, or existing receipt conflicts.
+        If the hostname or an existing receipt is unsafe or malformed.
 
     """
-    job_id = _numeric_job_id(slurm_job_id)
     manifest = campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
     resolved_hostname = hostname or socket.gethostname()
     if not resolved_hostname or any(character in resolved_hostname for character in "\r\n\t"):
@@ -568,17 +629,19 @@ def create_runtime_progress_reporter(
         raise ValueError(message)
     identity = _bound_identity(
         manifest,
+        campaign_evidence.campaign_from_manifest(manifest, require_executable=False),
         run_id=run_id,
         batch_name=batch_name,
         batch_id=batch_id,
         case_index=case_index,
         case_id=case_id,
-        job_id=job_id,
+        dispatch_key=dispatch.dispatch_key,
         hostname=resolved_hostname,
     )
+    identity["slurm_step_id"] = dispatch.step_id
     path = _progress_receipt_path(
         run_id,
-        job_id,
+        dispatch.dispatch_key,
         storage_root=storage_root,
         create_directory=True,
     )
@@ -590,7 +653,7 @@ def create_runtime_progress_reporter(
             raise ValueError(message) from error
         if not isinstance(existing, dict) or any(existing.get(key) != value for key, value in identity.items()):
             message = f"Runtime progress receipt identity conflicts: {path}"
-            raise ValueError(message)
+            raise RuntimeProgressIdentityError(message)
         if existing.get("terminal") is True:
             message = f"Runtime progress receipt is already terminal: {path}"
             raise FileExistsError(message)
@@ -726,24 +789,27 @@ def load_bound_runtime_progress(
 
 def load_runtime_progress(
     run_id: str,
-    job_id: str | int,
+    dispatch_key: str,
     expected_identity: Mapping[str, Any],
     *,
+    campaign: config_service.CampaignConfig,
     storage_root: Path | str | None = None,
     manifest: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """
-    Load one exact job-bound progress receipt without operational failures.
+    Load one exact dispatch-bound progress receipt without operational failures.
 
     Parameters
     ----------
     run_id : str
         Exact campaign-run identifier.
-    job_id : str | int
-        Exact numeric Slurm job identifier.
+    dispatch_key : str
+        Exact ``<allocation>-<submission_index>`` dispatch key.
     expected_identity : Mapping[str, Any]
-        Canonical batch and case identity for the job.
+        Canonical batch and case identity for the dispatch.
+    campaign : config_service.CampaignConfig
+        Frozen campaign whose execution batches, replacements included, the identity must belong to.
     storage_root : Path | str | None, optional
         Generation storage root.
     manifest : Mapping[str, Any] | None, optional
@@ -758,30 +824,32 @@ def load_runtime_progress(
 
     """
     try:
-        numeric_job_id = _numeric_job_id(job_id)
         required = ("batch_name", "batch_id", "case_index", "case_id")
         if any(key not in expected_identity for key in required):
             return _unavailable("invalid_expected_identity")
         source_manifest = manifest or campaign_evidence.load_campaign_run(run_id, storage_root=storage_root)
         expected = _bound_identity(
             source_manifest,
+            campaign,
             run_id=run_id,
             batch_name=str(expected_identity["batch_name"]),
             batch_id=str(expected_identity["batch_id"]),
             case_index=expected_identity["case_index"],
             case_id=str(expected_identity["case_id"]),
-            job_id=numeric_job_id,
+            dispatch_key=dispatch_key,
         )
         path = _progress_receipt_path(
             run_id,
-            numeric_job_id,
+            dispatch_key,
             storage_root=storage_root,
             create_directory=False,
         )
         if not path.exists():
             return _unavailable("not_reported")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if not _payload_is_supported(payload, expected):
+        # The step id is known only to the worker that wrote the receipt, so it is read back and checked for form.
+        step_id = payload.get("slurm_step_id") if isinstance(payload, dict) else None
+        if not _is_numeric_id(step_id) or not _payload_is_supported(payload, {**expected, "slurm_step_id": step_id}):
             return _unavailable("invalid_or_unsupported")
         updated_at = _parse_timestamp(payload["updated_at"])
         if updated_at is None:

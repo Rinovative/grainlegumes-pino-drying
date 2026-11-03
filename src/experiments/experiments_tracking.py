@@ -1,7 +1,4 @@
-"""
-experiments_tracking.py
-
-Mirror authoritative local experiment state to optional W&B observability.
+"""Mirror authoritative local experiment state to optional W&B observability.
 
 Responsibilities:
   - Keep disabled tracking free of SDK imports and tracking side effects
@@ -9,6 +6,7 @@ Responsibilities:
   - Publish bounded semantic config, completed-epoch history, summaries, and curated media
   - Mirror authoritative ID, OOD, and physics event values without recomputation
   - Fail closed on requested online or offline observer failures
+  - Keep the SDK console silent and the online SDK directory node-local, preserved in the run folder after an observer failure
   - Keep built-in system telemetry secondary to scientific metrics
 
 Design principles:
@@ -33,16 +31,19 @@ import math
 import os
 import platform
 import re
+import shutil
+import sys
+import tempfile
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from src import datasets
+from src import datasets, learning
 
 from . import experiments_run_identity as run_identity
 from . import experiments_wandb_schema as wandb_schema
@@ -58,7 +59,7 @@ POST_ARTIFACT_MEDIA_KEYS = frozenset(
     {
         "run_summary_table",
         "accuracy_physics_pareto",
-        "dual_continuity_diagnostics",
+        "physics_residual_diagnostics",
         "pressure_boundary_summary",
         "spectral_fidelity",
     }
@@ -70,10 +71,10 @@ _MAX_EVALUATION_SUMMARY_ENTRIES = 512
 _MAX_EVALUATION_SUMMARY_TEXT = 512
 _TRANSIENT_EVALUATION_HORIZONS = "1|2|4|8|16|32|64|128|full"
 _TRANSIENT_EVALUATION_METRIC_KEY = re.compile(
-    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|ood)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
+    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|additional_evaluation)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
 )
 _TRANSIENT_EVALUATION_PIPELINE_KEY = re.compile(r"^evaluation/pipeline/(?:0|[1-9][0-9]*)/(?P<metric>[A-Za-z0-9_]+)$")
-_TRANSIENT_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|ood)/name$")
+_TRANSIENT_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|additional_evaluation)/name$")
 _TRANSIENT_EVALUATION_SPEEDUP_KEY = re.compile(
     r"^evaluation/timing/speedup/(?P<name>drying_only_solver_speedup|full_pipeline_solver_speedup|hybrid_component_speedup|comsol_process_speedup|generation_compute_end_to_end_speedup)/(?P<metric>available_count|unavailable_count|ratio_of_sums)$"
 )
@@ -320,8 +321,7 @@ def _accuracy_history_metric_ids(
 
 _PHYSICS_ID_SOURCE_KEYS = (
     "physics/id/momentum_residual_mse",
-    "physics/id/continuity_div_velocity_mse",
-    "physics/id/continuity_div_eps_velocity_mse",
+    "physics/id/flux_balance_mse",
     "physics/id/pressure_boundary_mse",
 )
 
@@ -388,7 +388,6 @@ def automatic_history_metric_definitions(
     *,
     objective_id: str,
     physics_training_enabled: bool,
-    continuity: str,
     physics_monitor_enabled: bool,
     cuda_enabled: bool,
     optuna_trial: bool = False,
@@ -453,18 +452,18 @@ def automatic_history_metric_definitions(
                     scientific_question="Is authoritative in-distribution validation performance improving?",
                 ),
                 _definition(
-                    f"ood/{objective_id}",
-                    f"Overview/OOD/{objective_id}",
+                    f"additional_evaluation/{objective_id}",
+                    f"Overview/additional_evaluation/{objective_id}",
                     owner=evaluation_owner,
-                    computation_cost="existing OOD diagnostic pass",
-                    scientific_question="Is out-of-distribution generalization improving or degrading?",
+                    computation_cost="existing additional evaluation pass",
+                    scientific_question="Is performance on the declared evaluation holdouts improving or degrading?",
                 ),
                 _definition(
-                    "generalization/objective_gap",
-                    "Overview/generalization_gap",
+                    "additional_evaluation/objective_difference",
+                    "Overview/additional_evaluation_objective_difference",
                     owner=loop_owner,
                     computation_cost="one scalar subtraction",
-                    scientific_question="How far does OOD error separate from ID error?",
+                    scientific_question="How far does holdout error separate from validation error?",
                 ),
             )
         )
@@ -526,9 +525,10 @@ def automatic_history_metric_definitions(
     if physics_training_enabled:
         training_physics = (
             ("loss_momentum", "Does the weighted momentum contribution converge?"),
+            ("loss_continuity", "Does the weighted flux-balance contribution converge?"),
             ("loss_boundary", "Does the weighted pressure-boundary contribution converge?"),
-            (f"loss_continuity_{continuity}", "Does the configured weighted continuity contribution converge?"),
-            ("residual_weight", "What residual weight is actually applied during warmup?"),
+            ("momentum_weight", "What momentum weight is actually applied during warmup?"),
+            ("continuity_weight", "What continuity weight is actually applied during warmup?"),
             ("boundary_weight", "What boundary weight is actually applied during warmup?"),
         )
         for suffix, question in training_physics:
@@ -628,10 +628,6 @@ class TrackingIOError(TrackingError):
     """Represent loss of records in an explicitly requested tracking mode."""
 
 
-class TrackingCallbackError(TrackingError):
-    """Represent a callback payload or orchestration contract violation."""
-
-
 class TrackingUploadError(TrackingError):
     """
     Represent rejection by the run-file or curated-media upload allowlist.
@@ -671,6 +667,11 @@ class _WandbArtifact(Protocol):
 class _WandbModule(Protocol):
     """Describe the lazily imported W&B module surface."""
 
+    Settings: Callable[..., Any]
+
+    def setup(self, *, settings: Any) -> Any:
+        """Apply process-wide SDK settings."""
+
     def init(self, **kwargs: Any) -> _WandbRun | None:
         """Initialize one W&B run."""
 
@@ -688,7 +689,7 @@ def _require_initialized_run(run: _WandbRun | None) -> _WandbRun:
 
 def _utc_now() -> str:
     """Return a timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _safe_error(error: BaseException) -> dict[str, str]:
@@ -797,6 +798,8 @@ def _build_transient_semantic_config(
     task_contract = cast("Mapping[str, Any]", config["task_contract"])
     data_config = cast("Mapping[str, Any]", config["data"])
     run_config = cast("Mapping[str, Any]", config["run"])
+    training_config = cast("Mapping[str, Any]", config["training"])
+    matched_checkpoint = training_config.get("matched_a1_b") is not None and training_config.get("comparison_arm") in {"b", "a1"}
     roles = cast("Mapping[str, Any]", split_indices["roles"])
     datasets_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", split_indices["dataset_identity"])))
     split_payload = {
@@ -805,7 +808,7 @@ def _build_transient_semantic_config(
         "artifact": "split_indices.pt",
         "artifact_sha256": split_indices_sha256,
         "sampling": copy.deepcopy(split_indices["sampling"]),
-        "ood_fraction": split_indices["ood_fraction"],
+        "additional_evaluation_fraction": split_indices["additional_evaluation_fraction"],
         "split_seed": split_indices["split_seed"],
         "roles": copy.deepcopy(dict(roles)),
     }
@@ -819,7 +822,6 @@ def _build_transient_semantic_config(
         "run": {
             "name": run_config["name"],
             "seed": run_config["seed"],
-            "revision": run_config.get("revision", 0),
             "naming_schema_version": run_config.get("naming_schema_version", 1),
             "stage": cast("Mapping[str, Any]", config["training"]).get("stage"),
         },
@@ -827,8 +829,7 @@ def _build_transient_semantic_config(
             "datasets": datasets_payload,
             "configured_identity": {
                 "train_dataset": data_config["train_dataset"],
-                "ood_datasets": copy.deepcopy(data_config["ood_datasets"]),
-                "dataset_references": copy.deepcopy(data_config.get("dataset_references")),
+                "additional_evaluation_datasets": copy.deepcopy(data_config["additional_evaluation_datasets"]),
             },
             "loader": {
                 key: copy.deepcopy(data_config.get(key))
@@ -854,7 +855,7 @@ def _build_transient_semantic_config(
             "runtime_backend": copy.deepcopy(dict(runtime_provenance or {})),
             "schema_versions": {
                 "run": run_config.get("naming_schema_version", 1),
-                "checkpoint": 1,
+                "checkpoint": 2 if matched_checkpoint else 1,
                 "tracking_integration": TRACKING_INTEGRATION_VERSION,
                 "wandb_metrics": config_defaults.WANDB_METRIC_SCHEMA_VERSION,
             },
@@ -907,10 +908,10 @@ def build_semantic_config(
         raise TypeError(msg)
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     dataset_payload: dict[str, Any] = {}
-    for evidence, tracked_role in (
-        (split_contract.role("train"), "id"),
-        (split_contract.role("ood"), "ood"),
-    ):
+    tracked_roles = [(split_contract.role("train"), "id")]
+    if split_contract.additional_evaluation is not None:
+        tracked_roles.append((split_contract.additional_evaluation, "additional_evaluation"))
+    for evidence, tracked_role in tracked_roles:
         raw_identity = evidence.source.as_dict()
         dataset_payload[tracked_role] = {
             key: copy.deepcopy(raw_identity[key])
@@ -955,25 +956,24 @@ def build_semantic_config(
             "max_cases": int(monitor_config["max_cases"]),
             "physics_kind": physics_contract.get("kind"),
             "equation_set": physics_contract.get("equation_set"),
-            "continuity_forms": copy.deepcopy(physics_contract.get("allowed_continuities")),
+            "continuity": physics_contract.get("continuity"),
             "boundary": physics_contract.get("boundary"),
             "derivatives": copy.deepcopy(dict(derivative_config)),
             "interior_crop": int(physics_config["interior_crop"]),
             "metric_ids": [source.removeprefix("physics/id/") for source in _PHYSICS_ID_SOURCE_KEYS],
         }
     }
-    model_kind = str(model_payload["kind"])
-    model_payload["variant"] = f"pi-{model_kind}" if physics_enabled else model_kind
+    model_payload["variant"] = learning.models.naming.architecture_label(config)
     model_payload["parameter_counts"] = parameter_counts
     evaluation_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["evaluation"])))
     training_config = cast("Mapping[str, Any]", config["training"])
     evaluation_payload["roles"] = {
         "selection": "id",
         "id_interpretation": "in_distribution_validation",
-        "diagnostic": ["ood", "physics"],
+        "diagnostic": ["additional_evaluation", "physics"],
         "event_model": "completed_epoch_interval_or_terminal",
         "id_interval_epochs": int(training_config["evaluation_interval"]),
-        "ood_interval_epochs": int(training_config["ood_evaluation_interval"]),
+        "additional_evaluation_interval_epochs": int(training_config["additional_evaluation_interval"]),
         "physics_interval_epochs": int(monitor_config["interval"]),
         "epoch_zero_evaluation": False,
     }
@@ -991,15 +991,14 @@ def build_semantic_config(
                 "schema_version": split_contract.schema_version,
                 "artifact": "split_indices.pt",
                 "artifact_sha256": split_indices_sha256,
-                "n_train_full": split_contract.role("train").full_count,
-                "n_train": split_contract.role("train").count,
-                "n_eval": split_contract.role("eval").count,
-                "n_ood_full": split_contract.role("ood").full_count,
-                "n_ood": split_contract.role("ood").count,
-                "train_ratio": split_contract.train_ratio,
-                "ood_fraction": split_contract.ood_fraction,
+                "n_train_full": split_contract.train.full_count,
+                "n_train": split_contract.train.count,
+                "n_validation": split_contract.validation.count,
+                "n_id_test": split_contract.id_test.count,
+                "n_additional_evaluation": None if split_contract.additional_evaluation is None else split_contract.additional_evaluation.count,
                 "split_seed": split_contract.split_seed,
-                "membership_digests": {role: split_contract.role(role).membership_digest for role in datasets.preprocessing.splits.SPLIT_ROLES},
+                "case_partition_digest": split_contract.case_partition_digest,
+                "membership_digests": {role: split_contract.role(role).membership_digest for role in split_contract.roles},
             },
             "normalization": {
                 **copy.deepcopy(dict(preprocessing)),
@@ -1068,7 +1067,7 @@ def build_monitor_membership(
     if settings["mode"] == "disabled" or not bool(monitor["enabled"]):
         return None
     split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    evidence = split_contract.role("eval")
+    evidence = split_contract.validation
     selected = list(evidence.index_values[: int(monitor["max_cases"])])
     digest = datasets.contracts.identity.membership_digest(
         role="wandb_physics_monitor",
@@ -1152,6 +1151,17 @@ class WandbSession:
     _observer_failed: bool = False
     _failed_operation: str | None = None
     _uploaded_media: list[str] = field(default_factory=list)
+    _local_root: Path | None = None
+
+    def _preserve_local_state(self) -> None:
+        """Copy the node-local SDK directory into the run folder; a failed copy is a warning and never masks the run outcome."""
+        source = None if self._local_root is None else self._local_root / "wandb"
+        if source is None or not source.is_dir():
+            return
+        try:
+            shutil.copytree(source, self.run_dir / "wandb", dirs_exist_ok=True)
+        except OSError as copy_error:
+            print(f"Local W&B state was not preserved in the run folder: {type(copy_error).__name__}", file=sys.stderr)
 
     @property
     def enabled(self) -> bool:
@@ -1163,11 +1173,6 @@ class WandbSession:
         """Return the active W&B run URL when the SDK exposes one."""
         value = getattr(self._run, "url", None)
         return value if isinstance(value, str) and value else None
-
-    @property
-    def history_destination_by_source(self) -> dict[str, str]:
-        """Return the unique admitted local-to-W&B history mapping."""
-        return {definition.source_key: definition.wandb_key for definition in self.history_metric_definitions}
 
     @property
     def history_definition_by_source(self) -> dict[str, HistoryMetricDefinition]:
@@ -1445,11 +1450,20 @@ class WandbSession:
         if isinstance(data, Mapping):
             datasets = data.get("datasets")
             if isinstance(datasets, Mapping):
-                for role in ("id", "ood"):
-                    identity = datasets.get(role)
-                    if isinstance(identity, Mapping):
-                        summary[f"data/{role}/dataset_id"] = identity.get("dataset_id")
-                        summary[f"data/{role}/fingerprint"] = identity.get("fingerprint")
+                if isinstance(task, Mapping) and task.get("id") == "transient_drying":
+                    train_identity = datasets.get("train")
+                    if isinstance(train_identity, Mapping):
+                        summary["data/train/dataset_id"] = train_identity.get("dataset_id")
+                        summary["data/train/index_digest"] = train_identity.get("index_digest")
+                    additional = datasets.get("additional_evaluation")
+                    if isinstance(additional, list):
+                        summary["data/additional_evaluation/dataset_count"] = len(additional)
+                else:
+                    for role in ("id", "additional_evaluation"):
+                        identity = datasets.get(role)
+                        if isinstance(identity, Mapping):
+                            summary[f"data/{role}/dataset_id"] = identity.get("dataset_id")
+                            summary[f"data/{role}/fingerprint"] = identity.get("fingerprint")
             split = data.get("split")
             if isinstance(split, Mapping):
                 summary["data/split_sha256"] = split.get("artifact_sha256")
@@ -1550,8 +1564,12 @@ class WandbSession:
             self._run.finish(exit_code=exit_code)
         except Exception as failure:
             self._finished = True
-            raise self._operation_failure(failure, operation="finish") from failure
+            tracking_error = self._operation_failure(failure, operation="finish")
+            self._preserve_local_state()
+            raise tracking_error from failure
         self._finished = True
+        if self._observer_failed:
+            self._preserve_local_state()
         terminal_tracking_status = "failed" if self._observer_failed else "finished"
         self._persist({"status": terminal_tracking_status, "finished_at": _utc_now()})
 
@@ -1562,7 +1580,7 @@ def _runtime_wandb_tags(settings: Mapping[str, Any], semantic_config: Mapping[st
     if settings.get("workflow") == "optuna_trial" and isinstance(semantic_config, Mapping):
         tuning = semantic_config.get("tuning")
         role = tuning.get("study_role") if isinstance(tuning, Mapping) else None
-        if role in {"production", "smoke"}:
+        if role == "production":
             tags = [f"optuna-{role}" if tag == "optuna" else tag for tag in tags]
     return list(dict.fromkeys(tags))
 
@@ -1682,7 +1700,6 @@ def initialize_wandb(
         evaluation_metrics,
         objective_id=objective_id,
         physics_training_enabled=bool(physics_config["enabled"]),
-        continuity=str(physics_config["continuity"]),
         physics_monitor_enabled=bool(monitor_settings["enabled"]),
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
@@ -1690,9 +1707,14 @@ def initialize_wandb(
         state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
     )
 
+    # Online SDK state lives on the process TMPDIR (node-local, removed at container exit) and is copied into the run folder
+    # when the session fails; offline state stays in the run folder because `wandb sync` needs it.
+    local_root = path if mode == "offline" else Path(os.environ.get("TMPDIR") or tempfile.gettempdir()) / f"wandb-{run_id}"
     sdk_run: _WandbRun | None = None
     try:
         wandb = cast("_WandbModule", importlib.import_module("wandb"))
+        # Process-wide: the credential line is printed before per-run settings apply.
+        wandb.setup(settings=wandb.Settings(silent=True))
         sdk_run = _require_initialized_run(
             wandb.init(
                 project=str(settings["project"]),
@@ -1704,7 +1726,7 @@ def initialize_wandb(
                 name=run_name,
                 id=run_id,
                 resume=resume_policy,
-                dir=str(path),
+                dir=str(local_root),
                 config=copy.deepcopy(dict(semantic_config or {})),
                 save_code=False,
                 settings={
@@ -1763,6 +1785,7 @@ def initialize_wandb(
         history_metric_definitions=history_definitions,
         state_updater=state_updater,
         _last_logged_epoch=previous_last_logged_epoch,
+        _local_root=None if mode == "offline" else local_root,
     )
 
 

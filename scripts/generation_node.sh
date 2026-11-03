@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 if (( $# < 2 )); then
-  printf 'Usage: %s REPOSITORY cli|benchmark-preflight|campaign-case|benchmark-case|smoke [ARGS...]\n' "$0" >&2
+  printf 'Usage: %s SOURCE_TREE cli|benchmark-preflight|campaign-case|benchmark-case|node-worker [ARGS...]\n' "$0" >&2
   exit 2
 fi
 
@@ -17,7 +17,13 @@ if [[ ! -f "${PREREQUISITE_HELPER}" || -L "${PREREQUISITE_HELPER}" || ! -r "${PR
   exit 1
 fi
 
-# Admit repository-owned source before importing any project Python.
+# A case step repeats the checks that the node worker reported once at node start: its passing checks stay silent,
+# a failing check is still reported on stderr and ends the step.
+if [[ "${MODE}" == campaign-case || "${MODE}" == benchmark-case ]]; then
+  export GENERATION_PREFLIGHT_QUIET=1
+fi
+
+# Admit the frozen source tree, its roots, and the native venv before importing any project Python.
 if [[ "${MODE}" == cli || "${MODE}" == benchmark-preflight ]]; then
   /bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
     "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "${BASH_SOURCE[0]}" >&2
@@ -28,14 +34,6 @@ fi
 # shellcheck source=generation_prerequisites.sh
 source "${PREREQUISITE_HELPER}"
 
-EXPECTED_STORAGE="$(realpath -m -- "${REPOSITORY_ROOT}/../storage")"
-EXPECTED_VENV="$(realpath -m -- "${REPOSITORY_ROOT}/../runtime/venvs/native")"
-if [[ "${MODE}" != smoke && "${STORAGE_ROOT:-}" != "${EXPECTED_STORAGE}" \
-  || "${GENERATION_NATIVE_VENV:-}" != "${EXPECTED_VENV}" \
-  || ! -x "${EXPECTED_VENV}/bin/python" ]]; then
-  printf 'Generation node requires sibling storage and native Generation venv.\n' >&2
-  exit 2
-fi
 if [[ ! "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ \
   || ! "${SLURM_CPUS_PER_TASK:-}" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Generation node requires a Slurm CPU allocation.\n' >&2
@@ -61,7 +59,7 @@ cleanup_benchmark_preflight() {
 
 validate_source_after_python() {
   local status="$1"
-  if ! /bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
+  if ! GENERATION_PREFLIGHT_QUIET=1 /bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
     "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT}" "${BASH_SOURCE[0]}" >&2; then
     if (( status == 0 )); then
       status=1
@@ -145,19 +143,62 @@ validate_case_environment() {
     "case materialization and HDF5 conversion/admission"
 }
 
+WORKER_WORKSPACE_MARKER=".generation-worker-workspace.json"
+
+# ICE does not reclaim node-local scratch after a job ends, and a killed worker (time limit, OOM, KILL) never runs its trap.
+# Remove only this user's marked worker roots whose job no longer exists in the queue; skip the sweep when the queue is unknown.
+sweep_stale_worker_scratch() {
+  local scratch_parent="$1" active_jobs entry name job_id lock
+  if ! active_jobs="$(squeue -h -u "$(id -un)" -o %A 2>/dev/null)"; then
+    printf 'Stale worker scratch sweep skipped: the Slurm queue is unavailable.\n' >&2
+    return 0
+  fi
+  active_jobs=$'\n'"${active_jobs// /}"$'\n'
+  for entry in "${scratch_parent%/}"/vp2-generation-*.* "${scratch_parent%/}"/vp2-benchmark-*.*; do
+    if [[ ! -d "${entry}" || -L "${entry}" || ! -O "${entry}" \
+      || ! -f "${entry}/${WORKER_WORKSPACE_MARKER}" || -L "${entry}/${WORKER_WORKSPACE_MARKER}" ]]; then
+      continue
+    fi
+    name="${entry##*/}"
+    if [[ ! "${name}" =~ ^vp2-(generation|benchmark)-([0-9]+)[.-] ]]; then
+      continue
+    fi
+    job_id="${BASH_REMATCH[2]}"
+    if [[ "${active_jobs}" == *$'\n'"${job_id}"$'\n'* ]]; then
+      continue
+    fi
+    # The worker holds this lock for its whole lifetime; only a free lock proves the owner is gone.
+    lock="${entry}.lock"
+    if [[ ! -f "${lock}" || -L "${lock}" || ! -O "${lock}" ]]; then
+      continue
+    fi
+    (
+      flock -n -x 9 || exit 0
+      printf 'Removing stale worker scratch of finished job %s: %s\n' "${job_id}" "${entry}" >&2
+      rm -rf -- "${entry}" && rm -f -- "${lock}"
+    ) 9<>"${lock}" || printf 'Could not remove stale worker scratch: %s\n' "${entry}" >&2
+  done
+}
+
 CASE_RUN_ID=""
 WORK_ROOT=""
+WORKER_LOCK=""
 MARKER_READY=false
 CHILD_PID=""
 INTERRUPTION_SIGNAL=""
 
 cleanup_case_worker() {
+  local cleanup_status=0
   if [[ "${MARKER_READY}" != true ]]; then
-    rmdir -- "${WORK_ROOT}"
-    return
+    rmdir -- "${WORK_ROOT}" || cleanup_status=$?
+  else
+    run_python cleanup-worker-workspace "${WORK_ROOT}" \
+      --campaign-run-id "${CASE_RUN_ID}" --storage-root "${STORAGE_ROOT}" || cleanup_status=$?
   fi
-  run_python cleanup-worker-workspace "${WORK_ROOT}" \
-    --campaign-run-id "${CASE_RUN_ID}" --storage-root "${STORAGE_ROOT}"
+  if [[ -n "${WORKER_LOCK}" ]]; then
+    rm -f -- "${WORKER_LOCK}"
+  fi
+  return "${cleanup_status}"
 }
 
 handle_case_signal() {
@@ -197,12 +238,21 @@ run_case_worker() {
     generation_prerequisite_missing \
       "CPU compute-node" "writable scratch parent: ${scratch_parent}" "compute"
   fi
+  sweep_stale_worker_scratch "${scratch_parent}"
   if [[ "${MODE}" == campaign-case ]]; then
+    # A case step inside a node job shares its job ID with every other step; the step ID keeps the scratch root attributable.
     prefix="vp2-generation-${SLURM_JOB_ID}"
+    if [[ "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ ]]; then
+      prefix+="-${SLURM_STEP_ID}"
+    fi
   else
-    prefix="vp2-benchmark-${SLURM_JOB_ID}-${CASE_ROLE}"
+    prefix="vp2-benchmark-${SLURM_JOB_ID}-${SLURM_STEP_ID}-${CASE_ROLE}"
   fi
   WORK_ROOT="$(mktemp -d "${scratch_parent%/}/${prefix}.XXXXXX")"
+  # Held until this worker and every child inheriting the descriptor exit; the sweep never removes a locked scratch.
+  WORKER_LOCK="${WORK_ROOT}.lock"
+  exec {WORKER_LOCK_FD}>"${WORKER_LOCK}"
+  flock -x "${WORKER_LOCK_FD}"
   trap 'handle_case_signal INT' INT
   trap 'handle_case_signal TERM' TERM
   trap on_case_exit EXIT
@@ -211,11 +261,13 @@ run_case_worker() {
     --campaign-run-id "${CASE_RUN_ID}" --storage-root "${STORAGE_ROOT}" >/dev/null
   MARKER_READY=true
 
+  # Python starts directly in the background (not through run_python): a backgrounded shell function is a subshell,
+  # and the trap's TERM would stop that subshell while the case worker kept running without its orderly stop.
   if [[ "${MODE}" == campaign-case ]]; then
-    run_python run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}" \
+    "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}" \
       --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
   else
-    run_python run-core-benchmark-case "${CASE_RUN_ID}" "${VARIANT_ID}" "${CASE_ROLE}" \
+    "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-core-benchmark-case "${CASE_RUN_ID}" "${SWEEP_ID}" "${VARIANT_ID}" "${VARIANT_ATTEMPT}" "${CASE_ROLE}" \
       --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
   fi
   CHILD_PID="$!"
@@ -234,64 +286,41 @@ run_case_worker() {
   exit "${worker_status}"
 }
 
-cleanup_smoke() {
-  local status="$?"
-  trap - EXIT
-  if (( status != 0 )) && [[ -f "${WORK_ROOT}/smoke.log" ]]; then
-    tail -n 80 "${WORK_ROOT}/smoke.log" >&2
+NODE_DIRECTORY=""
+NODE_CORES=""
+NODE_CHILD_PID=""
+
+handle_node_signal() {
+  if [[ -n "${NODE_CHILD_PID}" ]]; then
+    kill -"$1" "${NODE_CHILD_PID}" 2>/dev/null || true
   fi
-  if [[ "${WORK_ROOT}" != "${SCRATCH_PARENT%/}/generation-native-smoke-${SLURM_JOB_ID}."* ]]; then
-    printf 'Refusing to remove an unexpected smoke workspace.\n' >&2
-    exit 1
-  fi
-  rm -rf -- "${WORK_ROOT}"
-  exit "${status}"
 }
 
-run_smoke() {
-  if (( $# != 0 )) || [[ "${SLURM_CPUS_PER_TASK}" != 1 ]]; then
-    printf 'Native Generation smoke requires a one-CPU Slurm allocation.\n' >&2
-    return 2
-  fi
-  module load Comsol/v6.4
-  "${GENERATION_NATIVE_VENV}/bin/python" -c \
-    'import sys, h5py, numpy, scipy, torch, yaml; import src.generation.cli.cli_generation; print("Generation Python", sys.version.split()[0])'
-
-  SCRATCH_PARENT="${TMPDIR:-/tmp}"
-  if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then
-    printf 'Smoke scratch parent is unavailable.\n' >&2
-    return 1
-  fi
-  WORK_ROOT="$(mktemp -d "${SCRATCH_PARENT%/}/generation-native-smoke-${SLURM_JOB_ID}.XXXXXXXX")"
-  trap cleanup_smoke EXIT
-  mkdir -p -- "${WORK_ROOT}/configuration" "${WORK_ROOT}/tmp"
-  cat > "${WORK_ROOT}/GenerationNativeSmoke.java" <<'JAVA'
-import com.comsol.model.Model;
-import com.comsol.model.util.ModelUtil;
-
-public class GenerationNativeSmoke {
-    public static void main(String[] args) throws java.io.IOException {
-        Model model = run();
-        model.save("smoke.mph");
-    }
-
-    public static Model run() {
-        return ModelUtil.create("GenerationNativeSmoke");
-    }
-}
-JAVA
-  cd "${WORK_ROOT}"
-  generation_comsol_version comsol
-  comsol compile -configuration "${WORK_ROOT}/configuration" GenerationNativeSmoke.java
-  [[ -s GenerationNativeSmoke.class ]] ||
-    { printf 'COMSOL Java smoke model was not compiled.\n' >&2; return 1; }
-  comsol batch -configuration "${WORK_ROOT}/configuration" -tmpdir "${WORK_ROOT}/tmp" \
-    -inputfile GenerationNativeSmoke.class -outputfile smoke.mph \
-    -job generation-native-smoke -np 1 -batchlog smoke.log -batchlogout
-  [[ -s smoke.mph ]] ||
-    { printf 'COMSOL native batch did not publish its disposable model.\n' >&2; return 1; }
-  printf 'GENERATION NATIVE SMOKE PASS job=%s comsol=6.4 model_bytes=%s\n' \
-    "${SLURM_JOB_ID}" "$(stat -c %s smoke.mph)"
+# The worker runs in the foreground of this batch script; Slurm's B: signal and scancel reach only this shell, so the
+# trap hands TERM and INT on to the Python worker, which stops launching and forwards TERM to its running steps.
+run_node_worker_mode() {
+  local worker_status=0
+  # The one preflight report of this node job. A subshell keeps the loaded COMSOL module out of the worker, and a failing
+  # check does not stop the worker: each case step repeats the checks and fails on its own.
+  ( validate_case_environment ) || printf 'Node job preflight: a check failed (see above); each case step repeats it and fails on its own.\n' >&2
+  trap 'handle_node_signal TERM' TERM
+  trap 'handle_node_signal INT' INT
+  # Not run_python: a backgrounded shell function runs in a subshell, and a TERM aimed at that subshell never reaches Python.
+  "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-node-worker "${NODE_DIRECTORY}" --cores "${NODE_CORES}" &
+  NODE_CHILD_PID="$!"
+  set +e
+  while :; do
+    wait "${NODE_CHILD_PID}"
+    worker_status="$?"
+    # A trapped signal ends wait early with a status above 128 while the worker still runs; wait again for its own status.
+    if ! kill -0 "${NODE_CHILD_PID}" 2>/dev/null; then
+      break
+    fi
+  done
+  set -e
+  NODE_CHILD_PID=""
+  trap - TERM INT
+  validate_source_after_python "${worker_status}" || exit "$?"
 }
 
 case "${MODE}" in
@@ -300,15 +329,18 @@ case "${MODE}" in
     ;;
   campaign-case)
     if (( $# != 4 )); then
-      printf 'Usage: %s REPOSITORY campaign-case CAMPAIGN_RUN_ID BATCH_NAME CASE_INDEX CORES_PER_CASE\n' "$0" >&2
+      printf 'Usage: %s SOURCE_TREE campaign-case CAMPAIGN_RUN_ID BATCH_NAME CASE_INDEX CORES_PER_CASE\n' "$0" >&2
       exit 2
     fi
     CASE_RUN_ID="$1"
     BATCH_NAME="$2"
     CASE_INDEX="$3"
     CORES_PER_CASE="$4"
-    if [[ ! "${CASE_RUN_ID}" =~ ^[A-Za-z0-9._-]+__[0-9a-f]{16}$ \
-      || "${GENERATION_CAMPAIGN_RUN_ID:-}" != "${CASE_RUN_ID}" \
+    if [[ ! "${CASE_RUN_ID}" =~ ^source~[a-z0-9]+(_[a-z0-9]+)*~[a-z0-9]+([-_+][a-z0-9]+)*(__[a-z0-9]+([-_+][a-z0-9]+)*)*$ ]]; then
+      printf 'Campaign case identity or Slurm allocation is inconsistent.\n' >&2
+      exit 2
+    fi
+    if [[ "${GENERATION_CAMPAIGN_RUN_ID:-}" != "${CASE_RUN_ID}" \
       || ! "${BATCH_NAME}" =~ ^[A-Za-z0-9._-]+$ \
       || ! "${CASE_INDEX}" =~ ^[1-9][0-9]*$ \
       || ! "${CORES_PER_CASE}" =~ ^[1-9][0-9]*$ \
@@ -321,31 +353,51 @@ case "${MODE}" in
     printf -v CASE_ID 'case_%04d' "${CASE_INDEX}"
     CASE_NODE="${SLURMD_NODENAME:-${HOSTNAME:-unavailable}}"
     CASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unavailable)"
-    printf 'CASE START campaign_run_id=%s batch=%s case=%s case_index=%s job=%s node=%s cores=%s started_at=%s\n' \
+    printf 'CASE START campaign_run_id=%s batch=%s case=%s case_index=%s job=%s step=%s dispatch=%s node=%s cores=%s started_at=%s\n' \
       "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_ID}" "${CASE_INDEX}" \
-      "${SLURM_JOB_ID}" "${CASE_NODE}" "${CORES_PER_CASE}" "${CASE_STARTED_AT}"
+      "${SLURM_JOB_ID}" "${SLURM_STEP_ID:-unavailable}" "${GENERATION_DISPATCH_KEY:-unavailable}" "${CASE_NODE}" "${CORES_PER_CASE}" "${CASE_STARTED_AT}"
     run_case_worker
     ;;
   benchmark-case)
-    if (( $# != 3 )); then
-      printf 'Usage: %s REPOSITORY benchmark-case BENCHMARK_RUN_ID VARIANT_ID CASE_ROLE\n' "$0" >&2
+    if (( $# != 5 )); then
+      printf 'Usage: %s SOURCE_TREE benchmark-case BENCHMARK_RUN_ID SWEEP_ID VARIANT_ID VARIANT_ATTEMPT CASE_ROLE\n' "$0" >&2
       exit 2
     fi
     CASE_RUN_ID="$1"
-    VARIANT_ID="$2"
-    CASE_ROLE="$3"
+    SWEEP_ID="$2"
+    VARIANT_ID="$3"
+    VARIANT_ATTEMPT="$4"
+    CASE_ROLE="$5"
     if [[ ! "${CASE_RUN_ID}" =~ ^core_scaling_transient__[0-9a-f]{16}$ \
       || "${GENERATION_BENCHMARK_RUN_ID:-}" != "${CASE_RUN_ID}" \
+      || ! "${SWEEP_ID}" =~ ^[a-z0-9]+(_[a-z0-9]+)*$ \
       || ! "${VARIANT_ID}" =~ ^[A-Za-z0-9._-]+$ \
-      || ! "${CASE_ROLE}" =~ ^(nominal|natural)$ \
+      || ! "${VARIANT_ATTEMPT}" =~ ^[1-9][0-9]*$ \
+      || ! "${CASE_ROLE}" =~ ^[A-Za-z0-9._-]+$ \
+      || ! "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ \
       || -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
       printf 'Benchmark case identity or Slurm allocation is inconsistent.\n' >&2
       exit 2
     fi
     run_case_worker
     ;;
-  smoke)
-    run_smoke "$@"
+  node-worker)
+    if (( $# != 2 )); then
+      printf 'Usage: %s SOURCE_TREE node-worker NODE_DIRECTORY CORES\n' "$0" >&2
+      exit 2
+    fi
+    NODE_DIRECTORY="$1"
+    NODE_CORES="$2"
+    if [[ "${NODE_DIRECTORY}" != /* \
+      || "${NODE_DIRECTORY}" == *$'\n'* || "${NODE_DIRECTORY}" == *$'\r'* \
+      || -L "${NODE_DIRECTORY}" || ! -d "${NODE_DIRECTORY}/tickets" \
+      || ! "${NODE_CORES}" =~ ^[1-9][0-9]*$ \
+      || "${SLURM_CPUS_PER_TASK}" -ne "${NODE_CORES}" \
+      || -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+      printf 'Node worker directory or Slurm allocation is inconsistent.\n' >&2
+      exit 2
+    fi
+    run_node_worker_mode
     ;;
   *)
     printf 'Unsupported Generation node mode: %s\n' "${MODE}" >&2

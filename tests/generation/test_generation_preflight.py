@@ -1,9 +1,19 @@
-# ruff: noqa: S101, S603, S607
-"""Native CPU preflight environment, resource, and self-cleaning contracts."""
+"""Native CPU preflight environment, resource, and self-cleaning contracts.
+
+Responsibilities:
+  - Check source admission, native environment boundaries, resource probes, and cleanup
+
+Design principles:
+  - Invalid runtime bindings fail clearly before case publication
+
+This module does NOT:
+  - Provision shared environments or run production simulations
+"""
 
 from __future__ import annotations
 
 import copy
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -12,6 +22,7 @@ from typing import Any
 
 import pytest
 import yaml
+from support.fake_git import FAKE_GIT_HEAD, install_fake_git
 
 from src import generation
 from src.generation.contracts import generation_contracts_source as source_service
@@ -30,15 +41,10 @@ def test_admitted_source_is_checked_before_case_publication(
     shutil.copy2(source, scripts / source.name)
     scientific = repository / "science.py"
     scientific.write_text("value = 1\n", encoding="utf-8")
-    for arguments in (
-        ("init", "-q"),
-        ("config", "user.name", "Test"),
-        ("config", "user.email", "test@example.invalid"),
-        ("add", "."),
-        ("commit", "-qm", "test source"),
-    ):
-        subprocess.run(["git", "-C", str(repository), *arguments], check=True)
-    expected = subprocess.run(
+    binary = tmp_path / "bin"
+    fake_git = install_fake_git(repository, binary)
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    expected = subprocess.run(  # noqa: S603 -- test-owned executable and controlled argument vector; no shell interpolation
         [str(preflight.sys.executable), str(scripts / source.name), str(repository)],
         check=True,
         capture_output=True,
@@ -46,23 +52,14 @@ def test_admitted_source_is_checked_before_case_publication(
     ).stdout.strip()
     monkeypatch.setattr(source_service.common.paths, "get_project_root", lambda: repository)
     monkeypatch.setenv("GENERATION_SOURCE_SHA256", expected)
-    monkeypatch.setenv(
-        "GENERATION_GIT_COMMIT",
-        subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip(),
-    )
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", FAKE_GIT_HEAD)
     source_service.validate_admitted_source_before_publication()
 
     scientific.write_text("value = 2\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="source changed"):
         source_service.validate_admitted_source_before_publication()
 
-    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repository), "commit", "-qm", "changed source"], check=True)
+    fake_git.change_head("c" * 40)
     with pytest.raises(RuntimeError, match="commit changed"):
         source_service.validate_admitted_source_before_publication()
 
@@ -74,7 +71,7 @@ def campaign_path(generation_config_factory: Any) -> Path:
         simulation_profile="steady_flow",
         scheduler_kind="slurm",
         natural_count=3,
-        campaign_purpose="family_generalization",
+        campaign_purpose="source_generation",
     )
     execution_path = path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
@@ -268,7 +265,10 @@ def test_preflight_separates_environment_from_runtime_and_removes_probe(
         "cores_per_node": campaign.execution_values["site"]["cores_per_node"],
         "max_admission_cases": campaign.execution_values["submission"]["max_admission_cases"],
         "poll_interval_seconds": campaign.execution_values["submission"]["poll_interval_seconds"],
-        "max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
+        "node_jobs": campaign.execution_values["cluster"]["node_jobs"],
+        "concurrent_cases_per_node": campaign.execution_values["cluster"]["concurrent_cases_per_node"],
+        "node_job_memory": campaign.execution_values["cluster"]["node_job_memory"],
+        "node_job_wall_time": campaign.execution_values["cluster"]["node_job_wall_time"],
     }
     assert report["path_cleanup_probe"]["probe_removed"] is True
     assert not Path(report["path_cleanup_probe"]["probe_path"]).exists()

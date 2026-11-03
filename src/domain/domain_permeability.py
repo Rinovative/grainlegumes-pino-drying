@@ -1,19 +1,12 @@
-"""
-domain_permeability.py
-
-Define permeability tensor naming, ordering, mapping, and diagnostics.
+"""Define permeability tensor ordering and diagnostics.
 
 Responsibilities:
-  - Declare COMSOL-exported and internal permeability component names
-  - Map source field names to internal tensor components
-  - Detect permeability dimensionality from available names
+  - Declare internal permeability component names and their canonical order
   - Derive exact principal values and anisotropy for symmetric 2D tensors
 
 Design principles:
   - Permeability contracts are declarative and deterministic
-  - Dimension detection depends only on the presence of source field names
   - Numerical diagnostics fail closed on non-positive-definite tensors
-  - Source preference order remains explicit for symmetric component pairs
 
 This module does NOT:
   - Normalize permeability for learned-model storage
@@ -24,32 +17,9 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
-
-# =============================================================================
-# COMSOL-exported full tensor components (3D, 9 components)
-# Row-wise order:
-#   [ kxx  kyx  kzx ]
-#   [ kxy  kyy  kzy ]
-#   [ kxz  kyz  kzz ]
-# =============================================================================
-
-COMSOL_KAPPA_3D_ORDER: list[str] = [
-    "kappaxx",
-    "kappayx",
-    "kappazx",
-    "kappaxy",
-    "kappayy",
-    "kappazy",
-    "kappaxz",
-    "kappayz",
-    "kappazz",
-]
 
 # =============================================================================
 # Internal canonical representation primitives (symmetric, reduced).
@@ -72,23 +42,6 @@ INTERNAL_KAPPA_3D_ORDER: list[str] = [
     "Kyz",
     "Kzz",
 ]
-
-# =============================================================================
-# Mapping: internal channel -> acceptable COMSOL source fields
-# The consumer decides HOW to combine if multiple are present:
-#   - prefer first available
-#   - or average symmetric pairs
-# =============================================================================
-
-INTERNAL_TO_COMSOL: dict[str, list[str]] = {
-    "Kxx": ["kappaxx"],
-    "Kyy": ["kappayy"],
-    "Kzz": ["kappazz"],
-    "Kxy": ["kappaxy", "kappayx"],
-    "Kxz": ["kappaxz", "kappazx"],
-    "Kyz": ["kappayz", "kappazy"],
-}
-
 
 # =============================================================================
 # Helpers
@@ -168,34 +121,3 @@ def symmetric_tensor_diagnostics(Kxx: Any, Kxy: Any, Kyy: Any) -> PermeabilityTe
         anisotropy_ratio=anisotropy,
         determinant=determinant,
     )
-
-
-def resolve_internal_to_present_sources(
-    available_fields: Iterable[str],
-) -> dict[str, list[str]]:
-    """
-    Resolve internal permeability components to present COMSOL source fields.
-
-    Parameters
-    ----------
-    available_fields : Iterable[str]
-        COMSOL field names actually present in the dataset.
-
-    Returns
-    -------
-    dict[str, list[str]]
-        Present internal components in canonical 2D or 3D order, each mapped to
-        present source names in declared preference order. Any z-component
-        selects the 3D candidate order. Absent components are omitted rather
-        than synthesized or averaged.
-
-    """
-    available = set(available_fields)
-    has_z_component = any(name in available for name in ("kappazx", "kappazy", "kappaxz", "kappayz", "kappazz"))
-    order = INTERNAL_KAPPA_3D_ORDER if has_z_component else INTERNAL_KAPPA_2D_ORDER
-
-    return {
-        internal: [source for source in INTERNAL_TO_COMSOL[internal] if source in available]
-        for internal in order
-        if any(source in available for source in INTERNAL_TO_COMSOL[internal])
-    }

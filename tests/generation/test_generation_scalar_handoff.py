@@ -1,5 +1,14 @@
-# ruff: noqa: EM101, EM102, PLR2004, S101, TRY003
-"""Exact transient scalar-handoff admission and single-owner contracts."""
+"""Exact transient scalar-handoff admission and single-owner contracts.
+
+Responsibilities:
+  - Check exact scalar/schedule contracts, parameter formatting, and byte-bound provenance
+
+Design principles:
+  - One admitted scalar source governs case and COMSOL handoff values
+
+This module does NOT:
+  - Generate schedules or execute the COMSOL builder
+"""
 
 from __future__ import annotations
 
@@ -16,7 +25,7 @@ from src.generation.contracts import generation_contracts_scalar_handoff as scal
 
 _EXPECTED_FIELDS = (
     "T_amb",
-    "eps_bed_cal_ref",
+    "eps_bed_ref",
     "rho_bu_dry_ref",
     "k_gr",
     "cp_gr_dry",
@@ -245,7 +254,8 @@ def test_scalar_source_admission_fails_closed(
         rows[1] = ";".join(columns)
         _rewrite_rows(source, payload, rows)
     else:
-        raise AssertionError(f"Unhandled mutation {mutation!r}.")
+        msg = f"Unhandled mutation {mutation!r}."
+        raise AssertionError(msg)
 
     with pytest.raises(error, match=match):
         _admit(payload, tmp_path)
@@ -261,7 +271,8 @@ def test_scalar_source_unreadable_error_is_actionable(
 
     def reject_source_read(path: Path) -> bytes:
         if path == source:
-            raise PermissionError("synthetic unreadable source")
+            msg = "synthetic unreadable source"
+            raise PermissionError(msg)
         return original(path)
 
     monkeypatch.setattr(Path, "read_bytes", reject_source_read)
@@ -300,7 +311,8 @@ def test_scalar_case_provenance_must_agree_with_admitted_bytes(
         payload["scalars"][3]["owner"] = "package_fixed"
         payload["scalar_handoff"]["entries"] = copy.deepcopy(payload["scalars"])
     else:
-        raise AssertionError(f"Unhandled mutation {mutation!r}.")
+        msg = f"Unhandled mutation {mutation!r}."
+        raise AssertionError(msg)
 
     with pytest.raises(ValueError, match=match):
         _admit(payload, tmp_path)

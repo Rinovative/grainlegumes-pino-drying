@@ -1,15 +1,15 @@
-"""
-generation_validation_policy.py
+"""Define shared blocking-integrity and advisory-diagnostic severity contracts.
 
-Define shared blocking-integrity and advisory-diagnostic severity contracts.
 Responsibilities:
   - Classify stable validation codes as blocking or advisory
   - Construct complete immutable advisory diagnostic records
   - Keep quality flags distinct from structural publication failures
+
 Design principles:
   - Structural, identity, and persistence integrity remain fail-closed
   - Finite scientific and numerical plausibility findings remain observational
   - Diagnostic records carry explicit evidence, thresholds, and timestamps
+
 This module does NOT:
   - Validate concrete files, arrays, identities, or scientific formulas
   - Decide Dataset filtering or campaign outcomes
@@ -17,7 +17,7 @@ This module does NOT:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict
 
 if TYPE_CHECKING:
@@ -146,7 +146,7 @@ def diagnostic_record(
     if not stage or not message:
         message_text = "Diagnostic stage and message must be non-empty."
         raise ValueError(message_text)
-    timestamp = recorded_at or datetime.now(timezone.utc).isoformat()
+    timestamp = recorded_at or datetime.now(UTC).isoformat()
     return {
         "code": code,
         "severity": severity,

@@ -1,16 +1,17 @@
-"""
-dataset_contracts_transient.py
+"""Define and serialize the Dataset-owned transient drying sample-data contract.
 
-Define and serialize the unregistered transient drying sample-data contract.
 Responsibilities:
   - Select Dataset-owned conditioning fields from Generation storage descriptors
   - Declare ordered state, temporal, boundary, scalar, target, and archive fields
   - Validate explicit sampling and boundary-preserving spatial-view specifications
+  - Own the rollout-window placement shared by Dataset items and trajectory windows
   - Serialize and digest the exact persisted transient sample contract
+
 Design principles:
   - Generation owns canonical HDF5 source names and physical units
   - Dataset owns model-facing channel selection and delta-target derivation
   - HDF5 regular-time coordinates, not copied index values, own physical time
+
 This module does NOT:
   - Register a transient learning task or build transient tensors
   - Validate HDF5 payloads, normalize time, or execute model rollouts
@@ -26,7 +27,7 @@ from typing import Any, Final, Literal, TypeAlias, cast
 
 from src import generation
 
-TransientSampleMode: TypeAlias = Literal["one_step_transition", "rollout_window"]
+TransientSampleMode: TypeAlias = Literal["one_step_transition", "rollout_window", "trajectory"]  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 
 TRANSIENT_PROFILE_ID: Final = "transient_drying"
 TRANSIENT_VIEW_ID: Final = "transient_drying"
@@ -35,9 +36,42 @@ TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION: Final = 1
 TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "one_step_transition",
     "rollout_window",
+    "trajectory",
 )
 _SPATIAL_AXIS_COUNT: Final = 2
 _MINIMUM_SPATIAL_AXIS_LENGTH: Final = 2
+
+
+def rollout_window_starts(transition_count: int, *, rollout_length: int, window_stride: int, window_offset: int) -> tuple[int, ...]:
+    """
+    Return every rollout-window start of one trajectory, the last aligned to its end.
+
+    Windows start at ``window_offset + k * window_stride``. When these stop short
+    of the final transition, one more window ending exactly at the trajectory end
+    is added, so every trajectory's last transitions are covered; it overlaps its
+    predecessor. A trajectory shorter than ``window_offset + rollout_length`` has
+    no window.
+
+    Raises
+    ------
+    ValueError
+        If a count, length, stride, or offset is not a valid integer.
+
+    """
+    for label, value, minimum in (
+        ("transition_count", transition_count, 0),
+        ("rollout_length", rollout_length, 1),
+        ("window_stride", window_stride, 1),
+        ("window_offset", window_offset, 0),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            message = f"{label} must be an integer >= {minimum}."
+            raise ValueError(message)
+    final_start = transition_count - rollout_length
+    starts = list(range(window_offset, final_start + 1, window_stride))
+    if starts and starts[-1] < final_start:
+        starts.append(final_start)
+    return tuple(starts)
 
 
 def validate_spatial_stride(value: Any) -> int:
@@ -200,7 +234,16 @@ class TransientTemporalContract:
 
 @dataclass(frozen=True, slots=True)
 class TransientSamplingSpec:
-    """Select one explicit deterministic transient sample materialization."""
+    """
+    Select one explicit deterministic transient sample materialization.
+
+    ``one_step_transition`` yields single transitions. ``rollout_window`` yields
+    windows of ``rollout_length`` placed by :func:`rollout_window_starts`.
+    ``trajectory`` yields each complete case trajectory as one item. Its
+    optional ``rollout_length`` is the length of the consecutive windows a
+    recurrent trainer cuts from it with stride ``rollout_length`` and offset
+    zero; evaluation of whole trajectories sets none.
+    """
 
     mode: TransientSampleMode
     rollout_length: int | None = None
@@ -217,6 +260,16 @@ class TransientSamplingSpec:
         if self.mode == "one_step_transition":
             if any(value is not None for value in window_values):
                 message = "one_step_transition does not accept rollout window settings."
+                raise ValueError(message)
+            return
+        if self.mode == "trajectory":
+            if self.window_stride is not None or self.window_offset is not None:
+                message = "trajectory sampling places its windows itself and accepts only rollout_length."
+                raise ValueError(message)
+            if self.rollout_length is not None and (
+                isinstance(self.rollout_length, bool) or not isinstance(self.rollout_length, int) or self.rollout_length < 2  # noqa: PLR2004 -- one transition is not a window
+            ):
+                message = "rollout_length must be null or an integer >= 2 for trajectory."
                 raise ValueError(message)
             return
         for label, value, minimum in (
@@ -239,9 +292,15 @@ class TransientSamplingSpec:
             available = ", ".join(TRANSIENT_SAMPLE_MODES)
             message = f"Unknown transient sample mode {mode!r}. Available modes: {available}."
             raise ValueError(message)
-        required = {"mode"} if mode == "one_step_transition" else {"mode", "rollout_length", "window_stride", "window_offset"}
-        if set(value) != required:
-            message = f"Transient sampling keys must be exactly {sorted(required)} for mode {mode!r}."
+        admitted = (
+            ({"mode"},)
+            if mode == "one_step_transition"
+            else ({"mode"}, {"mode", "rollout_length"})
+            if mode == "trajectory"
+            else ({"mode", "rollout_length", "window_stride", "window_offset"},)
+        )
+        if set(value) not in admitted:
+            message = f"Transient sampling keys must be exactly one of {[sorted(keys) for keys in admitted]} for mode {mode!r}."
             raise ValueError(message)
         return cls(
             mode=cast("TransientSampleMode", mode),
@@ -250,9 +309,20 @@ class TransientSamplingSpec:
             window_offset=value.get("window_offset"),
         )
 
+    def window_starts(self, transition_count: int) -> tuple[int, ...]:
+        """Return the window starts this sampling places in one trajectory."""
+        if self.rollout_length is None:
+            message = "One-step and whole-trajectory sampling place no rollout windows."
+            raise ValueError(message)
+        stride = self.rollout_length if self.window_stride is None else self.window_stride
+        offset = 0 if self.window_offset is None else self.window_offset
+        return rollout_window_starts(transition_count, rollout_length=self.rollout_length, window_stride=stride, window_offset=offset)
+
     def as_dict(self) -> dict[str, Any]:
         """Serialize the exact explicit sampling choice."""
         payload: dict[str, Any] = {"mode": self.mode}
+        if self.mode == "trajectory" and self.rollout_length is not None:
+            payload["rollout_length"] = self.rollout_length
         if self.mode == "rollout_window":
             payload.update(
                 {

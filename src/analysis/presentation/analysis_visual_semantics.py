@@ -1,7 +1,4 @@
-"""
-analysis_visual_semantics.py
-
-Define shared semantic colormaps and deterministic dataset colors for analysis views.
+"""Define shared semantic colormaps and deterministic dataset colors for analysis views.
 
 Responsibilities:
   - Resolve a field's semantic colormap and centered-scale requirement

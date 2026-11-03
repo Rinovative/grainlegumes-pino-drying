@@ -1,7 +1,4 @@
-"""
-common_serialization.py
-
-Publish authoritative files atomically and compute stable content digests.
+"""Publish authoritative files atomically and compute stable content digests.
 
 Responsibilities:
   - Write unique sibling temporary files and atomically replace destinations
@@ -22,11 +19,13 @@ This module does NOT:
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Callable, Mapping
+import warnings
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -34,6 +33,7 @@ from typing import Any
 PathWriter = Callable[[Path], None]
 
 _ATOMIC_TEMPORARY_SUFFIX = ".tmp"
+_FILE_HASH_CHUNK_SIZE = 1024 * 1024
 
 
 def atomic_write_temporary_destination(candidate: Path | str) -> Path | None:
@@ -189,14 +189,9 @@ def atomic_write_bytes(destination: Path | str, payload: bytes) -> Path:
     return atomic_path_write(destination, write_bytes)
 
 
-def atomic_write_text(
-    destination: Path | str,
-    payload: str,
-    *,
-    encoding: str = "utf-8",
-) -> Path:
+def atomic_write_text(destination: Path | str, payload: str) -> Path:
     """
-    Atomically publish a text payload.
+    Atomically publish a UTF-8 text payload.
 
     Parameters
     ----------
@@ -204,8 +199,6 @@ def atomic_write_text(
         Final file path.
     payload : str
         Complete text payload.
-    encoding : str, optional
-        Text encoding, by default ``"utf-8"``.
 
     Returns
     -------
@@ -220,17 +213,12 @@ def atomic_write_text(
     """
 
     def write_text(temp_path: Path) -> None:
-        temp_path.write_text(payload, encoding=encoding)
+        temp_path.write_text(payload, encoding="utf-8")
 
     return atomic_path_write(destination, write_text)
 
 
-def atomic_write_json(
-    destination: Path | str,
-    payload: Mapping[str, Any],
-    *,
-    indent: int = 2,
-) -> Path:
+def atomic_write_json(destination: Path | str, payload: Mapping[str, Any]) -> Path:
     """
     Atomically publish a JSON object with a final newline.
 
@@ -240,8 +228,6 @@ def atomic_write_json(
         Final file path.
     payload : Mapping[str, Any]
         JSON-serializable object.
-    indent : int, optional
-        Pretty-print indentation, by default 2.
 
     Returns
     -------
@@ -263,7 +249,7 @@ def atomic_write_json(
     serialized = json.dumps(
         dict(payload),
         ensure_ascii=True,
-        indent=indent,
+        indent=2,
         sort_keys=True,
     )
     return atomic_write_text(destination, f"{serialized}\n")
@@ -339,16 +325,14 @@ def canonical_json_sha256(payload: Any) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
+def file_sha256(path: Path | str) -> str:
     """
-    Return the SHA-256 digest of one file's exact bytes.
+    Return the SHA-256 digest of one file's exact bytes, streamed in one-MiB chunks.
 
     Parameters
     ----------
     path : Path | str
         Existing file path.
-    chunk_size : int, optional
-        Positive streaming chunk size, by default one MiB.
 
     Returns
     -------
@@ -357,17 +341,73 @@ def file_sha256(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
 
     Raises
     ------
-    ValueError
-        If ``chunk_size`` is not positive.
     OSError
         If the file cannot be opened or read.
 
     """
-    if chunk_size <= 0:
-        msg = f"chunk_size must be positive, got {chunk_size}."
-        raise ValueError(msg)
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(chunk_size), b""):
+        for chunk in iter(lambda: stream.read(_FILE_HASH_CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def python_implementation_sha256(root: Path, paths: Sequence[str]) -> str:
+    """Hash selected Python implementations without presentation-only changes.
+
+    Parameters
+    ----------
+    root : Path
+        Source root containing every selected file.
+    paths : Sequence[str]
+        Nonempty selection of relative Python file paths. The domain caller
+        selects its scientific dependencies; this helper does not discover them.
+
+    Returns
+    -------
+    str
+        Digest of relative names and syntax trees, excluding source positions,
+        comments and module, class and function docstrings.
+
+    Raises
+    ------
+    ValueError
+        The selection is empty or a path is not a contained relative Python file.
+    OSError, SyntaxError
+        A selected implementation cannot be read or parsed.
+
+    Notes
+    -----
+    This detects changes in the selected implementation, not mathematical
+    equivalence or dependencies omitted by the caller. Exact producing bytes
+    and environments remain separate reproduction evidence.
+
+    """
+    if not paths:
+        msg = "Python implementation identity requires selected files."
+        raise ValueError(msg)
+    source_root = root.resolve(strict=True)
+    implementations = {}
+    for name in sorted(set(paths)):
+        relative = Path(name)
+        source = source_root / relative
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.suffix != ".py"
+            or not source.resolve(strict=True).is_relative_to(source_root)
+        ):
+            msg = f"Implementation path must be a contained relative Python file: {name}"
+            raise ValueError(msg)
+        with warnings.catch_warnings():
+            # Third-party sources such as neuraloperator docstrings contain LaTeX
+            # escapes (a backslash before "hat") whose SyntaxWarning does not change the parsed tree.
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = node.body
+                if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                    del body[0]
+        implementations[relative.as_posix()] = ast.dump(tree, include_attributes=False)
+    return canonical_json_sha256(implementations)

@@ -1,18 +1,26 @@
-"""
-generation_cases_fields.py
+"""Generate deterministic bed, pressure, and initial-moisture spatial fields.
 
-Generate deterministic bed, pressure, and initial-moisture spatial fields.
 Responsibilities:
   - Preserve the maintained multiscale permeability and porosity construction
   - Use independent label-derived streams for bed, pressure, and moisture fields
   - Build a smooth bounded dry-basis initial-moisture field without clipping
+
 Design principles:
   - Cartesian orientation, units, and physical invariants fail closed
   - Moisture amplitude means maximum absolute deviation from its configured mean
   - Derived dry-bulk density and initial water follow the finalized formulas
+
 This module does NOT:
   - Define scientific ranges, schedules, COMSOL mappings, or storage semantics
   - Add local or high-frequency perturbations to initial moisture
+
+Notes:
+  Permeability and porosity:
+    - Scalar permeability uses a lognormal transform parameterized by its configured mean and coefficient of variation; tensor orientation follows a
+      smoothed director derived from bed-background gradients.
+    - Local porosity texture is centered on a case-level Kozeny-Carman trend with bounded packing scatter, clipped to global guards, then checked
+      against natural or active permeability-OOD mean support.
+
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ POROSITY_DIAGNOSTIC_KEYS: Final = frozenset(
         "background_field_sha256",
         "material_family",
         "material_kappa_nominal",
-        "material_eps_bed_cal_ref",
+        "material_eps_bed_ref",
         "A_KC_reference",
         "authored_permeability_support",
         "kc_compatible_permeability_support",
@@ -397,7 +405,7 @@ def _packing_reference(
     return {
         "material_family": str(coupling["material_family"]),
         "material_kappa_nominal": float(coupling["material_kappa_nominal"]),
-        "material_eps_bed_cal_ref": float(coupling["material_eps_bed_cal_ref"]),
+        "material_eps_bed_ref": float(coupling["material_eps_bed_ref"]),
         "A_KC_reference": coefficient,
         "authored_permeability_support": copy.deepcopy(coupling["authored_permeability_support"]),
         "kc_compatible_permeability_support": copy.deepcopy(coupling["kc_compatible_permeability_support"]),
@@ -740,11 +748,11 @@ def _generate_spatial_fields_once(
             family_bounds=family_bounds,
             random=np.random.default_rng(seeds["initial_moisture"]),
         )
-        calibration_porosity = _finite(values, "eps_bed_cal_ref")
-        if not 0 < calibration_porosity < 1:
-            msg = "eps_bed_cal_ref must lie strictly inside (0, 1)."
+        eps_bed_ref = _finite(values, "eps_bed_ref")
+        if not 0 < eps_bed_ref < 1:
+            msg = "eps_bed_ref must lie strictly inside (0, 1)."
             raise ValueError(msg)
-        dry_bulk_density = _finite(values, "rho_bu_dry_ref") * (1.0 - porosity) / (1.0 - calibration_porosity)
+        dry_bulk_density = _finite(values, "rho_bu_dry_ref") * (1.0 - porosity) / (1.0 - eps_bed_ref)
         initial_water = dry_bulk_density * moisture
         columns["X_0_db_field"] = moisture
         metadata["initial_moisture"] = moisture_metadata
@@ -756,7 +764,7 @@ def _generate_spatial_fields_once(
             }
         )
         metadata["derived_fields"] = {
-            "rho_bu_dry_formula": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_cal_ref)",
+            "rho_bu_dry_formula": "rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_ref)",
             "w_gr_0_formula": "rho_bu_dry*X_0_db_field",
             "initial_compartment_values": "w_surf(0)=w_int(0)=w_gr_0",
             "rho_bu_dry_sha256": _array_sha256(dry_bulk_density),

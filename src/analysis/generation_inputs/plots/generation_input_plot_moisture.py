@@ -1,15 +1,15 @@
-"""
-generation_input_plot_moisture.py
+"""Compose transient moisture, sorption, and inlet-bed A/B diagnostics.
 
-Compose transient moisture, sorption, and inlet-bed A/B diagnostics.
 Responsibilities:
   - Compare initial moisture and equilibrium-RH maps as A/B/B-minus-A rows
   - Retain separate A/B distributions with dataset-mean markers
   - Compare inlet startup RH with case and empirical bed-equilibrium summaries
+
 Design principles:
   - Equilibrium RH comes only from the canonical per-case inverse-Oswin result
   - Dataset reference values average per-case nonlinear diagnostics
   - Moisture and humidity remain separate physical quantities
+
 This module does NOT:
   - Render single-case alternatives, copy sorption equations, or resample fields
   - Display dataset-mean maps or alter generation acceptance
@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
+    from src.analysis.presentation import analysis_display_grid as display_grid
+
 RELATION_MARKER_SIZE: Final = 38.0
 RELATION_RANGE_LINE_WIDTH: Final = 6.0
 RELATION_PHASE_COLORS: Final = MappingProxyType(
@@ -59,6 +61,7 @@ def moisture_comparison(
     mean_b: diagnostics.DatasetDiagnostics,
     *,
     lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """Render moisture and equilibrium RH maps with retained distributions."""
     diagnostics.transient_evidence(first)
@@ -71,6 +74,7 @@ def moisture_comparison(
         diagnostics.MOISTURE_FIELD_NAMES,
         title="Initial moisture and sorption",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
         include_distributions=True,
         side_plot=partial(
             _draw_inlet_bed_comparison,

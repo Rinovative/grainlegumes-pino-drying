@@ -4,6 +4,7 @@ Dataset responsibility packages and the canonical package-builder facade.
 Provides:
 - contracts: Dataset view, identity, metadata, and temporal contracts
 - dataset_packages: canonical persisted package builder and supported CLI
+- dataset_plan: one authored plan through existing Generation, selection and PT services
 - packages: source admission, package planning, and immutable publication
 - preprocessing: identity-bound splitting and train-only normalization
 - runtime: unified Dataset loading and DataLoader orchestration
@@ -15,16 +16,17 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import contracts, dataset_packages, packages, preprocessing, runtime
+    from . import contracts, dataset_packages, dataset_plan, packages, preprocessing, runtime
 
 _MODULES = {
     "contracts": "contracts",
     "dataset_packages": "dataset_packages",
+    "dataset_plan": "dataset_plan",
     "packages": "packages",
     "preprocessing": "preprocessing",
     "runtime": "runtime",
 }
-__all__ = ["contracts", "dataset_packages", "packages", "preprocessing", "runtime"]
+__all__ = ["contracts", "dataset_packages", "dataset_plan", "packages", "preprocessing", "runtime"]
 
 
 def __getattr__(name: str) -> object:

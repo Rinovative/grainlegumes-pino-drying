@@ -1,23 +1,26 @@
-# ruff: noqa: S101, EM101, PT017, TRY003
-"""
-Verify task-generic and steady-flow artifact generation against current provenance.
+"""Verify task-generic and steady-flow artifact generation against current provenance.
 
-The suite checks field/unit propagation, normalized SSE/count equivalence across
-batch partitions, dual continuity, boundary naming, physical permeability, and
-reserved metadata rejection. Cache locking and rebuild races belong to
-``test_artifact_identity``. Visualization behavior is outside this module.
+Responsibilities:
+  - Check field and unit propagation, normalized statistics, dimensionless physics, and
+    permeability reconstruction
+
+Design principles:
+  - Task-owned semantics remain consistent across batch partitions
+
+This module does NOT:
+  - Test cache locking races or visualization behavior
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
-from support.synthetic_task import build_synthetic_generated_batch_identity
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -28,6 +31,8 @@ if TYPE_CHECKING:
 
 _SYNTHETIC_INPUT_VALUE = 4.0
 _SYNTHETIC_METADATA_VALUE = 3.25
+# Campaign-local case number 3 and global Dataset position 5 differ on purpose.
+_CASE_ID = "lentil__case_0003__fe83e052fbf2"
 
 
 class _MappingDataset(Dataset[dict[str, Any]]):
@@ -84,10 +89,12 @@ class _IdentityProcessor:
     def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
         """Normalize complete-batch inputs while preserving physical targets."""
         if self.training:
-            raise AssertionError("artifact preprocessing did not enter evaluation mode")
+            msg = "artifact preprocessing did not enter evaluation mode"
+            raise AssertionError(msg)
         inputs = batch["x"]
         if not isinstance(inputs, torch.Tensor):
-            raise TypeError("fixture inputs must be tensors")
+            msg = "fixture inputs must be tensors"
+            raise TypeError(msg)
         self.preprocessed_batch_sizes.append(int(inputs.shape[0]))
         return {**batch, "x": self.in_normalizer.transform(inputs)}
 
@@ -120,14 +127,16 @@ class _SteadyProjection(nn.Module):
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         """Construct pressure and velocity values by TaskSpec field names."""
-        coordinate = next(field.name for field in self.task.inputs if field.role == "coordinate")
-        coordinate_values = value[:, self.task.input_names.index(coordinate)]
-        zeros = torch.zeros_like(coordinate_values)
+        x_values = value[:, self.task.input_names.index("x")]
+        y_values = value[:, self.task.input_names.index("y")]
+        zeros = torch.zeros_like(x_values)
         pressure = next(group for group in self.task.output_groups if group.id == "pressure")
         velocity = next(group for group in self.task.output_groups if group.id == "velocity")
         output_by_field = dict.fromkeys(self.task.output_names, zeros)
-        output_by_field[pressure.fields[0]] = coordinate_values
-        output_by_field[velocity.fields[0]] = coordinate_values
+        output_by_field[pressure.fields[0]] = x_values
+        output_by_field[velocity.fields[0]] = x_values
+        # A height-dependent v makes the cross-section flux balance observable.
+        output_by_field[velocity.fields[1]] = 1e-3 * y_values
         return torch.stack([output_by_field[field] for field in self.task.output_names], dim=1)
 
 
@@ -154,7 +163,8 @@ def _attach_objective_contract(
     """Attach task-owned groups and unit saved-normalizer evidence in place."""
     selection = provenance.get("selection")
     if not isinstance(selection, dict):
-        raise TypeError("fixture selection must be a dictionary")
+        msg = "fixture selection must be a dictionary"
+        raise TypeError(msg)
     count = selection.get("effective_case_count")
     digest = selection.get("effective_ordered_source_indices_sha256")
     selection.update(
@@ -166,7 +176,8 @@ def _attach_objective_contract(
     )
     evaluator = provenance.setdefault("evaluator", {})
     if not isinstance(evaluator, dict):
-        raise TypeError("fixture evaluator must be a dictionary")
+        msg = "fixture evaluator must be a dictionary"
+        raise TypeError(msg)
     evaluator.update(
         {
             "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
@@ -230,9 +241,12 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
         save_root=save_root,
         dataset_name="synthetic_train",
         provenance=provenance,
+        case_ids=[_CASE_ID],
     )
 
     assert parquet_path.is_file()
+    assert frame.loc[0, "npz_path"] == f"npz/{_CASE_ID}.npz"
+    assert frame.loc[0, "case_index"] == 5
     assert frame.columns.is_unique
     assert {
         "rel_l2",
@@ -248,12 +262,12 @@ def test_generic_artifacts_preserve_task_fields_units_and_provenance(
     }.issubset(frame.columns)
     assert not {
         "momentum_residual_mse",
-        "div_velocity_mse",
-        "div_eps_velocity_mse",
+        "flux_balance_mse",
         "pressure_boundary_mse",
     }.intersection(frame.columns)
-    npz_path = save_root / "npz" / "case_0005.npz"
+    npz_path = save_root / "npz" / f"{_CASE_ID}.npz"
     with np.load(npz_path, allow_pickle=False) as payload:
+        assert int(payload["case_index"]) == 5
         assert payload["input_fields"].tolist() == list(task.input_names)
         assert payload["output_fields"].tolist() == list(task.output_names)
         assert payload["output_units"].tolist() == ["unit_out_a", "unit_out_b"]
@@ -398,6 +412,7 @@ def test_group_objective_matches_online_and_artifacts_across_partitions(
             save_root=root,
             dataset_name="synthetic",
             provenance=provenance,
+            case_ids=[f"lentil__case_{source_index:04d}__{source_index:012x}" for source_index in source_indices],
         )
         stored = json.loads((root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         artifact_frames.append(frame)
@@ -430,12 +445,12 @@ def test_group_objective_matches_online_and_artifacts_across_partitions(
     assert artifact_frames[0]["source_index"].tolist() == source_indices
 
 
-def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path: Path) -> None:
+def test_steady_artifact_stores_dimensionless_physics_semantics(tmp_path: Path) -> None:
     """
-    Keep dual continuity and pressure-boundary artifacts explicit.
+    Keep momentum, flux-balance, and pressure-boundary artifacts explicit.
 
-    Both training selections must emit the same named scalar and residual-array
-    contract for scientific comparison.
+    Every scalar must be the declared reduction of its stored residual array or
+    boundary values, scaled by the prescribed inlet pressure.
     """
     task = domain.tasks.steady_flow.STEADY_FLOW
     groups_by_id = {group.id: group for group in task.output_groups}
@@ -451,6 +466,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
     x_values = torch.linspace(0.0, 2.0, width)
     y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
     zeros = torch.zeros_like(x_grid)
+    inlet_pressure = 2.0
     coordinate_values = iter((x_grid, y_grid))
     input_by_field: dict[str, torch.Tensor] = {}
     for field in task.inputs:
@@ -463,7 +479,7 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         elif field.role == "porosity":
             input_by_field[field.name] = 0.25 + 0.25 * x_grid
         elif field.role == "boundary":
-            input_by_field[field.name] = zeros
+            input_by_field[field.name] = torch.where(y_grid == y_grid.amin(), inlet_pressure, 0.0)
         else:
             msg = f"unsupported steady-flow fixture role: {field.role}"
             raise AssertionError(msg)
@@ -479,86 +495,73 @@ def test_steady_artifact_stores_dual_continuity_and_boundary_semantics(tmp_path:
         }
     ]
     processor = _IdentityProcessor(task)
-    frames: list[pd.DataFrame] = []
-
-    for continuity in ("div_velocity", "div_eps_velocity"):
-        root = tmp_path / continuity
-        provenance = {
-            "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-            "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-            "run": {"name": continuity, "task": task.id},
-            "selection": {
-                "effective_case_count": 1,
-                "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
-            },
-            "evaluator": {
-                "input_fields": list(task.input_names),
-                "output_fields": list(task.output_names),
-                "output_units": {field.name: field.unit for field in task.outputs},
-                "physics_kind": task.physics.kind,
-            },
-            "physics": {"selected_training_continuity": continuity},
-        }
-        _attach_objective_contract(provenance, task=task)
-        frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
-            task=task,
-            model=_SteadyProjection(task),
-            loader=loader,
-            processor=processor,
-            device=torch.device("cpu"),
-            save_root=root,
-            dataset_name="steady",
-            provenance=provenance,
-        )
-        frames.append(frame)
-        row = frame.iloc[0]
-        required_scalars = {
-            "momentum_residual_mse",
-            "div_velocity_mse",
-            "div_eps_velocity_mse",
-            "pressure_boundary_mse",
-            "pressure_inlet_mse",
-            "pressure_outlet_mean_square",
-        }
-        assert required_scalars.issubset(frame.columns)
-        payload_path = analysis.artifacts.contracts.resolve_case_payload_path(
-            root,
-            row["npz_path"],
-            expected_filename=f"case_{int(row['case_index']):04d}.npz",
-        )
-        with np.load(payload_path, allow_pickle=False) as payload:
-            assert {"Rx", "Ry", "div_u", "div_eps_u", "coordinates"}.issubset(payload.files)
-            for name in ("Rx", "Ry", "div_u", "div_eps_u"):
-                assert payload[name].shape == (height, width)
-                assert np.issubdtype(payload[name].dtype, np.floating)
-                assert np.isfinite(payload[name]).all()
-            crop = analysis.artifacts.contracts.EVAL_PAD
-            interior = np.s_[crop:-crop, crop:-crop]
-            expected_momentum = float(np.mean(payload["Rx"][interior] ** 2 + payload["Ry"][interior] ** 2))
-            assert row["momentum_residual_mse"] == pytest.approx(expected_momentum)
-            assert row["div_velocity_mse"] == pytest.approx(float(np.mean(payload["div_u"][interior] ** 2)))
-            assert row["div_eps_velocity_mse"] == pytest.approx(float(np.mean(payload["div_eps_u"][interior] ** 2)))
-            assert row["div_velocity_mse"] != pytest.approx(row["div_eps_velocity_mse"])
-            expected_speed = np.sqrt(np.square(payload["pred"][velocity_indices]).sum(axis=0))
-            np.testing.assert_allclose(payload["pred"][-1], expected_speed)
-            assert payload["artifact_units"][-1] == velocity_unit
-            pressure = payload["pred"][pressure_index]
-            pressure_boundary = payload["p_in_bc"][0]
-            expected_inlet = float(np.mean((pressure[0] - pressure_boundary[0]) ** 2))
-            expected_outlet_mean_square = float(np.mean(pressure[-1]) ** 2)
-            outlet_pointwise_mse = float(np.mean(pressure[-1] ** 2))
-        assert row["pressure_inlet_mse"] == pytest.approx(expected_inlet)
-        assert row["pressure_outlet_mean_square"] == pytest.approx(expected_outlet_mean_square)
-        assert row["pressure_outlet_mean_square"] != pytest.approx(outlet_pointwise_mse)
-        assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
-
-    comparable = [
+    root = tmp_path / "steady"
+    provenance = {
+        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
+        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
+        "run": {"name": "steady", "task": task.id},
+        "selection": {
+            "effective_case_count": 1,
+            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
+        },
+        "evaluator": {
+            "input_fields": list(task.input_names),
+            "output_fields": list(task.output_names),
+            "output_units": {field.name: field.unit for field in task.outputs},
+            "physics_kind": task.physics.kind,
+        },
+        "physics": analysis.artifacts.contracts.steady_physics_provenance(task),
+    }
+    _attach_objective_contract(provenance, task=task)
+    frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
+        task=task,
+        model=_SteadyProjection(task),
+        loader=loader,
+        processor=processor,
+        device=torch.device("cpu"),
+        save_root=root,
+        dataset_name="steady",
+        provenance=provenance,
+        case_ids=[_CASE_ID],
+    )
+    row = frame.iloc[0]
+    required_scalars = {
         "momentum_residual_mse",
-        "div_velocity_mse",
-        "div_eps_velocity_mse",
+        "flux_balance_mse",
         "pressure_boundary_mse",
-    ]
-    assert frames[0].loc[:, comparable].iloc[0].tolist() == pytest.approx(frames[1].loc[:, comparable].iloc[0].tolist())
+        "pressure_inlet_mse",
+        "pressure_outlet_mean_square",
+    }
+    assert required_scalars.issubset(frame.columns)
+    payload_path = analysis.artifacts.contracts.resolve_case_payload_path(
+        root,
+        row["npz_path"],
+        expected_filename=f"{_CASE_ID}.npz",
+    )
+    with np.load(payload_path, allow_pickle=False) as payload:
+        assert {"Rx", "Ry", "flux_balance", "coordinates"}.issubset(payload.files)
+        for name, shape in (("Rx", (height, width)), ("Ry", (height, width)), ("flux_balance", (height,))):
+            assert payload[name].shape == shape
+            assert np.issubdtype(payload[name].dtype, np.floating)
+            assert np.isfinite(payload[name]).all()
+        crop = analysis.artifacts.contracts.EVAL_PAD
+        interior = np.s_[crop:-crop, crop:-crop]
+        expected_momentum = float(np.mean(payload["Rx"][interior] ** 2 + payload["Ry"][interior] ** 2))
+        assert row["momentum_residual_mse"] == pytest.approx(expected_momentum)
+        assert row["flux_balance_mse"] == pytest.approx(float(np.mean(payload["flux_balance"] ** 2)))
+        assert row["flux_balance_mse"] > 0.0
+        expected_speed = np.sqrt(np.square(payload["pred"][velocity_indices]).sum(axis=0))
+        np.testing.assert_allclose(payload["pred"][-1], expected_speed)
+        assert payload["artifact_units"][-1] == velocity_unit
+        pressure = payload["pred"][pressure_index]
+        pressure_boundary = payload["p_in_bc"][0]
+        expected_inlet = float(np.mean((pressure[0] - pressure_boundary[0]) ** 2)) / inlet_pressure**2
+        expected_outlet_mean_square = float(np.mean(pressure[-1]) / inlet_pressure) ** 2
+        outlet_pointwise_mse = float(np.mean(pressure[-1] ** 2)) / inlet_pressure**2
+    assert row["pressure_inlet_mse"] == pytest.approx(expected_inlet)
+    assert row["pressure_outlet_mean_square"] == pytest.approx(expected_outlet_mean_square)
+    assert row["pressure_outlet_mean_square"] != pytest.approx(outlet_pointwise_mse)
+    assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
 
 
 def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
@@ -608,7 +611,7 @@ def test_generic_artifacts_reject_reserved_source_metadata(
     ]
     processor = _IdentityProcessor(task)
 
-    try:
+    with pytest.raises(KeyError, match="reserved artifact identity"):
         analysis.artifacts.generation.generate_artifacts(
             task=task,
             model=_Projection(),
@@ -618,11 +621,64 @@ def test_generic_artifacts_reject_reserved_source_metadata(
             save_root=tmp_path / "target",
             dataset_name="synthetic_train",
             provenance=provenance,
+            case_ids=[_CASE_ID],
         )
-    except KeyError as error:
-        assert "reserved artifact identity" in str(error)
-    else:
-        raise AssertionError("reserved identity metadata was accepted")
+
+
+def test_generic_artifacts_require_case_ids_matching_membership(
+    tmp_path: Path,
+    synthetic_task: domain.tasks.spec.TaskSpec,
+) -> None:
+    """Reject case IDs that do not cover the saved membership one to one before any payload is written."""
+    task = synthetic_task
+    provenance = {
+        "selection": {
+            "effective_case_count": 1,
+            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
+        }
+    }
+    _attach_objective_contract(provenance, task=task)
+
+    with pytest.raises(ValueError, match="exactly match"):
+        analysis.artifacts.generation.generate_artifacts(
+            task=task,
+            model=_Projection(),
+            loader=[],
+            processor=_IdentityProcessor(task),
+            device=torch.device("cpu"),
+            save_root=tmp_path / "target",
+            dataset_name="synthetic_train",
+            provenance=provenance,
+            case_ids=[_CASE_ID, "field_pea__case_0001__0123456789ab"],
+        )
+    assert not (tmp_path / "target").exists()
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [
+        "case_0003",
+        "Lentil__case_0003__fe83e052fbf2",
+        "lentil__case_3__fe83e052fbf2",
+        "lentil__case_0003__fe83e052fbf",
+        "lentil__case_0003__fe83e052fbf2.npz",
+        "../lentil__case_0003__fe83e052fbf2",
+    ],
+)
+def test_case_payload_filename_rejects_non_package_case_ids(case_id: str) -> None:
+    """Name NPZ files only after the strict package case ID pattern accepted the ID."""
+    assert analysis.evaluation.dataframe.case_payload_filename(_CASE_ID) == f"{_CASE_ID}.npz"
+    with pytest.raises(ValueError, match="package case ID"):
+        analysis.evaluation.dataframe.case_payload_filename(case_id)
+
+
+def test_dataset_case_payload_filenames_drop_dataset_qualifier_and_reject_repeats() -> None:
+    """Combined evaluation Datasets keep the package case ID as file name and cannot repeat one."""
+    other = "field_pea__case_0001__0123456789ab"
+    names = analysis.evaluation.dataframe.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", other])
+    assert names == (f"{_CASE_ID}.npz", f"{other}.npz")
+    with pytest.raises(ValueError, match="duplicate case payload names"):
+        analysis.evaluation.dataframe.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", f"ood_b::{_CASE_ID}"])
 
 
 def test_synthetic_task_flows_through_final_dataset_contract(
@@ -644,22 +700,39 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         inputs=inputs[0],
         outputs=outputs[0],
     )
+    source_case = {
+        "package_case_id": "case_0000",
+        "source": source_identity,
+        "design": {"origin": "synthetic"},
+    }
     payload = datasets.contracts.identity.build_training_dataset_payload(
         task=synthetic_task,
         dataset_id="synthetic_train",
         sample_ids=("case_0000",),
-        generated_batch_identity=build_synthetic_generated_batch_identity(
-            batch_id="synthetic_train",
-            sample_ids=("case_0000",),
-        ),
+        source_selection_identity={
+            "schema_kind": "dataset_source_selection",
+            "schema_version": 1,
+            "source_cases": [source_case],
+        },
         source_identities=(source_identity,),
         source_metadata=(expected_metadata,),
-        source_provenance={"batch_manifest_sha256": "2" * 64},
+        source_provenance={"source_case_identities": [source_case]},
         case_fingerprints=(fingerprint,),
         inputs=inputs,
         outputs=outputs,
     )
     loaded = datasets.runtime.steady.create_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
+    retired_source = SimpleNamespace(
+        identity=loaded.identity,
+        data={"source_provenance": {"schema_kind": "simulation_batch_manifest"}},
+        path=loaded.path,
+    )
+    with pytest.raises(ValueError, match="current selection manifest provenance"):
+        analysis.artifacts.service._validate_bound_dataset_manifests(
+            (retired_source,),
+            dataset_names=("synthetic_train",),
+            dataset_root=tmp_path,
+        )
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
     generator = sample["meta"].get("generator")
@@ -680,3 +753,38 @@ def test_synthetic_task_flows_through_final_dataset_contract(
     assert torch.all(loaded[0]["x"][0] == _SYNTHETIC_INPUT_VALUE)
     assert synthetic_task.physics.kind == "none"
     assert tuple(field for group in synthetic_task.output_groups for field in group.fields) == synthetic_task.output_names
+
+
+def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep independent experiment/trial outputs separate despite equal scientific names, and record each processed run as a job log owner."""
+    service = analysis.artifacts.service
+    root = tmp_path / "experiments"
+    runs = tuple(root / experiment / "fno" / ("a" * 16) / "single" for experiment in ("first", "second"))
+    for run in runs:
+        run.mkdir(parents=True)
+        (run / "config.yaml").write_text(json.dumps({"run": {"name": "same-scientific-name"}}))
+    monkeypatch.setattr(service.experiments.run, "validate_evaluable_run", lambda _run: {"scientific_run_name": "same-scientific-name"})
+    assert tuple(service.iter_run_dirs(root, run_names=("same-scientific-name",))) == runs
+    monkeypatch.setattr(
+        service,
+        "load_run_artifact_plan",
+        lambda run: service.RunArtifactPlan(
+            run_dir=run,
+            id_dataset_name="dataset",
+            additional_evaluation_dataset_name=None,
+            scientific_run_name="same-scientific-name",
+        ),
+    )
+    monkeypatch.setattr(service, "run_or_load_artifacts", lambda **kwargs: pd.DataFrame({"run": [str(kwargs["run_dir"])]}))
+    monkeypatch.setattr(service, "_upload_published_artifacts", lambda **_kwargs: None)
+    monkeypatch.setattr(service, "cleanup_runtime", lambda _device: None)
+    owners_file = tmp_path / "owners"
+    monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(owners_file))
+    outputs = service.build_artifacts(runs_root=root, dataset_root=tmp_path / "datasets", device_policy="cpu")
+    assert set(outputs) == {str(run.resolve()) for run in runs}
+    for run in runs:
+        assert outputs[str(run.resolve())]["eval"]["run"].tolist() == [str(run)]
+    assert owners_file.read_text(encoding="utf-8").splitlines() == [str(run.resolve()) for run in runs]

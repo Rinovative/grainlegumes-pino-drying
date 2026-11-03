@@ -1,12 +1,8 @@
-"""
-domain_physics_contracts.py
-
-Define dependency-light semantic identifiers for steady-flow physics.
+"""Define dependency-light semantic identifiers for steady-flow physics.
 
 Responsibilities:
   - Own canonical Brinkman equation, boundary, continuity, and derivative identifiers
-  - Validate continuity and derivative selectors without tensor implementations
-  - Provide the default and complete supported continuity contract
+  - Validate derivative selectors without tensor implementations
 
 Design principles:
   - Task declarations and runtime equations share one identifier source
@@ -14,7 +10,7 @@ Design principles:
   - Exact identifiers fail closed without aliases or compatibility fallbacks
 
 This module does NOT:
-  - Implement residual equations, derivatives, masks, or scalar reductions
+  - Implement residual equations, derivatives, masks, scales, or scalar reductions
   - Import Torch or allocate tensors
   - Select experiment loss weights or diagnostic schedules
 """
@@ -23,40 +19,24 @@ from __future__ import annotations
 
 from typing import Final, Literal, cast
 
-ContinuityKind = Literal["div_eps_velocity", "div_velocity"]
 DerivativeKind = Literal["physical", "spectral"]
-SpectralExtension = Literal["none", "reflect"]
+SpectralExtension = Literal["none", "fourier_continuation"]
 STEADY_BRINKMAN_KIND: Final = "steady_2d_brinkman"
 STEADY_BRINKMAN_EQUATION_SET: Final = "steady_two_dimensional_brinkman"
-DEFAULT_CONTINUITY_KIND: Final[ContinuityKind] = "div_eps_velocity"
+CONTINUITY_KIND: Final = "cross_section_flux_balance"
 PRESSURE_BOUNDARY_KIND: Final = "pressure_inlet_zero_pressure_outlet"
-_CONTINUITY_KINDS: Final = ("div_velocity", "div_eps_velocity")
 _DERIVATIVE_KINDS: Final = ("physical", "spectral")
-_DERIVATIVE_EXTENSIONS: Final = ("none", "reflect")
+_DERIVATIVE_EXTENSIONS: Final = ("none", "fourier_continuation")
 
 __all__ = [
-    "DEFAULT_CONTINUITY_KIND",
+    "CONTINUITY_KIND",
     "PRESSURE_BOUNDARY_KIND",
     "STEADY_BRINKMAN_EQUATION_SET",
     "STEADY_BRINKMAN_KIND",
-    "ContinuityKind",
     "DerivativeKind",
     "SpectralExtension",
-    "available_continuity_kinds",
-    "available_derivative_kinds",
-    "validate_continuity_kind",
     "validate_derivative_kind",
 ]
-
-
-def available_continuity_kinds() -> tuple[str, ...]:
-    """Return supported semantic continuity formulations."""
-    return _CONTINUITY_KINDS
-
-
-def available_derivative_kinds() -> tuple[str, ...]:
-    """Return supported semantic numerical derivative identifiers."""
-    return _DERIVATIVE_KINDS
 
 
 def validate_derivative_kind(kind: str, *, extension: str) -> tuple[DerivativeKind, SpectralExtension]:
@@ -73,20 +53,3 @@ def validate_derivative_kind(kind: str, *, extension: str) -> tuple[DerivativeKi
         msg = "Physical derivatives require extension 'none'."
         raise ValueError(msg)
     return cast("DerivativeKind", kind), cast("SpectralExtension", extension)
-
-
-def validate_continuity_kind(kind: str) -> ContinuityKind:
-    """
-    Validate and return one exact continuity formulation identifier.
-
-    Raises
-    ------
-    ValueError
-        If ``kind`` is not ``"div_velocity"`` or ``"div_eps_velocity"``.
-
-    """
-    if kind not in _CONTINUITY_KINDS:
-        available = ", ".join(_CONTINUITY_KINDS)
-        msg = f"Unknown continuity identifier {kind!r}. Available continuity formulations: {available}."
-        raise ValueError(msg)
-    return cast("ContinuityKind", kind)

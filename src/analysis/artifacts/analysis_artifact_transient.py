@@ -1,19 +1,28 @@
-"""
-Generate and validate transient sequence artifacts through current project owners.
+"""Generate and validate transient sequence artifacts through current project owners.
 
-This module is the transient task branch of the existing artifact lifecycle. It
-selects saved complete-case membership, calls the public transient inference
-service, and delegates sequence persistence to Evaluation's strict artifact
-contract. It does not implement models, scaling, Dataset readers, or tracking.
+Responsibilities:
+  - Resolve completed-run roles and exact saved complete-case membership
+  - Generate bounded case inference, metric and timing evidence through maintained owners
+  - Delegate sequence staging and validate canonical or explicit selected-case artifacts
+
+Design principles:
+  - Saved membership order and training identity bind every artifact role
+  - Training and Evaluation spatial representations remain explicit
+  - Scoped subsets never claim complete canonical publication eligibility
+
+This module does NOT:
+  - Implement models, scaling or alternative Dataset storage readers
+  - Publish the final run-owned target or contact tracking services
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -27,9 +36,10 @@ from src.analysis.evaluation import evaluation_transient_metrics as transient_me
 from src.analysis.evaluation import evaluation_transient_rollout as rollout
 from src.analysis.evaluation import evaluation_transient_timing as transient_timing
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
-from src.datasets.packages import dataset_packages_builder as package_builder
 from src.datasets.packages import dataset_packages_generated_batch as generated_batch
+from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_run_identity as run_identity
+from src.learning.transient import learning_transient_handoff as transient_handoff
 from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
 from . import analysis_artifact_performance as artifact_performance
@@ -37,14 +47,23 @@ from . import analysis_artifact_timing as artifact_timing
 
 if TYPE_CHECKING:
     from src.datasets.runtime.dataset_runtime_transient import TransientPhysicalDataset
-    from src.generation.runtime.generation_runtime_batch import TerminalCaseEvidence
     from src.learning.learning_device import DeviceResolution
 
-TransientArtifactSplit = Literal["eval", "ood"]
+TransientArtifactSplit = Literal["eval", "additional_evaluation"]
+_SOURCE_SELECTOR_KEYS = (
+    "campaign_name",
+    "campaign_digest",
+    "material_family",
+    "case_id",
+    "case_input_id",
+    "simulation_case_id",
+    "case_hdf5_sha256",
+)
 _TIMING_REPETITIONS = 3
 _SPATIAL_AXIS_COUNT = 2
 _MINIMUM_SPATIAL_AXIS_LENGTH = 2
-_RESUME_EVIDENCE_SCHEMA_VERSION = 2
+_RESUME_EVIDENCE_SCHEMA_KIND = "evaluation_transient_resume_case"
+_RESUME_EVIDENCE_SCHEMA_VERSION = 1
 _CANONICAL_COMPLETION_CONTEXT_FIELDS = frozenset(
     {
         "final_bulk_moisture_wb",
@@ -86,42 +105,54 @@ class TransientArtifactRolePlan:
     source_identities: tuple[Mapping[str, Any], ...]
     case_ids_by_source: tuple[tuple[str, ...], ...]
     membership_digests: tuple[str, ...]
+    evaluation_assignments: tuple[Mapping[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class TransientArtifactPlan:
-    """Bind one completed transient run to its available ID and OOD role plans."""
+    """Bind one completed transient run to its ID and additional Evaluation roles."""
 
     run_dir: Path
     run_name: str
     id_role: TransientArtifactRolePlan
-    ood_role: TransientArtifactRolePlan | None
+    additional_role: TransientArtifactRolePlan | None
 
 
-def _storage_root_from_packages_root(dataset_root: Path | str) -> Path:
+def _storage_root_from_dataset_root(dataset_root: Path | str) -> Path:
     """Resolve and verify the storage root represented by one package-root path."""
     packages_root = Path(dataset_root).expanduser().resolve()
-    if packages_root.name != "packages" or packages_root.parent.name != "02_datasets":
-        message = "Transient artifact generation requires dataset_root to identify the authoritative <storage>/02_datasets/packages directory."
+    if packages_root.name != common.paths.DATASETS_AREA_NAME:
+        message = "Transient artifact generation requires dataset_root to identify the authoritative <storage>/02_datasets directory."
         raise ValueError(message)
-    storage_root = packages_root.parents[1]
-    if common.paths.get_dataset_packages_root(storage_root=storage_root).resolve() != packages_root:
+    storage_root = packages_root.parent
+    if common.paths.get_datasets_root(storage_root=storage_root).resolve() != packages_root:
         message = "Transient Dataset package root does not map to one authoritative storage root."
         raise ValueError(message)
     return storage_root
 
 
+def _reject_trial(completed: Mapping[str, Any]) -> None:
+    """Refuse Optuna trial evidence early: a trial keeps no checkpoints, so no artifact can bind to it."""
+    config = completed.get("config")
+    if isinstance(config, Mapping) and experiments.run.is_trial_config(config):
+        message = (
+            "Transient artifacts are unavailable for an Optuna trial: trials keep no checkpoints. Train the selected configuration as a normal run."
+        )
+        raise RuntimeError(message)
+
+
 def _require_completed_transient(value: Mapping[str, Any]) -> Mapping[str, Any]:
     """Require already-admitted completed transient-run evidence without reopening files."""
     config = value.get("config")
-    if value.get("is_completed") is not True or not isinstance(config, Mapping) or config.get("task") != "transient_drying":
+    if not isinstance(config, Mapping) or config.get("task") != "transient_drying":
         message = "Transient artifact generation requires admitted completed transient_drying evidence."
         raise RuntimeError(message)
+    _reject_trial(value)
     return value
 
 
 def _completed_transient(run_dir: Path | str) -> dict[str, Any]:
-    """Admit one completed transient run and reject provisional/static bundles."""
+    """Admit one completed transient run and reject static bundles."""
     completed = experiments.run.validate_completed_run(run_dir)
     _require_completed_transient(completed)
     return completed
@@ -131,7 +162,7 @@ def _role_plan(
     *,
     split: TransientArtifactSplit,
     dataset_role: sequence_artifact.DatasetRole,
-    dataset_ids: Sequence[str],
+    dataset_ids: Sequence[object],
     identities: Sequence[Mapping[str, Any]],
     role_evidence: Sequence[Mapping[str, Any]],
 ) -> TransientArtifactRolePlan:
@@ -185,10 +216,7 @@ def transient_artifact_plan_from_completed(
     *,
     run_dir: Path | str,
 ) -> TransientArtifactPlan:
-    """Project exact ID-test and OOD complete-case roles from completed evidence."""
-    if completed.get("is_completed") is not True:
-        message = "Transient artifact planning requires an admitted completed run."
-        raise ValueError(message)
+    """Project exact ID-test and declared additional Evaluation membership."""
     config = completed.get("config")
     split = completed.get("split_indices")
     if not isinstance(config, Mapping) or config.get("task") != "transient_drying" or not isinstance(split, Mapping):
@@ -197,6 +225,10 @@ def transient_artifact_plan_from_completed(
     data = config.get("data")
     identities = split.get("dataset_identity")
     roles = split.get("roles")
+    split_contract = datasets.runtime.transient_training
+    if split.get("schema_kind") != split_contract.SPLIT_SCHEMA_KIND or split.get("schema_version") != split_contract.SPLIT_SCHEMA_VERSION:
+        message = "Completed transient split must use the current Experiment case-split schema."
+        raise ValueError(message)
     if not isinstance(data, Mapping) or not isinstance(identities, Mapping) or not isinstance(roles, Mapping):
         message = "Completed transient config/split lacks data, Dataset identity, or role evidence."
         raise TypeError(message)
@@ -210,26 +242,46 @@ def transient_artifact_plan_from_completed(
         identities=(cast("Mapping[str, Any]", train_identity),),
         role_evidence=(cast("Mapping[str, Any]", id_test),),
     )
-    raw_ood_ids = data.get("ood_datasets")
-    raw_ood_identities = identities.get("ood")
-    raw_ood_role = roles.get("ood")
-    ood_role: TransientArtifactRolePlan | None = None
-    if raw_ood_ids:
+    raw_additional_identities = identities.get("additional_evaluation")
+    raw_additional_ids = (
+        [item.get("dataset_id") for item in raw_additional_identities if isinstance(item, Mapping)]
+        if isinstance(raw_additional_identities, list)
+        else None
+    )
+    raw_additional_role = roles.get("additional_evaluation")
+    raw_assignments = split.get("evaluation_assignments")
+    if not isinstance(raw_additional_ids, list) or not isinstance(raw_additional_identities, list) or not isinstance(raw_assignments, list):
+        message = "Completed transient additional Evaluation identities and assignments must be lists."
+        raise TypeError(message)
+    if not isinstance(raw_additional_role, Mapping) or not isinstance(raw_additional_role.get("parts"), list):
+        message = "Completed transient additional Evaluation role evidence is invalid."
+        raise TypeError(message)
+    if not (len(raw_additional_ids) == len(raw_additional_identities) == len(raw_additional_role["parts"]) == len(raw_assignments)):
+        message = "Completed transient additional Evaluation identities, membership, and assignments disagree."
+        raise ValueError(message)
+    for dataset_id, assignment in zip(raw_additional_ids, raw_assignments, strict=True):
         if (
-            not isinstance(raw_ood_ids, list)
-            or not isinstance(raw_ood_identities, list)
-            or not isinstance(raw_ood_role, Mapping)
-            or not isinstance(raw_ood_role.get("parts"), list)
+            not isinstance(assignment, Mapping)
+            or set(assignment) != {"dataset_id", "role", "relation", "assumptions"}
+            or assignment["dataset_id"] != dataset_id
+            or assignment["role"] != "ood"
+            or not isinstance(assignment["relation"], str)
+            or not assignment["relation"].strip()
+            or not isinstance(assignment["assumptions"], list)
+            or any(not isinstance(item, str) or not item.strip() for item in assignment["assumptions"])
         ):
-            message = "Completed transient OOD package and membership evidence is invalid."
-            raise TypeError(message)
-        ood_role = _role_plan(
-            split="ood",
-            dataset_role="ood",
-            dataset_ids=tuple(raw_ood_ids),
-            identities=tuple(raw_ood_identities),
-            role_evidence=tuple(raw_ood_role["parts"]),
+            message = f"Completed transient Evaluation assignment is invalid for {dataset_id!r}."
+            raise ValueError(message)
+    additional_role: TransientArtifactRolePlan | None = None
+    if raw_additional_ids:
+        additional_role = _role_plan(
+            split="additional_evaluation",
+            dataset_role="additional_evaluation",
+            dataset_ids=tuple(raw_additional_ids),
+            identities=tuple(raw_additional_identities),
+            role_evidence=tuple(raw_additional_role["parts"]),
         )
+        additional_role = replace(additional_role, evaluation_assignments=tuple(dict(item) for item in raw_assignments))
     run_config = config.get("run")
     if not isinstance(run_config, Mapping) or not isinstance(run_config.get("name"), str):
         message = "Completed transient config lacks scientific run identity."
@@ -238,7 +290,7 @@ def transient_artifact_plan_from_completed(
         run_dir=Path(run_dir).expanduser().resolve(),
         run_name=str(run_config["name"]),
         id_role=id_role,
-        ood_role=ood_role,
+        additional_role=additional_role,
     )
 
 
@@ -272,6 +324,7 @@ def select_transient_role_cases(
         source_identities=role.source_identities,
         case_ids_by_source=groups,
         membership_digests=role.membership_digests,
+        evaluation_assignments=role.evaluation_assignments,
     )
 
 
@@ -384,7 +437,6 @@ def _load_role_datasets(
         raise TypeError(message)
     backend = data.get("transient_backend_preference", "pt_shards")
     required = data.get("transient_backend_required", False)
-    allow_smoke = data.get("allow_technical_smoke", False)
     cache_size = data.get("hdf5_cache_size", 0)
     sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
     loaded: list[TransientPhysicalDataset] = []
@@ -396,20 +448,12 @@ def _load_role_datasets(
     ):
         if not case_ids:
             continue
-        manifest = datasets.packages.manifest.load_package_manifest(
-            dataset_id,
-            storage_root=storage_root,
-        )
-        regime = manifest.get("evaluation_regime")
-        membership = "id_test" if role.dataset_role == "id" else None
         request = datasets.runtime.factory.DatasetRequest(
             dataset_id=dataset_id,
             dataset_view="transient_drying",
-            evaluation_regime=cast("Any", regime),
-            membership=cast("Any", membership),
+            case_ids=case_ids,
             transient_sampling=sampling,
             storage_root=storage_root,
-            allow_technical_smoke=bool(allow_smoke),
             transient_backend_preference=cast("Any", backend),
             transient_backend_required=bool(required),
             spatial_stride=spatial_representation.spatial_stride,
@@ -550,77 +594,38 @@ def _materialize_case(
     )
 
 
-def _materialize_cases(
-    sources: Sequence[TransientPhysicalDataset],
-    *,
-    dataset_role: sequence_artifact.DatasetRole,
-) -> tuple[tuple[str, Mapping[str, Any], rollout.TransientEvaluationCase, str, Mapping[str, Any] | None], ...]:
-    """Compatibility wrapper that materializes selected cases in exact plan order."""
-    return tuple(_materialize_case(spec, dataset_role=dataset_role) for spec in _case_materialization_specs(sources))
-
-
-def _terminal_case(
-    *,
-    package_case_id: str,
-    case_record: Mapping[str, Any],
-    storage_root: Path,
-) -> tuple[Any, TerminalCaseEvidence]:
-    """Resolve the Generation terminal evidence named by one Dataset case."""
-    batch_id = case_record.get("source_batch_id")
-    if not isinstance(batch_id, str) or not batch_id:
-        message = f"Transient package case {package_case_id!r} lacks source_batch_id."
-        raise TypeError(message)
-    source_relative_path = case_record.get("source_relative_path")
-    if not isinstance(source_relative_path, str):
-        message = f"Transient package case {package_case_id!r} lacks source_relative_path."
-        raise TypeError(message)
-    relative_parts = Path(source_relative_path).parts
-    match relative_parts:
-        case ("01_generation", "processed", batch_storage_name, source_case_id, "case.h5"):
-            pass
-        case _:
-            message = f"Transient package case {package_case_id!r} has an invalid Generation source path."
-            raise ValueError(message)
-    batch = generation.runtime.admit_terminal_batch(
-        batch_storage_name,
-        storage_root=storage_root,
-        validation_depth="routine",
-    )
-    if batch.batch_id != batch_id:
-        message = f"Transient package case {package_case_id!r} conflicts with its terminal Generation batch identity."
-        raise RuntimeError(message)
-    matches = tuple(
-        case for case in batch.cases if case.case_id == source_case_id and case.simulation_case_id == case_record.get("simulation_case_id")
-    )
-    if len(matches) != 1:
-        message = f"Transient package case {package_case_id!r} does not map uniquely to terminal Generation evidence."
-        raise RuntimeError(message)
-    return batch, matches[0]
-
-
 def _generation_case_sources(
     role: TransientArtifactRolePlan,
     *,
     storage_root: Path,
-) -> dict[str, tuple[Any, TerminalCaseEvidence]]:
-    """Re-admit composite-backed package cases through the Dataset publication owner."""
-    result: dict[str, tuple[Any, TerminalCaseEvidence]] = {}
-    for dataset_id in role.source_dataset_ids:
-        prepared = package_builder.admit_package_composite_sources(
-            dataset_id,
-            storage_root=storage_root,
-        )
-        if prepared is None:
-            continue
-        for candidate in prepared.candidates:
-            package_case_id = str(candidate["package_case_id"])
-            if package_case_id in result:
-                message = f"Transient artifact packages contain duplicate Generation case evidence: {package_case_id!r}."
+) -> dict[str, Any]:
+    """Re-admit saved package members through their exact current Source selectors."""
+    result: dict[str, Any] = {}
+    for dataset_id, selected_case_ids in zip(role.source_dataset_ids, role.case_ids_by_source, strict=True):
+        manifest = datasets.packages.load_package_manifest_evidence("transient_drying", dataset_id, storage_root=storage_root)
+        entries = manifest.get("source_case_identities")
+        if not isinstance(entries, list):
+            message = "Transient Dataset manifest lacks current Source case identities."
+            raise TypeError(message)
+        by_case = {entry["package_case_id"]: entry for entry in entries}
+        if len(by_case) != len(entries):
+            message = "Transient Dataset manifest repeats a package case identity."
+            raise ValueError(message)
+        for package_case_id in selected_case_ids:
+            if package_case_id in result or package_case_id not in by_case:
+                message = f"Transient artifact package case has no unique saved Source identity: {package_case_id!r}."
                 raise ValueError(message)
-            result[package_case_id] = (
-                candidate["terminal_evidence"],
-                candidate["case_evidence"],
+            entry = by_case[package_case_id]
+            source = entry["source"]
+            admitted = generation.publication.catalog.resolve_raw_case_reference(
+                "transient_drying",
+                {key: source[key] for key in _SOURCE_SELECTOR_KEYS},
+                storage_root=storage_root,
             )
+            if admitted.source_identity != source or admitted.design_provenance != entry["design"]:
+                message = f"Transient package Source or design evidence drifted for {package_case_id!r}."
+                raise ValueError(message)
+            result[package_case_id] = admitted
     return result
 
 
@@ -629,25 +634,26 @@ def _canonical_case_evidence(
     *,
     package_case_id: str,
     case_record: Mapping[str, Any],
-    storage_root: Path,
-    generation_sources: Mapping[str, tuple[Any, TerminalCaseEvidence]],
+    generation_sources: Mapping[str, Any],
     spatial_representation: datasets.contracts.transient.TransientSpatialRepresentation | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Cross-check Dataset items against canonical Generation case semantics."""
-    source = generation_sources.get(package_case_id)
-    if source is None:
-        source = _terminal_case(
-            package_case_id=package_case_id,
-            case_record=case_record,
-            storage_root=storage_root,
-        )
-    batch, terminal_case = source
+    admitted = generation_sources.get(package_case_id)
+    if admitted is None:
+        message = f"Transient package case lacks its exact admitted Source identity: {package_case_id!r}."
+        raise ValueError(message)
+    source = admitted.source_identity
+    if (
+        case_record.get("source_hdf5_sha256") != source["case_hdf5_sha256"]
+        or case_record.get("case_input_id") != source["case_input_id"]
+        or case_record.get("simulation_case_id") != source["simulation_case_id"]
+        or case_record.get("source_batch_id") != source["source_batch_id"]
+        or case_record.get("source_relative_path") != source["case_hdf5_relative"]
+    ):
+        message = f"Transient package case contradicts its admitted Source identity: {package_case_id!r}."
+        raise ValueError(message)
     task = domain.tasks.registry.get_task("transient_drying")
-    canonical = generated_batch.interpret_generated_transient_case(
-        batch,
-        terminal_case,
-        task=task,
-    )
+    canonical = generated_batch.interpret_admitted_transient_source_case(admitted, task=task)
     canonical_reference = np.stack(
         [canonical["state_trajectories"][name] for name in sequence_artifact.STATE_ORDER],
         axis=1,
@@ -698,6 +704,81 @@ def _canonical_case_evidence(
     return canonical, canonical["runtime"]
 
 
+def _matched_budget_receipt(completed: Mapping[str, Any], parent: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind a matched B/A1 leaf to the immutable B receipt and common A0 manifest."""
+    config = cast("Mapping[str, Any]", completed["config"])
+    run_dir = cast("Path", completed["run_dir"])
+    training = cast("Mapping[str, Any]", config["training"])
+    protocol = cast("Mapping[str, Any]", training["matched_a1_b"])
+    parent_evidence = _parent_experiment_evidence(completed)
+    if parent_evidence["kind"] != "grouped":
+        msg = "Matched branch artifact requires its validated grouped parent experiment."
+        raise ValueError(msg)
+    record_path = run_dir.parent / "experiment.json"
+    if record_path.is_symlink() or not record_path.is_file():
+        msg = "Matched branch parent experiment record is absent or unsafe."
+        raise FileNotFoundError(msg)
+    output_root = common.paths.resolve_config_output_root(config, run_dir)
+    located = run_identity.load_readonly_transient_experiment_record(record_path, experiments_root=output_root)
+    record = located["record"]
+    if record.get("topology") != "a0_to_b_and_a1":
+        msg = "Matched branch artifact requires the declared A0 matched-branch topology."
+        raise ValueError(msg)
+    children = cast("Mapping[str, Mapping[str, Any]]", record["children"])
+    child_paths = {
+        role: run_identity.resolve_readonly_experiment_child(record, child, marker=record_path, output_root=output_root)
+        for role, child in children.items()
+    }
+    a0_run = child_paths["stage_a0"]
+    b_run = child_paths["stage_b"]
+    manifest_path = a0_run / transient_handoff.HANDOFF_DIRECTORY / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        msg = "Matched branch common A0 handoff manifest is absent or unsafe."
+        raise FileNotFoundError(msg)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("source_run_name") != parent.get("source_run_name") or manifest.get("files", {}).get("checkpoint", {}).get(
+        "sha256"
+    ) != parent.get("source_checkpoint_sha256"):
+        msg = "Matched branch teacher identity contradicts the common A0 handoff manifest."
+        raise ValueError(msg)
+    receipt = matched_budget.load_b_receipt(
+        b_run / matched_budget.RECEIPT_NAME,
+        parent_identity_sha256=str(record["parent_identity_sha256"]),
+        a0_handoff_sha256=common.serialization.file_sha256(manifest_path),
+        b_run_name=str(children["stage_b"]["run_name"]),
+    )
+    arm = training["comparison_arm"]
+    expected_child_path = child_paths["stage_b" if arm == "b" else "stage_a1"]
+    if run_dir.resolve() != expected_child_path or receipt["a0_run_name"] != children["stage_a0"]["run_name"]:
+        msg = "Matched branch receipt does not bind the selected parent child and A0 source."
+        raise ValueError(msg)
+    if arm == "a1":
+        local = matched_budget.load_b_receipt(
+            run_dir / matched_budget.RECEIPT_NAME,
+            parent_identity_sha256=str(record["parent_identity_sha256"]),
+            a0_handoff_sha256=common.serialization.file_sha256(manifest_path),
+            b_run_name=str(children["stage_b"]["run_name"]),
+        )
+        if local != receipt:
+            msg = "Companion local matched budget receipt differs from immutable B source."
+            raise ValueError(msg)
+    if (
+        receipt["dataset_identity"] != run_identity.dataset_identity_evidence(config)
+        or receipt["input_profile"] != config["input_profile"]
+        or receipt["temporal_conditioning"] != config["temporal"]["temporal_conditioning"]
+        or receipt["spatial_stride"] != config["data"]["spatial_stride"]
+        or receipt["model"] != config["model"]
+        or receipt["objective"] != config["evaluation"]["objective"]
+        or receipt["initialization"] != protocol["initialization"]
+    ):
+        msg = "Matched branch receipt contradicts saved scientific configuration."
+        raise ValueError(msg)
+    if arm == "b" and receipt["best_checkpoint_sha256"] != completed["selected_checkpoint_sha256"]:
+        msg = "B receipt selected checkpoint differs from artifact checkpoint."
+        raise ValueError(msg)
+    return receipt
+
+
 def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
     """Project immutable Training strategy, handoff, curriculum, and compute evidence."""
     config = completed.get("config")
@@ -719,10 +800,17 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
         raise TypeError(message)
     stage = training.get("stage")
     arm = training.get("comparison_arm")
-    expected_arm = {"a0": "A0", "a_plus": "A+", "b": "B"}
+    expected_arm = {"a0": "A0", "a1": "A1", "b": "B"}
     if stage not in {"a", "b"} or arm not in expected_arm or checkpoint_controller.get("arm") != expected_arm[arm]:
         message = "Completed transient stage/comparison arm identity is unsupported or contradictory."
         raise ValueError(message)
+    matched = training.get("matched_a1_b")
+    if matched is not None and (not isinstance(matched, Mapping) or matched.get("role") != arm):
+        msg = "Completed matched branch role contradicts its comparison arm."
+        raise ValueError(msg)
+    if arm == "a1" and matched is None:
+        msg = "A1 lineage requires its explicitly selected matched_a1_b protocol."
+        raise ValueError(msg)
     teacher_handoff = checkpoint_controller.get("teacher_handoff")
     if arm == "a0":
         if teacher_handoff is not None:
@@ -743,20 +831,53 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
         }
     else:
         if not isinstance(teacher_handoff, Mapping):
-            message = "A+ and B lineage require checkpoint-persisted teacher-handoff identity."
+            message = "A1 and B lineage require checkpoint-persisted teacher-handoff identity."
             raise TypeError(message)
         parent = dict(teacher_handoff)
-    strategy = "rollout" if arm == "b" else "teacher_forced_continuation" if arm == "a_plus" else "stage_a_teacher_forced"
+    strategy = "rollout" if arm == "b" else "teacher_forced_matched_train_seconds" if arm == "a1" else "stage_a_teacher_forced"
+    manifest: dict[str, Any] = {
+        "planned": None if matched is None else dict(matched),
+        "actual": dict(terminal_controller),
+    }
+    if matched is not None:
+        if arm == "a0":
+            if checkpoint_controller.get("clock_kind") == "train_seconds" or checkpoint_controller.get("budget_control") != "stage_epochs":
+                msg = "Matched A0 must retain its completed Stage-A epoch budget."
+                raise ValueError(msg)
+            parent_evidence = _parent_experiment_evidence(completed)
+            if parent_evidence["kind"] != "independent":
+                msg = "Matched A0 requires its exact shared A0 content identity."
+                raise ValueError(msg)
+            manifest["a0_semantic_config_sha256"] = parent_evidence["semantic_config_sha256"]
+        else:
+            receipt = _matched_budget_receipt(completed, parent)
+            planned = checkpoint_controller.get("planned_train_seconds")
+            actual = checkpoint_controller.get("train_seconds")
+            if (
+                checkpoint_controller.get("clock_kind") != "train_seconds"
+                or checkpoint_controller.get("budget_control") != "train_seconds"
+                or not isinstance(planned, (int, float))
+                or not isinstance(actual, (int, float))
+                or isinstance(planned, bool)
+                or isinstance(actual, bool)
+                or not (0 < planned <= actual)
+                or (arm == "b" and actual != receipt["budget_value"])
+                or (
+                    arm == "a1"
+                    and (planned != receipt["budget_value"] or checkpoint_controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
+                )
+            ):
+                msg = "Matched branch terminal budget contradicts the immutable B receipt."
+                raise ValueError(msg)
+            manifest["parent_experiment_sha256"] = receipt["parent_identity_sha256"]
+            manifest["b_train_budget_receipt"] = receipt
     return {
         "stage_identity": {"stage": stage, "comparison_arm": arm},
         "training_strategy": strategy,
         "curriculum_identity": dict(terminal_curriculum),
         "parent_checkpoint": parent,
         "stage_a_handoff": parent,
-        "matched_compute_manifest": {
-            "planned": training.get("matched_compute"),
-            "actual": dict(terminal_controller),
-        },
+        "matched_compute_manifest": manifest,
     }
 
 
@@ -839,6 +960,7 @@ def _base_identity(
         raise TypeError(message)
     lineage = _lineage(completed)
     source = canonical["source"]
+    metadata = canonical["meta"]
     return {
         "case_id": case.case_id,
         "dataset_identity": {
@@ -850,6 +972,10 @@ def _base_identity(
             ),
         },
         "dataset_role": role.dataset_role,
+        "evaluation_assignment": next(
+            (dict(assignment) for assignment in role.evaluation_assignments if assignment["dataset_id"] == case.metadata["dataset_id"]),
+            None,
+        ),
         "material_family": str(case.metadata["material_family"]),
         "simulation_identity": {
             "simulation_case_id": source["simulation_case_id"],
@@ -857,8 +983,8 @@ def _base_identity(
             "source_batch_id": case.metadata["source_batch_id"],
             "package_case_id": case.case_id,
             "generation_case_id": source["case_id"],
-            "simulation_profile": source["simulation_profile"],
-            "template_sha256": source["template_sha256"],
+            "simulation_profile": metadata["simulation_profile"],
+            "template_sha256": metadata["template_sha256"],
         },
         "model_kind": model["kind"],
         "model_parameters": dict(model["params"]),
@@ -911,8 +1037,8 @@ def _timing_case(
     repetitions: dict[str, tuple[float, ...]] = {}
     cold: dict[str, float] = {}
     if complete_rollout:
-        repetitions["drying_no_end_to_end_seconds"] = benchmark.warmed_end_to_end_seconds
-        cold["drying_no_end_to_end_seconds"] = benchmark.cold_end_to_end_seconds
+        repetitions["drying_no_prepared_rollout_wall_seconds"] = benchmark.warmed_prepared_rollout_wall_seconds
+        cold["drying_no_prepared_rollout_wall_seconds"] = benchmark.cold_prepared_rollout_wall_seconds
     if complete_rollout and all(value > 0.0 for value in benchmark.warmed_model_seconds):
         repetitions["drying_no_rollout_model_seconds"] = benchmark.warmed_model_seconds
         if benchmark.cold_model_seconds > 0.0:
@@ -932,7 +1058,7 @@ def _timing_case(
     }
     if not complete_rollout:
         reason = "diagnostic_rollout_stopped_after_nonfinite_prediction"
-        unavailable["drying_no_end_to_end_seconds"] = reason
+        unavailable["drying_no_prepared_rollout_wall_seconds"] = reason
         unavailable["drying_no_rollout_model_seconds"] = reason
     for component, source in source_by_component.items():
         value = generation_timing.get(source)
@@ -941,30 +1067,13 @@ def _timing_case(
             unavailable.pop(component, None)
         else:
             unavailable[component] = str(availability.get(source, f"{source}_unavailable"))
-    for component in (
-        "airflow_no_model_seconds",
-        "airflow_no_preprocessing_seconds",
-        "airflow_no_device_transfer_seconds",
-        "airflow_no_postprocessing_seconds",
-        "airflow_no_end_to_end_seconds",
-    ):
-        unavailable[component] = "compatible_airflow_model_not_selected"
-    for component in (
-        "drying_no_preprocessing_seconds",
-        "drying_no_device_transfer_seconds",
-        "drying_no_postprocessing_seconds",
-    ):
-        unavailable[component] = "public_transient_inference_does_not_expose_separate_component_clock"
+    unavailable["airflow_no_model_seconds"] = "compatible_airflow_model_not_selected"
     if "drying_no_rollout_model_seconds" not in repetitions:
         unavailable.setdefault(
             "drying_no_rollout_model_seconds",
             "model_clock_resolution_did_not_produce_a_positive_duration",
         )
-    for component in (
-        "surrogate_pipeline_model_seconds",
-        "surrogate_pipeline_end_to_end_seconds",
-    ):
-        unavailable[component] = "complete_airflow_to_drying_pipeline_not_selected"
+    unavailable["surrogate_pipeline_end_to_end_seconds"] = "complete_airflow_to_drying_pipeline_not_selected"
 
     processor = runtime_metadata.get("processor")
     cpu = str(processor) if isinstance(processor, str) and processor else "unknown"
@@ -993,54 +1102,58 @@ def _timing_case(
 
 
 def _parent_experiment_evidence(completed: Mapping[str, Any]) -> dict[str, Any]:
-    """Return exact grouped-parent evidence or explicit persisted legacy absence."""
+    """Return the exact admitted parent Experiment for a current transient run."""
     run_dir = completed.get("run_dir")
     summary = completed.get("summary")
     config = completed.get("config")
     if not isinstance(run_dir, Path) or not isinstance(summary, Mapping) or not isinstance(config, Mapping):
         message = "Completed transient evidence lacks its canonical run path, summary, or config."
         raise TypeError(message)
+    checkpoint_identity = completed.get("checkpoint_identity")
+    saved_digest = checkpoint_identity.get("resume_contract_digest") if isinstance(checkpoint_identity, Mapping) else None
+    if not isinstance(saved_digest, str) or re.fullmatch(r"[0-9a-f]{64}", saved_digest) is None:
+        message = "Completed transient parent binding requires a valid saved resume identity."
+        raise ValueError(message)
     run_evidence = summary.get("run_identity")
     child_source: dict[str, Any] | None = None
-    parent_label: str | None = None
     if isinstance(run_evidence, Mapping):
         source = run_evidence.get("source_repository")
         if isinstance(source, Mapping):
             child_source = dict(source)
-        raw_parent = run_evidence.get("parent_label")
-        if isinstance(raw_parent, str) and raw_parent:
-            parent_label = raw_parent
-    legacy = {
-        "kind": "legacy",
-        "parent_available": False,
-        "reason": ("child_run_identity_lacks_parent_label" if parent_label is None else "parent_experiment_record_not_persisted"),
-        "child_source_repository": child_source,
-    }
-    if parent_label is None:
-        return legacy
-    task = config.get("task")
-    if not isinstance(task, str) or run_dir.parent.name != "runs" or run_dir.parent.parent.name != task:
-        message = "Completed transient run path does not match its persisted task layout."
-        raise ValueError(message)
-    output_root = run_dir.parents[2]
-    marker = run_identity.experiment_record_path(
-        {"task": task, "parent_label": parent_label},
-        output_root=output_root,
-    )
+    layout = config.get("run", {}).get("layout")
+    if not isinstance(layout, Mapping):
+        message = "Completed transient run lacks its derived storage layout."
+        raise TypeError(message)
+    if layout["stage"] in {"a0", "single"}:
+        return {
+            "kind": "independent",
+            "layout": dict(layout),
+            "run_name": completed["scientific_run_name"],
+            "semantic_config_sha256": saved_digest,
+            "source_repository": child_source,
+        }
+    output_root = common.paths.resolve_config_output_root(config, run_dir)
+    marker = run_dir.parent / "experiment.json"
     if not marker.exists():
-        return legacy
+        message = "Current transient parent Experiment record is absent."
+        raise FileNotFoundError(message)
     if not marker.is_file() or marker.is_symlink():
         message = f"Transient parent experiment record is unsafe: {marker}."
         raise ValueError(message)
-    with marker.open("r", encoding="utf-8") as handle:
-        record = run_identity.validate_transient_experiment_record(json.load(handle))
-    matching_children = [child for child in record["children"].values() if Path(str(child["path"])).expanduser().resolve() == run_dir.resolve()]
+    located = run_identity.load_readonly_transient_experiment_record(marker, experiments_root=output_root)
+    record = located["record"]
+    matching_children = [
+        child
+        for child in record["children"].values()
+        if run_identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=output_root) == run_dir.resolve()
+    ]
     if len(matching_children) != 1:
         message = "Transient parent experiment does not bind the exact completed child path."
         raise ValueError(message)
     child = matching_children[0]
-    resolved_config_sha256 = run_identity.resolved_config_digest(config)
-    if child["run_name"] != completed.get("scientific_run_name") or child["resolved_config_sha256"] != resolved_config_sha256:
+    digest_key = "semantic_config_sha256"
+    expected_digest = saved_digest
+    if child["run_name"] != completed.get("scientific_run_name") or child.get(digest_key) != expected_digest:
         message = "Transient parent experiment child identity contradicts the completed run."
         raise ValueError(message)
     return {
@@ -1048,7 +1161,6 @@ def _parent_experiment_evidence(completed: Mapping[str, Any]) -> dict[str, Any]:
         "parent_available": True,
         "parent_label": record["parent_label"],
         "parent_identity_sha256": record["parent_identity_sha256"],
-        "run_revision": record["run_revision"],
         "source_repository": dict(record["source_repository"]),
         "child_source_repository": child_source,
     }
@@ -1232,6 +1344,7 @@ def _restore_resumed_case_evidence(
 ) -> _ResumedCaseEvidence:
     """Restore exact compact case evidence without Dataset or model execution."""
     required = {
+        "schema_kind",
         "schema_version",
         "case_id",
         "material_family",
@@ -1248,7 +1361,8 @@ def _restore_resumed_case_evidence(
         raise ValueError(message)
     material = value["material_family"]
     if (
-        value["schema_version"] != _RESUME_EVIDENCE_SCHEMA_VERSION
+        value["schema_kind"] != _RESUME_EVIDENCE_SCHEMA_KIND
+        or value["schema_version"] != _RESUME_EVIDENCE_SCHEMA_VERSION
         or value["case_id"] != case_id
         or not isinstance(material, str)
         or not material
@@ -1419,7 +1533,6 @@ def _role_provenance(
             "best_checkpoint_sha256": completed["selected_checkpoint_sha256"],
             "best_checkpoint_epoch": completed["selected_checkpoint_epoch"],
             "normalizer_sha256": completed["normalizer_sha256"],
-            "lifecycle_status": "completed",
             "parent_experiment": _parent_experiment_evidence(completed),
         },
         "dataset": {
@@ -1429,6 +1542,7 @@ def _role_provenance(
             "source_identities": [dict(value) for value in role.source_identities],
             "case_ids_by_source": [list(values) for values in role.case_ids_by_source],
             "membership_digests": list(role.membership_digests),
+            "evaluation_assignments": [dict(value) for value in role.evaluation_assignments],
         },
         "evaluation": {
             "config_identity": sequence_artifact.evaluation_protocol_identity(cast("Mapping[str, Any]", config["evaluation"])),
@@ -1437,6 +1551,7 @@ def _role_provenance(
             "modes": list(sequence_artifact.EVALUATION_MODES),
             "fixed_horizons": list(sequence_artifact.FIXED_HORIZONS),
             "rolling_origin_policy": sequence_artifact.ROLLING_ORIGIN_POLICY,
+            "recurrent_state_policy": sequence_artifact.RECURRENT_STATE_POLICY,
             "process_diagnostic_policy": _process_diagnostic_policy(),
             "prediction_validity": dict(prediction_validity),
             "pipeline_analysis": {
@@ -1486,10 +1601,11 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
             admitted_completed,
             evaluation_spatial_stride=evaluation_spatial_stride,
         )
-        print(f"[ARTIFACT] evaluation_spatial_stride={evaluation_representation.spatial_stride}")
-        print(f"[ARTIFACT] source_shape={evaluation_representation.source_shape}")
-        print(f"[ARTIFACT] evaluation_shape={evaluation_representation.represented_shape}")
-        storage_root = _storage_root_from_packages_root(dataset_root)
+        print(
+            f"artifact grid {evaluation_representation.source_shape} -> {evaluation_representation.represented_shape}"
+            f" (stride {evaluation_representation.spatial_stride})"
+        )
+        storage_root = _storage_root_from_dataset_root(dataset_root)
     datasets_for_role: tuple[TransientPhysicalDataset, ...] = ()
     context: Any | None = None
     generation_sources: Mapping[str, Any] | None = None
@@ -1667,7 +1783,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     case,
                     package_case_id=package_case_id,
                     case_record=case_record,
-                    storage_root=storage_root,
                     generation_sources=generation_sources,
                     spatial_representation=evaluation_representation,
                 )
@@ -1761,9 +1876,9 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                         "actual_model_calls_per_repetition": (benchmark.model_calls_per_repetition),
                         "complete_rollout": (benchmark.model_calls_per_repetition == case.transition_count),
                         "cold_model_seconds": benchmark.cold_model_seconds,
-                        "cold_end_to_end_seconds": (benchmark.cold_end_to_end_seconds),
+                        "cold_prepared_rollout_wall_seconds": (benchmark.cold_prepared_rollout_wall_seconds),
                         "warmed_model_seconds": list(benchmark.warmed_model_seconds),
-                        "warmed_end_to_end_seconds": list(benchmark.warmed_end_to_end_seconds),
+                        "warmed_prepared_rollout_wall_seconds": list(benchmark.warmed_prepared_rollout_wall_seconds),
                     },
                     "airflow_model": {
                         "available": False,
@@ -1812,6 +1927,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     unavailable_horizons=(evaluated.unavailable_horizons),
                     metric_statistics=case_statistics,
                     resume_evidence={
+                        "schema_kind": _RESUME_EVIDENCE_SCHEMA_KIND,
                         "schema_version": _RESUME_EVIDENCE_SCHEMA_VERSION,
                         "case_id": package_case_id,
                         "material_family": material,
@@ -2165,9 +2281,9 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
     completed: Mapping[str, Any],
     role: TransientArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
-    allow_legacy_scoped_package_identity: bool = False,
 ) -> None:
     """Bind eager or indexed sequence evidence to one exact completed run role."""
+    _reject_trial(completed)
     if (
         loaded.dataset_name != role.dataset_name
         or loaded.dataset_role != role.dataset_role
@@ -2175,6 +2291,7 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         or loaded.provenance["dataset"]["source_identities"] != [dict(value) for value in role.source_identities]
         or loaded.provenance["dataset"]["case_ids_by_source"] != [list(values) for values in role.case_ids_by_source]
         or loaded.provenance["dataset"]["membership_digests"] != list(role.membership_digests)
+        or loaded.provenance["dataset"]["evaluation_assignments"] != [dict(value) for value in role.evaluation_assignments]
     ):
         message = "Transient artifact Dataset provenance contradicts saved complete-case membership."
         raise ValueError(message)
@@ -2186,7 +2303,6 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         "best_checkpoint_sha256": completed["selected_checkpoint_sha256"],
         "best_checkpoint_epoch": completed["selected_checkpoint_epoch"],
         "normalizer_sha256": completed["normalizer_sha256"],
-        "lifecycle_status": "completed",
         "parent_experiment": _parent_experiment_evidence(completed),
     }
     if run != expected_run:
@@ -2215,14 +2331,7 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         identity = cast("Mapping[str, Any]", _sequence_value(record, "identity"))
         simulation = identity.get("simulation_identity")
         package_case_id = simulation.get("package_case_id") if isinstance(simulation, Mapping) else None
-        legacy_scoped_identity = (
-            allow_legacy_scoped_package_identity
-            and isinstance(simulation, Mapping)
-            and isinstance(package_case_id, str)
-            and bool(package_case_id)
-            and "generation_case_id" not in simulation
-        )
-        if package_case_id != record_case_id and not legacy_scoped_identity:
+        if package_case_id != record_case_id:
             message = "Transient artifact sequence record lost its qualified Dataset package identity."
             raise ValueError(message)
         simulation_records.add(record_case_id)
@@ -2256,6 +2365,7 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         "modes": list(sequence_artifact.EVALUATION_MODES),
         "fixed_horizons": list(sequence_artifact.FIXED_HORIZONS),
         "rolling_origin_policy": sequence_artifact.ROLLING_ORIGIN_POLICY,
+        "recurrent_state_policy": sequence_artifact.RECURRENT_STATE_POLICY,
     }
     if any(evaluation.get(key) != value for key, value in expected_protocol.items()):
         message = "Transient artifact Evaluation protocol is stale or incompatible."
@@ -2395,7 +2505,6 @@ def validate_scoped_transient_role_artifact_index(
         completed=completed,
         role=selected_role,
         evaluation_spatial_stride=evaluation_spatial_stride,
-        allow_legacy_scoped_package_identity=True,
     )
     return loaded
 
@@ -2411,28 +2520,6 @@ def validate_transient_role_artifact_index(
     loaded = sequence_artifact.load_transient_sequence_artifact_index(root)
     return validate_staged_transient_role_artifact(
         loaded,
-        completed=completed,
-        role=role,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
-
-
-def load_transient_role_artifact(
-    root: Path | str,
-    *,
-    run_dir: Path | str,
-    split: TransientArtifactSplit,
-    evaluation_spatial_stride: int = 1,
-) -> sequence_artifact.LoadedTransientSequenceArtifact:
-    """Admit a run-owned transient artifact role through completed-run validation."""
-    completed = _completed_transient(run_dir)
-    plan = transient_artifact_plan_from_completed(completed, run_dir=run_dir)
-    role = plan.id_role if split == "eval" else plan.ood_role
-    if role is None:
-        message = "Completed transient run has no saved OOD role."
-        raise FileNotFoundError(message)
-    return validate_transient_role_artifact(
-        root,
         completed=completed,
         role=role,
         evaluation_spatial_stride=evaluation_spatial_stride,

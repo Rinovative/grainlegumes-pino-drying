@@ -1,16 +1,15 @@
-"""
-eda_transient.py
+"""Define semantic completed-output exploratory analysis for transient drying.
 
-Define semantic completed-output exploratory analysis for transient drying.
 Responsibilities:
-  - Discover canonical transient fields without duplicating the Training profile
-  - Select exact physical-time states and summarize physical trajectories
-  - Report target attainment, censoring, schedules, parameters, and runtime evidence
+  - Summarize physical trajectories on exact physical-time support
+  - Report target attainment, censoring, supported schedules, and runtime evidence
   - Assemble backend-neutral scientific views from validated transient runtime items
+
 Design principles:
   - Canonical HDF5 remains the completed-case provenance and diagnostic authority
   - PT/HDF5 runtime items share one physical-value adapter independent of storage
   - Incompatible physical channels remain separate throughout every reduction
+
 This module does NOT:
   - Run Training or inference, calculate surrogate errors, or derive speedup
   - Parse Generation sidecars, solver logs, scheduler output, or source CSV files
@@ -75,22 +74,6 @@ def _within_unit_interval(value: float) -> bool:
     return lower_valid and upper_valid
 
 
-class PhysicalTimeUnavailableError(ValueError):
-    """Report an exact physical-time request absent from one case trajectory."""
-
-
-@dataclass(frozen=True, slots=True)
-class TransientSnapshot:
-    """Hold one exact physical state snapshot and its display semantics."""
-
-    case_id: str
-    physical_time_hours: float
-    channels: tuple[str, ...]
-    fields: dict[str, np.ndarray]
-    units: dict[str, str]
-    diagnostic_exact_stop: bool
-
-
 @dataclass(frozen=True, slots=True)
 class SupportedScheduleSeries:
     """Hold one linearly evaluated schedule on exact simulated case support."""
@@ -141,16 +124,6 @@ class CompletionTargetAnalysis:
     outcomes: pd.DataFrame
     cases: pd.DataFrame
     omissions: pd.DataFrame
-
-
-@dataclass(frozen=True, slots=True)
-class FieldDiscovery:
-    """Describe one EDA field through its current authoritative contract."""
-
-    name: str
-    unit: str
-    category: str
-    availability: str
 
 
 def _state_contract() -> tuple[tuple[str, ...], dict[str, str]]:
@@ -219,47 +192,6 @@ def validate_transient_frame(frame: pd.DataFrame) -> None:
         if any(len(shape) != _SPATIAL_STATE_NDIM or shape[0] != regular.size for shape in shapes) or len(set(shapes)) != 1:
             msg = f"Transient case {case_id!r} state trajectories are not aligned."
             raise ValueError(msg)
-
-
-def discover_fields(frame: pd.DataFrame) -> dict[str, tuple[FieldDiscovery, ...]]:
-    """Discover canonical state, static, boundary, scalar, and schedule fields."""
-    validate_transient_frame(frame)
-    contract = transient_contract.TRANSIENT_STEP_CONTRACT
-    profile = generation.contracts.get_profile_contract(_TRANSIENT_TASK_ID)
-    retained_static: set[str] = set()
-    retained_schedule: set[str] = set()
-    if not frame.empty:
-        retained_static = set(frame.iloc[0]["static_fields"])
-        schedule = frame.iloc[0].get("schedule")
-        retained_schedule = set(schedule) if isinstance(schedule, Mapping) else set()
-    training_static = {field.name for field in contract.static_spatial_conditioning}
-    archived = {field.name for field in contract.archived_ablation_fields}
-    return {
-        "dynamic_state": tuple(FieldDiscovery(field.name, field.unit, "dynamic_state", "available") for field in contract.dynamic_state),
-        "static_spatial": tuple(
-            FieldDiscovery(
-                field.name,
-                field.unit,
-                "training_static" if field.name in training_static else "archive_only",
-                "available" if field.name in retained_static else "unavailable",
-            )
-            for field in (*profile.coordinate_fields, *profile.static_fields)
-            if field.name in training_static or field.name in archived
-        ),
-        "boundary_interval": tuple(
-            FieldDiscovery(field.name, field.unit, "boundary_interval", "available") for field in contract.step_boundary_conditioning
-        ),
-        "scalar_material": tuple(FieldDiscovery(field.name, field.unit, "scalar_material", "available") for field in contract.scalar_conditioning),
-        "complete_schedule": tuple(
-            FieldDiscovery(
-                field.name,
-                field.unit,
-                "complete_schedule",
-                "available" if field.name in retained_schedule else "unavailable",
-            )
-            for field in profile.schedule_fields
-        ),
-    }
 
 
 def resolve_dynamic_channels(
@@ -399,62 +331,6 @@ def supported_schedule_series(
     )
 
 
-def _exact_time_index(values: np.ndarray, requested: float, tolerance: float) -> int | None:
-    """Return one exact classified time index or report ambiguity."""
-    matches = np.flatnonzero(np.isclose(values, requested, rtol=0.0, atol=tolerance))
-    if matches.size > 1:
-        msg = "Physical-time classification is ambiguous within its persisted tolerance."
-        raise ValueError(msg)
-    return None if matches.size == 0 else int(matches[0])
-
-
-def select_state_snapshot(
-    frame: pd.DataFrame,
-    case_id: str,
-    physical_time_hours: float,
-    *,
-    channels: Sequence[str] | None = None,
-) -> TransientSnapshot:
-    """Select one exact regular or diagnostic state at a physical time."""
-    if isinstance(physical_time_hours, bool) or not isinstance(physical_time_hours, (int, float)) or not math.isfinite(float(physical_time_hours)):
-        msg = "physical_time_hours must be one finite real scalar."
-        raise TypeError(msg)
-    row = _case_row(frame, case_id)
-    selected = resolve_dynamic_channels(frame, channels)
-    requested = float(physical_time_hours)
-    time = _semantic_mapping(row["time"], label="case time evidence")
-    tolerance = float(time["classification_tolerance_hours"])
-    regular = np.asarray(time["regular_state_hours"], dtype=np.float64)
-    index = _exact_time_index(regular, requested, tolerance)
-    diagnostic = False
-    if index is not None:
-        states = _semantic_mapping(row["state_trajectories"], label="state trajectories")
-        fields = {name: np.ascontiguousarray(np.asarray(states[name][index])) for name in selected}
-    else:
-        exact = row.get("exact_stop")
-        exact_time = exact.get("time_hours") if isinstance(exact, Mapping) else None
-        exact_state = exact.get("state") if isinstance(exact, Mapping) else None
-        if (
-            not isinstance(exact_time, (int, float))
-            or not isinstance(exact_state, Mapping)
-            or not math.isclose(requested, float(exact_time), rel_tol=0.0, abs_tol=tolerance)
-        ):
-            available = available_physical_times(frame, case_id)
-            msg = f"Physical time {requested:g} h is unavailable for {case_id!r}; available times are {available}."
-            raise PhysicalTimeUnavailableError(msg)
-        fields = {name: np.ascontiguousarray(np.asarray(exact_state[name])) for name in selected}
-        diagnostic = True
-    _names, units = _state_contract()
-    return TransientSnapshot(
-        case_id=str(case_id),
-        physical_time_hours=requested,
-        channels=selected,
-        fields=fields,
-        units={name: units[name] for name in selected},
-        diagnostic_exact_stop=diagnostic,
-    )
-
-
 def trajectory_table(
     frame: pd.DataFrame,
     case_id: str,
@@ -488,186 +364,62 @@ def trajectory_table(
     return result
 
 
-def fixed_time_summary(
-    frame: pd.DataFrame,
-    physical_time_hours: float,
-    *,
-    channels: Sequence[str] | None = None,
-) -> pd.DataFrame:
-    """Align exact physical-time summaries across cases and disclose exclusions."""
-    selected = resolve_dynamic_channels(frame, channels)
-    records: list[dict[str, Any]] = []
-    unavailable: list[str] = []
-    shorter: list[str] = []
-    right_censored_cases = 0
-    right_censored_contributors = 0
-    requested_time = float(physical_time_hours)
-    for case_id, row in frame.iterrows():
-        completion = row.get("completion")
-        is_right_censored = isinstance(completion, Mapping) and completion.get("right_censored") is True
-        right_censored_cases += int(is_right_censored)
-        try:
-            snapshot = select_state_snapshot(
-                frame,
-                str(case_id),
-                requested_time,
-                channels=selected,
-            )
-        except PhysicalTimeUnavailableError:
-            unavailable.append(str(case_id))
-            time = _semantic_mapping(row["time"], label=f"case {case_id!r} time evidence")
-            tolerance = float(time["classification_tolerance_hours"])
-            available = available_physical_times(frame, str(case_id))
-            if available and requested_time > max(available) + tolerance:
-                shorter.append(str(case_id))
-            continue
-        right_censored_contributors += int(is_right_censored)
-        for name in selected:
-            field = np.asarray(snapshot.fields[name], dtype=np.float64)
-            records.append(
-                {
-                    "case_id": str(case_id),
-                    "physical_time_hours": snapshot.physical_time_hours,
-                    "channel": name,
-                    "unit": snapshot.units[name],
-                    "spatial_mean": float(np.mean(field)),
-                    "spatial_minimum": float(np.min(field)),
-                    "spatial_maximum": float(np.max(field)),
-                    "diagnostic_exact_stop": snapshot.diagnostic_exact_stop,
-                }
-            )
-    result = pd.DataFrame.from_records(records)
-    result.attrs.update(
-        {
-            "contributing_case_count": len(frame) - len(unavailable),
-            "unavailable_case_count": len(unavailable),
-            "unavailable_case_ids": tuple(unavailable),
-            "shorter_trajectory_case_count": len(shorter),
-            "shorter_trajectory_case_ids": tuple(shorter),
-            "right_censored_case_count": right_censored_cases,
-            "right_censored_contributor_count": right_censored_contributors,
-            "failed_case_count": int(frame.attrs.get("failed_case_count", 0)),
-            "incomplete_case_count": int(frame.attrs.get("incomplete_case_count", 0)),
-            "alignment": "exact_physical_time_no_nearest_substitution",
-        }
-    )
-    return result
+def aggregate_exact_series(
+    times_by_case: Sequence[np.ndarray],
+    values_by_case: Sequence[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Summarize case values on the union of their exact physical times.
 
+    Parameters
+    ----------
+    times_by_case, values_by_case : sequence of numpy.ndarray
+        Aligned one-dimensional finite series, with strictly increasing times
+        for each distinct case. Values are already full-grid case summaries.
 
-def boundary_interval_table(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return all per-transition boundary endpoints and startup support evidence."""
-    validate_transient_frame(frame)
-    fields = transient_contract.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning
-    records: list[dict[str, Any]] = []
-    for case_id, row in frame.iterrows():
-        time = row["time"]
-        t_n = np.asarray(time["transition_t_n_hours"], dtype=np.float64)
-        t_np1 = np.asarray(time["transition_t_n_plus_1_hours"], dtype=np.float64)
-        boundary = row["boundary_intervals"]
-        for index, (start, stop) in enumerate(zip(t_n, t_np1, strict=True)):
-            record: dict[str, Any] = {
-                "case_id": str(case_id),
-                "transition_index": index,
-                "t_n_hours": float(start),
-                "t_n_plus_1_hours": float(stop),
-            }
-            for field in fields:
-                record[field.name] = float(np.asarray(boundary[field.name])[index])
-            records.append(record)
-    result = pd.DataFrame.from_records(records)
-    result.attrs["interpolation"] = transient_contract.TRANSIENT_STEP_CONTRACT.boundary_interval_interpolation
-    result.attrs["time_control"] = "none_fixed_transition_evidence"
-    return result
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Physical times, q10, median, q90, and contributing case counts. A
+        one-case quantile is retained numerically; a dispersion band requires
+        at least two contributors and must be hidden otherwise.
 
+    Notes
+    -----
+    Only stored observations at the exact same time contribute. No trajectory
+    is interpolated, extended, or weighted by its number of stored timestamps.
+    Non-finite source values fail admission rather than disappearing from the
+    aggregate support.
 
-def schedule_summary(frame: pd.DataFrame) -> pd.DataFrame:
-    """Summarize complete schedules without flattening their source arrays."""
-    validate_transient_frame(frame)
-    profile = generation.contracts.get_profile_contract(_TRANSIENT_TASK_ID)
-    records: list[dict[str, Any]] = []
-    for case_id, row in frame.iterrows():
-        schedule = row.get("schedule")
-        if not isinstance(schedule, Mapping):
-            continue
-        for field in profile.schedule_fields:
-            if field.name == "t":
-                continue
-            values = np.asarray(schedule[field.name], dtype=np.float64)
-            records.append(
-                {
-                    "case_id": str(case_id),
-                    "quantity": field.name,
-                    "unit": field.unit,
-                    "initial": float(values[0]),
-                    "final": float(values[-1]),
-                    "minimum": float(np.min(values)),
-                    "maximum": float(np.max(values)),
-                    "mean": float(np.mean(values)),
-                    "amplitude": float(np.max(values) - np.min(values)),
-                    "endpoint_change": float(values[-1] - values[0]),
-                }
-            )
-    result = pd.DataFrame.from_records(records)
-    result.attrs["source"] = "complete_generation_schedule"
-    result.attrs["time_control"] = "none_full_schedule_uses_x_axis"
-    return result
-
-
-def scalar_parameter_table(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return realized completed-case material-conditioning parameters."""
-    validate_transient_frame(frame)
-    fields = transient_contract.TRANSIENT_STEP_CONTRACT.scalar_conditioning
-    records: list[dict[str, Any]] = []
-    for case_id, row in frame.iterrows():
-        values = _semantic_mapping(row["scalar_conditioning"], label="scalar conditioning")
-        meta = _semantic_mapping(row["meta"], label="case metadata")
-        records.extend(
-            {
-                "case_id": str(case_id),
-                "material_family": meta.get("material_family"),
-                "parameter": field.name,
-                "unit": field.unit,
-                "value": float(values[field.name]),
-                "distribution_kind": "realized_completed_case",
-            }
-            for field in fields
-        )
-    result = pd.DataFrame.from_records(records)
-    result.attrs["time_control"] = "none_static_parameter"
-    return result
-
-
-def runtime_table(frame: pd.DataFrame) -> pd.DataFrame:
-    """Expose separated physical-duration and operational runtime evidence."""
-    validate_transient_frame(frame)
-    records: list[dict[str, Any]] = []
-    for case_id, row in frame.iterrows():
-        runtime = row.get("runtime")
-        completion = row.get("completion")
-        if not isinstance(runtime, Mapping) or not isinstance(completion, Mapping):
-            continue
-        availability = runtime.get("component_timing_availability")
-        availability = availability if isinstance(availability, Mapping) else {}
-        records.append(
-            {
-                "case_id": str(case_id),
-                "physical_drying_duration_hours": completion.get("physical_duration_hours"),
-                "time_to_target_hours": completion.get("time_to_target_hours"),
-                "stationary_airflow_solver_seconds": runtime.get("stationary_airflow_solver_seconds"),
-                "transient_drying_solver_seconds": runtime.get("transient_drying_solver_seconds"),
-                "scientific_solver_seconds": runtime.get("scientific_solver_seconds"),
-                "comsol_process_seconds": runtime.get("comsol_process_seconds"),
-                "queue_wait_seconds": runtime.get("queue_wait_seconds"),
-                "licence_wait_seconds": runtime.get("licence_wait_seconds"),
-                "generation_compute_end_to_end_seconds": runtime.get("generation_compute_end_to_end_seconds"),
-                "complete_execution_seconds": runtime.get("complete_execution_seconds"),
-                "component_timing_availability": dict(availability),
-            }
-        )
-    result = pd.DataFrame.from_records(records)
-    result.attrs["runtime_is_model_input"] = False
-    result.attrs["runtime_is_dataset_identity"] = False
-    return result
+    """
+    if not times_by_case or len(times_by_case) != len(values_by_case):
+        message = "Trajectory aggregation requires aligned non-empty case series."
+        raise ValueError(message)
+    observations: dict[float, list[float]] = {}
+    for times, values in zip(times_by_case, values_by_case, strict=True):
+        if not isinstance(times, np.ndarray) or not isinstance(values, np.ndarray):
+            message = "Trajectory aggregation requires one-dimensional numeric arrays."
+            raise TypeError(message)
+        if (
+            times.ndim != 1
+            or times.size == 0
+            or values.shape != times.shape
+            or not np.issubdtype(times.dtype, np.number)
+            or not np.issubdtype(values.dtype, np.number)
+            or np.iscomplexobj(times)
+            or np.iscomplexobj(values)
+            or not np.isfinite(times).all()
+            or not np.isfinite(values).all()
+            or np.any(times[1:] <= times[:-1])
+        ):
+            message = "Trajectory aggregation requires finite aligned values and strictly increasing physical times."
+            raise ValueError(message)
+        for time_value, value in zip(times, values, strict=True):
+            observations.setdefault(float(time_value), []).append(float(value))
+    physical_time = np.asarray(sorted(observations), dtype=np.float64)
+    quantiles = np.asarray([np.quantile(observations[float(time)], (0.1, 0.5, 0.9)) for time in physical_time], dtype=np.float64)
+    counts = np.asarray([len(observations[float(time)]) for time in physical_time], dtype=np.int64)
+    return physical_time, quantiles[:, 0], quantiles[:, 1], quantiles[:, 2], counts
 
 
 def _distribution(values: np.ndarray, *, configured_horizon_hours: float | None) -> dict[str, Any]:
@@ -790,8 +542,6 @@ def target_attainment_diagnostic(  # noqa: PLR0912 -- one complete diagnostic ad
             {
                 "case_id": str(case_id),
                 "material_family": meta.get("material_family"),
-                "dataset_role": meta.get("dataset_role"),
-                "case_family": meta.get("case_family"),
                 "completion_state": ("target_reached" if reached else "right_censored"),
                 "terminal_time_kind": terminal_time_kind,
                 "target_reached": reached,
@@ -1021,8 +771,16 @@ def _runtime_transitions(item: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise ValueError(msg)
     records = []
     current = state
+    stored_states = _numpy(item["state_sequence"]).astype(np.float32, copy=False) if "state_sequence" in item else None
+    if stored_states is not None and (
+        stored_states.shape != (length + 1, *state.shape)
+        or not np.array_equal(stored_states[0], state)
+        or not np.array_equal(stored_states[1:] - stored_states[:-1], target)
+    ):
+        message = "Exact stored state sequence disagrees with the runtime increment contract."
+        raise ValueError(message)
     for index in range(length):
-        following = current + target[index]
+        following = current + target[index] if stored_states is None else stored_states[index + 1]
         records.append(
             {
                 "t_n": float(t_n[index]),
@@ -1030,7 +788,9 @@ def _runtime_transitions(item: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "dt": float(dt[index]),
                 "state": np.ascontiguousarray(current),
                 "next_state": np.ascontiguousarray(following),
+                "target": np.ascontiguousarray(target[index]),
                 "boundary": np.ascontiguousarray(boundary[index]),
+                "exact_next_state": stored_states is not None,
             }
         )
         current = following
@@ -1069,7 +829,7 @@ def frame_from_transient_items(
             key = (transition["t_n"], transition["t_n_plus_1"])
             previous = entry["transitions"].get(key)
             if previous is not None:
-                for name in ("state", "next_state", "boundary"):
+                for name in ("state", "next_state", "target", "boundary"):
                     if not np.array_equal(previous[name], transition[name]):
                         msg = f"Duplicate transient runtime transition disagrees for {case_id!r}."
                         raise ValueError(msg)
@@ -1120,9 +880,11 @@ def frame_from_transient_items(
             ):
                 msg = f"Transient runtime item EDA requires one contiguous transition chain for {case_id!r}."
                 raise ValueError(msg)
-            if not np.array_equal(previous["next_state"], transition["state"]):
+            if not np.array_equal(transition["state"] - previous["state"], previous["target"]):
                 msg = f"Transient runtime state disagrees across adjacent transitions for {case_id!r}."
                 raise ValueError(msg)
+            previous["next_state"] = transition["state"]
+            previous["exact_next_state"] = True
         state_times = np.asarray(
             [transitions[0]["t_n"], *(transition["t_n_plus_1"] for transition in transitions)],
             dtype=np.float64,
@@ -1137,6 +899,9 @@ def frame_from_transient_items(
         rows.append(
             {
                 "state_trajectories": {name: np.ascontiguousarray(states[:, index]) for index, name in enumerate(state_names)},
+                "target_increments": {
+                    f"delta_{name}": np.stack([transition["target"][index] for transition in transitions]) for index, name in enumerate(state_names)
+                },
                 "static_fields": {name: np.ascontiguousarray(static[index]) for index, name in enumerate(static_names)},
                 "boundary_intervals": {
                     name: np.asarray(
@@ -1163,7 +928,7 @@ def frame_from_transient_items(
                         [transition["dt"] for transition in transitions],
                         dtype=np.float64,
                     ),
-                    "configured_horizon_hours": None,
+                    "configured_horizon_hours": metadata.get("configured_horizon_hours"),
                     "classification_tolerance_hours": time_tolerance,
                     "classification_tolerance_source": "float32_runtime_item_resolution",
                     "unit": contract.time_unit,
@@ -1178,26 +943,36 @@ def frame_from_transient_items(
                     "case_input_id": metadata.get("case_input_id"),
                     "simulation_case_id": case_id,
                     "material_family": metadata.get("material_family"),
-                    "dataset_role": metadata.get("split"),
-                    "case_family": metadata.get("evaluation_regime"),
                     "simulation_profile": metadata.get("source_simulation_profile"),
                 },
                 "source": {
                     "dataset_id": metadata.get("dataset_id"),
                     "source_batch_id": metadata.get("source_batch_id"),
                     "backend": backend,
+                    "state_evidence": "exact stored states"
+                    if transitions[-1]["exact_next_state"]
+                    else "stored current states; final endpoint reconstructed from float32 increment",
                 },
             }
         )
         case_ids.append(case_id)
     task = domain.tasks.registry.get_task(_TRANSIENT_TASK_ID)
     frame = pd.DataFrame(rows, index=pd.Index(case_ids, name="sample_id"))
+    groups = {
+        "dynamic_state": contract.dynamic_state,
+        "static_spatial": contract.static_spatial_conditioning,
+        "boundary_interval": contract.step_boundary_conditioning,
+        "scalar_material": contract.scalar_conditioning,
+    }
+    categories = {category: tuple(field.name for field in fields) for category, fields in groups.items()}
+    units = {field.name: field.unit for fields in groups.values() for field in fields}
     frame.attrs.update(
         {
             "task_id": task.id,
             "task_contract_digest": task.contract_digest,
             "dataset_backend": backend,
             "analysis_representation": "transient_runtime_item_semantics",
+            "complete_schedule_available": False,
             "loaded_case_count": len(frame),
             "available_case_count": len(frame),
             "total_discovered_case_count": len(frame),
@@ -1205,7 +980,10 @@ def frame_from_transient_items(
             "incomplete_case_count": 0,
             "exclusion_reasons": {},
             "field_names": state_names,
-            "field_units": {field.name: field.unit for field in contract.dynamic_state},
+            "field_units": units,
+            "field_categories": categories,
+            "field_roles": {field: category for category, fields in categories.items() for field in fields},
+            "field_representations": dict.fromkeys(state_names, "absolute_physical_state"),
             "spatial_shape": None if frame.empty else next(iter(frame.iloc[0]["state_trajectories"].values())).shape[1:],
         }
     )

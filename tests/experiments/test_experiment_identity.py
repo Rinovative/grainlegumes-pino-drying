@@ -1,120 +1,211 @@
-# ruff: noqa: S101
-"""Protect concise labels and immutable transient parent experiment records."""
+"""Protect content-derived run identity and transient parent provenance.
+
+Responsibilities:
+  - Check scientific identity, layout paths, and authored-source provenance separation
+  - Check parent-record binding of the matched A0/B/A1 children and of the persisted identity
+
+Design principles:
+  - The readable layout binds one scientific content per name while authored presentation remains provenance
+
+This module does NOT:
+  - Run comparison stages or create Dataset packages
+"""
 
 from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from support import configs
 
+from src import common
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+from src.experiments import experiments_run as run_service
 from src.experiments import experiments_run_identity as identity
-from src.experiments.config import experiments_config_transient_plan as transient_plan
 
 
 def _plan(
     output_root: Path,
-    *,
-    revision: int = 0,
-    seed: int = 17,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return isolated current-schema Stage A0/B configs under one temporary root."""
-    raw = configs.transient_two_stage_config(revision=revision, seed=seed)
-    plan = transient_plan.resolve_transient_training_plan(raw)
-    stage_a = copy.deepcopy(dict(plan.stage_a))
-    stage_b = copy.deepcopy(dict(plan.stage_b))
-    stage_a["paths"]["output_root"] = str(output_root)
-    stage_b["paths"]["output_root"] = str(output_root)
-    return stage_a, stage_b
+    raw: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Return isolated A0/B/A1 configs of one matched plan resolved under a temporary output root."""
+    plan = configs.resolve_plan(configs.transient_matched_config() if raw is None else raw, output_root=output_root)
+    return tuple(copy.deepcopy(dict(config)) for config in plan.stages)  # type: ignore[return-value]
 
 
-def test_parent_label_distinguishes_dataset_and_run_revisions() -> None:
-    """Omit zero revisions and place dN/rN before the stage suffix."""
-    raw = configs.transient_two_stage_config(revision=1)
-    raw["data"]["train_dataset"] = "transient_drying__family__id__0123456789abcdef"
-    plan = transient_plan.resolve_transient_training_plan(raw)
-
-    assert plan.stage_a["run"]["name"].endswith("_r1_a0")
-    assert "transient_drying" not in plan.stage_a["run"]["name"]
-    assert "0123456789abcdef" not in plan.stage_a["run"]["name"]
-    assert "__" not in plan.stage_a["run"]["name"]
+def _record(
+    stages: tuple[dict[str, Any], dict[str, Any], dict[str, Any]],
+    source: Path,
+) -> dict[str, Any]:
+    """Build the parent record of one resolved matched plan."""
+    stage_a0, stage_b, stage_a1 = stages
+    return identity.build_transient_experiment_record(stage_a0, stage_b, stage_a1=stage_a1, config_path=source)
 
 
-def test_parent_record_binds_flat_children_and_rejects_reuse(tmp_path: Path) -> None:
-    """Publish one visible parent without copying or nesting child artifacts."""
-    authored = configs.write_yaml(tmp_path / "synthetic_plan.yaml", configs.transient_two_stage_config())
-    stage_a, stage_b = _plan(tmp_path)
-    record = identity.build_transient_experiment_record(stage_a, stage_b, config_path=authored)
-    path = identity.publish_transient_experiment_record(record, output_root=tmp_path)
-
+def test_parent_record_uses_content_layout_and_relative_children(tmp_path: Path) -> None:
+    """Persist parent metadata in the pair directory and point to the shared A0 and the pair's leaves."""
+    authored = configs.write_yaml(tmp_path / "synthetic_plan.yaml", configs.transient_matched_config())
+    stages = _plan(tmp_path)
+    record = _record(stages, authored)
+    path = identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
     saved = identity.validate_transient_experiment_record(json.loads(path.read_text(encoding="utf-8")))
-    assert path == tmp_path / "transient_drying" / "runs" / saved["parent_label"] / "experiment.json"
-    assert saved["run_revision"] == 0
-    assert "_r0" not in saved["parent_label"]
-    assert saved["children"]["stage_a0"]["path"].endswith("_a0")
-    assert saved["children"]["stage_b"]["path"].endswith("_b")
-    assert Path(saved["children"]["stage_a0"]["path"]).parent == path.parent.parent
-    assert not Path(saved["children"]["stage_a0"]["path"]).exists()
+
+    pair = stages[1]["run"]["layout"]["pair"]
+    assert path == common.paths.resolve_config_experiment_dir(stages[0]) / pair / "experiment.json"
+    assert path.parent == common.paths.resolve_config_run_dir(stages[1]).parent
+    assert saved["layout"] == stages[1]["run"]["layout"]
+    assert saved["topology"] == "a0_to_b_and_a1"
+    assert {key: child["path"] for key, child in saved["children"].items()} == {"stage_a0": "../a0", "stage_b": "b", "stage_a1": "a1"}
+    (path.parent / "b").mkdir()
     with pytest.raises(FileExistsError, match="Matching experiment already exists"):
-        identity.publish_transient_experiment_record(record, output_root=tmp_path)
+        identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
 
 
-def test_explicit_new_run_revision_publishes_a_distinct_parent(tmp_path: Path) -> None:
-    """Accept an intentional nonzero revision as a distinct immutable experiment."""
-    authored_zero = configs.write_yaml(tmp_path / "plan-r0.yaml", configs.transient_two_stage_config())
-    stage_a_zero, stage_b_zero = _plan(tmp_path)
-    record_zero = identity.build_transient_experiment_record(stage_a_zero, stage_b_zero, config_path=authored_zero)
-    path_zero = identity.publish_transient_experiment_record(record_zero, output_root=tmp_path)
+def test_readonly_child_navigation_binds_saved_identity_after_training_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stages = _plan(tmp_path)
+    stage_a = stages[0]
+    authored = configs.write_yaml(tmp_path / "plan.yaml", configs.transient_matched_config())
+    record = _record(stages, authored)
+    marker = identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
+    child = record["children"]["stage_a0"]
+    run_dir = common.paths.resolve_config_run_dir(stage_a)
+    config_path = configs.write_yaml(run_dir / "config.yaml", stage_a)
+    summary = {
+        "schema_version": run_service.RUN_SUMMARY_SCHEMA_VERSION,
+        "status": "completed",
+        "config_sha256": common.serialization.file_sha256(config_path),
+        "checkpoint_identity": {"resume_contract_digest": child["semantic_config_sha256"]},
+    }
+    common.serialization.atomic_write_json(run_dir / "summary.json", summary)
+    monkeypatch.setattr(identity.training_checkpoint, "scientific_implementation_digest", lambda _task: "0" * 64)
+    monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", lambda _config: pytest.fail("Navigation must use saved identity"))
+    assert identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path) == run_dir
 
-    authored_one = configs.write_yaml(tmp_path / "plan-r1.yaml", configs.transient_two_stage_config(revision=1))
-    stage_a_one, stage_b_one = _plan(tmp_path, revision=1)
-    record_one = identity.build_transient_experiment_record(stage_a_one, stage_b_one, config_path=authored_one)
-    path_one = identity.publish_transient_experiment_record(record_one, output_root=tmp_path)
+    changed = copy.deepcopy(summary)
+    changed["checkpoint_identity"]["resume_contract_digest"] = "0" * 64
+    common.serialization.atomic_write_json(run_dir / "summary.json", changed)
+    with pytest.raises(ValueError, match="immutable parent"):
+        identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
+    changed["checkpoint_identity"] = {}
+    common.serialization.atomic_write_json(run_dir / "summary.json", changed)
+    with pytest.raises(ValueError, match="valid saved resume identity"):
+        identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
+    common.serialization.atomic_write_json(run_dir / "summary.json", summary)
+    raw = copy.deepcopy(stage_a)
+    raw["data"]["batch_size"] += 1
+    configs.write_yaml(config_path, raw)
+    with pytest.raises(ValueError, match="config bytes"):
+        identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
 
-    assert path_zero != path_one
-    assert "_r0" not in record_zero["parent_label"]
-    assert record_one["parent_label"].endswith("_r1")
-    assert record_one["run_revision"] == 1
 
-
-def test_seed_is_preserved_and_distinguishes_parent_identity(tmp_path: Path) -> None:
-    """Keep seed separate from both Dataset and run revisions."""
-    stage_a_17, stage_b_17 = _plan(tmp_path, seed=17)
-    stage_a_23, stage_b_23 = _plan(tmp_path, seed=23)
-
-    record_17 = identity.build_transient_experiment_record(
-        stage_a_17,
-        stage_b_17,
-        config_path=configs.write_yaml(tmp_path / "plan-s17.yaml", configs.transient_two_stage_config(seed=17)),
+def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path: Path) -> None:
+    stages = _plan(tmp_path)
+    stage_b = stages[1]
+    authored = configs.write_yaml(tmp_path / "plan.yaml", configs.transient_matched_config())
+    record = _record(stages, authored)
+    marker = identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
+    run_dir = common.paths.resolve_config_run_dir(stage_b)
+    configs.write_yaml(run_dir / "config.yaml", stage_b)
+    common.serialization.atomic_write_json(
+        run_dir / "summary.json",
+        {
+            "schema_version": run_service.RUN_SUMMARY_SCHEMA_VERSION,
+            "status": "budget_unmet",
+            "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(stage_b)},
+        },
     )
-    record_23 = identity.build_transient_experiment_record(
-        stage_a_23,
-        stage_b_23,
-        config_path=configs.write_yaml(tmp_path / "plan-s23.yaml", configs.transient_two_stage_config(seed=23)),
-    )
-
-    assert record_17["seed"] == stage_a_17["run"]["seed"]
-    assert record_23["seed"] == stage_a_23["run"]["seed"]
-    assert stage_a_17["run"]["name"] != stage_a_23["run"]["name"]
-    assert f"_s{record_17['seed']}_" in stage_a_17["run"]["name"]
-    assert f"_s{record_23['seed']}_" in stage_a_23["run"]["name"]
+    assert identity.resolve_readonly_experiment_child(record, record["children"]["stage_b"], marker=marker, output_root=tmp_path) == run_dir
+    with pytest.raises(run_service.RunLifecycleError, match="incomplete"):
+        run_service.validate_completed_run(run_dir)
 
 
-def test_same_parent_revision_with_different_config_is_conflict(tmp_path: Path) -> None:
-    """Reject a changed exact config at the same user-selected parent revision."""
-    authored = configs.write_yaml(tmp_path / "synthetic_plan.yaml", configs.transient_two_stage_config())
-    stage_a, stage_b = _plan(tmp_path)
-    original = identity.build_transient_experiment_record(stage_a, stage_b, config_path=authored)
-    identity.publish_transient_experiment_record(original, output_root=tmp_path)
+def test_scientific_change_changes_content_identity_and_parent_location(tmp_path: Path) -> None:
+    """Change the identities, not the readable parent location, when a scientific parameter changes."""
+    original_raw = configs.transient_matched_config()
+    changed_raw = copy.deepcopy(original_raw)
+    changed_raw["data"]["batch_size"] += 1
+    source = configs.write_yaml(tmp_path / "plan.yaml", original_raw)
+    original = _record(_plan(tmp_path, original_raw), source)
+    changed = _record(_plan(tmp_path, changed_raw), source)
 
-    changed_a = copy.deepcopy(stage_a)
-    changed_b = copy.deepcopy(stage_b)
-    changed_a["data"]["batch_size"] += 1
-    changed_b["data"]["batch_size"] += 1
-    changed = identity.build_transient_experiment_record(changed_a, changed_b, config_path=authored)
-    assert changed["parent_label"] == original["parent_label"]
-    with pytest.raises(FileExistsError, match=r"Run revision conflict.*set a new explicit run.revision"):
-        identity.publish_transient_experiment_record(changed, output_root=tmp_path)
+    assert original["parent_identity_sha256"] != changed["parent_identity_sha256"]
+    assert original["layout"]["a0_id"] != changed["layout"]["a0_id"]
+    assert identity.experiment_record_path(original, output_root=tmp_path) == identity.experiment_record_path(changed, output_root=tmp_path)
+
+
+def test_persisted_parent_must_match_the_requested_identity(tmp_path: Path) -> None:
+    """An existing marker admits only the exact identity it recorded; a missing one is not created implicitly."""
+    source = configs.write_yaml(tmp_path / "plan.yaml", configs.transient_matched_config())
+    record = _record(_plan(tmp_path), source)
+
+    with pytest.raises(FileNotFoundError, match="missing or unsafe"):
+        identity.validate_persisted_transient_experiment_record(record, output_root=tmp_path)
+    marker = identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
+    assert identity.validate_persisted_transient_experiment_record(record, output_root=tmp_path) == marker
+    # A record at the same location whose scientific child identity differs, with its digest recomputed to stay self-consistent.
+    other = copy.deepcopy(record)
+    other["children"]["stage_b"]["semantic_config_sha256"] = "f" * 64
+    payload = {key: value for key, value in other.items() if key not in {"parent_identity_sha256", "source_repository", "authored_config"}}
+    other["parent_identity_sha256"] = common.serialization.canonical_json_sha256(payload)
+
+    with pytest.raises(ValueError, match="persisted transient parent identity"):
+        identity.validate_persisted_transient_experiment_record(other, output_root=tmp_path)
+
+
+def test_authored_config_and_repository_provenance_do_not_change_parent_identity(tmp_path: Path) -> None:
+    """Keep source path/hash and repository facts separate from scientific identity."""
+    first_yaml = configs.write_yaml(tmp_path / "first.yaml", configs.transient_matched_config())
+    second_yaml = configs.write_yaml(tmp_path / "second.yaml", configs.transient_matched_config())
+    stages = _plan(tmp_path)
+    first = _record(stages, first_yaml)
+    second = _record(stages, second_yaml)
+
+    assert first["authored_config"] != second["authored_config"]
+    assert first["parent_identity_sha256"] == second["parent_identity_sha256"]
+
+
+def test_pairs_with_other_budgets_share_the_seed_group_a0(tmp_path: Path) -> None:
+    """A second B/A1 pair gets its own pair directory beside the one A0 of the seed group."""
+    raw = configs.transient_matched_config()
+    first = _plan(tmp_path, raw)
+    source = configs.write_yaml(tmp_path / "plan.yaml", raw)
+    marker = identity.admit_fresh_transient_experiment_record(_record(first, source), output_root=tmp_path)
+    a0 = common.paths.resolve_config_run_dir(first[0])
+    assert marker.parent.parent == a0.parent == common.paths.resolve_config_experiment_dir(first[0])
+    assert first[0]["run"]["layout"]["pair"] is None
+    raw["training"]["b"]["train_seconds"] = 2.0
+
+    second = _plan(tmp_path, raw)
+
+    assert common.paths.resolve_config_run_dir(second[0]) == a0
+    assert second[0]["run"]["layout"]["a0_id"] == first[0]["run"]["layout"]["a0_id"]
+    assert second[1]["run"]["layout"]["pair"] != first[1]["run"]["layout"]["pair"]
+    second_record = _record(second, source)
+    second_marker = identity.admit_fresh_transient_experiment_record(second_record, output_root=tmp_path)
+    assert second_marker.parent.parent == marker.parent.parent
+    assert second_record["children"]["stage_a0"]["path"] == "../a0"
+    assert identity.load_readonly_transient_experiment_record(second_marker, experiments_root=tmp_path)["output_root"] == tmp_path
+    for key, child in second_record["children"].items():
+        located = identity.resolve_readonly_experiment_child(second_record, child, marker=second_marker, output_root=tmp_path)
+        assert located == (a0 if key == "stage_a0" else second_marker.parent / key.removeprefix("stage_"))
+
+
+def test_same_pair_with_other_content_conflicts_at_the_parent_record(tmp_path: Path) -> None:
+    """One pair name binds one content: changed B settings under the same pair are refused, not renamed."""
+    raw = configs.transient_matched_config()
+    first = _plan(tmp_path, raw)
+    source = configs.write_yaml(tmp_path / "plan.yaml", raw)
+    identity.admit_fresh_transient_experiment_record(_record(first, source), output_root=tmp_path)
+    changed = copy.deepcopy(raw)
+    changed["training"]["b"]["evaluation_interval"] += 1
+
+    second = _plan(tmp_path, changed)
+
+    assert second[1]["run"]["layout"]["pair"] == first[1]["run"]["layout"]["pair"]
+    with pytest.raises(FileExistsError, match="Scientific parent identity conflict"):
+        identity.admit_fresh_transient_experiment_record(_record(second, source), output_root=tmp_path)

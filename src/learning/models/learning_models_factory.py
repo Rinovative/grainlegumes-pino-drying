@@ -1,7 +1,4 @@
-"""
-learning_models_factory.py
-
-Construct FNO, UNO, and capability-gated RNO models from resolved experiment configs.
+"""Construct FNO, UNO, and capability-gated RNO models from resolved experiment configs.
 
 Responsibilities:
   - Build FNO models from channel, mode and layer settings
@@ -473,6 +470,11 @@ def build_rno(
     if return_sequences is not False:
         message = "RNO requires return_sequences=False; transient rollouts carry hidden state explicitly."
         raise ValueError(message)
+    if rno_skip is not False:
+        # neuraloperator returns skip-added intermediate states as hidden states,
+        # so step-wise carry would diverge from its own full-sequence recurrence.
+        message = "RNO requires rno_skip=False; skip-added hidden states break step-wise hidden-state carry."
+        raise ValueError(message)
     rno_builder = _resolve_rno_builder()
     if rno_builder is None:
         message = "The installed neuraloperator package does not expose official RNO support."
@@ -768,6 +770,10 @@ def validate_model_params(
 
     if kind == "rno" and params.get("return_sequences", False) is not False:
         message = "model.params.return_sequences must be false for RNO."
+        raise ValueError(message)
+
+    if kind == "rno" and params.get("rno_skip", False) is not False:
+        message = "model.params.rno_skip must be false for RNO."
         raise ValueError(message)
 
     if kind == "uno":

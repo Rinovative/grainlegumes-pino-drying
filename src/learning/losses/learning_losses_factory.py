@@ -1,11 +1,9 @@
-"""
-learning_losses_factory.py
-
-Build semantic supervised and physics-informed loss compositions.
+"""Build semantic supervised and physics-informed loss compositions.
 
 Responsibilities:
   - Resolve semantic supervised data-loss identifiers
   - Build task-dimensional data losses with explicit reduction and weighting
+  - Own the non-periodic relative H1 definition shared by loss and metric
   - Build one named composition interface for supervised and physics training
 
 Design principles:
@@ -86,6 +84,40 @@ def validate_data_loss_semantics(kind: str, *, space: str) -> DataLossKindSpec:
     return spec
 
 
+def build_relative_h1(operator_dimensionality: int, *, reduction: str) -> Any:
+    """
+    Build the relative H1 norm for non-periodic task domains.
+
+    Parameters
+    ----------
+    operator_dimensionality : int
+        Task-owned number of spatial operator axes.
+    reduction : str
+        NeuralOp batch reduction, ``"mean"`` or ``"sum"``.
+
+    Returns
+    -------
+    neuralop.H1Loss
+        Relative H1 norm with one-sided boundary differences on every axis.
+
+    Notes
+    -----
+    NeuralOp's default periodic differences pair opposite boundaries; on a bed
+    with inlet pressure at one end and zero gauge at the other that wrap term
+    dominates the pressure gradient norm, so periodicity is disabled.
+
+    """
+    from neuralop import H1Loss  # noqa: PLC0415
+
+    return H1Loss(
+        d=operator_dimensionality,
+        reduction=reduction,
+        periodic_in_x=False,
+        periodic_in_y=False,
+        periodic_in_z=False,
+    )
+
+
 def build_data_loss(
     kind: str,
     *,
@@ -113,7 +145,7 @@ def build_data_loss(
         Sample-mean relative loss module.
 
     """
-    from neuralop import H1Loss, LpLoss  # noqa: PLC0415
+    from neuralop import LpLoss  # noqa: PLC0415
 
     from . import learning_losses_pino as pino  # noqa: PLC0415
 
@@ -122,7 +154,7 @@ def build_data_loss(
         msg = f"operator_dimensionality must be positive, got {operator_dimensionality}."
         raise ValueError(msg)
     if kind == "relative_h1":
-        implementation: Any = H1Loss(d=operator_dimensionality, reduction="mean")
+        implementation: Any = build_relative_h1(operator_dimensionality, reduction="mean")
     elif kind == "relative_l2":
         implementation = LpLoss(d=operator_dimensionality, p=2, reduction="mean")
     else:
@@ -163,10 +195,9 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
     Build the unified semantic training loss from resolved configuration.
 
     Supervised and physics-informed configurations return the same type and
-    named component interface. The task contract selects the equation, allowed
-    continuity formulations, default continuity, and boundary formulation. The
-    effective experiment config selects continuity, numerical derivatives,
-    explicit weights, and warmup. The caller supplies the already resolved
+    named component interface. The task contract owns the equation, continuity,
+    and boundary formulations. The effective experiment config selects numerical
+    derivatives, the three physics-term weights, and their warmups. The caller supplies the already resolved
     concrete runtime device. This factory never performs availability fallback.
 
     Parameters
@@ -186,8 +217,8 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
     TypeError
         If the device or required resolved mappings have invalid types.
     ValueError
-        If task physics, continuity, derivatives, weights, or crop settings
-        contradict their registered semantic contracts.
+        If task physics, derivatives, weights, or crop settings contradict
+        their registered semantic contracts.
 
     """
     import torch  # noqa: PLC0415
@@ -217,9 +248,6 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
         if physics_config.get("enabled") is not False:
             msg = "Transient drying supports data-only training; loss.physics.enabled must be false."
             raise ValueError(msg)
-        if physics_config.get("continuity") != "none":
-            msg = "Transient drying loss.physics.continuity must be 'none'."
-            raise ValueError(msg)
         transient_loss = transient.TransientIncrementLoss(
             kind=cast("transient.TransientDataLossKind", kind),
             channel_weights=data_config.get(
@@ -235,15 +263,6 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
         return transient_loss.to(device)
 
     task_physics = domain.tasks.registry.resolve_physics(task.physics.kind)
-    continuity = physics_config.get("continuity")
-    if not isinstance(continuity, str) or not continuity:
-        msg = "loss.physics.continuity must be a non-empty semantic identifier."
-        raise TypeError(msg)
-    if continuity not in task_physics.allowed_continuities:
-        available = ", ".join(task_physics.allowed_continuities)
-        msg = f"Unknown continuity identifier {continuity!r} at loss.physics.continuity. Available continuity formulations: {available}."
-        raise ValueError(msg)
-
     derivatives_config = physics_config.get("derivatives")
     if not isinstance(derivatives_config, dict):
         msg = "loss.physics.derivatives must be a mapping."
@@ -269,10 +288,10 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
         physics_kind=task_physics.kind,
         input_fields=task.input_names,
         output_fields=task.output_names,
-        continuity=continuity,
         boundary=task_physics.boundary,
         derivatives=derivatives,
-        residual_weight=_resolved_weight(physics_config, "residual_weight"),
+        momentum_weight=_resolved_weight(physics_config, "momentum_weight"),
+        continuity_weight=_resolved_weight(physics_config, "continuity_weight"),
         boundary_weight=_resolved_weight(physics_config, "boundary_weight"),
         interior_crop=int(physics_config["interior_crop"]),
     )

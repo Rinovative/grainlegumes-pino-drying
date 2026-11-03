@@ -1,7 +1,4 @@
-"""
-eda_selection.py
-
-Own lazy generated-output EDA views and one shared adaptive selection state.
+"""Own lazy generated-output EDA views and one shared adaptive selection state.
 
 Responsibilities:
   - Describe one admitted batch through its authoritative simulation profile
@@ -23,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import pandas as pd
 
@@ -34,8 +31,8 @@ from . import eda_sources as sources
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
 
-GeneratedOutputViewKey: TypeAlias = str
-GeneratedOutputCapability: TypeAlias = str
+GeneratedOutputViewKey: TypeAlias = str  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
+GeneratedOutputCapability: TypeAlias = str  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 
 _CAPABILITY_GENERATED_OUTPUT: GeneratedOutputCapability = "generated_output"
 _CAPABILITY_SPATIAL_FIELDS: GeneratedOutputCapability = "spatial_fields"
@@ -69,7 +66,7 @@ def _profile_capabilities(simulation_profile: str) -> frozenset[GeneratedOutputC
 
 
 class GeneratedOutputEDAView:
-    """Describe and lazily materialize one admitted generated-output batch."""
+    """Describe and lazily materialize one current Generation campaign view."""
 
     def __init__(
         self,
@@ -133,6 +130,20 @@ class GeneratedOutputEDAView:
         return self._batch
 
     @property
+    def tooltip(self) -> str:
+        """Describe the actual Generation evidence behind this selector."""
+        return "; ".join(
+            (
+                f"Campaign: {self.batch.campaign_name}",
+                f"campaign digest: {self.batch.campaign_digest}",
+                f"profile: {self.simulation_profile}",
+                f"campaign purpose: {self.batch.campaign_purpose or 'unspecified'}",
+                f"domain profile: {self.batch.domain_profile}",
+                f"selected successful cases: {self.batch.selected_case_count}",
+            )
+        )
+
+    @property
     def case_numbers(self) -> tuple[int, ...]:
         """Return bounded admitted case numbers in canonical order."""
         return tuple(case.case_index for case in self._cases)
@@ -179,18 +190,115 @@ class GeneratedOutputEDAView:
         return self._frame
 
 
+class PublishedDatasetEDAView:
+    """Expose one lazy published package without impersonating Generation evidence."""
+
+    def __init__(self, *, manifest: dict[str, Any], case_limit: int | None, loader: Callable[[], pd.DataFrame]) -> None:
+        """Bind package membership and a bounded authoritative runtime loader."""
+        self.manifest = manifest
+        self._loader = loader
+        self._frame: pd.DataFrame | None = None
+        identities = manifest["source_case_identities"]
+        selected = identities if case_limit is None else identities[:case_limit]
+        if not selected:
+            message = "Published Dataset EDA requires at least one source case."
+            raise ValueError(message)
+        self._case_ids = (
+            tuple(sorted(str(case["source"]["simulation_case_id"]) for case in selected))
+            if self.task_id == "transient_drying"
+            else tuple(str(case["package_case_id"]) for case in selected)
+        )
+        if len(set(self._case_ids)) != len(self._case_ids):
+            message = "Published Dataset EDA source case identities must be unique."
+            raise ValueError(message)
+
+    @property
+    def key(self) -> str:
+        """Return the exact immutable package identity."""
+        return str(self.manifest["dataset_id"])
+
+    @property
+    def label(self) -> str:
+        """Keep the package's authored name and unambiguous identity visible."""
+        return f"{self.manifest['dataset_name']} [{self.key}]"
+
+    @property
+    def task_id(self) -> str:
+        """Return the admitted model-facing Dataset view."""
+        return str(self.manifest["dataset_view"])
+
+    @property
+    def simulation_profile(self) -> str:
+        """Expose the profile-native EDA frame dispatch identity."""
+        return self.task_id
+
+    @property
+    def capabilities(self) -> frozenset[GeneratedOutputCapability]:
+        """Expose stored states and conditioning without inventing full schedules."""
+        return _profile_capabilities(self.task_id) - {_CAPABILITY_COMPLETION, _CAPABILITY_SCHEDULE}
+
+    def supports(self, required_capabilities: Iterable[GeneratedOutputCapability]) -> bool:
+        """Resolve content availability without opening scientific arrays."""
+        return frozenset(required_capabilities).issubset(self.capabilities)
+
+    @property
+    def tooltip(self) -> str:
+        """Disclose package membership, provenance and deferred hash admission."""
+        return f"Published Dataset: {self.key}; view: {self.task_id}; selected cases: {self.case_count}; payload hash checked on load."
+
+    @property
+    def case_ids(self) -> tuple[str, ...]:
+        """Return exact selected source identities in frame order."""
+        return self._case_ids
+
+    @property
+    def case_numbers(self) -> tuple[int, ...]:
+        """Return stable one-based package selection positions."""
+        return tuple(range(1, len(self._case_ids) + 1))
+
+    @property
+    def case_count(self) -> int:
+        """Return the bounded case count before array materialization."""
+        return len(self._case_ids)
+
+    @property
+    def is_loaded(self) -> bool:
+        """Report whether this package has been materialized."""
+        return self._frame is not None
+
+    def case_id(self, case_number: int) -> str:
+        """Resolve a visible package position without changing source identity."""
+        if case_number not in self.case_numbers:
+            message = f"Published Dataset has no case position {case_number}."
+            raise ValueError(message)
+        return self._case_ids[case_number - 1]
+
+    def load(self) -> pd.DataFrame:
+        """Cache one bounded physical package projection after exact admission."""
+        if self._frame is None:
+            frame = self._loader()
+            if frame.attrs.get("task_id") != self.task_id or tuple(map(str, frame.index)) != self.case_ids:
+                message = f"Published EDA frame disagrees with package membership: {self.key}."
+                raise ValueError(message)
+            self._frame = frame
+        return self._frame
+
+
+type EDAView = GeneratedOutputEDAView | PublishedDatasetEDAView
+
+
 class GeneratedOutputEDACatalog:
     """Hold deterministic profile-native views over one admitted source catalog."""
 
     def __init__(
         self,
-        views: Iterable[GeneratedOutputEDAView],
+        views: Iterable[EDAView],
         *,
-        source_catalog: sources.GeneratedOutputEDACatalog,
+        source_catalog: sources.GeneratedOutputEDACatalog | sources.PublishedDatasetEDACatalog,
     ) -> None:
         """Validate globally unique batch keys and concise labels without loading frames."""
         resolved = tuple(views)
-        if not isinstance(source_catalog, sources.GeneratedOutputEDACatalog):
+        if not isinstance(source_catalog, sources.GeneratedOutputEDACatalog | sources.PublishedDatasetEDACatalog):
             message = "Generated-output catalog requires its source admission catalog."
             raise TypeError(message)
         keys = tuple(view.key for view in resolved)
@@ -206,12 +314,12 @@ class GeneratedOutputEDACatalog:
         self._views_by_key = {view.key: view for view in resolved}
 
     @property
-    def views(self) -> tuple[GeneratedOutputEDAView, ...]:
+    def views(self) -> tuple[EDAView, ...]:
         """Return profile-native views in deterministic presentation order."""
         return self._views
 
     @property
-    def source_catalog(self) -> sources.GeneratedOutputEDACatalog:
+    def source_catalog(self) -> sources.GeneratedOutputEDACatalog | sources.PublishedDatasetEDACatalog:
         """Return the authoritative source-level admission accounting."""
         return self._source_catalog
 
@@ -220,7 +328,7 @@ class GeneratedOutputEDACatalog:
         """Return the union of capabilities declared across every catalog view."""
         return frozenset().union(*(view.capabilities for view in self._views))
 
-    def view(self, key: GeneratedOutputViewKey) -> GeneratedOutputEDAView:
+    def view(self, key: GeneratedOutputViewKey) -> EDAView:
         """Resolve one unique profile-native view."""
         try:
             return self._views_by_key[key]
@@ -233,7 +341,7 @@ class GeneratedOutputEDACatalog:
         required_capabilities: Iterable[GeneratedOutputCapability],
         *,
         keys: Iterable[GeneratedOutputViewKey] | None = None,
-    ) -> tuple[GeneratedOutputEDAView, ...]:
+    ) -> tuple[EDAView, ...]:
         """Return selected or catalog views supplying every requested capability."""
         candidates = self._views if keys is None else tuple(self.view(key) for key in keys)
         return tuple(view for view in candidates if view.supports(required_capabilities))
@@ -399,7 +507,7 @@ class GeneratedOutputSelectionState:
         self,
         *,
         required_capabilities: Iterable[GeneratedOutputCapability] = (),
-    ) -> tuple[GeneratedOutputEDAView, ...]:
+    ) -> tuple[EDAView, ...]:
         """Return selected views compatible with every requested capability."""
         return self._catalog.views_for_capabilities(
             required_capabilities,

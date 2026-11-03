@@ -1,7 +1,4 @@
-"""
-evaluation_case.py
-
-Load one current-schema artifact case for every evaluation plot and viewer.
+"""Load one current-schema artifact case for every evaluation plot and viewer.
 
 Responsibilities:
   - Parse explicit NPZ paths already validated by the artifact service
@@ -22,7 +19,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
@@ -60,11 +57,11 @@ _STEADY_ARRAY_NAMES = frozenset(
         "coordinates",
         "Rx",
         "Ry",
-        "div_u",
-        "div_eps_u",
+        "flux_balance",
     }
 )
-_STEADY_RESIDUAL_NAMES = ("Rx", "Ry", "div_u", "div_eps_u")
+_STEADY_MAP_RESIDUAL_NAMES = ("Rx", "Ry")
+_STEADY_RESIDUAL_NAMES = (*_STEADY_MAP_RESIDUAL_NAMES, "flux_balance")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +90,8 @@ class EvaluationCase:
     metadata : Mapping[str, Any]
         Source metadata without authoritative identity duplication.
     residuals : Mapping[str, numpy.ndarray]
-        Full-grid steady residual arrays, empty for generic tasks.
+        Dimensionless steady residuals, empty for generic tasks: full-grid
+        ``Rx``/``Ry`` maps and the per-row ``flux_balance`` profile.
     permeability : numpy.ndarray | None
         Physical permeability components in square metres when available.
     permeability_names : tuple[str, ...]
@@ -152,19 +150,6 @@ class EvaluationCase:
 
         """
         return dict(zip(self.fields, self.units, strict=True))
-
-    @property
-    def input_field_units(self) -> dict[str, str]:
-        """
-        Return input field units in declared order.
-
-        Returns
-        -------
-        dict[str, str]
-            Input field names mapped to their physical units.
-
-        """
-        return dict(zip(self.input_fields, self.input_units, strict=True))
 
 
 def _string_vector(
@@ -484,12 +469,17 @@ def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCas
 
     residual_presence = tuple(name in payload for name in _STEADY_RESIDUAL_NAMES)
     if any(residual_presence) and not all(residual_presence):
-        msg = "Steady residual arrays must contain Rx, Ry, div_u, and div_eps_u together."
+        msg = "Steady residual arrays must contain Rx, Ry, and flux_balance together."
         raise ValueError(msg)
-    residuals = {name: _finite_array(payload[name], label=name, rank=2) for name in _STEADY_RESIDUAL_NAMES if name in payload}
+    residuals = {name: _finite_array(payload[name], label=name, rank=2) for name in _STEADY_MAP_RESIDUAL_NAMES if name in payload}
     if any(array.shape != prediction.shape[-2:] for array in residuals.values()):
-        msg = "Steady residual arrays must use the full learned-output grid."
+        msg = "Steady residual maps must use the full learned-output grid."
         raise ValueError(msg)
+    if "flux_balance" in payload:
+        residuals["flux_balance"] = _finite_array(payload["flux_balance"], label="flux_balance", rank=1)
+        if residuals["flux_balance"].shape != prediction.shape[-2:-1]:
+            msg = "Steady flux_balance must hold one value per learned-output grid row."
+            raise ValueError(msg)
 
     permeability = None
     permeability_names: tuple[str, ...] = ()
@@ -569,66 +559,6 @@ def load_case(frame: pd.DataFrame, row_position: int) -> EvaluationCase:
             raise TypeError(msg)
         return cast("EvaluationCase", loader(frame, row_position))
     return _load_case_uncached(frame, row_position)
-
-
-def iter_cases(
-    frame: pd.DataFrame,
-    *,
-    max_cases: int | None = None,
-) -> Iterator[EvaluationCase]:
-    """
-    Yield validated cases in exact saved artifact membership order.
-
-    Parameters
-    ----------
-    frame : pandas.DataFrame
-        Current evaluation frame containing admitted NPZ paths and case identity.
-    max_cases : int | None, optional
-        Positive prefix bound. ``None`` yields every saved row.
-
-    Yields
-    ------
-    EvaluationCase
-        One schema-validated physical case loaded through :func:`load_case`.
-
-    Raises
-    ------
-    ValueError
-        If ``max_cases`` is non-positive, boolean, or non-integral.
-    IndexError, FileNotFoundError, KeyError, TypeError
-        Propagated from case loading when persisted membership cannot be read.
-
-    Notes
-    -----
-    Prefixing never sorts or reranks the frame, so displayed order remains
-    identical to persisted artifact membership.
-
-    """
-    if max_cases is None:
-        count = len(frame)
-    else:
-        if isinstance(max_cases, bool) or not isinstance(max_cases, Integral) or int(max_cases) <= 0:
-            msg = "max_cases must be a positive integer or None."
-            raise ValueError(msg)
-        count = min(len(frame), int(max_cases))
-    for position in range(count):
-        yield load_case(frame, position)
-
-
-def grid_extent(case: EvaluationCase) -> tuple[float, float, float, float]:
-    """
-    Return the physical image extent in x-min, x-max, y-min, y-max order.
-
-    The values come from the case coordinate fields and therefore retain their
-    declared coordinate units. No pixel-center or half-cell padding is added.
-    """
-    x_values, y_values = case.coordinates
-    return (
-        float(np.nanmin(x_values)),
-        float(np.nanmax(x_values)),
-        float(np.nanmin(y_values)),
-        float(np.nanmax(y_values)),
-    )
 
 
 def grid_spacing(case: EvaluationCase) -> tuple[float, float]:

@@ -1,17 +1,14 @@
-"""
-analysis_display_labels.py
-
-Own concise scientific display labels while preserving canonical identities separately.
+"""Own concise scientific display labels while preserving canonical identities separately.
 
 Responsibilities:
-  - Humanize maintained task, material, regime, purpose, and role identifiers
+  - Humanize maintained task, material, physical domain, and run role identifiers
   - Hold the authoritative metadata required for one visible dataset label
   - Disambiguate colliding dataset labels with the shortest stable identity prefix
   - Preserve canonical identities as metadata rather than parsing presentation text
 
 Design principles:
   - Presentation labels never become storage, scientific, or persistence identities
-  - Task, material or variation, campaign, and role remain distinct visible concepts
+  - Source domains and Experiment evaluation roles remain distinct visible concepts
   - Collision suffixes are deterministic and appear only when required for uniqueness
 
 This module does NOT:
@@ -37,22 +34,11 @@ _TASK_LABELS = {
 }
 _EVALUATION_ROLE_LABELS = {
     "id": "ID",
-    "ood": "Near-family OOD",
+    "ood": "OOD",
+    "additional_evaluation": "Additional evaluation",
 }
 _EVALUATION_PROTOCOL_LABELS = {
     "normalized_drying_group_macro_rmse": "Drying group macro RMSE",
-}
-_ROLE_LABELS = {
-    "id": "ID",
-    "seen": "ID",
-    "id_source": "ID",
-    "parameter_ood": "P OOD",
-    "family_ood": "F OOD",
-    "held_out_family_ood": "F OOD",
-    "near_family_ood": "NF OOD",
-    "far_family_ood": "FF OOD",
-    "extreme_family_ood": "S OOD",
-    "stress_ood": "S OOD",
 }
 _ACRONYMS = frozenset({"id", "ood"})
 
@@ -65,8 +51,7 @@ class DatasetDisplayMetadata:
     material_family: str
     sampling_regime: str
     campaign_purpose: str | None
-    source_role: str | None
-    evaluation_regime: str | None
+    domain_profile: str | None
     canonical_identity: str
 
     def __post_init__(self) -> None:
@@ -76,8 +61,7 @@ class DatasetDisplayMetadata:
         _require_identifier(self.sampling_regime, label="sampling_regime")
         for label, value in (
             ("campaign_purpose", self.campaign_purpose),
-            ("source_role", self.source_role),
-            ("evaluation_regime", self.evaluation_regime),
+            ("domain_profile", self.domain_profile),
         ):
             if value is not None:
                 _require_identifier(value, label=label)
@@ -157,25 +141,6 @@ def evaluation_protocol_display_label(protocol: str) -> str:
     return _EVALUATION_PROTOCOL_LABELS.get(protocol, humanize_identifier(protocol))
 
 
-def campaign_role_display_label(metadata: DatasetDisplayMetadata) -> str:
-    """Return the authoritative concise evaluation role at the end of a label."""
-    if not isinstance(metadata, DatasetDisplayMetadata):
-        message = "metadata must be DatasetDisplayMetadata."
-        raise TypeError(message)
-    role = metadata.evaluation_regime
-    if role is None and metadata.sampling_regime == "parameter_ood":
-        role = "parameter_ood"
-    if role is None:
-        role = metadata.source_role
-    if role is None:
-        return "role unspecified"
-    known = _ROLE_LABELS.get(role)
-    if known is not None:
-        return known
-    humanized = humanize_identifier(role)
-    return humanized if humanized == "ID" else humanized[:1].lower() + humanized[1:]
-
-
 def dataset_display_label(metadata: DatasetDisplayMetadata) -> str:
     """
     Return the ordinary task-qualified dataset label without collision evidence.
@@ -188,7 +153,7 @@ def dataset_display_label(metadata: DatasetDisplayMetadata) -> str:
     Returns
     -------
     str
-        Task, material or variation, abbreviated campaign, and authoritative role.
+        Task, material or variation, abbreviated campaign, and physical domain.
 
     """
     if not isinstance(metadata, DatasetDisplayMetadata):
@@ -204,7 +169,8 @@ def dataset_display_label(metadata: DatasetDisplayMetadata) -> str:
                 metadata.campaign_purpose,
             )
         )
-    parts.append(campaign_role_display_label(metadata))
+    if metadata.domain_profile is not None:
+        parts.append(humanize_identifier(metadata.domain_profile))
     return " · ".join(parts)
 
 

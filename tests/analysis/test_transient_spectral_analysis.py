@@ -1,4 +1,15 @@
-# ruff: noqa: S101, D100, D103, SLF001
+"""Protect transient spectral reductions and nonuniform-time admission.
+
+Responsibilities:
+  - Check mixed-task channel selection and spectra from final valid stored states
+
+Design principles:
+  - Selected plots preserve temperature arrays and authoritative temporal support
+
+This module does NOT:
+  - Interpolate transient times or generate reference trajectories
+"""
+
 from __future__ import annotations
 
 import matplotlib.pyplot as plt

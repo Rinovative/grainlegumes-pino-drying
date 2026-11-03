@@ -1,7 +1,4 @@
-"""
-domain_task_steady_flow.py
-
-Declare the authoritative steady two-dimensional porous-flow task contract.
+"""Declare the authoritative steady two-dimensional porous-flow task contract.
 
 Responsibilities:
   - Exact ordered steady-flow input and output fields
@@ -26,7 +23,6 @@ from src.domain.physics import domain_physics_contracts as physics_contracts
 
 from .domain_task_spec import (
     TASK_SCHEMA_VERSION,
-    DatasetDefaults,
     FieldSpec,
     MetricSpec,
     OutputGroupSpec,
@@ -74,10 +70,6 @@ STEADY_FLOW = TaskSpec(
     tensor_layout=("batch", "channel", "y", "x"),
     operator_axes=(2, 3),
     normalization_axes=(0, 2, 3),
-    default_datasets=DatasetDefaults(
-        train="steady_flow__lentil+chickpea+kidney_bean__id",
-        ood=("lhs_var120_seed4001",),
-    ),
     preprocessing=PreprocessingSpec(
         input_normalization="train_fitted_per_channel_standardization",
         output_normalization="train_fitted_per_channel_standardization",
@@ -185,8 +177,7 @@ STEADY_FLOW = TaskSpec(
     physics=PhysicsSpec(
         kind=physics_contracts.STEADY_BRINKMAN_KIND,
         equation_set=physics_contracts.STEADY_BRINKMAN_EQUATION_SET,
-        continuity=physics_contracts.DEFAULT_CONTINUITY_KIND,
-        allowed_continuities=physics_contracts.available_continuity_kinds(),
+        continuity=physics_contracts.CONTINUITY_KIND,
         boundary=physics_contracts.PRESSURE_BOUNDARY_KIND,
     ),
 )

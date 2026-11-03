@@ -1,7 +1,4 @@
-"""
-evaluation_artifact_loader.py
-
-Load strict path-selected evaluation artifacts without generation or inference.
+"""Load strict path-selected evaluation artifacts without generation or inference.
 
 Responsibilities:
   - Admit one explicit current run directory independently of its storage alias
@@ -20,6 +17,15 @@ This module does NOT:
   - Import artifact generation, reconstruct models, or execute inference
   - Create, repair, rebuild, publish, upload, or remove artifact payloads
   - Render figures or manage evaluation-session caches
+
+Notes:
+  Role admission:
+    - Steady ID and OOD roles come from the saved split contract and are admitted independently under their exact run-owned roots.
+    - Transient drying uses a separate sequence-index path for ID and additional-evaluation roles; explicit scoped roots remain marked partial.
+  Optional runtime evidence:
+    - A valid runtime-comparison sidecar is attached separately from scientific artifact identity. An invalid sidecar is retained as an operational
+      issue without invalidating otherwise admitted artifacts.
+
 """
 
 from __future__ import annotations
@@ -43,8 +49,8 @@ if TYPE_CHECKING:
 
     from src.domain.tasks.domain_task_spec import TaskSpec
 
-ArtifactRole = Literal["eval", "ood"]
-ArtifactSelectionRole = Literal["id", "ood"]
+ArtifactRole = Literal["eval", "additional_evaluation"]
+ArtifactSelectionRole = Literal["id", "additional_evaluation"]
 
 __all__ = [
     "ArtifactRole",
@@ -66,7 +72,7 @@ class EvaluationArtifactLoadError(RuntimeError):
     ----------
     message : str
         Human-readable admission failure and recovery guidance.
-    role : {"eval", "ood"} | None
+    role : {"eval", "additional_evaluation"} | None
         Rejected artifact role when the failure is role-local.
     run_dir : pathlib.Path | None
         Exact current run directory when it is known.
@@ -117,7 +123,7 @@ class LoadedEvaluationArtifact:
 
     Parameters
     ----------
-    split_role : {"eval", "ood"}
+    split_role : {"eval", "additional_evaluation"}
         Exact saved split role represented by the artifact.
     dataset_name : str
         Canonical saved dataset identity for the role.
@@ -151,9 +157,9 @@ class LoadedRunArtifacts:
     run_dir : pathlib.Path
         Exact resolved current run directory.
     id_artifact : LoadedEvaluationArtifact
-        Artifact bound to saved evaluation membership and ``analysis/id``.
-    ood_artifact : LoadedEvaluationArtifact
-        Artifact bound to saved OOD membership and its named OOD root.
+        Artifact bound to saved ID-test membership and ``analysis/id``.
+    additional_artifact : LoadedEvaluationArtifact
+        Artifact bound to saved additional evaluation membership and its named root.
 
     """
 
@@ -161,10 +167,7 @@ class LoadedRunArtifacts:
     run_name: str
     run_dir: Path
     id_artifact: LoadedEvaluationArtifact | None
-    ood_artifact: LoadedEvaluationArtifact | None
-    lifecycle_status: str = "completed"
-    is_completed: bool = True
-    is_provisional: bool = False
+    additional_artifact: LoadedEvaluationArtifact | None = None
     selected_checkpoint_role: str = "best"
     selected_checkpoint_epoch: int | None = None
     selected_checkpoint_sha256: str = ""
@@ -188,7 +191,7 @@ class _SavedRole:
 
     Parameters
     ----------
-    split_role : {"eval", "ood"}
+    split_role : {"eval", "additional_evaluation"}
         Exact persisted membership role.
     dataset_name : str
         Canonical saved dataset name.
@@ -315,7 +318,7 @@ def _missing(*, task: str, run_name: str, run_dir: Path, role: ArtifactRole, roo
         Canonical completed-run selection.
     run_dir : pathlib.Path
         Exact current run directory used by the recovery command.
-    role : {"eval", "ood"}
+    role : {"eval", "additional_evaluation"}
         Missing saved split role.
     root : pathlib.Path
         Exact expected artifact root.
@@ -352,7 +355,7 @@ def _incompatible(
         Canonical completed-run selection.
     run_dir : pathlib.Path
         Exact current run directory used by the recovery command.
-    role : {"eval", "ood"}
+    role : {"eval", "additional_evaluation"}
         Rejected saved split role.
     root : pathlib.Path
         Exact observed artifact root.
@@ -381,45 +384,23 @@ def _saved_roles(
     run_dir: Path,
     task: str,
     task_spec: TaskSpec,
-) -> tuple[_SavedRole, _SavedRole]:
-    """Resolve admitted ID and OOD artifact roles from typed split evidence."""
+) -> tuple[_SavedRole, _SavedRole | None]:
+    """Resolve admitted ID-test and additional evaluation artifact roles from typed split evidence."""
     config = _mapping(completed.get("config"), label="completed config")
     split_contract = datasets.preprocessing.splits.admit_split_contract(_mapping(completed.get("split_indices"), label="completed split_indices"))
     if split_contract.task != task or split_contract.task_contract_digest != task_spec.contract_digest:
         msg = "Saved split task identity contradicts the evaluable run task contract."
         raise ValueError(msg)
     data_config = _mapping(config.get("data"), label="config.yaml data")
-    id_evidence = split_contract.role("eval")
-    ood_evidence = split_contract.role("ood")
-    id_name = common.paths.validate_logical_name(
-        id_evidence.source.dataset_id,
-        label="saved eval dataset identity",
-    )
-    ood_name = common.paths.validate_logical_name(
-        ood_evidence.source.dataset_id,
-        label="saved OOD dataset identity",
-    )
-    if id_evidence.source.data_contract_digest != task_spec.data_contract_digest:
-        msg = "Saved ID dataset identity contradicts the evaluable run data contract."
-        raise ValueError(msg)
-    if ood_evidence.source.data_contract_digest != task_spec.data_contract_digest:
-        msg = "Saved OOD dataset identity contradicts the evaluable run data contract."
-        raise ValueError(msg)
+    id_evidence = split_contract.id_test
+    id_name = common.paths.validate_logical_name(id_evidence.source.dataset_id, label="saved ID dataset identity")
     if data_config.get("train_dataset") != id_name:
         msg = "config.yaml data.train_dataset contradicts saved ID dataset identity."
         raise ValueError(msg)
-    raw_configured_ood = data_config.get("ood_datasets")
-    if not isinstance(raw_configured_ood, list) or not raw_configured_ood:
-        msg = "config.yaml data.ood_datasets must contain one or more logical dataset ids."
+    evidences = [id_evidence] + ([] if split_contract.additional_evaluation is None else [split_contract.additional_evaluation])
+    if any(evidence.source.data_contract_digest != task_spec.data_contract_digest for evidence in evidences):
+        msg = "Saved dataset identity contradicts the evaluable run data contract."
         raise ValueError(msg)
-    configured_ood = tuple(
-        common.paths.validate_logical_name(dataset_id, label=f"config.yaml data.ood_datasets[{index}]")
-        for index, dataset_id in enumerate(raw_configured_ood)
-    )
-    if len(configured_ood) != len(set(configured_ood)) or datasets.contracts.identity.combined_dataset_id(configured_ood) != ood_name:
-        msg = "config.yaml data.ood_datasets do not match the saved OOD package-combination identity."
-        raise ValueError(msg)
-
     id_role = _SavedRole(
         split_role="eval",
         dataset_name=id_evidence.source.dataset_id,
@@ -428,15 +409,19 @@ def _saved_roles(
         saved_membership_digest=id_evidence.membership_digest,
         root=common.paths.resolve_id_analysis_dir(run_dir).absolute(),
     )
-    ood_role = _SavedRole(
-        split_role="ood",
-        dataset_name=ood_evidence.source.dataset_id,
-        dataset_identity=ood_evidence.source.as_dict(),
-        source_indices=ood_evidence.index_values,
-        saved_membership_digest=ood_evidence.membership_digest,
-        root=common.paths.resolve_ood_analysis_dir(run_dir, ood_name).absolute(),
+    additional = split_contract.additional_evaluation
+    if additional is None:
+        return id_role, None
+    additional_name = common.paths.validate_logical_name(additional.source.dataset_id, label="saved additional evaluation identity")
+    additional_role = _SavedRole(
+        split_role="additional_evaluation",
+        dataset_name=additional_name,
+        dataset_identity=additional.source.as_dict(),
+        source_indices=additional.index_values,
+        saved_membership_digest=additional.membership_digest,
+        root=common.paths.resolve_additional_evaluation_analysis_dir(run_dir, additional_name).absolute(),
     )
-    return id_role, ood_role
+    return id_role, additional_role
 
 
 def _expected_run_provenance(
@@ -455,9 +440,6 @@ def _expected_run_provenance(
         "best_checkpoint_sha256": summary["best_checkpoint_sha256"],
         "normalizer_sha256": summary["normalizer_sha256"],
         "best_checkpoint_epoch": evaluation["selected_checkpoint_epoch"],
-        "lifecycle_status": evaluation["lifecycle_status"],
-        "is_completed": evaluation["is_completed"],
-        "is_provisional": evaluation["is_provisional"],
         "selected_checkpoint_role": evaluation["selected_checkpoint_role"],
     }
 
@@ -603,99 +585,11 @@ def _expected_evaluator_provenance(
     }
 
 
-def _expected_physics_provenance(
-    *,
-    config: Mapping[str, Any],
-    task_spec: TaskSpec,
-) -> dict[str, Any] | None:
-    """
-    Return the exact current steady-Brinkman diagnostic contract.
-
-    Parameters
-    ----------
-    config : collections.abc.Mapping
-        Validated resolved run configuration.
-    task_spec : TaskSpec
-        Validated persisted task contract.
-
-    Returns
-    -------
-    dict[str, Any] | None
-        Exact physics provenance for steady Brinkman tasks, otherwise ``None``.
-
-    Raises
-    ------
-    TypeError, ValueError
-        If the selected continuity is malformed or not allowed by the task.
-
-    """
+def _expected_physics_provenance(task_spec: TaskSpec) -> dict[str, Any] | None:
+    """Return the exact current steady-Brinkman diagnostic contract, if any."""
     if task_spec.physics.kind != domain.physics.contracts.STEADY_BRINKMAN_KIND:
         return None
-    loss = _mapping(config.get("loss"), label="config.yaml loss")
-    physics_config = _mapping(loss.get("physics"), label="config.yaml loss.physics")
-    continuity = _nonempty_string(
-        physics_config.get("continuity"),
-        label="config.yaml loss.physics.continuity",
-    )
-    if continuity not in task_spec.physics.allowed_continuities:
-        msg = f"Selected training continuity {continuity!r} is not allowed by task {task_spec.id!r}."
-        raise ValueError(msg)
-    return {
-        "residual_schema_version": contracts.RESIDUAL_SCHEMA_VERSION,
-        "task_id": task_spec.id,
-        "task_contract_digest": task_spec.contract_digest,
-        "equation_kind": task_spec.physics.kind,
-        "equation_set": task_spec.physics.equation_set,
-        "boundary_condition_kind": task_spec.physics.boundary,
-        "selected_training_continuity": continuity,
-        "evaluated_continuity_formulations": list(domain.physics.contracts.available_continuity_kinds()),
-        "constants": {
-            "dynamic_viscosity_pa_s": domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY,
-            "porosity_floor": domain.physics.brinkman.POROSITY_FLOOR,
-            "permeability_scale_floor_m2": domain.physics.brinkman.PERMEABILITY_SCALE_FLOOR,
-            "permeability_determinant_floor": domain.physics.brinkman.PERMEABILITY_DETERMINANT_FLOOR,
-            "permeability_cross_ratio_clip": domain.physics.brinkman.PERMEABILITY_CROSS_RATIO_CLIP,
-        },
-        "permeability_representation": {
-            "Kxx": "10**stored_log10_ratio_to_1_m2",
-            "Kxy": "stored_dimensionless_ratio_times_sqrt(Kxx*Kyy)",
-            "Kyy": "10**stored_log10_ratio_to_1_m2",
-            "inverse": "normalized_symmetric_2x2_inverse_with_declared_floors",
-        },
-        "derivatives": {
-            "kind": contracts.ARTIFACT_DERIVATIVE_KIND,
-            "extension": contracts.ARTIFACT_DERIVATIVE_EXTENSION,
-            "operator_axes": list(task_spec.operator_axes),
-            "grid_axes": ["y", "x"],
-        },
-        "interior_crop": contracts.EVAL_PAD,
-        "residual_evaluation_region": {
-            "momentum_residual_mse": "interior grid after symmetric cell crop",
-            "div_velocity_mse": "interior grid after symmetric cell crop",
-            "div_eps_velocity_mse": "interior grid after symmetric cell crop",
-            "pressure_boundary_mse": "full-grid inlet and outlet masks",
-            "pressure_inlet_mse": "full-grid y-min inlet mask",
-            "pressure_outlet_mean_square": "square of the sample mean on the full-grid y-max outlet mask",
-            "residual_arrays": "full grid",
-        },
-        "scalar_definitions": {
-            "momentum_residual_mse": {"formula": "mean(Rx**2 + Ry**2)", "unit": "(Pa/m)^2"},
-            "div_velocity_mse": {"formula": "mean(div(u)**2)", "unit": "1/s^2"},
-            "div_eps_velocity_mse": {"formula": "mean(div(eps*u)**2)", "unit": "1/s^2"},
-            "pressure_boundary_mse": {
-                "formula": "pressure_inlet_mse + pressure_outlet_mean_square",
-                "unit": "Pa^2",
-            },
-            "pressure_inlet_mse": {"formula": "mean_inlet((p-p_in_bc)**2)", "unit": "Pa^2"},
-            "pressure_outlet_mean_square": {"formula": "mean_outlet(p)**2", "unit": "Pa^2"},
-        },
-        "array_definitions": {
-            "Rx": {"formula": "-dp/dx + div(tau)_x - mu*(K^-1*u)_x", "unit": "Pa/m"},
-            "Ry": {"formula": "-dp/dy + div(tau)_y - mu*(K^-1*u)_y", "unit": "Pa/m"},
-            "div_u": {"formula": "du/dx + dv/dy", "unit": "1/s"},
-            "div_eps_u": {"formula": "d(eps*u)/dx + d(eps*v)/dy", "unit": "1/s"},
-        },
-    }
+    return contracts.steady_physics_provenance(task_spec)
 
 
 def _validate_runtime_provenance(value: Any) -> int:
@@ -756,7 +650,7 @@ def _effective_selection(
     selection = _mapping(provenance.get("selection"), label="artifact provenance selection")
     membership_digest = contracts.ordered_indices_sha256(role.source_indices)
     expected = {
-        "index_key": "eval_indices" if role.split_role == "eval" else "ood_indices",
+        "index_key": "id_test_indices" if role.split_role == "eval" else "additional_evaluation_indices",
         "full_selected_case_count": len(role.source_indices),
         "effective_case_count": len(role.source_indices),
         "generation_limit": None,
@@ -824,7 +718,8 @@ def _validate_payload_membership(
         msg = "Artifact Parquet case_index values do not match saved source identities."
         raise ValueError(msg)
 
-    expected_paths = tuple((role.root / "npz" / f"case_{case_index:04d}.npz").absolute() for case_index in expected_case_indices)
+    case_files = dataframe.dataset_case_payload_filenames(_runtime_case_ids(role, frame))
+    expected_paths = tuple((role.root / "npz" / name).absolute() for name in case_files)
     raw_paths = frame["npz_path"].tolist()
     if any(not isinstance(value, str) or not value for value in raw_paths):
         msg = "Artifact Parquet npz_path values must be non-empty strings."
@@ -848,7 +743,7 @@ def _validate_payload_membership(
         msg = "Artifact provenance outputs.npz must be a list."
         raise TypeError(msg)
     manifest_paths = tuple(_mapping(item, label=f"artifact provenance outputs.npz[{index}]").get("path") for index, item in enumerate(npz_outputs))
-    expected_manifest_paths = tuple(sorted(f"npz/case_{case_index:04d}.npz" for case_index in expected_case_indices))
+    expected_manifest_paths = tuple(sorted(f"npz/{name}" for name in case_files))
     if manifest_paths != expected_manifest_paths:
         msg = "Artifact manifest NPZ membership does not match saved source membership."
         raise ValueError(msg)
@@ -900,7 +795,7 @@ def _bind_artifact_to_run(
 
     """
     provenance = dataframe.require_complete_provenance(frame)
-    expected_physics = _expected_physics_provenance(config=config, task_spec=task_spec)
+    expected_physics = _expected_physics_provenance(task_spec)
     expected_keys = {
         "provenance_schema_version",
         "artifact_schema_version",
@@ -1230,6 +1125,88 @@ def _load_role(
     )
 
 
+def _transient_physical_membership(
+    source_dataset_ids: Any,
+    source_identities: Any,
+    case_ids_by_source: Any,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, Any]:
+    """Project exact package/source and complete-case associations without sampling items."""
+    if (
+        not isinstance(source_dataset_ids, list)
+        or (not source_dataset_ids and not allow_empty)
+        or not all(isinstance(value, str) and value for value in source_dataset_ids)
+        or len(source_dataset_ids) != len(set(source_dataset_ids))
+        or not isinstance(source_identities, list)
+        or not isinstance(case_ids_by_source, list)
+        or len(source_dataset_ids) != len(source_identities)
+        or len(source_dataset_ids) != len(case_ids_by_source)
+    ):
+        message = "Transient physical membership has malformed package associations."
+        raise ValueError(message)
+    case_ids: list[str] = []
+    for dataset_id, identity, group in zip(source_dataset_ids, source_identities, case_ids_by_source, strict=True):
+        if (
+            not isinstance(identity, Mapping)
+            or identity.get("dataset_id") != dataset_id
+            or not isinstance(identity.get("index_digest"), str)
+            or not identity["index_digest"]
+            or not isinstance(identity.get("data_contract_digest"), str)
+            or not identity["data_contract_digest"]
+            or not isinstance(group, list)
+            or not group
+            or not all(isinstance(value, str) and value for value in group)
+            or len(group) != len(set(group))
+        ):
+            message = "Transient physical membership has malformed Source/case evidence."
+            raise ValueError(message)
+        case_ids.extend(group)
+    if len(case_ids) != len(set(case_ids)):
+        message = "Transient physical membership repeats a case across packages."
+        raise ValueError(message)
+    return {
+        "source_dataset_ids": list(source_dataset_ids),
+        "source_identities": deepcopy(source_identities),
+        "case_ids_by_source": deepcopy(case_ids_by_source),
+    }
+
+
+def _transient_physical_split(split: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry every already-admitted physical split role into Evaluation without extra reads."""
+    dataset = _mapping(split.get("dataset_identity"), label="transient split Dataset identity")
+    train = _mapping(dataset.get("train"), label="transient split training Dataset")
+    roles = _mapping(split.get("roles"), label="transient split roles")
+    scalar_roles = ("train", "validation", "id_test", "scaling_train_one_step")
+    if set(roles) != {*scalar_roles, "additional_evaluation"}:
+        message = "Transient physical split lacks exact saved roles."
+        raise ValueError(message)
+    physical = {
+        role: _transient_physical_membership(
+            [train.get("dataset_id")],
+            [dict(train)],
+            [_mapping(roles[role], label=f"transient {role} membership").get("case_ids")],
+        )
+        for role in scalar_roles
+    }
+    additional_role = _mapping(roles["additional_evaluation"], label="transient additional physical split")
+    if set(additional_role) != {"parts"}:
+        message = "Transient additional physical split requires exact saved parts evidence."
+        raise ValueError(message)
+    additional = additional_role["parts"]
+    identities = dataset.get("additional_evaluation")
+    if not isinstance(additional, list) or not isinstance(identities, list):
+        message = "Transient additional physical split evidence must contain package lists."
+        raise TypeError(message)
+    physical["additional_evaluation"] = _transient_physical_membership(
+        [_mapping(identity, label="additional Dataset identity").get("dataset_id") for identity in identities],
+        identities,
+        [_mapping(role, label="additional case membership").get("case_ids") for role in additional],
+        allow_empty=True,
+    )
+    return physical
+
+
 def _load_admitted_transient_run_artifacts(
     run_dir: Path,
     admitted: Mapping[str, Any],
@@ -1238,17 +1215,14 @@ def _load_admitted_transient_run_artifacts(
     artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
 ) -> LoadedRunArtifacts:
     """Load completed transient sequence roles without static artifact assumptions."""
-    if not bool(admitted.get("is_completed")):
-        msg = "Transient Evaluation requires a completed run; provisional artifacts are not admitted."
-        raise ValueError(msg)
     from src.analysis.artifacts import transient  # noqa: PLC0415
 
     plan = transient.transient_artifact_plan_from_completed(
         admitted,
         run_dir=run_dir,
     )
-    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "ood"}):
-        msg = "artifact_roles must contain unique values from {'id', 'ood'}."
+    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "additional_evaluation"}):
+        msg = "Transient artifact_roles must contain unique values from {'id', 'additional_evaluation'}."
         raise ValueError(msg)
     overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
     if set(overrides).difference(artifact_roles):
@@ -1260,9 +1234,9 @@ def _load_admitted_transient_run_artifacts(
         *,
         selection_role: ArtifactSelectionRole,
     ) -> LoadedEvaluationArtifact:
-        split_role: ArtifactRole = "eval" if selection_role == "id" else "ood"
+        split_role: ArtifactRole = "eval" if selection_role == "id" else "additional_evaluation"
         if role_plan is None:
-            root = common.paths.resolve_analysis_root(run_dir) / "ood"
+            root = common.paths.resolve_analysis_root(run_dir) / "additional_evaluation"
             raise _missing(
                 task="transient_drying",
                 run_name=plan.run_name,
@@ -1273,7 +1247,7 @@ def _load_admitted_transient_run_artifacts(
         canonical_root = (
             common.paths.resolve_id_analysis_dir(run_dir)
             if selection_role == "id"
-            else common.paths.resolve_ood_analysis_dir(run_dir, role_plan.dataset_name)
+            else common.paths.resolve_additional_evaluation_analysis_dir(run_dir, role_plan.dataset_name)
         ).absolute()
         override = overrides.get(selection_role)
         root = canonical_root if override is None else Path(override).expanduser().resolve(strict=False)
@@ -1343,6 +1317,7 @@ def _load_admitted_transient_run_artifacts(
         frame.attrs["transient_sequence_index"] = loaded
         frame.attrs["transient_unavailable_horizons"] = loaded.unavailable_horizons
         frame.attrs["transient_scaling_state"] = deepcopy(cast("Mapping[str, Any]", admitted["normalizer_state"]))
+        frame.attrs["transient_physical_split"] = _transient_physical_split(_mapping(admitted.get("split_indices"), label="admitted transient split"))
         frame.attrs[dataframe.COMPLETED_RUN_CONFIG_ATTR] = deepcopy(dict(cast("Mapping[str, Any]", admitted["config"])))
         return LoadedEvaluationArtifact(
             split_role=split_role,
@@ -1353,17 +1328,16 @@ def _load_admitted_transient_run_artifacts(
         )
 
     id_artifact = load_role(plan.id_role, selection_role="id") if "id" in artifact_roles else None
-    ood_artifact = load_role(plan.ood_role, selection_role="ood") if "ood" in artifact_roles else None
+    additional_artifact = (
+        load_role(plan.additional_role, selection_role="additional_evaluation") if "additional_evaluation" in artifact_roles else None
+    )
     summary = _mapping(admitted.get("summary"), label="completed transient summary")
     return LoadedRunArtifacts(
         task="transient_drying",
         run_name=plan.run_name,
         run_dir=run_dir,
         id_artifact=id_artifact,
-        ood_artifact=ood_artifact,
-        lifecycle_status="completed",
-        is_completed=True,
-        is_provisional=False,
+        additional_artifact=additional_artifact,
         selected_checkpoint_role=str(admitted["selected_checkpoint_role"]),
         selected_checkpoint_epoch=int(admitted["selected_checkpoint_epoch"]),
         selected_checkpoint_sha256=str(admitted["selected_checkpoint_sha256"]),
@@ -1375,7 +1349,7 @@ def _load_admitted_run_artifacts(
     run_dir: Path,
     admitted: Mapping[str, Any],
     *,
-    artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
 ) -> LoadedRunArtifacts:
     """Load both artifact roles from one already admitted current run path."""
@@ -1385,10 +1359,18 @@ def _load_admitted_run_artifacts(
     normalizer_state = _mapping(admitted.get("normalizer_state"), label="evaluable normalizer state")
     task_spec = experiments.config.loader.validate_resolved_task_contract(config)
     if task_spec.id == "transient_drying":
+        selected_roles: tuple[ArtifactSelectionRole, ...]
+        if artifact_roles is None:
+            from src.analysis.artifacts import transient  # noqa: PLC0415
+
+            plan = transient.transient_artifact_plan_from_completed(admitted, run_dir=run_dir)
+            selected_roles = ("id", "additional_evaluation") if plan.additional_role is not None else ("id",)
+        else:
+            selected_roles = artifact_roles
         return _load_admitted_transient_run_artifacts(
             run_dir,
             admitted,
-            artifact_roles=artifact_roles,
+            artifact_roles=selected_roles,
             artifact_root_overrides=artifact_root_overrides,
         )
     if artifact_root_overrides:
@@ -1412,15 +1394,12 @@ def _load_admitted_run_artifacts(
     evidence_summary["best_checkpoint_sha256"] = admitted["selected_checkpoint_sha256"]
     evidence_summary["normalizer_sha256"] = admitted["normalizer_sha256"]
     evaluation = {
-        "lifecycle_status": admitted["lifecycle_status"],
-        "is_completed": admitted["is_completed"],
-        "is_provisional": admitted["is_provisional"],
         "selected_checkpoint_role": admitted["selected_checkpoint_role"],
         "selected_checkpoint_epoch": admitted["selected_checkpoint_epoch"],
         "selected_checkpoint_sha256": admitted["selected_checkpoint_sha256"],
     }
     try:
-        id_role, ood_role = _saved_roles(
+        id_role, additional_role = _saved_roles(
             completed=admitted,
             run_dir=run_dir,
             task=task_spec.id,
@@ -1430,8 +1409,13 @@ def _load_admitted_run_artifacts(
         msg = f"Evaluable run has incompatible saved artifact identity: {type(error).__name__}: {error}"
         raise ValueError(msg) from error
 
-    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "ood"}):
-        msg = "artifact_roles must contain unique values from {'id', 'ood'}."
+    if artifact_roles is None:
+        artifact_roles = ("id", "additional_evaluation") if additional_role is not None else ("id",)
+    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "additional_evaluation"}):
+        msg = "artifact_roles must contain unique values from {'id', 'additional_evaluation'}."
+        raise ValueError(msg)
+    if "additional_evaluation" in artifact_roles and additional_role is None:
+        msg = "Evaluable run has no saved additional evaluation role."
         raise ValueError(msg)
 
     def load_role(role: _SavedRole) -> LoadedEvaluationArtifact:
@@ -1448,8 +1432,8 @@ def _load_admitted_run_artifacts(
         )
 
     id_artifact = load_role(id_role) if "id" in artifact_roles else None
-    ood_artifact = load_role(ood_role) if "ood" in artifact_roles else None
-    for artifact in (id_artifact, ood_artifact):
+    additional_artifact = load_role(additional_role) if additional_role is not None and "additional_evaluation" in artifact_roles else None
+    for artifact in (id_artifact, additional_artifact):
         if artifact is not None:
             artifact.frame.attrs[dataframe.COMPLETED_RUN_CONFIG_ATTR] = deepcopy(dict(config))
     return LoadedRunArtifacts(
@@ -1457,10 +1441,7 @@ def _load_admitted_run_artifacts(
         run_name=scientific_run_name,
         run_dir=run_dir,
         id_artifact=id_artifact,
-        ood_artifact=ood_artifact,
-        lifecycle_status=str(evaluation["lifecycle_status"]),
-        is_completed=bool(evaluation["is_completed"]),
-        is_provisional=bool(evaluation["is_provisional"]),
+        additional_artifact=additional_artifact,
         selected_checkpoint_role=str(evaluation["selected_checkpoint_role"]),
         selected_checkpoint_epoch=(int(evaluation["selected_checkpoint_epoch"]) if evaluation["selected_checkpoint_epoch"] is not None else None),
         selected_checkpoint_sha256=str(evaluation["selected_checkpoint_sha256"] or ""),
@@ -1471,7 +1452,7 @@ def _load_admitted_run_artifacts(
 def load_run_artifacts(
     run_dir: Path | str,
     *,
-    artifact_roles: tuple[ArtifactSelectionRole, ...] = ("id", "ood"),
+    artifact_roles: tuple[ArtifactSelectionRole, ...] | None = None,
     artifact_root_overrides: Mapping[ArtifactSelectionRole, Path | str] | None = None,
 ) -> LoadedRunArtifacts:
     """
@@ -1482,7 +1463,7 @@ def load_run_artifacts(
     validated ``config.yaml`` and ``summary.json`` evidence.
     """
     path = Path(run_dir).expanduser().resolve()
-    with experiments.run.evaluable_run_lease(path) as admitted:
+    with experiments.run.saved_artifact_run_lease(path) as admitted:
         return _load_admitted_run_artifacts(
             path,
             admitted,

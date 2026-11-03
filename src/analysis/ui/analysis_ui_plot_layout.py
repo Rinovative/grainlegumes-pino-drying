@@ -1,7 +1,4 @@
-"""
-analysis_ui_plot_layout.py
-
-Define shared notebook-scale physical-map and colorbar presentation.
+"""Define shared notebook-scale physical-map and colorbar presentation.
 
 Responsibilities:
   - Create equal-sized physical-map subplot grids
@@ -21,16 +18,17 @@ This module does NOT:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import Normalize, TwoSlopeNorm
+from matplotlib.colors import Normalize
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-untyped]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
@@ -63,6 +61,22 @@ MAP_LAYOUT = MapLayoutContract()
 _MINIMUM_GRID_TOP = 0.10
 
 
+@contextmanager
+def eda_typography() -> Iterator[None]:
+    """Moderately enlarge EDA figure text for an opt-in plotting scope."""
+    with plt.rc_context(
+        {
+            "font.size": 11.5,
+            "axes.titlesize": 12.5,
+            "axes.labelsize": 11.5,
+            "xtick.labelsize": 10.5,
+            "ytick.labelsize": 10.5,
+            "legend.fontsize": 10.5,
+        }
+    ):
+        yield
+
+
 def linear_norm(*values: np.ndarray) -> Normalize:
     """Return one finite linear normalization with stable constant-field limits."""
     if not values:
@@ -79,22 +93,6 @@ def linear_norm(*values: np.ndarray) -> Normalize:
         lower -= padding
         upper += padding
     return Normalize(vmin=lower, vmax=upper)
-
-
-def signed_norm(*values: np.ndarray) -> TwoSlopeNorm:
-    """Return one symmetric finite normalization centered exactly at zero."""
-    if not values:
-        message = "Signed map normalization requires at least one array."
-        raise ValueError(message)
-    combined = np.concatenate(tuple(np.ravel(np.asarray(value, dtype=np.float64)) for value in values))
-    if not np.isfinite(combined).all():
-        message = "Signed map normalization requires finite physical values."
-        raise ValueError(message)
-    limit = max(
-        float(np.max(np.abs(combined))),
-        float(np.finfo(np.float64).eps),
-    )
-    return TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
 
 
 def map_subplots(

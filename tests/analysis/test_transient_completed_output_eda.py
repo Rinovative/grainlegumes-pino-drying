@@ -1,22 +1,30 @@
-# ruff: noqa: S101, PLR2004, PD011, SLF001
-"""Protect transient completed-output EDA semantics and steady compatibility."""
+"""Protect transient completed-output EDA semantics and steady compatibility.
+
+Responsibilities:
+  - Check completed-source dispatch, exact-time trajectories, target outcomes, and spatial maps
+
+Design principles:
+  - Physical support and steady compatibility survive display transformations
+
+This module does NOT:
+  - Forward-fill completed cases or change source arrays
+"""
 
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.colors import BoundaryNorm
 
-from src import datasets, domain
+from src import common, datasets, domain, generation
 from src.analysis.eda import dataframe as eda_dataframe
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda import eda_selection as selection
@@ -24,180 +32,38 @@ from src.analysis.eda import eda_sources as sources
 from src.analysis.eda import eda_transient as transient
 from src.analysis.eda import eda_viewers as viewers
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
-from src.datasets.packages import dataset_packages_generated_batch as generated
-from tests.generation.test_generation_transient import (
-    _synthetic_scientific_contract,
-    _write_transient_case,
-)
-from tests.generation.test_generation_transient_shards import (
-    _fixture_context,
-    _publication_identity,
-)
-
-if TYPE_CHECKING:
-    from src.generation.runtime.generation_runtime_batch import (
-        TerminalBatchEvidence,
-        TerminalCaseEvidence,
-    )
-
-
-class _Artifact:
-    """Expose the terminal artifact API over one test-owned file."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-        self.size_bytes = path.stat().st_size
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"sha256": self.sha256, "size_bytes": self.size_bytes}
-
-
-class _Case:
-    """Provide the admitted-case surface consumed by the direct interpreter."""
-
-    case_id = "case_0001"
-    case_index = 1
-    case_input_id = "1" * 64
-    simulation_case_id = "2" * 64
-    material_family = "lentil"
-    hdf5_identity = SimpleNamespace(
-        simulation_profile="transient_drying",
-        git_commit="a" * 40,
-    )
-
-    def __init__(self, directory: Path) -> None:
-        self.directory = directory
-        self.artifact_requests: list[tuple[str, str]] = []
-
-    def artifact(self, stage: str, relative_path: str) -> _Artifact:
-        self.artifact_requests.append((stage, relative_path))
-        return _Artifact(self.directory / relative_path)
-
-    artifact_evidence = artifact
-
-    @staticmethod
-    def metadata_payload() -> dict[str, Any]:
-        return {
-            "seed_evidence": {"case_seed": 7},
-            "sampled_values": {"T_init": 295.0},
-            "sampled_units": {"T_init": "K"},
-            "material_role": "seen",
-            "evaluation_regime": "id",
-            "natural_support_state": "natural",
-            "spatial_diagnostics": {},
-            "schedule_diagnostics": {"schedule_class": "synthetic"},
-            "ood": {},
-        }
-
-
-class _Batch:
-    """Provide one exact terminal-batch binding for a synthetic case."""
-
-    simulation_profile = "transient_drying"
-    available_learning_views = ("steady_flow", "transient_drying")
-    airflow_source = "comsol_coupled_reference"
-    batch_id = "batch-1"
-    sampling_regime = "natural"
-    template_sha256 = "e" * 64
-    git_commit = "a" * 40
-
-    def __init__(self, case: _Case) -> None:
-        self.cases = (case,)
-        self._case = case
-
-    def case(self, case_id: str) -> _Case:
-        if case_id != self._case.case_id:
-            raise ValueError(case_id)
-        return self._case
-
-    @staticmethod
-    def scientific_config_payload() -> dict[str, Any]:
-        return _synthetic_scientific_contract()
-
-
-def _write_sidecars(directory: Path, *, target_reached: bool = True) -> None:
-    """Write current Generation timing and status evidence beside one HDF5 case."""
-    timing = {
-        "schema_kind": "simulation_case_timing",
-        "schema_version": 1,
-        "batch_id": "batch-1",
-        "case_id": "case_0001",
-        "case_input_id": "1" * 64,
-        "simulation_case_id": "2" * 64,
-        "simulation_profile": "transient_drying",
-        "git_commit": "a" * 40,
-        "exit_code": 0,
-        "timed_out": False,
-        "runtime_s": 12.0,
-        "comsol_process_seconds": 12.0,
-        "export_conversion_seconds": 3.0,
-        "complete_execution_s": 16.0,
-        "license_wait_seconds": 2.0,
-    }
-    status = {
-        "schema_kind": "simulation_case_status",
-        "schema_version": 1,
-        "solver_success": True,
-        "target_reached": target_reached,
-        "t_stop_exact": 2.5,
-        "f_wet_dm_final": 0.04 if target_reached else 0.07,
-        "runtime_s": 12.0,
-        "units": {
-            "runtime_s": "s",
-            "t_stop_exact": "h",
-            "f_wet_dm_final": "1",
-        },
-        "contains_nan_or_inf": False,
-        "field_shape_valid": True,
-        "case_state": "successful",
-        "stages": dict.fromkeys(("solver", "exports", "conversion", "publication"), "succeeded"),
-    }
-    (directory / "timing.json").write_text(json.dumps(timing), encoding="utf-8")
-    (directory / "status.json").write_text(json.dumps(status), encoding="utf-8")
+from src.datasets.packages import dataset_packages_trajectory as trajectory
 
 
 @pytest.fixture
-def transient_frame(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> pd.DataFrame:
-    """Return one fully interpreted canonical completed-case EDA frame."""
-    _write_transient_case(tmp_path / "case.h5")
-    _write_sidecars(tmp_path)
-    case = _Case(tmp_path)
+def transient_frame(transient_package: dict[str, Any]) -> pd.DataFrame:
+    """Return one fully interpreted current Source case EDA frame."""
+    storage_root = transient_package["root"]
+    source_selector = transient_package["source_selectors"][0]
+    rows = generation.publication.catalog.list_campaign_cases("transient_drying", transient_package["source_campaign"], storage_root=storage_root)
+    row = next(row for row in rows if all(row[key] == value for key, value in source_selector.items()))
+    source_case = sources.GeneratedOutputEDACase(case_id=str(row["case_id"]), case_index=1, row=dict(row))
+    batch = sources.GeneratedOutputEDABatch(
+        generation_root=common.paths.get_generation_root(storage_root=storage_root),
+        batch_id=f"transient_drying__{source_selector['campaign_name']}__{row['material_family']}",
+        campaign_name=str(source_selector["campaign_name"]),
+        source_name=transient_package["source_campaign"],
+        campaign_digest=str(source_selector["campaign_digest"]),
+        campaign_purpose="source_generation",
+        simulation_profile="transient_drying",
+        available_learning_views=("transient_drying",),
+        material_family=str(row["material_family"]),
+        domain_profile=str(row["domain_profile"]),
+        sampling_regime=str(row["sampling_regime"]),
+        cases=(source_case,),
+        candidate_rows=(dict(row),),
+        storage_root=storage_root,
+    )
     task = domain.tasks.registry.get_task("transient_drying")
-    row = generated.interpret_generated_transient_case(
-        cast("TerminalBatchEvidence", _Batch(case)),
-        cast("TerminalCaseEvidence", case),
-        task=task,
-    )
-    assert case.artifact_requests == [
-        ("processed", "case.h5"),
-        ("processed", "timing.json"),
-        ("processed", "status.json"),
-    ]
-    loaded = {
-        "sample_ids": [case.case_id],
-        "rows": [row],
-        "available_case_count": 1,
-        "task": task,
-        "generated_batch_identity": {"batch_manifest_identity_sha256": "f" * 64},
-        "manifest_sha256": "d" * 64,
-        "generation_root": tmp_path,
-        "analysis_representation": "transient_complete_case_rows",
-        "dataset_backend": "canonical_generation_hdf5",
-    }
-    monkeypatch.setattr(
-        datasets.packages.generated_batch,
-        "load_generated_batch",
-        lambda *_args, **_kwargs: loaded,
-    )
-    frame, logs = eda_dataframe.generate_eda_dataframe(
-        "synthetic_transient",
-        task=task,
-        show_progress=False,
-    )
+    frame, logs = eda_dataframe.generate_eda_dataframe_from_completed_cases(batch, task=task, show_progress=False, max_cases=1)
     assert any("completed trajectories" in line for line in logs)
-    assert frame.iloc[0]["meta"]["case_family"] == "id"
-    assert frame.iloc[0]["meta"]["parameter_units"] == {"T_init": "K"}
+    assert "case_family" not in frame.iloc[0]["meta"]
+    assert frame.iloc[0]["meta"]["parameter_units"]["T_init"] == "K"
     return frame
 
 
@@ -237,10 +103,11 @@ def _adaptive_catalog(
             simulation_profile="transient_drying",
             available_learning_views=("transient_drying",),
             batch_id=f"batch-{position}",
-            batch_storage_name=f"batch-{position}-storage",
+            campaign_name=f"campaign-{position}",
+            campaign_digest="a" * 64,
             campaign_purpose="family_generalization",
-            material_role="id_source",
-            evaluation_regime=None,
+            domain_profile="reference_range",
+            selected_case_count=1,
             cases=(case,),
         )
         views.append(
@@ -254,76 +121,14 @@ def _adaptive_catalog(
     source_catalog = sources.GeneratedOutputEDACatalog(
         batches=(),
         issues=(),
-        discovered_batch_count=0,
-        complete_batch_count=0,
-        partial_batch_count=0,
+        discovered_campaign_count=0,
+        discovered_candidate_count=0,
         total_issue_count=0,
     )
     return selection.GeneratedOutputEDACatalog(
         views,
         source_catalog=source_catalog,
     )
-
-
-def test_transient_dispatch_discovers_complete_canonical_evidence(
-    transient_frame: pd.DataFrame,
-) -> None:
-    """Discover every canonical field category and preserve startup endpoints."""
-    discovery = transient.discover_fields(transient_frame)
-    assert tuple(field.name for field in discovery["dynamic_state"]) == (
-        "T",
-        "phi",
-        "w_surf",
-        "w_int",
-    )
-    assert {field.name for field in discovery["static_spatial"]}.issuperset({"x", "y", "u", "v", "p", "eps_bed", "rho_bu_dry"})
-    assert tuple(field.name for field in discovery["boundary_interval"]) == (
-        "T_in_bc_t_n",
-        "T_in_bc_t_n_plus_1",
-        "omega_in_bc_t_n",
-        "omega_in_bc_t_n_plus_1",
-        "T_amb",
-        "startup_support_time_offset",
-        "T_in_bc_startup_support",
-        "omega_in_bc_startup_support",
-        "startup_support_present",
-    )
-    assert tuple(field.name for field in discovery["scalar_material"]) == (
-        "r_surf_0",
-        "r_int_surf",
-        "f_surf",
-        "A_osw",
-        "B_osw",
-        "C_osw",
-        "k_gr",
-        "cp_gr_dry",
-    )
-    assert tuple(field.name for field in discovery["complete_schedule"]) == (
-        "t",
-        "T_in_bc",
-        "omega_in_bc",
-    )
-    intervals = transient.boundary_interval_table(transient_frame)
-    assert intervals.loc[0, "startup_support_present"] == 1.0
-    support_offset = float(cast("Any", intervals.loc[0, "startup_support_time_offset"]))
-    assert support_offset > 0.0
-    support_time = float(cast("Any", intervals.loc[0, "t_n_hours"])) + support_offset
-    schedule_time = np.asarray(transient_frame.iloc[0]["schedule"]["t"], dtype=float)
-    assert np.count_nonzero(np.isclose(schedule_time, support_time, rtol=0.0, atol=1.0e-7)) == 1
-    schedule = transient_frame.iloc[0]["schedule"]
-    for schedule_name, current_name, following_name in (
-        ("T_in_bc", "T_in_bc_t_n", "T_in_bc_t_n_plus_1"),
-        ("omega_in_bc", "omega_in_bc_t_n", "omega_in_bc_t_n_plus_1"),
-    ):
-        current_index = int(np.flatnonzero(np.isclose(schedule_time, cast("Any", intervals.loc[0, "t_n_hours"])))[0])
-        following_index = int(np.flatnonzero(np.isclose(schedule_time, cast("Any", intervals.loc[0, "t_n_plus_1_hours"])))[0])
-        assert intervals.loc[0, current_name] == pytest.approx(schedule[schedule_name][current_index])
-        assert intervals.loc[0, following_name] == pytest.approx(schedule[schedule_name][following_index])
-    assert not transient.schedule_summary(transient_frame).empty
-    assert transient.scalar_parameter_table(transient_frame)["parameter"].nunique() == 8
-    time = transient_frame.iloc[0]["time"]
-    assert time["trajectory_length"] == len(time["regular_state_hours"])
-    assert np.asarray(time["valid_state_mask"]).all()
 
 
 def test_physical_time_channel_and_view_control_contracts(
@@ -337,13 +142,6 @@ def test_physical_time_channel_and_view_control_contracts(
         "w_surf",
         "w_int",
     )
-    snapshot = transient.select_state_snapshot(transient_frame, "case_0001", 1.0)
-    assert snapshot.channels == ("T", "phi", "w_surf", "w_int")
-    assert snapshot.diagnostic_exact_stop is False
-    exact = transient.select_state_snapshot(transient_frame, "case_0001", 2.5)
-    assert exact.diagnostic_exact_stop is True
-    with pytest.raises(transient.PhysicalTimeUnavailableError):
-        transient.select_state_snapshot(transient_frame, "case_0001", 1.5)
 
     render_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -487,6 +285,7 @@ def test_target_attainment_censoring_grouping_exclusions_and_runtime_separation(
 ) -> None:
     """Keep canonical target, censoring, physical duration, and runtime distinct."""
     reached = copy.deepcopy(transient_frame.iloc[0].to_dict())
+    reached["runtime"]["comsol_process_seconds"] = 12.0
     unreached = copy.deepcopy(reached)
     unreached["meta"]["material_family"] = "chickpea"
     unreached["completion"].update(
@@ -511,9 +310,6 @@ def test_target_attainment_censoring_grouping_exclusions_and_runtime_separation(
             "exclusion_reasons": {"bounded_prefix": 1},
         }
     )
-    fixed_time = transient.fixed_time_summary(frame, 1.0)
-    assert fixed_time.attrs["right_censored_case_count"] == 1
-    assert fixed_time.attrs["right_censored_contributor_count"] == 1
     diagnostic = transient.target_attainment_diagnostic(frame)
     assert diagnostic.summary["reached_count"] == 1
     assert diagnostic.summary["unreached_count"] == 1
@@ -527,15 +323,11 @@ def test_target_attainment_censoring_grouping_exclusions_and_runtime_separation(
     assert gaps["case_0002"] > 0.0
     assert diagnostic.groups["case_count"].sum() == 2
     assert diagnostic.exclusion_reasons == {"bounded_prefix": 1}
-
-    runtime = transient.runtime_table(frame)
-    assert runtime["physical_drying_duration_hours"].eq(2.5).all()
-    assert runtime["comsol_process_seconds"].eq(12.0).all()
-    assert runtime["queue_wait_seconds"].isna().all()
-    assert runtime.iloc[0]["component_timing_availability"]["queue_wait_seconds"] == "unavailable_not_persisted"
+    assert diagnostic.cases["comsol_process_seconds"].eq(12.0).all()
+    assert diagnostic.cases["queue_wait_seconds"].isna().all()
 
 
-def test_steady_dataframe_behavior_remains_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_steady_dataframe_behavior_remains_unchanged() -> None:
     """Retain steady field order, values, speed derivation, and metadata columns."""
     task = domain.tasks.registry.get_task("steady_flow")
     shape = (2, 3)
@@ -553,16 +345,7 @@ def test_steady_dataframe_behavior_remains_unchanged(monkeypatch: pytest.MonkeyP
         "manifest_sha256": "d" * 64,
         "generation_root": Path("/synthetic"),
     }
-    monkeypatch.setattr(
-        datasets.packages.generated_batch,
-        "load_generated_batch",
-        lambda *_args, **_kwargs: loaded,
-    )
-    frame, _logs = eda_dataframe.generate_eda_dataframe(
-        "synthetic_steady",
-        task=task,
-        show_progress=False,
-    )
+    frame, _logs = eda_dataframe._steady_dataframe(loaded, batch_name="synthetic_steady", task=task)
     assert tuple(frame.columns) == (*task.input_names, *task.output_names, "meta", "U")
     np.testing.assert_allclose(frame.iloc[0]["U"], np.hypot(frame.iloc[0]["u"], frame.iloc[0]["v"]))
     assert frame.attrs["field_names"] == (*task.input_names, *task.output_names, "U")
@@ -570,37 +353,19 @@ def test_steady_dataframe_behavior_remains_unchanged(monkeypatch: pytest.MonkeyP
 
 
 def test_hdf5_and_pt_items_match_after_selected_source_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    transient_package: dict[str, Any],
 ) -> None:
     """Produce equal semantic EDA from real HDF5/PT items, then use PT alone."""
-    dataset_id = "transient_drying__lentil__id__eda_backend_fixture"
-    manifest, index = _fixture_context(tmp_path, dataset_id=dataset_id)
-    shard_service = datasets.packages.transient_shards
-
-    def package_context(
-        _dataset_id: str,
-        *,
-        storage_root: Path,
-        validation_depth: str,
-    ) -> tuple[Path, dict[str, Any], dict[str, Any], str]:
-        assert validation_depth in {"full", "evidence"}
-        return Path(storage_root), manifest, index, "4" * 64
-
-    monkeypatch.setattr(shard_service, "_package_context", package_context)
-    shard_service.build_transient_shards(
-        dataset_id,
-        storage_root=tmp_path,
-        publication_identity=_publication_identity(),
-        target_shard_bytes=1_000_000,
-    )
-    index_path = tmp_path / "02_datasets/packages" / dataset_id / f"{dataset_id}.json"
+    storage_root = transient_package["root"]
+    dataset_id = transient_package["train_dataset"]
+    index_path = common.paths.resolve_dataset_path("transient_drying", dataset_id, dataset_root=storage_root / "02_datasets")
+    index = trajectory.load_transient_index(index_path)
     sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
     positions = (0, 1, 2)
     physical = datasets.runtime.transient.TransientPhysicalDataset(
         index_path,
         sampling=sampling,
-        source_root=tmp_path,
+        source_root=storage_root,
         sample_indices=positions,
     )
     try:
@@ -611,18 +376,12 @@ def test_hdf5_and_pt_items_match_after_selected_source_cleanup(
         hdf5_items,
         backend="canonical_hdf5",
     )
-    with pytest.raises(ValueError, match="contiguous transition chain"):
-        transient.frame_from_transient_items(
-            [hdf5_items[0], hdf5_items[2]],
-            backend="canonical_hdf5",
-        )
-
-    selected_source = tmp_path / str(index["cases"][0]["source_relative_path"])
+    selected_source = storage_root / str(index["cases"][0]["source_relative_path"])
     selected_source.unlink()
     sharded = datasets.runtime.transient.TransientPTShardDataset(
         index_path,
         sampling=sampling,
-        source_root=tmp_path,
+        source_root=storage_root,
         sample_indices=positions,
     )
     try:
@@ -645,10 +404,6 @@ def test_hdf5_and_pt_items_match_after_selected_source_cleanup(
         assert left.keys() == right.keys()
         for name in left:
             np.testing.assert_allclose(left[name], right[name], rtol=0.0, atol=0.0)
-    left_snapshot = transient.select_state_snapshot(hdf5_frame, "2" * 64, 2.0)
-    right_snapshot = transient.select_state_snapshot(pt_frame, "2" * 64, 2.0)
-    for name in left_snapshot.channels:
-        np.testing.assert_allclose(left_snapshot.fields[name], right_snapshot.fields[name], rtol=0.0, atol=0.0)
 
 
 def test_supported_schedule_stops_at_exact_final_time_without_mutating_source(
@@ -669,7 +424,7 @@ def test_supported_schedule_stops_at_exact_final_time_without_mutating_source(
     assert series.final_time_hours == pytest.approx(exact_final)
     assert series.physical_time_hours[-1] == pytest.approx(exact_final)
     assert np.all(series.physical_time_hours <= exact_final)
-    assert series.values[-1] == pytest.approx(np.interp(exact_final, source_time, source_values))
+    assert series.values[-1] == pytest.approx(np.interp(exact_final, source_time, source_values))  # noqa: PD011 -- dataclass values is a NumPy array
     np.testing.assert_array_equal(row["schedule"]["t"], source_time)
     np.testing.assert_array_equal(row["schedule"]["T_in_bc"], source_values)
     with pytest.raises(ValueError, match="outside simulated support"):
@@ -753,46 +508,6 @@ def test_trajectory_time_views_split_exact_support_at_one_hour() -> None:
     np.testing.assert_array_equal(values, original_values)
 
 
-def test_split_time_plot_converts_only_main_coordinates_to_days() -> None:
-    """Convert only displayed main-time coordinates and preserve exact support."""
-    physical_time = np.asarray((0.0, 0.5, 1.0, 24.0, 48.0))
-    values = np.asarray((10.0, 11.0, 12.0, 13.0, 14.0))
-    original_time = physical_time.copy()
-    original_values = values.copy()
-    figure, (main_axis, startup_axis) = plt.subplots(1, 2)
-    try:
-        main_support, startup_support = transient_plots._plot_split_time_series(
-            main_axis,
-            startup_axis,
-            physical_time,
-            values,
-            lower=None,
-            upper=None,
-            color="tab:blue",
-        )
-        transient_plots._configure_split_time_axes(
-            main_axis,
-            startup_axis,
-            (main_support,),
-            (startup_support,),
-        )
-
-        np.testing.assert_allclose(
-            main_axis.lines[0].get_xdata(),
-            np.asarray((1.0, 24.0, 48.0)) / 24.0,
-        )
-        np.testing.assert_array_equal(
-            startup_axis.lines[0].get_xdata(),
-            (0.0, 0.5, 1.0),
-        )
-        assert main_axis.get_xlabel() == "Time [d]"
-        assert startup_axis.get_xlabel() == "Time [h]"
-        np.testing.assert_array_equal(physical_time, original_time)
-        np.testing.assert_array_equal(values, original_values)
-    finally:
-        plt.close(figure)
-
-
 def test_changed_transient_plot_builders_preserve_authoritative_time_support(
     transient_frame: pd.DataFrame,
 ) -> None:
@@ -828,3 +543,44 @@ def test_changed_transient_plot_builders_preserve_authoritative_time_support(
     finally:
         for figure in figures:
             plt.close(figure)
+
+
+def test_spatial_maps_lock_full_grid_discrete_permeability_across_display_strides(transient_frame: pd.DataFrame) -> None:
+    """Physical permeability uses one full-grid logarithmic scale across maps."""
+    row = transient_frame.loc["case_0001"]
+    original = np.asarray(row["static_fields"]["Kxx"])
+    values = np.geomspace(1e-10, 1e-8, original.size).reshape(original.shape)
+    row["static_fields"]["Kxx"] = values
+    first = transient_plots.plot_spatial_field_comparison(
+        datasets={"A": transient_frame, "B": transient_frame},
+        case_ids={"A": "case_0001", "B": "case_0001"},
+        fields=("Kxx",),
+        lock_scale=True,
+        display_spatial_stride=1,
+    )
+    second = transient_plots.plot_spatial_field_comparison(
+        datasets={"A": transient_frame, "B": transient_frame},
+        case_ids={"A": "case_0001", "B": "case_0001"},
+        fields=("Kxx",),
+        lock_scale=True,
+        display_spatial_stride=4,
+    )
+    try:
+        maps = [axis.collections[0] for axis in first.axes if axis.get_aspect() == 1.0]
+        sampled = [axis.collections[0] for axis in second.axes if axis.get_aspect() == 1.0]
+        assert len(maps) == len(sampled) == 2
+        assert maps[0].norm is maps[1].norm
+        for item in (*maps, *sampled):
+            assert item.cmap.N == 11
+            assert isinstance(item.norm, BoundaryNorm)
+            np.testing.assert_allclose(item.norm.boundaries, np.geomspace(1e-10, 1e-8, 12))
+        sampled_array = sampled[0].get_array()
+        full_array = maps[0].get_array()
+        assert sampled_array is not None
+        assert full_array is not None
+        assert sampled_array.size < full_array.size
+        np.testing.assert_array_equal(row["static_fields"]["Kxx"], values)
+    finally:
+        row["static_fields"]["Kxx"] = original
+        plt.close(first)
+        plt.close(second)

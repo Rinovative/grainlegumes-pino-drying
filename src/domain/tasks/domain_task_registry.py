@@ -1,10 +1,7 @@
-"""
-domain_task_registry.py
-
-Register and resolve semantic task and task-selected physics identifiers.
+"""Register and resolve semantic task and task-selected physics identifiers.
 
 Responsibilities:
-  - Expose the exact set of registered task identifiers
+  - Hold the exact set of registered task identifiers
   - Resolve immutable TaskSpec objects without aliases or fallbacks
   - Resolve task-owned physics selectors by semantic identifier
 
@@ -33,19 +30,6 @@ _TASKS: Final = MappingProxyType({STEADY_FLOW.id: STEADY_FLOW, TRANSIENT_DRYING.
 _PHYSICS: Final = MappingProxyType({STEADY_FLOW.physics.kind: STEADY_FLOW.physics, TRANSIENT_DRYING.physics.kind: TRANSIENT_DRYING.physics})
 
 
-def available_tasks() -> tuple[str, ...]:
-    """
-    Return registered task identifiers in deterministic order.
-
-    Returns
-    -------
-    tuple[str, ...]
-        Exact semantic task identifiers accepted by the registry.
-
-    """
-    return tuple(sorted(_TASKS))
-
-
 def get_task(task_id: str) -> TaskSpec:
     """
     Resolve an exact semantic task identifier.
@@ -69,22 +53,9 @@ def get_task(task_id: str) -> TaskSpec:
     try:
         return _TASKS[task_id]
     except KeyError as error:
-        available = ", ".join(available_tasks())
+        available = ", ".join(sorted(_TASKS))
         msg = f"Unknown task {task_id!r}. Available tasks: {available}."
         raise ValueError(msg) from error
-
-
-def available_physics() -> tuple[str, ...]:
-    """
-    Return registered semantic physics identifiers.
-
-    Returns
-    -------
-    tuple[str, ...]
-        Exact physics selectors owned by registered tasks.
-
-    """
-    return tuple(sorted(_PHYSICS))
 
 
 def resolve_physics(kind: str) -> PhysicsSpec:
@@ -110,6 +81,6 @@ def resolve_physics(kind: str) -> PhysicsSpec:
     try:
         return _PHYSICS[kind]
     except KeyError as error:
-        available = ", ".join(available_physics())
+        available = ", ".join(sorted(_PHYSICS))
         msg = f"Unknown physics identifier {kind!r}. Available physics: {available}."
         raise ValueError(msg) from error

@@ -1,7 +1,4 @@
-"""
-evaluation_selection.py
-
-Own synchronized Evaluation notebook selection state.
+"""Own synchronized Evaluation notebook selection state.
 
 Responsibilities:
   - Retain selected experiments, child runs, artifact role, and analysis scope
@@ -23,18 +20,17 @@ This module does NOT:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from numbers import Real
 from pathlib import Path
-from types import MappingProxyType
 from typing import Literal
 
 from src.analysis.evaluation import evaluation_run_discovery as run_discovery
 
 EvaluationScope = Literal["aggregate", "single"]
-ArtifactRole = Literal["id", "ood", "both"]
+ArtifactRole = Literal["id", "additional_evaluation", "both"]
 EvaluationProtocol = Literal[
     "teacher_forced_one_step",
     "autonomous_full",
@@ -46,7 +42,7 @@ SelectionObserver = Callable[
 ]
 
 _SCOPE_VALUES = frozenset({"aggregate", "single"})
-_ARTIFACT_ROLES = frozenset({"id", "ood", "both"})
+_ARTIFACT_ROLES = frozenset({"id", "additional_evaluation", "both"})
 _TRANSIENT_PROTOCOLS = frozenset(
     {
         "teacher_forced_one_step",
@@ -180,15 +176,6 @@ class EvaluationSelectionState:
         if callback in self._observers:
             self._observers.remove(callback)
 
-    def groups_by_task(
-        self,
-    ) -> Mapping[str, tuple[run_discovery.EvaluationRunGroup, ...]]:
-        """Return deterministic experiment groups partitioned by persisted task."""
-        grouped: dict[str, list[run_discovery.EvaluationRunGroup]] = {}
-        for group in self._catalog.groups:
-            grouped.setdefault(group.task, []).append(group)
-        return MappingProxyType({task: tuple(groups) for task, groups in grouped.items()})
-
     def group(self) -> run_discovery.EvaluationRunGroup:
         """Return the exact selected experiment group."""
         if len(self._selection.experiment_identities) != 1:
@@ -229,6 +216,7 @@ class EvaluationSelectionState:
             replace(
                 self._selection,
                 task=group.task,
+                artifact_role=("id" if group.task != self._selection.task else self._selection.artifact_role),
                 experiment_identities=(group.identity_sha256,),
                 run_dirs=selected,
                 channels=(),
@@ -237,16 +225,6 @@ class EvaluationSelectionState:
                 protocol=None,
                 horizon=None,
             )
-        )
-
-    def select_runs(self, run_dirs: Sequence[Path | str]) -> None:
-        """Select exact children within the current experiment."""
-        if len(self._selection.experiment_identities) != 1:
-            message = "Use select_catalog_runs for a multi-experiment comparison."
-            raise RuntimeError(message)
-        self.select_experiment(
-            self._selection.experiment_identities[0],
-            run_dirs=run_dirs,
         )
 
     def select_catalog_runs(self, run_dirs: Sequence[Path | str]) -> None:
@@ -273,6 +251,7 @@ class EvaluationSelectionState:
             replace(
                 self._selection,
                 task=next(iter(tasks)),
+                artifact_role=("id" if next(iter(tasks)) != self._selection.task else self._selection.artifact_role),
                 experiment_identities=identities,
                 run_dirs=selected,
                 channels=(),
@@ -284,7 +263,7 @@ class EvaluationSelectionState:
         )
 
     def select_artifact_role(self, role: ArtifactRole) -> None:
-        """Select ID, OOD, or paired ID+OOD and clear role-local coordinates."""
+        """Select a task-owned artifact role and clear role-local coordinates."""
         if role not in _ARTIFACT_ROLES:
             message = f"Unknown Evaluation artifact role {role!r}."
             raise ValueError(message)

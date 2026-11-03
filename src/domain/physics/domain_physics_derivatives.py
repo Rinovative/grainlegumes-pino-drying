@@ -1,7 +1,4 @@
-"""
-domain_physics_derivatives.py
-
-Provide reusable spatial derivative operators for physical tensor fields.
+"""Provide reusable spatial derivative operators for physical tensor fields.
 
 Responsibilities:
   - Infer uniform-grid spacing from explicit coordinate tensors
@@ -21,20 +18,26 @@ This module does NOT:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Protocol, cast
+from functools import cache
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from torch import Tensor
-from torch.nn import functional
 
 from . import domain_physics_contracts as physics_contracts
 
+if TYPE_CHECKING:
+    from neuralop.layers.fourier_continuation import FCLegendre
+
 SpatialAxes = tuple[int, int]
 _MIN_SPATIAL_POINTS = 2
+# Fourier-continuation contract: Legendre fit through 5 boundary points per side
+# and 50 smooth continuation points per axis (neuraloperator defaults).
+FOURIER_CONTINUATION_MATCHING_POINTS = 5
+FOURIER_CONTINUATION_ADDITIONAL_POINTS = 50
 _SPATIAL_AXIS_COUNT = 2
-_DEFAULT_UNIFORM_TOLERANCE = 1e-5
+_UNIFORM_TOLERANCE = 1e-5
 _RECTILINEAR_EPSILON_FACTOR = 32.0
 _UNIFORM_ROUNDOFF_FACTOR = 4.0
 
@@ -48,21 +51,6 @@ class DerivativeOperator(Protocol):
     ``divergence`` returns ``d(field_x)/dx + d(field_y)/dy`` without cropping or
     scalar reduction.
     """
-
-    @property
-    def kind(self) -> physics_contracts.DerivativeKind:
-        """Return the semantic derivative identifier."""
-        ...
-
-    @property
-    def extension(self) -> physics_contracts.SpectralExtension:
-        """Return the explicit boundary-extension identifier."""
-        ...
-
-    @property
-    def axes(self) -> SpatialAxes:
-        """Return the explicit ``(y, x)`` spatial axes."""
-        ...
 
     def gradient(
         self,
@@ -84,7 +72,7 @@ class DerivativeOperator(Protocol):
         ...
 
 
-def _normalized_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
+def normalize_spatial_axes(ndim: int, axes: SpatialAxes) -> SpatialAxes:
     """
     Normalize the declared ``(y, x)`` axes for a tensor rank.
 
@@ -110,8 +98,8 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
     Validate a differentiable real field and return normalized spatial axes.
 
     The function does not copy data. Each declared spatial dimension must have
-    at least two points, which is the minimum shared by the physical stencil and
-    reflected FFT extension.
+    at least two points, the minimum of the physical stencil; Fourier
+    continuation checks its larger boundary-fit minimum separately.
 
     Raises
     ------
@@ -127,7 +115,7 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
     if not field.is_floating_point():
         msg = f"Derivative fields must use a floating dtype, got {field.dtype}."
         raise TypeError(msg)
-    normalized = _normalized_axes(field.ndim, axes)
+    normalized = normalize_spatial_axes(field.ndim, axes)
     if any(field.shape[axis] < _MIN_SPATIAL_POINTS for axis in normalized):
         msg = f"Derivative spatial axes require at least two points, got shape {tuple(field.shape)}."
         raise ValueError(msg)
@@ -166,12 +154,53 @@ def _spacing_float(spacing: float | Tensor, *, reference: Tensor, label: str) ->
     return float(value.detach().cpu().item())
 
 
+def _divergence(
+    operator: DerivativeOperator,
+    field_x: Tensor,
+    field_y: Tensor,
+    spacing_x: float | Tensor,
+    spacing_y: float | Tensor,
+) -> Tensor:
+    """
+    Return ``d(field_x)/dx + d(field_y)/dy`` through the operator's ``gradient``.
+
+    Parameters
+    ----------
+    operator : DerivativeOperator
+        Operator whose ``gradient`` differentiates each component.
+    field_x, field_y : torch.Tensor
+        Real floating vector components with identical shapes and arbitrary
+        leading dimensions.
+    spacing_x, spacing_y : float or torch.Tensor
+        Finite positive scalar physical spacings shared by both components.
+
+    Returns
+    -------
+    torch.Tensor
+        Divergence with the component shape, dtype, and device. Units are
+        component units per spacing unit when both components share units.
+
+    Raises
+    ------
+    TypeError
+        If either component is not a real floating tensor.
+    ValueError
+        If component shapes, axes, spatial lengths, or spacings are invalid.
+
+    """
+    if field_x.shape != field_y.shape:
+        msg = f"Vector component shapes must match, got {tuple(field_x.shape)} and {tuple(field_y.shape)}."
+        raise ValueError(msg)
+    derivative_x, _ = operator.gradient(field_x, spacing_x, spacing_y)
+    _, derivative_y = operator.gradient(field_y, spacing_x, spacing_y)
+    return derivative_x + derivative_y
+
+
 def infer_uniform_spacing(
     x_coordinate: Tensor,
     y_coordinate: Tensor,
     *,
     axes: SpatialAxes = (-2, -1),
-    uniform_tolerance: float = _DEFAULT_UNIFORM_TOLERANCE,
 ) -> tuple[Tensor, Tensor]:
     """
     Infer positive spacing from finite, increasing, uniform Cartesian grids.
@@ -182,10 +211,6 @@ def infer_uniform_spacing(
         Rectilinear coordinate fields with matching shapes.
     axes : tuple[int, int], optional
         ``(y_axis, x_axis)`` in the coordinate tensors.
-    uniform_tolerance : float, optional
-        Maximum finite non-negative scientific relative deviation from mean
-        spacing, applied together with a dtype- and coordinate-scale-aware
-        floating-point roundoff allowance.
 
     Returns
     -------
@@ -196,33 +221,25 @@ def infer_uniform_spacing(
     Raises
     ------
     TypeError
-        If coordinates are not floating tensors or the tolerance is not a real
-        non-boolean number.
+        If coordinates are not floating tensors.
     ValueError
         If shapes/axes differ, values are non-finite, the grid is not increasing
-        rectilinear Cartesian data, or spacing exceeds ``uniform_tolerance``.
+        rectilinear Cartesian data, or spacing is not uniform.
 
     Notes
     -----
     Cross-axis coordinate variation is admitted only at a small dtype-scaled
     roundoff tolerance. Along each varying axis, strict monotonicity remains
-    mandatory. Uniformity admits the configured relative deviation plus four
-    source-dtype epsilons at the coordinate scale, which covers subtraction of
-    independently rounded coordinate endpoints and mean-spacing reduction
-    without treating materially nonuniform grids as Cartesian.
+    mandatory. Uniformity admits a fixed relative deviation from mean spacing
+    plus four source-dtype epsilons at the coordinate scale, which covers
+    subtraction of independently rounded coordinate endpoints and mean-spacing
+    reduction without treating materially nonuniform grids as Cartesian.
 
     """
     y_axis, x_axis = _validate_field(x_coordinate, axes)
     _validate_field(y_coordinate, axes)
     if x_coordinate.shape != y_coordinate.shape:
         msg = f"Coordinate shapes must match, got {tuple(x_coordinate.shape)} and {tuple(y_coordinate.shape)}."
-        raise ValueError(msg)
-    if isinstance(uniform_tolerance, bool) or not isinstance(uniform_tolerance, (int, float)):
-        msg = f"uniform_tolerance must be a real number, got {type(uniform_tolerance).__name__}."
-        raise TypeError(msg)
-    tolerance = float(uniform_tolerance)
-    if not math.isfinite(tolerance) or tolerance < 0:
-        msg = "uniform_tolerance must be finite and non-negative."
         raise ValueError(msg)
     if not bool(torch.isfinite(x_coordinate).all().item()) or not bool(torch.isfinite(y_coordinate).all().item()):
         msg = "Coordinate grids must contain only finite values."
@@ -262,14 +279,14 @@ def infer_uniform_spacing(
         source_epsilon = torch.finfo(coordinate.dtype).eps
         coordinate_scale = coordinate.detach().to(torch.float64).abs().amax().clamp_min(mean.abs())
         roundoff_allowance = _UNIFORM_ROUNDOFF_FACTOR * source_epsilon * coordinate_scale
-        relative_allowance = tolerance * mean.abs()
+        relative_allowance = _UNIFORM_TOLERANCE * mean.abs()
         maximum_deviation = (differences - mean).abs().amax()
         allowed_deviation = relative_allowance + roundoff_allowance
         if bool((maximum_deviation > allowed_deviation).item()):
             msg = (
                 f"{label}-coordinate spacing is not uniform: maximum absolute deviation "
                 f"{float(maximum_deviation.detach().cpu().item()):.12g} exceeds the combined "
-                f"relative ({tolerance:.12g}) and {coordinate.dtype} roundoff allowance "
+                f"relative ({_UNIFORM_TOLERANCE:.12g}) and {coordinate.dtype} roundoff allowance "
                 f"{float(allowed_deviation.detach().cpu().item()):.12g}."
             )
             raise ValueError(msg)
@@ -311,7 +328,7 @@ def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> 
         raise ValueError(msg)
     if crop == 0:
         return field
-    normalized = _normalized_axes(field.ndim, axes)
+    normalized = normalize_spatial_axes(field.ndim, axes)
     if any(2 * crop >= field.shape[axis] for axis in normalized):
         msg = f"crop={crop} removes the complete spatial domain from shape {tuple(field.shape)}."
         raise ValueError(msg)
@@ -334,28 +351,10 @@ class PhysicalDerivatives:
     ----------
     axes : tuple[int, int]
         Declared ``(y, x)`` axes, normalized and validated when an operation runs.
-    kind : Literal["physical", "spectral"]
-        Semantic metadata identifier. The canonical factory value is
-        ``"physical"``.
-    extension : Literal["none", "reflect"]
-        Must be ``"none"`` for this implementation.
-
-    Raises
-    ------
-    ValueError
-        If constructed with an extension other than ``"none"``.
 
     """
 
     axes: SpatialAxes = (-2, -1)
-    kind: physics_contracts.DerivativeKind = "physical"
-    extension: physics_contracts.SpectralExtension = "none"
-
-    def __post_init__(self) -> None:
-        """Reject meaningless extension settings for physical derivatives."""
-        if self.extension != "none":
-            msg = "Physical derivatives require extension 'none'."
-            raise ValueError(msg)
 
     def gradient(
         self,
@@ -408,73 +407,43 @@ class PhysicalDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> Tensor:
-        """
-        Return the physical divergence ``d(field_x)/dx + d(field_y)/dy``.
-
-        Parameters
-        ----------
-        field_x, field_y : torch.Tensor
-            Real floating vector components with identical shapes and arbitrary
-            leading dimensions.
-        spacing_x, spacing_y : float or torch.Tensor
-            Finite positive scalar physical spacings shared by both components.
-
-        Returns
-        -------
-        torch.Tensor
-            Divergence with the component shape, dtype, and device. Units are
-            component units per spacing unit when both components share units.
-
-        Raises
-        ------
-        TypeError
-            If either component is not a real floating tensor.
-        ValueError
-            If component shapes, axes, spatial lengths, or spacings are invalid.
-
-        """
-        if field_x.shape != field_y.shape:
-            msg = f"Vector component shapes must match, got {tuple(field_x.shape)} and {tuple(field_y.shape)}."
-            raise ValueError(msg)
-        derivative_x, _ = self.gradient(field_x, spacing_x, spacing_y)
-        _, derivative_y = self.gradient(field_y, spacing_x, spacing_y)
-        return derivative_x + derivative_y
+        """Return the physical divergence ``d(field_x)/dx + d(field_y)/dy``; see ``_divergence``."""
+        return _divergence(self, field_x, field_y, spacing_x, spacing_y)
 
 
 @dataclass(frozen=True, slots=True)
 class SpectralDerivatives:
     """
-    Compute FFT derivatives with explicit periodic or reflected extension.
+    Compute FFT derivatives on periodic or Fourier-continued fields.
 
-    Frequencies are scaled by physical spacing. Reflected extension mirrors both
-    spatial axes before differentiation and crops back to the original domain.
-    Stable internal FFT precision is cast back to the caller dtype/device.
+    Frequencies are scaled by physical spacing. Fourier continuation appends a
+    smooth Legendre-fitted continuation to both spatial axes, so non-periodic
+    fields become smooth periodic signals without jumps or slope kinks, and
+    crops back to the original domain. Stable internal precision is cast back to
+    the caller dtype/device.
 
     Attributes
     ----------
-    extension : Literal["none", "reflect"]
-        ``"none"`` assumes periodic input. ``"reflect"`` mirrors both axes.
+    extension : Literal["none", "fourier_continuation"]
+        ``"none"`` assumes periodic input. ``"fourier_continuation"`` smoothly
+        extends both axes before the FFT.
     axes : tuple[int, int]
         Declared ``(y, x)`` axes, normalized and validated per operation.
-    kind : Literal["physical", "spectral"]
-        Semantic metadata identifier. The canonical factory value is
-        ``"spectral"``.
 
     Raises
     ------
     ValueError
-        If ``extension`` is not ``"none"`` or ``"reflect"``.
+        If ``extension`` is not ``"none"`` or ``"fourier_continuation"``.
 
     """
 
-    extension: physics_contracts.SpectralExtension = "reflect"
+    extension: physics_contracts.SpectralExtension = "fourier_continuation"
     axes: SpatialAxes = (-2, -1)
-    kind: physics_contracts.DerivativeKind = "spectral"
 
     def __post_init__(self) -> None:
         """Validate the spectral extension identifier."""
-        if self.extension not in {"none", "reflect"}:
-            msg = f"Unknown spectral extension {self.extension!r}. Expected 'none' or 'reflect'."
+        if self.extension not in {"none", "fourier_continuation"}:
+            msg = f"Unknown spectral extension {self.extension!r}. Expected 'none' or 'fourier_continuation'."
             raise ValueError(msg)
 
     @staticmethod
@@ -545,7 +514,11 @@ class SpectralDerivatives:
         -----
         Arbitrary spatial axes move to trailing y/x positions internally and are
         restored on return. ``extension="none"`` assumes periodic data.
-        ``"reflect"`` mirrors both axes and crops back to the original domain.
+        ``"fourier_continuation"`` requires at least
+        ``2 * FOURIER_CONTINUATION_MATCHING_POINTS`` points per axis, fits the
+        boundary samples of each axis, appends the smooth continuation, and
+        crops the derivative back to the original domain. Half and bfloat inputs
+        are continued in float32.
 
         """
         normalized_axes = _validate_field(field, self.axes)
@@ -555,15 +528,16 @@ class SpectralDerivatives:
         if self.extension == "none":
             derivative_x, derivative_y = self._gradient_last_axes(moved, dx, dy)
         else:
-            height, width = moved.shape[-2:]
-            padded = functional.pad(
-                moved,
-                (width - 1, width - 1, height - 1, height - 1),
-                mode="reflect",
-            )
-            padded_x, padded_y = self._gradient_last_axes(padded, dx, dy)
-            derivative_x = padded_x[..., height - 1 : 2 * height - 1, width - 1 : 2 * width - 1]
-            derivative_y = padded_y[..., height - 1 : 2 * height - 1, width - 1 : 2 * width - 1]
+            minimum = 2 * FOURIER_CONTINUATION_MATCHING_POINTS
+            if min(moved.shape[-2:]) < minimum:
+                msg = f"Fourier continuation requires at least {minimum} points per spatial axis, got shape {tuple(field.shape)}."
+                raise ValueError(msg)
+            continuation = _fourier_continuation()
+            work_dtype = torch.float32 if moved.dtype in {torch.float16, torch.bfloat16} else moved.dtype
+            extended = continuation.extend(moved.to(work_dtype), dim=2)
+            extended_x, extended_y = self._gradient_last_axes(extended, dx, dy)
+            derivative_x = continuation.restrict(extended_x, dim=2).to(field.dtype)
+            derivative_y = continuation.restrict(extended_y, dim=2).to(field.dtype)
         return (
             derivative_x.movedim((-2, -1), normalized_axes),
             derivative_y.movedim((-2, -1), normalized_axes),
@@ -576,35 +550,21 @@ class SpectralDerivatives:
         spacing_x: float | Tensor,
         spacing_y: float | Tensor,
     ) -> Tensor:
-        """
-        Return the FFT divergence ``d(field_x)/dx + d(field_y)/dy``.
+        """Return the FFT divergence ``d(field_x)/dx + d(field_y)/dy``; see ``_divergence``."""
+        return _divergence(self, field_x, field_y, spacing_x, spacing_y)
 
-        Parameters
-        ----------
-        field_x, field_y : torch.Tensor
-            Real floating vector components with identical shapes.
-        spacing_x, spacing_y : float or torch.Tensor
-            Finite positive scalar physical spacings shared by both components.
 
-        Returns
-        -------
-        torch.Tensor
-            Divergence with the component shape, dtype, and device.
+@cache
+def _fourier_continuation() -> FCLegendre:
+    """Return the shared stateless Legendre Fourier-continuation operator."""
+    # neuraloperator is imported lazily so dependency-light domain consumers,
+    # such as Generation contracts, do not load the ML stack on import.
+    from neuralop.layers.fourier_continuation import FCLegendre  # noqa: PLC0415
 
-        Raises
-        ------
-        TypeError
-            If either component is not a real floating tensor.
-        ValueError
-            If component shapes, axes, spatial lengths, or spacings are invalid.
-
-        """
-        if field_x.shape != field_y.shape:
-            msg = f"Vector component shapes must match, got {tuple(field_x.shape)} and {tuple(field_y.shape)}."
-            raise ValueError(msg)
-        derivative_x, _ = self.gradient(field_x, spacing_x, spacing_y)
-        _, derivative_y = self.gradient(field_y, spacing_x, spacing_y)
-        return derivative_x + derivative_y
+    return FCLegendre(
+        d=FOURIER_CONTINUATION_MATCHING_POINTS,
+        n_additional_pts=FOURIER_CONTINUATION_ADDITIONAL_POINTS,
+    )
 
 
 def build_derivative_operator(
@@ -621,7 +581,8 @@ def build_derivative_operator(
     kind : str
         ``"physical"`` or ``"spectral"``.
     extension : str
-        ``"none"`` or ``"reflect"``. Physical derivatives require ``"none"``.
+        ``"none"`` or ``"fourier_continuation"``. Physical derivatives require
+        ``"none"``.
     axes : tuple[int, int], optional
         ``(y_axis, x_axis)`` used by the operator.
 
@@ -633,8 +594,8 @@ def build_derivative_operator(
     Raises
     ------
     ValueError
-        If ``kind`` or ``extension`` is unsupported, including reflected
-        extension requested for physical differences.
+        If ``kind`` or ``extension`` is unsupported, including Fourier
+        continuation requested for physical differences.
 
     """
     resolved_kind, resolved_extension = physics_contracts.validate_derivative_kind(kind, extension=extension)

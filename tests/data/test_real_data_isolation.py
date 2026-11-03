@@ -1,15 +1,19 @@
-# ruff: noqa: S101
-"""Protect the explicit opt-in boundary for mounted production packages."""
+"""Protect the explicit opt-in boundary for mounted production packages.
+
+Responsibilities:
+  - Check that real-data access requires both an opt-in flag and explicit storage root
+
+Design principles:
+  - Missing authorization or storage configuration fails without fallback
+
+This module does NOT:
+  - Read production packages as part of the default synthetic suite
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import pytest
 from support import real_data
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_real_data_acceptance_requires_flag_and_storage_root(

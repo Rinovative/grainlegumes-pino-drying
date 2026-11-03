@@ -1,7 +1,4 @@
-"""
-experiments_wandb_schema.py
-
-Define the curated transient W&B history projection and display organization.
+"""Define the curated transient W&B history projection and display organization.
 
 Responsibilities:
   - Map authoritative completed-epoch metrics to concise W&B history namespaces
@@ -26,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
-from .config import experiments_config_loader as config_loader
+from .config import experiments_config_naming as config_naming
 
 _GIB: Final = float(1024**3)
 
@@ -53,8 +50,8 @@ def curated_transient_metric_projections(
     projections = [
         MetricProjection("train/loss_total", "Overview/train_loss"),
         MetricProjection(f"id/{objective_id}", "Overview/id_objective"),
-        MetricProjection(f"ood/{objective_id}", "Overview/ood_objective"),
-        MetricProjection("generalization/objective_gap", "Overview/generalization_gap"),
+        MetricProjection(f"additional_evaluation/{objective_id}", "Overview/additional_evaluation_objective"),
+        MetricProjection("additional_evaluation/objective_difference", "Overview/additional_evaluation_difference"),
         MetricProjection("optimization/learning_rate", "Optimization/learning_rate"),
         MetricProjection("train/loss_data_T", "Loss/T"),
         MetricProjection("train/loss_data_phi", "Loss/phi"),
@@ -63,7 +60,7 @@ def curated_transient_metric_projections(
     ]
     if state_aux_enabled:
         projections.append(MetricProjection("train/loss_state_aux", "Loss/state_aux"))
-    for role, namespace in (("id", "ID"), ("ood", "OOD")):
+    for role, namespace in (("id", "ID"), ("additional_evaluation", "AdditionalEvaluation")):
         projections.extend(
             (
                 MetricProjection(f"{role}/{objective_id}/component/T", f"Accuracy/{namespace}/T"),
@@ -117,11 +114,11 @@ def transient_run_organization(
     stage = training.get("stage")
     if stage == "a" and arm == "a0":
         job_type = "stage_a0"
-    elif stage == "a" and arm == "a_plus":
-        job_type = "stage_a_plus"
+    elif stage == "a" and arm == "a1":
+        job_type = "stage_a1"
     elif stage == "b" and arm == "b":
         job_type = "stage_b"
     else:
         message = f"Unsupported transient training stage/arm for W&B organization: {stage!r}/{arm!r}."
         raise ValueError(message)
-    return config_loader.generate_parent_experiment_label(config), job_type
+    return config_naming.parent_label(config["run"]["layout"]), job_type

@@ -1,7 +1,4 @@
-"""
-evaluation_session.py
-
-Reuse validated evaluation cases and plot-independent numerical reductions.
+"""Reuse validated evaluation cases and plot-independent numerical reductions.
 
 Responsibilities:
   - Bind caches to canonical run, role, membership, and output-manifest identity
@@ -21,6 +18,17 @@ This module does NOT:
   - Load run directories, generate artifacts, run inference, or repair payloads
   - Cache Matplotlib figures, widgets, display labels, or export state
   - Keep an unbounded process-global case or numerical cache
+
+Notes:
+  Session lifecycle:
+    - Bind provenance-complete frames directly or from strict loaded-run results.
+    - Use load_case for immutable selected cases, full_summary for full-membership or bounded all-field spatial reductions, and prefix_summary for
+      deterministic saved-order prefix diagnostics.
+    - Close explicitly or use context management to detach frames, release caches, and remove session scratch.
+  Identity and scratch:
+    - Frame and payload witnesses guard access; changed evidence invalidates associated case and summary caches.
+    - Exact spatial reductions use session-owned temporary projections within explicit byte limits.
+
 """
 
 from __future__ import annotations
@@ -37,7 +45,7 @@ from itertools import pairwise
 from numbers import Integral
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
 
@@ -134,7 +142,7 @@ class ArtifactKey:
     config_digest, checkpoint_digest, normalizer_digest : str
         Exact completed-run scientific identity digests.
     split_role : str
-        Explicit ``eval`` or ``ood`` persisted role.
+        Explicit ``eval`` or ``additional_evaluation`` persisted role.
     dataset_fingerprint, membership_digest : str
         Dataset and effective ordered-membership identities.
     manifest_digest : str
@@ -247,8 +255,10 @@ class FullEvaluationSummary:
         Pointwise signed-error standard deviation and exact q90 absolute error.
     case_reference_means, case_prediction_means : numpy.ndarray
         Per-case spatial means with shape ``(case, field)``.
-    momentum_mean, div_velocity_mean, div_eps_velocity_mean : numpy.ndarray | None
-        Full-grid mean steady residual magnitudes.
+    momentum_mean : numpy.ndarray | None
+        Full-grid mean dimensionless momentum-residual magnitude.
+    flux_balance_mean : numpy.ndarray | None
+        Per-row mean absolute dimensionless cross-section flux deviation.
     pressure_declared, pressure_predicted, pressure_absolute_error : numpy.ndarray | None
         Per-case pressure-drop evidence in pascals.
     spatial_error, residual_error, pressure_error : str | None, optional
@@ -268,8 +278,7 @@ class FullEvaluationSummary:
     case_reference_means: np.ndarray
     case_prediction_means: np.ndarray
     momentum_mean: np.ndarray | None
-    div_velocity_mean: np.ndarray | None
-    div_eps_velocity_mean: np.ndarray | None
+    flux_balance_mean: np.ndarray | None
     pressure_declared: np.ndarray | None
     pressure_predicted: np.ndarray | None
     pressure_absolute_error: np.ndarray | None
@@ -1295,7 +1304,7 @@ class EvaluationSession:
         ----------
         loaded_runs : Iterable[LoadedRunArtifacts]
             Non-empty strict-loader results. Each canonical run contributes its
-            validated ``eval`` and ``ood`` frames exactly once.
+            validated ``eval`` and any ``additional_evaluation`` frame exactly once.
         **limits : int
             Optional resource limits accepted by :class:`EvaluationSession`.
 
@@ -1310,7 +1319,7 @@ class EvaluationSession:
             If an item does not expose the strict loaded-run contract.
         ValueError
             If input is empty, run names repeat, or artifact roles contradict
-            their required ``eval`` and ``ood`` bindings.
+            their ``eval`` and ``additional_evaluation`` bindings.
 
         Notes
         -----
@@ -1360,15 +1369,16 @@ class EvaluationSession:
         for loaded in runs:
             run_name = getattr(loaded, "run_name", None)
             id_artifact = getattr(loaded, "id_artifact", None)
-            ood_artifact = getattr(loaded, "ood_artifact", None)
-            if not isinstance(run_name, str) or not run_name or id_artifact is None or ood_artifact is None:
-                msg = "loaded_runs items must expose run_name, id_artifact, and ood_artifact."
+            additional_artifact = getattr(loaded, "additional_artifact", None)
+            if not isinstance(run_name, str) or not run_name or id_artifact is None:
+                msg = "loaded_runs items must expose run_name and id_artifact."
                 raise TypeError(msg)
             if run_name in seen_names:
                 msg = f"Duplicate canonical loaded run name: {run_name!r}."
                 raise ValueError(msg)
             seen_names.add(run_name)
-            for expected_role, artifact in (("eval", id_artifact), ("ood", ood_artifact)):
+            role_artifacts = [("eval", id_artifact)] + ([] if additional_artifact is None else [("additional_evaluation", additional_artifact)])
+            for expected_role, artifact in role_artifacts:
                 split_role = getattr(artifact, "split_role", None)
                 frame = getattr(artifact, "frame", None)
                 if split_role != expected_role or frame is None:
@@ -1416,7 +1426,7 @@ class EvaluationSession:
         """
         return self
 
-    def __enter__(self) -> EvaluationSession:  # noqa: PYI034 -- Python 3.10 has no typing.Self
+    def __enter__(self) -> Self:
         """
         Return this live session for context-managed use.
 
@@ -1863,12 +1873,11 @@ class EvaluationSession:
         case_prediction_means = np.empty((count, field_count), dtype=np.float64)
         case_magnitude_reference_means = np.empty((count, magnitude_count), dtype=np.float64)
         case_magnitude_prediction_means = np.empty((count, magnitude_count), dtype=np.float64)
-        required_residuals = {"Rx", "Ry", "div_u", "div_eps_u"}
+        required_residuals = {"Rx", "Ry", "flux_balance"}
         residual_available = set(first.residuals) == required_residuals
-        residual_error = None if residual_available else "Steady-flow residual maps require Rx, Ry, div_u, and div_eps_u."
+        residual_error = None if residual_available else "Steady-flow residual summaries require Rx, Ry, and flux_balance."
         momentum_sum = np.zeros((height, width), dtype=np.float64) if residual_available else None
-        div_velocity_sum = np.zeros((height, width), dtype=np.float64) if residual_available else None
-        div_eps_velocity_sum = np.zeros((height, width), dtype=np.float64) if residual_available else None
+        flux_balance_sum = np.zeros(height, dtype=np.float64) if residual_available else None
         pressure_declared = np.empty(count, dtype=np.float64)
         pressure_predicted = np.empty(count, dtype=np.float64)
         pressure_error_values = np.empty(count, dtype=np.float64)
@@ -1888,7 +1897,12 @@ class EvaluationSession:
             if magnitude_count:
                 case_magnitude_reference_means[position] = np.mean(magnitude_reference, axis=(1, 2))
                 case_magnitude_prediction_means[position] = np.mean(magnitude_prediction, axis=(1, 2))
-            compatible = case.prediction.shape == first.prediction.shape and np.allclose(case.coordinates, first.coordinates)
+            compatible = (
+                case.prediction.shape == first.prediction.shape
+                and case.coordinate_units == first.coordinate_units
+                and np.array_equal(case.coordinates, first.coordinates)
+                and case.fields == first.fields
+            )
             if not compatible:
                 spatial_error = "Spatial evaluation summaries require identical grids within an artifact dataset."
             if spatial_error is None:
@@ -1910,8 +1924,7 @@ class EvaluationSession:
                     residual_error = "Spatial residual aggregation requires identical full grids and array semantics."
                 else:
                     cast("np.ndarray", momentum_sum)[:] += np.sqrt(case.residuals["Rx"] ** 2 + case.residuals["Ry"] ** 2)
-                    cast("np.ndarray", div_velocity_sum)[:] += np.abs(case.residuals["div_u"])
-                    cast("np.ndarray", div_eps_velocity_sum)[:] += np.abs(case.residuals["div_eps_u"])
+                    cast("np.ndarray", flux_balance_sum)[:] += np.abs(case.residuals["flux_balance"])
             if pressure_error is None:
                 try:
                     declared, predicted, absolute_error = _pressure_drop(case, pressure_field=cast("str", pressure_field))
@@ -1978,10 +1991,9 @@ class EvaluationSession:
 
         if residual_error is None:
             momentum_mean: np.ndarray | None = cast("np.ndarray", momentum_sum) / count
-            div_velocity_mean: np.ndarray | None = cast("np.ndarray", div_velocity_sum) / count
-            div_eps_velocity_mean: np.ndarray | None = cast("np.ndarray", div_eps_velocity_sum) / count
+            flux_balance_mean: np.ndarray | None = cast("np.ndarray", flux_balance_sum) / count
         else:
-            momentum_mean = div_velocity_mean = div_eps_velocity_mean = None
+            momentum_mean = flux_balance_mean = None
         if pressure_error is not None:
             declared_values = predicted_values = absolute_values = None
         else:
@@ -2007,8 +2019,7 @@ class EvaluationSession:
             case_reference_means=_readonly(case_reference_means),
             case_prediction_means=_readonly(case_prediction_means),
             momentum_mean=None if momentum_mean is None else _readonly(momentum_mean),
-            div_velocity_mean=None if div_velocity_mean is None else _readonly(div_velocity_mean),
-            div_eps_velocity_mean=None if div_eps_velocity_mean is None else _readonly(div_eps_velocity_mean),
+            flux_balance_mean=None if flux_balance_mean is None else _readonly(flux_balance_mean),
             pressure_declared=None if declared_values is None else _readonly(declared_values),
             pressure_predicted=None if predicted_values is None else _readonly(predicted_values),
             pressure_absolute_error=None if absolute_values is None else _readonly(absolute_values),
@@ -2113,8 +2124,13 @@ class EvaluationSession:
                 If prefix cases do not share one learned-field grid shape.
 
             """
-            if case.reference.shape != first.reference.shape:
-                msg = "Bounded-prefix evaluation summaries require one shared grid shape within an artifact."
+            if (
+                case.reference.shape != first.reference.shape
+                or case.coordinate_units != first.coordinate_units
+                or case.fields != first.fields
+                or not np.array_equal(case.coordinates, first.coordinates)
+            ):
+                msg = "Bounded-prefix evaluation summaries require one exact shared grid within an artifact."
                 raise dataframe.ComparisonCompatibilityError(msg)
             projection[position, :field_count] = case.reference
             projection[position, field_count : 2 * field_count] = case.error

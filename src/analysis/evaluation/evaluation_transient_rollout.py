@@ -1,9 +1,19 @@
-"""
-Orchestrate transient-drying Evaluation through the public inference service.
+"""Orchestrate transient-drying Evaluation through the public inference service.
 
-The module assembles complete case trajectories from Dataset-owned one-step
-items and distinguishes teacher-forced, full-autonomous, and rolling-origin
-requests. It does not load checkpoints, construct models, or fit scaling.
+Responsibilities:
+  - Assemble complete case trajectories from Dataset-owned one-step items
+  - Evaluate teacher-forced, autonomous and rolling-origin requests
+  - Build validated sequence records and truthful unsupported-horizon evidence
+  - Benchmark bounded full rollouts and retain canonical target-completion evidence
+
+Design principles:
+  - Each autonomous request resets from its explicit reference origin
+  - Physical time, conditioning and reference trajectories remain case-bound
+  - Generation-admitted target evidence remains distinct from prediction diagnostics
+
+This module does NOT:
+  - Load checkpoints, construct models or fit scaling
+  - Publish final artifacts or replace Dataset and Generation admission
 """
 
 from __future__ import annotations
@@ -87,7 +97,7 @@ class TransientRolloutEvaluation:
 
 @dataclass(frozen=True, slots=True)
 class TransientRolloutBenchmark:
-    """Store cold and warmed full-rollout timing from public inference requests."""
+    """Store cold and warmed model and prepared diagnostic-rollout wall clocks."""
 
     case_id: str
     warmup_passes: int
@@ -96,9 +106,9 @@ class TransientRolloutBenchmark:
     wall_clock: str
     model_calls_per_repetition: int
     cold_model_seconds: float
-    cold_end_to_end_seconds: float
+    cold_prepared_rollout_wall_seconds: float
     warmed_model_seconds: tuple[float, ...]
-    warmed_end_to_end_seconds: tuple[float, ...]
+    warmed_prepared_rollout_wall_seconds: tuple[float, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +426,14 @@ def benchmark_transient_full_rollout(
     warmup_passes: int = 1,
     repetitions: int = 3,
 ) -> TransientRolloutBenchmark:
-    """Measure bounded independent full rollouts with model and monotonic wall clocks."""
+    """Measure model calls and prepared diagnostic-rollout wall time separately.
+
+    Case materialization, context construction, case preparation and request-window
+    construction occur before both clocks. The wall clock covers the complete
+    prepared diagnostic rollout, including its non-model operations; it is not
+    end-to-end inference latency. Cold and warmed refer to the first and repeated
+    prepared rollout invocations, not process or model-loading cold starts.
+    """
     if not isinstance(context, inference.TransientInferenceContext) or not isinstance(case, TransientEvaluationCase):
         message = "Transient benchmark requires admitted inference context and case evidence."
         raise TypeError(message)
@@ -487,9 +504,9 @@ def benchmark_transient_full_rollout(
         wall_clock="time.perf_counter",
         model_calls_per_repetition=cold_calls,
         cold_model_seconds=cold_model,
-        cold_end_to_end_seconds=cold_wall,
+        cold_prepared_rollout_wall_seconds=cold_wall,
         warmed_model_seconds=tuple(warmed_model),
-        warmed_end_to_end_seconds=tuple(warmed_wall),
+        warmed_prepared_rollout_wall_seconds=tuple(warmed_wall),
     )
 
 
@@ -789,7 +806,15 @@ def evaluate_transient_case(
     rolling_origins: Sequence[int] | None = None,
     fixed_horizons: Sequence[int] = FIXED_HORIZONS,
 ) -> TransientRolloutEvaluation:
-    """Evaluate all required modes while resetting each public autonomous request."""
+    """
+    Evaluate all required modes of one case.
+
+    One teacher-forced pass predicts every one-step record from its reference
+    state. For the RNO this pass also builds the hidden state over the reference
+    prefix, so each one-step record and each rolling origin starts from the
+    state the model reaches on the true trajectory up to that origin; the
+    autonomous full rollout starts from the model's own initial state.
+    """
     if not isinstance(context, inference.TransientInferenceContext):
         message = "context must be one public TransientInferenceContext."
         raise TypeError(message)
@@ -847,51 +872,49 @@ def evaluate_transient_case(
         external_airflow=external_airflow,
     )
 
-    records: list[TransientSequenceRecord] = []
+    origins = default_rolling_origins(case.transition_count) if rolling_origins is None else tuple(rolling_origins)
+    if (
+        not origins
+        or any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < case.transition_count for value in origins)
+        or len(set(origins)) != len(origins)
+        or tuple(sorted(origins)) != origins
+    ):
+        message = "rolling_origins must be unique ordered case-local transition indices."
+        raise ValueError(message)
     unavailable: list[UnavailableHorizon] = []
-    for origin in range(case.transition_count):
-        request = _prepared_request(
-            runtime_case,
+    warm = inference.teacher_forced_prepared_transient_diagnostic(
+        context,
+        _prepared_request(runtime_case, origin=0, length=case.transition_count),
+        reference_states=runtime_case.reference_states[:, : case.transition_count],
+        capture=origins if context.model_kind == "rno" else (),
+    )
+    warm_states = warm.next_states.detach().cpu().numpy()[0]
+    warm_scaled = warm.scaled_deltas.detach().cpu().numpy()[0]
+    warm_decoded = warm.decoded_deltas.detach().cpu().numpy()[0]
+    records: list[TransientSequenceRecord] = [
+        _record(
+            case=case,
+            mode="teacher_forced_one_step",
             origin=origin,
-            length=1,
+            requested_horizon=1,
+            predicted=np.concatenate((case.reference_states[origin : origin + 1], warm_states[origin : origin + 1]), axis=0),
+            scaled_model_outputs=warm_scaled[origin : origin + 1],
+            decoded_physical_increments=warm_decoded[origin : origin + 1],
+            prediction_available=np.ones(1, dtype=bool),
+            identity=admitted_identity,
+            timing={
+                "kind": "model_only_public_inference",
+                "seconds": warm.step_seconds[origin],
+                "model_calls": 1,
+                "device": warm.timing.device,
+                "precision": warm.timing.precision,
+            },
+            target_wet_basis=target_wet_basis,
+            target_fraction_limit=target_fraction_limit,
+            reference_completion=None,
         )
-        result = inference.predict_prepared_transient_step_diagnostic(
-            context,
-            request,
-        )
-        if result.decoded_delta is None:
-            message = "Diagnostic one-step inference omitted its decoded physical increment."
-            raise RuntimeError(message)
-        predicted = np.concatenate(
-            (
-                case.reference_states[origin : origin + 1],
-                result.next_state.detach().cpu().numpy(),
-            ),
-            axis=0,
-        )
-        records.append(
-            _record(
-                case=case,
-                mode="teacher_forced_one_step",
-                origin=origin,
-                requested_horizon=1,
-                predicted=predicted,
-                scaled_model_outputs=result.scaled_delta.detach().cpu().numpy(),
-                decoded_physical_increments=result.decoded_delta.detach().cpu().numpy(),
-                prediction_available=np.ones(1, dtype=bool),
-                identity=admitted_identity,
-                timing={
-                    "kind": "model_only_public_inference",
-                    "seconds": result.timing.model_seconds,
-                    "model_calls": result.timing.model_calls,
-                    "device": result.timing.device,
-                    "precision": result.timing.precision,
-                },
-                target_wet_basis=target_wet_basis,
-                target_fraction_limit=target_fraction_limit,
-                reference_completion=None,
-            )
-        )
+        for origin in range(case.transition_count)
+    ]
 
     full_request = _prepared_request(
         runtime_case,
@@ -939,15 +962,6 @@ def evaluate_transient_case(
         )
     )
 
-    origins = default_rolling_origins(case.transition_count) if rolling_origins is None else tuple(rolling_origins)
-    if (
-        not origins
-        or any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < case.transition_count for value in origins)
-        or len(set(origins)) != len(origins)
-        or tuple(sorted(origins)) != origins
-    ):
-        message = "rolling_origins must be unique ordered case-local transition indices."
-        raise ValueError(message)
     for origin in origins:
         remaining = case.transition_count - origin
         origin_request = _prepared_request(
@@ -958,6 +972,7 @@ def evaluate_transient_case(
         origin_result = inference.rollout_prepared_transient_autonomous_diagnostic(
             context,
             origin_request,
+            initial_hidden=warm.captured_hidden.get(origin),
         )
         if origin_result.decoded_deltas is None or origin_result.prediction_available is None:
             message = "Diagnostic rolling inference omitted raw availability evidence."

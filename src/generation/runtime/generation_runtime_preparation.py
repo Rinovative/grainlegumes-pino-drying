@@ -1,10 +1,8 @@
-"""
-generation_runtime_preparation.py
-
-Prepare isolated runtime workspaces from deterministic scientific case bundles.
+"""Prepare isolated runtime workspaces from deterministic scientific case bundles.
 
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
+  - Copy and byte-verify one raw case, admitted from canonical storage or supplied by a caller that owns its inputs
   - Generate case-local adapters and copy a digest-verified COMSOL model
   - Preserve cleanup boundaries when preparation fails
 
@@ -52,6 +50,7 @@ class PreparedCase:
     model_path: Path
     exports_directory: Path
     runtime_directory: Path
+    comsol_directory: Path
 
 
 class CasePreparationError(RuntimeError):
@@ -78,15 +77,17 @@ def _require_template_digest(path: Path, expected_sha256: str, *, message: str) 
         raise RuntimeError(message)
 
 
-def _materialize_canonical_raw_bundle(
+def _resolve_raw_source(
     config: config_contract.GenerationConfig,
     case_index: int,
-    work_directory: Path,
     *,
     storage_root: Path,
     input_generation_id: str | None,
-) -> tuple[case_service.CaseBundle, str, Path]:
-    """Copy an exactly admitted persisted raw case into isolated scratch."""
+    raw_case_directory: Path | None,
+) -> tuple[Path, str]:
+    """Return the raw case directory to copy and the input-generation identity it is recorded under."""
+    if raw_case_directory is not None:
+        return raw_case_directory, input_service.configured_input_generation_id(config)
     case_id = config.case_id(case_index)
     try:
         reference = (
@@ -109,20 +110,44 @@ def _materialize_canonical_raw_bundle(
             "prepare canonical inputs through ./scripts/generation before worker execution."
         )
         raise RuntimeError(message) from error
-    source_case_json = reference.case_directory / "case.json"
+    return reference.case_directory, reference.source_id
+
+
+def _materialize_raw_bundle(
+    config: config_contract.GenerationConfig,
+    case_index: int,
+    work_directory: Path,
+    *,
+    storage_root: Path,
+    input_generation_id: str | None,
+    raw_case_directory: Path | None,
+) -> tuple[case_service.CaseBundle, str, Path]:
+    """Copy and re-verify one raw case, admitted from canonical storage or supplied as a bundle, into isolated scratch."""
+    case_id = config.case_id(case_index)
+    source_directory, source_id = _resolve_raw_source(
+        config,
+        case_index,
+        storage_root=storage_root,
+        input_generation_id=input_generation_id,
+        raw_case_directory=raw_case_directory,
+    )
+    source_case_json = source_directory / "case.json"
     payload = json.loads(source_case_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        message = f"Canonical raw case payload is invalid: {reference.case_directory}"
+        message = f"Raw case payload is invalid: {source_directory}"
         raise TypeError(message)
     case_service.validate_case_payload_schema(payload)
+    if payload["case_id"] != case_id:
+        message = f"Raw case payload belongs to {payload['case_id']!r}, not {case_id}: {source_directory}"
+        raise ValueError(message)
     target_case_json = work_directory / "case.json"
     shutil.copy2(source_case_json, target_case_json)
     if source_case_json.read_bytes() != target_case_json.read_bytes():
-        message = f"Canonical raw case.json changed during scratch materialization: {source_case_json}"
+        message = f"Raw case.json changed during scratch materialization: {source_case_json}"
         raise RuntimeError(message)
     input_paths: list[Path] = []
     for filename, identity in sorted(payload["input_files"].items()):
-        source_path = reference.input_directory / filename
+        source_path = source_directory / filename
         target_path = work_directory / filename
         shutil.copy2(source_path, target_path)
         if (
@@ -130,7 +155,7 @@ def _materialize_canonical_raw_bundle(
             or common.serialization.file_sha256(target_path) != identity["sha256"]
             or target_path.read_bytes() != source_path.read_bytes()
         ):
-            message = f"Canonical raw input changed during scratch materialization: {source_path}"
+            message = f"Raw case input changed during scratch materialization: {source_path}"
             raise RuntimeError(message)
         input_paths.append(target_path)
     scalar_handoff = (
@@ -146,8 +171,8 @@ def _materialize_canonical_raw_bundle(
             input_paths=tuple(input_paths),
             scalar_handoff=scalar_handoff,
         ),
-        reference.source_id,
-        reference.case_directory.resolve(),
+        source_id,
+        source_directory.resolve(),
     )
 
 
@@ -158,14 +183,22 @@ def prepare_case_work_directory(
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
     input_generation_id: str | None = None,
+    raw_case_directory: Path | None = None,
 ) -> PreparedCase:
     """
     Prepare a fresh case directory beside a digest-verified disposable model.
 
-    A supplied input-generation identity selects an already admitted historical
-    source for postprocessing replay. Normal solver execution omits it and stays
-    bound to the exact active source commit.
+    A supplied input-generation identity selects an already admitted persisted
+    input source, as campaign cases do under newer code. Without it the case is
+    bound to the exact active source commit. A supplied raw case directory (one
+    generated case bundle: ``case.json`` plus its declared input files) replaces
+    canonical admission for callers that own their inputs, such as the core
+    benchmark; it is copied and verified byte for byte like an admitted source
+    and is mutually exclusive with an input-generation identity.
     """
+    if raw_case_directory is not None and input_generation_id is not None:
+        message = "A supplied raw case directory and an input-generation identity are mutually exclusive."
+        raise ValueError(message)
     case_id = config.case_id(case_index)
     _require_template_digest(
         config.template_path,
@@ -186,12 +219,13 @@ def prepare_case_work_directory(
             bundle,
             admitted_input_generation_id,
             canonical_raw_directory,
-        ) = _materialize_canonical_raw_bundle(
+        ) = _materialize_raw_bundle(
             config,
             case_index,
             work_directory,
             storage_root=storage,
             input_generation_id=input_generation_id,
+            raw_case_directory=raw_case_directory,
         )
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(
@@ -203,6 +237,7 @@ def prepare_case_work_directory(
         runtime_directory = work_directory / "runtime"
         exports_directory.mkdir()
         runtime_directory.mkdir()
+        comsol_directory = comsol_service.create_scratch_directories(work_directory)
         _require_template_digest(
             config.template_path,
             config.template_sha256,
@@ -228,4 +263,5 @@ def prepare_case_work_directory(
         model_path=model_path,
         exports_directory=exports_directory,
         runtime_directory=runtime_directory,
+        comsol_directory=comsol_directory,
     )

@@ -1,7 +1,4 @@
-"""
-learning_inference.py
-
-Rebuild deterministic model inference contexts from saved run artifacts.
+"""Rebuild deterministic model inference contexts from saved run artifacts.
 
 Responsibilities:
   - Resolve the saved task contract and reconstruct the semantic model kind
@@ -21,22 +18,24 @@ This module does NOT:
   - Generate analysis artifacts. ``analysis.artifacts`` owns publication
   - Allocate or transition run directories. ``experiments.run`` owns lifecycle state
 
-Saved-run contract:
-  - This module assumes the current saved-run contract:
-    run_dir/
-      config.yaml
-      normalizer.pt
-      best_checkpoint.pt
-      last_checkpoint.pt
-      split_indices.pt
-      summary.json
-  - The inference pipeline:
-    1. Load config.yaml to get the resolved task, model kind and parameters
-    2. Reconstruct the model and load model_state_dict from best_checkpoint.pt
-    3. Reconstruct a DefaultDataProcessor from the already validated normalizer state
-    4. Load split_indices.pt and select an explicit train/eval/OOD role
-    5. Apply saved split membership before building the DataLoader
-    6. Return the model, DataLoader, processor, and device for inference
+Notes:
+  Saved-run contract:
+    Completed-run layout:
+      run_dir/
+        config.yaml
+        normalizer.pt
+        best_checkpoint.pt
+        last_checkpoint.pt
+        split_indices.pt
+        summary.json
+    Only completed runs are admitted; resume a budget_unmet or interrupted run to completion first.
+    Inference sequence:
+      1. Load the saved resolved configuration
+      2. Reconstruct the model and load best-checkpoint weights
+      3. Restore the admitted normalizer state without refitting
+      4. Admit and apply the requested saved train, evaluation, or OOD membership
+      5. Build the deterministic loader and return it with the model, processor, and device
+
 """
 
 from __future__ import annotations
@@ -64,7 +63,7 @@ if TYPE_CHECKING:
 # RUN CONTRACT
 # ======================================================================
 
-SplitRole = Literal["train", "eval", "ood"]
+SplitRole = Literal["train", "validation", "id_test", "additional_evaluation"]
 
 
 @dataclass(frozen=True)
@@ -74,7 +73,7 @@ class SplitSelection:
 
     Attributes
     ----------
-    role : {"train", "eval", "ood"}
+    role : {"train", "validation", "id_test", "additional_evaluation"}
         Semantic saved membership being reconstructed.
     dataset_paths : tuple[pathlib.Path, ...]
         Current package files resolved for the saved logical dataset selection.
@@ -199,29 +198,28 @@ def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
     return data_cfg
 
 
-def _configured_dataset_ids(config: Mapping[str, Any]) -> dict[SplitRole, tuple[str, ...]]:
+def _configured_dataset_ids(config: Mapping[str, Any], role: SplitRole, *, dataset_root: Path) -> tuple[str, ...]:
     """
-    Resolve ordered train, evaluation, and OOD package IDs from ``config.yaml``.
+    Resolve the ordered package IDs behind one saved split role.
 
-    Train and evaluation share one package. OOD may combine multiple independent
-    packages in configured order. Every name passes central path validation.
+    Train, validation and ID-test share the training Dataset. Additional
+    evaluation combines the Datasets that declare OOD cases, in the same order
+    the training loaders used.
     """
     data_cfg = _data_section(config)
-    train_dataset = common.paths.validate_logical_name(
-        data_cfg.get("train_dataset"),
-        label="data.train_dataset",
-    )
-    raw_ood = data_cfg.get("ood_datasets")
-    if not isinstance(raw_ood, list) or not raw_ood:
-        msg = "Run config data.ood_datasets must contain one or more logical dataset ids."
+    train_dataset = common.paths.validate_logical_name(data_cfg.get("train_dataset"), label="data.train_dataset")
+    if role != "additional_evaluation":
+        return (train_dataset,)
+    raw_additional = data_cfg.get("additional_evaluation_datasets")
+    if not isinstance(raw_additional, list):
+        msg = "Run config data.additional_evaluation_datasets must be a list."
         raise TypeError(msg)
-    ood_datasets = tuple(
-        common.paths.validate_logical_name(dataset_id, label=f"data.ood_datasets[{index}]") for index, dataset_id in enumerate(raw_ood)
+    components = datasets.runtime.training.additional_evaluation_components(
+        train_dataset,
+        tuple(raw_additional),
+        storage_root=common.paths.storage_root_for_datasets_root(dataset_root),
     )
-    if len(ood_datasets) != len(set(ood_datasets)):
-        msg = "Run config data.ood_datasets must not contain duplicates."
-        raise ValueError(msg)
-    return {"train": (train_dataset,), "eval": (train_dataset,), "ood": ood_datasets}
+    return tuple(dataset_id for dataset_id, _ in components)
 
 
 def _validate_split_role(split: str) -> SplitRole:
@@ -231,30 +229,6 @@ def _validate_split_role(split: str) -> SplitRole:
         msg = f"Unknown inference split {split!r}. Expected one of: {allowed}."
         raise ValueError(msg)
     return cast("SplitRole", split)
-
-
-def _split_settings(config: Mapping[str, Any]) -> tuple[float, float, int]:
-    """
-    Recover the exact saved split ratios and stable split subseed.
-
-    The subseed is re-derived from ``run.seed`` through the maintained seed plan.
-    Missing run/data mappings or split settings fail instead of defaulting.
-    """
-    data_cfg = _data_section(config)
-    run_cfg = config.get("run")
-    if not isinstance(run_cfg, Mapping):
-        msg = "Run config must contain a mapping at run."
-        raise TypeError(msg)
-    required = ((data_cfg, "train_ratio"), (data_cfg, "ood_fraction"), (run_cfg, "seed"))
-    if any(key not in section for section, key in required):
-        msg = "Run config is missing train_ratio, ood_fraction, or run.seed split settings."
-        raise KeyError(msg)
-    split_seed = experiments.run.build_seed_plan(int(run_cfg["seed"]))["split"]
-    return (
-        cast("float", data_cfg["train_ratio"]),
-        cast("float", data_cfg["ood_fraction"]),
-        split_seed,
-    )
 
 
 def _normalize_dataset_paths(
@@ -281,27 +255,22 @@ def _select_split(
     """
     Bind one requested split role to saved membership and current package paths.
 
-    Saved split ratios, subseed, and combined logical identity must agree with
-    ``config.yaml``. Explicit paths change location only; later fingerprint
-    validation still prevents substitution of different package content.
+    The saved combined logical identity must agree with ``config.yaml``.
+    Explicit paths change location only; later fingerprint validation still
+    prevents substitution of different package content.
     """
     role = _validate_split_role(split)
-    train_ratio, ood_fraction, split_seed = _split_settings(config)
-    split_contract = datasets.preprocessing.splits.admit_split_contract(
-        split_indices,
-        expected_train_ratio=train_ratio,
-        expected_ood_fraction=ood_fraction,
-        expected_split_seed=split_seed,
-    )
+    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
     role_evidence = split_contract.role(role)
-    configured_dataset_ids = _configured_dataset_ids(config)[role]
+    configured_dataset_ids = _configured_dataset_ids(config, role, dataset_root=dataset_root)
     saved_dataset_id = role_evidence.source.dataset_id
     expected_dataset_id = datasets.contracts.identity.combined_dataset_id(configured_dataset_ids)
     if saved_dataset_id != expected_dataset_id:
         msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {expected_dataset_id!r}."
         raise RuntimeError(msg)
+    task = str(config["task"])
     selected_paths = dataset_paths or tuple(
-        common.paths.resolve_dataset_path(dataset_id, dataset_root=dataset_root) for dataset_id in configured_dataset_ids
+        common.paths.resolve_dataset_path(task, dataset_id, dataset_root=dataset_root) for dataset_id in configured_dataset_ids
     )
     if len(selected_paths) != len(configured_dataset_ids):
         msg = "Explicit dataset paths must align with the configured package selection."
@@ -403,14 +372,13 @@ def _build_eval_loader(dataset: Dataset[Any], batch_size: int) -> DataLoader:
     DataLoader
         Deterministic DataLoader with no shuffling.
 
+    Notes
+    -----
+    The runtime factory owns batch collation, so steady items whose metadata holds
+    absent values batch exactly as they do in training.
+
     """
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-    )
+    return datasets.runtime.factory.make_data_loader(dataset, datasets.runtime.factory.LoaderSettings(batch_size=batch_size))
 
 
 # ======================================================================
@@ -422,7 +390,7 @@ def load_inference_context_with_resolution(
     device_resolution: learning_device.DeviceResolution,
     dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
-    split: SplitRole | str = "eval",
+    split: SplitRole | str = "id_test",
     batch_size: int = 1,
 ) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
     """
@@ -447,9 +415,9 @@ def load_inference_context_with_resolution(
     dataset_root : str | Path | None, optional
         Current explicit dataset root used with the saved logical dataset id.
         Defaults to the current central dataset-root resolution.
-    split : {"train", "eval", "ood"}, optional
-        Saved split role to load. `eval` and `train` use the saved training
-        dataset membership. ``ood`` uses saved OOD membership against the OOD
+    split : {"train", "validation", "id_test", "additional_evaluation"}, optional
+        Saved split role to load. Train, validation and ID-test use the saved
+        training Dataset membership; ``additional_evaluation`` uses the saved holdout membership against the evaluation
         final dataset recorded by training. Default is `eval`.
     batch_size : int, optional
         Evaluation batch size. Default is 1.
@@ -484,7 +452,7 @@ def load_inference_context_with_resolution(
     device = device_resolution.device
     run_dir = Path(run_dir)
     requested_dataset_paths = _normalize_dataset_paths(dataset_path)
-    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_dataset_packages_root()
+    current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_datasets_root()
     evaluable_run = experiments.run.validate_evaluable_run(run_dir)
 
     cfg = evaluable_run["config"]
@@ -550,7 +518,7 @@ def load_inference_context(
     run_dir: str | Path,
     dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
-    split: SplitRole | str = "eval",
+    split: SplitRole | str = "id_test",
     batch_size: int = 1,
     device_policy: str = "auto",
 ) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
@@ -565,7 +533,7 @@ def load_inference_context(
         Optional exact dataset package path or ordered package paths bound to saved identity.
     dataset_root : str | Path | None, optional
         Current independent dataset root.
-    split : {"train", "eval", "ood"}, optional
+    split : {"train", "validation", "id_test", "additional_evaluation"}, optional
         Saved split role.
     batch_size : int, optional
         Inference batch size.

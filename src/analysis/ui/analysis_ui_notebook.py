@@ -1,7 +1,4 @@
-"""
-analysis_ui_notebook.py
-
-Build notebook dropdown sections, lazy panels and figure exports.
+"""Build notebook dropdown sections, lazy panels and figure exports.
 
 Responsibilities:
   - Assemble plot functions into dropdown sections
@@ -20,7 +17,7 @@ This module does NOT:
 
 import re
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from inspect import signature
 from pathlib import Path
 from typing import Any
@@ -119,7 +116,7 @@ def _next_export_path(directory: Path, *, stem: str, timestamp: str) -> Path:
     """Return one timestamped PDF path without overwriting an existing export."""
     candidate = directory / f"{stem}_{timestamp}.pdf"
     index = 1
-    while candidate.exists():
+    while candidate.exists() or candidate.is_symlink():
         candidate = directory / f"{stem}_{timestamp}_{index}.pdf"
         index += 1
     return candidate
@@ -400,10 +397,42 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
     *,
     panel_controls: Sequence[widgets.Widget] = (),
     export_state: dict | None = None,
-    export_dir: str = "exports",
+    export_dir: str = "",
+    protected_export_roots: Sequence[Path | str] = (),
     export_btn_text: str = "Export PDF",
 ) -> LazyTabbedPanelOutput:
-    """Build one collapsible, replaceable lazy tab panel with PDF export."""
+    """Build one collapsible, replaceable lazy tab panel with explicit PDF export.
+
+    Parameters
+    ----------
+    sections : Sequence[widgets.Widget]
+        Initial lazy view sections.
+    tab_titles : Sequence[str] | None, optional
+        Display titles for the initial sections.
+    open_btn_text : str, optional
+        Label of the panel-opening button.
+    close_btn_text : str, optional
+        Label of the panel-closing button.
+    panel_controls : Sequence[widgets.Widget], optional
+        Additional controls above the lazy sections.
+    export_btn_text : str, optional
+        Label of the explicit export action.
+    export_state : dict | None, optional
+        Current figure and naming context populated by selected views.
+    export_dir : str, optional
+        Initial value for the editable export-directory field. An empty value
+        requires the user to choose a directory before export.
+    protected_export_roots : Sequence[Path | str], optional
+        Immutable artifact roots where PDF exports are forbidden. Resolved
+        paths are checked on explicit export, including symlink targets.
+
+    Notes
+    -----
+    Viewing figures never creates the selected export directory. The directory
+    and PDF are created only after the Export button is pressed and the path
+    passes the protected-root check.
+
+    """
     current_sections = list(sections)
     titles = list(tab_titles) if tab_titles is not None else [f"Tab {index + 1}" for index in range(len(current_sections))]
     if not current_sections or len(titles) != len(current_sections):
@@ -444,6 +473,13 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
         button_style="success",
         layout=widgets.Layout(width="145px"),
     )
+    export_directory = widgets.Text(
+        value=export_dir,
+        description="Export directory:",
+        placeholder="Choose a folder before exporting",
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="100%"),
+    )
 
     def do_export(_: object = None) -> None:
         """Write the current single- or multi-page figure bundle to PDF."""
@@ -461,23 +497,36 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
             if not figures:
                 print("[Export] No figure is selected. Render a plot first.")
                 return
-            out_dir = Path(export_dir)
+            selected_directory = export_directory.value.strip()
+            if not selected_directory:
+                print("[Export] Choose an export directory before exporting.")
+                return
+            out_dir = Path(selected_directory).expanduser().resolve()
+            protected_roots = tuple(Path(root).expanduser().resolve() for root in protected_export_roots)
+            if any(out_dir == root or out_dir.is_relative_to(root) for root in protected_roots):
+                print("[Export] Choose a directory outside immutable artifact roots.")
+                return
             out_dir.mkdir(parents=True, exist_ok=True)
             stem = _export_stem(export_state)
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
             out_path = _next_export_path(out_dir, stem=stem, timestamp=timestamp)
-            if len(figures) == 1:
-                figures[0].savefig(out_path, bbox_inches="tight")
-            else:
-                with PdfPages(out_path) as pdf:
-                    for figure in figures:
-                        pdf.savefig(figure, bbox_inches="tight")
+            try:
+                with out_path.open("xb") as output:
+                    if len(figures) == 1:
+                        figures[0].savefig(output, format="pdf", bbox_inches="tight")
+                    else:
+                        with PdfPages(output) as pdf:
+                            for figure in figures:
+                                pdf.savefig(figure, bbox_inches="tight")
+            except FileExistsError:
+                print("[Export] The output filename became occupied. Export again to choose a free filename.")
+                return
             print(f"[Export] Saved: {out_path}")
 
     export_btn.on_click(do_export)
     header = widgets.HBox((close_btn, export_btn))
     controls_box = widgets.VBox(tuple(panel_controls))
-    panel_children: list[widgets.Widget] = [header]
+    panel_children: list[widgets.Widget] = [header, widgets.HBox((export_directory,))]
     if panel_controls:
         panel_children.append(controls_box)
     panel_children.extend((status_out, tabs))

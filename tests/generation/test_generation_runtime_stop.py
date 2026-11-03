@@ -1,5 +1,15 @@
-# ruff: noqa: PLR2004, S101, SLF001
-"""Focused controlled-stop lifecycle and workspace-containment contracts."""
+"""Focused controlled-stop lifecycle and workspace-containment contracts.
+
+Responsibilities:
+  - Check controlled stop, owned process escalation, status grammar, and capacity cleanup
+  - Check that the stall rule's simulated-time minimum is recorded without changing stop control
+
+Design principles:
+  - Ambiguous or changed status bytes remain preserved within exact workspace bounds
+
+This module does NOT:
+  - Terminate unrelated processes or delete unknown artifacts
+"""
 
 from __future__ import annotations
 
@@ -8,6 +18,7 @@ import json
 import signal
 import subprocess
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -119,11 +130,13 @@ def test_timeout_requests_stop_at_reserve_then_classifies_clean_controlled_exit(
         monotonic_clock=clock,
         timestamp_clock=lambda: "2026-08-18T00:00:00+00:00",
     )
+    (tmp_path / "active-case" / "solved.mph.status").write_text("1790892938336\nRunning", encoding="utf-8")
 
     result = controller.wait_for_exit(cancellation_requested=lambda: False)
 
     _require(result.exit_code == 0, "Controlled fake process did not exit cleanly.")
     _require(result.timed_out, "Controlled timeout exit lost its timeout classification.")
+    _require(result.minimum_simulated_reached_after_seconds is None, "A controller without a stall rule invented a minimum time.")
     _require(result.graceful_stop_requested, "Reserve boundary did not request controlled stop.")
     _require(not result.force_escalated, "Clean controlled exit unexpectedly escalated.")
     _require(clock() == clean_exit_at, "Stop was not requested at the 3300-second reserve boundary.")
@@ -144,6 +157,281 @@ def test_timeout_requests_stop_at_reserve_then_classifies_clean_controlled_exit(
         },
         "Controlled-stop evidence does not preserve the timeout request.",
     )
+
+
+def test_a_stalled_solver_is_stopped_after_the_check_time_with_its_own_reserve(tmp_path: Path) -> None:
+    """Below the simulated minimum after the check time, the solver is stopped as stalled and escalated after one reserve, not at the timeout."""
+    clock = _Clock()
+    process = _Process(clock)
+    escalations: list[signal.Signals] = []
+    probe_times: list[float] = []
+
+    def signal_group(process_group_id: int, value: signal.Signals) -> None:
+        assert process_group_id == process.pid
+        escalations.append(value)
+        process.finish(-int(value))
+
+    def stuck_at_start() -> float:
+        probe_times.append(clock())
+        return 54.0
+
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        signal_process_group=signal_group,
+        timestamp_clock=lambda: "2026-10-26T00:00:00+00:00",
+        stall_rule=stop_service.StallRule(check_after_seconds=900.0, minimum_simulated_seconds=3600.0, simulated_seconds=stuck_at_start),
+    )
+    (tmp_path / "active-case" / "solved.mph.status").write_text("1790892938336\nRunning", encoding="utf-8")
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.stalled
+    assert not result.timed_out
+    assert result.force_escalated
+    assert result.minimum_simulated_reached_after_seconds is None
+    assert escalations == [signal.SIGTERM]
+    assert 1200.0 <= clock() < 2100.0
+    assert len(set(probe_times)) == len(probe_times)
+    evidence = json.loads((tmp_path / "active-case" / "runtime" / "stop.json").read_text(encoding="utf-8"))
+    assert evidence["reason"] == "stalled"
+
+
+@pytest.mark.parametrize(("simulated", "reached_after"), [(None, None), (7200.0, 0.0)])
+def test_an_unknown_or_progressing_simulated_time_never_triggers_the_stall_rule(
+    tmp_path: Path, simulated: float | None, reached_after: float | None
+) -> None:
+    """Only a known simulated time below the minimum stops the solver; the timeout stays the backstop otherwise."""
+    clock = _Clock()
+    process = _Process(clock, exit_at=1500.0)
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=lambda: simulated,
+            observed_simulated_seconds=lambda: simulated,
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.reason is None
+    assert result.exit_code == 0
+    assert result.minimum_simulated_reached_after_seconds == reached_after
+
+
+def test_recording_the_minimum_leaves_the_stall_decision_reads_unchanged(tmp_path: Path) -> None:
+    """The minimum time comes from the observation reader alone; the decision reader is still read only from the check time on."""
+    clock = _Clock()
+    process = _Process(clock)
+    decision_reads: list[float] = []
+
+    def decision_reader() -> float:
+        decision_reads.append(clock())
+        return 54.0
+
+    def signal_group(_process_group_id: int, value: signal.Signals) -> None:
+        process.finish(-int(value))
+
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        signal_process_group=signal_group,
+        poll_interval_seconds=10.0,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=decision_reader,
+            observed_simulated_seconds=lambda: 5.0 * clock(),
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.stalled
+    assert decision_reads == [900.0]
+    assert result.minimum_simulated_reached_after_seconds == 720.0
+
+
+def test_a_failing_observation_reader_changes_no_stop_decision(tmp_path: Path) -> None:
+    """An observation error is ignored: an operator force request still escalates and no minimum time is invented."""
+    clock = _Clock()
+    process = _Process(clock)
+
+    def broken_reader() -> float:
+        message = "stdout unreadable"
+        raise OSError(message)
+
+    def signal_group(_process_group_id: int, value: signal.Signals) -> None:
+        process.finish(-int(value))
+
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        signal_process_group=signal_group,
+        poll_interval_seconds=10.0,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=lambda: 7200.0,
+            observed_simulated_seconds=broken_reader,
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False, force_requested=lambda: clock() >= 50.0)
+
+    assert result.reason == "cancelled"
+    assert result.force_escalated
+    assert result.minimum_simulated_reached_after_seconds is None
+
+
+def test_the_stall_rule_records_the_minimum_with_its_own_uncached_reader(tmp_path: Path) -> None:
+    """The decision reader keeps its refresh cache; the observation reader sees appended solver rows at once."""
+    stdout = tmp_path / "stdout.log"
+    header = "Step Time Stepsize Res Jac Sol Order Tfail NLfail LinErr LinRes\n"
+    stdout.write_text(header + "1 10 1 2 1 2 1 0 0 1e-3 1e-4\n", encoding="utf-8")
+    config = SimpleNamespace(execution_values={"runtime": {"stall_stop": {"check_after_seconds": 900.0, "minimum_simulated_seconds": 3600.0}}})
+    rule = batch_runtime._stall_rule(cast("Any", config), cast("Any", SimpleNamespace(runtime_directory=tmp_path)))  # pyright: ignore[reportPrivateUsage]
+    assert rule is not None
+    assert rule.observed_simulated_seconds is not None
+    assert rule.simulated_seconds() == 10.0
+    assert rule.observed_simulated_seconds() == 10.0
+
+    with stdout.open("a", encoding="utf-8") as stream:
+        stream.write("2 4000 3990 4 2 4 1 0 0 1e-3 1e-4\n")
+
+    assert rule.simulated_seconds() == 10.0
+    assert rule.observed_simulated_seconds() == 4000.0
+
+
+def test_the_first_simulated_minimum_time_is_recorded_before_the_stall_check_time(tmp_path: Path) -> None:
+    """The observation reader is read on every iteration, so a progressing case records its first minimum time long before check_after_seconds."""
+    clock = _Clock()
+    process = _Process(clock, exit_at=1500.0)
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        poll_interval_seconds=10.0,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=lambda: 5.0 * clock(),
+            observed_simulated_seconds=lambda: 5.0 * clock(),
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.reason is None
+    assert result.exit_code == 0
+    assert result.minimum_simulated_reached_after_seconds == 720.0
+
+
+def test_a_minimum_reached_only_at_process_exit_is_recorded_by_the_final_observation(tmp_path: Path) -> None:
+    """The observation reader is read once more after the process has exited, because the last solver output may arrive with the exit."""
+    clock = _Clock()
+    process = _Process(clock, exit_at=100.0)
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=2400.0,
+        graceful_stop_reserve_seconds=300.0,
+        monotonic_clock=clock,
+        poll_interval_seconds=10.0,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=lambda: 10.0,
+            observed_simulated_seconds=lambda: 4000.0 if process.poll() is not None else 10.0,
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.reason is None
+    assert result.minimum_simulated_reached_after_seconds == 100.0
+
+
+def test_a_forced_stop_result_carries_the_recorded_minimum_time(tmp_path: Path) -> None:
+    """Every result, including the one after hard-deadline escalation, keeps the time the minimum was first reached."""
+    clock = _Clock()
+    process = _Process(clock)
+
+    def signal_group(_process_group_id: int, value: signal.Signals) -> None:
+        process.finish(-int(value))
+
+    controller = stop_service.SolverStopController(
+        process,
+        _workspace(tmp_path),
+        timeout_seconds=1000.0,
+        graceful_stop_reserve_seconds=100.0,
+        monotonic_clock=clock,
+        signal_process_group=signal_group,
+        poll_interval_seconds=10.0,
+        stall_rule=stop_service.StallRule(
+            check_after_seconds=900.0,
+            minimum_simulated_seconds=3600.0,
+            simulated_seconds=lambda: 7200.0 if clock() >= 300.0 else 10.0,
+            observed_simulated_seconds=lambda: 7200.0 if clock() >= 300.0 else 10.0,
+        ),
+    )
+
+    result = controller.wait_for_exit(cancellation_requested=lambda: False)
+
+    assert result.timed_out
+    assert result.force_escalated
+    assert result.minimum_simulated_reached_after_seconds == 300.0
+
+
+def test_the_timing_stall_progress_binds_the_rule_minimum_to_the_observed_time() -> None:
+    """The persisted record exists only with a stall rule and keeps an unobserved minimum explicit."""
+    without_rule = SimpleNamespace(execution_values={"runtime": {}})
+    with_rule = SimpleNamespace(execution_values={"runtime": {"stall_stop": {"check_after_seconds": 600, "minimum_simulated_seconds": 1800}}})
+    reached = stop_service.StopResult(0, None, False, False, 412.5)
+
+    def progress(config: object, result: stop_service.StopResult | None) -> dict[str, float | None] | None:
+        return batch_runtime._stall_progress(cast("Any", config), result)  # pyright: ignore[reportPrivateUsage]
+
+    assert progress(without_rule, reached) is None
+    assert progress(with_rule, None) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": None}
+    assert progress(with_rule, stop_service.StopResult(0, None, False, False)) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": None}
+    assert progress(with_rule, reached) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": 412.5}
+
+
+@pytest.mark.parametrize("content", ["1790892938336\nDone", "1790892938336\nRunning extra", "Running"])
+def test_stop_rejects_nonrunning_or_malformed_solver_status(tmp_path: Path, content: str) -> None:
+    """Only an owned exact COMSOL Running record may precede Stop 2."""
+    work_directory = _workspace(tmp_path)
+    status_path = work_directory / stop_service.STOP_STATUS_FILENAME
+    status_path.write_text(content, encoding="utf-8")
+    controller = stop_service.SolverStopController(
+        _Process(_Clock()),
+        work_directory,
+        timeout_seconds=10.0,
+        graceful_stop_reserve_seconds=2.0,
+        monotonic_clock=_Clock(),
+    )
+
+    with pytest.raises(stop_service.UnexpectedStopStatusContentError):
+        controller.request_graceful_stop("timeout")
+    assert status_path.read_text(encoding="utf-8") == content
 
 
 def test_hard_deadline_escalates_only_owned_group_until_no_process_remains(tmp_path: Path) -> None:
@@ -233,17 +521,11 @@ def test_unexpected_status_content_is_preserved_with_bounded_diagnostics(tmp_pat
     )
     _require(diagnostics["solver_exit_code"] is None, "Pre-termination diagnostics invented a solver exit code.")
     _require(diagnostics["required_exports_present"] is None, "Pre-termination diagnostics invented export evidence.")
-    _require(diagnostics["replay_available"] is None, "Pre-termination diagnostics invented replay evidence.")
 
-    enriched = caught.value.with_runtime_evidence(
-        exit_code=-signal.SIGTERM,
-        required_exports_present=False,
-        replay_available=False,
-    )
+    enriched = caught.value.with_runtime_evidence(exit_code=-signal.SIGTERM, required_exports_present=False)
     enriched_diagnostics = json.loads(str(enriched).split(": ", maxsplit=1)[1])
     _require(enriched_diagnostics["solver_exit_code"] == -signal.SIGTERM, "Solver exit evidence was not retained.")
     _require(enriched_diagnostics["required_exports_present"] is False, "Missing export evidence was not retained.")
-    _require(enriched_diagnostics["replay_available"] is False, "Unavailable replay evidence was not retained.")
 
 
 def test_non_utf8_status_content_is_preserved_and_classified(tmp_path: Path) -> None:

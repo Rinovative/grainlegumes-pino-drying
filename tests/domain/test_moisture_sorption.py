@@ -1,4 +1,14 @@
-"""Exact modified-Oswin moisture-equilibrium contracts."""
+"""Exact modified-Oswin moisture-equilibrium contracts.
+
+Responsibilities:
+  - Check modified-Oswin forward/inverse round trips and explicit clipping
+
+Design principles:
+  - Equilibrium values are compared numerically and invalid clipping contracts fail
+
+This module does NOT:
+  - Fit material sorption coefficients or run drying solves
+"""
 
 from __future__ import annotations
 

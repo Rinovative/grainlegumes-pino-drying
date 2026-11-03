@@ -1,16 +1,16 @@
-"""
-generation_input_table_schema.py
+"""Define compact grouped labels for generation-input EDA tables.
 
-Define compact grouped labels for generation-input EDA tables.
 Responsibilities:
   - Group persisted parameters into airflow and drying presentation families
   - Shorten repeated parameter, field-summary, and boundary labels
   - Expand schedule component weights into independently comparable rows
   - Preserve deterministic category and row ordering across table views
+
 Design principles:
   - Presentation metadata never changes persisted names or scientific values
   - Unknown future rows remain visible in an explicit uncategorized group
   - Units remain owned by diagnostics and appear once in displayed row labels
+
 This module does NOT:
   - Read generation inputs, calculate summaries, or render notebook widgets
   - Define parameter validity, schedule science, or persistence contracts
@@ -89,7 +89,7 @@ _PARAMETER_ROWS: Final = (
         (
             ("porosity.smooth_len_rel", "Smooth length"),
             ("porosity.texture_amp", "Texture amplitude"),
-            ("eps_bed_cal_ref", "Calibration reference"),
+            ("eps_bed_ref", "Reference porosity"),
             ("eps_min_global", "Global minimum"),
             ("eps_max_global", "Global maximum"),
         ),

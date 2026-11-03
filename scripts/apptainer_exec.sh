@@ -50,7 +50,13 @@ if paths_overlap "${PROJECT_ROOT}" "${STORAGE_ROOT}"; then
   printf 'Repository and storage roots must not overlap: %s ; %s\n' "${PROJECT_ROOT}" "${STORAGE_ROOT}" >&2
   exit 1
 fi
-if paths_overlap "${PROJECT_ROOT}" "${RUNTIME_ROOT}"; then
+# The one admitted overlap: a frozen source tree RUNTIME_ROOT/sources/<commit12>-<fingerprint12> as the repository.
+# It stays bound read-only at /workspace/repo; inside the image every root is an explicit /workspace path.
+frozen_source_tree() {
+  local tree_name="${PROJECT_ROOT#"${RUNTIME_ROOT}/sources/"}"
+  [[ "${PROJECT_ROOT}" == "${RUNTIME_ROOT}/sources/"* && "${tree_name}" =~ ^[0-9a-f]{12}-[0-9a-f]{12}$ ]]
+}
+if paths_overlap "${PROJECT_ROOT}" "${RUNTIME_ROOT}" && ! frozen_source_tree; then
   printf 'Repository and runtime roots must not overlap: %s ; %s\n' "${PROJECT_ROOT}" "${RUNTIME_ROOT}" >&2
   exit 1
 fi
@@ -62,7 +68,6 @@ fi
 CONTAINER_DIRECTORY="${RUNTIME_ROOT}/containers"
 CACHE_DIRECTORY="${RUNTIME_ROOT}/apptainer/cache"
 HOME_DIRECTORY="${RUNTIME_ROOT}/apptainer/home"
-TEMP_DIRECTORY="${RUNTIME_ROOT}/apptainer/tmp"
 XDG_CACHE_DIRECTORY="${RUNTIME_ROOT}/apptainer/xdg-cache"
 XDG_CONFIG_DIRECTORY="${RUNTIME_ROOT}/apptainer/xdg-config"
 LOG_DIRECTORY="${RUNTIME_ROOT}/logs"
@@ -71,7 +76,6 @@ mkdir -p -- \
   "${CONTAINER_DIRECTORY}" \
   "${CACHE_DIRECTORY}" \
   "${HOME_DIRECTORY}" \
-  "${TEMP_DIRECTORY}" \
   "${XDG_CACHE_DIRECTORY}" \
   "${XDG_CONFIG_DIRECTORY}" \
   "${LOG_DIRECTORY}"
@@ -85,6 +89,64 @@ if ! command -v apptainer >/dev/null 2>&1; then
   exit 1
 fi
 
+# Temporary files live in a private directory on node-local storage that is removed when the container exits:
+# on the shared runtime volume, Python multiprocessing and W&B could not delete theirs (EBUSY) and left them behind.
+SCRATCH_PARENT="${TMPDIR:-/tmp}"
+# A job ended by SIGKILL or the OOM killer cannot run the EXIT trap, and ICE does not clear node scratch after jobs:
+# remove such leftovers of this user's ended jobs. Only directories older than an hour whose job is no longer queued
+# go, and nothing goes when the queue cannot be read.
+if [[ -n "${SLURM_JOB_ID:-}" ]] && ACTIVE_JOBS="$(squeue -h -u "$(id -un)" -o %i 2>/dev/null)"; then
+  while IFS= read -r -d '' leftover; do
+    leftover_job="${leftover##*/vp2-apptainer.}"
+    leftover_job="${leftover_job%%.*}"
+    if [[ "${leftover_job}" =~ ^[0-9]+$ && "${leftover_job}" != "${SLURM_JOB_ID}" ]] && ! grep -qx -- "${leftover_job}" <<<"${ACTIVE_JOBS}"; then
+      rm -rf -- "${leftover}"
+    fi
+  done < <(find "${SCRATCH_PARENT}" -mindepth 1 -maxdepth 1 -type d -name 'vp2-apptainer.*.*' -user "$(id -u)" -mmin +60 -print0 2>/dev/null)
+fi
+TEMP_DIRECTORY="$(mktemp -d "${SCRATCH_PARENT}/vp2-apptainer.${SLURM_JOB_ID:-local}.XXXXXXXX")"
+
+# A container cannot hard-link across the separate storage and runtime binds (EXDEV), so the host links the Slurm logs after the run:
+# JOB_LOG_FILES (host paths, one per line) go into logs/ of every folder the job recorded in JOB_LOG_OWNERS_FILE. This runs in the
+# EXIT trap, so it never changes the exit status or aborts the cleanup: errexit is off, every problem is one warning, nothing exits.
+link_job_logs() (
+  set +e
+  local record="${TEMP_DIRECTORY}/job-log-owners" storage line owner log target identity error
+  [[ -n "${JOB_LOG_FILES:-}" && -f "${record}" ]] || return 0
+  storage="$(realpath -e -- "${STORAGE_ROOT}")" || return 0
+  while IFS= read -r line; do
+    # The container records resolved paths, so an owner must be its own canonical path: `..` or a symbolic link cannot lead out.
+    owner="${storage}/${line#/workspace/storage/}"
+    if [[ "${line}" != /workspace/storage/?* || "$(realpath -e -- "${owner}" 2>/dev/null)" != "${owner}" || ! -d "${owner}" || -L "${owner}/logs" ]]; then
+      printf 'Warning: job log owner is not a directory below storage reached without .. or symbolic links (logs/ included): %s\n' "${line}" >&2
+      continue
+    fi
+    if ! error="$(mkdir -p -- "${owner}/logs" 2>&1)"; then
+      printf 'Warning: could not create %s/logs: %s\n' "${owner}" "${error}" >&2
+      continue
+    fi
+    while IFS= read -r log; do
+      [[ -f "${log}" && ! -L "${log}" ]] || continue
+      target="${owner}/logs/${log##*/}"
+      if [[ -e "${target}" || -L "${target}" ]]; then
+        [[ "${target}" -ef "${log}" ]] || printf 'Warning: %s is a different file; %s was not linked.\n' "${target}" "${log}" >&2
+        continue
+      fi
+      identity="$(stat -c '%d:%i' -- "${log}")"
+      if ! error="$(ln -- "${log}" "${target}" 2>&1)"; then
+        printf 'Warning: could not link %s: %s\n' "${log}" "${error}" >&2
+      elif [[ "$(stat -c '%d:%i' -- "${target}")" != "${identity}" ]]; then
+        rm -f -- "${target}"
+        printf 'Warning: %s changed while it was linked; the link was removed.\n' "${log}" >&2
+      fi
+    done <<<"${JOB_LOG_FILES}"
+  done < <(sort -u -- "${record}")
+  return 0
+)
+trap 'link_job_logs; rm -rf -- "${TEMP_DIRECTORY}" || printf "Warning: could not remove %s\n" "${TEMP_DIRECTORY}" >&2' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
 export APPTAINER_CACHEDIR="${CACHE_DIRECTORY}"
 export APPTAINER_TMPDIR="${TEMP_DIRECTORY}"
 export HOME="${HOME_DIRECTORY}"
@@ -97,12 +159,13 @@ APPTAINER_ARGUMENTS=(
   --bind "${PROJECT_ROOT}:/workspace/repo:ro"
   --bind "${STORAGE_ROOT}:/workspace/storage:rw"
   --bind "${RUNTIME_ROOT}:/workspace/runtime:rw"
+  --bind "${TEMP_DIRECTORY}:/workspace/tmp:rw"
   --pwd /workspace/repo
-  --env HOME=/home/vp2
   --env PROJECT_ROOT=/workspace/repo
   --env STORAGE_ROOT=/workspace/storage
   --env RUNTIME_ROOT=/workspace/runtime
-  --env TMPDIR=/workspace/runtime/apptainer/tmp
+  --env TMPDIR=/workspace/tmp
+  --env JOB_LOG_OWNERS_FILE=/workspace/tmp/job-log-owners
   --env XDG_CACHE_HOME=/workspace/runtime/apptainer/xdg-cache
   --env XDG_CONFIG_HOME=/workspace/runtime/apptainer/xdg-config
 )
@@ -111,4 +174,5 @@ if [[ "${GPU_MODE}" == true ]]; then
   APPTAINER_ARGUMENTS+=(--nv --env "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}")
 fi
 
-exec apptainer exec "${APPTAINER_ARGUMENTS[@]}" "${IMAGE_PATH}" "$@"
+# No exec: the shell stays to link the job logs and remove the temporary directory; set -e passes the container's exit status on.
+apptainer exec "${APPTAINER_ARGUMENTS[@]}" "${IMAGE_PATH}" "$@"

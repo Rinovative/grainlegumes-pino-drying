@@ -1,16 +1,16 @@
-"""
-generation_input_diagnostics.py
+"""Build immutable diagnostics from admitted profile-aware generation inputs.
 
-Build immutable diagnostics from admitted profile-aware generation inputs.
 Responsibilities:
   - Preserve exact sampled, scalar, schedule, spatial, and provenance evidence
   - Derive shared permeability and transient moisture diagnostics canonically
   - Preserve exact persisted supports and evaluate display-only boundary curves
   - Provide Celsius-aware A/B comparisons and empirical dataset summaries
+
 Design principles:
   - Generation, profile, and domain owners define every scientific semantic
   - Steady and transient inputs share one model with explicit optional content
   - Every derived array is an independent read-only physical representation
+
 This module does NOT:
   - Read unadmitted files, execute COMSOL, or mark inputs as completed
   - Invent missing profile inputs, mutate evidence, or render notebook widgets
@@ -426,10 +426,8 @@ def _canonical_schedule(
     if not np.array_equal(canonical[:, 0], times):
         msg = "Final COMSOL schedule does not retain the exact canonical regular support."
         raise ValueError(msg)
-    if handoff["regular_output_time_policy"] != "common.time.regular_times_unchanged":
-        msg = "Generation-input EDA requires unchanged regular output times."
-        raise ValueError(msg)
-    return canonical, _immutable(canonical), enabled, duration_h
+    output_times = schedule_service.regular_output_times(handoff, times)
+    return canonical, _immutable(canonical[: len(output_times)]), enabled, duration_h
 
 
 def _startup_diagnostics(
@@ -541,11 +539,11 @@ def build_case_diagnostics(case: admission.AdmittedInputCase) -> GenerationInput
         msg = "Transient scalar or schedule inventory does not match its profile contract."
         raise ValueError(msg)
     scalars = MappingProxyType({name: float(case.scalars[name]) for name in SCALAR_NAMES})
-    calibration_porosity = scalars["eps_bed_cal_ref"]
-    if not 0.0 < calibration_porosity < 1.0:
-        msg = "Calibration porosity must lie strictly inside (0, 1)."
+    eps_bed_ref = scalars["eps_bed_ref"]
+    if not 0.0 < eps_bed_ref < 1.0:
+        msg = "Reference porosity must lie strictly inside (0, 1)."
         raise ValueError(msg)
-    dry_density = scalars["rho_bu_dry_ref"] * (1.0 - raw["eps_bed"]) / (1.0 - calibration_porosity)
+    dry_density = scalars["rho_bu_dry_ref"] * (1.0 - raw["eps_bed"]) / (1.0 - eps_bed_ref)
     initial_temperature = float(case.payload["sampled_values"]["T_init"])
     equilibrium_humidity = domain.moisture.oswin_equilibrium_relative_humidity(
         raw["X_0_db_field"],
@@ -578,13 +576,6 @@ def build_case_diagnostics(case: admission.AdmittedInputCase) -> GenerationInput
     )
 
 
-def build_collection_diagnostics(
-    cases: Sequence[admission.AdmittedInputCase],
-) -> tuple[GenerationInputDiagnostics, ...]:
-    """Build immutable diagnostics in caller-supplied stable case order."""
-    return tuple(build_case_diagnostics(case) for case in cases)
-
-
 def _require_transient(
     record: GenerationInputDiagnostics,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, StartupDiagnostics]:
@@ -606,18 +597,6 @@ def transient_evidence(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, StartupDiagnostics]:
     """Return complete exact transient evidence through the public contract."""
     return _require_transient(record)
-
-
-def schedule_window_rows(
-    schedule: np.ndarray,
-    duration_h: float,
-    *,
-    startup_only: bool,
-) -> np.ndarray:
-    """Return immutable exact persisted rows for one semantic schedule window."""
-    times_h = schedule[:, 0]
-    mask = (times_h >= 0.0) & (times_h <= duration_h) if startup_only else times_h >= duration_h
-    return _immutable(np.array(schedule[mask], copy=True))
 
 
 def evaluate_boundary_schedule(
@@ -701,27 +680,6 @@ def dataset_boundary_schedule(
     )
 
 
-def startup_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
-    """Return exact final-schedule rows over the active startup interval."""
-    schedule, _canonical, _output, startup = _require_transient(record)
-    duration_h = startup.duration_h if startup.enabled else 0.0
-    return schedule_window_rows(schedule, duration_h, startup_only=True)
-
-
-def operating_schedule_rows(record: GenerationInputDiagnostics) -> np.ndarray:
-    """Return exact final-schedule rows from active startup rejoin or time zero."""
-    schedule, _canonical, _output, startup = _require_transient(record)
-    start_h = startup.duration_h if startup.enabled else 0.0
-    return schedule_window_rows(schedule, start_h, startup_only=False)
-
-
-def startup_schedule_minutes(record: GenerationInputDiagnostics) -> np.ndarray:
-    """Return startup rows with only their time coordinate converted to minutes."""
-    rows = np.array(startup_schedule_rows(record), copy=True)
-    rows[:, 0] *= 60.0
-    return _immutable(rows)
-
-
 def field_statistics(record: GenerationInputDiagnostics) -> pd.DataFrame:
     """Return compact statistics over each quantity's meaningful support."""
     rows = []
@@ -736,23 +694,6 @@ def field_statistics(record: GenerationInputDiagnostics) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows).set_index("quantity")
-
-
-def _homogeneous_records(
-    records: Sequence[GenerationInputDiagnostics],
-    *,
-    minimum: int = 1,
-) -> tuple[GenerationInputDiagnostics, ...]:
-    """Return a non-empty same-profile record tuple."""
-    selected = tuple(records)
-    if len(selected) < minimum:
-        msg = f"Generation-input comparison requires at least {minimum} case(s)."
-        raise ValueError(msg)
-    profiles_found = {record.profile_id for record in selected}
-    if len(profiles_found) != 1:
-        msg = "Generation-input comparison requires cases from one simulation profile."
-        raise ValueError(msg)
-    return selected
 
 
 def _schedule_mean(

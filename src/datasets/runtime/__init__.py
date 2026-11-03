@@ -3,7 +3,7 @@ Unified steady and transient Dataset loading and DataLoader orchestration.
 
 Provides:
 - factory: package request, Dataset, and DataLoader construction
-- package_validation: published-package inspection and loader smoke validation
+- package_validation: published-package tensor inspection
 - steady: materialized steady-flow Dataset runtime
 - training: split and training DataLoader orchestration
 - transient_training: transient split, scaling, and DataLoader orchestration

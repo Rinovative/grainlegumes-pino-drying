@@ -1,7 +1,4 @@
-"""
-evaluation_transient_metrics.py
-
-Aggregate strict transient drying evaluation statistics.
+"""Aggregate strict transient drying evaluation statistics.
 
 Responsibilities:
   - Accumulate complete-dataset normalized and physical error statistics
@@ -35,41 +32,15 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 _STATE_FIELDS = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
-_AIRFLOW_METRIC_ID_COUNT = 2
 _MINIMUM_STATE_ARRAY_RANK = 2
 _MINIMUM_STABILITY_ARRAY_RANK = 3
 _SPATIAL_MASK_RANK = 2
 NORMALIZED_AIRFLOW_GROUP_MACRO_RMSE = "normalized_airflow_group_macro_rmse"
-HISTORICAL_AIRFLOW_GROUP_MACRO_RMSE_ALIAS = "normalized_group_macro_rmse"
 NORMALIZED_DRYING_GROUP_MACRO_RMSE = "normalized_drying_group_macro_rmse"
 TEMPERATURE_PLAUSIBILITY_RANGE_K: Final = (0.0, 2_000.0)
 BULK_MOISTURE_CELL_WEIGHTING: Final = "canonical_trapezoidal_boundary_weights_over_spatial_mask"
 BULK_MOISTURE_INVALID_POLICY: Final = "unavailable_without_imputation"
 STABILITY_GROWTH_FACTOR: Final = 2.0
-
-
-def resolve_airflow_metric_value(values: Mapping[str, object]) -> float:
-    """Read the explicit Airflow metric ID while admitting its historical alias."""
-    explicit = values.get(NORMALIZED_AIRFLOW_GROUP_MACRO_RMSE)
-    historical = values.get(HISTORICAL_AIRFLOW_GROUP_MACRO_RMSE_ALIAS)
-    if explicit is None and historical is None:
-        msg = "Airflow Evaluation requires normalized_airflow_group_macro_rmse or its historical normalized_group_macro_rmse alias."
-        raise KeyError(msg)
-    candidates = [value for value in (explicit, historical) if value is not None]
-    admitted: list[float] = []
-    for value in candidates:
-        if isinstance(value, bool) or not isinstance(value, Real):
-            msg = "Airflow group macro RMSE values must be finite real scalars."
-            raise TypeError(msg)
-        admitted_value = float(value)
-        if not np.isfinite(admitted_value):
-            msg = "Airflow group macro RMSE values must be finite real scalars."
-            raise ValueError(msg)
-        admitted.append(admitted_value)
-    if len(admitted) == _AIRFLOW_METRIC_ID_COUNT and admitted[0] != admitted[1]:
-        msg = "Explicit and historical Airflow metric IDs disagree."
-        raise ValueError(msg)
-    return admitted[0]
 
 
 @dataclass(frozen=True, slots=True)

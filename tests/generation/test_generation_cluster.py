@@ -1,27 +1,55 @@
-# ruff: noqa: S101, PLR2004, SLF001
-"""Dynamic per-case feeder, Slurm identity, and transfer contracts."""
+"""Node-job feeder, dispatch identity, resume and admission, and shared dispatcher primitives.
+
+Responsibilities:
+  - Check node-job feeding, exact Slurm node-job and step ownership, interrupted-dispatch recovery, resume, and cancellation
+  - Check the resume matrix, the settled admission cap, the failure budget, and the admission block reasons
+  - Check the shared dispatcher primitives: node-job slot queue rows and job-step accounting rows
+
+Design principles:
+  - Persisted intents prevent duplicate submission; operational changes preserve science
+  - Hand-built run records carry one leased node job so dispatch, drain, and ticket files stay real
+
+This module does NOT:
+  - Contact a live scheduler or silently retry solver failures
+"""
 
 from __future__ import annotations
 
 import json
 import shlex
-import shutil
 import subprocess
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import yaml
+from support.fake_slurm import (
+    COMMIT,
+    NODE_ID,
+    Crash,
+    FakeSlurm,
+    bind_worker,
+    crash_at,
+    dispatch_record,
+    feed,
+    load_manifest,
+    make_campaign,
+    node_directory,
+    open_node_job,
+    submit,
+)
+from support.generation_fixtures import make_generation_config_factory
 
 from src import common, generation
+from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.cli import cli_generation
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
-from src.generation.runtime import generation_runtime_workspace as workspace
+from src.generation.runtime import generation_runtime_node as node
 
 
 def _synthetic_retry_policy(
@@ -29,29 +57,40 @@ def _synthetic_retry_policy(
     initial_delay_seconds: float = 20.0,
     maximum_delay_seconds: float = 30.0,
 ) -> dict[str, Any]:
-    """Return one test-owned unlimited temporary-license retry policy."""
+    """Return one test-owned bounded node licence-wait policy."""
     return {
         "enabled": True,
         "initial_delay_seconds": initial_delay_seconds,
         "maximum_delay_seconds": maximum_delay_seconds,
-        "maximum_wait_seconds": None,
+        "maximum_wait_seconds": 3600.0,
     }
 
 
-def _scheduler(
-    *,
-    active: dict[str, list[str]] | None = None,
-    accounted: dict[str, list[str]] | None = None,
-) -> dict[str, Any]:
-    """Return one successful synthetic scheduler reconciliation view."""
-    active_rows = {} if active is None else active
-    accounted_rows = {} if accounted is None else accounted
+def _scheduler(*, allocations: dict[str, list[str]] | None = None) -> dict[str, Any]:
+    """Return one successful synthetic scheduler view: the live node-job allocations and no step accounting."""
     return {
         "squeue": {"command": ["squeue"], "output": "", "error": None},
         "sacct": {"command": ["sacct"], "output": "", "error": None},
-        "active": active_rows,
-        "accounted": accounted_rows,
+        "sacct_steps": {"command": ["sacct"], "output": "", "error": None},
+        "allocations": {"active": {} if allocations is None else allocations, "accounted": {}},
+        "steps": {},
+        "active": {},
+        "accounted": {},
+        "not_started": [],
     }
+
+
+def _record_dispatches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Replace the ticket publication by a recorder of ``(case id, mode)`` that leaves a dispatched record as the real dispatch does."""
+    recorded: list[tuple[str, str]] = []
+
+    def dispatch(manifest: dict[str, Any], campaign: Any, task: Any, node_job: dict[str, Any], *, mode: str, **_kwargs: Any) -> dict[str, Any]:
+        recorded.append((task.case_id, mode))
+        dispatch_record(manifest, campaign, task, node_job, mode=mode)
+        return manifest
+
+    monkeypatch.setattr(generation.campaign, "_dispatch_case", dispatch)
+    return recorded
 
 
 def _set_native_launch_evidence(monkeypatch: pytest.MonkeyPatch, commit: str) -> None:
@@ -63,6 +102,262 @@ def _set_native_launch_evidence(monkeypatch: pytest.MonkeyPatch, commit: str) ->
         "GENERATION_NATIVE_VENV",
         str(common.paths.get_runtime_root().resolve() / "venvs" / "native"),
     )
+
+
+def _assert_latest_epoch_worker_binding(
+    manifest: dict[str, Any],
+    storage: Path,
+    work_root: Path,
+    campaign_name: str,
+    source_commit: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the maintained worker entrypoint to read the dispatch that a superseding idle epoch owns."""
+    bind_worker(monkeypatch, manifest, index=2, step="1", attempt="2", cpus="2")
+    monkeypatch.setattr(source_service, "required_git_commit", lambda: source_commit)
+    worker_seen: list[tuple[str, int, str]] = []
+    worker_outcome = SimpleNamespace(status="interrupted")
+
+    def run_worker(worker_campaign: Any, task: Any, **_kwargs: Any) -> Any:
+        worker_seen.append((worker_campaign.source_name, worker_campaign.execution_values["cluster"]["cores_per_case"], task.case_id))
+        return worker_outcome
+
+    monkeypatch.setattr(generation.campaign.cluster_service, "run_campaign_case", run_worker)
+    submission = manifest["submissions"][1]["case"]
+    assert (
+        generation.campaign.run_campaign_case_job(
+            manifest["campaign_run_id"],
+            submission["batch_name"],
+            submission["case_index"],
+            storage_root=storage,
+            work_root=work_root,
+        )
+        is worker_outcome
+    )
+    assert worker_seen == [(campaign_name, 2, "case_0001")]
+
+
+def _assert_epoch_append_cannot_rebind_existing_dispatches(
+    manifest: dict[str, Any], campaign: Any, storage: Path, campaign_name: str, original_commit: str, source_commit: str
+) -> None:
+    """Reject caller-owned boundaries before publishing any new epoch file."""
+    epoch_dir = common.paths.resolve_generation_epochs_directory(
+        common.paths.resolve_generation_execution_directory(
+            common.paths.resolve_generation_campaign_directory("steady_flow", campaign_name, storage_root=storage)
+        )
+    )
+    next_epoch = epoch_dir / "epoch_0004.json"
+    binding = generation.campaign._requested_execution_binding(campaign, source_commit)
+    for protected in ({"first_submission_index": 2}, {"campaign_run_id": manifest["campaign_run_id"]}):
+        with pytest.raises(ValueError, match="cannot override generated identity or submission boundaries"):
+            lifecycle.append_execution_epoch(manifest, {**binding, **protected})
+        assert not next_epoch.exists()
+        assert generation.campaign._execution_binding(manifest, submission_index=1)["git_commit"] == original_commit
+        assert generation.campaign._execution_binding(manifest, submission_index=2)["git_commit"] == source_commit
+
+
+def test_canonical_active_resume_rebinds_source_and_resources_without_changing_science(
+    generation_config_factory: Any,
+    world: FakeSlurm,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drained source run binds later node jobs and case dispatches to a new operational epoch."""
+    campaign = make_campaign(generation_config_factory, natural_count=2, max_admission_cases=1)
+    canonical_path = campaign.source_path
+    name = campaign.source_name
+    original_commit, next_commit = COMMIT, "c" * 40
+    storage = world.storage
+
+    def snapshot_binding(commit: str, fingerprint: str) -> tuple[str, str]:
+        snapshot_dir = storage / "source_snapshots" / fingerprint
+        snapshot_dir.mkdir(parents=True)
+        tracked_diff = snapshot_dir / "tracked.diff"
+        tracked_diff.write_bytes(b"")
+        snapshot = snapshot_dir / "snapshot.json"
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "schema_kind": "generation_source_snapshot",
+                    "schema_version": 1,
+                    "git_commit": commit,
+                    "source_fingerprint_sha256": fingerprint,
+                    "tracked_diff_sha256": common.serialization.file_sha256(tracked_diff),
+                    "untracked": [],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return str(snapshot), common.serialization.file_sha256(snapshot)
+
+    origin_snapshot, origin_snapshot_sha = snapshot_binding(original_commit, "b" * 64)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT", origin_snapshot)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT_SHA256", origin_snapshot_sha)
+    commit = {"value": original_commit}
+    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit["value"])
+    submitted: list[str] = []
+    submit_node_job = cluster.submit_node_job
+
+    def recording_submit(command: list[str], *, git_commit: str, environment: dict[str, str]) -> str:
+        assert environment["GENERATION_CAMPAIGN_RUN_ID"] == f"source~steady_flow~{name}"
+        submitted.append(git_commit)
+        return submit_node_job(command, git_commit=git_commit, environment=environment)
+
+    monkeypatch.setattr(cluster, "submit_node_job", recording_submit)
+    first = submit(campaign, world)
+    assert submitted == [original_commit]
+    origin = {
+        "path": origin_snapshot,
+        "sha256": origin_snapshot_sha,
+        "source_fingerprint_sha256": "b" * 64,
+    }
+    assert first["source_snapshot"] == origin
+    assert lifecycle.execution_epochs(first)[0]["source_snapshot"] == origin_snapshot
+    world.add_step("7001", 0, first["submissions"][0]["step_name"], "CANCELLED", "0:15")
+    world.set_state("7001", "COMPLETED")  # a new operational epoch is admitted only once every previous node job has ended
+    execution_path = canonical_path.parent / "execution.yaml"
+    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    execution["cluster"]["cores_per_case"] = 2
+    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+    updated = generation.cases.config.load_campaign_config(canonical_path)
+    assert updated.campaign_digest == campaign.campaign_digest
+    commit["value"] = next_commit
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", next_commit)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "d" * 64)
+    next_snapshot, next_snapshot_sha = snapshot_binding(next_commit, "d" * 64)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT", next_snapshot)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT_SHA256", next_snapshot_sha)
+    monkeypatch.delenv(source_service.SOURCE_TRANSITION_ENVIRONMENT_VARIABLE, raising=False)
+    with pytest.raises(RuntimeError, match="--continue-with-current-code"):
+        generation.campaign.submit_campaign(updated, git_commit=next_commit, storage_root=storage, max_admission_cases=2)
+    assert len(lifecycle.execution_epochs(first)) == 1
+    # From here on the launcher was asked to continue the bound campaign with the current code.
+    monkeypatch.setenv(source_service.SOURCE_TRANSITION_ENVIRONMENT_VARIABLE, source_service.EXPLICIT_SOURCE_TRANSITION)
+    fill = generation.campaign._fill_submission_capacity
+
+    def stop_after_epoch(*_args: Any, **_kwargs: Any) -> None:
+        message = "test-owned stop after durable epoch admission"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(generation.campaign, "_fill_submission_capacity", stop_after_epoch)
+    with pytest.raises(RuntimeError, match="test-owned stop after durable epoch admission"):
+        generation.campaign.submit_campaign(updated, git_commit=next_commit, storage_root=storage, max_admission_cases=2)
+    monkeypatch.setattr(generation.campaign, "_fill_submission_capacity", fill)
+    assert [epoch["first_submission_index"] for epoch in lifecycle.execution_epochs(first)] == [1, 2]
+    assert submitted == [original_commit]
+
+    # The cancelled case restarts in a new node job that the newest epoch binds.
+    final_commit = "e" * 40
+    commit["value"] = final_commit
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", final_commit)
+    monkeypatch.setenv("GENERATION_SOURCE_SHA256", "f" * 64)
+    final_snapshot, final_snapshot_sha = snapshot_binding(final_commit, "f" * 64)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT", final_snapshot)
+    monkeypatch.setenv("GENERATION_SOURCE_SNAPSHOT_SHA256", final_snapshot_sha)
+    resumed = generation.campaign.submit_campaign(updated, git_commit=final_commit, storage_root=storage, max_admission_cases=2)
+    assert resumed["git_commit"] == original_commit
+    assert resumed["source_snapshot"] == origin
+    assert resumed["execution_config_digest"] == first["execution_config_digest"]
+    assert submitted == [original_commit, final_commit]
+    assert resumed["slurm_job_ids"] == ["7001", "7002"]
+    retry = resumed["submissions"][1]
+    assert (retry["mode"], retry["attempt_index"], retry["job_id"], retry["case"]) == ("resume", 2, "7002", first["submissions"][0]["case"])
+    tickets = [json.loads(node.ticket_path(node_directory(campaign, world, job), 1).read_text(encoding="utf-8")) for job in resumed["node_jobs"]]
+    assert [(ticket["cores"], ticket["argv"][-1]) for ticket in tickets] == [(1, "1"), (2, "2")]
+    epochs = lifecycle.execution_epochs(resumed)
+    assert [epoch["git_commit"] for epoch in epochs] == [original_commit, next_commit, final_commit]
+    assert [(epoch["source_snapshot"], epoch["source_snapshot_sha256"]) for epoch in epochs] == [
+        (origin_snapshot, origin_snapshot_sha),
+        (next_snapshot, next_snapshot_sha),
+        (final_snapshot, final_snapshot_sha),
+    ]
+    assert [epoch["source_sha256"] for epoch in epochs] == ["b" * 64, "d" * 64, "f" * 64]
+    assert [epoch["first_submission_index"] for epoch in epochs] == [1, 2, 2]
+    assert generation.campaign._execution_binding(resumed, submission_index=1)["git_commit"] == original_commit
+    assert generation.campaign._execution_binding(resumed, submission_index=2)["git_commit"] == final_commit
+
+    _assert_latest_epoch_worker_binding(resumed, storage, tmp_path / "worker", name, final_commit, monkeypatch)
+    _assert_epoch_append_cannot_rebind_existing_dispatches(resumed, updated, storage, name, original_commit, final_commit)
+
+    invalid = {**generation.campaign._requested_execution_binding(updated, final_commit), "execution_config_digest": "0" * 64}
+    with pytest.raises(ValueError, match="changed execution contract"):
+        lifecycle.append_execution_epoch(resumed, invalid)
+    assert len(lifecycle.execution_epochs(resumed)) == len(epochs)
+    common_path = canonical_path.parent / "common.yaml"
+    scientific = yaml.safe_load(common_path.read_text(encoding="utf-8"))
+    scientific["grid"]["nx"] += 2
+    scientific["grid"]["ny"] += 2
+    common_path.write_text(yaml.safe_dump(scientific, sort_keys=False), encoding="utf-8")
+    changed_science = generation.cases.config.load_campaign_config(canonical_path)
+    assert changed_science.campaign_digest != campaign.campaign_digest
+    assert changed_science.source_name == campaign.source_name
+    with pytest.raises(ValueError, match="conflicting frozen scientific semantics"):
+        lifecycle.create_campaign(changed_science, storage_root=storage)
+
+
+def test_unexpected_operational_failure_stops_feeding_until_explicit_same_campaign_run(
+    generation_config_factory: Any,
+    world: FakeSlurm,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retained worker exception cannot silently launch another case or retry."""
+    campaign = make_campaign(generation_config_factory, natural_count=2, max_admission_cases=1)
+    name = campaign.source_name
+    storage = world.storage
+    initial = submit(campaign, world)
+    first = initial["submissions"][0]
+    first_case = first["case"]
+    assert (initial["slurm_job_ids"], len(initial["submissions"])) == (["7001"], 1)
+    lifecycle.record_candidate_attempt(
+        "steady_flow",
+        name,
+        "lentil",
+        str(first_case["case_id"]),
+        attempt_index=1,
+        stage="publication",
+        failure_class="publication",
+        reason_code="ValueError",
+        retryable=True,
+        detail="synthetic unexpected publication error",
+        evidence={"dispatch_key": "7001-1", "exception_type": "ValueError"},
+        storage_root=storage,
+    )
+    world.add_step("7001", 0, first["step_name"], "RUNNING")
+    with pytest.raises(RuntimeError, match=r"stopped automatic feeding.*7001-1"):
+        feed(campaign, world)
+    with pytest.raises(RuntimeError, match="requires terminal step accounting"):
+        submit(campaign, world)
+    assert load_manifest(campaign, world)["submissions"] == initial["submissions"]
+    world.clear_steps()
+    world.add_step("7001", 0, first["step_name"], "FAILED", "1:0")
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match=r"stopped automatic feeding.*7001-1"):
+            feed(campaign, world)
+    stopped = load_manifest(campaign, world)
+    assert (stopped["slurm_job_ids"], len(stopped["submissions"])) == (["7001"], 1)
+    assert lifecycle.candidate_records("steady_flow", name, storage_root=storage)[0]["attempts"][0]["evidence"]["dispatch_key"] == "7001-1"
+
+    wait_record = {
+        "classification": "temporary_license_capacity",
+        "retry_budget_remaining": True,
+        "first_blocked_at": "2026-01-01T00:00:00+00:00",
+        "next_retry_at": "2026-01-01T00:00:20+00:00",
+    }
+    monkeypatch.setattr(
+        generation.campaign.license_service,
+        "latest_wait_for_dispatch",
+        lambda *_args, dispatch_key, **_kwargs: wait_record if dispatch_key == "7001-1" else None,
+    )
+    monkeypatch.setattr(generation.campaign.license_service, "wait_record_is_eligible", lambda _attempt: True)
+    resumed = submit(campaign, world)
+    assert resumed["slurm_job_ids"] == ["7001"]  # the retry is a new ticket in the node job that is still alive
+    retry = resumed["submissions"][1]
+    assert (retry["case"], retry["mode"], retry["attempt_index"], retry["job_id"], retry["ticket_seq"]) == (first_case, "resume", 2, "7001", 2)
+    pending = feed(campaign, world)
+    assert (pending["slurm_job_ids"], len(pending["submissions"])) == (["7001"], 2)
 
 
 def _synthetic_input_sources(campaign: Any) -> dict[str, dict[str, Any]]:
@@ -85,134 +380,101 @@ def _synthetic_input_references(campaign: Any) -> dict[str, dict[int, Any]]:
     return references
 
 
-def test_one_case_submission_and_local_only_concurrency(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Protect ordinary one-case jobs and isolate local development concurrency."""
+def test_campaign_tasks_are_unique(generation_config_factory: Any) -> None:
+    """Every planned case has one exact identity."""
     config_path, _template = generation_config_factory(scheduler_kind="slurm")
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     assert len(tasks) == campaign.total_case_count
     assert len({(task.batch_id, task.case_id) for task in tasks}) == len(tasks)
 
-    task = tasks[0]
-    runtime = common.paths.get_runtime_root().resolve()
-    _set_native_launch_evidence(monkeypatch, "a" * 40)
-    command = cluster.build_campaign_case_slurm_submission_command(
-        campaign,
-        task,
-        run_id="synthetic__0123456789abcdef",
-        storage_root=tmp_path.resolve(),
-        scheduler_log_directory=tmp_path.resolve(),
-        scheduler_job_name="vp2-synthetic-0001",
-        attempt_index=1,
-    )
-    assert command[0] == "sbatch"
-    assert "--nodes=1" in command
-    assert "--ntasks=1" in command
-    assert f"--cpus-per-task={campaign.execution_values['cluster']['cores_per_case']}" in command
-    assert not any(argument.startswith("--array") for argument in command)
-    assert "--exclusive" not in command
-    assert f"--output={runtime}/logs/generation/slurm-%j.out" in command
-    assert f"--error={runtime}/logs/generation/slurm-%j.err" in command
-    wrapped = command[-1]
-    assert wrapped.startswith("--wrap=")
-    worker_arguments = shlex.split(wrapped.removeprefix("--wrap="))
-    launcher_index = next(index for index, argument in enumerate(worker_arguments) if argument.endswith("generation_node.sh"))
-    launcher = Path(worker_arguments[launcher_index])
-    assert worker_arguments[launcher_index + 1] == str(launcher.parents[1])
-    assert worker_arguments[launcher_index + 2] == "campaign-case"
-    assert task.batch_name in worker_arguments
-    assert str(task.case_index) in worker_arguments
-    assert "GENERATION_ATTEMPT_INDEX=1" in worker_arguments
-    assert f"STORAGE_ROOT={tmp_path.resolve()}" in worker_arguments
-    assert "GENERATION_SOURCE_SHA256=" + "b" * 64 in worker_arguments
 
-    plan = cluster.build_local_resource_plan(
-        cores_per_case=1,
-        max_parallel_cases=2,
-        remaining_cases=5,
-    )
-    assert plan.effective_parallel_cases == 2
-    assert not hasattr(plan, "max_nodes")
-    assert not hasattr(plan, "cases_per_node")
+def test_tree_mode_node_job_submission_runs_from_the_tree_with_explicit_bindings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A controller running from a frozen tree submits a node job that executes from it and names every root, tree and snapshot."""
+    tree_id = "a" * 12 + "-" + "b" * 12
+    runtime = tmp_path / "runtime"
+    tree = runtime / "sources" / tree_id
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    node_directory_path = tmp_path / "node"
+    node_directory_path.mkdir()
+    snapshot = storage / "source_snapshots" / tree_id / "snapshot.json"
+    for name, value in (
+        ("SOURCE_TREE_ID", tree_id),
+        ("PROJECT_ROOT", str(tree)),
+        ("STORAGE_ROOT", str(storage)),
+        ("RUNTIME_ROOT", str(runtime)),
+        ("GENERATION_SOURCE_SHA256", "b" * 64),
+        ("GENERATION_SOURCE_SNAPSHOT", str(snapshot)),
+        ("GENERATION_SOURCE_SNAPSHOT_SHA256", "c" * 64),
+        ("GENERATION_NATIVE_VENV", str(runtime / "venvs/native")),
+    ):
+        monkeypatch.setenv(name, value)
+    make_generation_config_factory(tree)  # places the tree's node launcher
+
+    arguments: dict[str, Any] = {
+        "seat": 1,
+        "submission_token": "abcdef0123456789",
+        "node_directory": node_directory_path,
+        "storage_root": storage,
+        "cores_per_node": 2,
+        "node_job_memory": "4G",
+        "node_job_wall_time": "01:00:00",
+        "partition": "standard",
+        "exclusions": [],
+        "comsol_module": "Comsol/test",
+        "python_executable": "python3",
+        "comsol_executable": "comsol",
+    }
+
+    command = cluster.build_node_job_submission_command(**arguments)
+    assert f"--chdir={tree}" in command
+    worker_arguments = shlex.split(command[-1].removeprefix("--wrap="))
+    assert worker_arguments[worker_arguments.index(str(tree / "scripts/generation_node.sh")) + 1] == str(tree)
+    for binding in (
+        f"PROJECT_ROOT={tree}",
+        f"SOURCE_TREE_ID={tree_id}",
+        f"RUNTIME_ROOT={runtime}",
+        f"STORAGE_ROOT={storage}",
+        f"GENERATION_SOURCE_SNAPSHOT={snapshot}",
+        "GENERATION_SOURCE_SNAPSHOT_SHA256=" + "c" * 64,
+    ):
+        assert worker_arguments.count(binding) == 1
+    monkeypatch.delenv("GENERATION_SOURCE_SNAPSHOT")
+    monkeypatch.delenv("GENERATION_SOURCE_SNAPSHOT_SHA256")
+    with pytest.raises(ValueError, match="Source-tree workers require"):
+        cluster.build_node_job_submission_command(**arguments)
 
 
 def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
     generation_config_factory: Any,
-    tmp_path: Path,
+    world: FakeSlurm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise first submission and exact persisted-job reconciliation."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
+    """Exercise first node-job submission and exact persisted-allocation reconciliation: a live node job takes later cases as tickets."""
+    campaign = make_campaign(generation_config_factory, natural_count=3, max_admission_cases=1)
     tasks = cluster.campaign_tasks(campaign)
-    commit = "8" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    storage = tmp_path / "storage"
-    calls: list[list[str]] = []
-    submitted_ids = iter(("12345", "12346"))
-    scheduler_mode = {"value": "active"}
+    storage = world.storage
+    submit_node_job = cluster.submit_node_job
 
-    def fake_scheduler(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        arguments = list(command)
-        calls.append(arguments)
-        if arguments[0] == "sbatch":
-            discovery = generation.cases.admission.discover_input_batches(storage)
-            assert not discovery.issues
-            assert sum(len(source.cases) for source in discovery.sources) == campaign.total_case_count
-            return subprocess.CompletedProcess(
-                arguments,
-                0,
-                stdout=f"{next(submitted_ids)}\n",
-                stderr="",
-            )
-        if arguments[0] == "squeue":
-            assert arguments == [
-                "squeue",
-                "--noheader",
-                "--jobs=12345",
-                "--format=%i|%T|%R|%N|%V|%S|%M",
-            ]
-            output = "12345|PENDING|Resources|\n" if scheduler_mode["value"] == "active" else ""
-            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
-        if arguments[0] == "sacct":
-            assert arguments == [
-                "sacct",
-                "--noheader",
-                "--parsable2",
-                "--jobs",
-                "12345",
-                "--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,NodeList,AllocCPUS,Partition",
-            ]
-            output = "" if scheduler_mode["value"] == "active" else "12345|COMPLETED|0:0\n"
-            return subprocess.CompletedProcess(arguments, 0, stdout=output, stderr="")
-        raise AssertionError(arguments)
+    def checked_submit(command: list[str], **kwargs: Any) -> str:
+        discovery = generation.cases.admission.discover_input_batches(storage)
+        assert not discovery.issues
+        assert sum(len(source.cases) for source in discovery.sources) == campaign.total_case_count
+        return submit_node_job(command, **kwargs)
 
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_scheduler)
+    monkeypatch.setattr(cluster, "submit_node_job", checked_submit)
 
     first_progress: list[dict[str, Any]] = []
-    first = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-        progress=lambda event: first_progress.append(dict(event)),
-    )
-    assert first["slurm_job_ids"] == ["12345"]
-    assert [command[0] for command in calls] == ["sbatch"]
-    persisted = campaign_evidence.load_campaign_run(
-        first["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert persisted["submissions"][0]["job_id"] == "12345"
+    first = submit(campaign, world, progress=lambda event: first_progress.append(dict(event)))
+    assert first["slurm_job_ids"] == ["7001"]
+    assert len(world.sbatch_arguments()) == 1
+    assert world.leases == ["7001"]
+    persisted = load_manifest(campaign, world)
+    dispatch = persisted["submissions"][0]
+    assert (dispatch["job_id"], dispatch["node_job_token"], dispatch["ticket_seq"]) == ("7001", persisted["node_jobs"][0]["token"], 1)
+    assert node.ticket_path(node_directory(campaign, world, persisted["node_jobs"][0]), 1).is_file()
     assert persisted["scheduler_log_directory"] == str(common.paths.get_runtime_root().resolve() / "logs" / "generation")
-    assert not (campaign_evidence.campaign_run_directory(first["campaign_run_id"], storage_root=storage) / "scheduler").exists()
     assert [event["scheduler_submissions"] for event in first_progress if event.get("operation") == "scheduler_submission"] == [1]
 
     blocked = AssertionError("Current canonical inputs were regenerated before resubmission.")
@@ -223,14 +485,9 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
             "generate_case_input_bundle",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(blocked),
         )
-        active = generation.campaign.submit_campaign(
-            campaign,
-            git_commit=commit,
-            storage_root=storage,
-            progress=lambda event: active_progress.append(dict(event)),
-        )
-    assert active["slurm_job_ids"] == ["12345"]
-    assert [command[0] for command in calls].count("sbatch") == 1
+        active = submit(campaign, world, progress=lambda event: active_progress.append(dict(event)))
+    assert active["slurm_job_ids"] == ["7001"]
+    assert len(world.sbatch_arguments()) == 1
     assert not any(event.get("operation") == "scheduler_submission" for event in active_progress)
 
     unchanged_progress: list[dict[str, Any]] = []
@@ -239,12 +496,17 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         storage_root=storage,
         progress=lambda event: unchanged_progress.append(dict(event)),
     )
-    assert unchanged["slurm_job_ids"] == ["12345"]
-    assert [command[0] for command in calls].count("sbatch") == 1
+    assert unchanged["slurm_job_ids"] == ["7001"]
+    assert len(world.sbatch_arguments()) == 1
     assert not any(event.get("operation") == "scheduler_submission" for event in unchanged_progress)
 
-    scheduler_mode["value"] = "completed"
+    world.add_step("7001", 0, dispatch["step_name"], "COMPLETED")
+    world.set_state("7001", "COMPLETED")  # a larger admission cap is a new execution epoch: it needs every previous node job ended
     first_case = tasks[0]
+    # The first case has no real publication here, so recording its success decision is out of this test's scope.
+    monkeypatch.setattr(
+        generation.campaign, "_reconcile_success_decisions", lambda _manifest, _campaign, _views, records, _scheduler, **_kwargs: records
+    )
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
         "completed_case_is_valid",
@@ -256,14 +518,83 @@ def test_scheduler_argv_and_duplicate_safe_campaign_reconciliation(
         lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
     advanced_progress: list[dict[str, Any]] = []
-    advanced = generation.campaign.feed_campaign(
-        first["campaign_run_id"],
-        storage_root=storage,
-        progress=lambda event: advanced_progress.append(dict(event)),
-    )
-    assert advanced["slurm_job_ids"] == ["12345", "12346"]
+    advanced = submit(campaign, world, max_admission_cases=2, progress=lambda event: advanced_progress.append(dict(event)))
+    assert advanced["slurm_job_ids"] == ["7001", "7002"]
+    assert len(world.sbatch_arguments()) == 2
     assert advanced["submissions"][1]["case"]["case_id"] == tasks[1].case_id
+    assert (advanced["submissions"][1]["job_id"], advanced["submissions"][1]["ticket_seq"]) == ("7002", 1)
     assert [event["scheduler_submissions"] for event in advanced_progress if event.get("operation") == "scheduler_submission"] == [2]
+
+    # Liveness is read once per cycle for the current user only, never by job selection; accounting names exactly the persisted allocations.
+    queue_formats = {"%i|%j|%T|%k", "%i|%T|%R|%N|%V|%S|%M"}
+    for line in world.log("squeue.log"):
+        arguments = line.split()
+        assert arguments[0] == "--noheader"
+        assert sum(argument.startswith("--user=") for argument in arguments) == 1
+        assert not any(argument.startswith("--jobs") for argument in arguments)
+        assert arguments[-1].removeprefix("--format=") in queue_formats
+    for line in world.log("sacct.log"):
+        arguments = line.split()
+        assert arguments[:3] == ["--noheader", "--parsable2", "--jobs"]
+        assert arguments[3] in {"7001", "7001,7002"}
+        assert arguments[4] in {
+            "--format=JobIDRaw,State,ExitCode,Submit,Start,End,Elapsed,NodeList,AllocCPUS,Partition",
+            f"--format={cluster.STEP_ACCOUNTING_FORMAT}",
+        }
+
+
+def test_archived_owned_job_uses_exact_accounting_without_claiming_unrelated_live_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired live-queue ID still has terminal sacct evidence for its allocation and steps, and no active ownership."""
+    commands: list[list[str]] = []
+
+    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
+        commands.append(command)
+        if command[0] == "squeue":
+            assert any(argument.startswith("--user=") for argument in command)
+            assert not any(argument.startswith("--jobs") for argument in command)
+            return "99999|RUNNING|unrelated|node-other|2026-10-02T00:00:00|2026-10-02T00:00:01|00:00:01", None
+        assert command[0] == "sacct"
+        assert command[3:5] == ["--jobs", "845436"]
+        if command[5] == f"--format={cluster.STEP_ACCOUNTING_FORMAT}":
+            return (
+                "845436.0|sf-lentil-c0001-s1|FAILED|2:0|2026-10-02T00:00:00|2026-10-02T00:00:05|2026-10-02T00:30:00|00:29:55|node-a|1|test|1024K",
+                None,
+            )
+        return "845436|FAILED|2:0", None
+
+    monkeypatch.setattr(generation.campaign, "_scheduler_output", scheduler_output)
+    evidence = generation.campaign._scheduler_evidence(["845436"])
+    generation.campaign._require_scheduler_evidence(evidence)
+    assert evidence["allocations"]["active"] == {}
+    assert evidence["allocations"]["accounted"]["845436"][1:3] == ["FAILED", "2:0"]
+    assert evidence["steps"][("845436", "sf-lentil-c0001-s1")]["state"] == "FAILED"
+    assert evidence["active"] == evidence["accounted"] == {}  # per-dispatch rows come from the dispatch records, not from the allocation
+    assert generation.campaign.query_active_scheduler_job_ids(("845436",)) == ()
+    assert [command[0] for command in commands] == ["squeue", "sacct", "sacct", "squeue"]
+
+
+@pytest.mark.parametrize(
+    "live_row",
+    [
+        "845436|PENDING",
+        "845436|PENDING|Resources|N/A|2026-10-02T00:00:00|N/A|00:00:00|unexpected",
+    ],
+)
+def test_owned_live_queue_row_requires_exact_seven_field_protocol(live_row: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject truncated and extended owned rows before terminal accounting can hide them."""
+
+    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
+        if command[0] == "squeue":
+            assert command[-1] == "--format=%i|%T|%R|%N|%V|%S|%M"
+            return live_row, None
+        assert command[0] == "sacct"
+        return "845436|FAILED|2:0", None
+
+    monkeypatch.setattr(generation.campaign, "_scheduler_output", scheduler_output)
+    with pytest.raises(ValueError, match="ambiguous owned scheduler liveness evidence"):
+        generation.campaign._scheduler_evidence(["845436"])
 
 
 def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
@@ -281,6 +612,7 @@ def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
     commit = "7" * 40
     storage = tmp_path / "storage"
     monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
+    lifecycle.create_campaign(campaign, storage_root=storage)
     generated = generation.cases.input_generation.generate_input_cases(
         batch,
         1,
@@ -309,351 +641,24 @@ def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
         )
 
     assert scheduler_calls == []
-    assert not campaign_evidence.campaign_run_directory(
+    assert not campaign_evidence.campaign_run_manifest_path(
         run_id,
         storage_root=storage,
-    ).exists()
-
-
-def test_license_retry_waits_then_resubmits_the_same_case_once(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Hold same-key work until one oldest probe proves solver startup."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=2,
-        max_admission_cases=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "9" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    storage = tmp_path / "storage"
-    submitted_ids = iter(("4101", "4102", "4103"))
-    submit_commands: list[list[str]] = []
-    retry_eligible = {"value": False}
-    retry_active = {"value": False}
-    solver_window_recorded = {"value": False}
-    old_solver_window_recorded = {"value": False}
-    completed_cases: set[int] = set()
-    wait_record = {
-        "classification": "temporary_license_capacity",
-        "retry_budget_remaining": True,
-        "first_blocked_at": "2026-01-01T00:00:00+00:00",
-        "next_retry_at": "2026-01-01T00:00:20+00:00",
-    }
-
-    def fake_submit(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        arguments = list(command)
-        assert arguments[0] == "sbatch"
-        submit_commands.append(arguments)
-        job_id = next(submitted_ids)
-        if job_id == "4102":
-            retry_active["value"] = True
-        return subprocess.CompletedProcess(arguments, 0, stdout=f"{job_id}\n", stderr="")
-
-    def scheduler_evidence(job_ids: list[str]) -> dict[str, Any]:
-        active = {"4102": ["4102", "RUNNING"]} if retry_active["value"] and "4102" in job_ids else {}
-        return _scheduler(
-            active=active,
-            accounted={job_id: [job_id, "COMPLETED"] for job_id in job_ids if job_id not in active},
-        )
-
-    def latest_wait(
-        *_args: Any,
-        job_id: str,
-        **_kwargs: Any,
-    ) -> dict[str, Any] | None:
-        return wait_record if job_id == "4101" else None
-
-    def runtime_progress(_run_id: str, _job_id: str, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        return {
-            "availability": "unavailable",
-            "reason": "not_reported",
-            "age_seconds": None,
-            "stale": None,
-        }
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", scheduler_evidence)
-    monkeypatch.setattr(generation.campaign.subprocess, "run", fake_submit)
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda _batch, case_index, **_kwargs: case_index in completed_cases,
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "case_failure_is_recorded",
-        lambda *_args, **_kwargs: False,
-    )
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "latest_wait_for_job",
-        latest_wait,
-    )
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "wait_record_is_eligible",
-        lambda _attempt: retry_eligible["value"],
-    )
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "load_in_allocation_license_window",
-        lambda *_args, job_id, **_kwargs: (
-            {
-                "solver_progress_started": True,
-                "outcome": "solver_progress_started",
-                "reason": "solver_progress_started",
-            }
-            if job_id == "4102" and solver_window_recorded["value"]
-            else {
-                "solver_progress_started": True,
-                "outcome": "solver_progress_started",
-                "reason": "solver_progress_started",
-            }
-            if job_id == "4101" and old_solver_window_recorded["value"]
-            else {
-                "outcome": "window_exhausted",
-                "reason": "in_allocation_license_window_exhausted",
-            }
-            if job_id == "4101"
-            else None
-        ),
-    )
-    monkeypatch.setattr(
-        generation.campaign.progress_service,
-        "load_runtime_progress",
-        runtime_progress,
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_finalize_completed_batches",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_successful_status_summary",
-        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
-    )
-
-    initial = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    run_id = str(initial["campaign_run_id"])
-    assert initial["slurm_job_ids"] == ["4101"]
-
-    waiting = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert waiting["state"] == "license_blocked"
-    assert waiting["slurm_job_ids"] == ["4101"]
-
-    retry_eligible["value"] = True
-    retry_snapshots: list[dict[str, Any]] = []
-    retried = generation.campaign.resume_campaign(
-        run_id,
-        storage_root=storage,
-        status_callback=lambda status: retry_snapshots.append(dict(status)),
-    )
-    assert retried["slurm_job_ids"] == ["4101", "4102"]
-    assert [record["mode"] for record in retried["submissions"]] == [
-        "initial",
-        "license_retry",
-    ]
-    assert retried["submissions"][1]["case"] == retried["submissions"][0]["case"]
-    assert len(retry_snapshots) == 1
-    retry_snapshot = retry_snapshots[0]
-    retry_case = next(case for case in retry_snapshot["cases"] if case["case_id"] == tasks[0].case_id)
-    assert retry_case["state"] == "scheduler_pending"
-    assert retry_case["classified_state"] == "pending"
-    assert retry_case["reason"] == "scheduler_snapshot_predates_submission"
-    assert retry_case["automatic_continuation_allowed"] is True
-    assert retry_snapshot["failed_cases"] == 0
-    assert retry_snapshot["work_unit_counts"]["failed"] == 0
-    assert retry_snapshot["failure_circuit_breaker_tripped"] is False
-    assert retry_snapshot["admission_blocked"] is True
-    assert retry_snapshot["admission_block_reason"] == "max_admission_cases_reached"
-
-    visible_snapshots: list[dict[str, Any]] = []
-    unresolved = generation.campaign.resume_campaign(
-        run_id,
-        storage_root=storage,
-        status_callback=lambda status: visible_snapshots.append(dict(status)),
-    )
-    assert unresolved["slurm_job_ids"] == ["4101", "4102"]
-    assert len(submit_commands) == 2
-    assert len(visible_snapshots) == 1
-    visible_case = next(case for case in visible_snapshots[0]["cases"] if case["case_id"] == tasks[0].case_id)
-    assert visible_case["state"] == "running"
-    assert visible_case["classified_state"] == "active"
-    assert visible_snapshots[0]["failed_cases"] == 0
-    assert visible_snapshots[0]["failure_circuit_breaker_tripped"] is False
-
-    old_solver_window_recorded["value"] = True
-    unreleased = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert unreleased["slurm_job_ids"] == ["4101", "4102"]
-
-    solver_window_recorded["value"] = True
-    released = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert released["slurm_job_ids"] == ["4101", "4102", "4103"]
-    assert released["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
-    assert released["submissions"][-1]["mode"] == "initial"
-
-    retry_active["value"] = False
-    completed_cases.update(task.case_index for task in tasks)
-    terminal = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert terminal["state"] == "complete"
-
-
-def test_stale_failure_allows_fresh_submission_without_active_job_duplication(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Ignore a prior execution failure while preserving active-job priority."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=2,
-        max_running_cases=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    task = cluster.campaign_tasks(campaign)[0]
-    batch = campaign.batch(task.batch_name)
-    storage = tmp_path / "stale campaign storage"
-    source_commit = "7" * 40
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", source_commit)
-    monkeypatch.setenv(
-        "GENERATION_CAMPAIGN_RUN_ID",
-        "source-campaign__0123456789abcdef",
-    )
-    generation.cases.input_generation.generate_input_cases(
-        batch,
-        len(batch.case_indices),
-        storage_root=storage,
-    )
-    generation.runtime.record_case_failure(
-        batch,
-        task.case_index,
-        RuntimeError("prior synthetic failure"),
-        worker_slot=0,
-        scheduler_kind="slurm",
-        allocated_node="node-source",
-        work_directory=None,
-        storage_root=storage,
-        scratch_cleanup_status="not_created",
-        failure_stage="input",
-    )
-
-    current_commit = "8" * 40
-    _set_native_launch_evidence(monkeypatch, current_commit)
-    current_run_id = generation.campaign.campaign_run_id(
-        campaign,
-        git_commit=current_commit,
-    )
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", current_commit)
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", current_run_id)
-    scheduler = _scheduler()
-    submissions: list[list[str]] = []
-
-    def submit(command: list[str], **_kwargs: Any) -> str:
-        submissions.append(command)
-        return "321"
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: current_commit)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: scheduler)
-    monkeypatch.setattr(generation.campaign, "_submit_case", submit)
-
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=current_commit,
-        storage_root=storage,
-    )
-    assert manifest["slurm_job_ids"] == ["321"]
-    assert len(submissions) == 1
-
-    scheduler["active"] = {"321": ["321", "RUNNING", "node-new", "node-new"]}
-    active = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert active["slurm_job_ids"] == ["321"]
-    assert len(submissions) == 1
-
-
-def test_current_failure_is_not_automatically_retried(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Never retry a failed scientific case during same-config continuation."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=1,
-        maximum_failed_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    task = cluster.campaign_tasks(campaign)[0]
-    batch = campaign.batch(task.batch_name)
-    storage = tmp_path / "current failure storage"
-    commit = "9" * 40
-    run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
-    monkeypatch.setenv("GENERATION_GIT_COMMIT", commit)
-    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
-    generation.cases.input_generation.generate_input_cases(
-        batch,
-        len(batch.case_indices),
-        storage_root=storage,
-    )
-    generation.runtime.record_case_failure(
-        batch,
-        task.case_index,
-        RuntimeError("current synthetic failure"),
-        worker_slot=0,
-        scheduler_kind="slurm",
-        allocated_node="node-current",
-        work_directory=None,
-        storage_root=storage,
-        scratch_cleanup_status="not_created",
-        failure_stage="input",
-    )
-    submitted: list[list[str]] = []
-
-    def submit(command: list[str], **_kwargs: Any) -> str:
-        submitted.append(command)
-        return "654"
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: _scheduler(),
-    )
-    monkeypatch.setattr(generation.campaign, "_submit_case", submit)
-
-    unchanged = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    assert unchanged["state"] == "completed_with_failures"
-    assert submitted == []
+    ).is_file()
 
 
 @pytest.mark.parametrize(
-    ("case_state", "replay_available", "expected_action", "expected_state"),
+    ("case_state", "expected_action", "expected_state"),
     [
-        ("successful", False, "reuse", "complete"),
-        ("never_started", False, "submit_initial", "active"),
-        ("cancelled", False, "submit_resume", "active"),
-        ("interrupted", False, "submit_resume", "active"),
-        ("conversion_failed", True, "replay", "complete"),
-        ("publication_failed", True, "replay", "complete"),
-        ("exports_failed", False, "stop", "completed_with_failures"),
-        ("failed", False, "stop", "completed_with_failures"),
-        ("timed_out", False, "stop", "completed_with_failures"),
+        ("successful", "reuse", "complete"),
+        ("never_started", "submit_initial", "active"),
+        ("cancelled", "submit_resume", "active"),
+        ("interrupted", "submit_resume", "active"),
+        ("conversion_failed", "stop", "completed_with_failures"),
+        ("publication_failed", "stop", "completed_with_failures"),
+        ("exports_failed", "stop", "completed_with_failures"),
+        ("failed", "stop", "completed_with_failures"),
+        ("timed_out", "stop", "completed_with_failures"),
     ],
 )
 def test_campaign_resume_matrix_never_silently_retries_solver_failures(
@@ -661,16 +666,15 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     case_state: str,
-    replay_available: bool,
     expected_action: str,
     expected_state: str,
 ) -> None:
-    """Protect reuse, restart, replay, and explicit-retry boundaries."""
+    """Protect canonical reuse and restart boundaries and the stop at every recorded failure; a settled campaign drains its node job."""
     config_path, _template = generation_config_factory(natural_count=2)
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     target = tasks[0]
-    run_id = "resume-matrix__0123456789abcdef"
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit="c" * 40)
     commit = "c" * 40
     storage = tmp_path / case_state
     campaign_evidence.campaign_run_directory(
@@ -679,18 +683,24 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     ).mkdir(parents=True)
     manifest: dict[str, Any] = {
         "campaign_run_id": run_id,
+        "remote_storage_root": str(storage),
+        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
         "git_commit": commit,
         "slurm_job_ids": [],
+        "node_jobs": [],
+        "node_job_intent": None,
         "submissions": [],
         "submission_intent": None,
         "submission_config": {
             "max_admission_cases": 1,
-            "max_running_cases": None,
+            "node_jobs": 2,
+            "concurrent_cases_per_node": 4,
             "maximum_failed_cases": 0,
-            "temporary_license_retry": _synthetic_retry_policy(),
+            "license_wait": _synthetic_retry_policy(),
         },
         "state": "active",
     }
+    node_job = open_node_job(manifest, storage)
     views = [
         {
             "batch_name": task.batch_name,
@@ -698,13 +708,23 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
             "case_index": task.case_index,
             "case_id": task.case_id,
             "state": (case_state if task == target else "successful"),
-            "postprocessing_replay_available": (replay_available if task == target else False),
-            "attempt_campaign_run_id": (run_id if task == target and replay_available else None),
         }
         for task in tasks
     ]
-    submissions: list[tuple[str, str]] = []
-    replays: list[tuple[str, int]] = []
+    monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda *_args, **_kwargs: campaign)
+    records = [
+        {
+            "reservation": {"batch_id": task.batch_id, "case_id": task.case_id, "origin": "primary"},
+            "decision": {"outcome": "successful"} if task != target or case_state == "successful" else None,
+            "attempts": [],
+        }
+        for task in tasks
+    ]
+    monkeypatch.setattr(lifecycle, "candidate_records", lambda *_args, **_kwargs: records)
+    # The stubbed records have no campaign tree behind them, so the derived cases view of a completion is stubbed too.
+    monkeypatch.setattr(generation.publication.catalog, "campaign_cases_csv", lambda *_args, **_kwargs: "material,case_id\n")
+
+    submissions = _record_dispatches(monkeypatch)
     finalized: list[bool] = []
 
     monkeypatch.setattr(
@@ -720,7 +740,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     monkeypatch.setattr(
         generation.campaign,
         "_scheduler_evidence",
-        lambda _job_ids: _scheduler(),
+        lambda _job_ids: _scheduler(allocations={"7001": ["7001", "RUNNING"]}),
     )
     monkeypatch.setattr(
         generation.campaign,
@@ -742,42 +762,9 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         "_repository_commit",
         lambda: commit,
     )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_write_campaign_manifest",
-        lambda payload, **_kwargs: dict(payload),
-    )
-
-    def submit(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        submissions.append((task.case_id, mode))
-        payload["state"] = "active"
-        return dict(payload)
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit)
-
-    def replay(batch: Any, case_index: int, **_kwargs: Any) -> Any:
-        replays.append((batch.batch_name, case_index))
-        return SimpleNamespace(status="replayed")
-
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "replay_case_postprocessing",
-        replay,
-    )
 
     def case_is_valid(_batch: Any, case_index: int, **_kwargs: Any) -> bool:
-        if case_index != target.case_index:
-            return True
-        return case_state == "successful" or (expected_action == "replay" and bool(replays))
+        return case_index != target.case_index or case_state == "successful"
 
     monkeypatch.setattr(
         generation.campaign.batch_runtime,
@@ -790,8 +777,8 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
     )
     monkeypatch.setattr(
-        generation.campaign,
-        "_finalize_completed_batches",
+        lifecycle,
+        "seal_selected_pool",
         lambda *_args, **_kwargs: finalized.append(True),
     )
 
@@ -807,42 +794,26 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         assert submissions == [(target.case_id, "resume")]
     else:
         assert submissions == []
-    if expected_action == "replay":
-        assert replays == [(target.batch_name, target.case_index)]
-    else:
-        assert replays == []
-    assert bool(finalized) is (expected_action in {"reuse", "replay"})
+    assert bool(finalized) is (expected_action == "reuse")
+    drained = expected_action not in {"submit_initial", "submit_resume"}
+    assert (node_job["draining"], node_job["stop_ticket_seq"]) == (drained, 1 if drained else None)
+    assert node.ticket_path(campaign_evidence.campaign_node_job_directory(run_id, node_job["token"], storage_root=storage), 1).is_file() is drained
 
 
 def test_malformed_persisted_job_id_fails_before_scheduler_query(
     generation_config_factory: Any,
-    tmp_path: Path,
+    world: FakeSlurm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject non-numeric durable job identity without querying Slurm."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "7" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    storage = tmp_path / "storage"
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: "123")
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    path = campaign_evidence.campaign_run_manifest_path(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    path = campaign_evidence.campaign_run_manifest_path(manifest["campaign_run_id"], storage_root=world.storage)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["slurm_job_ids"] = ["123 --all"]
-    payload["submissions"][0]["job_id"] = "123 --all"
-    path.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    payload["slurm_job_ids"] = ["7001 --all"]
+    payload["node_jobs"][0]["job_id"] = "7001 --all"
+    payload["submissions"][0]["job_id"] = "7001 --all"
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     monkeypatch.setattr(
         generation.campaign,
         "_scheduler_output",
@@ -850,383 +821,7 @@ def test_malformed_persisted_job_id_fails_before_scheduler_query(
     )
 
     with pytest.raises(ValueError, match="submission state is malformed"):
-        generation.campaign.feed_campaign(
-            manifest["campaign_run_id"],
-            storage_root=storage,
-        )
-
-
-def test_feeder_restores_one_pending_job_without_limiting_running_jobs(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Submit one at a time, keep max_admission_cases=1, and allow running growth."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=6,
-        max_admission_cases=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "a" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    submitted = iter(("101", "102", "103", "104"))
-    scheduler_state: dict[str, list[str]] = {}
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_case",
-        lambda *_args, **_kwargs: next(submitted),
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: _scheduler(active=scheduler_state),
-    )
-    monkeypatch.setattr(
-        generation.campaign.progress_service,
-        "load_runtime_progress",
-        lambda _run_id, job_id, _identity, **_kwargs: (
-            {
-                "availability": "available",
-                "phase": "transient_drying",
-                "parser_state": "available",
-            }
-            if scheduler_state.get(job_id, [None, None])[1] == "RUNNING"
-            else {"availability": "unavailable", "reason": "not_reported"}
-        ),
-    )
-    monkeypatch.setattr(
-        generation.campaign.license_service,
-        "load_in_allocation_license_window",
-        lambda *_args, job_id, **_kwargs: (
-            {
-                "solver_progress_started": True,
-                "outcome": "solver_progress_started",
-                "reason": "solver_progress_started",
-            }
-            if scheduler_state.get(job_id, [None, None])[1] == "RUNNING"
-            else None
-        ),
-    )
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    assert manifest["slurm_job_ids"] == ["101"]
-    assert manifest["submission_config"]["max_admission_cases"] == 1
-    first_case = manifest["submissions"][0]["case"]
-    assert first_case["case_id"] == cluster.campaign_tasks(campaign)[0].case_id
-
-    scheduler_state["101"] = ["101", "PENDING", "Resources", ""]
-    unchanged = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert unchanged["slurm_job_ids"] == ["101"]
-
-    scheduler_state["101"] = ["101", "RUNNING", "node-a", "node-a"]
-    second = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert second["slurm_job_ids"] == ["101", "102"]
-    assert second["submissions"][1]["case"] != first_case
-
-    scheduler_state["102"] = ["102", "PENDING", "Resources", ""]
-    still_two = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert still_two["slurm_job_ids"] == ["101", "102"]
-
-    scheduler_state["102"] = ["102", "RUNNING", "node-b", "node-b"]
-    third = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert third["slurm_job_ids"] == ["101", "102", "103"]
-
-    scheduler_state["103"] = ["103", "PENDING", "Resources", ""]
-    saturated = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert saturated["slurm_job_ids"] == ["101", "102", "103"]
-
-    scheduler_state["103"] = ["103", "RUNNING", "node-c", "node-c"]
-    scheduler_state["999"] = ["999", "PENDING", "Resources", ""]
-    unrelated_pending_is_ignored = generation.campaign.feed_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert unrelated_pending_is_ignored["slurm_job_ids"] == ["101", "102", "103", "104"]
-
-
-def test_feeder_refills_max_admission_cases_after_one_pending_case(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Submit the next unsent case when one scheduler-pending case leaves buffer capacity."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-        max_admission_cases=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "e" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    submitted = iter(("301", "302"))
-    scheduler_state: dict[str, list[str]] = {}
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(submitted))
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler(active=scheduler_state))
-    storage = tmp_path / "storage"
-    initial = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-    manifest_path = campaign_evidence.campaign_run_manifest_path(initial["campaign_run_id"], storage_root=storage)
-    persisted = campaign_evidence.load_campaign_run(initial["campaign_run_id"], storage_root=storage)
-    persisted["submission_config"]["max_admission_cases"] = 2
-    generation.campaign.common.serialization.atomic_write_json(manifest_path, persisted)
-
-    scheduler_state["301"] = ["301", "PENDING", "Resources", ""]
-    advanced = generation.campaign.feed_campaign(initial["campaign_run_id"], storage_root=storage)
-
-    assert advanced["slurm_job_ids"] == ["301", "302"]
-    assert advanced["submissions"][1]["case"]["case_id"] == cluster.campaign_tasks(campaign)[1].case_id
-
-
-def test_feeder_pending_jobs_do_not_consume_running_capacity(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fill four pending slots independently of a two-running-case cap."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=5,
-        max_admission_cases=1,
-        max_running_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "f" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    submitted = iter(("401", "402", "403", "404"))
-    scheduler_state: dict[str, list[str]] = {}
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(submitted))
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler(active=scheduler_state))
-    storage = tmp_path / "storage"
-    initial = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-    manifest_path = campaign_evidence.campaign_run_manifest_path(initial["campaign_run_id"], storage_root=storage)
-    persisted = campaign_evidence.load_campaign_run(initial["campaign_run_id"], storage_root=storage)
-    persisted["submission_config"]["max_admission_cases"] = 4
-    generation.campaign.common.serialization.atomic_write_json(manifest_path, persisted)
-
-    scheduler_state["401"] = ["401", "PENDING", "Resources", ""]
-    filled = generation.campaign.feed_campaign(initial["campaign_run_id"], storage_root=storage)
-
-    assert filled["slurm_job_ids"] == ["401", "402", "403", "404"]
-    assert filled["state"] == "active"
-
-
-def test_feeder_skips_valid_success_before_submitting_next_unsent_case(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep immutable success authoritative when a prior job leaves squeue."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=4,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "f" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    job_ids = iter(("401", "402"))
-    scheduler = _scheduler()
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(job_ids))
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: scheduler)
-    completed: set[tuple[str, int]] = set()
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) in completed,
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_successful_status_summary",
-        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
-    )
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-    completed.add((tasks[0].batch_name, tasks[0].case_index))
-    scheduler["accounted"] = {"401": ["401", "COMPLETED", "0:0"]}
-    advanced = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
-    assert advanced["slurm_job_ids"] == ["401", "402"]
-    assert advanced["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
-
-
-def test_optional_running_cap_blocks_only_while_capacity_is_occupied(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Hold new work at the explicit cap and advance after success frees capacity."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=2,
-        maximum_failed_cases=2,
-        max_running_cases=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "b" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    job_ids = iter(("201", "202"))
-    scheduler = _scheduler()
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_submit_case", lambda *_args, **_kwargs: next(job_ids))
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: scheduler)
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-
-    scheduler["active"] = {"201": ["201", "RUNNING", "node-a", "node-a"]}
-    capped = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
-    assert capped["slurm_job_ids"] == ["201"]
-
-    scheduler["active"] = {}
-    scheduler["accounted"] = {"201": ["201", "COMPLETED", "0:0"]}
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda batch, case_index, **_kwargs: (batch.batch_name, case_index) == (tasks[0].batch_name, tasks[0].case_index),
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_successful_status_summary",
-        lambda *_args, **_kwargs: generation.campaign._empty_successful_status_summary(),
-    )
-    advanced = generation.campaign.feed_campaign(manifest["campaign_run_id"], storage_root=storage)
-    assert advanced["slurm_job_ids"] == ["201", "202"]
-    assert advanced["submissions"][-1]["mode"] == "initial"
-    assert advanced["submissions"][-1]["case"]["case_id"] == tasks[1].case_id
-
-
-@pytest.mark.parametrize("maximum_failed_cases", [0, 2, 5])
-def test_failure_circuit_breaker_uses_configured_n_plus_one_and_monitors_active_jobs(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    maximum_failed_cases: int,
-) -> None:
-    """Feed through N failures, stop at N+1, and retain active monitoring."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=maximum_failed_cases + 3,
-        maximum_failed_cases=maximum_failed_cases,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "d" * 40
-    run_id = f"failure-threshold-{maximum_failed_cases}__0123456789abcdef"
-    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
-    run_directory.mkdir(parents=True)
-    manifest: dict[str, Any] = {
-        "campaign_run_id": run_id,
-        "git_commit": commit,
-        "slurm_job_ids": [],
-        "submission_config": {
-            "max_admission_cases": 1,
-            "max_running_cases": None,
-            "maximum_failed_cases": maximum_failed_cases,
-            "temporary_license_retry": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "state": "active",
-    }
-
-    def view(task: Any, state: str) -> dict[str, Any]:
-        return {
-            "batch_name": task.batch_name,
-            "batch_id": task.batch_id,
-            "case_index": task.case_index,
-            "case_id": task.case_id,
-            "state": state,
-            "failure_stage": "solver" if state in {"failed", "timed_out"} else None,
-            "temporary_license_retry": None,
-            "postprocessing_replay_available": False,
-        }
-
-    reconciled: dict[str, tuple[list[dict[str, Any]], int, int]] = {"value": ([], 0, 0)}
-    submitted: list[tuple[str, str]] = []
-    monkeypatch.setattr(campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
-    monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
-    monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: reconciled["value"])
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        submitted.append((task.case_id, mode))
-        return {**payload, "state": "active"}
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-
-    reconciled["value"] = (
-        [view(task, "failed" if index < maximum_failed_cases else "never_started") for index, task in enumerate(tasks)],
-        0,
-        0,
-    )
-    feedable = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
-    assert feedable["state"] == "active"
-    assert submitted == [(tasks[maximum_failed_cases].case_id, "initial")]
-
-    submitted.clear()
-    manifest["state"] = "active"
-    reconciled["value"] = (
-        [view(task, "failed" if index <= maximum_failed_cases else "never_started") for index, task in enumerate(tasks)],
-        0,
-        0,
-    )
-    tripped = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
-    assert tripped["state"] == "failure_threshold_reached"
-    assert submitted == []
-
-    manifest["state"] = "active"
-    reconciled["value"] = (
-        [
-            view(
-                task,
-                "failed" if index <= maximum_failed_cases else "running" if index == maximum_failed_cases + 1 else "never_started",
-            )
-            for index, task in enumerate(tasks)
-        ],
-        0,
-        1,
-    )
-    monitored = generation.campaign.feed_campaign(run_id, storage_root=tmp_path)
-    assert monitored["state"] == "active"
-    assert submitted == []
+        feed(campaign, world)
 
 
 @pytest.mark.parametrize(
@@ -1275,12 +870,12 @@ def test_solver_failure_threshold_has_an_exact_exceeds_boundary(
     )
 
 
-def test_replay_failures_do_not_precede_or_starve_normal_admission(
+def test_conversion_failures_do_not_starve_normal_admission(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fill pending capacity before independently attempting every eligible replay."""
+    """Keep canonical admission independent of recorded conversion failures, which hold no admission."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=12,
@@ -1289,24 +884,30 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
-    run_id = "replay-admission__0123456789abcdef"
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit="e" * 40)
     commit = "e" * 40
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path)
     run_directory.mkdir(parents=True)
     manifest: dict[str, Any] = {
         "campaign_run_id": run_id,
+        "remote_storage_root": str(tmp_path),
+        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
         "git_commit": commit,
         "slurm_job_ids": [],
+        "node_jobs": [],
+        "node_job_intent": None,
         "submission_intent": None,
         "submission_config": {
             "max_admission_cases": 2,
-            "max_running_cases": None,
+            "node_jobs": 2,
+            "concurrent_cases_per_node": 4,
             "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
+            "license_wait": _synthetic_retry_policy(),
         },
         "submissions": [],
         "state": "active",
     }
+    open_node_job(manifest, tmp_path)
     views = [
         {
             "batch_name": task.batch_name,
@@ -1316,19 +917,15 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
             "state": "conversion_failed" if index < 2 else "never_started",
             "failure_stage": "conversion" if index < 2 else None,
             "temporary_license_retry": None,
-            "postprocessing_replay_available": index < 2,
-            "replay_eligible": index < 2,
-            "replay_blocked": False,
-            "attempt_campaign_run_id": run_id if index < 2 else None,
         }
         for index, task in enumerate(tasks)
     ]
-    events: list[str] = []
-    submitted: list[str] = []
-    replayed: list[str] = []
+    monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda *_args, **_kwargs: campaign)
+    monkeypatch.setattr(lifecycle, "candidate_records", lambda *_args, **_kwargs: [])
+
     monkeypatch.setattr(campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler())
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", lambda _job_ids: _scheduler(allocations={"7001": ["7001", "RUNNING"]}))
     monkeypatch.setattr(generation.campaign, "_reconciled", lambda *_args, **_kwargs: (views, 0, 0))
     monkeypatch.setattr(
         generation.campaign,
@@ -1341,75 +938,13 @@ def test_replay_failures_do_not_precede_or_starve_normal_admission(
         lambda *_args, **_kwargs: _synthetic_input_references(campaign),
     )
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(generation.campaign, "_write_campaign_manifest", lambda payload, **_kwargs: dict(payload))
-    monkeypatch.setattr(
-        generation.campaign,
-        "_refresh_resume_task_views",
-        lambda *_args, **_kwargs: [dict(view) for view in views],
-    )
     monkeypatch.setattr(generation.campaign.batch_runtime, "completed_case_is_valid", lambda *_args, **_kwargs: False)
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        assert mode == "initial"
-        events.append("submit")
-        submitted.append(task.case_id)
-        payload["submissions"].append(
-            {
-                "case": {
-                    "batch_name": task.batch_name,
-                    "batch_id": task.batch_id,
-                    "case_index": task.case_index,
-                    "case_id": task.case_id,
-                }
-            }
-        )
-        return payload
-
-    def fail_replay(batch: Any, case_index: int, **_kwargs: Any) -> None:
-        events.append("replay")
-        replayed.append(batch.case_id(case_index))
-        message = "deterministic replay failure"
-        raise generation.runtime.batch.CaseLocalReplayError(message)
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    monkeypatch.setattr(generation.campaign.batch_runtime, "replay_case_postprocessing", fail_replay)
+    dispatched = _record_dispatches(monkeypatch)
 
     resumed = generation.campaign.resume_campaign(run_id, storage_root=tmp_path)
 
     assert resumed["state"] == "active"
-    assert submitted == [tasks[2].case_id, tasks[3].case_id]
-    assert replayed == [tasks[0].case_id, tasks[1].case_id]
-    assert events == ["submit", "submit", "replay", "replay"]
-
-    def fail_integrity(*_args: Any, **_kwargs: Any) -> None:
-        message = "conflicting immutable publication hash"
-        raise generation.runtime.batch.ReplayIntegrityError(message)
-
-    with monkeypatch.context() as scoped:
-        scoped.setattr(
-            generation.campaign,
-            "_fill_submission_capacity",
-            lambda payload, *_args, **_kwargs: payload,
-        )
-        scoped.setattr(
-            generation.campaign.batch_runtime,
-            "replay_case_postprocessing",
-            fail_integrity,
-        )
-        with pytest.raises(
-            generation.runtime.batch.ReplayIntegrityError,
-            match="immutable publication hash",
-        ):
-            generation.campaign.resume_campaign(run_id, storage_root=tmp_path)
+    assert dispatched == [(tasks[2].case_id, "initial"), (tasks[3].case_id, "initial")]
 
 
 def _admission_view(
@@ -1508,6 +1043,63 @@ def test_logical_admission_membership_is_lifecycle_owned(
     assert generation.campaign._view_consumes_admission(view) is expected
 
 
+@pytest.mark.parametrize(
+    ("states", "canonical", "expected"),
+    [
+        (("successful", "never_started", "never_started", "never_started"), True, "staged"),
+        (("successful", "never_started", "never_started", "never_started"), False, "completed_with_failures"),
+        (("failed", "never_started", "never_started", "never_started"), True, "completed_with_failures"),
+        (("successful", "publication_failed", "never_started", "never_started"), True, "completed_with_failures"),
+        (("successful", "license_blocked", "never_started", "never_started"), True, "license_blocked"),
+        (("successful", "scheduler_unknown", "never_started", "never_started"), True, "active"),
+    ],
+)
+def test_settled_admission_cap_persists_staged_only_for_failure_free_canonical_subset(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    states: tuple[str, ...],
+    canonical: bool,
+    expected: str,
+) -> None:
+    """Persist an honest capped success state without relabeling failure or uncertainty; a settled state drains the node job."""
+    admitted = sum(state != "never_started" for state in states)
+    config_path, _template = generation_config_factory(
+        simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=len(states), max_admission_cases=admitted, maximum_failed_cases=5
+    )
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    tasks = cluster.campaign_tasks(campaign)
+    if not canonical:
+        campaign = replace(campaign, schema_version=campaign.schema_version + 1)
+    storage = tmp_path / "storage"
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
+    run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
+    run_directory.mkdir(parents=True)
+    manifest = generation.campaign._new_campaign_manifest(
+        campaign,
+        run_id=run_id,
+        requested_commit="a" * 40,
+        run_directory=run_directory,
+        scheduler_log_directory=tmp_path / "scheduler",
+        storage_root=storage,
+        input_sources=_synthetic_input_sources(campaign),
+    )
+    node_job = open_node_job(manifest, storage)
+    views = [_admission_view(task, state) for task, state in zip(tasks, states, strict=True)]
+    for task, state in zip(tasks, states, strict=True):
+        if state != "never_started":
+            dispatch_record(manifest, campaign, task, node_job)
+    result = generation.campaign._fill_submission_capacity(
+        manifest, campaign, views, pending_jobs=0, running_jobs=0, scheduler=_scheduler(), storage_root=storage, tasks=tasks
+    )
+    persisted = json.loads(campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage).read_text())
+    assert result["state"] == persisted["state"] == expected
+    assert len(result["submissions"]) == admitted
+    assert campaign_evidence._validate_campaign_run_header(persisted, run_id=run_id) == ["7001"]
+    settled = expected in {"staged", "completed_with_failures"}
+    assert persisted["node_jobs"][0]["draining"] is settled
+    assert (persisted["node_jobs"][0]["stop_ticket_seq"] is not None) is settled
+
+
 @pytest.mark.parametrize("failure_count", [1, 3])
 def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
     generation_config_factory: Any,
@@ -1519,7 +1111,7 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=failure_count + 3,
-        max_admission_cases=2,
+        max_admission_cases=failure_count + 3,
         maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -1539,45 +1131,36 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
     )
     fresh = [_admission_view(task, "never_started") for task in tasks[failure_count + 1 :]]
     views = [*failed, active, *fresh]
-    manifest = {
-        "campaign_run_id": f"failure-continuation-{failure_count}__0123456789abcdef",
+    run_id = generation.campaign.campaign_run_id(campaign, git_commit="e" * 40)
+    campaign_evidence.campaign_run_directory(run_id, storage_root=tmp_path).mkdir(parents=True)
+    manifest: dict[str, Any] = {
+        "campaign_run_id": run_id,
+        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
         "git_commit": "e" * 40,
-        "slurm_job_ids": ["811"],
+        "remote_storage_root": str(tmp_path),
+        "slurm_job_ids": [],
+        "node_jobs": [],
+        "node_job_intent": None,
         "submission_config": {
-            "max_admission_cases": 2,
-            "max_running_cases": None,
+            "max_admission_cases": failure_count + 3,
+            "node_jobs": 2,
+            "concurrent_cases_per_node": 4,
             "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
+            "license_wait": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "admission_reservations": [],
         "submissions": [],
         "state": "active",
     }
-    scheduler = _scheduler(active={"811": ["811", "RUNNING"]})
-    submitted: list[str] = []
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: cluster.CampaignTask,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        assert mode == "initial"
-        submitted.append(task.case_id)
-        return payload
-
+    node_job = open_node_job(manifest, tmp_path, job_id="811")
+    scheduler = _scheduler(allocations={"811": ["811", "RUNNING"]})
+    for task in tasks[:failure_count]:  # every earlier case was admitted fresh and its step ended in failure
+        key = f"811-{dispatch_record(manifest, campaign, task, node_job)['submission_index']}"
+        scheduler["accounted"][key] = [key, "FAILED", "1:0"]
+    dispatch_record(manifest, campaign, tasks[failure_count], node_job)  # the case that is still running
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "e" * 40)
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
+    dispatched = _record_dispatches(monkeypatch)
 
     advanced = generation.campaign._fill_submission_capacity(
         manifest,
@@ -1590,8 +1173,9 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
     )
 
     assert advanced["state"] == "active"
-    assert submitted == [view["case_id"] for view in fresh]
-    assert scheduler["active"] == {"811": ["811", "RUNNING"]}
+    assert dispatched == [(view["case_id"], "initial") for view in fresh]
+    assert [job["draining"] for job in advanced["node_jobs"]] == [False]
+    assert scheduler["allocations"]["active"] == {"811": ["811", "RUNNING"]}
     assert (
         generation.campaign._solver_failure_threshold_exceeded(
             views,
@@ -1612,8 +1196,8 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
     ),
     [
         (0, True, 5, True, "max_admission_cases_reached", False),
-        (1, False, 5, False, None, False),
-        (1, True, 5, True, "max_admission_cases_reached", False),
+        (1, False, 5, True, "max_admission_cases_reached", False),
+        (1, True, 5, True, "max_admission_cases_exceeded", False),
         (2, False, 1, True, "solver_failure_threshold_exceeded", True),
     ],
 )
@@ -1627,10 +1211,11 @@ def test_admission_block_reason_is_independent_of_displayed_failure_count(
     expected_circuit_breaker: bool,
 ) -> None:
     """Attribute capacity and failure-budget blocks to their actual owner."""
+    admission_limit = 4 if maximum_failed_cases == 1 else 1
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=4,
-        max_admission_cases=1,
+        max_admission_cases=admission_limit,
         maximum_failed_cases=maximum_failed_cases,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -1648,21 +1233,25 @@ def test_admission_block_reason_is_independent_of_displayed_failure_count(
     fresh_index = failure_count + int(capacity_occupied)
     views.extend(_admission_view(task, "never_started") for task in tasks[fresh_index:])
     manifest = {
+        "campaign_run_id": "synthetic-admission__0123456789abcdef",
+        "git_commit": "a" * 40,
+        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
         "submission_config": {
-            "max_admission_cases": 1,
-            "max_running_cases": None,
+            "max_admission_cases": admission_limit,
+            "node_jobs": 2,
+            "concurrent_cases_per_node": 4,
             "maximum_failed_cases": maximum_failed_cases,
         },
         "submission_intent": None,
-        "submissions": [],
+        "submissions": [
+            {"case": {"batch_id": view["batch_id"], "case_index": view["case_index"]}, "mode": "initial"}
+            for view in views
+            if view["state"] != "never_started"
+        ],
         "admission_reservations": [],
     }
 
-    blocked, reason = generation.campaign._normal_admission_status(
-        manifest,
-        views,
-        running_jobs=0,
-    )
+    blocked, reason = generation.campaign._normal_admission_status(manifest, views)
 
     assert blocked is expected_blocked
     assert reason == expected_reason
@@ -1680,7 +1269,7 @@ def test_excess_stable_admission_blocks_monitoring_without_submission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Keep monitoring an over-limit historical pool without admitting fresh work."""
+    """Keep monitoring an over-limit historical pool without admitting fresh work or submitting a node job."""
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=6,
@@ -1691,12 +1280,17 @@ def test_excess_stable_admission_blocks_monitoring_without_submission(
     views = [*(_admission_view(task, "pending") for task in tasks[:5]), _admission_view(tasks[5], "never_started")]
     manifest: dict[str, Any] = {
         "campaign_run_id": "over-limit__0123456789abcdef",
+        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
         "git_commit": "a" * 40,
+        "slurm_job_ids": [],
+        "node_jobs": [],
+        "node_job_intent": None,
         "submission_config": {
             "max_admission_cases": 4,
-            "max_running_cases": None,
+            "node_jobs": 2,
+            "concurrent_cases_per_node": 4,
             "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
+            "license_wait": _synthetic_retry_policy(),
         },
         "submission_intent": None,
         "submissions": [],
@@ -1705,13 +1299,12 @@ def test_excess_stable_admission_blocks_monitoring_without_submission(
     }
     monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "a" * 40)
     monkeypatch.setattr(generation.campaign.common.serialization, "atomic_write_json", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_one",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("over-limit admission submitted work")),
-    )
+    for forbidden in ("_dispatch_case", "_submit_node_job"):
+        monkeypatch.setattr(
+            generation.campaign, forbidden, lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("over-limit admission submitted work"))
+        )
 
-    assert generation.campaign._normal_admission_status(manifest, views, running_jobs=5) == (
+    assert generation.campaign._normal_admission_status(manifest, views) == (
         True,
         "max_admission_cases_exceeded",
     )
@@ -1721,10 +1314,33 @@ def test_excess_stable_admission_blocks_monitoring_without_submission(
         views,
         pending_jobs=5,
         running_jobs=0,
-        scheduler={"active": {}},
+        scheduler=_scheduler(),
         storage_root=tmp_path,
     )
     assert manifest["state"] == "active"
+
+
+def test_node_capacity_and_unresolved_intents_block_fresh_admission() -> None:
+    """Fresh work waits while the node jobs hold their ticket capacity of unresolved cases or an intent is unresolved."""
+    unstarted = {"batch_id": "batch", "case_index": 3, "state": "never_started", "runtime_progress": {"availability": "unavailable"}}
+    views = [
+        {"batch_id": "batch", "case_index": index, "state": "pending", "runtime_progress": {"availability": "unavailable"}} for index in (1, 2)
+    ] + [unstarted]
+    manifest: dict[str, Any] = {
+        "campaign_run_id": "synthetic-capacity__0123456789abcdef",
+        "git_commit": "a" * 40,
+        "execution_config_digest": "b" * 64,
+        "submission_config": {"max_admission_cases": 8, "node_jobs": 1, "concurrent_cases_per_node": 1, "maximum_failed_cases": 5},
+        "submission_intent": None,
+        "node_job_intent": None,
+        "submissions": [],
+        "admission_reservations": [],
+    }
+    assert generation.campaign._normal_admission_status(manifest, views) == (True, "node_capacity_reached")  # one node job holds 2 x 1 cases
+    manifest["submission_config"]["concurrent_cases_per_node"] = 2
+    assert generation.campaign._normal_admission_status(manifest, views) == (False, None)
+    manifest["node_job_intent"] = NODE_ID
+    assert generation.campaign._normal_admission_status(manifest, views) == (True, "submission_intent_unresolved")
 
 
 def test_durable_submission_intent_counts_one_logical_case() -> None:
@@ -1745,463 +1361,6 @@ def test_durable_submission_intent_counts_one_logical_case() -> None:
     }
 
     assert generation.campaign._logical_admission_case_keys(manifest, [view]) == frozenset({("batch", 1)})
-
-
-def test_two_due_license_retries_submit_independently(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Submit both due logical slot owners without a campaign launch gate."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-        max_admission_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        _admission_view(tasks[0], "license_blocked", retry_eligible=True),
-        _admission_view(tasks[1], "license_blocked", retry_eligible=True),
-        _admission_view(tasks[2], "never_started"),
-    ]
-    due = "2026-01-01T00:00:00+00:00"
-    for view in views[:2]:
-        view["license_next_retry_at"] = due
-        view["license_first_blocked_at"] = due
-        view["temporary_license_retry"]["next_retry_at"] = due
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "two-retries__0123456789abcdef",
-        "git_commit": "f" * 40,
-        "submission_config": {
-            "max_admission_cases": 2,
-            "max_running_cases": None,
-            "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "state": "license_blocked",
-    }
-    submitted: list[tuple[str, str]] = []
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "f" * 40)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        submitted.append((task.case_id, mode))
-        payload["submissions"].append(
-            {
-                "status": "submitted",
-                "recorded_at": "2026-01-01T00:00:00+00:00",
-                "mode": mode,
-                "case": {
-                    "batch_id": task.batch_id,
-                    "case_index": task.case_index,
-                    "case_id": task.case_id,
-                },
-            }
-        )
-        return payload
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=0,
-        running_jobs=0,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-
-    assert submitted == [
-        (tasks[0].case_id, "license_retry"),
-        (tasks[1].case_id, "license_retry"),
-    ]
-    assert generation.campaign._admission_summary(manifest, views)["count"] == 2
-    assert views[2]["state"] == "never_started"
-
-
-@pytest.mark.parametrize(
-    "states",
-    [("pending", "pending"), ("license_blocked", "license_blocked"), ("pending", "license_blocked")],
-)
-def test_shared_admission_limit_blocks_a_third_case(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    states: tuple[str, str],
-) -> None:
-    """Keep a never-started case out for every full two-case mixture."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-        max_admission_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        _admission_view(tasks[0], states[0]),
-        _admission_view(tasks[1], states[1]),
-        _admission_view(tasks[2], "never_started"),
-    ]
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "full-admission__0123456789abcdef",
-        "git_commit": "e" * 40,
-        "submission_config": {
-            "max_admission_cases": 2,
-            "max_running_cases": None,
-            "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "state": "active",
-    }
-    submitted: list[str] = []
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: cluster.CampaignTask,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        submitted.append(task.case_id)
-        return payload
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "e" * 40)
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=sum(state == "pending" for state in states),
-        running_jobs=0,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-
-    assert submitted == []
-    assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
-
-
-def test_repeated_independent_retries_do_not_accumulate_blocked_cases(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Retry both oldest due owners while retaining exactly two logical slots."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=8,
-        max_admission_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        _admission_view(task, "license_blocked", retry_eligible=index < 2) if index < 2 else _admission_view(task, "never_started")
-        for index, task in enumerate(tasks)
-    ]
-    common_due = "2026-01-01T00:00:00+00:00"
-    for view in views[:2]:
-        view["license_next_retry_at"] = common_due
-        view["license_first_blocked_at"] = common_due
-        view["temporary_license_retry"]["next_retry_at"] = common_due
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "no-accumulation__0123456789abcdef",
-        "git_commit": "d" * 40,
-        "submission_config": {
-            "max_admission_cases": 2,
-            "max_running_cases": None,
-            "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "state": "license_blocked",
-    }
-    clock = {"value": datetime(2026, 1, 1, tzinfo=timezone.utc)}
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "d" * 40)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del mode, storage_root
-        payload["submissions"].append(
-            {
-                "submission_index": len(payload["submissions"]) + 1,
-                "mode": "license_retry",
-                "status": "submitted",
-                "job_id": str(len(payload["submissions"]) + 1),
-                "recorded_at": clock["value"].isoformat(),
-                "case": {
-                    "batch_id": task.batch_id,
-                    "case_index": task.case_index,
-                    "case_id": task.case_id,
-                },
-            }
-        )
-        view = views[tasks.index(task)]
-        next_due = clock["value"] + timedelta(seconds=20)
-        view["license_next_retry_at"] = next_due.isoformat()
-        view["temporary_license_retry"]["next_retry_at"] = next_due.isoformat()
-        view["temporary_license_retry"]["retry_count"] += 1
-        return payload
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    for _advance in range(5):
-        generation.campaign._fill_submission_capacity(
-            manifest,
-            campaign,
-            views,
-            pending_jobs=0,
-            running_jobs=0,
-            scheduler={"active": {}},
-            storage_root=tmp_path,
-        )
-        assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
-        clock["value"] += timedelta(seconds=20)
-
-    case_ids = [record["case"]["case_id"] for record in manifest["submissions"]]
-    assert case_ids == [tasks[index % 2].case_id for index in range(10)]
-    assert all(view["state"] == "never_started" for view in views[2:])
-    assert len(generation.campaign._logical_admission_case_keys(manifest, views)) == 2
-
-
-def test_restart_reconstructs_blocked_admission_without_admitting_more(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reconstruct two blocked slot owners from durable state after restart."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-        max_admission_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        _admission_view(tasks[0], "license_blocked"),
-        _admission_view(tasks[1], "license_blocked"),
-        _admission_view(tasks[2], "never_started"),
-    ]
-    manifest = json.loads(
-        json.dumps(
-            {
-                "campaign_run_id": "restart-admission__0123456789abcdef",
-                "git_commit": "b" * 40,
-                "submission_config": {
-                    "max_admission_cases": 2,
-                    "max_running_cases": None,
-                    "maximum_failed_cases": 5,
-                    "temporary_license_retry": _synthetic_retry_policy(),
-                },
-                "submission_intent": None,
-                "submissions": [
-                    {
-                        "submission_index": index,
-                        "mode": "license_retry",
-                        "status": "submitted",
-                        "job_id": str(index),
-                        "case": {
-                            "batch_id": task.batch_id,
-                            "case_index": task.case_index,
-                            "case_id": task.case_id,
-                        },
-                    }
-                    for index, task in enumerate(tasks[:2], start=1)
-                ],
-                "state": "license_blocked",
-            }
-        )
-    )
-    submitted: list[str] = []
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: cluster.CampaignTask,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        submitted.append(task.case_id)
-        return payload
-
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "b" * 40)
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    assert generation.campaign._admission_summary(manifest, views)["count"] == 2
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=0,
-        running_jobs=0,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-
-    assert submitted == []
-    assert generation.campaign._admission_summary(manifest, views) == {
-        "count": 2,
-        "maximum": 2,
-        "components": {
-            "pending": 0,
-            "starting": 0,
-            "license_waiting": 2,
-            "acquiring_license": 0,
-        },
-    }
-
-
-def test_solver_start_releases_slots_for_progressive_discovery(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Release admission at solver start and admit the next case immediately."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=5,
-        max_admission_cases=2,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        _admission_view(tasks[0], "active", solver_started=True),
-        _admission_view(tasks[1], "license_blocked"),
-        _admission_view(tasks[2], "never_started"),
-        _admission_view(tasks[3], "never_started"),
-        _admission_view(tasks[4], "never_started"),
-    ]
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "progressive__0123456789abcdef",
-        "git_commit": "c" * 40,
-        "submission_config": {
-            "max_admission_cases": 2,
-            "max_running_cases": None,
-            "maximum_failed_cases": 5,
-            "temporary_license_retry": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "admission_reservations": [],
-        "state": "active",
-    }
-    submitted: list[str] = []
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "c" * 40)
-    monkeypatch.setattr(
-        generation.campaign.common.serialization,
-        "atomic_write_json",
-        lambda *_args, **_kwargs: None,
-    )
-
-    def submit_one(
-        payload: dict[str, Any],
-        _campaign: Any,
-        task: Any,
-        *,
-        mode: str,
-        storage_root: Path | str | None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        del storage_root
-        submitted.append(task.case_id)
-        payload["submissions"].append(
-            {
-                "submission_index": len(payload["submissions"]) + 1,
-                "mode": mode,
-                "status": "submitted",
-                "job_id": str(len(payload["submissions"]) + 1),
-                "recorded_at": "2026-01-01T00:00:00+00:00",
-                "case": {
-                    "batch_id": task.batch_id,
-                    "case_index": task.case_index,
-                    "case_id": task.case_id,
-                },
-            }
-        )
-        return payload
-
-    monkeypatch.setattr(generation.campaign, "_submit_one", submit_one)
-
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=0,
-        running_jobs=1,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-    assert submitted == [tasks[2].case_id]
-    assert manifest["admission_reservations"] == []
-
-    views[2] = _admission_view(tasks[2], "active", solver_started=True)
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=0,
-        running_jobs=2,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-    assert submitted == [tasks[2].case_id, tasks[3].case_id]
-
-    views[3] = _admission_view(tasks[3], "license_blocked")
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=0,
-        running_jobs=2,
-        scheduler={"active": {}},
-        storage_root=tmp_path,
-    )
-    assert submitted == [tasks[2].case_id, tasks[3].case_id]
-    assert views[4]["state"] == "never_started"
-    assert generation.campaign._admission_summary(manifest, views)["components"] == {
-        "pending": 0,
-        "starting": 0,
-        "license_waiting": 2,
-        "acquiring_license": 0,
-    }
 
 
 def test_admission_reservations_are_exact_unsent_plan_members(
@@ -2269,6 +1428,9 @@ def test_license_retry_activity_ends_at_common_solver_progress() -> None:
         "license_retry_active": False,
     }
     manifest = {
+        "campaign_run_id": "synthetic-admission__0123456789abcdef",
+        "git_commit": "a" * 40,
+        "execution_config_digest": "b" * 64,
         "submission_config": {"max_admission_cases": 2},
         "submission_intent": None,
     }
@@ -2282,227 +1444,152 @@ def test_license_retry_activity_ends_at_common_solver_progress() -> None:
 
 def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(
     generation_config_factory: Any,
-    tmp_path: Path,
+    world: FakeSlurm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Signal running workers gracefully first and force only on request."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=1,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "c" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    scheduler = _scheduler()
+    """Signal running node jobs gracefully first and force only on request; the request is durable before any command."""
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    run_id = manifest["campaign_run_id"]
+    world.set_state("7001", "RUNNING", node="node-a")
     commands: list[list[str]] = []
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_case",
-        lambda *_args, **_kwargs: "301",
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: scheduler,
-    )
+    real_run = subprocess.run
 
-    def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-        persisted = campaign_evidence.load_campaign_run(
-            manifest["campaign_run_id"],
-            storage_root=storage,
-        )
-        expected_state = "force_cancel_requested" if "--signal=KILL" in command else "cancel_requested"
-        assert persisted["state"] == expected_state
-        assert (
-            campaign_evidence.campaign_run_directory(
-                manifest["campaign_run_id"],
-                storage_root=storage,
-            )
-            / "cancellations.json"
-        ).is_file()
-        commands.append(command)
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+    def run(command: list[str], **kwargs: Any) -> Any:
+        if command[0] == "scancel":
+            expected_state = "force_cancel_requested" if "--signal=KILL" in command else "cancel_requested"
+            assert load_manifest(campaign, world)["state"] == expected_state
+            assert common.paths.resolve_generation_cancellations_path(
+                campaign_evidence.campaign_execution_directory(run_id, storage_root=world.storage)
+            ).is_file()
+            commands.append(command)
+        return real_run(command, **kwargs)
 
     monkeypatch.setattr(generation.campaign.subprocess, "run", run)
-    storage = tmp_path / "storage"
-    manifest = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    scheduler["active"] = {
-        "301": ["301", "RUNNING", "node-a", "node-a"],
-    }
 
-    graceful = generation.campaign.cancel_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert commands == [["scancel", "--signal=TERM", "--batch", "301"]]
-    assert graceful["schema_version"] == 1
+    graceful = generation.campaign.cancel_campaign(run_id, storage_root=world.storage)
+    assert commands == [["scancel", "--signal=TERM", "--batch", "7001"]]
     assert graceful["attempts"][-1]["mode"] == "graceful"
-    running = generation.campaign.campaign_status(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert running["campaign_state"] == "running"
-    assert running["cancellation_requested"] is True
+    running = generation.campaign.campaign_status(run_id, storage_root=world.storage)
+    assert running["campaign_state"] == "cancel_requested"
 
-    forced = generation.campaign.cancel_campaign(
-        manifest["campaign_run_id"],
-        storage_root=storage,
-        force=True,
-    )
-    assert commands[-1] == ["scancel", "--signal=KILL", "--full", "301"]
+    forced = generation.campaign.cancel_campaign(run_id, storage_root=world.storage, force=True)
+    assert commands[-1] == ["scancel", "--signal=KILL", "--full", "7001"]
     assert [attempt["mode"] for attempt in forced["attempts"]] == [
         "graceful",
         "force",
     ]
 
-    scheduler["active"] = {}
-    scheduler["accounted"] = {"301": ["301", "CANCELLED", "0:15"]}
-    cancelled = generation.campaign.campaign_status(
-        manifest["campaign_run_id"],
-        storage_root=storage,
+    world.set_state("7001", "CANCELLED")
+    cancelled = generation.campaign.campaign_status(run_id, storage_root=world.storage)
+    assert cancelled["campaign_state"] == "force_cancel_requested"
+
+
+def test_cancelled_canonical_campaign_requires_explicit_terminal_continuation(generation_config_factory: Any, world: FakeSlurm) -> None:
+    """Keep cancellation sticky until exact node jobs drain and the user reruns CONFIG."""
+    campaign = make_campaign(generation_config_factory)
+    first = submit(campaign, world)
+    run_id = first["campaign_run_id"]
+    world.set_state("7001", "RUNNING", node="node-a")
+    generation.campaign.cancel_campaign(run_id, storage_root=world.storage)
+    assert feed(campaign, world)["state"] == "cancel_requested"
+    assert len(world.sbatch_arguments()) == 1
+    with pytest.raises(RuntimeError, match="terminal scheduler evidence"):
+        submit(campaign, world)
+    for nonterminal in ("RUNNING", "PENDING", "COMPLETING", "UNKNOWN"):
+        world.set_state("7001", nonterminal)
+        with pytest.raises(RuntimeError, match="terminal scheduler evidence"):
+            submit(campaign, world)
+        assert load_manifest(campaign, world)["state"] == "cancel_requested"
+        assert len(world.sbatch_arguments()) == 1
+    world.set_state("7001", "CANCELLED")
+    world.add_step("7001", 0, first["submissions"][0]["step_name"], "CANCELLED", "0:15")  # the step the cancellation interrupted
+    assert feed(campaign, world)["state"] == "cancel_requested"
+    assert generation.campaign.campaign_status(run_id, storage_root=world.storage)["suggested_next_command"] == (
+        f"./scripts/generation run {first['campaign_config']}"
     )
-    assert cancelled["campaign_state"] == "cancelled"
-    assert cancelled["counts"]["cancelled"] == 1
+    resumed = submit(campaign, world)
+    assert resumed["campaign_run_id"] == run_id
+    assert resumed["slurm_job_ids"] == ["7001", "7002"]
+    assert (resumed["submissions"][-1]["mode"], resumed["submissions"][-1]["attempt_index"], resumed["submissions"][-1]["job_id"]) == (
+        "resume",
+        2,
+        "7002",
+    )
+    assert len(world.sbatch_arguments()) == 2
+    receipt = common.paths.resolve_generation_cancellations_path(campaign_evidence.campaign_execution_directory(run_id, storage_root=world.storage))
+    assert receipt.is_file()
 
 
-def test_interrupted_submission_intent_recovers_exact_job_without_duplicate(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_canonical_attempt_uses_persisted_dispatch_identity_for_exact_ownership(
+    generation_config_factory: Any, world: FakeSlurm, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Recover a lost sbatch response from its unique persisted job name."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    commit = "c" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    storage = tmp_path / "storage"
-    run_id = generation.campaign.campaign_run_id(campaign, git_commit=commit)
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-
-    def lost_response(*_args: Any, **_kwargs: Any) -> str:
-        message = "synthetic lost sbatch response"
-        raise OSError(message)
-
-    monkeypatch.setattr(generation.campaign, "_submit_case", lost_response)
-    with pytest.raises(OSError, match="lost sbatch response"):
-        generation.campaign.submit_campaign(campaign, git_commit=commit, storage_root=storage)
-    intent = campaign_evidence.load_campaign_run(run_id, storage_root=storage)
-    assert intent["submission_intent"] == 1
-    job_name = intent["submissions"][0]["job_name"]
-
-    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
-        if any(argument == f"--name={job_name}" for argument in command):
-            return "98765|PENDING|Resources", None
-        if command[0] == "squeue":
-            assert "--jobs=98765" in command
-            return "98765|PENDING|Resources|", None
-        if command[0] == "sacct":
-            assert command[3:5] == ["--jobs", "98765"]
-            return "", None
-        raise AssertionError(command)
-
-    monkeypatch.setattr(generation.campaign, "_scheduler_output", scheduler_output)
-    recovered = generation.campaign.feed_campaign(run_id, storage_root=storage)
-    assert recovered["submission_intent"] is None
-    assert recovered["slurm_job_ids"] == ["98765"]
-    assert len(recovered["submissions"]) == 1
+    """Join the producer's allocation and submission-index receipt to one owned dispatch and epoch."""
+    campaign = make_campaign(generation_config_factory)
+    manifest = submit(campaign, world)
+    storage = world.storage
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    bind_worker(monkeypatch, manifest)
+    receipt_path = generation.runtime.record_case_failure(
+        batch,
+        task.case_index,
+        RuntimeError("synthetic input failure"),
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node-a",
+        work_directory=None,
+        storage_root=storage,
+        scratch_cleanup_status="not_created",
+        failure_stage="input",
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert (receipt["job_id"], receipt["slurm_step_id"], receipt["submission_index"]) == ("7001", "0", 1)
+    assert "scheduler_job_id" not in receipt
+    reference = generation.cases.input_generation.admit_configured_input_references(
+        batch, storage_root=storage, validation_depth="evidence", git_commit=COMMIT
+    )[task.case_index]
+    admitted = generation.campaign._admitted_case_attempt(manifest, batch, task, input_reference=reference, storage_root=storage)
+    assert admitted is not None
+    assert admitted.attempt.receipt_path == receipt_path
+    assert admitted.current is True
+    for field, wrong in (("job_id", "7002"), ("submission_index", 2), ("solver_git_commit", "b" * 40)):
+        tampered = {**receipt, field: wrong}
+        receipt_path.write_text(json.dumps(tampered, sort_keys=True) + "\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="Attempt evidence disagrees"):
+            generation.campaign._admitted_case_attempt(manifest, batch, task, input_reference=reference, storage_root=storage)
 
 
 def test_resume_recovers_next_case_intent_while_first_case_is_pending(
     generation_config_factory: Any,
-    tmp_path: Path,
+    world: FakeSlurm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recover a lost second response before admitting another logical case."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=3,
-        max_admission_cases=1,
+    """Recover an interrupted second dispatch before admitting another logical case, without a second node job."""
+    campaign = make_campaign(generation_config_factory, natural_count=3, max_admission_cases=2)
+    crash_at(
+        monkeypatch,
+        generation.campaign.node_service,
+        "ensure_node_ticket",
+        after=False,
+        when=lambda _directory, ticket: ticket.seq == 2,
     )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    commit = "d" * 40
-    _set_native_launch_evidence(monkeypatch, commit)
-    storage = tmp_path / "storage"
-    submitted = iter(("101",))
-    real_scheduler_evidence = generation.campaign._scheduler_evidence
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: commit)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_scheduler_evidence",
-        lambda _job_ids: _scheduler(),
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_case",
-        lambda *_args, **_kwargs: next(submitted),
-    )
-    initial = generation.campaign.submit_campaign(
-        campaign,
-        git_commit=commit,
-        storage_root=storage,
-    )
-    manifest_path = campaign_evidence.campaign_run_manifest_path(
-        initial["campaign_run_id"],
-        storage_root=storage,
-    )
-    manifest = campaign_evidence.load_campaign_run(
-        initial["campaign_run_id"],
-        storage_root=storage,
-    )
-    manifest["submission_config"]["max_admission_cases"] = 2
-    generation.campaign.common.serialization.atomic_write_json(manifest_path, manifest)
+    with pytest.raises(Crash):
+        submit(campaign, world)
+    interrupted = load_manifest(campaign, world)
+    assert interrupted["submission_intent"] == 2
+    assert [item["status"] for item in interrupted["submissions"]] == ["dispatched", "dispatching"]
+    directory = node_directory(campaign, world, interrupted["node_jobs"][0])
+    assert sorted(path.name for path in (directory / "tickets").iterdir()) == ["000001.json"]
 
-    def lost_response(*_args: Any, **_kwargs: Any) -> str:
-        message = "synthetic lost second sbatch response"
-        raise OSError(message)
-
-    monkeypatch.setattr(generation.campaign, "_submit_case", lost_response)
-    with pytest.raises(OSError, match="lost second sbatch response"):
-        generation.campaign._submit_one(
-            manifest,
-            campaign,
-            tasks[1],
-            mode="initial",
-            storage_root=storage,
-        )
-    interrupted = campaign_evidence.load_campaign_run(
-        initial["campaign_run_id"],
-        storage_root=storage,
-    )
-    assert interrupted["submission_intent"] is not None
-    intent_job_name = interrupted["submissions"][-1]["job_name"]
-
-    def scheduler_output(command: list[str]) -> tuple[str, str | None]:
-        if any(argument == f"--name={intent_job_name}" for argument in command):
-            return "202|PENDING|Resources", None
-        if command[0] == "squeue":
-            return "101|PENDING|Resources|\n202|PENDING|Resources|", None
-        if command[0] == "sacct":
-            return "", None
-        raise AssertionError(command)
-
-    monkeypatch.setattr(generation.campaign, "_scheduler_output", scheduler_output)
-    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", real_scheduler_evidence)
-    monkeypatch.setattr(
-        generation.campaign,
-        "_submit_case",
-        lambda *_args, **_kwargs: pytest.fail("resume duplicated the recovered case"),
-    )
-
-    resumed = generation.campaign.resume_campaign(
-        initial["campaign_run_id"],
-        storage_root=storage,
-    )
+    resumed = generation.campaign.resume_campaign(interrupted["campaign_run_id"], storage_root=world.storage)
 
     assert resumed["submission_intent"] is None
-    assert resumed["slurm_job_ids"] == ["101", "202"]
-    assert len(resumed["submissions"]) == 2
+    assert resumed["slurm_job_ids"] == ["7001"]
+    assert [item["status"] for item in resumed["submissions"]] == ["dispatched", "dispatched"]
+    assert len({item["case"]["case_id"] for item in resumed["submissions"]}) == 2
+    assert sorted(path.name for path in (directory / "tickets").iterdir()) == ["000001.json", "000002.json"]
+    assert len(world.sbatch_arguments()) == 1
 
 
 def test_config_owned_plan_is_machine_parseable_and_read_only(
@@ -2555,7 +1642,7 @@ def test_submission_policy_changes_execution_but_not_scientific_case_identity(
     assert [batch.scientific_config_digest for batch in changed.batches] == [batch.scientific_config_digest for batch in original.batches]
     assert [batch.case_input_config_digest for batch in changed.batches] == [batch.case_input_config_digest for batch in original.batches]
     commit = "9" * 40
-    assert generation.campaign.campaign_run_id(changed, git_commit=commit) != generation.campaign.campaign_run_id(
+    assert generation.campaign.campaign_run_id(changed, git_commit=commit) == generation.campaign.campaign_run_id(
         original,
         git_commit=commit,
     )
@@ -2591,7 +1678,7 @@ def test_validate_config_exposes_resolved_campaign_ownership(
     monkeypatch.setattr(
         cli_generation.readiness_service,
         "campaign_unresolved_gates",
-        lambda _path: {},
+        lambda _path, **_kwargs: {},
     )
 
     status = cli_generation.main(["validate-config", str(config_path), "--allow-incomplete"])
@@ -2601,461 +1688,173 @@ def test_validate_config_exposes_resolved_campaign_ownership(
     assert output["campaign_purpose"] == campaign.campaign_purpose
     assert output["case_counts"]["derived_total"] == campaign.total_case_count
     assert output["seed_plan"]["campaign_seed"] == campaign.batches[0].scientific_values["campaign_seed"]
-    assert output["dataset_package_requests"] == [{"evaluation_regime": "id", "source_role": "seen", "dataset_revision": 0}]
-    assert len(output["dataset_package_inventory"]) == len(campaign.dataset_packages)
+    assert "dataset_package_requests" not in output
+    assert "dataset_package_inventory" not in output
 
 
-def test_transfer_publication_keeps_validated_source_and_is_retry_safe(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_resume_rejects_unsupported_handle_before_runtime_effects(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject an invalid execution handle before storage, locks, or scheduler work."""
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        message = "invalid handle reached runtime effects"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(generation.campaign.campaign_evidence, "campaign_run_directory", forbidden)
+    monkeypatch.setattr(generation.campaign, "_scheduler_evidence", forbidden)
+    with pytest.raises(ValueError, match="canonical source campaign execution handle"):
+        generation.campaign.resume_campaign("unsafe_execution_handle")
+
+
+# -- shared dispatcher primitives: seat queue and step accounting --
+
+
+def _fake_squeue(monkeypatch: pytest.MonkeyPatch, *, stdout: str = "", returncode: int = 0, stderr: str = "") -> list[list[str]]:
+    """Replace the squeue runner and the user name; return the argument vectors it receives."""
+    commands: list[list[str]] = []
+
+    def run(arguments: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(list(arguments))
+        return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(cluster, "_run_squeue", run)
+    monkeypatch.setattr(cluster.getpass, "getuser", lambda: "tester")
+    return commands
+
+
+def test_query_seat_jobs_returns_every_own_nonterminal_seat_job_with_state_and_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rows of any dispatcher come back as job ID to (seat, state, comment); a seat without a row is free."""
+    commands = _fake_squeue(monkeypatch, stdout="101|gen-seat-1|RUNNING|tokenaaaa\n\n102|gen-seat-2|PENDING|\n103|gen-seat-1|PENDING|a|b\n")
+    assert cluster.query_seat_jobs([2, 1, 2]) == {
+        "101": (1, "RUNNING", "tokenaaaa"),
+        "102": (2, "PENDING", ""),
+        "103": (1, "PENDING", "a|b"),
+    }
+    assert commands == [["squeue", "--noheader", "--user=tester", "--name=gen-seat-1,gen-seat-2", "--format=%i|%j|%T|%k"]]
+    commands = _fake_squeue(monkeypatch)
+    assert cluster.query_seat_jobs([1]) == {}
+    assert commands[0][3] == "--name=gen-seat-1"
+    commands = _fake_squeue(monkeypatch)
+    assert cluster.query_seat_jobs([4, 3]) == {}
+    assert commands[0][3] == "--name=gen-seat-3,gen-seat-4"
+
+
+@pytest.mark.parametrize("seats", [[], [0], [5], [True], [1, 5]])
+def test_query_seat_jobs_rejects_missing_or_unknown_seats_before_any_query(monkeypatch: pytest.MonkeyPatch, seats: list[int]) -> None:
+    """Only the node-job slots can be queried."""
+    commands = _fake_squeue(monkeypatch)
+    with pytest.raises(ValueError, match="slot"):
+        cluster.query_seat_jobs(seats)
+    assert commands == []
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "match"),
+    [
+        ("", 1, "squeue: down"),
+        ("101|gen-seat-1|RUNNING\n", 0, "malformed"),
+        ("abc|gen-seat-1|RUNNING|token\n", 0, "malformed"),
+        ("101_4|gen-seat-1|RUNNING|token\n", 0, "malformed"),
+        ("101|other-job|RUNNING|token\n", 0, "malformed"),
+        ("101|gen-seat-2|RUNNING|token\n", 0, "malformed"),
+        ("101|gen-seat-1||token\n", 0, "malformed"),
+        ("101|gen-seat-1|RUNNING|a\n101|gen-seat-1|PENDING|b\n", 0, "twice"),
+    ],
+)
+def test_query_seat_jobs_fails_closed_on_a_failed_query_or_a_malformed_row(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, returncode: int, match: str
 ) -> None:
-    """Protect marked staging, destination hashes, source retention, and retries."""
-    run_id = "synthetic_transfer__0123456789abcdef"
-    destination = tmp_path / "destination storage"
-    staging = workspace.create_transfer_staging(
-        storage_root=destination,
-        run_id=run_id,
-    )
-    assert staging.parent == (destination / ".incoming").resolve()
-    campaign_directory = f"01_generation/meta/campaigns/{run_id}"
-    relative_directories = (
-        "01_generation/meta/batches/synthetic_batch",
-        "01_generation/raw/synthetic_batch",
-        "01_generation/processed/synthetic_batch",
-        f"01_generation/attempts/synthetic_batch/case_00001/{run_id}",
-        campaign_directory,
-    )
-    for index, relative in enumerate(relative_directories):
-        directory = staging / relative
-        directory.mkdir(parents=True)
-        (directory / f"payload-{index}.txt").write_text(
-            f"payload-{index}\n",
-            encoding="utf-8",
-        )
-    terminal_path = staging / campaign_directory / "campaign_terminal.json"
-    terminal_path.write_text('{"status":"terminal"}\n', encoding="utf-8")
-    terminal = {
-        "campaign_id": "synthetic_campaign_id",
-        "git_commit": "d" * 40,
-        "batches": [{}],
-    }
-    plan = {
-        "campaign_directory": campaign_directory,
-        "batches": [
-            {
-                "meta_directory": relative_directories[0],
-                "raw_directory": relative_directories[1],
-                "processed_directory": relative_directories[2],
-                "attempt_directories": [relative_directories[3]],
-            }
-        ],
-    }
-    source_bytes = {
-        relative: {path.relative_to(staging / relative).as_posix(): path.read_bytes() for path in (staging / relative).rglob("*") if path.is_file()}
-        for relative in relative_directories
-    }
-    destination_checks = {"count": 0}
-
-    def fake_terminal(
-        _run_id: str,
-        *,
-        storage_root: Path | str | None = None,
-    ) -> dict[str, Any]:
-        assert storage_root is not None
-        root = Path(storage_root).resolve()
-        if root == destination.resolve():
-            destination_checks["count"] += 1
-            for relative, expected in source_bytes.items():
-                published = destination / relative
-                assert {
-                    path.relative_to(published).as_posix(): path.read_bytes()
-                    for path in published.rglob("*")
-                    if path.is_file() and path.relative_to(published).as_posix() not in campaign_evidence.POST_TRANSFER_OPERATIONAL_PATHS
-                } == expected
-        return terminal
-
-    monkeypatch.setattr(
-        generation.campaign,
-        "validate_terminal_campaign",
-        fake_terminal,
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "campaign_transfer_plan",
-        lambda *_args, **_kwargs: plan,
-    )
-    receipt = generation.campaign.publish_transferred_campaign(
-        run_id,
-        staging_root=staging,
-        destination_root=destination,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-    )
-    assert receipt["status"] == "transfer_complete"
-    assert receipt["source_removed"] is False
-    assert receipt["transferred_file_count"] == 6
-    assert receipt["transferred_bytes"] == sum(len(payload) for directory in source_bytes.values() for payload in directory.values())
-    assert len(receipt["files"]) == receipt["transferred_file_count"]
-    assert destination_checks["count"] == 2
-    assert all(not (staging / relative).exists() for relative in relative_directories)
-    assert all((destination / relative).is_dir() for relative in relative_directories)
-
-    repeated = generation.campaign.publish_transferred_campaign(
-        run_id,
-        staging_root=staging,
-        destination_root=destination,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-    )
-    assert repeated == receipt
-    assert destination_checks["count"] == 4
-
-    receipt_path = destination / campaign_directory / "transfer_complete.json"
-    immutable_receipt = receipt_path.read_bytes()
-    (destination / campaign_directory / "dataset_packages_complete.lock").touch()
-    (destination / campaign_directory / "dataset_packages_complete.json").write_text("{}\n", encoding="utf-8")
-    (destination / campaign_directory / campaign_evidence.TECHNICAL_SMOKE_EVIDENCE_FILENAME).write_text(
-        "{}\n",
-        encoding="utf-8",
-    )
-    validated = campaign_evidence.validate_transfer_receipt(
-        run_id,
-        terminal=terminal,
-        plan=plan,
-        storage_root=destination,
-    )
-    current_inventory = campaign_evidence.transfer_inventory_from_plan(plan, storage_root=destination)
-    assert validated == receipt
-    assert receipt_path.read_bytes() == immutable_receipt
-    assert current_inventory == {
-        "file_count": receipt["transferred_file_count"],
-        "size_bytes": receipt["transferred_bytes"],
-        "files": receipt["files"],
-        "inventory_sha256": receipt["transfer_inventory_sha256"],
-    }
-
-    authority = generation.campaign.campaign_transfer_authority(
-        run_id,
-        storage_root=destination,
-    )
-    receipt_path.write_text("{}\n", encoding="utf-8")
-    repaired = generation.campaign.repair_transferred_campaign(
-        run_id,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-        authority=authority,
-        storage_root=destination,
-    )
-    assert repaired["status"] == "transfer_complete"
-    assert repaired["files"] == receipt["files"]
-    assert repaired["directories"] != receipt["directories"]
-
-    recovery_staging = workspace.create_transfer_staging(
-        storage_root=destination,
-        run_id=run_id,
-    )
-    for relative in relative_directories:
-        shutil.copytree(destination / relative, recovery_staging / relative)
-    missing_path = destination / relative_directories[0] / "payload-0.txt"
-    missing_path.unlink()
-    recovered = generation.campaign.publish_transferred_campaign(
-        run_id,
-        staging_root=recovery_staging,
-        destination_root=destination,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-    )
-    assert recovered["status"] == "transfer_complete"
-    assert missing_path.read_bytes() == b"payload-0\n"
-
-    nested = destination / campaign_directory / "nested"
-    nested.mkdir()
-    nested_lock = nested / "dataset_packages_complete.lock"
-    nested_lock.touch()
-    with pytest.raises(ValueError, match="Transfer completion receipt or GPU publication is invalid"):
-        campaign_evidence.validate_transfer_receipt(
-            run_id,
-            terminal=terminal,
-            plan=plan,
-            storage_root=destination,
-        )
-    nested_lock.unlink()
-    nested.rmdir()
-
-    transferred_path = destination / relative_directories[0] / "payload-0.txt"
-    transferred_path.write_text("mutated\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="Transfer completion receipt or GPU publication is invalid"):
-        campaign_evidence.validate_transfer_receipt(
-            run_id,
-            terminal=terminal,
-            plan=plan,
-            storage_root=destination,
-        )
-
-    source_bytes[relative_directories[0]]["payload-0.txt"] = b"mutated\n"
-    invalid_receipt = receipt_path.read_bytes()
-    with pytest.raises(RuntimeError, match="differs from the canonical CPU"):
-        generation.campaign.repair_transferred_campaign(
-            run_id,
-            source_host="cpu.example",
-            source_storage_root="/remote/storage",
-            authority=authority,
-            storage_root=destination,
-        )
-    assert receipt_path.read_bytes() == invalid_receipt
-
-    unmarked = tmp_path / "unmarked staging"
-    unmarked.mkdir()
-    with pytest.raises(ValueError, match="marker"):
-        generation.campaign.publish_transferred_campaign(
-            run_id,
-            staging_root=unmarked,
-            destination_root=destination,
-            source_host="cpu.example",
-            source_storage_root="/remote/storage",
-        )
+    """An unreadable queue is an error, never a free seat."""
+    _fake_squeue(monkeypatch, stdout=stdout, returncode=returncode, stderr="squeue: down")
+    with pytest.raises(RuntimeError, match=match):
+        cluster.query_seat_jobs([1])
 
 
-def test_case_attempt_index_counts_only_real_slurm_submissions(
-    generation_config_factory: Any,
-) -> None:
-    """Do not consume a case attempt number when sbatch never returns a job ID."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    task = cluster.campaign_tasks(campaign)[0]
-    case = generation.campaign._task_payload(task)
-    manifest = {
-        "submissions": [
-            {"case": case, "status": "submission_failed", "job_id": None},
+@pytest.mark.parametrize("failure", [FileNotFoundError("squeue"), subprocess.TimeoutExpired("squeue", 60)])
+def test_query_seat_jobs_reports_an_unrunnable_squeue(monkeypatch: pytest.MonkeyPatch, failure: Exception) -> None:
+    """A missing executable or a timeout becomes a RuntimeError that keeps its cause."""
+
+    def run(_arguments: Any) -> subprocess.CompletedProcess[str]:
+        raise failure
+
+    monkeypatch.setattr(cluster, "_run_squeue", run)
+    with pytest.raises(RuntimeError, match="Could not query") as caught:
+        cluster.query_seat_jobs([1])
+    assert caught.value.__cause__ is failure
+
+
+def _sacct_row(job_id: str, name: str, state: str = "COMPLETED", *, exit_code: str = "0:0", max_rss: str = "") -> str:
+    """Return one parsable2 row in STEP_ACCOUNTING_FORMAT order."""
+    times = ["2026-10-27T10:00:00", "2026-10-27T10:00:05", "2026-10-27T10:10:00", "00:09:55"]
+    return "|".join([job_id, name, state, exit_code, *times, "hpc117", "4", "standard", max_rss])
+
+
+def test_step_accounting_format_lists_the_fields_the_step_rows_are_parsed_from() -> None:
+    """The single sacct format starts with the row identity, then carries every parsed field."""
+    assert cluster.STEP_ACCOUNTING_FORMAT.split(",") == [
+        "JobIDRaw",
+        "JobName",
+        "State",
+        "ExitCode",
+        "Submit",
+        "Start",
+        "End",
+        "Elapsed",
+        "NodeList",
+        "AllocCPUS",
+        "Partition",
+        "MaxRSS",
+    ]
+
+
+def test_parse_step_accounting_keeps_only_numeric_steps_and_normalizes_states() -> None:
+    """Allocation, batch and extern rows are skipped; the step state loses its annotation and suffix."""
+    output = "\n".join(
+        [
+            _sacct_row("100", "gen-seat-1", "RUNNING"),
+            _sacct_row("100.batch", "batch", "RUNNING"),
+            _sacct_row("100.extern", "extern", "RUNNING"),
+            _sacct_row("100.0", "case-1", "COMPLETED", max_rss="2048K"),
+            _sacct_row("100.1", "case-2", "CANCELLED by 123", exit_code="0:15"),
+            _sacct_row("100.2", "case-3", "CANCELLED+", exit_code="0:15"),
+            _sacct_row("100.3", "case-4", "OUT_OF_MEMORY", exit_code="0:125", max_rss="1G"),
+            "",
         ]
+    )
+    rows = cluster.parse_step_accounting(output)
+    assert sorted(rows) == [("100", "case-1"), ("100", "case-2"), ("100", "case-3"), ("100", "case-4")]
+    assert rows[("100", "case-1")] == {
+        "step_id": "0",
+        "state": "COMPLETED",
+        "exit_code": "0:0",
+        "submit": "2026-10-27T10:00:00",
+        "start": "2026-10-27T10:00:05",
+        "end": "2026-10-27T10:10:00",
+        "elapsed": "00:09:55",
+        "node": "hpc117",
+        "cpus": "4",
+        "partition": "standard",
+        "max_rss": "2048K",
     }
-    assert generation.campaign._next_case_attempt_index(manifest, task) == 1
-    manifest["submissions"].extend(
-        (
-            {"case": case, "status": "submitted", "job_id": "4101"},
-            {"case": case, "status": "submission_failed", "job_id": None},
-        )
-    )
-    assert generation.campaign._next_case_attempt_index(manifest, task) == 2
+    assert (rows[("100", "case-2")]["state"], rows[("100", "case-2")]["exit_code"]) == ("CANCELLED", "0:15")
+    assert rows[("100", "case-3")]["state"] == "CANCELLED"
+    assert (rows[("100", "case-4")]["state"], rows[("100", "case-4")]["max_rss"]) == ("OUT_OF_MEMORY", "1G")
+    assert rows[("100", "case-2")]["max_rss"] == ""
+    assert cluster.parse_step_accounting("") == {}
 
 
-def test_partial_transfer_publication_is_distinct_and_hash_validated(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Publish partial evidence without creating complete campaign authority."""
-    run_id = "synthetic_partial__0123456789abcdef"
-    destination = tmp_path / "destination"
-    staging = workspace.create_transfer_staging(
-        storage_root=destination,
-        run_id=run_id,
-    )
-    campaign_directory = f"01_generation/meta/campaigns/{run_id}"
-    directories = (
-        "01_generation/meta/batches/partial_batch",
-        "01_generation/raw/partial_batch",
-        "01_generation/processed/partial_batch",
-        f"01_generation/attempts/partial_batch/case_00002/{run_id}",
-    )
-    for index, relative in enumerate((*directories, campaign_directory)):
-        directory = staging / relative
-        directory.mkdir(parents=True)
-        (directory / f"payload-{index}.txt").write_text(
-            f"payload-{index}\n",
-            encoding="utf-8",
-        )
-    staged_case = staging / directories[2] / "case_0001" / "case.h5"
-    staged_case.parent.mkdir()
-    staged_case.write_bytes(b"canonical-case")
-    successful = [
-        {
-            "batch_name": "partial_batch",
-            "batch_id": "partial-batch-id",
-            "case_id": "case_0001",
-            "case_index": 1,
-            "state": "successful",
-            "classified_state": "successful",
-        }
-    ]
-    failed = [
-        {
-            "batch_name": "partial_batch",
-            "batch_id": "partial-batch-id",
-            "case_id": "case_0002",
-            "case_index": 2,
-            "state": "failed",
-            "classified_state": "failed",
-        }
-    ]
-    plan = {
-        "campaign_run_id": run_id,
-        "campaign_name": "partial",
-        "git_commit": "d" * 40,
-        "campaign_config": "partial.yaml",
-        "campaign_directory": campaign_directory,
-        "batches": [
-            {
-                "batch_name": "partial_batch",
-                "batch_id": "partial-batch-id",
-                "case_count": 2,
-                "meta_directory": directories[0],
-                "raw_directory": directories[1],
-                "processed_directory": directories[2],
-                "attempt_directories": [directories[3]],
-            }
-        ],
-    }
-    partial_path = staging / campaign_directory / "campaign_partial.json"
-    partial_path.write_text(
-        json.dumps(
-            {
-                "schema_kind": "generation_campaign_partial",
-                "schema_version": 1,
-                "campaign_run_id": run_id,
-                "campaign_id": "campaign-id",
-                "git_commit": "d" * 40,
-                "campaign_state": "completed_with_failures",
-                "successful_cases": successful,
-                "failed_cases": failed,
-                "resume_command": f"resume {run_id}",
-                "recorded_at": "2026-08-20T00:00:00+00:00",
-                "transfer_plan": plan,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        generation.campaign,
-        "partial_campaign_transfer_plan",
-        lambda *_args, **_kwargs: plan,
-    )
-    monkeypatch.setattr(
-        campaign_evidence,
-        "load_campaign_run",
-        lambda *_args, **_kwargs: {
-            "campaign_run_id": run_id,
-            "campaign_config": "partial.yaml",
-            "git_commit": "d" * 40,
-        },
-    )
-    partial_batch = SimpleNamespace(
-        batch_name="partial_batch",
-        batch_id="partial-batch-id",
-        case_indices=(1, 2),
-        case_id=lambda index: f"case_{index:04d}",
-    )
-    monkeypatch.setattr(
-        campaign_evidence,
-        "campaign_from_manifest",
-        lambda _manifest: SimpleNamespace(
-            campaign_id="campaign-id",
-            campaign_name="partial",
-            batches=(partial_batch,),
-        ),
-    )
-    monkeypatch.setattr(
-        generation.campaign.batch_runtime,
-        "completed_case_is_valid",
-        lambda *_args, **_kwargs: True,
-    )
+@pytest.mark.parametrize("order", [(9, 10), (10, 9)])
+def test_parse_step_accounting_keeps_the_highest_step_id_of_a_duplicate_name(order: tuple[int, int]) -> None:
+    """A repeated step name inside one allocation resolves to its highest step ID by number, whatever the row order."""
+    output = "\n".join(_sacct_row(f"100.{step}", "case-1", "FAILED" if step == 9 else "COMPLETED") for step in order)
+    output += "\n" + _sacct_row("200.0", "case-1", "TIMEOUT")
+    rows = cluster.parse_step_accounting(output)
+    assert (rows[("100", "case-1")]["step_id"], rows[("100", "case-1")]["state"]) == ("10", "COMPLETED")
+    assert rows[("200", "case-1")]["state"] == "TIMEOUT"
+    assert len(rows) == 2
 
-    receipt = generation.campaign.publish_transferred_campaign(
-        run_id,
-        staging_root=staging,
-        destination_root=destination,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-        partial=True,
-    )
 
-    assert receipt["schema_version"] == 1
-    assert receipt["status"] == "partial"
-    assert receipt["successful_cases"] == successful
-    assert receipt["failed_cases"] == failed
-    assert receipt["source_removed"] is False
-    assert not (destination / campaign_directory / "transfer_complete.json").exists()
-    assert (destination / campaign_directory / "transfer_partial.json").is_file()
-
-    published_case = destination / directories[2] / "case_0001" / "case.h5"
-    case_identity = (
-        published_case.stat().st_ino,
-        common.serialization.file_sha256(published_case),
-    )
-    repeated_staging = workspace.create_transfer_staging(
-        storage_root=destination,
-        run_id=run_id,
-    )
-    for relative in (*directories, campaign_directory):
-        shutil.copytree(
-            destination / relative,
-            repeated_staging / relative,
-        )
-    repeated = generation.campaign.publish_transferred_campaign(
-        run_id,
-        staging_root=repeated_staging,
-        destination_root=destination,
-        source_host="cpu.example",
-        source_storage_root="/remote/storage",
-        partial=True,
-    )
-    assert all(record["status"] == "reused" for record in repeated["directories"])
-    assert (
-        published_case.stat().st_ino,
-        common.serialization.file_sha256(published_case),
-    ) == case_identity
-
-    conflicting_staging = workspace.create_transfer_staging(
-        storage_root=destination,
-        run_id=run_id,
-    )
-    for relative in (*directories, campaign_directory):
-        shutil.copytree(
-            destination / relative,
-            conflicting_staging / relative,
-        )
-    with pytest.raises(FileExistsError, match="partial transfer identity conflicts"):
-        generation.campaign.publish_transferred_campaign(
-            run_id,
-            staging_root=conflicting_staging,
-            destination_root=destination,
-            source_host="other-cpu.example",
-            source_storage_root="/remote/storage",
-            partial=True,
-        )
-
-    published_partial = destination / campaign_directory / "campaign_partial.json"
-    original_partial = published_partial.read_bytes()
-    payload = json.loads(published_partial.read_text(encoding="utf-8"))
-    payload["resume_command"] = "resume conflicting-run"
-    published_partial.write_text(
-        json.dumps(payload) + "\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match="Partial transfer receipt"):
-        generation.campaign.validate_partially_transferred_campaign(
-            run_id,
-            storage_root=destination,
-        )
-
-    published_partial.write_bytes(original_partial)
-    (destination / campaign_directory / "transfer_partial.json").unlink()
-    shared = generation.campaign.repair_partial_campaign_publication(
-        run_id,
-        source_host="shared-filesystem",
-        source_storage_root=str(destination),
-        storage_root=destination,
-    )
-    assert shared["source_removed"] is False
-    assert shared["source_storage_root"] == str(destination)
-    assert all(record["status"] == "reused" for record in shared["directories"])
-    assert (
-        generation.campaign.repair_partial_campaign_publication(
-            run_id,
-            source_host="shared-filesystem",
-            source_storage_root=str(destination),
-            storage_root=destination,
-        )
-        == shared
-    )
+def test_parse_step_accounting_rejects_a_truncated_step_row() -> None:
+    """A step row without every field is an error, while a truncated allocation row is not a step."""
+    assert cluster.parse_step_accounting("100|gen-seat-1|RUNNING\n") == {}
+    with pytest.raises(ValueError, match="malformed step row"):
+        cluster.parse_step_accounting("100.0|case-1|COMPLETED|0:0\n")

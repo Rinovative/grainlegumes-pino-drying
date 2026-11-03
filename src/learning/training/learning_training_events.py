@@ -1,9 +1,17 @@
-"""
-Canonical completed-epoch event scheduling.
+"""Schedule interval events on genuine completed training epochs.
 
-Every interval-based training phase uses :func:`is_completed_epoch_event`.
-Normal histories begin only after a completed optimizer epoch, include the
-terminal target exactly once, and never synthesize or backfill observations.
+Responsibilities:
+  - Decide whether a completed epoch meets its interval or terminal target
+  - Enumerate the exact ordered event epochs and return the first event
+
+Design principles:
+  - Epochs, intervals, and targets must be exact positive integers
+  - The terminal target appears once even when it is outside the interval cadence
+  - Epochs beyond the declared target are rejected
+
+This module does NOT:
+  - Execute training phases or synthesize missing observations
+  - Persist histories or choose a phase's interval and target
 """
 
 from __future__ import annotations

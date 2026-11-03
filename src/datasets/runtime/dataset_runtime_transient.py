@@ -1,16 +1,16 @@
-"""
-dataset_runtime_transient.py
+"""Lazily materialize physical-unit transient samples from admitted indexes.
 
-Lazily materialize physical-unit transient samples from admitted indexes.
 Responsibilities:
   - Resolve and revalidate immutable source HDF5 and temporal evidence
-  - Materialize explicit one-step transitions or deterministic rollout windows
+  - Materialize explicit one-step transitions, deterministic rollout windows, or complete trajectories
   - Apply one validated boundary-preserving spatial view to every spatial field
   - Own process-local read-only handles, shard admissions, and bounded caches
+
 Design principles:
   - One admitted trajectory index drives every runtime sampling mode
   - Delta targets are derived from canonical absolute endpoint states
   - Worker serialization never carries open HDF5 resources
+
 This module does NOT:
   - Build or publish transient indexes
   - Normalize time, train models, or execute autoregressive model rollouts
@@ -21,12 +21,11 @@ from __future__ import annotations
 import math
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import h5py
 import numpy as np
@@ -37,6 +36,9 @@ from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 from src.datasets.packages import dataset_packages_transient_shards as transient_shards
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
 _SHA256_LENGTH = 64
 _TRANSIENT_FIELD_RANK = 4
@@ -63,8 +65,6 @@ class TransientMetadata(TypedDict):
     source_batch_id: str
     source_simulation_profile: str
     material_family: str
-    evaluation_regime: str
-    split: str
     time_index_n: int
     time_index_n_plus_1: int
     sequence_length: int
@@ -91,9 +91,6 @@ class TransientItem(TypedDict):
     metadata: TransientMetadata
 
 
-TransientTransform = Callable[[TransientItem], TransientItem]
-
-
 @dataclass(frozen=True, slots=True)
 class _ItemReference:
     """Bind one runtime item to consecutive transition-index positions."""
@@ -114,41 +111,17 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         hdf5_cache_size: int = 0,
         spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
-        transform: TransientTransform | None = None,
     ) -> None:
         """Validate index/source identities without retaining open HDF5 handles."""
-        if not isinstance(sampling, transient_contract.TransientSamplingSpec):
-            message = "sampling must be one validated TransientSamplingSpec."
-            raise TypeError(message)
-        if isinstance(hdf5_cache_size, bool) or not isinstance(hdf5_cache_size, int) or hdf5_cache_size < 0:
-            message = "hdf5_cache_size must be a non-negative integer."
-            raise ValueError(message)
-        self.index_path = Path(index_path).expanduser().resolve()
-        self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
-        self.payload = trajectory.load_transient_index(self.index_path)
-        self.sampling = sampling
-        self.hdf5_cache_size = hdf5_cache_size
-        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
-        self.transform = transform
-        self.storage_backend = "canonical_hdf5"
-        self.dataset_manifest_digest: str | None = None
-        self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
-        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
-        if sample_indices is None:
-            selected = tuple(range(len(self.payload["samples"])))
-        else:
-            selected = tuple(sample_indices)
-            if (
-                any(isinstance(index, bool) or not isinstance(index, int) for index in selected)
-                or any(index < 0 or index >= len(self.payload["samples"]) for index in selected)
-                or len(selected) != len(set(selected))
-                or selected != tuple(sorted(selected))
-            ):
-                message = "Transient sample_indices must be unique ordered valid integer positions."
-                raise ValueError(message)
-        self.sample_indices = selected
-        self._item_references = self._build_item_references()
-        self._process_id: int | None = None
+        self._admit_index(
+            index_path,
+            sampling=sampling,
+            source_root=source_root,
+            hdf5_cache_size=hdf5_cache_size,
+            spatial_stride=spatial_stride,
+            sample_indices=sample_indices,
+            storage_backend="canonical_hdf5",
+        )
         self._handles: OrderedDict[Path, h5py.File] = OrderedDict()
         selected_cases = {int(self.payload["samples"][position]["case_index"]) for position in self.sample_indices}
         source_paths: list[Path | None] = []
@@ -164,6 +137,51 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             source_stats.append((stat.st_size, stat.st_mtime_ns))
         self._source_paths = tuple(source_paths)
         self._source_stats = tuple(source_stats)
+
+    def _admit_index(
+        self,
+        index_path: Path | str,
+        *,
+        sampling: transient_contract.TransientSamplingSpec,
+        source_root: Path | str | None,
+        hdf5_cache_size: int,
+        spatial_stride: int,
+        sample_indices: Sequence[int] | None,
+        storage_backend: str,
+    ) -> None:
+        """Validate the request and bind the index, selection and item references shared by every storage backend."""
+        if not isinstance(sampling, transient_contract.TransientSamplingSpec):
+            message = "sampling must be one validated TransientSamplingSpec."
+            raise TypeError(message)
+        if isinstance(hdf5_cache_size, bool) or not isinstance(hdf5_cache_size, int) or hdf5_cache_size < 0:
+            message = "hdf5_cache_size must be a non-negative integer."
+            raise ValueError(message)
+        self.index_path = Path(index_path).expanduser().resolve()
+        self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
+        self.payload = trajectory.load_transient_index(self.index_path)
+        self.sampling = sampling
+        self.hdf5_cache_size = hdf5_cache_size
+        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
+        self.storage_backend = storage_backend
+        self.dataset_manifest_digest: str | None = None
+        self.dataset_case_partition: dict[str, Any] | None = None
+        self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
+        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
+        if sample_indices is None:
+            selected = tuple(range(len(self.payload["samples"])))
+        else:
+            selected = tuple(sample_indices)
+            if (
+                any(isinstance(position, bool) or not isinstance(position, int) for position in selected)
+                or any(position < 0 or position >= len(self.payload["samples"]) for position in selected)
+                or len(selected) != len(set(selected))
+                or selected != tuple(sorted(selected))
+            ):
+                message = "Transient sample_indices must be unique ordered valid integer positions."
+                raise ValueError(message)
+        self.sample_indices = selected
+        self._item_references = self._build_item_references()
+        self._process_id: int | None = None
 
     @property
     def dataset_id(self) -> str:
@@ -239,32 +257,34 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 for position in self.sample_indices
             )
         rollout_length = self.sampling.rollout_length
-        window_stride = self.sampling.window_stride
-        window_offset = self.sampling.window_offset
-        if rollout_length is None or window_stride is None or window_offset is None:
-            message = "Validated rollout sampling is missing required window values."
-            raise RuntimeError(message)
+        whole = self.sampling.mode == "trajectory"
         grouped: dict[int, list[int]] = {}
         for position in self.sample_indices:
             case_index = int(self.payload["samples"][position]["case_index"])
             grouped.setdefault(case_index, []).append(position)
         references: list[_ItemReference] = []
         for case_index, positions in grouped.items():
-            final_start = len(positions) - rollout_length
-            for start in range(window_offset, final_start + 1, window_stride):
-                window = tuple(positions[start : start + rollout_length])
-                samples = [self.payload["samples"][position] for position in window]
-                if any(
-                    current["time_index_n_plus_1"] != following["time_index_n"] or current["schedule_index_n_plus_1"] != following["schedule_index_n"]
-                    for current, following in pairwise(samples)
-                ):
-                    message = "Transient rollout windows require consecutive regular transitions from one case."
-                    raise trajectory.TransientDataContractError(message)
-                references.append(_ItemReference(case_index=case_index, sample_positions=window))
-        if not references:
-            message = (
-                f"Transient selection has no complete rollout window of length {rollout_length} at offset {window_offset} and stride {window_stride}."
+            samples = [self.payload["samples"][position] for position in positions]
+            if any(
+                current["time_index_n_plus_1"] != following["time_index_n"] or current["schedule_index_n_plus_1"] != following["schedule_index_n"]
+                for current, following in pairwise(samples)
+            ):
+                message = "Transient rollout windows and trajectories require consecutive regular transitions from one case."
+                raise trajectory.TransientDataContractError(message)
+            if whole:
+                # A trainer window length requires at least one complete window per trajectory.
+                if rollout_length is None or self.sampling.window_starts(len(positions)):
+                    references.append(_ItemReference(case_index=case_index, sample_positions=tuple(positions)))
+                continue
+            if rollout_length is None:
+                message = "Validated rollout sampling is missing its rollout length."
+                raise RuntimeError(message)
+            starts = self.sampling.window_starts(len(positions))
+            references.extend(
+                _ItemReference(case_index=case_index, sample_positions=tuple(positions[start : start + rollout_length])) for start in starts
             )
+        if not references:
+            message = f"Transient selection has no complete rollout window for sampling {self.sampling.as_dict()}."
             raise ValueError(message)
         return tuple(references)
 
@@ -309,6 +329,16 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
     def __len__(self) -> int:
         """Return the deterministic item count for the explicit sampling mode."""
         return len(self._item_references)
+
+    def item_transition_counts(self) -> tuple[int, ...]:
+        """Return the regular transition count of every item; whole trajectories may differ."""
+        return tuple(len(reference.sample_positions) for reference in self._item_references)
+
+    def cases_without_items(self) -> tuple[str, ...]:
+        """Return selected package cases whose transitions yield no item under this sampling, such as a too-short window."""
+        selected = {int(self.payload["samples"][position]["case_index"]) for position in self.sample_indices}
+        covered = {reference.case_index for reference in self._item_references}
+        return tuple(str(self.payload["cases"][index]["package_case_id"]) for index in sorted(selected - covered))
 
     def _validate_runtime_source(self, case_index: int) -> Path:
         """Reject a source whose stat or hash changed after dataset admission."""
@@ -417,6 +447,41 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             source_label=path,
         )
 
+    def read_case_arrays(self, package_case_id: str) -> trajectory.TransientCaseArrays:
+        """Read exact physical arrays for one fully selected indexed HDF5 case."""
+        if self.storage_backend != "canonical_hdf5":
+            message = "Whole-case physical arrays require the canonical HDF5 runtime backend."
+            raise NotImplementedError(message)
+        if not isinstance(package_case_id, str) or not package_case_id:
+            message = "package_case_id must be a non-empty string."
+            raise ValueError(message)
+        matches = [index for index, case in enumerate(self.payload["cases"]) if case["package_case_id"] == package_case_id]
+        if len(matches) != 1:
+            message = f"Transient package case {package_case_id!r} does not identify exactly one indexed case."
+            raise ValueError(message)
+        case_index = matches[0]
+        all_positions = tuple(position for position, sample in enumerate(self.payload["samples"]) if int(sample["case_index"]) == case_index)
+        selected_positions = tuple(position for position in self.sample_indices if int(self.payload["samples"][position]["case_index"]) == case_index)
+        if not all_positions or selected_positions != all_positions:
+            message = f"Transient package case {package_case_id!r} is not fully admitted by this runtime selection."
+            raise ValueError(message)
+        case = self.payload["cases"][case_index]
+        samples = [self.payload["samples"][position] for position in all_positions]
+        path = self._validate_runtime_source(case_index)
+        handle, close_after = self._open_handle(path)
+        try:
+            return trajectory.read_transient_case_arrays(
+                handle,
+                path,
+                case,
+                samples,
+                expected_regular_horizon=self.configured_regular_horizon,
+                spatial_stride=self.spatial_stride,
+            )
+        finally:
+            if close_after:
+                handle.close()
+
     def _materialize_item(
         self,
         *,
@@ -467,7 +532,13 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         one_step = self.sampling.mode == "one_step_transition"
         first_time_index = int(samples[0]["time_index_n"])
         last_time_index = int(samples[-1]["time_index_n_plus_1"])
-        sample_id = str(samples[0]["sample_id"]) if one_step else f"{case['package_case_id']}__window_{first_time_index:04d}_{last_time_index:04d}"
+        sample_id = (
+            str(samples[0]["sample_id"])
+            if one_step
+            else f"{case['package_case_id']}__trajectory"
+            if self.sampling.mode == "trajectory"
+            else f"{case['package_case_id']}__window_{first_time_index:04d}_{last_time_index:04d}"
+        )
         spatial_representation = self.spatial_representation()
         canonical_shape = spatial_representation.source_shape
         effective_shape = spatial_representation.represented_shape
@@ -503,8 +574,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "source_batch_id": str(case["source_batch_id"]),
                 "source_simulation_profile": str(case["source_simulation_profile"]),
                 "material_family": str(case["material_family"]),
-                "evaluation_regime": str(case["evaluation_regime"]),
-                "split": str(case["membership"]),
                 "time_index_n": first_time_index,
                 "time_index_n_plus_1": last_time_index,
                 "sequence_length": int(case["sequence_length"]),
@@ -519,7 +588,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "spatial_index_identity_sha256": spatial_representation.index_identity_sha256,
             },
         }
-        return item if self.transform is None else self.transform(item)
+        return item
 
     def __getstate__(self) -> dict[str, Any]:
         """Exclude open HDF5 handles from worker serialization."""
@@ -552,41 +621,17 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         hdf5_cache_size: int = 0,
         spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
-        transform: TransientTransform | None = None,
     ) -> None:
         """Admit shard evidence without opening canonical source HDF5 files."""
-        if not isinstance(sampling, transient_contract.TransientSamplingSpec):
-            message = "sampling must be one validated TransientSamplingSpec."
-            raise TypeError(message)
-        if isinstance(hdf5_cache_size, bool) or not isinstance(hdf5_cache_size, int) or hdf5_cache_size < 0:
-            message = "hdf5_cache_size must be a non-negative integer."
-            raise ValueError(message)
-        self.index_path = Path(index_path).expanduser().resolve()
-        self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
-        self.payload = trajectory.load_transient_index(self.index_path)
-        self.sampling = sampling
-        self.hdf5_cache_size = hdf5_cache_size
-        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
-        self.transform = transform
-        self.storage_backend = "pt_shards"
-        self.dataset_manifest_digest: str | None = None
-        self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
-        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
-        if sample_indices is None:
-            selected = tuple(range(len(self.payload["samples"])))
-        else:
-            selected = tuple(sample_indices)
-            if (
-                any(isinstance(position, bool) or not isinstance(position, int) for position in selected)
-                or any(position < 0 or position >= len(self.payload["samples"]) for position in selected)
-                or len(selected) != len(set(selected))
-                or selected != tuple(sorted(selected))
-            ):
-                message = "Transient sample_indices must be unique ordered valid integer positions."
-                raise ValueError(message)
-        self.sample_indices = selected
-        self._item_references = self._build_item_references()
-        self._process_id: int | None = None
+        self._admit_index(
+            index_path,
+            sampling=sampling,
+            source_root=source_root,
+            hdf5_cache_size=hdf5_cache_size,
+            spatial_stride=spatial_stride,
+            sample_indices=sample_indices,
+            storage_backend="pt_shards",
+        )
         self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._validated_shards: set[int] = set()
         self._shard_receipt = transient_shards.load_transient_shard_receipt(
@@ -820,8 +865,8 @@ def select_transient_cases(
 
     The original runtime remains usable when replacement admission fails. The
     selected runtime preserves its storage backend, sampling contract, source
-    root, cache policy, and transform without opening storage outside that
-    backend's constructor.
+    root, and cache policy without opening storage outside that backend's
+    constructor.
     """
     if not isinstance(dataset, TransientPhysicalDataset):
         message = "dataset must be one admitted transient physical runtime."
@@ -854,7 +899,6 @@ def select_transient_cases(
         hdf5_cache_size=dataset.hdf5_cache_size,
         spatial_stride=dataset.spatial_stride,
         sample_indices=positions,
-        transform=dataset.transform,
     )
     if replacement.storage_backend != dataset.storage_backend:
         replacement.close()
@@ -865,28 +909,3 @@ def select_transient_cases(
         replacement.bind_dataset_manifest_digest(manifest_digest)
     dataset.close()
     return replacement
-
-
-def select_transient_sample_indices(
-    payload: Mapping[str, Any],
-    *,
-    membership: str | None,
-    ood_group: str | None,
-) -> tuple[int, ...]:
-    """Select transition positions from case membership and optional OOD group."""
-    cases = payload.get("cases")
-    samples = payload.get("samples")
-    if not isinstance(cases, list) or not isinstance(samples, list):
-        message = "Transient selector requires one validated index payload."
-        raise TypeError(message)
-    selected_cases = {
-        index
-        for index, case in enumerate(cases)
-        if (membership is None or case.get("membership") == membership) and (ood_group is None or case.get("ood_group") == ood_group)
-    }
-    indices = tuple(index for index, sample in enumerate(samples) if sample.get("case_index") in selected_cases)
-    if not indices:
-        selector = {"membership": membership, "ood_group": ood_group}
-        message = f"Transient package has no samples for selector {selector}."
-        raise ValueError(message)
-    return indices

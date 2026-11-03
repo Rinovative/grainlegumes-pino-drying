@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-DEFAULT_PROJECT_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
-PROJECT_ROOT="$(realpath -m -- "${PROJECT_ROOT:-${DEFAULT_PROJECT_ROOT}}")"
-STORAGE_ROOT="$(realpath -m -- "${STORAGE_ROOT:-${PROJECT_ROOT}/../storage}")"
-RUNTIME_ROOT="$(realpath -m -- "${RUNTIME_ROOT:-${PROJECT_ROOT}/../runtime}")"
-
-source_fingerprint() {
-  python3 "${PROJECT_ROOT}/scripts/source_fingerprint.py" "${PROJECT_ROOT}"
+# The worker runs from the frozen source tree RUNTIME_ROOT/sources/SOURCE_TREE_ID submitted by scripts/slurm_ml.sh.
+# Its roots are explicit: a tree never infers storage or runtime from its own location, and no Git is needed here.
+for variable_name in PROJECT_ROOT STORAGE_ROOT RUNTIME_ROOT SOURCE_TREE_ID; do
+  [[ -n "${!variable_name:-}" ]] || { printf '%s must be set by the submission for a frozen source tree.\n' "${variable_name}" >&2; exit 1; }
+done
+PROJECT_ROOT="$(realpath -m -- "${PROJECT_ROOT}")"
+STORAGE_ROOT="$(realpath -m -- "${STORAGE_ROOT}")"
+RUNTIME_ROOT="$(realpath -m -- "${RUNTIME_ROOT}")"
+[[ "${SOURCE_TREE_ID}" =~ ^[0-9a-f]{12}-[0-9a-f]{12}$ \
+  && "${PROJECT_ROOT##*/}" == "${SOURCE_TREE_ID}" \
+  && "${PROJECT_ROOT}" == "${RUNTIME_ROOT}/sources/${SOURCE_TREE_ID}" ]] || {
+  printf 'PROJECT_ROOT must be the source tree RUNTIME_ROOT/sources/SOURCE_TREE_ID (%s), got %s.\n' "${SOURCE_TREE_ID}" "${PROJECT_ROOT}" >&2
+  exit 1
 }
-
-if [[ "${1:-}" == --source-fingerprint ]]; then
-  (( $# == 1 )) || exit 2
-  source_fingerprint
-  exit
-fi
+source_transition="${ML_SOURCE_TRANSITION:-none}"
+[[ "${source_transition}" == none || "${source_transition}" == explicit ]] || { printf 'ML_SOURCE_TRANSITION must be explicit when set.\n' >&2; exit 2; }
 
 if (( $# < 12 )); then
   printf 'Usage: %s MODE GRES COMMIT SOURCE_SHA CONFIG_SHA SIF_IDENTITY SIF_SHA CPUS MEMORY TIME PARTITION train|optuna|artifacts|probe [CLI arguments...]\n' "$0" >&2
@@ -55,12 +56,23 @@ else
   }
   unset CUDA_VISIBLE_DEVICES
 fi
-[[ "$(git -C "${PROJECT_ROOT}" rev-parse HEAD)" == "${expected_commit}" ]] || {
-  printf 'Repository commit changed after submission.\n' >&2
+# The tree has no Git metadata: its bytes, paths and modes are checked against the durable snapshot named like it.
+verification="$(python3 "${PROJECT_ROOT}/scripts/source_fingerprint.py" --verify-tree "${PROJECT_ROOT}" "${STORAGE_ROOT}/source_snapshots")" || {
+  printf 'Source tree failed verification against its snapshot: %s\n' "${PROJECT_ROOT}" >&2
   exit 1
 }
-[[ "$(source_fingerprint)" == "${expected_source_sha}" ]] || {
-  printf 'Repository source state changed after submission.\n' >&2
+read -r tree_id tree_commit tree_sha < <(
+  python3 -c 'import json, sys
+verified = json.load(sys.stdin)
+print(verified["tree_id"], verified["git_commit"], verified["source_fingerprint_sha256"])' <<<"${verification}"
+) || { printf 'Source tree verification result is unreadable.\n' >&2; exit 1; }
+[[ "${tree_id}" == "${SOURCE_TREE_ID}" ]] || { printf 'Verified source tree differs from SOURCE_TREE_ID.\n' >&2; exit 1; }
+[[ "${tree_commit}" == "${expected_commit}" ]] || {
+  printf 'Source tree commit differs from the submitted commit.\n' >&2
+  exit 1
+}
+[[ "${tree_sha}" == "${expected_source_sha}" ]] || {
+  printf 'Source tree fingerprint differs from the submitted fingerprint.\n' >&2
   exit 1
 }
 sif_path="${RUNTIME_ROOT}/containers/grainlegumes-pino-drying.sif"
@@ -98,16 +110,17 @@ else
   [[ "${expected_config_sha}" == none ]] || exit 2
 fi
 
-printf 'Slurm job: %s\nPartition: %s\nCPUs per task: %s\nRequested memory: %s\nRequested time: %s\nGPU GRES request: %s\nCUDA_VISIBLE_DEVICES: %s\nSource commit: %s\nSource worktree SHA256: %s\nSIF: %s\nSIF SHA256: %s\n' \
-  "${SLURM_JOB_ID}" "${SLURM_JOB_PARTITION}" "${SLURM_CPUS_PER_TASK}" "${requested_memory}" "${requested_time}" "${gres}" "${CUDA_VISIBLE_DEVICES:-none}" \
-  "${expected_commit}" "${expected_source_sha}" "${sif_path}" "${sif_sha}"
+# Three header lines; the full digests are persisted with the run in the provenance JSON below.
+printf 'job %s | partition %s | gres %s (CUDA %s) | %s CPUs | %s | %s\nsource %s | commit %s | transition %s\nimage %s | sha256 %s\n' \
+  "${SLURM_JOB_ID}" "${SLURM_JOB_PARTITION}" "${gres}" "${CUDA_VISIBLE_DEVICES:-none}" "${SLURM_CPUS_PER_TASK}" "${requested_memory}" "${requested_time}" \
+  "${SOURCE_TREE_ID}" "${expected_commit:0:12}" "${source_transition}" "${sif_path##*/}" "${sif_sha:0:12}"
 
-provenance="$(python3 - "${mode}" "${gres}" "${expected_commit}" "${expected_source_sha}" "${expected_config_sha}" "${sif_sha}" "${requested_memory}" "${requested_time}" <<'PY'
+provenance="$(python3 - "${mode}" "${gres}" "${expected_commit}" "${expected_source_sha}" "${source_transition}" "${expected_config_sha}" "${sif_sha}" "${requested_memory}" "${requested_time}" <<'PY'
 import json
 import os
 import sys
 
-mode, gres, commit, source_sha, config_sha, sif_sha, memory, wall_time = sys.argv[1:]
+mode, gres, commit, source_sha, source_transition, config_sha, sif_sha, memory, wall_time = sys.argv[1:]
 print(json.dumps({
     "job_id": os.environ["SLURM_JOB_ID"],
     "partition": os.environ.get("SLURM_JOB_PARTITION", ""),
@@ -119,6 +132,7 @@ print(json.dumps({
     "gres": gres,
     "source_commit": commit,
     "source_worktree_sha256": source_sha,
+    "source_transition": source_transition,
     "config_sha256": config_sha,
     "sif_path": "/workspace/runtime/containers/grainlegumes-pino-drying.sif",
     "sif_sha256": sif_sha,
@@ -132,6 +146,10 @@ fi
 if [[ -n "${WANDB_API_KEY:-}" ]]; then
   export APPTAINERENV_WANDB_API_KEY="${WANDB_API_KEY}"
 fi
+
+# Slurm expands %j only in its own file names: the job's log files (host paths, one per line) are linked into the run and study folders by the executor.
+JOB_LOG_FILES="${ML_JOB_LOG_TEMPLATES:-}"
+export JOB_LOG_FILES="${JOB_LOG_FILES//%j/${SLURM_JOB_ID}}"
 
 executor="${PROJECT_ROOT}/scripts/apptainer_exec.sh"
 [[ -x "${executor}" ]] || { printf 'Maintained Apptainer executor is unavailable.\n' >&2; exit 1; }

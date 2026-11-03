@@ -1,5 +1,15 @@
-# ruff: noqa: S101
-"""Protect configuration semantics with complete test-owned requests."""
+"""Protect configuration semantics with complete test-owned requests.
+
+Responsibilities:
+  - Check explicit request resolution, scientific identity, resume compatibility, and invalid
+    semantics
+
+Design principles:
+  - Runtime/reporting changes stay distinct from scientific changes
+
+This module does NOT:
+  - Select production defaults or execute training
+"""
 
 from __future__ import annotations
 
@@ -26,48 +36,55 @@ def test_minimal_direct_config_resolves_and_preserves_user_values(
     raw["data"]["batch_size"] = _SYNTHETIC_BATCH_SIZE
     raw["optimizer"]["lr"] = 4.321e-3
 
-    resolved = experiments.config.loader.resolve_config(raw)
+    resolved = configs.resolve(raw)
     task = domain.tasks.registry.get_task("steady_flow")
 
     assert resolved["model"]["kind"] == model_kind
     assert resolved["model"]["params"]["in_channels"] == task.in_channels
     assert resolved["model"]["params"]["out_channels"] == task.out_channels
     assert resolved["data"]["train_dataset"] == "synthetic_train"
-    assert resolved["data"]["ood_datasets"] == ["synthetic_ood"]
+    assert resolved["data"]["additional_evaluation_datasets"] == ["synthetic_ood"]
     assert resolved["data"]["batch_size"] == _SYNTHETIC_BATCH_SIZE
     assert resolved["optimizer"]["lr"] == pytest.approx(4.321e-3)
     assert resolved["evaluation"]["objective"]["id"] == "normalized_group_macro_rmse"
 
 
-@pytest.mark.parametrize("dataset_key", ["train_dataset", "ood_datasets"])
-def test_training_and_evaluation_require_exact_dataset_ids(
-    dataset_key: str,
-) -> None:
+def test_training_requires_an_exact_dataset_id() -> None:
     """Reject implicit selection from whatever Dataset packages happen to exist."""
     raw = configs.direct_config()
-    raw["data"].pop(dataset_key)
+    raw["data"].pop("train_dataset")
 
-    with pytest.raises((TypeError, ValueError), match=dataset_key):
-        experiments.config.loader.resolve_config(raw)
+    with pytest.raises((TypeError, ValueError), match="train_dataset"):
+        configs.resolve(raw)
+
+
+@pytest.mark.parametrize(("key", "value"), [("ood_datasets", ["synthetic_ood"]), ("train_ratio", 0.8), ("ood_fraction", 0.2)])
+def test_steady_membership_keys_are_dataset_owned(key: str, value: object) -> None:
+    """Reject run-owned steady split keys; membership comes from the Dataset partition."""
+    raw = configs.direct_config()
+    raw["data"][key] = value
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=key):
+        configs.resolve(raw)
 
 
 def test_minimal_physics_config_preserves_explicit_semantics() -> None:
     """Propagate explicitly supplied formulation and weight values unchanged."""
     raw = configs.direct_config(physics_enabled=True)
     physics = raw["loss"]["physics"]
-    physics["derivatives"] = {"kind": "spectral", "extension": "reflect"}
-    physics["continuity"] = "div_eps_velocity"
-    physics["residual_weight"]["target"] = 4.0e-3
+    physics["derivatives"] = {"kind": "spectral", "extension": "fourier_continuation"}
+    physics["momentum_weight"]["target"] = 4.0e-3
+    physics["continuity_weight"]["target"] = 5.0e-3
     physics["boundary_weight"]["target"] = 6.0e-3
 
-    resolved = experiments.config.loader.resolve_config(raw)
+    resolved = configs.resolve(raw)
 
     assert resolved["loss"]["physics"]["derivatives"] == {
         "kind": "spectral",
-        "extension": "reflect",
+        "extension": "fourier_continuation",
     }
-    assert resolved["loss"]["physics"]["continuity"] == "div_eps_velocity"
-    assert resolved["loss"]["physics"]["residual_weight"]["target"] == pytest.approx(4.0e-3)
+    assert resolved["loss"]["physics"]["momentum_weight"]["target"] == pytest.approx(4.0e-3)
+    assert resolved["loss"]["physics"]["continuity_weight"]["target"] == pytest.approx(5.0e-3)
     assert resolved["loss"]["physics"]["boundary_weight"]["target"] == pytest.approx(6.0e-3)
 
 
@@ -75,14 +92,14 @@ def test_scientific_change_updates_name_and_resume_identity() -> None:
     """Treat an explicit physics-weight change as continuation-incompatible."""
     first_raw = configs.direct_config(physics_enabled=True)
     second_raw = copy.deepcopy(first_raw)
-    second_raw["loss"]["physics"]["residual_weight"]["target"] = 7.0e-3
-    first = experiments.config.loader.resolve_config(first_raw)
-    second = experiments.config.loader.resolve_config(second_raw)
+    second_raw["loss"]["physics"]["continuity_weight"]["target"] = 7.0e-3
+    first = configs.resolve(first_raw)
+    second = configs.resolve(second_raw)
 
-    assert first["run"]["name"] != second["run"]["name"]
+    assert first["run"]["name"] == second["run"]["name"]  # Unoccupied readable labels; exact identities remain distinct.
     assert learning.training.checkpoint.config_digest(first) != (learning.training.checkpoint.config_digest(second))
     assert learning.training.checkpoint.resume_contract_digest(first) != (learning.training.checkpoint.resume_contract_digest(second))
-    with pytest.raises(ValueError, match=r"loss\.physics\.residual_weight\.target"):
+    with pytest.raises(ValueError, match=r"loss\.physics\.continuity_weight\.target"):
         experiments.run.validate_resume_config(second, first)
 
 
@@ -98,7 +115,7 @@ def test_runtime_location_changes_preserve_scientific_and_resume_identity(
     replacement: str,
 ) -> None:
     """Exclude device and output location from run naming and resume semantics."""
-    first = experiments.config.loader.resolve_config(configs.direct_config())
+    first = configs.resolve(configs.direct_config())
     second = copy.deepcopy(first)
     if field == "device":
         second["run"]["device"] = replacement
@@ -112,12 +129,11 @@ def test_runtime_location_changes_preserve_scientific_and_resume_identity(
 
 def test_reporting_and_data_worker_changes_preserve_training_identity() -> None:
     """Exclude run labels, reporting, paths, devices, and loader workers from model science."""
-    original = experiments.config.loader.resolve_config(configs.direct_config())
+    original = configs.resolve(configs.direct_config())
     operational = copy.deepcopy(original)
     operational["run"].update(
         {
             "name": "relabeled-run",
-            "suffix": "reporting-only",
             "device": "cuda",
         }
     )
@@ -137,10 +153,10 @@ def test_reporting_and_data_worker_changes_preserve_training_identity() -> None:
 
 def test_objective_change_is_resume_incompatible() -> None:
     """Bind model selection semantics to persisted continuation identity."""
-    first = experiments.config.loader.resolve_config(configs.direct_config())
+    first = configs.resolve(configs.direct_config())
     changed_raw = configs.direct_config()
     changed_raw["evaluation"]["objective"] = {"id": "normalized_relative_h1"}
-    second = experiments.config.loader.resolve_config(changed_raw)
+    second = configs.resolve(changed_raw)
 
     assert learning.training.checkpoint.resume_contract_digest(first) != (learning.training.checkpoint.resume_contract_digest(second))
     with pytest.raises(ValueError, match=r"evaluation\.objective"):
@@ -178,24 +194,44 @@ def test_invalid_config_fails_at_the_public_resolver(
     mutation(raw)
 
     with pytest.raises((TypeError, ValueError), match=match):
-        experiments.config.loader.resolve_config(raw)
+        configs.resolve(raw)
 
 
-def test_unknown_continuity_fails_with_the_semantic_path() -> None:
-    """Reject a physics formulation not declared by the selected task."""
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("continuity", "div_velocity"), ("residual_weight", {"target": 1.0e-3, "warmup": {"kind": "linear", "epochs": 1}})],
+)
+def test_superseded_physics_selectors_fail_closed(key: str, value: object) -> None:
+    """Reject pointwise-continuity and shared-weight configs instead of dropping their meaning."""
     raw = configs.direct_config(physics_enabled=True)
-    raw["loss"]["physics"]["continuity"] = "unsupported"
+    raw["loss"]["physics"][key] = value
 
     with pytest.raises(
         experiments.config.loader.ConfigError,
-        match=r"loss\.physics\.continuity",
+        match=rf"loss\.physics contains unknown key\(s\): \['{key}'\]",
     ):
-        experiments.config.loader.resolve_config(raw)
+        configs.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [(("momentum_weight", "target"), "1.0e3"), (("boundary_weight", "warmup", "epochs"), 2.5), (("interior_crop",), "2")],
+)
+def test_physics_numbers_reject_text_and_fractional_counts(path: tuple[str, ...], value: object) -> None:
+    """Reject YAML text such as an unsigned exponent and truncating counts instead of coercing them."""
+    raw = configs.direct_config(physics_enabled=True)
+    node: Any = raw["loss"]["physics"]
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"loss\.physics\." + r"\.".join(path)):
+        configs.resolve(raw)
 
 
 def test_duplicate_metric_identifier_is_rejected() -> None:
     """Prevent an objective from resolving against an ambiguous declaration."""
-    resolved = experiments.config.loader.resolve_config(configs.direct_config())
+    resolved = configs.resolve(configs.direct_config())
     raw = configs.direct_config()
     metrics = copy.deepcopy(resolved["evaluation"]["metrics"])
     for metric in metrics:
@@ -204,12 +240,12 @@ def test_duplicate_metric_identifier_is_rejected() -> None:
     raw["evaluation"]["metrics"] = metrics
 
     with pytest.raises(ValueError, match="Duplicate evaluation metric id"):
-        experiments.config.loader.resolve_config(raw)
+        configs.resolve(raw)
 
 
 def test_resolved_task_contract_rejects_an_unsupported_schema() -> None:
     """Fail closed when persisted task semantics use another schema version."""
-    resolved = experiments.config.loader.resolve_config(configs.direct_config())
+    resolved = configs.resolve(configs.direct_config())
     resolved["task_contract"]["schema_version"] += 1
 
     with pytest.raises(

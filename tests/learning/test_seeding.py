@@ -1,24 +1,30 @@
-# ruff: noqa: S101, N818, NPY002, S311, TC003
-"""
-Protect labeled subseeds and pre-construction process reproducibility controls.
+"""Protect labeled subseeds and pre-construction process reproducibility controls.
 
-Python, NumPy, Torch, model initialization, deterministic flags, and call-order
-independence are exercised with CPU-safe stubs. Exact checkpoint RNG restoration is
-covered by ``test_checkpoint_resume``. This module does not assert bitwise behavior
-across different library or hardware versions.
+Responsibilities:
+  - Check stable labeled subseeds, process RNGs, deterministic controls, and model initialization
+    order
+
+Design principles:
+  - CPU-safe fixtures test reproducibility within the current library/runtime boundary
+
+This module does NOT:
+  - Promise bitwise equality across hardware versions or restore checkpoint RNGs
 """
 
 from __future__ import annotations
 
 import random
-from pathlib import Path
-from typing import Any
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import torch
 
 from src import datasets, experiments, learning
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_labeled_subseeds_are_stable_distinct_and_reproducible() -> None:
@@ -45,15 +51,15 @@ def test_process_seed_reproduces_python_numpy_torch_and_model_init() -> None:
     seed = experiments.run.derive_subseed(11, "model_init")
     experiments.run.seed_process(seed, device=torch.device("cpu"))
     first = (
-        random.random(),
-        float(np.random.random()),
+        random.random(),  # noqa: S311 -- deterministic training-seed test exercises process-global Python RNG
+        float(np.random.random()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         torch.rand(3),
         torch.nn.Linear(3, 2).weight.detach().clone(),
     )
     experiments.run.seed_process(seed, device=torch.device("cpu"))
     second = (
-        random.random(),
-        float(np.random.random()),
+        random.random(),  # noqa: S311 -- deterministic training-seed test exercises process-global Python RNG
+        float(np.random.random()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         torch.rand(3),
         torch.nn.Linear(3, 2).weight.detach().clone(),
     )
@@ -118,6 +124,8 @@ def test_model_subseed_is_applied_immediately_before_construction(
         "model": {"kind": "synthetic"},
         "paths": {"output_root": str(tmp_path)},
     }
+    # The stub config has no resolved identity to register; this test only observes seeding order.
+    monkeypatch.setattr(experiments.registry, "reserve", lambda *_args: nullcontext())
     run_dir = experiments.run.prepare_fresh_run(config, run_dir=tmp_path / "run")
     seed_calls: list[int] = []
     expected = experiments.run.build_seed_plan(23)
@@ -132,7 +140,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
         "create_dataloaders_from_config",
         lambda *_args, **_kwargs: {
             "data_processor": _Processor(),
-            "split_indices": {"train_indices": torch.tensor([0]), "eval_indices": torch.tensor([1]), "ood_indices": torch.tensor([0])},
+            "split_indices": {"train_indices": torch.tensor([0]), "validation_indices": torch.tensor([1]), "id_test_indices": torch.tensor([2])},
         },
     )
     synthetic_task = object()
@@ -166,16 +174,16 @@ def test_model_subseed_is_applied_immediately_before_construction(
         build_normalizer_artifact,
     )
 
-    class ConstructionReached(RuntimeError):
+    class ConstructionReachedError(RuntimeError):
         """Stop the orchestration immediately after the ordering assertion."""
 
     def build_model(_config: dict[str, Any], *, device: torch.device) -> torch.nn.Module:
         assert device == torch.device("cpu")
         assert seed_calls[-1] == expected["model_init"]
-        raise ConstructionReached
+        raise ConstructionReachedError
 
     monkeypatch.setattr(learning.models.factory, "build_model", build_model)
-    with pytest.raises(ConstructionReached):
+    with pytest.raises(ConstructionReachedError):
         experiments.run.execute_prepared_run(
             config,
             run_dir=run_dir,

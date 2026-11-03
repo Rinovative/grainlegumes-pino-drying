@@ -1,66 +1,19 @@
-"""
-domain_fields.py
-
-Define reusable canonical field names and semantic field groups.
+"""Define canonical permeability and porosity field names.
 
 Responsibilities:
-  - Declare coordinate, permeability, boundary and state field primitives
-  - Group fields by physical role
-  - Validate exact canonical names without aliases
+  - Declare the canonical permeability and porosity field-name tuples
 
 Design principles:
   - Field names are declarative constants independent of model architecture
-  - Semantic groups provide reusable vocabulary, not learned channel order
+  - The tuples provide reusable vocabulary, not learned channel order
   - Registered TaskSpec objects remain authoritative for learned ordering
 
 This module does NOT:
   - Define task-specific tensor layouts or model input/output membership
   - Define permeability storage conversion or source-field mapping
-  - Accept aliases for canonical field identifiers
 """
 
 from __future__ import annotations
 
-COORDINATE_FIELDS = ("x", "y")
 PERMEABILITY_FIELDS = ("Kxx", "Kxy", "Kyy")
 POROSITY_FIELDS = ("eps_bed",)
-BOUNDARY_FIELDS = ("p_in_bc",)
-STATE_FIELDS = ("p", "u", "v")
-DERIVED_ANALYSIS_FIELDS = ("U",)
-ANALYSIS_FIELDS = (*STATE_FIELDS, *DERIVED_ANALYSIS_FIELDS)
-KNOWN_FIELDS = frozenset(
-    (
-        *COORDINATE_FIELDS,
-        *PERMEABILITY_FIELDS,
-        *POROSITY_FIELDS,
-        *BOUNDARY_FIELDS,
-        *STATE_FIELDS,
-    )
-)
-
-
-def require_known_field(name: str) -> str:
-    """
-    Validate and return one canonical field name.
-
-    Parameters
-    ----------
-    name : str
-        Candidate machine-readable field name.
-
-    Returns
-    -------
-    str
-        The unchanged canonical field name.
-
-    Raises
-    ------
-    ValueError
-        If `name` is not part of the reusable canonical field vocabulary.
-
-    """
-    if name not in KNOWN_FIELDS:
-        available = ", ".join(sorted(KNOWN_FIELDS))
-        msg = f"Unknown field {name!r}. Available canonical fields: {available}."
-        raise ValueError(msg)
-    return name

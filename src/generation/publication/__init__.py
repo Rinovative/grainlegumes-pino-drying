@@ -1,11 +1,10 @@
 """
-Canonical Generation storage, inventory, and campaign-evidence publication.
+Canonical Generation storage and campaign-evidence publication.
 
 Provides:
-- attempt: unsuccessful-attempt retention and replay evidence admission
+- attempt: unsuccessful-attempt retention and evidence admission
 - campaign_evidence: terminal campaign and transfer evidence admission
-- completion_composite: partial-parent and replacement composite evidence admission
-- inventory: parameter ownership and effective-consumer inspection
+- catalog: bounded case-outcome and exact raw-source inspection
 - storage: canonical HDF5 conversion and admission
 """
 
@@ -17,18 +16,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import generation_publication_attempt as attempt
     from . import generation_publication_campaign_evidence as campaign_evidence
-    from . import generation_publication_completion_composite as completion_composite
-    from . import generation_publication_inventory as inventory
+    from . import generation_publication_catalog as catalog
     from . import generation_publication_storage as storage
 
 _MODULES = {
     "attempt": "generation_publication_attempt",
     "campaign_evidence": "generation_publication_campaign_evidence",
-    "completion_composite": "generation_publication_completion_composite",
-    "inventory": "generation_publication_inventory",
+    "catalog": "generation_publication_catalog",
     "storage": "generation_publication_storage",
 }
-__all__ = ["attempt", "campaign_evidence", "completion_composite", "inventory", "storage"]
+__all__ = ["attempt", "campaign_evidence", "catalog", "storage"]
 
 
 def __getattr__(name: str) -> object:

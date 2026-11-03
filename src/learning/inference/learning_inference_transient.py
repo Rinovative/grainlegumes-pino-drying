@@ -1,18 +1,17 @@
-"""
-learning_inference_transient.py
-
-Serve explicit physical transient-drying inference from completed run evidence.
+"""Serve explicit physical transient-drying inference from completed run evidence.
 
 Responsibilities:
   - Reconstruct a transient model, tensorizer, and fitted scaling artifact from one completed run
   - Validate explicit physical one-step and rollout request evidence
   - Apply the admitted airflow-source policy without mutating caller tensors
   - Execute stateless or recurrent model calls and return physical reconstructed states with factual timing
+  - Build the RNO hidden state over reference prefixes for warm one-step and rolling-origin diagnostics
 
 Design principles:
   - Completed-run admission is the sole persisted-artifact read boundary
   - Tensorizer and scaling artifacts remain authoritative for channel assembly and reconstruction
   - Public recurrent requests start with no hidden state and carry it only within that request
+  - Diagnostic requests may start from a state the caller built over the same trajectory's reference prefix
   - Model timing excludes request validation, transfer, tensorization, scaling, and reconstruction
 
 This module does NOT:
@@ -23,7 +22,7 @@ This module does NOT:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -47,8 +46,6 @@ _MODEL_KINDS = {"fno", "uno", "rno"}
 _PRECISION = "float32"
 _TIME_ATOL = 1.0e-6
 _PREPARED_REQUEST_TOKEN = object()
-
-# ruff: noqa: EM101, EM102, PLR2004, SLF001, TRY003
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +82,8 @@ class TransientPreparedRequest:
     def __post_init__(self) -> None:
         """Reject construction outside the strict preparation owner."""
         if self._owner_token is not _PREPARED_REQUEST_TOKEN:
-            raise TypeError("Prepared transient requests must come from strict admission.")
+            msg = "Prepared transient requests must come from strict admission."
+            raise TypeError(msg)
 
     @property
     def length(self) -> int:
@@ -125,17 +123,43 @@ class TransientRolloutResult:
     prediction_available: torch.Tensor | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TransientTeacherForcedResult:
+    """
+    Return warm one-step diagnostics over a reference trajectory.
+
+    Step ``k`` predicts from the reference state ``k`` with the hidden state
+    built over reference steps ``0..k-1``. ``captured_hidden`` maps requested
+    step counts to that state; ``0`` is the model's own initial state.
+    """
+
+    next_states: torch.Tensor
+    scaled_deltas: torch.Tensor
+    decoded_deltas: torch.Tensor
+    step_seconds: tuple[float, ...]
+    timing: TransientTiming
+    captured_hidden: Mapping[int, object | None]
+
+
+_STATE_BATCH_RANK = 4
+_STATE_CHANNEL_COUNT = 4
+_BOUNDARY_CHANNEL_COUNT = 9
+_BOUNDARY_BATCH_RANK = 3
+
+
 def _require_precision(value: str) -> Literal["float32"]:
     """Require the sole supported explicit transient inference precision."""
     if value != _PRECISION:
-        raise ValueError("Transient inference supports only precision 'float32'.")
+        msg = "Transient inference supports only precision 'float32'."
+        raise ValueError(msg)
     return cast('Literal["float32"]', _PRECISION)
 
 
 def _require_model_kind(value: object) -> Literal["fno", "uno", "rno"]:
     """Require one persisted transient model kind."""
     if value not in _MODEL_KINDS:
-        raise ValueError("Transient inference model.kind must be 'fno', 'uno', or 'rno'.")
+        msg = "Transient inference model.kind must be 'fno', 'uno', or 'rno'."
+        raise ValueError(msg)
     return cast('Literal["fno", "uno", "rno"]', value)
 
 
@@ -146,11 +170,14 @@ def _resolve_device(device: str | torch.device) -> torch.device:
     elif isinstance(device, str):
         resolved = learning.device.resolve_device(device, path="transient inference device").device
     else:
-        raise TypeError("Transient inference device must be one string policy or torch.device.")
+        msg = "Transient inference device must be one string policy or torch.device."
+        raise TypeError(msg)
     if resolved.type not in {"cpu", "cuda"}:
-        raise ValueError("Transient inference requires one concrete CPU or CUDA device.")
+        msg = "Transient inference requires one concrete CPU or CUDA device."
+        raise ValueError(msg)
     if resolved.type == "cuda" and resolved.index is None:
-        raise ValueError("Transient inference requires an indexed CUDA device.")
+        msg = "Transient inference requires an indexed CUDA device."
+        raise ValueError(msg)
     return resolved
 
 
@@ -170,10 +197,12 @@ def _place_model_float32(model: nn.Module, *, device: torch.device) -> nn.Module
     model.load_state_dict(converted_state, strict=True, assign=True)
     for name, value in (*model.named_parameters(), *model.named_buffers()):
         if value.device != device:
-            raise RuntimeError(f"Transient inference model tensor {name!r} is not on the resolved device.")
+            msg = f"Transient inference model tensor {name!r} is not on the resolved device."
+            raise RuntimeError(msg)
         expected = torch.complex64 if value.is_complex() else torch.float32 if value.is_floating_point() else value.dtype
         if value.dtype != expected:
-            raise RuntimeError(f"Transient inference model tensor {name!r} violates float32-equivalent precision.")
+            msg = f"Transient inference model tensor {name!r} violates float32-equivalent precision."
+            raise RuntimeError(msg)
     return model
 
 
@@ -212,7 +241,8 @@ def _prove_cross_resolution_output_shape(
     params = model_config.get("params") if isinstance(model_config, Mapping) else None
     input_channels = params.get("in_channels") if isinstance(params, Mapping) else None
     if isinstance(input_channels, bool) or not isinstance(input_channels, int) or input_channels < 1:
-        raise TypeError("Transient model preflight requires a positive resolved in_channels value.")
+        msg = "Transient model preflight requires a positive resolved in_channels value."
+        raise TypeError(msg)
     probe = torch.zeros(
         (1, input_channels, *evaluation_shape),
         device=device,
@@ -259,11 +289,16 @@ def build_transient_inference_context(
     """
     resolved_precision = _require_precision(precision)
     config = completed.get("config")
-    if completed.get("is_completed") is not True or not isinstance(config, Mapping) or config.get("task") != "transient_drying":
-        raise RuntimeError("Transient inference requires admitted completed transient_drying evidence.")
+    if not isinstance(config, Mapping) or config.get("task") != "transient_drying":
+        msg = "Transient inference requires admitted completed transient_drying evidence."
+        raise RuntimeError(msg)
+    if experiments.run.is_trial_config(config):
+        msg = "Transient inference is unavailable for an Optuna trial: trials keep no checkpoints. Train the selected configuration as a normal run."
+        raise RuntimeError(msg)
     normalizer_state = completed.get("normalizer_state")
     if not isinstance(normalizer_state, Mapping):
-        raise TypeError("Completed transient run must provide one scaling-artifact mapping.")
+        msg = "Completed transient run must provide one scaling-artifact mapping."
+        raise TypeError(msg)
     scaling = TransientScalingArtifact.from_state_dict(normalizer_state)
     resolved_device = _resolve_device(device)
     scaling = scaling.to(resolved_device)
@@ -277,7 +312,8 @@ def build_transient_inference_context(
     )
     model_config = config.get("model")
     if not isinstance(model_config, Mapping):
-        raise TypeError("Completed transient run must provide model configuration.")
+        msg = "Completed transient run must provide model configuration."
+        raise TypeError(msg)
     kind = _require_model_kind(model_config.get("kind"))
     decision = architecture_compatibility.get("decision")
     training_stride = scaling.dataset_identity.get("spatial_stride")
@@ -302,7 +338,8 @@ def build_transient_inference_context(
         }
     )
     if spec != scaling.tensorizer:
-        raise RuntimeError("Completed transient config tensorizer disagrees with admitted scaling artifact.")
+        msg = "Completed transient config tensorizer disagrees with admitted scaling artifact."
+        raise RuntimeError(msg)
     model = model_factory.build_model(dict(config), device=resolved_device)
     best_checkpoint = completed.get("best_checkpoint")
     if (
@@ -310,7 +347,8 @@ def build_transient_inference_context(
         or best_checkpoint.get("schema_version") != learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
         or not isinstance(best_checkpoint.get("model_state_dict"), Mapping)
     ):
-        raise TypeError("Completed transient run must provide an admitted best model state dict.")
+        msg = "Completed transient run must provide an admitted best model state dict."
+        raise TypeError(msg)
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = _place_model_float32(model, device=resolved_device)
     model.eval()
@@ -379,9 +417,11 @@ def load_transient_inference_context(
 def _require_request_tensor(value: object, *, label: str) -> torch.Tensor:
     """Require one finite float32 tensor without moving or copying caller data."""
     if not isinstance(value, torch.Tensor) or value.dtype != torch.float32:
-        raise TypeError(f"Transient inference {label} must be one torch.float32 tensor.")
+        msg = f"Transient inference {label} must be one torch.float32 tensor."
+        raise TypeError(msg)
     if not bool(torch.isfinite(value).all().item()):
-        raise ValueError(f"Transient inference {label} must contain only finite values.")
+        msg = f"Transient inference {label} must contain only finite values."
+        raise ValueError(msg)
     return value
 
 
@@ -390,10 +430,12 @@ def _resolve_airflow_source(value: str | None) -> str:
     task = domain.tasks.registry.get_task("transient_drying")
     declared = task.training_airflow_source
     if declared != _COMSOL_REFERENCE_AIRFLOW_SOURCE or declared not in _AIRFLOW_SOURCES:
-        raise RuntimeError("Transient task airflow policy must declare exactly 'comsol_reference'.")
+        msg = "Transient task airflow policy must declare exactly 'comsol_reference'."
+        raise RuntimeError(msg)
     source = declared if value is None else value
     if source not in _AIRFLOW_SOURCES:
-        raise ValueError("airflow_source must be exactly 'comsol_reference' or 'external'.")
+        msg = "airflow_source must be exactly 'comsol_reference' or 'external'."
+        raise ValueError(msg)
     return source
 
 
@@ -423,37 +465,54 @@ def _validate_request(
     }
     for label, value in tensors.items():
         _require_request_tensor(value, label=label)
-    if state.ndim != 4 or state.shape[1] != 4:
-        raise ValueError("Transient inference state must have shape [B,4,Y,X].")
+    if state.ndim != _STATE_BATCH_RANK or state.shape[1] != _STATE_CHANNEL_COUNT:
+        msg = "Transient inference state must have shape [B,4,Y,X]."
+        raise ValueError(msg)
     batch_size, _, height, width = state.shape
     if min(batch_size, height, width) < 1:
-        raise ValueError("Transient inference state must have non-empty B, Y, and X axes.")
+        msg = "Transient inference state must have non-empty B, Y, and X axes."
+        raise ValueError(msg)
     if (height, width) != spatial_shape:
-        raise ValueError("Transient inference state spatial shape must match the admitted Evaluation grid.")
+        msg = "Transient inference state spatial shape must match the admitted Evaluation grid."
+        raise ValueError(msg)
     if static.shape != (batch_size, 7, height, width):
-        raise ValueError("Transient inference static must have shape [B,7,Y,X].")
-    if boundary.ndim != 3 or boundary.shape[0] != batch_size or boundary.shape[2] != 9 or boundary.shape[1] < 1:
-        raise ValueError("Transient inference boundary must have non-empty shape [B,L,9].")
+        msg = "Transient inference static must have shape [B,7,Y,X]."
+        raise ValueError(msg)
+    if (
+        boundary.ndim != _BOUNDARY_BATCH_RANK
+        or boundary.shape[0] != batch_size
+        or boundary.shape[2] != _BOUNDARY_CHANNEL_COUNT
+        or boundary.shape[1] < 1
+    ):
+        msg = "Transient inference boundary must have non-empty shape [B,L,9]."
+        raise ValueError(msg)
     length = int(boundary.shape[1])
     if scalars.shape != (batch_size, 8):
-        raise ValueError("Transient inference scalars must have shape [B,8].")
+        msg = "Transient inference scalars must have shape [B,8]."
+        raise ValueError(msg)
     if any(value.shape != (batch_size, length) for value in (t_n, t_next, dt)):
-        raise ValueError("Transient inference t_n, t_next, and dt must each have shape [B,L].")
+        msg = "Transient inference t_n, t_next, and dt must each have shape [B,L]."
+        raise ValueError(msg)
     source_device = state.device
     if any(value.device != source_device for value in tensors.values()):
-        raise ValueError("Transient inference request tensors must share one source device.")
+        msg = "Transient inference request tensors must share one source device."
+        raise ValueError(msg)
     if airflow_source == "comsol_reference":
         if external_airflow is not None:
-            raise ValueError("comsol_reference airflow does not accept external_airflow.")
+            msg = "comsol_reference airflow does not accept external_airflow."
+            raise ValueError(msg)
     else:
         external = _require_request_tensor(external_airflow, label="external_airflow")
         if external.shape != (batch_size, 3, height, width) or external.device != source_device:
-            raise ValueError("external_airflow must have shape [B,3,Y,X] on the request source device.")
+            msg = "external_airflow must have shape [B,3,Y,X] on the request source device."
+            raise ValueError(msg)
     ones = torch.ones_like(dt)
     if not torch.allclose(dt, ones, rtol=0.0, atol=_TIME_ATOL) or not torch.allclose(t_next - t_n, dt, rtol=0.0, atol=_TIME_ATOL):
-        raise ValueError("Transient inference requires exact regular fixed 1h time evidence.")
+        msg = "Transient inference requires exact regular fixed 1h time evidence."
+        raise ValueError(msg)
     if bool((t_n < -_TIME_ATOL).any()) or bool((t_next > horizon + _TIME_ATOL).any()):
-        raise ValueError("Transient inference time evidence must remain within the admitted scaling horizon.")
+        msg = "Transient inference time evidence must remain within the admitted scaling horizon."
+        raise ValueError(msg)
     return batch_size, length, height, width
 
 
@@ -475,7 +534,8 @@ def _owned_runtime_inputs(
     runtime_state, runtime_static, runtime_boundary, runtime_scalars, runtime_t_n, runtime_t_next, runtime_dt = runtime_values
     if airflow_source == "external":
         if external_airflow is None:
-            raise RuntimeError("Validated external airflow unexpectedly missing.")
+            msg = "Validated external airflow unexpectedly missing."
+            raise RuntimeError(msg)
         runtime_airflow = external_airflow.to(
             device=context.device,
             dtype=torch.float32,
@@ -500,7 +560,8 @@ def prepare_transient_request(
 ) -> TransientPreparedRequest:
     """Strictly validate one request once and place its tensors for reuse."""
     if not isinstance(context, TransientInferenceContext):
-        raise TypeError("context must be one TransientInferenceContext.")
+        msg = "context must be one TransientInferenceContext."
+        raise TypeError(msg)
     resolved_airflow_source = _resolve_airflow_source(airflow_source)
     _validate_request(
         state=state,
@@ -538,7 +599,7 @@ def prepare_transient_request(
         t_n=runtime_t_n,
         t_next=runtime_t_next,
         dt=runtime_dt,
-        _versions=tuple(value._version for value in owned),
+        _versions=tuple(value._version for value in owned),  # noqa: SLF001 -- PyTorch mutation counters and owned request versions protect input identity
         _owner_token=_PREPARED_REQUEST_TOKEN,
     )
 
@@ -564,12 +625,15 @@ def _require_prepared_request(
 ) -> None:
     """Require one request created for the exact active inference context."""
     if not isinstance(request, TransientPreparedRequest) or request.context is not context:
-        raise TypeError("Prepared transient request must belong to the exact inference context.")
+        msg = "Prepared transient request must belong to the exact inference context."
+        raise TypeError(msg)
     tensors = _prepared_tensors(request)
     if any(value.device != context.device or value.dtype != torch.float32 for value in tensors):
-        raise RuntimeError("Prepared transient request placement drifted from its inference context.")
-    if tuple(value._version for value in tensors) != request._versions:
-        raise RuntimeError("Prepared transient request tensors were mutated after strict admission.")
+        msg = "Prepared transient request placement drifted from its inference context."
+        raise RuntimeError(msg)
+    if tuple(value._version for value in tensors) != request._versions:  # noqa: SLF001 -- PyTorch mutation counters and owned request versions protect input identity
+        msg = "Prepared transient request tensors were mutated after strict admission."
+        raise RuntimeError(msg)
 
 
 def window_transient_prepared_request(
@@ -581,7 +645,8 @@ def window_transient_prepared_request(
 ) -> TransientPreparedRequest:
     """Return one zero-copy case-local window from already-admitted runtime inputs."""
     if not isinstance(request, TransientPreparedRequest):
-        raise TypeError("request must be one TransientPreparedRequest.")
+        msg = "request must be one TransientPreparedRequest."
+        raise TypeError(msg)
     _require_prepared_request(request.context, request)
     if (
         isinstance(origin, bool)
@@ -592,17 +657,20 @@ def window_transient_prepared_request(
         or length < 1
         or origin + length > request.length
     ):
-        raise ValueError("Prepared transient window must lie inside the admitted request.")
+        msg = "Prepared transient window must lie inside the admitted request."
+        raise ValueError(msg)
     selected_state = request.state if state is None else state
     if origin and state is None:
-        raise ValueError("A nonzero prepared transient origin requires its exact current state.")
+        msg = "A nonzero prepared transient origin requires its exact current state."
+        raise ValueError(msg)
     if (
         not isinstance(selected_state, torch.Tensor)
         or selected_state.shape != request.state.shape
         or selected_state.device != request.context.device
         or selected_state.dtype != torch.float32
     ):
-        raise ValueError("Prepared transient window state contradicts runtime shape or placement.")
+        msg = "Prepared transient window state contradicts runtime shape or placement."
+        raise ValueError(msg)
     stop = origin + length
     tensors = (
         selected_state,
@@ -622,7 +690,7 @@ def window_transient_prepared_request(
         t_n=tensors[4],
         t_next=tensors[5],
         dt=tensors[6],
-        _versions=tuple(value._version for value in tensors),
+        _versions=tuple(value._version for value in tensors),  # noqa: SLF001 -- PyTorch mutation counters and owned request versions protect input identity
         _owner_token=_PREPARED_REQUEST_TOKEN,
     )
 
@@ -632,7 +700,7 @@ class _ModelCallTimer:
 
     def __init__(self, device: torch.device) -> None:
         self._device = device
-        self._cpu_seconds = 0.0
+        self._cpu_calls: list[float] = []
         self._cuda_events: list[tuple[Any, Any]] = []
 
     def measure(self, invoke: Callable[[], object]) -> object:
@@ -648,21 +716,26 @@ class _ModelCallTimer:
             return result
         started = perf_counter()
         result = invoke()
-        self._cpu_seconds += perf_counter() - started
+        self._cpu_calls.append(perf_counter() - started)
         return result
+
+    def call_seconds(self) -> tuple[float, ...]:
+        """Return model-only seconds of every measured call after one bounded completion wait."""
+        if self._device.type == "cuda":
+            if not self._cuda_events:
+                return ()
+            self._cuda_events[-1][1].synchronize()
+            calls = tuple(float(start.elapsed_time(end)) / 1000.0 for start, end in self._cuda_events)
+        else:
+            calls = tuple(self._cpu_calls)
+        if any(seconds < 0.0 for seconds in calls):
+            msg = "Transient inference measured negative model time."
+            raise RuntimeError(msg)
+        return calls
 
     def finish(self) -> float:
         """Return aggregate model-only seconds after one bounded completion wait."""
-        if self._device.type == "cuda":
-            if not self._cuda_events:
-                return 0.0
-            self._cuda_events[-1][1].synchronize()
-            seconds = sum(float(start.elapsed_time(end)) for start, end in self._cuda_events) / 1000.0
-        else:
-            seconds = self._cpu_seconds
-        if seconds < 0.0:
-            raise RuntimeError("Transient inference measured negative model time.")
-        return seconds
+        return sum(self.call_seconds())
 
 
 def _timed_predict(
@@ -738,46 +811,6 @@ def predict_prepared_transient_step(
         next_state=next_state,
         scaled_delta=scaled_delta,
         timing=timing,
-    )
-
-
-def predict_prepared_transient_step_diagnostic(
-    context: TransientInferenceContext,
-    request: TransientPreparedRequest,
-) -> TransientStepResult:
-    """Preserve one model output and decoded increment for artifact diagnostics."""
-    _require_prepared_request(context, request)
-    step_input = context.tensorizer.assemble_step(
-        request.state,
-        request.static,
-        request.boundary[:, 0],
-        request.scalars,
-        request.t_n[:, 0],
-    )
-    scaled_delta, _, seconds = _timed_predict(
-        context,
-        step_input,
-        hidden=None,
-        require_finite_output=False,
-    )
-    scaled_delta = scaled_delta.to(
-        device=context.scaling.device,
-        dtype=torch.float32,
-    )
-    next_state, decoded_delta = context.tensorizer.reconstruct_next_state_diagnostic(
-        request.state,
-        scaled_delta,
-    )
-    return TransientStepResult(
-        next_state=next_state,
-        scaled_delta=scaled_delta,
-        timing=_timing(
-            seconds=seconds,
-            context=context,
-            mode="one_step",
-            calls=1,
-        ),
-        decoded_delta=decoded_delta,
     )
 
 
@@ -862,11 +895,113 @@ def rollout_prepared_transient_autonomous(
     )
 
 
+def teacher_forced_prepared_transient_diagnostic(
+    context: TransientInferenceContext,
+    request: TransientPreparedRequest,
+    *,
+    reference_states: torch.Tensor,
+    capture: Iterable[int] = (),
+) -> TransientTeacherForcedResult:
+    """
+    Predict every step from its reference state while carrying the RNO state.
+
+    Parameters
+    ----------
+    context : TransientInferenceContext
+        Active inference context.
+    request : TransientPreparedRequest
+        Admitted request starting at its trajectory's first transition.
+    reference_states : torch.Tensor
+        Reference current states ``[B,L,4,Y,X]`` for every request step; the
+        first equals ``request.state``.
+    capture : Iterable[int], optional
+        Step counts after which the hidden state is returned.
+
+    Returns
+    -------
+    TransientTeacherForcedResult
+        Raw outputs, reconstructed one-step states, per-call model seconds, and
+        the captured states. Stateless models return no hidden state.
+
+    Raises
+    ------
+    ValueError
+        If reference states or capture positions contradict the request.
+
+    """
+    _require_prepared_request(context, request)
+    expected_shape = (request.state.shape[0], request.length, *request.state.shape[1:])
+    if (
+        not isinstance(reference_states, torch.Tensor)
+        or reference_states.shape != expected_shape
+        or reference_states.device != context.device
+        or reference_states.dtype != torch.float32
+        or not torch.equal(reference_states[:, 0], request.state)
+    ):
+        msg = "Teacher-forced reference states must align with the prepared request."
+        raise ValueError(msg)
+    positions = frozenset(capture)
+    if any(isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= request.length for value in positions):
+        msg = "Captured hidden-state positions must be step counts within the request."
+        raise ValueError(msg)
+    if context.model_kind != "rno" and positions:
+        msg = "Stateless transient models expose no hidden state."
+        raise ValueError(msg)
+    next_states = reference_states.new_empty(expected_shape)
+    scaled_deltas = reference_states.new_empty(expected_shape)
+    decoded_deltas = reference_states.new_empty(expected_shape)
+    hidden: object | None = None
+    captured: dict[int, object | None] = {0: None} if 0 in positions else {}
+    timer = _ModelCallTimer(context.device)
+    with torch.inference_mode():
+        for index in range(request.length):
+            current = reference_states[:, index]
+            step_input = context.tensorizer.assemble_step(
+                current,
+                request.static,
+                request.boundary[:, index],
+                request.scalars,
+                request.t_n[:, index],
+            )
+            scaled_delta, hidden = rollout.predict_step(
+                context.model,
+                step_input,
+                model_kind=context.model_kind,
+                hidden=hidden,
+                model_call=timer.measure,
+                require_finite_output=False,
+            )
+            scaled_delta = scaled_delta.to(device=context.scaling.device, dtype=torch.float32)
+            next_state, decoded_delta = context.tensorizer.reconstruct_next_state_diagnostic(current, scaled_delta)
+            scaled_deltas[:, index].copy_(scaled_delta)
+            decoded_deltas[:, index].copy_(decoded_delta)
+            next_states[:, index].copy_(next_state)
+            if index + 1 in positions:
+                captured[index + 1] = hidden
+    step_seconds = timer.call_seconds()
+    return TransientTeacherForcedResult(
+        next_states=next_states,
+        scaled_deltas=scaled_deltas,
+        decoded_deltas=decoded_deltas,
+        step_seconds=step_seconds,
+        timing=_timing(seconds=sum(step_seconds), context=context, mode="one_step", calls=request.length),
+        captured_hidden=captured,
+    )
+
+
 def rollout_prepared_transient_autonomous_diagnostic(
     context: TransientInferenceContext,
     request: TransientPreparedRequest,
+    *,
+    initial_hidden: object | None = None,
 ) -> TransientRolloutResult:
-    """Preserve one computed prediction prefix and stop before invalid feedback."""
+    """
+    Preserve one computed prediction prefix and stop before invalid feedback.
+
+    ``initial_hidden`` continues an RNO state built over the reference prefix
+    of the same trajectory, for example by
+    :func:`teacher_forced_prepared_transient_diagnostic`.
+    """
     _require_prepared_request(context, request)
     current = request.state
     batch_size, channels, height, width = current.shape
@@ -879,7 +1014,10 @@ def rollout_prepared_transient_autonomous_diagnostic(
         dtype=torch.bool,
         device=current.device,
     )
-    hidden: object | None = None
+    if context.model_kind != "rno" and initial_hidden is not None:
+        msg = "Stateless transient models cannot start from a hidden state."
+        raise ValueError(msg)
+    hidden = initial_hidden
     timer = _ModelCallTimer(context.device)
     model_calls = 0
     with torch.inference_mode():

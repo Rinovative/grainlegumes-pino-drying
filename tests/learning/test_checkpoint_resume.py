@@ -1,11 +1,14 @@
-# ruff: noqa: NPY002, S101, PLR2004
-"""
-Protect exact epoch-boundary resume and strict best/last checkpoint publication.
+"""Protect exact epoch-boundary resume and strict best/last checkpoint publication.
 
-Deterministic synthetic loaders/models cover optimizer, scheduler, scaler, RNG,
-history, objective roles, schema validation-before-mutation, non-finite loss,
-writer failure, and concurrent run behavior. Run-directory allocation and high-level
-inference admission are covered by their dedicated modules.
+Responsibilities:
+  - Check exact resumed state, checkpoint roles and payload kinds, transactional restore, cadence,
+    and objective selection
+
+Design principles:
+  - Synthetic deterministic training distinguishes best selection from last resume state
+
+This module does NOT:
+  - Allocate run directories or validate high-level inference admission
 """
 
 from __future__ import annotations
@@ -31,6 +34,23 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from torch.optim.optimizer import Optimizer
+
+    from src.learning.training.learning_training_checkpoint import CheckpointPayloadKind
+
+_CONTINUATION_KEYS = frozenset(
+    {
+        "next_epoch",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "python_rng_state",
+        "numpy_rng_state",
+        "torch_cpu_rng_state",
+        "torch_cuda_rng_states",
+        "train_loader_generator_state",
+        "train_sampler_state_dict",
+    }
+)
 
 
 class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
@@ -153,7 +173,8 @@ class _WarmupStatefulLoss(_StatefulLoss):
         position = int(self.epoch_index.item()) if epoch is None else epoch
         fraction = min(float(position) / 10.0, 1.0)
         return {
-            "weight_physics": fraction,
+            "weight_momentum": fraction,
+            "weight_continuity": 3.0 * fraction,
             "weight_boundary": 2.0 * fraction,
         }
 
@@ -194,11 +215,12 @@ def _objective(*, direction: str = "minimize") -> dict[str, Any]:
 def _config(epochs: int, *, direction: str = "minimize", evaluation_interval: int = 2) -> dict[str, Any]:
     """Return the minimal resolved training contract used by loop tests."""
     return {
+        "task": "steady_flow",
         "run": {"device": "cpu"},
         "training": {
             "epochs": epochs,
             "evaluation_interval": evaluation_interval,
-            "ood_evaluation_interval": evaluation_interval,
+            "additional_evaluation_interval": evaluation_interval,
         },
         "evaluation": {"objective": _objective(direction=direction)},
         "tracking": {
@@ -213,8 +235,8 @@ def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[st
     """
     Build a complete current checkpoint identity namespaced by one run label.
 
-    Task, config, Dataset, split, normalizer, and objective dependencies vary
-    together so selection tests avoid unrelated identity failures.
+    The task remains steady flow. The run-scoped config, Dataset, split,
+    normalizer, and objective dependencies vary together for selection tests.
     """
 
     def digest(label: str) -> str:
@@ -222,19 +244,21 @@ def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[st
 
     return {
         "identity_contract_sha256": learning.training.checkpoint.TRAINING_IDENTITY_CONTRACT_DIGEST,
-        "task": run,
+        "task": "steady_flow",
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
         "resume_contract_digest": digest("resume"),
-        "dataset_ids": {"train": f"{run}-train-dataset", "ood": f"{run}-ood-dataset"},
-        "dataset_fingerprints": {"train": digest("train"), "ood": digest("ood")},
+        "dataset_ids": {"train": f"{run}-train-dataset", "additional_evaluation": f"{run}-ood-dataset"},
+        "dataset_fingerprints": {"train": digest("train"), "additional_evaluation": digest("ood")},
         "split_contract_digest": digest("split-contract"),
         "split_membership_digests": {
             "train": digest("train-membership"),
-            "eval": digest("eval-membership"),
-            "ood": digest("ood-membership"),
+            "validation": digest("validation-membership"),
+            "id_test": digest("id-test-membership"),
+            "additional_evaluation": digest("ood-membership"),
         },
         "normalizer_sha256": digest("normalizer"),
+        "numerical_environment": learning.training.checkpoint.numerical_environment_identity(),
         "objective": _objective(direction=direction),
     }
 
@@ -364,7 +388,12 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         for _epoch, epoch_duration, train_duration, throughput in resume_observations
         for value in (epoch_duration, train_duration, throughput)
     )
-    assert resumed_result == full_result | {
+    # Direct operational clocks vary between invocations; every scientific
+    # result and all model/optimizer/checkpoint/RNG states remain exact below.
+    assert resumed_result["operational_timing"]["scope"] == full_result["operational_timing"]["scope"]
+    assert {key: value for key, value in resumed_result.items() if key != "operational_timing"} == {
+        key: value for key, value in full_result.items() if key != "operational_timing"
+    } | {
         "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "last_checkpoint_path": str(resumed_dir / "last_checkpoint.pt"),
@@ -392,6 +421,33 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         _assert_nested_equal(full_last[key], resumed_last[key])
 
 
+def test_resume_at_the_final_epoch_boundary_finalizes_without_training(tmp_path: Path) -> None:
+    """
+    Resume a run whose last checkpoint already completed every configured epoch.
+
+    Such a run was interrupted after its terminal checkpoints but before
+    finalization; resuming it must validate and return the published state
+    without another epoch, optimizer step or epoch event.
+    """
+    first, _model, _optimizer, _scheduler, _loss, _loader = _run(tmp_path, epochs=2, seed=151)
+    saved = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    events: list[int] = []
+
+    resumed, model, _optimizer, _scheduler, _loss, _loader = _run(
+        tmp_path,
+        epochs=2,
+        seed=999,
+        resume_from=tmp_path / "last_checkpoint.pt",
+        epoch_end_callback=lambda epoch, _values: events.append(epoch),
+    )
+
+    assert resumed["status"] == "completed"
+    assert events == []
+    for key in ("completed_epoch", "global_step", "best_epoch", "best_metric", "objective_history"):
+        assert resumed[key] == first[key]
+    _assert_nested_equal(model.state_dict(), saved["model_state_dict"])
+
+
 def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
     """
     Train three epochs and load both published checkpoint roles explicitly.
@@ -408,6 +464,7 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         run_dir / "best_checkpoint.pt",
         expected_identity=identity,
         expected_role="best",
+        payload_kind="evaluation",
         scheduler_expected=True,
         amp_expected=False,
         require_best=True,
@@ -416,6 +473,7 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         run_dir / "last_checkpoint.pt",
         expected_identity=identity,
         expected_role="last",
+        payload_kind="full",
         scheduler_expected=True,
         amp_expected=False,
         require_best=True,
@@ -424,18 +482,25 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
     assert best["checkpoint_role"] == "best"
     assert last["checkpoint_role"] == "last"
     assert last["completed_epoch"] == 3
+    # A steady best is never continued, so it keeps no optimizer, scheduler, scaler, RNG, or loader state.
+    assert (best["payload_kind"], last["payload_kind"]) == ("evaluation", "full")
+    assert _CONTINUATION_KEYS.isdisjoint(best)
+    assert "batch_progress" not in best
+    assert _CONTINUATION_KEYS.issubset(last)
     with pytest.raises(ValueError, match="role mismatch"):
         learning.training.checkpoint.load_checkpoint(
             run_dir / "last_checkpoint.pt",
             expected_identity=identity,
             expected_role="best",
+            payload_kind="full",
             scheduler_expected=True,
             amp_expected=False,
             require_best=True,
         )
 
 
-def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mismatch", ["config", "numerical_environment"])
+def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mismatch: str) -> None:
     """
     Replace the saved checkpoint identity before restoring into fresh components.
 
@@ -446,7 +511,10 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path) ->
     run_dir.mkdir()
     _run(run_dir, epochs=2, seed=7)
     payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    payload["identity"] = _identity("other")
+    if mismatch == "config":
+        payload["identity"] = _identity("other")
+    else:
+        payload["identity"]["numerical_environment"]["numpy"] = "changed-numerical-runtime"
 
     model, optimizer, scheduler, loss, train_loader, _ = _components(99)
     before = copy.deepcopy(model.state_dict())
@@ -514,6 +582,7 @@ def test_cpu_checkpoint_ignores_unrelated_host_cuda_rng(
     monkeypatch.setattr(torch.cuda, "get_rng_state", unexpected_cuda_capture)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
+        payload_kind="full",
         identity=_identity("cpu-portable"),
         completed_epoch=1,
         global_step=0,
@@ -543,6 +612,7 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
     source_model, source_optimizer, source_scheduler, source_loss, source_loader, _ = _components(82)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
+        payload_kind="full",
         identity=_identity("device-portable"),
         completed_epoch=1,
         global_step=0,
@@ -593,6 +663,7 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
     source_loss.set_epoch(3)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
+        payload_kind="full",
         identity=_identity("transactional"),
         completed_epoch=1,
         global_step=1,
@@ -624,7 +695,7 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
         "loss": copy.deepcopy(loss.state_dict()),
         "loader": _loader_generator(train_loader).get_state().clone(),
         "python_rng": random.getstate(),
-        "numpy_rng": copy.deepcopy(np.random.get_state()),
+        "numpy_rng": copy.deepcopy(np.random.get_state()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         "torch_rng": torch.get_rng_state().clone(),
     }
 
@@ -647,7 +718,7 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
     _assert_nested_equal(before["loss"], loss.state_dict())
     assert torch.equal(before["loader"], _loader_generator(train_loader).get_state())
     _assert_nested_equal(before["python_rng"], random.getstate())
-    _assert_nested_equal(before["numpy_rng"], np.random.get_state())
+    _assert_nested_equal(before["numpy_rng"], np.random.get_state())  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
     assert torch.equal(before["torch_rng"], torch.get_rng_state())
 
 
@@ -665,8 +736,9 @@ def test_non_finite_objective_never_creates_a_loadable_best(tmp_path: Path) -> N
     with pytest.raises(FloatingPointError, match="non-finite"):
         learning.training.loop.train_loop(
             config={
+                "task": "steady_flow",
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "additional_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
                 "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },
@@ -735,6 +807,7 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
         run_dir / "last_checkpoint.pt",
         expected_identity=identity,
         expected_role="last",
+        payload_kind="full",
         scheduler_expected=False,
         amp_expected=False,
         require_best=True,
@@ -744,29 +817,113 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
 
 @pytest.mark.parametrize(
     "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
+    [2.0, 1],
+    ids=("floating-current", "previous-version"),
 )
-def test_checkpoint_requires_integer_version_one(
+def test_checkpoint_requires_integer_current_version(
     schema_version: object,
     tmp_path: Path,
 ) -> None:
-    """Reject alternate runtime representations and unsupported checkpoint versions."""
+    """Reject alternate runtime representations and the previous checkpoint version."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _run(run_dir, epochs=2, seed=42)
     payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION == 2
     payload["schema_version"] = schema_version
 
-    with pytest.raises(ValueError, match="schema_version"):
+    with pytest.raises(ValueError, match="schema_version is unsupported"):
         learning.training.checkpoint.validate_checkpoint(
             payload,
             expected_identity=_identity(),
             expected_role="last",
+            payload_kind="full",
             scheduler_expected=True,
             amp_expected=False,
             require_best=True,
+        )
+
+
+def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None:
+    """Reject a best whose kind contradicts the expectation, and a missing or extra key."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    _run(run_dir, epochs=1, seed=23)
+    evaluation_best = torch.load(run_dir / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+    model, optimizer, scheduler, loss, train_loader, _ = _components(23)
+    full_best = learning.training.checkpoint.make_checkpoint(
+        role="best",
+        payload_kind="full",
+        identity=_identity(),
+        completed_epoch=evaluation_best["completed_epoch"],
+        global_step=evaluation_best["global_step"],
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        amp_enabled=False,
+        loss=loss,
+        best_metric=evaluation_best["best_metric"],
+        best_epoch=evaluation_best["best_epoch"],
+        objective_history=evaluation_best["objective_history"],
+        train_loader=train_loader,
+        runtime_device=torch.device("cpu"),
+    )
+    missing = {key: value for key, value in evaluation_best.items() if key != "loss_state_dict"}
+    extra = {**evaluation_best, "optimizer_state_dict": optimizer.state_dict()}
+
+    def validate(payload: dict[str, Any], kind: CheckpointPayloadKind) -> dict[str, Any]:
+        return learning.training.checkpoint.validate_checkpoint(
+            payload,
+            expected_identity=_identity(),
+            expected_role="best",
+            payload_kind=kind,
+            scheduler_expected=True,
+            amp_expected=False,
+            require_best=True,
+        )
+
+    assert validate(evaluation_best, "evaluation")["payload_kind"] == "evaluation"
+    assert validate(full_best, "full")["payload_kind"] == "full"
+    rejected: tuple[tuple[dict[str, Any], CheckpointPayloadKind, str], ...] = (
+        (evaluation_best, "full", "payload_kind mismatch: expected 'full', got 'evaluation'"),
+        (full_best, "evaluation", "payload_kind mismatch: expected 'evaluation', got 'full'"),
+        (missing, "evaluation", r"Missing keys: \['loss_state_dict'\]"),
+        (extra, "evaluation", r"Unknown keys: \['optimizer_state_dict'\]"),
+    )
+    for payload, kind, match in rejected:
+        with pytest.raises(ValueError, match=match):
+            validate(payload, kind)
+
+
+def test_writer_admits_continuation_state_only_in_full_payloads() -> None:
+    """A last checkpoint is always full, and an evaluation best records no batch progress."""
+    model, optimizer, scheduler, loss, train_loader, _ = _components(29)
+    common: dict[str, Any] = {
+        "identity": _identity(),
+        "completed_epoch": 1,
+        "global_step": 4,
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "scaler": None,
+        "amp_enabled": False,
+        "loss": loss,
+        "best_metric": 0.5,
+        "best_epoch": 1,
+        "objective_history": [{"epoch": 1, "objective_id": "mse", "value": 0.5}],
+        "train_loader": train_loader,
+        "runtime_device": torch.device("cpu"),
+    }
+
+    with pytest.raises(ValueError, match="a last checkpoint is always full"):
+        learning.training.checkpoint.make_checkpoint(role="last", payload_kind="evaluation", **common)
+    with pytest.raises(ValueError, match="records no batch continuation progress"):
+        learning.training.checkpoint.make_checkpoint(
+            role="best",
+            payload_kind="evaluation",
+            batch_progress={"epoch": 1, "cursor": 2, "size": 4, "complete": False},
+            **common,
         )
 
 
@@ -783,6 +940,7 @@ def test_cpu_checkpoint_rejects_amp_scaler_state() -> None:
     with pytest.raises(ValueError, match="concrete CUDA runtime device"):
         learning.training.checkpoint.make_checkpoint(
             role="last",
+            payload_kind="full",
             identity=_identity("scaled"),
             completed_epoch=1,
             global_step=0,
@@ -857,7 +1015,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(101)
     ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
     config = _config(6, evaluation_interval=2)
-    config["training"]["ood_evaluation_interval"] = 3
+    config["training"]["additional_evaluation_interval"] = 3
     config["tracking"]["wandb"]["monitor"] = {
         "enabled": True,
         "interval": 4,
@@ -885,8 +1043,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
         physics_calls += 1
         return {
             "physics/id/momentum_residual_mse": float(physics_calls),
-            "physics/id/continuity_div_velocity_mse": 2.0,
-            "physics/id/continuity_div_eps_velocity_mse": 3.0,
+            "physics/id/flux_balance_mse": 2.0,
             "physics/id/pressure_boundary_mse": 4.0,
         }
 
@@ -905,7 +1062,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
         optimizer=optimizer,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        ood_loader=ood_loader,
+        additional_evaluation_loader=ood_loader,
         train_loss=loss,
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
@@ -918,7 +1075,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
     assert ood_epochs == [3, 6]
     assert physics_calls == 2
     assert [epoch for epoch, payload in observed.items() if "id/mse" in payload] == [2, 4, 6]
-    assert [epoch for epoch, payload in observed.items() if "ood/mse" in payload] == [3, 6]
+    assert [epoch for epoch, payload in observed.items() if "additional_evaluation/mse" in payload] == [3, 6]
     assert [epoch for epoch, payload in observed.items() if "physics/id/momentum_residual_mse" in payload] == [4, 6]
     assert observed[4]["physics/id/momentum_residual_mse"] == 1.0
     assert observed[6]["physics/id/momentum_residual_mse"] == 2.0
@@ -937,7 +1094,7 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
         optimizer=optimizer,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        ood_loader=eval_loader,
+        additional_evaluation_loader=eval_loader,
         train_loss=loss,
         eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.3, 0.9])},
         scheduler=scheduler,
@@ -950,8 +1107,8 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
     assert result["best_epoch"] == 2
     assert result["best_metric"] == 0.3
     assert [values["id/mse"] for values in observed] == [0.4, 0.3]
-    assert [values["ood/mse"] for values in observed] == [0.1, 0.9]
-    assert [values["generalization/objective_gap"] for values in observed] == pytest.approx([-0.3, 0.6])
+    assert [values["additional_evaluation/mse"] for values in observed] == [0.1, 0.9]
+    assert [values["additional_evaluation/objective_difference"] for values in observed] == pytest.approx([-0.3, 0.6])
     assert result["terminal_epoch"] == 2
     assert set(result["terminal_metrics"]) == {"train/loss_total", "train/loss_data"}
 
@@ -983,6 +1140,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         run_dir / "best_checkpoint.pt",
         expected_identity=_identity("selected-best"),
         expected_role="best",
+        payload_kind="evaluation",
         scheduler_expected=True,
         amp_expected=False,
         require_best=True,
@@ -1024,8 +1182,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         assert max_cases == 2
         return {
             "physics/id/momentum_residual_mse": 1.0,
-            "physics/id/continuity_div_velocity_mse": 2.0,
-            "physics/id/continuity_div_eps_velocity_mse": 3.0,
+            "physics/id/flux_balance_mse": 2.0,
             "physics/id/pressure_boundary_mse": 4.0,
         }
 
@@ -1035,7 +1192,8 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     selected_config["loss"] = {
         "physics": {
             "enabled": True,
-            "residual_weight": {"target": 1.0, "warmup": {"epochs": 10}},
+            "momentum_weight": {"target": 1.0, "warmup": {"epochs": 10}},
+            "continuity_weight": {"target": 3.0, "warmup": {"epochs": 10}},
             "boundary_weight": {"target": 2.0, "warmup": {"epochs": 10}},
         }
     }
@@ -1044,7 +1202,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        ood_loader=ood_loader,
+        additional_evaluation_loader=ood_loader,
         eval_metrics={
             "mse": _DatasetMSE(),
             **{metric_id: _DatasetMSE() for metric_id in science_metric_ids},
@@ -1060,24 +1218,23 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     assert selected["selected_epoch"] == 1
     metrics = selected["selected_metrics"]
     assert metrics["selected/id/mse"] == 0.2
-    assert metrics["selected/ood/mse"] == 0.6
+    assert metrics["selected/additional_evaluation/mse"] == 0.6
     assert {metric_id: metrics[f"selected/id/{metric_id}"] for metric_id in science_metric_ids} == id_science_metrics
-    assert {metric_id: metrics[f"selected/ood/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
-    assert metrics["selected/generalization/objective_gap"] == pytest.approx(0.4)
-    assert metrics["selected/physics/continuity_div_velocity_mse"] == 2.0
-    assert metrics["selected/physics/continuity_div_eps_velocity_mse"] == 3.0
-    assert metrics["selected/training/residual_weight"] == 0.0
-    assert metrics["selected/training/boundary_weight"] == 0.0
+    assert {metric_id: metrics[f"selected/additional_evaluation/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
+    assert metrics["selected/additional_evaluation/objective_difference"] == pytest.approx(0.4)
+    assert metrics["selected/physics/flux_balance_mse"] == 2.0
+    for term in ("momentum", "continuity", "boundary"):
+        assert metrics[f"selected/training/{term}_weight"] == 0.0
 
     settled_config = copy.deepcopy(selected_config)
-    settled_config["loss"]["physics"]["residual_weight"]["warmup"]["epochs"] = 0
-    settled_config["loss"]["physics"]["boundary_weight"]["warmup"]["epochs"] = 0
+    for term in ("momentum", "continuity", "boundary"):
+        settled_config["loss"]["physics"][f"{term}_weight"]["warmup"]["epochs"] = 0
     settled = learning.training.loop.evaluate_selected_checkpoint(
         config=settled_config,
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        ood_loader=ood_loader,
+        additional_evaluation_loader=ood_loader,
         eval_metrics={"mse": _DatasetMSE()},
         device=torch.device("cpu"),
         data_processor=None,
@@ -1088,8 +1245,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         max_physics_cases=2,
     )
     settled_metrics = settled["selected_metrics"]
-    assert "selected/training/residual_weight" not in settled_metrics
-    assert "selected/training/boundary_weight" not in settled_metrics
+    assert not any(key.startswith("selected/training/") for key in settled_metrics)
 
 
 def test_training_timer_excludes_post_training_epoch_lifecycle(
@@ -1184,8 +1340,9 @@ def test_missing_best_prevents_successful_loop_completion(
     with pytest.raises(FileNotFoundError, match="Required best checkpoint"):
         learning.training.loop.train_loop(
             config={
+                "task": "steady_flow",
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "additional_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
                 "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },

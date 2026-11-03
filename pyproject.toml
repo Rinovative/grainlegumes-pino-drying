@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "grainlegumes-pino-drying"
 version = "0.1.0"
-description = "Physics-informed neural-operator pipeline for steady 2D airflow through heterogeneous porous media, motivated by grain-legume drying applications."
+description = "Physics-informed neural-operator pipeline for steady airflow and transient grain-legume drying in heterogeneous porous media."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 authors = [{ name = "Rino M. Albertin" }]
@@ -68,85 +68,45 @@ markers = [
   "integration: End-to-end lifecycle, subprocess, shell-wrapper, package-publication, worker, or training/artifact workflow tests.",
 ]
 
-# ============================================================
-# 🧹 Ruff Configuration
-# ============================================================
-
+# One project-wide lint policy; the formatter owns whitespace and trailing commas.
 [tool.ruff]
 line-length = 150
 target-version = "py312"
-extend-exclude = [
-  "venv",
-  ".venv",
-  ".mypy_cache",
-  ".ruff_cache",
-  "logs",
-  "data",
-  "outputs",
-  "results",
-  "build",
-  "dist"
-]
 
-# ------------------------------------------------------------
-# ✨ Ruff Formatter
-# ------------------------------------------------------------
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
-# ------------------------------------------------------------
-# 🧹 Ruff Linter
-# ------------------------------------------------------------
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
-  # 🔧 Formatting conflicts
-  "COM812",  # Trailing comma handled by formatter
-
-  # 🧾 Docstring style conflicts
-  "D203",  # Conflicts with D211
-  "D212",  # Conflicts with D213
-
-  # 📦 Current package structure
-  "INP001",  # Allow implicit namespace-style layout in current src setup
-
-  # 🔬 Scientific / research code conventions
-  "ANN401",  # Allow Any
-  "FBT001", "FBT002", "FBT003",  # Allow boolean arguments
-  "PLR0913", "PLR0917",  # Allow many function arguments, including positional scientific APIs
-  "N806", "N803",  # Allow scientific variable names
-  "CPY001",  # Keep the Apache copyright notice at repository level
-  "EXE002",  # Ignore executable-bit mismatch
-  "T201",  # Allow print statements
-  "D205", # Allow multi-line docstring summary to be on a separate line
-  "D400", # Allow the first line to not end with a period
-  "D415", # Allow the first line to not end with a period, question mark, or exclamation point
-  "UP017", # Keep existing UTC timezone objects without unrelated timestamp churn
-  "UP040", # Preserve runtime TypeAlias objects in persisted-data and public contracts
-  "UP042", # Preserve the established string-enum runtime type
-  "FURB162", # Preserve existing timestamp parsing and normalization behavior
+  "COM812",  # Trailing commas are owned by Ruff's formatter.
+  "D203",  # Use D211 for consistent class docstring spacing.
+  "D212", "D213",  # Module summaries start on the opening line; NumPy API docstrings may start below it. The module-header validator owns module structure.
+  "ANN401",  # Validated scientific/configuration payloads have dynamic values.
+  "FBT001", "FBT002", "FBT003",  # Explicit scientific and lifecycle boolean controls.
+  "PLR0913", "PLR0917",  # Scientific APIs expose independently named physical inputs.
+  "N806", "N803",  # Mathematical identifiers follow the governing equations.
+  "CPY001",  # The repository-level Apache license owns the copyright notice.
+  "T201",  # CLIs and interactive scientific workflows intentionally report to stdout.
 ]
 fixable = ["ALL"]
 
 [tool.ruff.lint.per-file-ignores]
-"notebooks/*.ipynb" = [
-  "ANN",  # Interactive notebook helpers do not require a fully typed API surface
-  "EM102",  # Direct contextual exception messages are clearer in notebook cells
-  "TRY003",  # Notebook validation errors are local, not reusable exception APIs
-]
+# Test assertions and descriptive test names are the pytest interface. Test-owned
+# numeric expectations express the behavior under test, rather than production defaults.
+# Private access deliberately exercises focused numerical and injected-failure boundaries.
+"tests/**/*.py" = ["S101", "D103", "PLR2004", "INP001", "SLF001"]
+# Executable helpers are scripts, not importable namespace packages.
+"scripts/*.py" = ["INP001"]
+# Notebook cells are an interactive category, not a reusable typed Python API.
+"notebooks/*.ipynb" = ["ANN", "EM102", "TRY003", "INP001"]
 
-# ------------------------------------------------------------
-# 🧠 Code complexity
-# ------------------------------------------------------------
 [tool.ruff.lint.mccabe]
 max-complexity = 20
 
-# ------------------------------------------------------------
-# 🧱 Structural limits
-# ------------------------------------------------------------
 [tool.ruff.lint.pylint]
 max-branches = 20
 max-statements = 100

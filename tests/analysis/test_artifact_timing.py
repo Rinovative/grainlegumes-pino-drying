@@ -1,5 +1,14 @@
-# ruff: noqa: S101, EM101, PLR2004, TRY003
-"""Verify direct timing, strict persistence, matching, and cache independence."""
+"""Verify direct timing, strict persistence, matching, and cache independence.
+
+Responsibilities:
+  - Check direct inference timing, case matching, strict timing schemas, and atomic persistence
+
+Design principles:
+  - Missing COMSOL evidence stays unavailable; scientific identity excludes timing
+
+This module does NOT:
+  - Parse live solver logs or benchmark production models
+"""
 
 from __future__ import annotations
 
@@ -64,8 +73,8 @@ def _model_identity() -> dict[str, str]:
 
 def _neural_cases() -> list[dict[str, Any]]:
     return [
-        {"case_id": "case_0001", "source_index": 0, "neural_operator_forward_s": 0.1},
-        {"case_id": "case_0002", "source_index": 2, "neural_operator_forward_s": 0.2},
+        {"case_id": "case_0001", "source_index": 0, "batch_amortized_neural_operator_forward_s": 0.1},
+        {"case_id": "case_0002", "source_index": 2, "batch_amortized_neural_operator_forward_s": 0.2},
     ]
 
 
@@ -77,8 +86,8 @@ def _comsol_payload(*, digest: str = "a" * 64) -> dict[str, Any]:
         "batch_id": "batch-a",
         "batch_manifest_sha256": digest,
         "cases": [
-            {"case_id": "case_0001", "elapsed_seconds": 20.0},
-            {"case_id": "case_0003", "elapsed_seconds": 30.0},
+            {"case_id": "case_0001", "comsol_process_seconds": 20.0},
+            {"case_id": "case_0003", "comsol_process_seconds": 30.0},
         ],
         "aggregates": {
             "measured_case_count": 2,
@@ -108,7 +117,8 @@ def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: p
     """Verify that cpu forward is direct inference mode and never uses cuda."""
 
     def forbidden(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("CPU timing accessed CUDA")
+        msg = "CPU timing accessed CUDA"
+        raise AssertionError(msg)
 
     monkeypatch.setattr(torch.cuda, "synchronize", forbidden)
     model = _RecordingProjection()
@@ -123,29 +133,34 @@ def test_cpu_forward_is_direct_inference_mode_and_never_uses_cuda(monkeypatch: p
     assert model.inference_modes == [True]
 
 
-def test_case_matching_uses_only_identical_ids_and_primary_speedup() -> None:
-    """Verify that case matching uses only identical ids and primary speedup."""
+def test_case_matching_uses_only_identical_ids_and_explicit_duration_ratio() -> None:
+    """Pair process walls with batch-amortized forwards only for identical cases."""
     payload = _comparison()
     first, second = payload["cases"]
     assert first["case_id"] == "case_0001"
-    assert first["comsol_solve_s"] == 20.0
-    assert first["speedup"] == 200.0
+    assert first["comsol_process_s"] == 20.0
+    assert first["comsol_process_to_batch_amortized_forward_ratio"] == 200.0
     assert second["case_id"] == "case_0002"
-    assert second["comsol_solve_s"] is None
-    assert second["speedup"] is None
-    assert payload["aggregates"]["neural_operator_forward_s"]["count"] == 2
-    assert payload["aggregates"]["comsol_solve_s"]["count"] == 1
-    assert payload["aggregates"]["speedup"]["median"] == 200.0
+    assert second["comsol_process_s"] is None
+    assert second["comsol_process_to_batch_amortized_forward_ratio"] is None
+    assert payload["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"] == 2
+    assert payload["aggregates"]["comsol_process_s"]["count"] == 1
+    assert payload["aggregates"]["comsol_process_to_batch_amortized_forward_ratio"]["median"] == 200.0
     assert payload["comparison"]["status"] == "available"
+    assert payload["measurement"]["batch_size"] == 2
+    assert payload["measurement"]["case_duration_attribution"] == analysis.artifacts.timing.CASE_DURATION_ATTRIBUTION
+    assert payload["boundaries"]["reference_component"] == "comsol_process_s"
+    assert payload["boundaries"]["surrogate_component"] == "batch_amortized_neural_operator_forward_s"
+    assert payload["boundaries"]["reference_boundary"] != payload["boundaries"]["surrogate_boundary"]
 
 
 def test_missing_comsol_timing_retains_neural_measurements_without_fabrication() -> None:
     """Verify that missing comsol timing retains neural measurements without fabrication."""
     payload = _comparison(comsol=False)
     assert payload["comparison"] == {"status": "unavailable", "reason": "COMSOL timing is unavailable"}
-    assert all(case["comsol_solve_s"] is None and case["speedup"] is None for case in payload["cases"])
-    assert payload["aggregates"]["neural_operator_forward_s"]["count"] == 2
-    assert payload["aggregates"]["speedup"]["count"] == 0
+    assert all(case["comsol_process_s"] is None and case["comsol_process_to_batch_amortized_forward_ratio"] is None for case in payload["cases"])
+    assert payload["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"] == 2
+    assert payload["aggregates"]["comsol_process_to_batch_amortized_forward_ratio"]["count"] == 0
 
 
 def test_manifest_mismatch_is_rejected() -> None:
@@ -167,11 +182,12 @@ def test_manifest_mismatch_is_rejected() -> None:
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda payload: payload["cases"][0].__setitem__("neural_operator_forward_s", 0.0),
-        lambda payload: payload["cases"][0].__setitem__("neural_operator_forward_s", float("inf")),
-        lambda payload: payload["cases"][0].__setitem__("speedup", 99.0),
+        lambda payload: payload["cases"][0].__setitem__("batch_amortized_neural_operator_forward_s", 0.0),
+        lambda payload: payload["cases"][0].__setitem__("batch_amortized_neural_operator_forward_s", float("inf")),
+        lambda payload: payload["cases"][0].__setitem__("comsol_process_to_batch_amortized_forward_ratio", 99.0),
         lambda payload: payload["cases"].append(copy.deepcopy(payload["cases"][0])),
         lambda payload: payload["cases"][0].pop("source_index"),
+        lambda payload: payload["boundaries"].__setitem__("surrogate_boundary", "isolated single-case latency"),
     ],
 )
 def test_runtime_comparison_rejects_invalid_or_duplicate_cases(mutation: Any) -> None:
@@ -252,7 +268,7 @@ def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() 
     """Verify that comsol timing rejects zero nonfinite malformed and duplicate records."""
     for value in (0.0, -1.0, float("inf")):
         payload = _comsol_payload()
-        payload["cases"][0]["elapsed_seconds"] = value
+        payload["cases"][0]["comsol_process_seconds"] = value
         with pytest.raises((TypeError, ValueError)):
             analysis.artifacts.timing.validate_simulation_batch_timing(payload)
     malformed = _comsol_payload()
@@ -278,3 +294,11 @@ def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> 
     assert not list(artifact_root.glob(".*.tmp"))
     assert analysis.artifacts.timing.load_runtime_comparison(artifact_root) == _comparison()
     assert analysis.artifacts.contracts.artifact_output_manifest(artifact_root) == before
+
+
+def test_steady_comsol_boundary_requires_explicit_process_measurement() -> None:
+    """Neutral elapsed time cannot be relabeled as COMSOL process time."""
+    payload = _comsol_payload()
+    payload["cases"][0]["elapsed_seconds"] = payload["cases"][0].pop("comsol_process_seconds")
+    with pytest.raises(ValueError, match="invalid fields"):
+        analysis.artifacts.timing.validate_simulation_batch_timing(payload)

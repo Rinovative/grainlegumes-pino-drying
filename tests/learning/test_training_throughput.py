@@ -1,13 +1,24 @@
-# ruff: noqa: S101, PLR2004
-"""Protect optimizer-phase timing and actual-sample training throughput."""
+"""Protect optimizer-phase timing and actual-sample training throughput.
+
+Responsibilities:
+  - Check optimizer-phase timers, actual sample counts, and invalid-duration rejection
+
+Design principles:
+  - Loader iteration and final optimizer work remain inside measured training time
+
+This module does NOT:
+  - Benchmark production training or include post-training lifecycle work
+"""
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
+from support import configs
 from torch import nn
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
@@ -157,3 +168,85 @@ def test_invalid_training_duration_fails_without_publishing_throughput(
             nn.MSELoss(),
             torch.device("cpu"),
         )
+
+
+@pytest.mark.parametrize("publication_fails", [False, True])
+def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication_fails: bool,
+) -> None:
+    """Measure both checkpoint operations directly and retain partial failure evidence."""
+    config = configs.resolve(configs.direct_config())
+    config["training"]["epochs"] = 1
+    config["tracking"]["wandb"]["monitor"]["enabled"] = False
+    objective_id = config["evaluation"]["objective"]["id"]
+    clock = [10.0]
+    events: list[str] = []
+    saved: dict[Path, dict[str, Any]] = {}
+    timing: dict[str, Any] = {}
+    model, optimizer = _model_and_optimizer()
+    loader = DataLoader(_MappingDataset(1), batch_size=1)
+    monkeypatch.setattr(loop.time, "monotonic", lambda: clock[0])
+
+    def train(*_args: Any, **_kwargs: Any) -> dict[str, float]:
+        clock[0] += 7.0
+        return {"train/loss": 0.5, "optimizer_steps": 1.0}
+
+    def evaluate(*_args: Any, **_kwargs: Any) -> dict[str, float]:
+        clock[0] += 11.0
+        return {objective_id: 0.25}
+
+    def capture(**kwargs: Any) -> dict[str, Any]:
+        events.append(f"capture_{kwargs['role']}")
+        clock[0] += 2.0
+        return {
+            "completed_epoch": kwargs["completed_epoch"],
+            "next_epoch": kwargs["completed_epoch"] + 1,
+            "best_metric": kwargs["best_metric"],
+            "best_epoch": kwargs["best_epoch"],
+            "checkpoint_role": kwargs["role"],
+        }
+
+    def publish(payload: dict[str, Any], path: Path) -> None:
+        events.append(f"publish_{payload['checkpoint_role']}")
+        clock[0] += 3.0
+        if publication_fails and payload["checkpoint_role"] == "last":
+            message = "bounded checkpoint publication failure"
+            raise OSError(message)
+        saved[path] = payload
+
+    def observer(_epoch: int, _values: dict[str, float]) -> None:
+        events.append("observer")
+        clock[0] += 50.0
+
+    monkeypatch.setattr(loop, "train_one_epoch", train)
+    monkeypatch.setattr(loop, "eval_one_epoch", evaluate)
+    monkeypatch.setattr(loop.checkpoints, "make_checkpoint", capture)
+    monkeypatch.setattr(loop.checkpoints, "save_checkpoint", publish)
+    monkeypatch.setattr(loop.checkpoints, "load_checkpoint", lambda path, **_kwargs: saved[Path(path)])
+    arguments = {
+        "config": config,
+        "device": torch.device("cpu"),
+        "model": model,
+        "optimizer": optimizer,
+        "train_loader": loader,
+        "eval_loader": loader,
+        "train_loss": nn.MSELoss(),
+        "eval_metrics": {objective_id: object()},
+        "save_dir": tmp_path,
+        "epoch_end_callback": observer,
+        "checkpoint_identity": {"test_identity": "synthetic"},
+        "operational_timing": timing,
+    }
+    if publication_fails:
+        with pytest.raises(OSError, match="bounded checkpoint publication failure"):
+            loop.train_loop(**arguments)
+    else:
+        result = loop.train_loop(**arguments)
+        assert result["operational_timing"] == timing
+        assert events[-1] == "observer"
+    assert events[:4] == ["capture_best", "publish_best", "capture_last", "publish_last"]
+    assert timing["checkpoint_capture_and_publication_seconds"] == 10.0
+    assert timing["checkpoint_capture_and_publication_attempts"] == 2
+    assert timing["epoch_duration_scope"].endswith("excludes_epoch_state_last_checkpoint_and_observers")

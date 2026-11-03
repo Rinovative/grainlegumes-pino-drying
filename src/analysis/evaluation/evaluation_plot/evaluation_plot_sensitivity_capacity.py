@@ -1,7 +1,4 @@
-"""
-evaluation_plot_sensitivity_capacity.py
-
-Separate exact model-capacity evidence from exploratory metadata sensitivity.
+"""Separate exact model-capacity evidence from exploratory metadata sensitivity.
 
 Responsibilities:
   - Compare authoritative accuracy with declared architecture values
@@ -23,10 +20,9 @@ This module does NOT:
 
 from __future__ import annotations
 
-import math
 import textwrap
 from collections.abc import Mapping
-from numbers import Integral, Real
+from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
@@ -75,90 +71,6 @@ def _model_identity(frame: pd.DataFrame) -> tuple[str, int, Mapping[str, Any]]:
         msg = "Capacity analysis requires an exact positive trainable parameter count."
         raise dataframe.ComparisonCompatibilityError(msg)
     return family, int(trainable), architecture
-
-
-def _numeric_architecture_values(
-    value: object,
-    *,
-    prefix: str = "",
-    output: dict[str, float] | None = None,
-) -> dict[str, float]:
-    """Flatten declared numeric architecture values without family-specific names."""
-    result = {} if output is None else output
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            child = f"{prefix}.{key}" if prefix else str(key)
-            _numeric_architecture_values(item, prefix=child, output=result)
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _numeric_architecture_values(item, prefix=f"{prefix}[{index}]", output=result)
-    elif not isinstance(value, bool) and isinstance(value, Real) and prefix:
-        numeric = float(value)
-        if np.isfinite(numeric):
-            result[prefix] = numeric
-    return result
-
-
-def plot_error_vs_architecture_parameters(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
-    """
-    Plot authoritative aggregate error against declared architecture parameters.
-
-    Numeric architecture leaves are flattened in first-seen provenance order.
-    No config file, run name, family-specific proxy, or hidden default is read.
-    """
-    dataframe.validate_comparison(datasets)
-    summaries: list[tuple[str, pd.DataFrame, dict[str, float], float]] = []
-    parameter_order: list[str] = []
-    for label, frame in datasets.items():
-        _family, _trainable, architecture = _model_identity(frame)
-        values = _numeric_architecture_values(architecture)
-        for parameter in values:
-            if parameter not in parameter_order:
-                parameter_order.append(parameter)
-        objective = float(frame.attrs["normalized_group_macro_rmse"]["value"])
-        if not np.isfinite(objective) or objective < 0.0:
-            msg = "Architecture analysis requires a finite non-negative authoritative aggregate."
-            raise ValueError(msg)
-        summaries.append((label, frame, values, objective))
-    if not parameter_order:
-        msg = "Architecture analysis requires at least one declared numeric parameter."
-        raise ValueError(msg)
-
-    columns = min(3, len(parameter_order))
-    rows = math.ceil(len(parameter_order) / columns)
-    figure, axes = plt.subplots(
-        rows,
-        columns,
-        figsize=(7.5 * columns, 4.5 * rows),
-        squeeze=False,
-        constrained_layout=True,
-    )
-    colors = plt.get_cmap("tab10")
-    all_positive = all(objective > 0.0 for _label, _frame, _values, objective in summaries)
-    for axis, parameter in zip(axes.flat, parameter_order, strict=False):
-        for dataset_index, (label, _frame, values, objective) in enumerate(summaries):
-            if parameter not in values:
-                continue
-            axis.scatter(values[parameter], objective, s=70, color=colors(dataset_index % colors.N))
-            axis.annotate(
-                label,
-                (values[parameter], objective),
-                xytext=(4, 4),
-                textcoords="offset points",
-                fontsize=8,
-            )
-        axis.set_xlabel(parameter)
-        axis.set_ylabel("normalized_group_macro_rmse [1]")
-        axis.set_yscale("log" if all_positive else "symlog")
-        axis.grid(alpha=0.3, which="both")
-    for axis in axes.flat[len(parameter_order) :]:
-        axis.axis("off")
-    figure_title, _count_headings = layout.aggregate_title_context(
-        "Authoritative error versus declared architecture parameters",
-        layout.effective_case_counts(datasets),
-    )
-    figure.suptitle(figure_title)
-    return figure
 
 
 def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[float, int]:

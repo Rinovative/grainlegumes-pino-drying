@@ -1,7 +1,4 @@
-"""
-experiments_config_defaults.py
-
-Define generic runtime defaults around task-owned semantic contracts.
+"""Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
   - Provide generic run, data-loader, optimizer, scheduler, and training defaults
@@ -9,7 +6,7 @@ Responsibilities:
   - Return serializable defaults for strict experiment resolution
 
 Design principles:
-  - Dataset selections are explicit exact IDs or immutable logical references
+  - Dataset selections are explicit exact immutable IDs
   - Task-fixed scientific semantics come exclusively from the registered TaskSpec
   - Runtime defaults remain independent of concrete task field names
   - Semantic identifiers are distinct from Python implementation class names
@@ -28,15 +25,13 @@ from src import domain
 
 RUN_DEFAULTS: dict[str, Any] = {
     "seed": 9,
-    "revision": 0,
+    "revision": None,
     "deterministic": True,
     "device": "auto",
-    "suffix": None,
 }
 
 DATA_RUNTIME_DEFAULTS: dict[str, Any] = {
-    "train_ratio": 0.8,
-    "ood_fraction": 0.2,
+    "additional_evaluation_datasets": [],
     "batch_size": 32,
     "num_workers": 8,
     "pin_memory": True,
@@ -47,15 +42,19 @@ PHYSICS_LOSS_DEFAULTS: dict[str, Any] = {
     "enabled": False,
     "derivatives": {
         "kind": "spectral",
-        "extension": "reflect",
+        "extension": "fourier_continuation",
     },
     "interior_crop": 2,
-    "residual_weight": {
-        "target": 1.0e-4,
+    "momentum_weight": {
+        "target": 1.0,
+        "warmup": {"kind": "linear", "epochs": 50},
+    },
+    "continuity_weight": {
+        "target": 1.0e3,
         "warmup": {"kind": "linear", "epochs": 50},
     },
     "boundary_weight": {
-        "target": 5.0e-4,
+        "target": 1.0e2,
         "warmup": {"kind": "linear", "epochs": 50},
     },
 }
@@ -80,7 +79,7 @@ SCHEDULER_DEFAULTS: dict[str, dict[str, Any]] = {
 TRAINING_DEFAULTS: dict[str, Any] = {
     "epochs": 600,
     "evaluation_interval": 5,
-    "ood_evaluation_interval": 5,
+    "additional_evaluation_interval": 5,
     "mixed_precision": False,
 }
 
@@ -91,12 +90,10 @@ WANDB_TASK_PROJECTS = {
     "transient_drying": "grainlegumes-pino-drying-transient",
 }
 WANDB_MAX_TAGS = 2
-WANDB_METRIC_SCHEMA_VERSION = 2
+WANDB_METRIC_SCHEMA_VERSION = 3
 WANDB_WORKFLOWS = (
     "train",
     "optuna_trial",
-    "gpu_smoke",
-    "cpu_acceptance",
     "tracking_validation",
 )
 
@@ -145,6 +142,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
         return {
             "run": RUN_DEFAULTS,
             "data": {
+                "additional_evaluation_fraction": 1.0,
                 "batch_size": 2,
                 "num_workers": 2,
                 "pin_memory": True,
@@ -153,7 +151,6 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
                 "transient_backend_preference": "pt_shards",
                 "transient_backend_required": False,
                 "hdf5_cache_size": 0,
-                "allow_technical_smoke": False,
             },
             "input_profile": task.primary_input_profile,
             "temporal": {"sampling": {"mode": "one_step_transition"}, "temporal_conditioning": {"kind": "none"}},
@@ -167,7 +164,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
                     "channel_weights": [1.0, 1.0, 1.0, 1.0],
                     "state_aux_weight": 0.0,
                 },
-                "physics": {"enabled": False, "continuity": "none"},
+                "physics": {"enabled": False},
             },
             "evaluation": {"metrics": [metric.as_dict(all_fields=task.metric_names) for metric in task.default_metrics]},
             "optimizer": OPTIMIZER_DEFAULTS["adamw"],
@@ -175,19 +172,12 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
             "training": {
                 "epochs": 100,
                 "evaluation_interval": 1,
-                "ood_evaluation_interval": 1,
+                "additional_evaluation_interval": 1,
                 "mixed_precision": False,
                 "stage": "a",
                 "comparison_arm": "a0",
                 "gradient_accumulation_steps": 1,
-                "fixed_evaluation_horizon": 1,
                 "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": 9},
-                "matched_compute": {
-                    "planned_seconds": None,
-                    "planned_steps": None,
-                    "rollout_reference_seconds": None,
-                    "rollout_reference_steps": None,
-                },
                 "teacher_handoff": None,
             },
             "tracking": {
@@ -207,10 +197,7 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
                 "space": "normalized",
                 "weight": 1.0,
             },
-            "physics": {
-                **PHYSICS_LOSS_DEFAULTS,
-                "continuity": task.physics.continuity,
-            },
+            "physics": dict(PHYSICS_LOSS_DEFAULTS),
         },
         "evaluation": {
             "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],

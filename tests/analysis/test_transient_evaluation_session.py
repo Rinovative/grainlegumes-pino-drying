@@ -1,9 +1,17 @@
-# ruff: noqa: S101
-"""Protect transient Evaluation aggregation, presentation, and local reports."""
+"""Protect transient Evaluation aggregation, presentation, and local reports.
+
+Responsibilities:
+  - Check pooled statistics, target records, lazy case access, panels, and local reports
+
+Design principles:
+  - Unequal support, unavailable metrics, and material summaries retain distinct meanings
+
+This module does NOT:
+  - Generate model predictions or refit saved scales
+"""
 
 from __future__ import annotations
 
-import json
 import warnings
 from dataclasses import asdict
 from inspect import Parameter, signature
@@ -18,13 +26,13 @@ import pandas as pd
 import pytest
 import torch
 from matplotlib.figure import Figure
+from support.transient_evaluation import production_frame, scaling_state, sequence_frame, sequence_record
 
-from src import analysis, datasets, domain, experiments
+from src import analysis, experiments
 from src.analysis.evaluation import evaluation_transient_session as session
-from src.analysis.evaluation import evaluation_transient_timing as timing
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
-from src.learning.transient.learning_transient_contracts import TemporalConditioningSpec, TransientTensorizerSpec
-from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -32,192 +40,6 @@ if TYPE_CHECKING:
 
 _TRANSIENT_TRACKING_SUMMARY_LIMIT = 470
 _TRANSIENT_PUBLICATION_SUMMARY_LIMIT = 512
-_SCOPE_DETAIL_CONTROL_COUNT = 3
-
-
-def _scaling_state() -> dict[str, object]:
-    spec = TransientTensorizerSpec("canonical_physics_complete_v1", TemporalConditioningSpec("none"))
-    contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
-    names = tuple(
-        tuple(field.name for field in group)
-        for group in (contract.dynamic_state, contract.static_spatial_conditioning, contract.step_boundary_conditioning, contract.scalar_conditioning)
-    )
-    artifact = TransientScalingArtifact(
-        task_contract_digest=domain.tasks.registry.get_task("transient_drying").contract_digest,
-        data_contract_digest=domain.tasks.registry.get_task("transient_drying").data_contract_digest,
-        tensorizer=spec,
-        dataset_identity={"synthetic": "session"},
-        train_membership_digest="a" * 64,
-        scale_mode="state_std",
-        numerical_floor=SCALE_FLOOR,
-        unique_train_state_count=1,
-        unique_transition_count=1,
-        transition_count=1,
-        spatial_shape=(1, 1),
-        state_names=names[0],
-        static_names=names[1],
-        boundary_names=names[2],
-        scalar_names=names[3],
-        state_mean=torch.zeros(4),
-        state_std=torch.full((4,), 2.0),
-        delta_rms=torch.ones(4),
-        increment_scale=torch.full((4,), 2.0),
-        static_mean=torch.zeros(7),
-        static_std=torch.ones(7),
-        scalar_mean=torch.zeros(8),
-        scalar_std=torch.ones(8),
-        omega_boundary_mean=torch.tensor(0.0),
-        omega_boundary_std=torch.tensor(1.0),
-        horizon=8.0,
-    )
-    return artifact.state_dict()
-
-
-def _record(
-    mode: str,
-    horizon: int | str,
-    *,
-    case_id: str = "case",
-    offset: float = 2.0,
-    material_family: str = "lentil",
-) -> SimpleNamespace:
-    length = 2 if horizon == 1 else 3
-    reference = np.zeros((length, 4, 1, 1), dtype=np.float32)
-    prediction = reference.copy()
-    prediction[1:] = offset
-    full_reference = mode == "autonomous_full" and horizon == "full"
-    target = {
-        "predicted_evidence_scope": "regular_sequence_grid",
-        "predicted_available": True,
-        "predicted_unavailable_reason": None,
-        "predicted_reached": True,
-        "predicted_time_to_target": 1.0,
-        "predicted_final_gap": -0.1,
-        "predicted_final_time": float(length - 1),
-        "reference_evidence_scope": ("canonical_completed_case" if full_reference else "unavailable_partial_interval"),
-        "reference_available": full_reference,
-        "reference_unavailable_reason": (None if full_reference else "canonical_completed_case_target_unavailable_for_partial_interval"),
-        "reference_reached": False,
-        "reference_time_to_target": None,
-        "reference_final_gap": (0.2 if full_reference else None),
-        "reference_final_time": (float(length - 1) if full_reference else None),
-    }
-    return SimpleNamespace(
-        mode=mode,
-        case_id=case_id,
-        requested_horizon=horizon,
-        origin_index=0,
-        physical_times=np.arange(length, dtype=np.float64),
-        reference_states=reference,
-        predicted_states=prediction,
-        spatial_mask=np.ones((1, 1), dtype=bool),
-        static_conditioning=np.asarray(
-            [
-                [[0.0]],
-                [[0.0]],
-                [[1.0]],
-                [[1.0]],
-                [[101325.0]],
-                [[0.4]],
-                [[100.0]],
-            ],
-            dtype=np.float32,
-        ),
-        scalar_conditioning=np.asarray([0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        identity={
-            "material_family": material_family,
-            "input_profile": "canonical_physics_complete_v1",
-            "model_kind": "fno",
-            "dataset_backend": "canonical_hdf5",
-            "timing_evidence_identity": "b" * 64,
-            "scaling_identity": {"semantic_digest": "c" * 64},
-        },
-        target=target,
-    )
-
-
-def _frame(records: tuple[SimpleNamespace, ...]) -> pd.DataFrame:
-    frame = pd.DataFrame()
-    frame.attrs.update(
-        {
-            "artifact_kind": "transient_sequence",
-            "transient_sequence_records": records,
-            "transient_unavailable_horizons": ({"case_id": "case", "requested_horizon": 4, "reason": "short"},),
-            "transient_scaling_state": _scaling_state(),
-        }
-    )
-    return frame
-
-
-def _production_frame(
-    records: tuple[SimpleNamespace, ...],
-    *,
-    artifact_root: str,
-    dataset_name: str = "transient_dataset",
-    dataset_role: str = "id",
-) -> pd.DataFrame:
-    frame = _frame(records)
-    report = timing.build_transient_timing_report(
-        (
-            timing.TransientTimingCase(
-                case_id="case",
-                repetitions={
-                    "drying_no_rollout_model_seconds": (0.01, 0.02, 0.03),
-                    "drying_no_end_to_end_seconds": (0.02, 0.03, 0.04),
-                    "comsol_transient_drying_seconds": (0.3,),
-                },
-                device="cpu",
-                precision="float32",
-                dataset_backend="canonical_hdf5",
-                warmup_passes=1,
-                cpu="test-cpu",
-                software_versions={"python": "test", "pytorch": "test", "numpy": "test"},
-                cold_timings={"drying_no_rollout_model_seconds": 0.05},
-            ),
-        )
-    )
-    frame.attrs.update(
-        {
-            "artifact_root": artifact_root,
-            "artifact_provenance": {
-                "run": {
-                    "best_checkpoint_sha256": "d" * 64,
-                    "best_checkpoint_epoch": 3,
-                },
-                "dataset": {
-                    "name": dataset_name,
-                    "role": dataset_role,
-                    "source_dataset_ids": [dataset_name],
-                    "membership_digests": ["e" * 64],
-                },
-                "evaluation": {
-                    "pipeline_analysis": {
-                        "conditions": [
-                            "A_comsol_reference",
-                            "B_drying_on_comsol_airflow",
-                            "C_drying_on_airflow_no",
-                        ],
-                        "c_available": False,
-                        "c_unavailable_reasons": ["compatible_airflow_checkpoint_not_selected"],
-                        "fabricated_prediction_count": 0,
-                    },
-                    "component_availability": {
-                        "case": {"dataset_materialization_seconds": 0.005},
-                    },
-                    "timing_report": json.loads(json.dumps(asdict(report))),
-                },
-                "lineage": {
-                    "stage_identity": {"stage": "b", "comparison_arm": "b"},
-                    "training_strategy": "rollout",
-                    "matched_compute_manifest": {
-                        "planned": {"clock": "cuda_device_seconds"},
-                        "actual": {"budget_complete": True},
-                    },
-                },
-            },
-        }
-    )
-    return frame
 
 
 def _channel_capability_frame(
@@ -314,7 +136,7 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
     tmp_path: Path,
 ) -> None:
     """Pool float64 sums rather than case RMSE and keep aggregate paths payload-free."""
-    short = _record(
+    short = sequence_record(
         "autonomous_full",
         "full",
         case_id="short",
@@ -325,9 +147,9 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
     short.physical_times = short.physical_times[:2]
     records = (
         short,
-        _record("autonomous_full", "full", case_id="long", offset=3.0),
+        sequence_record("autonomous_full", "full", case_id="long", offset=3.0),
     )
-    scaling = TransientScalingArtifact.from_state_dict(_scaling_state())
+    scaling = TransientScalingArtifact.from_state_dict(scaling_state())
 
     def statistics(record: SimpleNamespace) -> dict[str, dict[str, object]]:
         """Build test-owned persisted states through the production accumulator."""
@@ -433,7 +255,7 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
             "artifact_kind": "transient_sequence",
             "transient_sequence_index": index,
             "transient_unavailable_horizons": (),
-            "transient_scaling_state": _scaling_state(),
+            "transient_scaling_state": scaling_state(),
         }
     )
     evaluation = session.TransientEvaluationSession({"id": frame})
@@ -450,7 +272,6 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
     assert cumulative["physical_w_gr_rmse"] == pytest.approx(expected_physical)
     assert cumulative["normalized_drying_group_macro_rmse"] != pytest.approx(1.0)
     assert index.cache_size == 0
-    assert evaluation.cache_sizes["payload_records"] == 0
     assert cumulative["temperature_range_violations"] > 0
     compact = evaluation.full_autonomous_summaries()
     assert tuple(summary.case_id for summary in compact) == ("short", "long")
@@ -460,8 +281,8 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
 
 def test_session_uses_saved_scale_excludes_origin_and_retains_default_modes() -> None:
     """Use persisted scaling, omit origins, and retain all three required modes."""
-    values = (_record("teacher_forced_one_step", 1), _record("autonomous_full", "full"), _record("rolling_origin", 2))
-    evaluation = session.TransientEvaluationSession({"id": _frame(values)})
+    values = (sequence_record("teacher_forced_one_step", 1), sequence_record("autonomous_full", "full"), sequence_record("rolling_origin", 2))
+    evaluation = session.TransientEvaluationSession({"id": sequence_frame(values)})
     summaries = evaluation.summaries()
     teacher_cumulative = next(item for item in summaries if item.mode == "teacher_forced_one_step" and item.scope == "cumulative")
     assert teacher_cumulative.metrics.normalized_drying_group_macro_rmse == pytest.approx(1.0)
@@ -476,13 +297,13 @@ def test_session_uses_saved_scale_excludes_origin_and_retains_default_modes() ->
 def test_target_records_select_one_full_autonomous_outcome_per_case() -> None:
     """Avoid multiplying target outcomes across rollout modes, origins, and horizons."""
     records = (
-        _record("teacher_forced_one_step", 1, case_id="a"),
-        _record("autonomous_full", "full", case_id="a"),
-        _record("rolling_origin", 2, case_id="a"),
-        _record("autonomous_full", "full", case_id="b"),
-        _record("rolling_origin", 4, case_id="b"),
+        sequence_record("teacher_forced_one_step", 1, case_id="a"),
+        sequence_record("autonomous_full", "full", case_id="a"),
+        sequence_record("rolling_origin", 2, case_id="a"),
+        sequence_record("autonomous_full", "full", case_id="b"),
+        sequence_record("rolling_origin", 4, case_id="b"),
     )
-    evaluation = session.TransientEvaluationSession({"id": _frame(records)})
+    evaluation = session.TransientEvaluationSession({"id": sequence_frame(records)})
     selected = evaluation.full_autonomous_records()
     assert tuple(record.case_id for record in selected) == ("a", "b")
     assert all(record.mode == "autonomous_full" and record.requested_horizon == "full" for record in selected)
@@ -491,14 +312,14 @@ def test_target_records_select_one_full_autonomous_outcome_per_case() -> None:
 def test_session_keeps_material_summaries_and_unavailability_separate() -> None:
     """Group sufficient statistics by identity-owned material without parsing case IDs."""
     records = (
-        _record(
+        sequence_record(
             "rolling_origin",
             4,
             case_id="chickpea__case_0001",
             offset=2.0,
             material_family="chickpea",
         ),
-        _record(
+        sequence_record(
             "rolling_origin",
             4,
             case_id="lentil__case_0001",
@@ -506,7 +327,7 @@ def test_session_keeps_material_summaries_and_unavailability_separate() -> None:
             material_family="lentil",
         ),
     )
-    frame = _frame(records)
+    frame = sequence_frame(records)
     frame.attrs["transient_unavailable_horizons"] = (
         {
             "case_id": "chickpea__case_0001",
@@ -539,8 +360,8 @@ def test_session_keeps_material_summaries_and_unavailability_separate() -> None:
 
 def test_session_aggregates_cases_scopes_unavailability_and_target_evidence() -> None:
     """Aggregate sufficient statistics while preserving scope and censoring evidence."""
-    records = (_record("rolling_origin", 4, case_id="a", offset=2.0), _record("rolling_origin", 4, case_id="b", offset=4.0))
-    frame = _frame(records)
+    records = (sequence_record("rolling_origin", 4, case_id="a", offset=2.0), sequence_record("rolling_origin", 4, case_id="b", offset=4.0))
+    frame = sequence_frame(records)
     frame.attrs["transient_unavailable_horizons"] = ({"case_id": "a", "requested_horizon": 4, "reason": "short"},)
     evaluation = session.TransientEvaluationSession({"id": frame})
     summaries = evaluation.summaries(modes=("rolling_origin",))
@@ -561,7 +382,7 @@ def test_session_aggregates_cases_scopes_unavailability_and_target_evidence() ->
 
 def test_exact_stop_gap_is_not_paired_with_a_regular_prediction_endpoint() -> None:
     """Keep final-gap errors unavailable when canonical and predicted endpoints differ."""
-    record = _record("autonomous_full", "full")
+    record = sequence_record("autonomous_full", "full")
     target = dict(record.target)
     target.update(
         {
@@ -572,7 +393,7 @@ def test_exact_stop_gap_is_not_paired_with_a_regular_prediction_endpoint() -> No
         }
     )
     record.target = target
-    evaluation = session.TransientEvaluationSession({"id": _frame((record,))})
+    evaluation = session.TransientEvaluationSession({"id": sequence_frame((record,))})
     cumulative = next(item for item in evaluation.summaries() if item.mode == "autonomous_full" and item.scope == "cumulative")
     assert cumulative.target_time_error_count == 1
     assert cumulative.target_gap_count == 0
@@ -584,19 +405,19 @@ def test_exact_stop_gap_is_not_paired_with_a_regular_prediction_endpoint() -> No
 def test_tracking_summary_stays_bounded_for_complete_two_role_horizon_inventory(tmp_path: Path) -> None:
     """Keep the complete two-role aggregate inventory within the W&B scalar cap."""
     records = (
-        _record("teacher_forced_one_step", 1),
-        _record("autonomous_full", "full"),
-        *(_record("rolling_origin", horizon) for horizon in analysis.evaluation.transient_artifact.FIXED_HORIZONS),
-        _record("rolling_origin", "full"),
+        sequence_record("teacher_forced_one_step", 1),
+        sequence_record("autonomous_full", "full"),
+        *(sequence_record("rolling_origin", horizon) for horizon in analysis.evaluation.transient_artifact.FIXED_HORIZONS),
+        sequence_record("rolling_origin", "full"),
     )
     frames = {
-        role: _production_frame(
+        role: production_frame(
             records,
             artifact_root=str(tmp_path / role),
             dataset_name=f"{role}_dataset",
             dataset_role=role,
         )
-        for role in ("id", "ood")
+        for role in ("id", "additional_evaluation")
     }
     metric_id = "normalized_drying_group_macro_rmse"
     for frame in frames.values():
@@ -624,7 +445,7 @@ def test_tracking_summary_stays_bounded_for_complete_two_role_horizon_inventory(
     assert len(publication) <= _TRANSIENT_PUBLICATION_SUMMARY_LIMIT
     assert all(key.startswith("evaluation/") for key in publication)
     assert all(isinstance(value, (bool, float, int, str)) for value in publication.values())
-    validator = experiments.tracking._validate_transient_evaluation_summary_entry  # noqa: SLF001
+    validator = experiments.tracking._validate_transient_evaluation_summary_entry
     assert all(validator(key, value) == key for key, value in publication.items())
     assert publication["evaluation/identity/checkpoint_sha256"] == "d" * 64
     assert publication["evaluation/identity/input_profile"] == "canonical_physics_complete_v1"
@@ -648,13 +469,13 @@ def test_transient_registry_invokes_every_visible_entry(
 ) -> None:
     """Invoke every registered transient entry through explicit export context."""
     records = (
-        _record("teacher_forced_one_step", 1),
-        _record("autonomous_full", "full"),
-        _record("rolling_origin", 2),
+        sequence_record("teacher_forced_one_step", 1),
+        sequence_record("autonomous_full", "full"),
+        sequence_record("rolling_origin", 2),
     )
     evaluation = session.TransientEvaluationSession(
         {
-            "id": _production_frame(
+            "id": production_frame(
                 records,
                 artifact_root=str(tmp_path / "artifact"),
             )
@@ -699,46 +520,18 @@ def test_transient_registry_invokes_every_visible_entry(
     assert captured
     assert len({plot_name for _label, _factory, plot_name in captured}) == len(captured)
     registered_names = {plot_name for _label, _factory, plot_name in captured}
-    assert captured_tabs == [
-        "Overview",
-        "Global Error Analysis",
-        "Architecture Sensitivity",
-        "Error Decomposition",
-        "Sample Viewer",
-        "Outlier & Extreme Case Analysis",
-        "Temporal & Rollout Analysis",
-    ]
-    assert tuple(label for label, _factory, _plot_name in captured) == (
-        "Overview: Summary table",
-        "1-1. Global error metrics",
-        "1-2. Global error distribution",
-        "1-3. GT vs Prediction (mean)",
-        "1-4. Mean error maps",
-        "1-5. Std error maps",
-        "2-1. Model-family configuration",
-        "3-1. Error vs |GT| magnitude",
-        "7-1. Sample GT vs Prediction",
-        "8-1. Worst per-channel cases (tables)",
-        "8-2. Worst per-channel cases (field plots)",
-        "9-1. Reference vs prediction trajectories",
-        "9-2. Error over physical time",
-        "9-3. Error vs rollout horizon",
-        "9-4. Final-state drying summary",
-    )
     assert {
         "1_3_gt_vs_prediction_mean",
         "1_4_mean_error_maps",
         "7_1_sample_gt_vs_prediction",
         "9_1_reference_prediction_trajectories",
     }.issubset(registered_names)
-    assert not any(
-        fragment in plot_name for plot_name in registered_names for fragment in ("pressure", "velocity", "divergence", "permeability", "timing")
-    )
+    assert not any(fragment in plot_name for plot_name in registered_names for fragment in ("pressure", "velocity", "divergence", "permeability"))
     results: dict[str, object] = {}
     for _label, factory, plot_name in captured:
         parameters = signature(factory).parameters
         assert all(parameter.kind is not Parameter.VAR_KEYWORD for parameter in parameters.values())
-        result = analysis.ui.notebook._invoke_dropdown_entry(  # noqa: SLF001
+        result = analysis.ui.notebook._invoke_dropdown_entry(
             factory,
             export_state={
                 "fig": None,
@@ -762,13 +555,12 @@ def test_transient_registry_invokes_every_visible_entry(
     plt.close("all")
 
 
-def test_transient_field_views_reuse_exact_eda_widget_structure(
-    monkeypatch: pytest.MonkeyPatch,
+def test_transient_controls_expose_admitted_state_and_derived_channels(
     tmp_path: Path,
 ) -> None:
-    """Keep case, status, channels, scale, time, output, and scope ordering exact."""
-    frame = _production_frame(
-        (_record("autonomous_full", "full"),),
+    """Expose source-backed state and derived moisture without a widget-layout snapshot."""
+    frame = production_frame(
+        (sequence_record("autonomous_full", "full"),),
         artifact_root=str(tmp_path / "artifact"),
     )
     frame.attrs["artifact_provenance"]["evaluation"].update(
@@ -778,83 +570,8 @@ def test_transient_field_views_reuse_exact_eda_widget_structure(
         }
     )
     evaluation = session.TransientEvaluationSession({"id": frame})
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
-    monkeypatch.setattr(analysis.ui.viewers, "render_figure", lambda **_kwargs: None)
-
-    sample = analysis.evaluation.panel._make_transient_sample_viewer(  # noqa: SLF001
-        session=evaluation,
-        fields=fields,
-        comparison=False,
-    )
-    assert tuple(type(child) for child in sample.children) == (
-        widgets.HBox,
-        widgets.HTML,
-        widgets.VBox,
-        widgets.HBox,
-        widgets.VBox,
-        widgets.Output,
-    )
-    case_row = sample.children[0]
-    assert isinstance(case_row, widgets.HBox)
-    assert case_row.layout.width == "230px"
-    assert case_row.children[0].layout.width == "150px"
-    assert tuple(child.layout.width for child in case_row.children[1:]) == (
-        "40px",
-        "40px",
-    )
-    channel_container = sample.children[2]
-    assert isinstance(channel_container, widgets.VBox)
-    channel_widget = channel_container.children[1]
-    assert isinstance(channel_widget, widgets.VBox)
-    channel_group = cast(
-        "analysis.ui.components.CheckboxGroup",
-        channel_widget,
-    )
-    channel_grid = channel_widget.children[0]
-    assert isinstance(channel_grid, widgets.GridBox)
-    assert channel_grid.layout.grid_template_columns.startswith("repeat(3,")
-    assert tuple(channel_group.boxes) == (
-        *analysis.evaluation.transient_artifact.STATE_ORDER,
-        "w_gr",
-    )
-    scale_container = sample.children[3]
-    time_container = sample.children[4]
-    assert isinstance(scale_container, widgets.HBox)
-    assert isinstance(time_container, widgets.VBox)
-    assert isinstance(scale_container.children[0], widgets.Checkbox)
-    time_row = time_container.children[0]
-    assert isinstance(time_row, widgets.HBox)
-    assert tuple(control.description for control in time_row.children) == (
-        "Time [h]:",
-        "≪",
-        "←",
-        "→",
-        "≫",
-    )
-
-    scoped = analysis.evaluation.panel._make_transient_scope_viewer(  # noqa: SLF001
-        session=evaluation,
-        fields=fields,
-        plot_kind="trajectory",
-        comparison=False,
-    )
-    scope_row = scoped.children[0]
-    assert isinstance(scope_row, widgets.HBox)
-    scope, detail = scope_row.children
-    assert isinstance(detail, widgets.HBox)
-    assert isinstance(scope, widgets.ToggleButtons)
-    assert tuple(scope.options) == (
-        ("Aggregate", "aggregate"),
-        ("Single case", "single"),
-    )
-    assert len(detail.children) == _SCOPE_DETAIL_CONTROL_COUNT
-    scope.value = "single"
-    assert len(detail.children) == _SCOPE_DETAIL_CONTROL_COUNT
-    assert detail.children[0].layout.width == "150px"
-    assert tuple(child.layout.width for child in detail.children[1:]) == (
-        "40px",
-        "40px",
-    )
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    assert tuple(field.key for field in fields) == (*analysis.evaluation.transient_artifact.STATE_ORDER, "w_gr")
     evaluation.close()
 
 
@@ -872,43 +589,21 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
 ) -> None:
     """Pool exact-time case evidence and keep slider/channel changes payload-free."""
     records = (
-        _record("autonomous_full", "full", case_id="low", offset=1.0),
-        _record("autonomous_full", "full", case_id="high", offset=-3.0),
+        sequence_record("autonomous_full", "full", case_id="low", offset=1.0),
+        sequence_record("autonomous_full", "full", case_id="high", offset=-3.0),
     )
     evaluation = session.TransientEvaluationSession(
         {
-            "id": _production_frame(
+            "id": production_frame(
                 records,
                 artifact_root=str(tmp_path / "artifact"),
             )
         }
     )
-    spatial = analysis.evaluation.plots.transient.plot_aggregate_spatial_error(
-        records,
-        state_field="w_surf",
-        physical_time=1.0,
-    )
-    comparison = analysis.evaluation.plots.transient.plot_predicted_vs_reference(
-        records,
-        state_field="w_surf",
-        physical_time=1.0,
-    )
-    np.testing.assert_allclose(
-        np.asarray(spatial.axes[0].collections[0].get_array()),
-        np.asarray([[2.0]]),
-    )
-    np.testing.assert_allclose(
-        np.asarray(comparison.axes[0].collections[0].get_offsets(), dtype=np.float64),
-        np.asarray(((0.0, 1.0), (0.0, -3.0))),
-    )
-    assert "kg/m^3" in comparison.axes[0].get_xlabel()
-    plt.close(spatial)
-    plt.close(comparison)
-
     faceted = analysis.evaluation.plots.transient.plot_aggregate_error_maps(
         {
             "Chickpea · ID": (records[0],),
-            "Kidney bean · Near-family OOD": (records[1],),
+            "Kidney bean · OOD": (records[1],),
         },
         state_fields=("w_surf",),
         physical_time=1.0,
@@ -916,7 +611,7 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
     )
     assert tuple(axis.get_title() for axis in faceted.axes[:2]) == (
         "Chickpea · ID",
-        "Kidney bean · Near-family OOD",
+        "Kidney bean · OOD",
     )
     np.testing.assert_allclose(
         np.asarray(faceted.axes[0].collections[0].get_array()),
@@ -946,8 +641,8 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
         counted,
     )
     export_state: dict[str, object] = {}
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
-    viewer = analysis.evaluation.panel._make_transient_aggregate_viewer(  # noqa: SLF001
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    viewer = analysis.evaluation.panel._make_transient_aggregate_viewer(
         session=evaluation,
         fields=fields,
         plot_kind="mean_error",
@@ -969,6 +664,46 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
     evaluation.close()
 
 
+def test_transient_temporal_union_preserves_short_tails_counts_and_nonfinite_unavailability() -> None:
+    """Exact-time cohorts retain late support and never average away invalid predictions."""
+    long = sequence_record("autonomous_full", "full", case_id="long", offset=1.0)
+    short = sequence_record("autonomous_full", "full", case_id="short", offset=3.0)
+    short.physical_times = short.physical_times[:2]
+    short.reference_states = short.reference_states[:2]
+    short.predicted_states = short.predicted_states[:2]
+    assert analysis.evaluation.panel._shared_transient_physical_times((long, short)) == (0.0, 1.0, 2.0)
+    rows = (
+        (np.array((1.0, 2.0)), np.array((1.0, 2.0))),
+        (np.array((1.0,)), np.array((np.nan,))),
+    )
+    exact = analysis.evaluation.plots.transient._aggregate_exact_time_values(rows)
+    np.testing.assert_array_equal(exact.times, [1.0, 2.0])
+    np.testing.assert_array_equal(exact.count, [2, 1])
+    np.testing.assert_array_equal(exact.invalid_count, [1, 0])
+    assert np.isnan(exact.mean[0])
+    assert exact.mean[1] == 2.0
+    assert np.isnan(exact.lower).all()
+
+    trajectory = analysis.evaluation.plots.transient.plot_state_trajectory_summary({"ID": (long, short)}, state_fields=("T",))
+    trajectory_times = np.asarray(trajectory.axes[0].lines[0].get_xdata())
+    assert trajectory_times.size == 3
+    np.testing.assert_array_equal(trajectory.axes[1].lines[0].get_ydata(), [2, 2, 1])
+    plt.close(trajectory)
+    error = analysis.evaluation.plots.transient.plot_error_over_physical_time(
+        {"ID": (long, short)}, scaling_states={"ID": scaling_state()}, state_fields=("T",)
+    )
+    error_times = np.asarray(error.axes[0].lines[0].get_xdata())
+    assert error_times.size == 2
+    np.testing.assert_array_equal(error.axes[1].lines[0].get_ydata(), [2, 1])
+    plt.close(error)
+
+    empty_context = analysis.evaluation.plots.transient.plot_aggregate_error_maps(
+        {"ID": (long,), "OOD": ()}, state_fields=("T",), physical_time=2.0, statistic="mean"
+    )
+    assert any("No case at this exact time" in text.get_text() for text in empty_context.axes[1].texts)
+    plt.close(empty_context)
+
+
 def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -976,7 +711,7 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
     """Expose one material-labelled union while retaining exact artifact ownership."""
 
     def owned_record(case_id: str, material: str, compact_case: str) -> SimpleNamespace:
-        record = _record(
+        record = sequence_record(
             "autonomous_full",
             "full",
             case_id=case_id,
@@ -990,6 +725,13 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
             "generation_case_id": compact_case,
             "package_case_id": case_id,
         }
+        if material == "kidney_bean":
+            record.identity["evaluation_assignment"] = {
+                "dataset_id": f"dataset_{material}",
+                "role": "ood",
+                "relation": "held-out material family",
+                "assumptions": ["same schedule"],
+            }
         return record
 
     id_records = (
@@ -1013,17 +755,17 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
     )
     evaluation = session.TransientEvaluationSession(
         {
-            "Model ID": _production_frame(
+            "Model ID": production_frame(
                 id_records,
                 artifact_root=str(tmp_path / "id"),
                 dataset_name="transient_drying__lentil+chickpea__id",
                 dataset_role="id",
             ),
-            "Model OOD": _production_frame(
+            "Model Additional evaluation": production_frame(
                 ood_records,
-                artifact_root=str(tmp_path / "ood"),
-                dataset_name="transient_drying__kidney_bean__near_family_ood",
-                dataset_role="ood",
+                artifact_root=str(tmp_path / "additional_evaluation"),
+                dataset_name="kidney_bean_holdout",
+                dataset_role="additional_evaluation",
             ),
         }
     )
@@ -1054,8 +796,8 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         "render_figure",
         lambda **_kwargs: None,
     )
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
-    viewer = analysis.evaluation.panel._make_transient_sample_viewer(  # noqa: SLF001
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    viewer = analysis.evaluation.panel._make_transient_sample_viewer(
         session=evaluation,
         fields=fields,
         comparison=False,
@@ -1069,16 +811,18 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
     assert not any(isinstance(widget, widgets.Dropdown) and widget.description == "Model / artifact:" for widget in _widget_tree(viewer))
     case_selector.value = 2
     assert routed[-1] == (
-        "Model OOD",
+        "Model Additional evaluation",
         "transient_drying__kidney_bean__natural__case_0004",
     )
 
     inventory = evaluation.partitioned_case_inventory()
-    assert tuple(entry.dataset_role for entry in inventory) == ("id", "id", "ood")
+    assert tuple(entry.dataset_role for entry in inventory) == ("id", "id", "additional_evaluation")
+    assert inventory[-1].evaluation_assignment is not None
+    assert inventory[-1].evaluation_assignment["role"] == "ood"
     assert tuple(entry.artifact_root for entry in inventory) == (
         (tmp_path / "id").resolve(),
         (tmp_path / "id").resolve(),
-        (tmp_path / "ood").resolve(),
+        (tmp_path / "additional_evaluation").resolve(),
     )
     aggregate = evaluation.dataset_dataframe(modes=("autonomous_full",))
     assert set(aggregate["material_family"]) == {
@@ -1086,14 +830,14 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         "lentil",
         "kidney_bean",
     }
-    assert set(aggregate["dataset_role"]) == {"id", "ood"}
+    assert set(aggregate["dataset_role"]) == {"id", "additional_evaluation"}
     assert set(aggregate["artifact_root"]) == {
         str((tmp_path / "id").resolve()),
-        str((tmp_path / "ood").resolve()),
+        str((tmp_path / "additional_evaluation").resolve()),
     }
 
     routed.clear()
-    aggregate_view = analysis.evaluation.panel._make_transient_aggregate_viewer(  # noqa: SLF001
+    aggregate_view = analysis.evaluation.panel._make_transient_aggregate_viewer(
         session=evaluation,
         fields=fields,
         plot_kind="mean_error",
@@ -1109,20 +853,18 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
             "transient_drying__lentil__natural__case_0010",
         ),
         (
-            "Model OOD",
+            "Model Additional evaluation",
             "transient_drying__kidney_bean__natural__case_0004",
         ),
     ]
     assert not any(isinstance(widget, widgets.Dropdown) and widget.description == "Material:" for widget in _widget_tree(aggregate_view))
-    coverage_status = next(
-        widget for widget in _widget_tree(aggregate_view) if isinstance(widget, widgets.HTML) and "All material-role partitions" in widget.value
-    )
+    support_status = next(widget for widget in _widget_tree(aggregate_view) if isinstance(widget, widgets.HTML) and "n(t)=" in widget.value)
     assert all(
-        label in coverage_status.value
+        f"{label}: n(t)=1" in support_status.value
         for label in (
             "Chickpea · ID",
             "Lentil · ID",
-            "Kidney bean · Near-family OOD",
+            "Kidney bean · OOD",
         )
     )
     evaluation.close()
@@ -1133,20 +875,20 @@ def test_sample_view_keeps_physical_time_local_and_rollout_coordinates_outside(
 ) -> None:
     """Use full-rollout sample time without adding global protocol or horizon controls."""
     records = (
-        _record("teacher_forced_one_step", 1),
-        _record("autonomous_full", "full"),
-        _record("rolling_origin", 2),
+        sequence_record("teacher_forced_one_step", 1),
+        sequence_record("autonomous_full", "full"),
+        sequence_record("rolling_origin", 2),
     )
     evaluation = session.TransientEvaluationSession(
         {
-            "id": _production_frame(
+            "id": production_frame(
                 records,
                 artifact_root=str(tmp_path / "artifact"),
             )
         }
     )
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
-    viewer = analysis.evaluation.panel._make_transient_sample_viewer(  # noqa: SLF001
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    viewer = analysis.evaluation.panel._make_transient_sample_viewer(
         session=evaluation,
         fields=fields,
         comparison=False,
@@ -1155,21 +897,6 @@ def test_sample_view_keeps_physical_time_local_and_rollout_coordinates_outside(
         isinstance(widget, widgets.Dropdown) and widget.description in {"Protocol:", "Origin:", "Horizon:"} for widget in _widget_tree(viewer)
     )
     assert any(isinstance(widget, widgets.FloatText) and widget.description == "Time [h]:" for widget in _widget_tree(viewer))
-
-    trajectory = analysis.evaluation.plots.transient.plot_state_trajectory(
-        records[1],
-        state_field="w_gr",
-    )
-    np.testing.assert_allclose(
-        np.asarray(trajectory.axes[0].lines[0].get_ydata(), dtype=np.float64),
-        (0.0, 0.0, 0.0),
-    )
-    np.testing.assert_allclose(
-        np.asarray(trajectory.axes[0].lines[1].get_ydata(), dtype=np.float64),
-        (0.0, 2.0, 2.0),
-    )
-    assert "kg/m^3" in trajectory.axes[0].get_ylabel()
-    plt.close(trajectory)
     evaluation.close()
 
 
@@ -1178,20 +905,20 @@ def test_outlier_field_view_starts_from_persisted_worst_channel_case(
 ) -> None:
     """Route the per-channel outlier field view through one exact ranked case."""
     records = (
-        _record("autonomous_full", "full", case_id="best", offset=1.0),
-        _record("autonomous_full", "full", case_id="worst", offset=3.0),
+        sequence_record("autonomous_full", "full", case_id="best", offset=1.0),
+        sequence_record("autonomous_full", "full", case_id="worst", offset=3.0),
     )
     evaluation = session.TransientEvaluationSession(
         {
-            "id": _production_frame(
+            "id": production_frame(
                 records,
                 artifact_root=str(tmp_path / "artifact"),
             )
         }
     )
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
     export_state: dict[str, object] = {}
-    viewer = analysis.evaluation.panel._make_transient_sample_viewer(  # noqa: SLF001
+    viewer = analysis.evaluation.panel._make_transient_sample_viewer(
         session=evaluation,
         fields=fields,
         comparison=False,
@@ -1266,11 +993,11 @@ def test_horizon_error_uses_one_global_axis_for_sparse_frame_inventories() -> No
 
 def test_evaluation_physical_time_axes_reuse_shared_units_and_export() -> None:
     """Format simulated time centrally while leaving rollout indices distinct."""
-    record = _record("autonomous_full", "full")
+    record = sequence_record("autonomous_full", "full")
     record.physical_times = np.asarray((0.0, 84.0, 168.0))
     central = analysis.evaluation.plots.transient.plot_central_error_vs_time(
         record,
-        scaling_state=_scaling_state(),
+        scaling_state=scaling_state(),
     )
     summary = pd.DataFrame.from_records(
         (
@@ -1335,14 +1062,24 @@ def test_evaluation_physical_time_axes_reuse_shared_units_and_export() -> None:
             plt.close(figure)
 
 
-def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(tmp_path: Path) -> None:
+def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep exact-time controls, all states, unavailable C, and local report outputs."""
     records = (
-        _record("teacher_forced_one_step", 1),
-        _record("autonomous_full", "full"),
-        _record("rolling_origin", 2),
+        sequence_record("teacher_forced_one_step", 1),
+        sequence_record("autonomous_full", "full"),
+        sequence_record("rolling_origin", 2),
     )
-    frame = _production_frame(records, artifact_root=str(tmp_path / "artifact"))
+    frame = production_frame(records, artifact_root=str(tmp_path / "artifact"))
+    scale = error_diagnostics.transient_reference_scale(
+        frame.attrs["transient_scaling_state"],
+        field="T",
+        unit="K",
+        state_order=analysis.evaluation.transient_artifact.STATE_ORDER,
+        dataset_identity="a" * 64,
+    )
+    assert isinstance(scale, error_diagnostics.ReferenceScale)
+    for record in records:
+        record.identity["scaling_identity"]["semantic_digest"] = scale.scaler_identity
     frame.attrs["artifact_provenance"]["evaluation"].update(
         {
             "objective": {"fields": list(analysis.evaluation.transient_artifact.STATE_ORDER)},
@@ -1355,8 +1092,8 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
         "plot_name": "maps",
         "title": "maps",
     }
-    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)  # noqa: SLF001
-    viewer = analysis.evaluation.panel._make_transient_sample_viewer(  # noqa: SLF001
+    fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
+    viewer = analysis.evaluation.panel._make_transient_sample_viewer(
         session=evaluation,
         fields=fields,
         comparison=False,
@@ -1396,7 +1133,7 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
     assert export_state["fig"] is None
     channel_row.boxes["T"].value = True
 
-    trajectory_viewer = analysis.evaluation.panel._make_transient_scope_viewer(  # noqa: SLF001
+    trajectory_viewer = analysis.evaluation.panel._make_transient_scope_viewer(
         session=evaluation,
         fields=fields,
         plot_kind="trajectory",
@@ -1415,7 +1152,7 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
 
     with pytest.raises(ValueError, match="unavailable"):
         analysis.evaluation.plots.transient.plot_state_maps(records[0], physical_time=0.5)
-    figure = analysis.evaluation.plots.transient.plot_state_maps(records[0])
+    figure = analysis.evaluation.plots.transient.plot_state_maps(records[0], error_mode="Signed error")
     figure.canvas.draw()
     expected_map_count = len(analysis.evaluation.transient_artifact.STATE_ORDER) * 3
     map_axes = tuple(figure.axes[:expected_map_count])
@@ -1449,59 +1186,59 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
     assert channel_figure.axes[0].get_ylabel() == "Normalized RMSE [1]"
     assert len(channel_figure.axes[0].patches) == len(analysis.evaluation.transient_artifact.STATE_ORDER)
     plt.close(channel_figure)
-    worst_figure = analysis.evaluation.plots.transient.plot_worst_case_errors(evaluation.case_dataframe(modes=("autonomous_full",)))
-    assert "Worst" in worst_figure.axes[0].get_title()
-    plt.close(worst_figure)
-
-    paired = session.TransientEvaluationSession(
-        {
-            "Model ID": _production_frame(
-                records,
-                artifact_root=str(tmp_path / "id-artifact"),
-            ),
-            "Model OOD": _production_frame(
-                records,
-                artifact_root=str(tmp_path / "ood-artifact"),
-            ),
-        }
-    )
-    generalization = analysis.evaluation.plots.transient.plot_id_ood_generalization(paired.dataset_dataframe())
-    assert generalization.axes[0].get_title() == "ID-to-OOD generalization"
-    assert "Near-family OOD" in generalization.axes[0].get_ylabel()
-    plt.close(generalization)
-    paired.close()
 
     degradation = evaluation.pipeline_degradation()
     assert len(degradation) == 1
     assert degradation[0].c_available is False
     assert degradation[0].complete_pipeline_error is None
-    accuracy = evaluation.case_dataframe(modes=("autonomous_full",))
-    accuracy = accuracy.loc[(accuracy["scope"] == "cumulative") & (accuracy["requested_horizon"] == "full")]
-    accuracy_figure = analysis.evaluation.plots.transient.plot_accuracy_vs_inference_time(
-        accuracy,
-        evaluation.timing_report("id"),
-    )
-    np.testing.assert_allclose(
-        np.asarray(accuracy_figure.axes[0].collections[0].get_offsets(), dtype=np.float64),
-        np.asarray([[0.03, 1.0]], dtype=np.float64),
-    )
-    plt.close(accuracy_figure)
-    speedup_figure = analysis.evaluation.plots.transient.plot_accuracy_vs_speedup(
-        accuracy,
-        evaluation.timing_report("id"),
-    )
-    np.testing.assert_allclose(
-        np.asarray(speedup_figure.axes[0].collections[0].get_offsets(), dtype=np.float64),
-        np.asarray([[15.0, 1.0]], dtype=np.float64),
-    )
-    plt.close(speedup_figure)
     runtime_figure = analysis.evaluation.plots.transient.plot_timing_distributions(evaluation.timing_report("id"))
-    assert all(axis.get_ylabel() == "Warmed runtime [s]" for axis in runtime_figure.axes)
+    assert all(axis.get_ylabel() == "Recorded duration [s]" for axis in runtime_figure.axes)
     plt.close(runtime_figure)
+    state_maps = analysis.evaluation.plots.transient.plot_state_maps
+    curated_map_checks: list[bool] = []
+
+    def check_curated_normalized_maps(record: Any, **kwargs: Any) -> Figure:
+        figure = state_maps(record, **kwargs)
+        for channel in range(len(analysis.evaluation.transient_artifact.STATE_ORDER)):
+            error_axis = figure.axes[channel * 3 + 2]
+            assert error_axis.collections, "Curated normalized error requires the persisted train-only scale."
+            np.testing.assert_allclose(
+                np.asarray(error_axis.collections[0].get_array()),
+                np.abs(record.predicted_states[-1, channel] - record.reference_states[-1, channel]) / 2.0,
+            )
+        curated_map_checks.append(True)
+        return figure
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_state_maps", check_curated_normalized_maps)
     report = analysis.presentation.curated.render_curated_transient_analysis(
         session=evaluation,
         output_dir=tmp_path / "report",
     )
     assert set(report.media_files).union(report.tables) == analysis.presentation.curated.TRANSIENT_CURATED_ANALYSIS_KEYS
     assert all(report_path.is_file() for report_path in report.media_files.values())
+    assert curated_map_checks == [True]
     evaluation.close()
+
+
+def test_comparison_ranking_requires_every_material_metric() -> None:
+    """Do not rank a partially unavailable model using only its easier material."""
+    rows = []
+    for frame_name, values in (("Complete", (1.0, 3.0)), ("Incomplete", (0.1, float("nan")))):
+        for material, value in zip(("lentil", "chickpea"), values, strict=True):
+            rows.append(
+                {
+                    "frame": frame_name,
+                    "material_family": material,
+                    "requested_horizon": "full",
+                    "scope": "cumulative",
+                    "normalized_drying_group_macro_rmse": value,
+                    **{f"normalized_rmse_{field}": value for field in analysis.evaluation.transient_artifact.STATE_ORDER},
+                }
+            )
+    fake = SimpleNamespace(dataset_dataframe=lambda **_kwargs: pd.DataFrame(rows))
+    ranked = analysis.evaluation.panel._transient_comparison_summary(cast("session.TransientEvaluationSession", fake))
+    assert list(ranked["frame"]) == ["Complete", "Incomplete"]
+    assert ranked.iloc[0]["normalized_drying_group_macro_rmse"] == pytest.approx(2.0)
+    assert pd.isna(ranked.iloc[1]["normalized_drying_group_macro_rmse"])
+    assert not ranked.iloc[1]["Metric available"]
+    assert list(ranked["Material count"]) == [2, 2]

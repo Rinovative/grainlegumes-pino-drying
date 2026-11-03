@@ -1,15 +1,18 @@
-"""
-generation_campaign_status.py
+"""Render concise human and campaign-monitor views of canonical campaign status.
 
-Render concise human and workflow-monitor views of canonical campaign status.
 Responsibilities:
-  - Format deterministic per-case scheduler and runtime progress evidence
+  - Format deterministic per-case scheduler and runtime progress evidence and one line per campaign node job
   - Derive stable state and solver-advancement render signatures
   - Bound automatic active-case output without hiding explicit status detail
+  - Render the driver's live board: one line per case, counts, and an estimated remaining time from the status the driver already reads
+
 Design principles:
   - Presentation consumes canonical status without changing campaign decisions
   - Partial solver values remain raw evidence rather than convergence claims
   - Missing monitoring evidence is explicit and non-fatal
+  - The board keeps only in-memory observation times, including unverified-failure sightings; estimates say unknown without enough evidence
+  - Replacement lineage comes only from the status's exact parent link, never from batch names or case order alone
+
 This module does NOT:
   - Query Slurm, parse COMSOL logs, or validate terminal case success
   - Persist monitoring evidence or authorize publication and cleanup
@@ -17,8 +20,11 @@ This module does NOT:
 
 from __future__ import annotations
 
+import heapq
 import math
-from datetime import datetime, timezone
+import re
+import statistics
+from datetime import UTC, datetime
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
 
@@ -28,7 +34,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 _MONITOR_RECORD_KIND = "campaign-monitor"
-_SOURCE_MONITOR_RECORD_KIND = "source-monitor"
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3_600
 _MAX_ACTIONABLE_DETAILS = 20
@@ -69,6 +74,19 @@ _PRE_SOLVER_RUNTIME_PHASES = frozenset(
         "starting_solver",
     }
 )
+_BOARD_REPEAT_SECONDS = 300  # the board is repeated this often while nothing changed, so a long solve still shows its progress
+_BOARD_STALE_SECONDS = 600  # a running case whose solver evidence stayed unchanged this long is marked as stuck
+_SLURM_ELAPSED = re.compile(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d{2})\Z")
+_WAITING_WORDS = {
+    "scheduler_pending": "queued in Slurm",
+    "pending": "queued in Slurm",
+    "license_blocked": "waiting for a COMSOL license",
+    "admission_waiting": "waiting for admission",
+    "never_started": "not started yet",
+}
+# The campaign's reason for a case whose scheduler step ended COMPLETED without result evidence visible to the driver's node.
+_UNVERIFIED_FAILURE_REASON = "completed_without_valid_case_evidence"
+_VERIFYING_TEXT = "step ended, result not yet visible"
 
 
 def _text(value: object) -> str:
@@ -174,8 +192,8 @@ def _runtime_view(case: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _case_bucket(case: Mapping[str, Any]) -> str:
-    """Return one aggregate presentation bucket for a canonical case state."""
-    state = str(case.get("state"))
+    """Return one aggregate presentation bucket for a canonical case state; a case without a state is unknown, not failed."""
+    state = str(case.get("state") or "scheduler_unknown")
     if state == "successful":
         return "successful"
     if state in _FAILED_CASE_STATES:
@@ -190,7 +208,8 @@ def _case_bucket(case: Mapping[str, Any]) -> str:
         # A reservation has entered admission; the Admission line retains its
         # precise starting/acquiring/waiting occupancy projection.
         return "running"
-    if state == "never_started":
+    if state in {"never_started", "skipped"}:
+        # A benchmark candidate skipped after its variant reached the success target never ran.
         return "not_admitted"
     return "failed"
 
@@ -347,15 +366,12 @@ def _license_blocked_lines(case: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def _replay_state(case: Mapping[str, Any]) -> str:
-    """Return the compact operational replay state for a failed case."""
-    if case.get("replay_running") is True:
-        return "running"
-    if case.get("replay_blocked") is True:
-        return "blocked"
-    if case.get("replay_eligible") is True:
-        return "eligible"
-    return "unavailable"
+def _failure_reason(case: Mapping[str, Any]) -> str | None:
+    """Return the bounded reason of one failed work unit in words."""
+    raw_reason = case.get("reason")
+    if isinstance(raw_reason, str) and raw_reason.startswith(_UNSAFE_CAPACITY_STATUS_PREFIX):
+        return "Unowned or unsupported COMSOL status artifact."
+    return _bounded_text(raw_reason, maximum=_MAX_REASON_CHARACTERS)
 
 
 def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
@@ -368,13 +384,7 @@ def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
         if rendered is not None:
             details.append(f"{name}={rendered}")
     lines.append(f"  {'  '.join(details)}")
-    lines.append(f"  replay={_replay_state(case)}")
-    raw_reason = case.get("reason")
-    reason: str | None
-    if isinstance(raw_reason, str) and raw_reason.startswith(_UNSAFE_CAPACITY_STATUS_PREFIX):
-        reason = "Unowned or unsupported COMSOL status artifact."
-    else:
-        reason = _bounded_text(raw_reason, maximum=_MAX_REASON_CHARACTERS)
+    reason = _failure_reason(case)
     if reason is not None:
         lines.append(f'  reason="{reason}"')
     reconciliation = case.get("case_reconciliation")
@@ -391,20 +401,14 @@ def _failed_case_lines(case: Mapping[str, Any]) -> list[str]:
             )
         )
         lines.append(f"  {'  '.join(parts)}")
-    evidence = _compact_evidence_path(case.get("case_reconciliation_evidence_path") or case.get("evidence_path") or case.get("replay_evidence_path"))
+    evidence = _compact_evidence_path(case.get("case_reconciliation_evidence_path") or case.get("evidence_path"))
     if evidence is not None:
         lines.append(f"  evidence={evidence}")
     return lines
 
 
-def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
-    """Return compact successful-case terminal evidence."""
-    lines = [_case_heading(case, include_runtime=False)]
-    details = ["state=successful"]
-    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
-    if reason is not None:
-        details.append(f"reason={reason}")
-    lines.append(f"  {'  '.join(details)}")
+def _terminal_value_parts(case: Mapping[str, Any]) -> list[str]:
+    """Return the simulated end and the bulk moisture against its target of one successful case, as far as reported."""
     terminal = []
     simulated_end = _float_value(case.get("simulated_end_time"))
     simulated_end_unit = _available_text(case.get("simulated_end_time_unit"))
@@ -416,6 +420,18 @@ def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
     target = _float_value(case.get("target_moisture_wb"))
     if target is not None:
         terminal.append(f"target={100.0 * target:.1f}% wb")
+    return terminal
+
+
+def _completed_case_lines(case: Mapping[str, Any]) -> list[str]:
+    """Return compact successful-case terminal evidence."""
+    lines = [_case_heading(case, include_runtime=False)]
+    details = ["state=successful"]
+    reason = _bounded_text(case.get("reason"), maximum=_MAX_REASON_CHARACTERS)
+    if reason is not None:
+        details.append(f"reason={reason}")
+    lines.append(f"  {'  '.join(details)}")
+    terminal = _terminal_value_parts(case)
     if terminal:
         lines.append(f"  {'  '.join(terminal)}")
     reconciliation = case.get("case_reconciliation")
@@ -446,12 +462,12 @@ def _terminal_timestamp(
     if not isinstance(value, str):
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))  # noqa: FURB162 -- retain exact persisted timestamp input normalization and rejection behavior
     except ValueError:
         return None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return None
-    return parsed.astimezone(timezone.utc)
+    return parsed.astimezone(UTC)
 
 
 def _terminal_case_identity(case: Mapping[str, Any]) -> tuple[str, str]:
@@ -578,6 +594,32 @@ def _actionable_section(
     _append_section(lines, title, records)
 
 
+def _node_job_lines(status: Mapping[str, Any]) -> list[str]:
+    """Return one line per node job and one for an unresolved node-job submission."""
+    lines: list[str] = []
+    jobs = status.get("node_jobs")
+    for job in jobs if isinstance(jobs, list) else ():
+        parts = [
+            f"seat={_text(job.get('seat'))}",
+            f"job={_text(job.get('job_id'))}",
+            f"state={_text(job.get('state'))}",
+        ]
+        node = _available_text(job.get("node"))
+        if node is not None:
+            parts.append(f"node={node}")
+        parts.append(f"unresolved={_text(job.get('unresolved_dispatches'))}")
+        if job.get("draining") is True:
+            parts.append("draining")
+        if job.get("cancel_published") is True:
+            parts.append("cancel_published")
+        if job.get("lease") not in {None, "ok"}:
+            parts.append(f"lease={_text(job.get('lease'))}")
+        lines.append(f"Node job: {'  '.join(parts)}")
+    if status.get("node_job_intent") is not None:
+        lines.append(f"Node job submission unresolved: token={_text(status.get('node_job_intent'))}")
+    return lines
+
+
 def format_campaign_status_summary(
     status: Mapping[str, Any],
     *,
@@ -625,8 +667,6 @@ def format_campaign_status_summary(
         submission_values.get("max_admission_cases", 0),
     )
     case_counts = {name: len(buckets[name]) for name in _CASE_SUMMARY_LABELS}
-    max_running = submission_values.get("max_running_cases")
-    max_running_text = "unlimited" if max_running is None else _text(max_running)
     lines = [
         f"Campaign: {_text(status.get('campaign_run_id'))}",
         f"State: {_text(status.get('campaign_state'))}",
@@ -634,9 +674,11 @@ def format_campaign_status_summary(
         (
             "Resources: "
             f"cores_per_case={_text(submission_values.get('cores_per_case'))}  "
-            f"max_admission_cases={_text(submission_values.get('max_admission_cases'))}  "
-            f"max_running_cases={max_running_text}"
+            f"node_jobs={_text(submission_values.get('node_jobs'))}  "
+            f"concurrent_cases_per_node={_text(submission_values.get('concurrent_cases_per_node'))}  "
+            f"max_admission_cases={_text(submission_values.get('max_admission_cases'))}"
         ),
+        *_node_job_lines(status),
         ("Cases: " + "  ".join(f"{name}={case_counts[name]}" for name in _CASE_SUMMARY_LABELS) + f"  total={len(cases)}"),
         f"Admission: {_text(admission_count)}/{_text(admission_maximum)}",
         ("  " + "  ".join(f"{name}={_text(admission_counts[name])}" for name in _ADMISSION_SUMMARY_LABELS)),
@@ -649,7 +691,7 @@ def format_campaign_status_summary(
             "license_blocked",
             "not_admitted",
         )
-    ) or any(case.get("replay_eligible") is True for case in buckets["failed"])
+    )
     if status.get("admission_blocked") is True:
         block_reason = _bounded_text(
             status.get("admission_block_reason"),
@@ -697,6 +739,41 @@ def format_campaign_status_summary(
     return "\n".join(lines)
 
 
+def _case_signature_parts(case: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the state and identity fields and the state plus solver-advancement fields of one case."""
+    runtime = _runtime_view(case)
+    urgent = {
+        "batch_name": case.get("batch_name"),
+        "case_id": case.get("case_id"),
+        "state": case.get("state"),
+        "latest_job_id": case.get("latest_job_id"),
+        "scheduler_state": case.get("scheduler_state"),
+        "node": case.get("node"),
+        "attempt_index": case.get("attempt_index"),
+        "attempt_campaign_run_id": case.get("attempt_campaign_run_id"),
+        "phase": runtime.get("phase"),
+        "terminal": runtime.get("terminal"),
+        # A decision or its lineage recorded while another case runs changes what the board shows at once.
+        "terminal_decision": case.get("terminal_decision"),
+        "failure_reason": case.get("failure_reason"),
+        "failure_detail": case.get("failure_detail"),
+        "parent_failed_case_id": case.get("parent_failed_case_id"),
+    }
+    progress = {
+        **urgent,
+        "parser_state": runtime.get("parser_state"),
+        "comsol_progress_percent": runtime.get("comsol_progress_percent"),
+        "step_index": runtime.get("step_index"),
+        "simulated_time_seconds": runtime.get("simulated_time_seconds"),
+        "step_size_seconds": runtime.get("step_size_seconds"),
+        "order": runtime.get("order"),
+        "time_failures": runtime.get("time_failures"),
+        "nonlinear_failures": runtime.get("nonlinear_failures"),
+        "nonlinear_iteration": runtime.get("nonlinear_iteration"),
+    }
+    return urgent, progress
+
+
 def campaign_monitor_signatures(status: Mapping[str, Any]) -> tuple[str, str]:
     """
     Derive state and solver-advancement signatures for rate-limited rendering.
@@ -715,43 +792,19 @@ def campaign_monitor_signatures(status: Mapping[str, Any]) -> tuple[str, str]:
     urgent_cases: list[dict[str, Any]] = []
     progress_cases: list[dict[str, Any]] = []
     for case in _case_inventory(status):
-        runtime = _runtime_view(case)
-        urgent = {
-            "batch_name": case.get("batch_name"),
-            "case_id": case.get("case_id"),
-            "state": case.get("state"),
-            "latest_job_id": case.get("latest_job_id"),
-            "scheduler_state": case.get("scheduler_state"),
-            "node": case.get("node"),
-            "attempt_index": case.get("attempt_index"),
-            "attempt_campaign_run_id": case.get("attempt_campaign_run_id"),
-            "postprocessing_state": case.get("postprocessing_state"),
-            "replay_eligible": case.get("replay_eligible"),
-            "replay_blocked": case.get("replay_blocked"),
-            "replay_block_reason": case.get("replay_block_reason"),
-            "replay_attempt_count": case.get("replay_attempt_count"),
-            "phase": runtime.get("phase"),
-            "terminal": runtime.get("terminal"),
-        }
+        urgent, progress = _case_signature_parts(case)
         urgent_cases.append(urgent)
-        progress_cases.append(
-            {
-                **urgent,
-                "parser_state": runtime.get("parser_state"),
-                "comsol_progress_percent": runtime.get("comsol_progress_percent"),
-                "step_index": runtime.get("step_index"),
-                "simulated_time_seconds": runtime.get("simulated_time_seconds"),
-                "step_size_seconds": runtime.get("step_size_seconds"),
-                "order": runtime.get("order"),
-                "time_failures": runtime.get("time_failures"),
-                "nonlinear_failures": runtime.get("nonlinear_failures"),
-                "nonlinear_iteration": runtime.get("nonlinear_iteration"),
-            }
-        )
+        progress_cases.append(progress)
     urgent_payload = {
         "campaign_state": status.get("campaign_state"),
         "admission_blocked": status.get("admission_blocked"),
         "admission_block_reason": status.get("admission_block_reason"),
+        "node_jobs": [
+            {key: job.get(key) for key in ("seat", "job_id", "state", "draining", "unresolved_dispatches")}
+            for job in status.get("node_jobs") or ()
+            if isinstance(job, dict)
+        ],
+        "node_job_intent": status.get("node_job_intent"),
         "cases": urgent_cases,
     }
     progress_payload = {"campaign_state": status.get("campaign_state"), "cases": progress_cases}
@@ -795,30 +848,210 @@ def format_campaign_monitor(
     return f"{header}\n{summary}"
 
 
-def format_workflow_monitor(
-    status: Mapping[str, Any],
-    source_status: Mapping[str, Any],
-    *,
-    max_active_cases: int,
-) -> str:
-    """Format one campaign header, one source header, and one bounded summary."""
-    campaign_record = format_campaign_monitor(
-        status,
-        max_active_cases=max_active_cases,
-    )
-    campaign_header, summary = campaign_record.split("\n", 1)
-    source_header = "\t".join(
-        (
-            _SOURCE_MONITOR_RECORD_KIND,
-            str(source_status["campaign_run_id"]),
-            str(source_status["campaign_state"]),
-            str(source_status["source_state"]),
-            ("unavailable" if source_status.get("reclaimable_bytes") is None else str(source_status["reclaimable_bytes"])),
-            str(source_status["cleanup_eligibility"]),
-            str(source_status["active_slurm"]),
+def format_duration(seconds: float) -> str:
+    """Return a coarse human duration: seconds below a minute, minutes below an hour, else hours and minutes."""
+    whole = int(seconds)
+    if whole < _SECONDS_PER_MINUTE:
+        return f"{whole} s"
+    if whole < _SECONDS_PER_HOUR:
+        return f"{whole // _SECONDS_PER_MINUTE} min"
+    return f"{whole // _SECONDS_PER_HOUR} h {whole % _SECONDS_PER_HOUR // _SECONDS_PER_MINUTE:02d} min"
+
+
+def _elapsed_seconds(value: object) -> float | None:
+    """Return the seconds of one Slurm ``[D-][HH:]MM:SS`` elapsed field."""
+    match = _SLURM_ELAPSED.match(value) if isinstance(value, str) else None
+    if match is None:
+        return None
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return float(((days * 24 + hours) * _SECONDS_PER_MINUTE + minutes) * _SECONDS_PER_MINUTE + seconds)
+
+
+def _case_key(case: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the batch and case identity under which the board tracks one case."""
+    return str(case.get("batch_name") or _group_label(case)), str(case.get("case_id"))
+
+
+def _board_group(case: Mapping[str, Any]) -> str:
+    """Return the board group of one case: done, running, waiting or failed."""
+    bucket = _case_bucket(case)
+    if bucket == "running" and case.get("state") != "admission_waiting":
+        return "running"
+    return {"successful": "done", "failed": "failed"}.get(bucket, "waiting")
+
+
+def _running_parts(case: Mapping[str, Any]) -> tuple[list[str], float | None]:
+    """Return the board fields of one running case and its estimated remaining solving seconds.
+
+    Progress is the solver time past the case's own ``physical_start_hours`` against its ``physical_horizon_hours``,
+    both from the status. The estimate extrapolates that progress; a drying case that reaches its target moisture
+    earlier ends before the horizon, so the estimate is an upper bound.
+    """
+    runtime = _runtime_view(case)
+    simulated = _float_value(runtime.get("simulated_time_seconds"))
+    start_hours = _float_value(case.get("physical_start_hours"))
+    horizon_hours = _float_value(case.get("physical_horizon_hours"))
+    eta = None
+    if runtime.get("availability") != "available":
+        parts = [f"no runtime report ({_text(runtime.get('reason'))})"]
+    elif runtime.get("parser_state") != "available" or simulated is None or start_hours is None or not horizon_hours:
+        # A running case's batch always has its persisted time window, so only the solver phase can be missing here.
+        parts = [(_available_text(runtime.get("phase")) or "starting").replace("_", " ")]
+    else:
+        progressed, horizon_seconds = simulated - start_hours * _SECONDS_PER_HOUR, horizon_hours * _SECONDS_PER_HOUR
+        parts = [f"{100.0 * progressed / horizon_seconds:.0f} %", f"{_format_simulated_time(progressed)} / {horizon_hours:g} h"]
+        elapsed = _float_value(runtime.get("elapsed_seconds"))
+        if progressed > 0 and elapsed is not None:
+            eta = max(0.0, elapsed * (horizon_seconds - progressed) / progressed)
+        parts.append(f"step {_format_step_size(runtime.get('step_size_seconds'))}")
+        parts.append(f"Tfail {_text(runtime.get('time_failures'))}  NLfail {_text(runtime.get('nonlinear_failures'))}")
+        parts.append(f"updated {_format_age(runtime)}")
+    parts.append("ETA unknown" if eta is None else f"ETA ~{format_duration(eta)}")
+    return parts, eta
+
+
+def _remaining_seconds(running_etas: Sequence[float | None], waiting: int, finished_seconds: Sequence[float], seats: int) -> float | None:
+    """Estimate the seconds until every case ended, or ``None`` without evidence for each running or waiting case.
+
+    Running cases keep their seats; each waiting case, taking the median duration of the finished cases, goes whole
+    to the seat that frees first, and the estimate is the latest finish.
+    """
+    known = [eta for eta in running_etas if eta is not None]
+    if len(known) < len(running_etas) or (waiting and not finished_seconds):
+        return None
+    typical = statistics.median(finished_seconds) if waiting else 0.0
+    finishes = sorted(known)[-seats:] + [0.0] * max(0, seats - len(known))
+    heapq.heapify(finishes)
+    for _case in range(waiting):
+        heapq.heappush(finishes, heapq.heappop(finishes) + typical)
+    return max(finishes)
+
+
+def _replacements(cases: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], str]:
+    """Map each failed case to the replacement that took its slot, from the status's exact ``parent_failed_case_id``.
+
+    Every replacement names its slot's failed primary, so the successor of a failed case is the first later case of
+    its material that names the same primary (the failed case itself when it is the primary).
+    """
+    pairs: dict[tuple[str, str], str] = {}
+    for failed in (case for case in cases if _board_group(case) == "failed"):
+        material, case_id = _group_label(failed), str(failed.get("case_id"))
+        slot = failed.get("parent_failed_case_id") or case_id
+        successors = sorted(
+            str(case.get("case_id"))
+            for case in cases
+            if _group_label(case) == material and case.get("parent_failed_case_id") == slot and str(case.get("case_id")) > case_id
         )
+        if successors:
+            pairs[material, case_id] = successors[0]
+    return pairs
+
+
+def _failed_parts(case: Mapping[str, Any], replaced: Mapping[tuple[str, str], str]) -> list[str]:
+    """Return the board fields of one failed case: its typed reason and detail and what became of its slot."""
+    code, detail = _available_text(case.get("failure_reason")), _available_text(case.get("failure_detail"))
+    typed = detail if code is None or (detail or "").startswith(code) else code if detail is None else f"{code}: {detail}"
+    reason = _bounded_text(typed, maximum=_MAX_REASON_CHARACTERS) or _failure_reason(case) or _text(case.get("classified_state")).replace("_", " ")
+    replacement = replaced.get((_group_label(case), str(case.get("case_id"))))
+    if case.get("terminal_decision") is None:
+        return [reason, "no decision recorded"]
+    return [reason, f"replaced by {replacement}" if replacement else "decision recorded"]
+
+
+def _is_unverified(case: Mapping[str, Any]) -> bool:
+    """Return whether one case failed for a COMPLETED step whose result evidence may still become visible on another node.
+
+    The status names that classification in ``reason``; a recorded failed decision settles the case, a recorded success
+    (the step's own decision, seen before its result files) does not.
+    """
+    return (
+        _board_group(case) == "failed"
+        and _available_text(case.get("reason")) == _UNVERIFIED_FAILURE_REASON
+        and case.get("terminal_decision") != "failed"
     )
-    return f"{campaign_header}\n{source_header}\n{summary}"
+
+
+class CampaignBoard:
+    """Render the live overview of one running campaign from the status payload the driver reads at every poll."""
+
+    def __init__(self, *, started: float, seats: int, verify_seconds: float) -> None:
+        """Observe from clock reading ``started``; ``seats`` is the number of parallel cases.
+
+        ``verify_seconds`` is how long an unverified failure reads as verifying before it reads as failed; the driver passes
+        its own failure settle window, so the board and the driver agree on it.
+        """
+        self._started = started
+        self._seats = max(1, seats)
+        self._verify_seconds = verify_seconds
+        self._signature: str | None = None
+        self._printed_at = started
+        self._evidence: dict[tuple[str, str], tuple[str, float]] = {}
+        self._unverified_since: dict[tuple[str, str], float] = {}
+        self._verifying_until: float | None = None
+
+    def observe(self, status: Mapping[str, Any], *, now: float) -> str | None:
+        """Record solver-evidence changes and first sightings of unverified failures; return the board when it is due, else ``None``.
+
+        The board is due at the first call, when the state signature of the campaign changed, after the repeat interval, and
+        when a case printed as verifying leaves that state because its window expired.
+        """
+        cases = _case_inventory(status)
+        self._unverified_since = {_case_key(case): self._unverified_since.get(_case_key(case), now) for case in cases if _is_unverified(case)}
+        if not cases:
+            return None
+        for case in cases:
+            fingerprint = common.serialization.canonical_json_sha256(_case_signature_parts(case)[1])
+            key = _case_key(case)
+            previous = self._evidence.get(key)
+            if previous is None or previous[0] != fingerprint:
+                self._evidence[key] = (fingerprint, now)
+        signature = campaign_monitor_signatures(status)[0]
+        window_closed = self._verifying_until is not None and now >= self._verifying_until
+        if signature == self._signature and now - self._printed_at < _BOARD_REPEAT_SECONDS and not window_closed:
+            return None
+        self._signature, self._printed_at = signature, now
+        ends = [since + self._verify_seconds for since in self._unverified_since.values()]
+        self._verifying_until = min((end for end in ends if end > now), default=None)
+        return self._render(status, cases, now)
+
+    def _group(self, case: Mapping[str, Any], now: float) -> str:
+        """Return the board group of one case at ``now``: an unverified failure inside its window is verifying, else its status group."""
+        since = self._unverified_since.get(_case_key(case))
+        if since is not None and now - since < self._verify_seconds:
+            return "verifying"
+        return _board_group(case)
+
+    def _render(self, status: Mapping[str, Any], cases: Sequence[Mapping[str, Any]], now: float) -> str:
+        """Return the header with the counts and the estimate, the node jobs, and one line per case."""
+        grouped = [(case, self._group(case, now)) for case in cases]
+        groups = {name: [case for case, group in grouped if group == name] for name in ("done", "running", "waiting", "failed", "verifying")}
+        running = {_case_key(case): _running_parts(case) for case in groups["running"]}
+        finished = [seconds for case in groups["done"] if (seconds := _elapsed_seconds(case.get("elapsed"))) is not None]
+        remaining = _remaining_seconds([eta for _parts, eta in running.values()], len(groups["waiting"]), finished, self._seats)
+        active = bool(running or groups["waiting"])
+        estimate = "unknown" if remaining is None else f"~{format_duration(remaining)}" if active else "none"
+        counts = "  ".join(f"{name} {len(members)}" for name, members in groups.items() if name != "verifying" or members)
+        lines = [f"Board  {counts}  of {len(cases)}  elapsed {format_duration(now - self._started)}  remaining {estimate}", *_node_job_lines(status)]
+        replaced = _replacements(cases)
+        width = max((len(_group_label(case)) for case in cases), default=0)
+        for case in sorted(cases, key=lambda item: (_group_label(item), str(item.get("case_id")))):
+            group = self._group(case, now)
+            key = _case_key(case)
+            parts = [_WAITING_WORDS.get(str(case.get("state")), _text(case.get("state")).replace("_", " "))]
+            if group == "running":
+                parts = list(running[key][0])
+                stale = now - self._evidence[key][1]
+                if stale > _BOARD_STALE_SECONDS:
+                    parts.append(f"no progress for {int(stale // _SECONDS_PER_MINUTE)} min")
+            elif group == "done":
+                took = _elapsed_seconds(case.get("elapsed"))
+                parts = [*_terminal_value_parts(case), *([] if took is None else [f"took {format_duration(took)}"])]
+            elif group == "verifying":
+                parts = [_VERIFYING_TEXT]
+            elif group == "failed":
+                parts = _failed_parts(case, replaced)
+            lines.append(f"{_group_label(case):<{width}}  {key[1]}  {group:<7}  {'  '.join(parts)}")
+        return "\n".join(lines)
 
 
 def format_benchmark_status_summary(
@@ -826,82 +1059,59 @@ def format_benchmark_status_summary(
     *,
     max_active_cases: int | None = None,
 ) -> str:
-    """Format benchmark status through the common bounded work-unit model."""
+    """Format benchmark sweep status through the common bounded work-unit model."""
     raw_units = status.get("work_units")
     units = raw_units if isinstance(raw_units, list) and all(isinstance(item, dict) for item in raw_units) else []
     normalized = [
         {
             **unit,
             "case_id": str(unit.get("work_unit_id", f"{unit.get('variant_id', 'unavailable')} {unit.get('case_role', 'unavailable')}")),
-            "batch_name": str(unit.get("variant_id", "unavailable")),
+            "batch_name": f"{unit.get('sweep_id', 'unavailable')}/{unit.get('variant_id', 'unavailable')}",
         }
         for unit in units
     ]
     categories = _CASE_SUMMARY_LABELS
     buckets = {name: [unit for unit in normalized if _case_bucket(unit) == name] for name in categories}
-    wave = status.get("current_wave")
-    wave_values = wave if isinstance(wave, dict) else {}
-    current_variant = wave_values.get("variant_id")
-    current_units = [unit for unit in normalized if unit.get("variant_id") == current_variant]
-    current_counts = {name: sum(_case_bucket(unit) == name for unit in current_units) for name in categories}
     lines = [
         f"Benchmark: {_text(status.get('suite_name'))}",
         f"Run: {_text(status.get('benchmark_run_id'))}",
         f"State: {_text(status.get('state'))}",
-        f"Wave: {_text(wave_values.get('wave_position'))}/{_text(status.get('wave_count'))}",
-        f"Current cores_per_case: {_text(wave_values.get('cores_per_case'))}",
         f"Measurements: {len(buckets['successful'])}/{len(normalized)} successful",
         "Work units: " + "  ".join(f"{name}={len(buckets[name])}" for name in categories) + f"  total={len(normalized)}",
     ]
-    if current_units:
-        lines.extend(
-            (
-                "",
-                "Current wave:",
-                f"  successful={current_counts['successful']}/{len(current_units)}",
-                f"  running={current_counts['running']}",
-                f"  scheduler_pending={current_counts['scheduler_pending']}",
-                f"  license_blocked={current_counts['license_blocked']}",
-                f"  elapsed={_text(status.get('current_wave_elapsed'))}",
-                f"  last_progress_timestamp={_text(status.get('last_progress_timestamp'))}",
-                f"  eta={_text(status.get('eta'))}",
+    sweeps = status.get("sweeps")
+    if isinstance(sweeps, list):
+        lines.append("")
+        lines.append("Sweeps:")
+        for sweep in sweeps:
+            if not isinstance(sweep, dict):
+                continue
+            lines.append(
+                f"  {_text(sweep.get('sweep_id'))} ({_text(sweep.get('order'))}): state={_text(sweep.get('state'))} "
+                f"variants={_text(sweep.get('measured_variants'))}/{_text(sweep.get('total_variants'))} "
+                f"current_cores_per_case={_text(sweep.get('current_cores_per_case'))} "
+                f"node_jobs={','.join(str(item) for item in sweep.get('node_job_ids') or []) or 'none'}"
             )
-        )
+    lines.append(f"Last progress: {_text(status.get('last_progress_timestamp'))}  eta={_text(status.get('eta'))}")
     detail_limit = _MAX_ACTIONABLE_DETAILS if max_active_cases is None else max_active_cases
     _actionable_section(lines, "Running work units", buckets["running"], maximum=max_active_cases, renderer=_active_case_lines)
-    _actionable_section(lines, "Scheduler-pending work units", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
-    _actionable_section(lines, "License-blocked work units", buckets["license_blocked"], maximum=detail_limit, renderer=_license_blocked_lines)
-    _actionable_section(lines, "Failed work units", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
+    _actionable_section(lines, "Queued work units", buckets["scheduler_pending"], maximum=None, renderer=_scheduler_pending_lines)
+    _actionable_section(lines, "Failed or interrupted work units", buckets["failed"], maximum=detail_limit, renderer=_failed_case_lines)
     _actionable_section(lines, "Completed work units", buckets["successful"], maximum=None, renderer=_completed_case_lines)
     if buckets["not_admitted"]:
-        _append_section(lines, "Not admitted", _grouped_population_rows(buckets["not_admitted"]))
+        _append_section(lines, "Not yet dispatched", _grouped_population_rows(buckets["not_admitted"]))
     partial = status.get("partial_evaluation")
     if isinstance(partial, dict):
-        lines.extend(("", "Partial wave evaluation (provisional):"))
-        variants = partial.get("variants")
-        if isinstance(variants, list):
-            for variant in variants:
-                if not isinstance(variant, dict):
-                    continue
-                lines.extend(
-                    (
-                        f"  {variant.get('variant_id')}:",
-                        f"    cores_per_case={_text(variant.get('cores_per_case'))}",
-                        f"    successful_measurement_count={_text(variant.get('successful_measurement_count'))}",
-                        f"    median_comsol_process_seconds={_text(variant.get('median_comsol_process_seconds'))}",
-                        f"    minimum_comsol_process_seconds={_text(variant.get('minimum_comsol_process_seconds'))}",
-                        f"    maximum_comsol_process_seconds={_text(variant.get('maximum_comsol_process_seconds'))}",
-                        f"    median_core_hours_per_case={_text(variant.get('median_core_hours_per_case'))}",
-                        f"    estimated_cases_per_node={_text(variant.get('estimated_cases_per_node'))}",
-                        f"    estimated_compute_only_cases_per_node_hour={_text(variant.get('estimated_cases_per_node_hour'))}",
-                        f"    scheduler_queue_seconds={_text(variant.get('scheduler_queue_seconds'))}",
-                        f"    license_wait_seconds={_text(variant.get('license_wait_seconds'))}",
-                        f"    license_probe_seconds={_text(variant.get('license_probe_seconds'))}",
-                        f"    observed_solver_concurrency={_text(variant.get('observed_peak_solver_concurrency'))}",
-                        f"    peak_memory_per_case_bytes={_text(variant.get('peak_memory_per_case_bytes'))}",
-                        f"    peak_scratch_per_case_bytes={_text(variant.get('peak_scratch_per_case_bytes'))}",
-                    )
-                )
+        lines.extend(("", "Measured sweep variants (provisional):"))
+        measurements = partial.get("measurements")
+        for row in measurements if isinstance(measurements, list) else []:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"  {_text(row.get('sweep_id'))} k={_text(row.get('cores_per_case'))}: node={_text(row.get('node'))} "
+                f"successful={_text(row.get('successful_cases'))}/{_text(row.get('cases'))} "
+                f"makespan_s={_text(row.get('makespan_seconds'))} cases_per_node_hour={_text(row.get('throughput_cases_per_node_hour'))}"
+            )
         lines.append(f"  provisional_recommendation={_text(partial.get('recommended_cores_per_case'))}")
     final_summary = status.get("final_summary")
     if isinstance(final_summary, dict):
@@ -913,19 +1123,15 @@ def format_benchmark_status_summary(
                 (
                     "",
                     f"Final benchmark summary: {_text(final_summary.get('path'))}",
-                    f"  fastest_single_case_cores={_text(final_summary.get('fastest_single_case_cores'))}",
-                    f"  lowest_core_hours_cores={_text(final_summary.get('lowest_core_hours_cores'))}",
                     f"  recommended_cores_per_case={_text(final_summary.get('recommended_cores_per_case'))}",
-                    f"  estimated_cases_per_node={_text(final_summary.get('estimated_cases_per_node'))}",
-                    (f"  estimated_compute_only_cases_per_node_hour={_text(final_summary.get('estimated_compute_only_cases_per_node_hour'))}"),
-                    f"  license_qualification={_text(final_summary.get('license_qualification'))}",
+                    f"  recommended_throughput_cases_per_node_hour={_text(final_summary.get('recommended_throughput_cases_per_node_hour'))}",
                 )
             )
     return "\n".join(lines)
 
 
 def format_benchmark_monitor(status: Mapping[str, Any], *, max_active_cases: int) -> str:
-    """Format a rate-limit header and shared benchmark summary."""
+    """Format a rate-limit header and the shared benchmark summary."""
     raw_units = status.get("work_units")
     units = raw_units if isinstance(raw_units, list) else []
     normalized = [
@@ -942,8 +1148,7 @@ def format_benchmark_monitor(status: Mapping[str, Any], *, max_active_cases: int
     benchmark_state = common.serialization.canonical_json_sha256(
         {
             "common_state_signature": state_signature,
-            "current_wave": status.get("current_wave"),
-            "waves": status.get("waves"),
+            "sweeps": status.get("sweeps"),
             "partial_evaluation": status.get("partial_evaluation"),
         }
     )

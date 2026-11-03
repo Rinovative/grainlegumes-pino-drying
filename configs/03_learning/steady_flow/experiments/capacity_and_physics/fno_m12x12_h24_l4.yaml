@@ -1,0 +1,26 @@
+# Role: one steady_flow experiment; values set here override base.yaml. Edit: freely.
+# Recreated from named run: S-FNO_m12x12_h24_l4_20260109_201346
+task: steady_flow  # Selects the task contract and its compatible data/model/loss validation.
+base: ../../base.yaml  # Shared task settings; every value set below overrides them.
+
+run:
+  deterministic: true  # Request deterministic kernels where supported; may reduce performance or reject unsupported operations.
+
+model:
+  kind: fno  # Select the architecture family; its params below are interpreted by that family.
+  params:
+    n_modes: [12, 12]  # Fourier modes retained along each spatial axis; higher values increase spectral capacity and cost.
+    hidden_channels: 24  # Width of the model’s hidden feature representation.
+    n_layers: 4  # Number of architecture layers/blocks; affects capacity and compute.
+    lifting_channel_ratio: 2  # FNO lifting width relative to hidden_channels.
+    projection_channel_ratio: 2  # FNO projection width relative to hidden_channels.
+    fno_skip: linear  # FNO spectral-block skip connection type.
+    channel_mlp_skip: soft-gating  # Channel-MLP skip connection type.
+    implementation: factorized  # FNO spectral implementation choice; factorized uses factorized spectral weights.
+
+loss:
+  physics:
+    enabled: false  # Enable the physics residual and boundary loss terms.
+
+optimizer:
+  lr: 1.0e-2  # Initial learning rate; controls the optimizer update scale.

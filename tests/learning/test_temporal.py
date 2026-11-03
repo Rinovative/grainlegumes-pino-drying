@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Explicit temporal-conditioning transformation contracts."""
+"""Explicit temporal-conditioning transformation contracts.
+
+Responsibilities:
+  - Check configured temporal conditioning and incompatible time-scale rejection
+
+Design principles:
+  - Explicit horizon semantics replace inferred time policies
+
+This module does NOT:
+  - Sample rollout windows or allocate training horizons
+"""
 
 from __future__ import annotations
 

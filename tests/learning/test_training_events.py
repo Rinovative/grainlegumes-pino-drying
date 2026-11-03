@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Protect the one canonical completed-epoch event predicate."""
+"""Protect the one canonical completed-epoch event predicate.
+
+Responsibilities:
+  - Check terminal-inclusive completed-epoch cadence and invalid epoch rejection
+
+Design principles:
+  - Epoch zero cannot produce a completed training event
+
+This module does NOT:
+  - Run evaluation or publish checkpoint state
+"""
 
 from __future__ import annotations
 

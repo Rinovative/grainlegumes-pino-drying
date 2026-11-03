@@ -1,15 +1,15 @@
-"""
-generation_input_plot_permeability.py
+"""Compose tensor and derived-permeability A/B spatial comparisons.
 
-Compose tensor and derived-permeability A/B spatial comparisons.
 Responsibilities:
   - Group Kxx, Kxy, and Kyy as tensor-component rows
   - Group per-case principal permeabilities and anisotropy as derived rows
   - Reuse the common independent-or-locked A/B/B-minus-A map contract
+
 Design principles:
   - Kxy remains signed and zero-centred in raw and difference maps
   - Nonlinear eigenvalue diagnostics are derived per case before aggregation
   - Every component retains its physical unit and distribution
+
 This module does NOT:
   - Render single-case alternatives or recompute permeability diagnostics
   - Define tensor validity, resample grids, or load input files
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
     from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+    from src.analysis.presentation import analysis_display_grid as display_grid
 
 TENSOR_FIELDS: Final = ("Kxx", "Kxy", "Kyy")
 DERIVED_FIELDS: Final = ("K_min", "K_max", "K_anisotropy")
@@ -38,6 +39,7 @@ def tensor_comparison(
     mean_b: diagnostics.DatasetDiagnostics,
     *,
     lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """Render all permeability tensor components as A/B/B-minus-A rows."""
     return spatial.comparison_block(
@@ -48,6 +50,7 @@ def tensor_comparison(
         TENSOR_FIELDS,
         title="Permeability tensor",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
         include_distributions=True,
     )
 
@@ -59,6 +62,7 @@ def derived_comparison(
     mean_b: diagnostics.DatasetDiagnostics,
     *,
     lock_scale: bool,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure | widgets.HTML:
     """Render principal permeability and anisotropy as A/B/B-minus-A rows."""
     return spatial.comparison_block(
@@ -69,5 +73,6 @@ def derived_comparison(
         DERIVED_FIELDS,
         title="Derived permeability",
         lock_scale=lock_scale,
+        display_spatial_stride=display_spatial_stride,
         include_distributions=True,
     )

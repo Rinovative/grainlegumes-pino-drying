@@ -2,6 +2,7 @@
 Semantic neural-operator model construction.
 
 Provides:
+- naming: metadata-only architecture descriptors
 - factory: configuration-driven FNO and UNO construction
 """
 
@@ -12,9 +13,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import learning_models_factory as factory
+    from . import learning_models_naming as naming
 
-_MODULES = {"factory": "learning_models_factory"}
-__all__ = ["factory"]
+_MODULES = {"factory": "learning_models_factory", "naming": "learning_models_naming"}
+__all__ = ["factory", "naming"]
 
 
 def __getattr__(name: str) -> object:

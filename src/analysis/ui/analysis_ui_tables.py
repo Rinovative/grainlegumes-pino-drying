@@ -1,15 +1,15 @@
-"""
-analysis_ui_tables.py
+"""Render reusable styled DataFrame tables for analysis notebooks.
 
-Render reusable styled DataFrame tables for analysis notebooks.
 Responsibilities:
   - Format numeric table values consistently for notebook display
   - Derive reusable readable row-local colors for HTML and figure tables
   - Compose compact single or grouped table widget layouts with safe titles
+
 Design principles:
   - Table styling is presentation-only
   - Numeric color scaling is configurable by column or per-row
   - Callers retain ownership of table content, grouping, and semantic labels
+
 This module does NOT:
   - Compute scientific statistics or choose displayed columns
   - Compose notebook sections or manage figure-export state

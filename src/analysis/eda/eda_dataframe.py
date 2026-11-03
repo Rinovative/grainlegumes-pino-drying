@@ -1,16 +1,13 @@
-"""
-eda_dataframe.py
-
-Materialize bounded task-aware EDA frames from generated COMSOL batches.
+"""Materialize bounded task-aware EDA frames from admitted Source cases.
 
 Responsibilities:
-  - Load a validated manifest-ordered generated-batch prefix
+  - Read an exact campaign case prefix through Source admission
   - Preserve task field physical units, stored representations, roles, and identities
   - Derive speed magnitude when the task declares compatible velocity outputs
 
 Design principles:
-  - EDA reads the generation domain without resolving training datasets
-  - Bounded prefixes preserve manifest order and disclose available case counts
+  - EDA reads Source evidence without assigning training or Evaluation roles
+  - Bounded prefixes preserve campaign candidate order and disclose available case counts
   - Task contracts remain authoritative for field names and scientific metadata
 
 This module does NOT:
@@ -21,94 +18,21 @@ This module does NOT:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
+from src import domain
+
+_SPATIAL_DIMENSIONS = 2
+
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from src.analysis.eda.eda_sources import GeneratedOutputEDABatch
     from src.domain.tasks.domain_task_spec import TaskSpec
-
-
-class _CompletedCaseBatch(Protocol):
-    """Describe one EDA-visible collection of Generation-admitted completed cases."""
-
-    @property
-    def source_kind(self) -> str:
-        """Return terminal or partial source classification."""
-        ...
-
-    @property
-    def batch_id(self) -> str:
-        """Return immutable batch identity."""
-        ...
-
-    @property
-    def batch_name(self) -> str:
-        """Return the logical batch name."""
-        ...
-
-    @property
-    def batch_storage_name(self) -> str:
-        """Return the canonical batch storage locator."""
-        ...
-
-    @property
-    def campaign_run_id(self) -> str | None:
-        """Return the partial campaign identity when applicable."""
-        ...
-
-    @property
-    def campaign_state(self) -> str | None:
-        """Return the partial campaign state when applicable."""
-        ...
-
-    @property
-    def campaign_sources(self) -> tuple[tuple[str, str], ...]:
-        """Return every campaign run and state contributing partial evidence."""
-        ...
-
-    @property
-    def generation_root(self) -> Path:
-        """Return the canonical Generation root."""
-        ...
-
-    @property
-    def interpreter_batch(self) -> Any:
-        """Return the exact admitted batch view for Dataset interpretation."""
-        ...
-
-    @property
-    def cases(self) -> tuple[Any, ...]:
-        """Return ordered individually admitted cases."""
-        ...
-
-    @property
-    def available_case_count(self) -> int:
-        """Return the admitted valid-case count."""
-        ...
-
-    @property
-    def discovered_case_count(self) -> int:
-        """Return complete candidate-case accounting."""
-        ...
-
-    @property
-    def failed_case_count(self) -> int:
-        """Return authoritative failed-case count."""
-        ...
-
-    @property
-    def incomplete_case_count(self) -> int:
-        """Return running or incomplete-case count."""
-        ...
-
-    @property
-    def invalid_case_count(self) -> int:
-        """Return corrupt or identity-invalid case count."""
-        ...
 
 
 def _transient_dataframe(
@@ -254,93 +178,183 @@ def _steady_dataframe(
     return frame, logs
 
 
+def load_published_dataset_frame(
+    manifest: dict[str, Any],
+    *,
+    storage_root: Path,
+    max_cases: int | None,
+) -> pd.DataFrame:
+    """
+    Read actual model-facing package values with full-grid scientific support.
+
+    Steady PT admission necessarily materializes the complete payload once.
+    Transient admission reads the index, then limits source-array reads to the
+    selected complete cases. Fitted Training normalizers are never invented.
+    """
+    from src import datasets  # noqa: PLC0415
+    from src.datasets.runtime import dataset_runtime_steady as steady_runtime  # noqa: PLC0415
+    from src.datasets.runtime import dataset_runtime_transient as transient_runtime  # noqa: PLC0415
+
+    from . import eda_transient as transient  # noqa: PLC0415
+
+    view = datasets.contracts.views.get_view(str(manifest["dataset_view"]))
+    sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition") if view.id == "transient_drying" else None
+    identities = manifest["source_case_identities"]
+    selected = identities if max_cases is None else identities[:max_cases]
+    package_ids = tuple(str(case["package_case_id"]) for case in selected)
+    request = datasets.runtime.factory.DatasetRequest(
+        dataset_id=str(manifest["dataset_id"]),
+        dataset_view=view.id,
+        case_ids=package_ids,
+        transient_sampling=sampling,
+        storage_root=storage_root,
+        transient_backend_preference="canonical_hdf5",
+        spatial_stride=1,
+    )
+    runtime = datasets.runtime.factory.create_dataset(request)
+    task = domain.tasks.registry.get_task(view.id)
+    if isinstance(runtime, transient_runtime.TransientPhysicalDataset):
+        try:
+            cases = {case["package_case_id"]: case for case in runtime.payload["cases"]}
+            items = []
+            for package_id in package_ids:
+                case = cases[package_id]
+                arrays = runtime.read_case_arrays(package_id)
+                items.append(
+                    {
+                        "state": arrays.states[0],
+                        "state_sequence": arrays.states,
+                        "target": arrays.states[1:] - arrays.states[:-1],
+                        "static": arrays.static,
+                        "scalars": arrays.scalars,
+                        "boundary": arrays.boundary,
+                        "time": {"t_n": arrays.time[:-1], "t_n_plus_1": arrays.time[1:], "dt": np.diff(arrays.time)},
+                        "metadata": {
+                            **{
+                                key: case[key]
+                                for key in (
+                                    "simulation_case_id",
+                                    "case_input_id",
+                                    "source_batch_id",
+                                    "material_family",
+                                    "source_simulation_profile",
+                                )
+                            },
+                            "dataset_id": runtime.dataset_id,
+                            "configured_horizon_hours": runtime.configured_regular_horizon,
+                        },
+                    }
+                )
+            frame = transient.frame_from_transient_items(items, backend=runtime.storage_backend)
+        finally:
+            runtime.close()
+    elif isinstance(runtime, steady_runtime.SteadyFlowDataset | steady_runtime.SteadyDatasetSelection):
+        positions = {sample_id: index for index, sample_id in enumerate(runtime.identity.sample_ids)}
+        rows: list[dict[str, Any]] = []
+        for case_id in package_ids:
+            item = runtime[positions[case_id]]
+            inputs, targets = item["x"].numpy(), item["y"].numpy()
+            rows.append(
+                {field: inputs[index] for index, field in enumerate(task.input_names)}
+                | {field: targets[index] for index, field in enumerate(task.output_names)}
+                | {"meta": dict(item["meta"])}
+            )
+        loaded = {
+            "sample_ids": package_ids,
+            "rows": rows,
+            "available_case_count": len(identities),
+            "generated_batch_identity": None,
+            "manifest_sha256": manifest["dataset_digest"],
+            "generation_root": storage_root,
+            "dataset_backend": "published_steady_pt",
+            "case_accounting_scope": "published_package_membership",
+        }
+        frame, _logs = _steady_dataframe(loaded, batch_name=str(manifest["dataset_name"]), task=task)
+        frame.attrs["source_physical_field_units"] = dict(frame.attrs["field_units"])
+        frame.attrs["field_units"] = {
+            name: "1" if frame.attrs["field_representations"][name].startswith("dimensionless_") else unit
+            for name, unit in frame.attrs["field_units"].items()
+        }
+    else:
+        message = f"Unsupported published runtime type: {type(runtime).__name__}."
+        raise TypeError(message)
+    frame.attrs.update(
+        dataset_id=manifest["dataset_id"],
+        dataset_manifest=manifest,
+        dataset_view=view.id,
+        available_case_count=len(identities),
+        loaded_case_count=len(selected),
+        case_accounting_scope="published_package_membership",
+        normalization="Published values before train-fitted normalization; no fitted scaler is loaded.",
+    )
+    return frame
+
+
 def generate_eda_dataframe_from_completed_cases(
-    batch: _CompletedCaseBatch,
+    batch: GeneratedOutputEDABatch,
     *,
     task: TaskSpec,
     show_progress: bool = True,
     max_cases: int | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Materialize one bounded EDA frame from independently admitted completed cases.
-
-    Parameters
-    ----------
-    batch : completed-case batch evidence
-        Case-local Generation evidence assembled by the EDA source catalog.
-    task : TaskSpec
-        Requested task contract.
-    show_progress : bool, optional
-        Enable bounded per-case progress feedback.
-    max_cases : int | None, optional
-        Positive per-batch manifest-order prefix bound.
-
-    Returns
-    -------
-    tuple[pandas.DataFrame, list[str]]
-        Task-aware EDA frame and concise source-loading logs.
-
-    Notes
-    -----
-    This path intentionally does not construct a terminal batch manifest or a
-    Dataset generated-batch identity. It is an EDA-only view over case-local
-    Generation admission evidence.
-
-    """
-    del show_progress  # Completed-case EDA avoids notebook progress side effects.
-    if batch.source_kind != "partial":
-        message = "Case-local EDA materialization accepts partial campaign evidence only."
+    """Materialize exact successful Source cases from one current campaign view."""
+    del show_progress  # Case-local EDA avoids notebook progress side effects.
+    if task.id != batch.simulation_profile:
+        message = "Generation EDA task contradicts its selected campaign."
         raise ValueError(message)
     if max_cases is not None and (isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases < 1):
         message = f"max_cases must be a positive integer or None, got {max_cases!r}."
         raise ValueError(message)
-    if not batch.cases:
-        message = f"Generated-output EDA batch {batch.batch_id!r} has no admitted completed cases."
+    selected = batch.cases if max_cases is None else batch.cases[:max_cases]
+    if not selected:
+        message = f"Generation EDA campaign {batch.campaign_name!r} has no successful cases."
         raise ValueError(message)
     from src import datasets  # noqa: PLC0415
 
-    selected = batch.cases if max_cases is None else batch.cases[:max_cases]
     rows: list[dict[str, Any]] = []
-    interpreter_batch = batch.interpreter_batch
     for case in selected:
+        admitted = batch.admit_case(case)
         if task.id == "transient_drying":
-            rows.append(datasets.packages.generated_batch.interpret_generated_transient_case(interpreter_batch, case, task=task))
+            rows.append(datasets.packages.generated_batch.interpret_admitted_transient_source_case(admitted, task=task))
         elif task.id == "steady_flow":
-            _shape, inputs, outputs, metadata, _source, _fingerprint = datasets.packages.generated_batch.interpret_generated_case(
-                interpreter_batch,
-                case,
+            _shape, inputs, outputs, metadata, source, _fingerprint = datasets.packages.generated_batch.interpret_admitted_source_case(
+                admitted,
+                package_case_id=case.case_id,
                 task=task,
             )
             rows.append(
                 {
                     **{name: inputs[index].numpy() for index, name in enumerate(task.input_names)},
                     **{name: outputs[index].numpy() for index, name in enumerate(task.output_names)},
-                    "meta": metadata,
+                    "meta": {**metadata, "source_design_provenance": admitted.design_provenance},
+                    "source": source,
                 }
             )
         else:
-            message = f"Generated-output EDA does not support task {task.id!r}."
+            message = f"Generation EDA does not support task {task.id!r}."
             raise ValueError(message)
-    available = batch.available_case_count
-    exclusion_reasons = {} if batch.invalid_case_count == 0 else {"invalid_or_corrupt": batch.invalid_case_count}
     loaded = {
         "sample_ids": [case.case_id for case in selected],
         "rows": rows,
-        "available_case_count": available,
+        "available_case_count": batch.available_case_count,
         "total_discovered_case_count": batch.discovered_case_count,
         "failed_case_count": batch.failed_case_count,
         "incomplete_case_count": batch.incomplete_case_count,
         "invalid_case_count": batch.invalid_case_count,
-        "exclusion_reasons": exclusion_reasons,
-        "case_accounting_scope": "individually_admitted_campaign_cases",
+        "exclusion_reasons": {},
+        "case_accounting_scope": "generation_source_campaign_candidates",
         "task": task,
         "generated_batch_identity": {
-            "source_kind": "individually_admitted_campaign_cases",
-            "campaign_run_id": batch.campaign_run_id,
-            "campaign_state": batch.campaign_state,
-            "campaign_sources": [{"run_id": run_id, "state": state} for run_id, state in batch.campaign_sources],
-            "batch_id": batch.batch_id,
-            "case_ids": [case.case_id for case in batch.cases],
+            "schema_kind": "analysis_generation_campaign_selection",
+            "schema_version": 1,
+            "campaign_name": batch.campaign_name,
+            "campaign_digest": batch.campaign_digest,
+            "material_family": batch.material_family,
+            "domain_profile": batch.domain_profile,
+            "source_selectors": [case.selector for case in selected],
+            "design_provenance": [
+                row["source"]["design_provenance"] if task.id == "transient_drying" else row["meta"]["source_design_provenance"] for row in rows
+            ],
         },
         "manifest_sha256": None,
         "generation_root": batch.generation_root,
@@ -348,39 +362,76 @@ def generate_eda_dataframe_from_completed_cases(
         "dataset_backend": "canonical_generation_hdf5",
     }
     if task.id == "transient_drying":
-        return _transient_dataframe(loaded, batch_name=batch.batch_storage_name, task=task)
-    return _steady_dataframe(loaded, batch_name=batch.batch_storage_name, task=task)
+        return _transient_dataframe(loaded, batch_name=batch.campaign_name, task=task)
+    return _steady_dataframe(loaded, batch_name=batch.campaign_name, task=task)
 
 
-def generate_eda_dataframe(
-    batch_name: str,
-    *,
-    task: TaskSpec,
-    storage_root: str | Path | None = None,
-    show_progress: bool = True,
-    max_cases: int | None = None,
-) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Materialize one validated manifest-ordered generated-batch prefix.
+@dataclass(frozen=True, slots=True)
+class PublishedTensorValue:
+    """Bind a stored model input or target to its authoritative tensor contract."""
 
-    The shared generated-source reader enforces the same manifest hashes, unit
-    headers, Cartesian grid, finite values, porosity, permeability, transforms,
-    and task field ordering as the final dataset builder. No model-training path
-    is resolved or opened.
-    """
+    group: str
+    purpose: str
+    name: str
+    unit: str
+    representation: str
+    support: str
+    array: np.ndarray
+
+
+def published_tensor_values(frame: pd.DataFrame, case_id: str, *, transition: int = 0) -> tuple[PublishedTensorValue, ...]:
+    """Inspect actual package inputs and targets without fitting or decoding them."""
     from src import datasets  # noqa: PLC0415
 
-    loaded: dict[str, Any] = datasets.packages.generated_batch.load_generated_batch(
-        batch_name,
-        task_id=task.id,
-        storage_root=storage_root,
-        show_progress=show_progress,
-        max_cases=max_cases,
-    )
-    loaded_task = loaded["task"]
-    if loaded_task.contract_digest != task.contract_digest:
-        msg = f"Generated reader task contract does not match requested task {task.id!r}."
-        raise ValueError(msg)
-    if task.id == "transient_drying":
-        return _transient_dataframe(loaded, batch_name=batch_name, task=task)
-    return _steady_dataframe(loaded, batch_name=batch_name, task=task)
+    view_id = frame.attrs.get("dataset_view")
+    if not isinstance(view_id, str) or case_id not in frame.index:
+        message = "Published tensor inspection requires an admitted package and exact case."
+        raise ValueError(message)
+    inspection = datasets.contracts.views.inspect_contract(view_id)
+    row = frame.loc[case_id]
+    transient = view_id == "transient_drying"
+    if transient:
+        transition_times = np.asarray(row["time"]["transition_t_n_hours"])
+        if isinstance(transition, bool) or not isinstance(transition, int) or not 0 <= transition < transition_times.size:
+            message = "Transient tensor inspection requires an exact stored transition index."
+            raise ValueError(message)
+    elif transition != 0:
+        message = "Steady tensor inspection has no transition dimension."
+        raise ValueError(message)
+    results = []
+    for group in inspection.groups:
+        if group.purpose == "archive":
+            continue
+        for field in group.fields:
+            if not transient:
+                values = np.asarray(row[field.name])
+                support = "domain"
+                if field.name == "p_in_bc":
+                    x = np.asarray(row["x"])
+                    values = values[x == np.min(x)]
+                    support = "inlet boundary"
+            elif group.name == "state":
+                values = np.asarray(row["state_trajectories"][field.name][transition])
+                support = "domain at current state time"
+            elif group.name == "target":
+                values = np.asarray(row["target_increments"][field.name][transition])
+                support = "domain; next-state minus current-state"
+            elif group.name == "static":
+                values = np.asarray(row["static_fields"][field.name])
+                support = "static domain"
+            elif group.name == "boundary":
+                values = np.asarray(row["boundary_intervals"][field.name][transition])
+                support = "transition boundary conditioning"
+            elif group.name == "scalars":
+                values = np.asarray(row["scalar_conditioning"][field.name])
+                support = "material scalar"
+            else:
+                message = f"Unsupported published tensor group: {group.name}."
+                raise ValueError(message)
+            representation = field.representation or "physical value"
+            unit = "1" if representation.startswith("dimensionless_") else field.unit
+            if values.ndim == _SPATIAL_DIMENSIONS and field.name in {"rho_bu_dry", "rho_gr_dry"} and np.all(values == values.flat[0]):
+                values = np.asarray(values.flat[0])
+                support = "constant density (metadata)"
+            results.append(PublishedTensorValue(group.name, group.purpose, field.name, unit, representation, support, values))
+    return tuple(results)

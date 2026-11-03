@@ -1,16 +1,16 @@
-"""
-generation_input_plot_layout.py
+"""Define notebook-width map, normalization, and colorbar contracts.
 
-Define notebook-width map, normalization, and colorbar contracts.
 Responsibilities:
   - Create bounded generation-input map and composite figure grids
   - Attach every map colorbar directly to its associated map axis
   - Centralize independent, locked, and signed physical normalization
   - Record map-to-colorbar bindings for focused geometry verification
+
 Design principles:
   - Colorbar geometry follows settled map-axis geometry after canvas drawing
   - Every map retains its own axes-coupled colorbar
   - Presentation helpers never transform or clip displayed scientific values
+
 This module does NOT:
   - Load generation inputs, derive fields, or select cases
   - Import evaluation internals or use manually positioned colorbar axes
@@ -24,11 +24,12 @@ from weakref import WeakKeyDictionary
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import Normalize, TwoSlopeNorm
 from matplotlib.layout_engine import ConstrainedLayoutEngine
 from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-untyped]
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_field_maps as field_maps
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -108,6 +109,7 @@ class MapColorbarBinding:
 
 
 _COLORBAR_BINDINGS = WeakKeyDictionary()
+_MAP_SCALES: WeakKeyDictionary[ScalarMappable, field_maps.FieldMapDefinition] = WeakKeyDictionary()
 
 
 def _reserve_outer_colorbar_labels(figure: Figure) -> None:
@@ -166,42 +168,27 @@ def map_subplots(*, rows: int, columns: int) -> tuple[Figure, np.ndarray]:
     return figure, axes
 
 
-def linear_norm(*values: np.ndarray) -> Normalize:
-    """Return one finite linear normalization shared by all supplied arrays."""
-    if not values:
-        message = "A physical normalization requires at least one array."
-        raise ValueError(message)
-    combined = np.concatenate(tuple(np.ravel(np.asarray(value, dtype=np.float64)) for value in values))
-    if not np.isfinite(combined).all():
-        message = "Map normalization requires finite physical values."
-        raise ValueError(message)
-    lower = float(np.min(combined))
-    upper = float(np.max(combined))
-    if lower == upper:
-        padding = max(abs(lower), 1.0) * 1.0e-12
-        lower -= padding
-        upper += padding
-    return Normalize(vmin=lower, vmax=upper)
+def signed_norm(*values: np.ndarray) -> field_maps.FieldMapDefinition:
+    """Use the shared zero-centred eleven-interval signed-difference scale."""
+    return field_maps.build_field_map(
+        np.concatenate(tuple(np.ravel(value) for value in values)),
+        semantic=field_maps.FieldMapSemantic.SIGNED_ERROR,
+    )
 
 
-def signed_norm(*values: np.ndarray) -> TwoSlopeNorm:
-    """Return one symmetric finite normalization centred exactly at zero."""
-    if not values:
-        message = "A signed normalization requires at least one array."
-        raise ValueError(message)
-    combined = np.concatenate(tuple(np.ravel(np.asarray(value, dtype=np.float64)) for value in values))
-    if not np.isfinite(combined).all():
-        message = "Signed map normalization requires finite physical values."
-        raise ValueError(message)
-    limit = max(float(np.max(np.abs(combined))), float(np.finfo(np.float64).eps))
-    return TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
-
-
-def physical_norm(quantity: str, *values: np.ndarray) -> Normalize:
-    """Return one data-driven physical normalization for a quantity."""
+def physical_norm(quantity: str, *values: np.ndarray) -> field_maps.FieldMapDefinition:
+    """Build one shared discrete physical scale from complete source arrays."""
+    semantic = field_maps.FieldMapSemantic.LINEAR_POSITIVE
     if quantity == "Kxy":
-        return signed_norm(*values)
-    return linear_norm(*values)
+        semantic = field_maps.FieldMapSemantic.LINEAR_SIGNED
+    elif quantity in {"Kxx", "Kyy", "K_min", "K_max"}:
+        semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
+    return field_maps.build_field_map(
+        np.concatenate(tuple(np.ravel(value) for value in values)),
+        semantic=semantic,
+        field=quantity,
+        unit=diagnostics.FIELD_UNITS[quantity],
+    )
 
 
 def comparison_norms(
@@ -210,7 +197,7 @@ def comparison_norms(
     second: np.ndarray,
     *,
     lock_scale: bool,
-) -> tuple[Normalize, Normalize]:
+) -> tuple[field_maps.FieldMapDefinition, field_maps.FieldMapDefinition]:
     """
     Return independent or exactly shared A/B physical normalizations.
 
@@ -230,19 +217,19 @@ def draw_array_map(
     values: np.ndarray,
     *,
     title: str,
-    norm: Normalize,
-    cmap: str | None = None,
+    norm: field_maps.FieldMapDefinition,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> ScalarMappable:
     """Draw one exact structured-grid array without creating a colorbar."""
-    resolved_cmap = "coolwarm" if isinstance(norm, TwoSlopeNorm) else "viridis"
+    indices = display_grid.display_indices(values.shape, display_spatial_stride)
     image = axis.pcolormesh(
-        x_coordinates,
-        y_coordinates,
-        values,
+        display_grid.display_sample(x_coordinates, indices),
+        display_grid.display_sample(y_coordinates, indices),
+        display_grid.display_sample(values, indices),
         shading="auto",
-        cmap=resolved_cmap if cmap is None else cmap,
-        norm=norm,
+        **norm.pcolormesh_kwargs(),
     )
+    _MAP_SCALES[image] = norm
     axis.set_aspect("equal")
     axis.set_xlabel("x [m]", fontsize=MAP_LAYOUT.label_size)
     axis.set_ylabel("y [m]", fontsize=MAP_LAYOUT.label_size)
@@ -257,8 +244,8 @@ def draw_map(
     quantity: str,
     *,
     title: str,
-    norm: Normalize | None = None,
-    cmap: str | None = None,
+    norm: field_maps.FieldMapDefinition | None = None,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> ScalarMappable:
     """Draw one exact structured-grid field without creating a colorbar."""
     if quantity not in diagnostics.display_field_names(record):
@@ -273,7 +260,7 @@ def draw_map(
         values,
         title=title,
         norm=resolved_norm,
-        cmap=cmap,
+        display_spatial_stride=display_spatial_stride,
     )
 
 
@@ -317,7 +304,8 @@ def add_map_colorbar(
         size=f"{100.0 * MAP_LAYOUT.colorbar_width_fraction:g}%",
         pad=f"{100.0 * MAP_LAYOUT.colorbar_pad_fraction:g}%",
     )
-    colorbar = figure.colorbar(image, cax=colorbar_axis)
+    scale = _MAP_SCALES[image]
+    colorbar = figure.colorbar(image, cax=colorbar_axis, **scale.colorbar_kwargs())
     colorbar.set_label(label, fontsize=MAP_LAYOUT.label_size)
     colorbar.ax.tick_params(labelsize=MAP_LAYOUT.tick_size)
     _bindings(figure).append(
@@ -380,11 +368,3 @@ def align_axis_to_references(
 
     align()
     figure.canvas.mpl_connect("draw_event", align)
-
-
-def readable_case_title(
-    quantity: str,
-    record: diagnostics.GenerationInputDiagnostics,
-) -> str:
-    """Return a concise map title without source paths or technical identities."""
-    return f"{diagnostics.FIELD_LABELS[quantity]} — {diagnostics.case_display_label(record)}"

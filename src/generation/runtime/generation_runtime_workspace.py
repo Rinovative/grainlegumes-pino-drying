@@ -1,15 +1,15 @@
-"""
-generation_runtime_workspace.py
+"""Validate persistent roots and own disposable generation workspaces.
 
-Validate persistent roots and own disposable generation workspaces.
 Responsibilities:
   - Resolve user-owned persistent storage and explicitly bounded scratch roots
-  - Create collision-safe case, worker, and transfer staging directories
+  - Create collision-safe case, worker, and publication staging directories
   - Guard every recursive workspace cleanup with identity markers and containment
+
 Design principles:
   - Persistent and disposable paths have separate ownership rules
   - Symlink resolution and exact marker identity precede every destructive action
   - Cleanup never targets repositories, storage roots, publications, or templates
+
 This module does NOT:
   - Generate scientific inputs, run COMSOL, submit Slurm jobs, or publish cases
   - Delete canonical data or infer ownership from a directory name
@@ -24,7 +24,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 
 CASE_WORKSPACE_MARKER: Final = path_contract.CASE_WORKSPACE_MARKER
 WORKER_WORKSPACE_MARKER: Final = ".generation-worker-workspace.json"
-TRANSFER_STAGING_MARKER: Final = ".generation-transfer-staging.json"
 PUBLICATION_STAGING_MARKER: Final = ".generation-publication-staging.json"
 WORKSPACE_SCHEMA_VERSION: Final = 1
 _SLURM_JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
@@ -72,18 +71,6 @@ _WORKER_MARKER_KEYS: Final = frozenset(
         "slurm_array_task_id",
     }
 )
-_TRANSFER_MARKER_KEYS: Final = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "run_id",
-        "storage_root",
-        "work_directory",
-        "created_at",
-        "hostname",
-        "creator_pid",
-    }
-)
 _PUBLICATION_MARKER_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -102,7 +89,7 @@ _PUBLICATION_MARKER_KEYS: Final = frozenset(
 
 def _utc_now() -> str:
     """Return one timezone-aware UTC timestamp."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 resolve_storage_root = path_contract.resolve_storage_root
@@ -276,9 +263,7 @@ def _guard_cleanup_target(
         home,
         repository,
         storage_root.resolve(),
-        common.paths.get_generation_meta_root(storage_root=storage_root).resolve(),
-        common.paths.get_generation_raw_root(storage_root=storage_root).resolve(),
-        common.paths.get_generation_processed_root(storage_root=storage_root).resolve(),
+        common.paths.get_generation_root(storage_root=storage_root).resolve(),
         common.paths.get_datasets_root(storage_root=storage_root).resolve(),
         *(path.resolve() for path in extra_forbidden),
     }
@@ -410,7 +395,7 @@ def cleanup_worker_workspace(
     storage_root: Path,
     allow_active_job_id: str | None,
 ) -> int:
-    """Remove every marked case child and then its exact worker root."""
+    """Remove an empty marked worker root after case-owned cleanup completes."""
     resolved = path_contract.absolute_path(directory, label="worker workspace")
     root = resolved.parent.resolve()
     guarded, marker = _guard_cleanup_target(
@@ -424,31 +409,11 @@ def cleanup_worker_workspace(
         expected_case_id=None,
         allow_active_job_id=allow_active_job_id,
     )
-    reclaimed = 0
-    for child in sorted(guarded.iterdir()):
-        if child.name == WORKER_WORKSPACE_MARKER:
-            continue
-        if not child.is_dir() or child.is_symlink():
-            message = f"Worker workspace contains an unowned entry: {child}"
-            raise ValueError(message)
-        case_marker = _load_marker(
-            child / CASE_WORKSPACE_MARKER,
-            expected_keys=_CASE_MARKER_KEYS,
-            label="case workspace marker",
-        )
-        case_id = case_marker.get("case_id")
-        if not isinstance(case_id, str):
-            message = f"Case workspace marker has no valid case identity: {child}"
-            raise TypeError(message)
-        reclaimed += cleanup_case_workspace(
-            child,
-            allowed_root=guarded,
-            storage_root=storage_root,
-            expected_run_id=run_id,
-            expected_case_id=case_id,
-            allow_active_job_id=allow_active_job_id,
-        )
-    reclaimed += (guarded / WORKER_WORKSPACE_MARKER).stat().st_size
+    remaining = [child for child in guarded.iterdir() if child.name != WORKER_WORKSPACE_MARKER]
+    if remaining:
+        message = f"Worker case scratch remains after child exit; preserving unpublished evidence: {guarded}"
+        raise RuntimeError(message)
+    reclaimed = (guarded / WORKER_WORKSPACE_MARKER).stat().st_size
     (guarded / WORKER_WORKSPACE_MARKER).unlink()
     guarded.rmdir()
     if marker.get("run_id") != run_id:
@@ -522,135 +487,3 @@ def cleanup_publication_staging(
     reclaimed = _directory_size(resolved)
     shutil.rmtree(resolved)
     return reclaimed
-
-
-def create_transfer_staging(
-    *,
-    storage_root: Path | str,
-    run_id: str,
-) -> Path:
-    """Create marked incoming staging on the destination filesystem."""
-    storage = resolve_storage_root(storage_root, create=True)
-    safe_run_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    root = storage / ".incoming"
-    root.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix=f"{safe_run_id}.", dir=root)).resolve()
-    marker = {
-        "schema_kind": "generation_transfer_staging",
-        "schema_version": WORKSPACE_SCHEMA_VERSION,
-        "run_id": safe_run_id,
-        "storage_root": str(storage),
-        "work_directory": str(directory),
-        "created_at": _utc_now(),
-        "hostname": socket.gethostname(),
-        "creator_pid": os.getpid(),
-    }
-    common.serialization.atomic_write_json(directory / TRANSFER_STAGING_MARKER, marker)
-    return directory
-
-
-def validate_transfer_staging(
-    directory: Path | str,
-    *,
-    run_id: str,
-) -> Path:
-    """Validate one exact marked transfer staging directory without removing it."""
-    resolved = path_contract.absolute_path(directory, label="transfer staging")
-    marker = _load_marker(
-        resolved / TRANSFER_STAGING_MARKER,
-        expected_keys=_TRANSFER_MARKER_KEYS,
-        label="generation_transfer_staging marker",
-    )
-    storage_value = marker.get("storage_root")
-    if not isinstance(storage_value, str):
-        message = f"Transfer staging marker has no storage identity: {resolved}"
-        raise TypeError(message)
-    storage = resolve_storage_root(storage_value, create=False)
-    root = storage / ".incoming"
-    guarded, validated_marker = _guard_cleanup_target(
-        resolved,
-        allowed_root=root,
-        storage_root=storage,
-        marker_filename=TRANSFER_STAGING_MARKER,
-        marker_keys=_TRANSFER_MARKER_KEYS,
-        marker_kind="generation_transfer_staging",
-        expected_run_id=run_id,
-        expected_case_id=None,
-        allow_active_job_id=None,
-    )
-    if validated_marker.get("storage_root") != str(storage):
-        message = f"Transfer staging marker storage identity is invalid: {guarded}"
-        raise ValueError(message)
-    return guarded
-
-
-def cleanup_transfer_staging(
-    directory: Path | str,
-    *,
-    storage_root: Path | str,
-    run_id: str,
-) -> int:
-    """Remove one exact marked transfer staging directory."""
-    storage = resolve_storage_root(storage_root, create=False)
-    root = storage / ".incoming"
-    resolved, marker = _guard_cleanup_target(
-        directory,
-        allowed_root=root,
-        storage_root=storage,
-        marker_filename=TRANSFER_STAGING_MARKER,
-        marker_keys=_TRANSFER_MARKER_KEYS,
-        marker_kind="generation_transfer_staging",
-        expected_run_id=run_id,
-        expected_case_id=None,
-        allow_active_job_id=None,
-    )
-    if marker.get("storage_root") != str(storage):
-        message = f"Transfer staging marker storage identity is invalid: {resolved}"
-        raise ValueError(message)
-    reclaimed = _directory_size(resolved)
-    shutil.rmtree(resolved)
-    return reclaimed
-
-
-def transfer_staging_candidates(
-    *,
-    storage_root: Path | str,
-    run_id: str | None,
-    include_sizes: bool = True,
-) -> tuple[dict[str, Any], ...]:
-    """Return only valid marked transfer staging cleanup candidates."""
-    if not isinstance(include_sizes, bool):
-        message = "include_sizes must be boolean."
-        raise TypeError(message)
-    storage = resolve_storage_root(storage_root, create=False)
-    root = storage / ".incoming"
-    if not root.exists():
-        return ()
-    if not root.is_dir() or root.is_symlink():
-        message = f"Transfer staging root is unsafe: {root}"
-        raise ValueError(message)
-    safe_run_id = None if run_id is None else common.paths.validate_logical_name(run_id, label="campaign_run_id")
-    candidates: list[dict[str, Any]] = []
-    for directory in sorted(root.iterdir()):
-        if not directory.is_dir() or directory.is_symlink():
-            message = f"Transfer staging root contains an unsafe entry: {directory}"
-            raise ValueError(message)
-        marker = _load_marker(
-            directory / TRANSFER_STAGING_MARKER,
-            expected_keys=_TRANSFER_MARKER_KEYS,
-            label="transfer staging marker",
-        )
-        marker_run_id = marker.get("run_id")
-        if safe_run_id is not None and marker_run_id != safe_run_id:
-            continue
-        if marker.get("storage_root") != str(storage) or marker.get("work_directory") != str(directory.resolve()):
-            message = f"Transfer staging marker identity is invalid: {directory}"
-            raise ValueError(message)
-        candidates.append(
-            {
-                "path": str(directory.resolve()),
-                "run_id": marker_run_id,
-                "size_bytes": _directory_size(directory) if include_sizes else None,
-            }
-        )
-    return tuple(candidates)

@@ -1,0 +1,25 @@
+# Role: Source-only campaign for direct ./scripts/generation runs; Datasets come from configs/02_datasets/. Edit: rarely.
+# Source campaign assembly: referenced YAML files define the resolved physical, sampling, and execution inputs.
+schema_kind: generation_source_campaign
+schema_version: 1
+sources_config: configs/01_generation/physical_model/sources.yaml
+registry_config: configs/01_generation/physical_model/registry.yaml
+common_config: configs/01_generation/physical_model/common.yaml
+operations_config: configs/01_generation/physical_model/fixed_bed.yaml
+profile_config: configs/01_generation/physical_model/profiles/transient_drying.yaml
+execution_config: configs/01_generation/execution.yaml
+# Physical design inputs: seed_base expands into deterministic material/profile/block streams; counts define each original design size.
+sampling:
+  method: lhs
+  seed_base: 9200
+  counts:
+    natural:
+      lentil: 50
+      chickpea: 50
+      kidney_bean: 20
+# Material families included in this physical Source design; Dataset roles and splits are assigned downstream.
+materials:
+- lentil
+- chickpea
+- kidney_bean
+domain_profile: reference_range  # Selects natural-support/OOD branch semantics; this label does not assign learning or evaluation roles.

@@ -1,16 +1,16 @@
-"""
-generation_input_labels.py
+"""Build concise generation-input dataset labels from canonical metadata.
 
-Build concise generation-input dataset labels from canonical metadata.
 Responsibilities:
   - Map maintained simulation profiles to compact presentation labels
   - Format material, regime, and campaign-purpose label components
   - Build complete profile-qualified dataset labels
   - Disambiguate genuine visible-label collisions with stable identities
+
 Design principles:
   - Canonical metadata remains authoritative over storage or filename parsing
   - Presentation labels never replace scientific or persisted identities
   - Identity suffixes appear only for otherwise identical complete labels
+
 This module does NOT:
   - Discover datasets, admit persisted inputs, or render notebook controls
   - Define canonical profile, campaign-purpose, or batch identity values

@@ -1,16 +1,16 @@
-"""
-generation_contracts_comsol_spreadsheet.py
+"""Parse COMSOL Spreadsheet-format exports for observation and numeric admission.
 
-Parse COMSOL Spreadsheet-format exports for observation and numeric admission.
 Responsibilities:
   - Identify percent-prefixed COMSOL metadata and column-header records
   - Preserve raw headers while applying declared-unit-aware canonicalization
   - Admit finite rectangular numeric rows without consuming the first data row
   - Validate COMSOL Nodes and Expressions metadata when semantically applicable
+
 Design principles:
   - Header identification follows table structure rather than fixed line numbers
   - Unit normalization removes only exact declared trailing unit decorations
   - Malformed or ambiguous tables fail closed without ordinary header inference
+
 This module does NOT:
   - Infer source aliases, delimiters, scientific mappings, or export roles
   - Rewrite COMSOL output text or make metadata part of scientific identity
@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass
 from itertools import chain, pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 
@@ -445,66 +445,6 @@ def read_comsol_spreadsheet(
     )
 
 
-def validate_export_mapping_observation(
-    path: Path | str,
-    *,
-    delimiter: str,
-    columns: Mapping[str, str],
-    units: Mapping[str, str],
-    wide_temporal: bool,
-) -> dict[str, Any]:
-    """Validate and report exact configured headers for one COMSOL export."""
-    if tuple(columns) != tuple(units):
-        message = "Export observation columns and units disagree."
-        raise ValueError(message)
-    expected_units = {source: str(units[logical]) for logical, source in columns.items()}
-    if wide_temporal:
-        table = read_comsol_spreadsheet(
-            path,
-            delimiter=delimiter,
-            include_values=False,
-        )
-        temporal_groups = group_temporal_columns(
-            table.raw_header,
-            expected_units=expected_units,
-        )
-        canonical_header = [column.source for column in temporal_groups[0].columns]
-        temporal_times = [group.state_time for group in temporal_groups]
-    else:
-        table = read_comsol_spreadsheet(
-            path,
-            delimiter=delimiter,
-            expected_units=expected_units,
-            include_values=False,
-        )
-        temporal_groups = ()
-        temporal_times = []
-        canonical_header = list(table.canonical_header)
-    expected_sources = list(columns.values())
-    missing = sorted(set(expected_sources).difference(canonical_header))
-    if missing:
-        message = f"COMSOL export is missing explicitly configured headers {missing}: {Path(path)}"
-        raise ValueError(message)
-    return {
-        "delimiter": delimiter,
-        "raw_header": list(table.raw_header),
-        "canonical_header": canonical_header,
-        "parsed_shape": list(table.shape),
-        "comsol_metadata": dict(table.metadata),
-        "expected_source_headers": expected_sources,
-        "columns": {
-            logical: {
-                "declared_source_header": source,
-                "observed_exact_header_match": source in canonical_header,
-            }
-            for logical, source in columns.items()
-        },
-        "temporal_group_count": len(temporal_groups),
-        "temporal_state_times": temporal_times,
-        "temporal_structure_error": None,
-    }
-
-
 def iter_comsol_spreadsheet_numeric_rows(
     path: Path | str,
     *,
@@ -552,34 +492,3 @@ def iter_comsol_spreadsheet_numeric_rows(
             raise ValueError(message) from error
 
     return _rows()
-
-
-def _delimiter_candidate(path: Path, delimiter: str) -> tuple[int | None, str | None]:
-    """Return parsed width or one delimiter-specific failure."""
-    try:
-        table = read_comsol_spreadsheet(path, delimiter=delimiter, include_values=False)
-    except ValueError as error:
-        return None, str(error)
-    return table.shape[1], None
-
-
-def detect_comsol_spreadsheet_delimiter(path: Path | str) -> str:
-    """Detect comma or semicolon from the uniquely parseable table structure."""
-    source = Path(path)
-    candidates: list[tuple[str, int]] = []
-    errors: list[str] = []
-    for delimiter in _SUPPORTED_DELIMITERS:
-        width, error = _delimiter_candidate(source, delimiter)
-        if width is None:
-            errors.append(f"{delimiter!r}: {error}")
-        else:
-            candidates.append((delimiter, width))
-    if not candidates:
-        message = f"Could not parse COMSOL Spreadsheet export with a supported delimiter: {source}. {'; '.join(errors)}"
-        raise ValueError(message)
-    maximum_width = max(width for _, width in candidates)
-    widest = [delimiter for delimiter, width in candidates if width == maximum_width]
-    if len(widest) != 1:
-        message = f"COMSOL Spreadsheet delimiter is ambiguous for {source}: {widest}."
-        raise ValueError(message)
-    return widest[0]

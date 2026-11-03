@@ -1,16 +1,16 @@
-"""
-generation_input_workspace.py
+"""Prepare the read-only generation-input notebook workspace.
 
-Prepare the read-only generation-input notebook workspace.
 Responsibilities:
   - Discover admitted canonical input datasets for notebook presentation
   - Summarize datasets, discovery issues, and canonical naming conventions
   - Establish deterministic session selection and construct the EDA panel
   - Provide actionable plain guidance when no canonical dataset is admitted
+
 Design principles:
   - Existing discovery, label, selection, and panel owners remain authoritative
   - Workspace preparation reads canonical storage without mutating it
   - Plain summary output remains separate from the interactive panel
+
 This module does NOT:
   - Generate, plan, reuse, or publish canonical input cases
   - Implement scientific diagnostics, plots, or panel internals
@@ -30,7 +30,9 @@ from . import generation_input_sources as sources
 if TYPE_CHECKING:
     import ipywidgets as widgets
 
-_GENERATION_DOCUMENTATION_LINK: Final = "../docs/simulation_generation.md#canonical-input-case-generation-and-eda"
+    from src.analysis.presentation import analysis_display_grid as display_grid
+
+_GENERATION_DOCUMENTATION_LINK: Final = "../docs/06_generation_reference.md#input-only-generation-and-status"
 _GENERIC_GENERATION_COMMAND: Final = (
     './scripts/generation inputs "$CAMPAIGN_CONFIG" --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"'
 )
@@ -39,10 +41,11 @@ _MAXIMUM_DISPLAYED_ISSUES: Final = 5
 
 @dataclass(frozen=True, slots=True)
 class GenerationInputEDAWorkspace:
-    """Hold plain notebook guidance and the separately displayed EDA panel."""
+    """Hold plain notebook guidance, the separately displayed EDA panel, and the discovered campaign candidate outcomes."""
 
     summary_text: str
     panel: widgets.Output | None
+    outcomes: sources.CampaignOutcomeCatalog
 
 
 def _dataset_summary(
@@ -106,13 +109,18 @@ def _empty_catalog_workspace(
     )
     if details:
         summary = f"{summary}\n\n{details}"
-    return GenerationInputEDAWorkspace(summary_text=summary, panel=None)
+    return GenerationInputEDAWorkspace(
+        summary_text=summary,
+        panel=panel.build_campaign_outcome_panel(catalog.outcomes) if catalog.outcomes.rows else None,
+        outcomes=catalog.outcomes,
+    )
 
 
 def prepare_generation_input_eda_workspace(
     *,
     storage_root: Path | str,
     title: str = "Generation-input EDA",
+    display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> GenerationInputEDAWorkspace:
     """
     Prepare one read-only workspace over admitted canonical generation inputs.
@@ -123,6 +131,9 @@ def prepare_generation_input_eda_workspace(
         Canonical storage root containing already generated input cases.
     title : str, optional
         Visible title for the collapsible interactive panel.
+
+    display_spatial_stride : {1, 2, 4, "auto"}, optional
+        Endpoint-preserving map samples; statistics use complete grids.
 
     Returns
     -------
@@ -148,13 +159,21 @@ def prepare_generation_input_eda_workspace(
         datasets=catalog,
         selection_state=selection_state,
         title=title,
+        display_spatial_stride=display_spatial_stride,
     )
     summary_parts = (
         _dataset_summary(catalog, storage_root=root),
         _naming_summary(catalog),
+        (
+            f"Campaign candidate records: {len(catalog.outcomes.rows)}; {len(catalog.outcomes.issues)} outcome-discovery issues. "
+            "Successful, failed and pending candidates remain separate in Dataset overview."
+        ),
+        "\n".join(catalog.outcomes.issues),
+        f"Map display stride: {display_spatial_stride}; statistics and scale limits use complete source grids.",
         _issue_details(catalog),
     )
     return GenerationInputEDAWorkspace(
         summary_text="\n\n".join(part for part in summary_parts if part),
         panel=interactive_panel,
+        outcomes=catalog.outcomes,
     )

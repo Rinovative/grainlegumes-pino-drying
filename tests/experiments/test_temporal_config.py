@@ -1,16 +1,26 @@
-# ruff: noqa: S101
-"""Explicit transient temporal configuration and identity contracts."""
+"""Explicit transient temporal configuration and identity contracts.
+
+Responsibilities:
+  - Check explicit temporal policies and sampling/conditioning identity changes
+
+Design principles:
+  - Missing policies fail rather than being inferred
+
+This module does NOT:
+  - Construct temporal tensors or execute rollout training
+"""
 
 from __future__ import annotations
 
 import pytest
 
-from src import datasets, experiments, learning
+from src import datasets, learning
+from src.experiments.config import experiments_config_loader as loader
 
 
 def _temporal_config(*, sampling: dict[str, object], conditioning: str) -> dict[str, object]:
     """Resolve one complete test-owned temporal experiment branch."""
-    return experiments.config.temporal.resolve_transient_temporal_config(
+    return loader._resolve_temporal_config(
         {
             "sampling": sampling,
             "temporal_conditioning": {"kind": conditioning},
@@ -46,20 +56,18 @@ def test_temporal_config_requires_both_explicit_policies() -> None:
     }
     assert rollout["temporal_conditioning"] == {"kind": "none"}
     with pytest.raises(ValueError, match="keys must be exactly"):
-        experiments.config.temporal.resolve_transient_temporal_config({"sampling": {"mode": "one_step_transition"}})
+        loader._resolve_temporal_config({"sampling": {"mode": "one_step_transition"}})
     with pytest.raises(ValueError, match="rollout_length"):
-        experiments.config.temporal.resolve_transient_sampling({"mode": "rollout_window"})
+        loader._resolve_temporal_config({"sampling": {"mode": "rollout_window"}, "temporal_conditioning": {"kind": "none"}})
     with pytest.raises(TypeError, match="explicit transient_sampling"):
         datasets.runtime.factory.DatasetRequest(
             dataset_id="synthetic_transient",
             dataset_view="transient_drying",
-            evaluation_regime="id",
         )
     with pytest.raises(ValueError, match="cannot include transient_sampling"):
         datasets.runtime.factory.DatasetRequest(
             dataset_id="synthetic_steady",
             dataset_view="steady_flow",
-            evaluation_regime="id",
             transient_sampling=datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),
         )
 

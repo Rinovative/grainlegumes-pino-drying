@@ -1,0 +1,129 @@
+"""Protect Train-only transient scaling through the public training-loader boundary.
+
+Responsibilities:
+  - Fit the scaler through ``create_transient_training_loaders`` on the compact published transient package
+  - Compare the fitted state moments, increment RMS and counts with Train-only values recomputed from the published PT shards
+  - Require an identity-bound scaler cache hit to restore the identical fitted evidence
+
+Design principles:
+  - The package holds held-out cases whose state values lie outside every Train case, so fitting on any other membership is visible
+  - Expected statistics use the documented definition on test-read tensors and never call scaler code
+  - Both Train sampling branches (direct one-step items and a separately selected one-step fitting Dataset) must give the same Train-only fit
+
+This module does NOT:
+  - Train models, judge physical accuracy, or cover scaler cache identity drift and restored-scaler handoff
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import pytest
+import torch
+
+from src import datasets
+from src.learning.learning_temporal import TemporalConditioningSpec
+from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
+
+if TYPE_CHECKING:
+    from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
+
+_STATE_TOLERANCE = 1.0e-4
+_SAMPLING = {
+    "one_step": datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),
+    "rollout": datasets.contracts.transient.TransientSamplingSpec(mode="rollout_window", rollout_length=2, window_stride=1, window_offset=0),
+}
+
+
+def _published_states(package: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Read every case's regular state sequence [time, channel, y, x] from the published PT shards."""
+    shards = datasets.packages.transient_shards
+    root, dataset_id = package["root"], package["train_dataset"]
+    receipt = shards.load_transient_shard_receipt(dataset_id, storage_root=root, validation_depth="evidence")
+    states: dict[str, torch.Tensor] = {}
+    for shard_index in range(receipt["shard_count"]):
+        payload = shards.load_transient_shard_payload(dataset_id, shard_index, storage_root=root, receipt=receipt)
+        for case in payload["cases"]:
+            states[str(case["case_record"]["package_case_id"])] = case["states"].clone()
+    return states
+
+
+def _channel_moments(states: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return population mean and standard deviation per channel over all states of the given cases."""
+    pooled = torch.cat([sequence.to(torch.float64).transpose(0, 1).reshape(sequence.shape[1], -1) for sequence in states], dim=1)
+    return pooled.mean(dim=1), pooled.std(dim=1, correction=0)
+
+
+def _increment_rms(states: list[torch.Tensor]) -> torch.Tensor:
+    """Return the per-channel RMS of float32 one-step increments over the given cases."""
+    increments = [(sequence[1:] - sequence[:-1]).to(torch.float64).transpose(0, 1).reshape(sequence.shape[1], -1) for sequence in states]
+    return torch.cat(increments, dim=1).square().mean(dim=1).sqrt()
+
+
+def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifact, dict[str, Any], list[str]]:
+    """Create the public loaders once and return the fitted scaler, split evidence and scaler cache outcomes."""
+    cache_outcomes: list[str] = []
+
+    def record(event: str, values: Any) -> None:
+        if event == "scaler_cache":
+            cache_outcomes.append(str(values["state"]))
+
+    loaders = datasets.runtime.transient_training.create_transient_training_loaders(
+        train_dataset_id=package["train_dataset"],
+        additional_evaluation_dataset_ids=[],
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
+        train_sampling=sampling,
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0, hdf5_cache_size=0),
+        storage_root=str(package["root"]),
+        transient_backend_preference="pt_shards",
+        transient_backend_required=True,
+        startup_callback=record,
+    )
+    try:
+        return loaders.scaling_artifact, loaders.split, cache_outcomes
+    finally:
+        owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
+        for loader in owned:
+            if loader is not None:
+                loader.dataset.close()
+
+
+@pytest.mark.parametrize("sampling", list(_SAMPLING.values()), ids=list(_SAMPLING))
+def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[str, Any], sampling: Any) -> None:
+    """Fit state moments and increment RMS on Train cases only, and restore them identically from the cache.
+
+    The held-out cases carry strictly larger values than every Train case in at least one channel, so a fit that
+    admits validation or ID-test evidence changes the statistics beyond tolerance.
+    """
+    partition = transient_package["case_partition"]
+    by_case = _published_states(transient_package)
+    train = [by_case[case_id] for case_id in partition["train"]]
+    held_out = [by_case[case_id] for role in ("validation", "id_test") for case_id in partition[role]]
+    assert train
+    assert held_out
+
+    train_mean, train_std = _channel_moments(train)
+    all_mean, _ = _channel_moments(list(by_case.values()))
+    case_means = [sequence.to(torch.float64).mean(dim=(0, 2, 3)) for sequence in (*train, *held_out)]
+    train_means, held_out_means = torch.stack(case_means[: len(train)]), torch.stack(case_means[len(train) :])
+    separated = held_out_means.min(dim=0).values > train_means.max(dim=0).values
+    assert bool(separated.any()), "fixture premise: held-out cases must lie outside the Train range in some channel"
+    shifted = (all_mean - train_mean).abs() > 0.01 * train_mean.abs()
+    assert bool(shifted[separated].all()), "fixture premise: Train-only differs from the whole Dataset"
+
+    artifact, split, first_cache = _fit(transient_package, sampling)
+
+    torch.testing.assert_close(artifact.state_mean.to(torch.float64), train_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    torch.testing.assert_close(artifact.state_std.to(torch.float64), train_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    torch.testing.assert_close(artifact.delta_rms.to(torch.float64), _increment_rms(train), rtol=1.0e-5, atol=1.0e-6)
+    assert split["roles"]["scaling_train_one_step"]["case_ids"] == partition["train"]
+    assert artifact.unique_train_state_count == sum(sequence.shape[0] for sequence in train)
+    assert artifact.unique_transition_count == artifact.transition_count == sum(sequence.shape[0] - 1 for sequence in train)
+
+    restored, _, second_cache = _fit(transient_package, sampling)
+
+    assert first_cache == ["miss"]
+    assert second_cache == ["hit"]
+    assert restored.digest == artifact.digest
+    for name in ("state_mean", "state_std", "delta_rms", "increment_scale"):
+        assert torch.equal(getattr(restored, name), getattr(artifact, name))

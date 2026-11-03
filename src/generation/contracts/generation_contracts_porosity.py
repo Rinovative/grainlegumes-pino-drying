@@ -1,15 +1,15 @@
-"""
-generation_contracts_porosity.py
+"""Resolve fixed material Kozeny-Carman calibration and packing-scatter supports.
 
-Resolve fixed material Kozeny-Carman calibration and packing-scatter supports.
 Responsibilities:
   - Derive and validate fixed material Kozeny-Carman reference coefficients
   - Resolve joint permeability/porosity supports before case sampling
   - Invert the monotonic global permeability-to-porosity trend robustly
+
 Design principles:
   - Material calibration remains fixed at its canonical reference record
   - Authored supports remain visible beside resolved effective supports
   - Local porosity morphology remains outside this scalar coupling owner
+
 This module does NOT:
   - Sample DOE coordinates, generate local fields, or author material values
   - Impose a pointwise permeability-to-porosity relation
@@ -59,13 +59,13 @@ def kozeny_carman_response(epsilon: float) -> float:
     return value**3 / (1.0 - value) ** 2
 
 
-def derive_reference_coefficient(material_kappa_nominal: float, eps_bed_cal_ref: float) -> float:
-    """Derive ``A_KC_reference = kappa_nominal / g(eps_bed_cal_ref)``."""
+def derive_reference_coefficient(material_kappa_nominal: float, eps_bed_ref: float) -> float:
+    """Derive ``A_KC_reference = kappa_nominal / g(eps_bed_ref)``."""
     permeability = _finite(material_kappa_nominal, label="Material nominal permeability")
     if permeability <= 0.0:
         msg = "Material nominal permeability must be strictly positive."
         raise ValueError(msg)
-    coefficient = permeability / kozeny_carman_response(eps_bed_cal_ref)
+    coefficient = permeability / kozeny_carman_response(eps_bed_ref)
     if not math.isfinite(coefficient) or coefficient <= 0.0:
         msg = "Derived Kozeny-Carman reference coefficient must be finite and positive."
         raise ValueError(msg)
@@ -149,7 +149,7 @@ def resolve_porosity_coupling(
     *,
     material_family: str,
     material_kappa_nominal: float,
-    eps_bed_cal_ref: float,
+    eps_bed_ref: float,
     authored_permeability_support: Mapping[str, Any],
     packing_porosity_mean_support: Mapping[str, Any],
     eps_min_global: float,
@@ -168,8 +168,8 @@ def resolve_porosity_coupling(
         msg = "Natural packing-porosity support must lie strictly inside global porosity guards."
         raise ValueError(msg)
     nominal = _finite(material_kappa_nominal, label="Material nominal permeability")
-    calibration = _finite(eps_bed_cal_ref, label="Material calibration porosity")
-    coefficient = derive_reference_coefficient(nominal, calibration)
+    reference_porosity = _finite(eps_bed_ref, label="Material reference porosity")
+    coefficient = derive_reference_coefficient(nominal, reference_porosity)
     kc_lower = coefficient * kozeny_carman_response(natural_lower)
     kc_upper = coefficient * kozeny_carman_response(natural_upper)
     effective_lower, effective_upper = max(authored_lower, kc_lower), min(authored_upper, kc_upper)
@@ -185,8 +185,8 @@ def resolve_porosity_coupling(
         )
         raise ValueError(msg)
     nominal_identity = solve_reference_porosity(nominal, coefficient, eps_min_global=global_lower, eps_max_global=global_upper)
-    if not math.isclose(nominal_identity, calibration, rel_tol=0.0, abs_tol=_SUPPORT_TOLERANCE):
-        msg = "Material nominal Kozeny-Carman identity does not recover calibration porosity."
+    if not math.isclose(nominal_identity, reference_porosity, rel_tol=0.0, abs_tol=_SUPPORT_TOLERANCE):
+        msg = "Material nominal Kozeny-Carman identity does not recover reference porosity."
         raise RuntimeError(msg)
     tails: dict[str, dict[str, float]] = {}
     for item in authored_kappa_ood or []:
@@ -231,7 +231,7 @@ def resolve_porosity_coupling(
     return {
         "material_family": material_family,
         "material_kappa_nominal": nominal,
-        "material_eps_bed_cal_ref": calibration,
+        "material_eps_bed_ref": reference_porosity,
         "A_KC_reference": coefficient,
         "authored_permeability_support": {"lower": authored_lower, "upper": authored_upper},
         "natural_porosity_support": {"lower": natural_lower, "upper": natural_upper},

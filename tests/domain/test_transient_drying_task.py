@@ -1,5 +1,14 @@
-# ruff: noqa: S101
-"""Protect the registered transient-drying task contract."""
+"""Protect the registered transient-drying task contract.
+
+Responsibilities:
+  - Check registered transient profiles, metrics, serialization, and steady payload compatibility
+
+Design principles:
+  - Task declarations retain authoritative field and metric contracts
+
+This module does NOT:
+  - Implement drying solvers or perform transient training
+"""
 
 from src import domain
 

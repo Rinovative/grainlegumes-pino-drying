@@ -1,13 +1,10 @@
-"""
-analysis_channel_semantics.py
-
-Define shared ordering and compatibility rules for scientific display channels.
+"""Define shared ordering rules for scientific display channels.
 
 Responsibilities:
   - Classify channels into four authoritative scientific field groups
   - Preserve schema-declared order within each group
   - Exclude coordinate channels unless a view explicitly requests them
-  - Resolve deterministic intersections without inspecting scientific arrays
+  - Resolve deterministic channel order without inspecting scientific arrays
 
 Design principles:
   - Explicit task/schema metadata owns category and within-group order
@@ -98,27 +95,6 @@ def ordered_channels(
                 declaration_order,
             ),
         )
-    )
-
-
-def compatible_channels(
-    channel_groups: Iterable[Iterable[str]],
-    *,
-    metadata: Mapping[str, ChannelPresentationMetadata | ChannelCategory] | None = None,
-    include_coordinates: bool = False,
-) -> tuple[str, ...]:
-    """Return the ordered exact intersection of selected channel groups."""
-    groups = tuple(tuple(group) for group in channel_groups)
-    if not groups:
-        return ()
-    first = _unique_channel_names(groups[0])
-    common = set(first)
-    for group in groups[1:]:
-        common.intersection_update(_unique_channel_names(group))
-    return ordered_channels(
-        (name for name in first if name in common),
-        metadata=metadata,
-        include_coordinates=include_coordinates,
     )
 
 

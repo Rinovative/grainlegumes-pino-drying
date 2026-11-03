@@ -1,16 +1,19 @@
-# ruff: noqa: S101
-"""
-Protect current artifact reader identity, cache admission, and contained rebuilds.
+"""Protect current artifact reader identity, cache admission, and contained rebuilds.
 
-The tests cover current table parsing, metadata collision rejection, ordered
-membership, symlink/path containment, concurrent publication, and provenance
-completion races. Numerical artifact generation is covered in
-``test_artifact_provenance``. Plot usability is covered separately.
+Responsibilities:
+  - Check table schema, metadata identity, contained rebuilds, and run discovery admission
+
+Design principles:
+  - Scientific cache identity excludes runtime location; unsafe paths fail before mutation
+
+This module does NOT:
+  - Verify numerical artifact generation or plot usability
 """
 
 from __future__ import annotations
 
 import copy
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -84,10 +87,10 @@ def test_dataframe_reader_rejects_every_unexpected_column() -> None:
 
 @pytest.mark.parametrize(
     "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
+    [2.0, 1],
+    ids=("floating-current", "previous-version"),
 )
-def test_dataframe_reader_requires_integer_artifact_version_one(schema_version: bool | float) -> None:
+def test_dataframe_reader_requires_the_current_integer_artifact_version(schema_version: float) -> None:
     """Reject alternate representations and unsupported Parquet schema versions."""
     frame = _current_generic_frame(metadata="{}")
     frame["artifact_schema_version"] = schema_version  # pyright: ignore[reportCallIssue, reportArgumentType]
@@ -197,7 +200,6 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
             "effective_config_digest": "config-a",
             "best_checkpoint_sha256": "checkpoint-a",
             "normalizer_sha256": "normalizer-a",
-            "lifecycle_status": "completed",
         },
         "model": {
             "kind": "fno",
@@ -251,16 +253,16 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
             "task_contract_digest": "task-a",
             "equation_kind": "steady_brinkman",
             "equation_set": ["momentum", "continuity"],
+            "continuity_kind": "cross_section_flux_balance",
             "boundary_condition_kind": "pressure_drop",
-            "selected_training_continuity": "div_eps_velocity",
-            "evaluated_continuity_formulations": ["div_velocity", "div_eps_velocity"],
-            "derivatives": {"kind": "spectral", "extension": "reflect"},
+            "scales": {"pressure": {"formula": "mean_inlet(p_in_bc)", "unit": "Pa"}},
+            "derivatives": {"kind": "physical", "extension": "none"},
             "interior_crop": 2,
             "residual_evaluation_region": {"kind": "interior"},
             "constants": {"dynamic_viscosity_pa_s": 1.8139e-5},
             "permeability_representation": {"kind": "symmetric_tensor"},
-            "scalar_definitions": {"div_velocity_mse": "mean(div(u)**2)"},
-            "array_definitions": {"div_u": "du/dx + dv/dy"},
+            "scalar_definitions": {"flux_balance_mse": "mean(flux_balance**2)"},
+            "array_definitions": {"flux_balance": "(q(y) - mean_y(q)) / flux"},
         },
         "generation": {
             "effective_case_limit": None,
@@ -277,7 +279,8 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
         (("dataset", "fingerprint"), "dataset-b"),
         (("selection", "effective_ordered_source_indices_sha256"), "membership-b"),
         (("evaluator", "objective", "reduction"), "wrong-reduction"),
-        (("physics", "selected_training_continuity"), "div_velocity"),
+        (("physics", "continuity_kind"), "pointwise_divergence"),
+        (("physics", "scales", "pressure", "formula"), "max_inlet(p_in_bc)"),
         (("generation", "inference_batch_size"), 2),
     ]
     for keys, replacement in mutations:
@@ -301,32 +304,12 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
     assert analysis.artifacts.contracts.artifact_identity_digest(operational) == baseline
 
 
-def test_rebuild_removes_only_one_exact_target(tmp_path: Path) -> None:
-    """
-    Confine rebuild deletion to one exact ID or named OOD target.
-
-    Removing one OOD fixture must preserve the ID and sibling OOD markers, and
-    broad or out-of-run paths must be rejected before filesystem mutation.
-    """
+def test_artifact_target_rejects_broad_and_out_of_run_paths(tmp_path: Path) -> None:
+    """Reject the analysis root, the additional-evaluation parent and out-of-run paths."""
     run_dir = tmp_path / "run"
-    id_target = run_dir / "analysis" / "id"
-    first_ood = run_dir / "analysis" / "ood" / "first"
-    second_ood = run_dir / "analysis" / "ood" / "second"
-    for target in (id_target, first_ood, second_ood):
-        target.mkdir(parents=True)
-        (target / "marker").write_text(target.name, encoding="utf-8")
-
-    analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=first_ood)
-
-    assert not first_ood.exists()
-    assert (id_target / "marker").is_file()
-    assert (second_ood / "marker").is_file()
-    with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis")
-    with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "ood")
-    with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=tmp_path / "outside")
+    for save_root in (run_dir / "analysis", run_dir / "analysis" / "additional_evaluation", tmp_path / "outside"):
+        with pytest.raises(ValueError, match="exact artifact target"):
+            analysis.artifacts.service._validated_artifact_target(run_dir=run_dir, save_root=save_root)
 
 
 def test_upload_gate_requires_an_explicit_complete_current_artifact(
@@ -434,7 +417,7 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     (run_dir / "analysis").symlink_to(outside, target_is_directory=True)
 
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "id")
+        analysis.artifacts.service._validated_artifact_target(run_dir=run_dir, save_root=run_dir / "analysis" / "id")
 
     assert marker.read_text(encoding="utf-8") == "keep"
 
@@ -442,20 +425,20 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     (target_symlink_run / "analysis").mkdir(parents=True)
     (target_symlink_run / "analysis" / "id").symlink_to(outside_target, target_is_directory=True)
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(
+        analysis.artifacts.service._validated_artifact_target(
             run_dir=target_symlink_run,
             save_root=target_symlink_run / "analysis" / "id",
         )
     assert marker.read_text(encoding="utf-8") == "keep"
 
     sibling_run = tmp_path / "sibling-symlink-run"
-    sibling_target = sibling_run / "analysis" / "ood" / "keep"
+    sibling_target = sibling_run / "analysis" / "additional_evaluation" / "keep"
     sibling_target.mkdir(parents=True)
     sibling_marker = sibling_target / "keep.txt"
     sibling_marker.write_text("keep", encoding="utf-8")
     (sibling_run / "analysis" / "id").symlink_to(sibling_target, target_is_directory=True)
     with pytest.raises(ValueError, match="exact artifact target"):
-        analysis.artifacts.service.rebuild_artifact_target(
+        analysis.artifacts.service._validated_artifact_target(
             run_dir=sibling_run,
             save_root=sibling_run / "analysis" / "id",
         )
@@ -488,5 +471,66 @@ def test_discovery_rejects_every_malformed_child_run_marker(
     malformed.mkdir()
     (malformed / marker_name).touch()
 
-    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint|invalid JSON"):
         list(analysis.artifacts.service.iter_run_dirs(tmp_path))
+
+
+def test_discovery_skips_unselected_non_completed_runs_and_refuses_a_selected_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-completed run never blocks the completed siblings of a root, yet an explicit name selection stays strict."""
+    service = analysis.artifacts.service
+    for name, status in (("finished", "completed"), ("unfinished", "interrupted")):
+        run = tmp_path / name
+        run.mkdir()
+        (run / "config.yaml").write_text(json.dumps({"run": {"name": name}}), encoding="utf-8")
+        (run / "summary.json").write_text(json.dumps({"schema_version": 1, "status": status}), encoding="utf-8")
+    admit = service.experiments.run.validate_evaluable_run
+    monkeypatch.setattr(
+        service.experiments.run,
+        "validate_evaluable_run",
+        lambda run: {"scientific_run_name": run.name} if run.name == "finished" else admit(run),
+    )
+
+    assert list(service.iter_run_dirs(tmp_path)) == [tmp_path / "finished"]
+    skipped = capsys.readouterr().out
+    assert "unfinished" in skipped
+    assert "interrupted" in skipped
+    assert list(service.iter_run_dirs(tmp_path, run_names=["finished"])) == [tmp_path / "finished"]
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"interrupted.*Resume the run to completion"):
+        list(service.iter_run_dirs(tmp_path, run_names=["unfinished"]))
+
+
+def test_discovery_skips_valid_optuna_trials_but_rejects_malformed_layouts_and_normal_runs_without_checkpoints(tmp_path: Path) -> None:
+    """Skip a finished trial (config and summary only) by its valid recorded layout; keep failing closed otherwise."""
+    trial_layout = {
+        "task": "transient_drying",
+        "dataset": "dataset-id",
+        "family": "optuna",
+        "config_name": "fno_study",
+        "model_label": "fno_m2x2_h4_l1",
+        "seed": 17,
+        "revision": None,
+        "budget_epochs": 3,
+        "stage": "single",
+        "pair": None,
+        "trial": "0001__fno_m2x2_h4_l1__lr-0p001",
+        "a0_id": "a" * 16,
+        "branch_id": None,
+    }
+
+    def leaf(root: Path, **changes: object) -> Path:
+        directory = root / "run"
+        directory.mkdir(parents=True)
+        (directory / "config.yaml").write_text(json.dumps({"run": {"layout": {**trial_layout, **changes}}}), encoding="utf-8")
+        (directory / "summary.json").write_text(json.dumps({"schema_version": 1, "status": "completed"}), encoding="utf-8")
+        return root
+
+    assert list(analysis.artifacts.service.iter_run_dirs(leaf(tmp_path / "trial"))) == []
+    with pytest.raises(ValueError, match="trial"):
+        list(analysis.artifacts.service.iter_run_dirs(leaf(tmp_path / "malformed", trial=False)))
+    normal = leaf(tmp_path / "normal", family="base", budget_epochs=None, trial=None)
+    with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
+        list(analysis.artifacts.service.iter_run_dirs(normal))

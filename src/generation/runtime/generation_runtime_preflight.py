@@ -1,16 +1,16 @@
-"""
-generation_runtime_preflight.py
+"""Audit the native CPU generation environment without starting a COMSOL solve.
 
-Audit the native CPU generation environment without starting a COMSOL solve.
 Responsibilities:
   - Validate compute Python, COMSOL, modules, templates, scratch, and storage
   - Validate the configured Generation venv through Python runtime prefixes
   - Validate user-owned persistent roots and node-local scratch containment
   - Exercise one collision-safe marked directory creation and cleanup lifecycle
+
 Design principles:
   - Environment readiness and production scientific readiness remain separate
   - Every command is an argument vector with bounded captured output
   - A preflight probe is self-cleaning and never becomes campaign state
+
 This module does NOT:
   - Submit production work, execute a model, install packages, or change science
   - Treat template hashes or fake executables as runtime COMSOL validation
@@ -433,7 +433,10 @@ def run_cpu_preflight(
             "cores_per_node": campaign.execution_values["cluster"]["cores_per_node"],
             "max_admission_cases": campaign.execution_values["submission"]["max_admission_cases"],
             "poll_interval_seconds": campaign.execution_values["submission"]["poll_interval_seconds"],
-            "max_running_cases": campaign.execution_values["submission"]["max_running_cases"],
+            "node_jobs": campaign.execution_values["cluster"]["node_jobs"],
+            "concurrent_cases_per_node": campaign.execution_values["cluster"]["concurrent_cases_per_node"],
+            "node_job_memory": campaign.execution_values["cluster"]["node_job_memory"],
+            "node_job_wall_time": campaign.execution_values["cluster"]["node_job_wall_time"],
         },
         "path_cleanup_probe": _path_guard_probe(
             storage_root=storage,

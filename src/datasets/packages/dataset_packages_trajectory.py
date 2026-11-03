@@ -1,18 +1,30 @@
-"""
-dataset_packages_trajectory.py
+"""Build and admit role-neutral transient trajectory indexes from canonical HDF5 cases.
 
-Build and admit compact transient trajectory indexes from canonical HDF5 cases.
 Responsibilities:
   - Validate source time, channel, status, and case identities
-  - Publish portable case-level membership and deterministic transition indexes
+  - Publish portable case identities and deterministic transition indexes
   - Admit current index schema, contract, and digest evidence
+
 Design principles:
   - Absolute HDF5 states remain canonical and indexes store only references
-  - Every transition inherits one immutable case-level membership
+  - Every transition retains its immutable source-case identity
   - Exact-stop diagnostic states never enter learned transitions
+
 This module does NOT:
   - Own process-local HDF5 handles or Dataset item materialization
   - Fit normalization, train models, or perform rollouts
+
+Notes:
+  Source layout:
+    HDF5 arrays are read from ``time``, ``transient/fields``, ``static/fields``,
+    ``schedule/values``, and ``scalar/values``; configured timing is checked
+    against ``provenance/scientific_config_json`` and its digest.
+  Index records:
+    Each case keeps a storage-root-relative HDF5 path and source hash; each
+    transition stores regular-time and schedule indices rather than copied
+    field arrays. A ``status.json`` in the result's ``evidence`` directory is
+    optional, and its digest is retained when present.
+
 """
 
 from __future__ import annotations
@@ -30,12 +42,11 @@ import numpy as np
 
 from src import common, generation
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
-from src.datasets.contracts import dataset_contracts_views as views
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-TRANSIENT_INDEX_SCHEMA_KIND: Final = "vp2_transient_transition_index"
+TRANSIENT_INDEX_SCHEMA_KIND: Final = "dataset_transient_transition_index"
 TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
 _SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(
     transient_contract.TRANSIENT_PROFILE_ID,
@@ -58,15 +69,10 @@ class TransientSourceCase:
     path: Path
     package_case_id: str
     source_batch_id: str
-    membership: str
-    evaluation_regime: str
     expected_sha256: str
     expected_case_input_id: str
     expected_simulation_case_id: str
     material_family: str
-    ood_group: str | None
-    ood_parameters: tuple[str, ...]
-    ood_evidence: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,7 +492,7 @@ def _status_evidence(
     tolerance: float,
 ) -> dict[str, Any]:
     """Validate an adjacent canonical status sidecar when it is available."""
-    status_path = path.with_name("status.json")
+    status_path = common.paths.resolve_generation_result_evidence_directory(path.parent) / "status.json"
     last_regular = float(time[-1])
     expected_stop = last_regular if exact_stop is None else exact_stop
     if not status_path.exists():
@@ -718,13 +724,6 @@ def _case_record(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], float]:
     """Validate one source and return case, transition, and horizon records."""
     path = source.path.expanduser().resolve()
-    if source.evaluation_regime not in views.PACKAGE_REGIMES:
-        message = f"Unsupported transient evaluation regime: {source.evaluation_regime!r}."
-        raise TransientDataContractError(message)
-    valid_memberships = (*views.ID_MEMBERSHIPS, views.TECHNICAL_SMOKE_MEMBERSHIP) if source.evaluation_regime == "id" else (source.evaluation_regime,)
-    if source.membership not in valid_memberships:
-        message = f"Membership {source.membership!r} is invalid for {source.evaluation_regime!r}."
-        raise TransientDataContractError(message)
     observed_sha256 = common.serialization.file_sha256(path)
     if observed_sha256 != source.expected_sha256:
         message = f"Transient source content differs from package admission: {path}."
@@ -753,11 +752,6 @@ def _case_record(
         "source_batch_id": source.source_batch_id,
         "source_simulation_profile": profile,
         "material_family": source.material_family,
-        "evaluation_regime": source.evaluation_regime,
-        "membership": source.membership,
-        "ood_group": source.ood_group,
-        "ood_parameters": list(source.ood_parameters),
-        "ood_evidence": deepcopy(source.ood_evidence),
         "sequence_length": layout.regular_state_count,
         "stored_state_count": int(layout.time.size + (layout.exact_stop_time is not None)),
         "transition_count": len(samples),
@@ -784,15 +778,14 @@ def build_transient_index(
     *,
     dataset_name: str,
     dataset_id: str,
-    evaluation_regime: str,
     source_root: Path | str,
 ) -> dict[str, Any]:
     """Build one deterministic compact transition index from canonical cases."""
     if not sources:
         message = "Transient index construction requires at least one source case."
         raise TransientDataContractError(message)
-    if evaluation_regime not in views.PACKAGE_REGIMES or not dataset_name or not dataset_id:
-        message = "Transient dataset name, ID, or evaluation regime is invalid."
+    if not dataset_name or not dataset_id:
+        message = "Transient dataset name or ID is invalid."
         raise TransientDataContractError(message)
     root = Path(source_root)
     cases: list[dict[str, Any]] = []
@@ -826,7 +819,6 @@ def build_transient_index(
         "dataset_name": dataset_name,
         "dataset_id": dataset_id,
         "dataset_view": "transient_drying",
-        "evaluation_regime": evaluation_regime,
         "contract_digest": transient_contract.transient_contract_digest(),
         "contract": transient_contract.transient_contract_payload(),
         "configured_regular_horizon": {
@@ -868,7 +860,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         "dataset_name",
         "dataset_id",
         "dataset_view",
-        "evaluation_regime",
         "contract_digest",
         "contract",
         "configured_regular_horizon",
@@ -888,7 +879,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         payload["schema_kind"] != TRANSIENT_INDEX_SCHEMA_KIND
         or payload["schema_version"] != TRANSIENT_INDEX_SCHEMA_VERSION
         or payload["dataset_view"] != "transient_drying"
-        or payload["evaluation_regime"] not in views.PACKAGE_REGIMES
         or not isinstance(payload["dataset_name"], str)
         or not payload["dataset_name"]
         or not isinstance(payload["dataset_id"], str)
@@ -926,11 +916,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         "source_batch_id",
         "source_simulation_profile",
         "material_family",
-        "evaluation_regime",
-        "membership",
-        "ood_group",
-        "ood_parameters",
-        "ood_evidence",
         "sequence_length",
         "stored_state_count",
         "transition_count",
@@ -979,7 +964,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
             or not simulation_case_id
             or simulation_case_id in simulation_case_ids
             or case["source_simulation_profile"] != transient_contract.TRANSIENT_PROFILE_ID
-            or case["evaluation_regime"] != payload["evaluation_regime"]
             or isinstance(sequence_length, bool)
             or not isinstance(sequence_length, int)
             or sequence_length < _MINIMUM_TRANSIENT_STATE_COUNT

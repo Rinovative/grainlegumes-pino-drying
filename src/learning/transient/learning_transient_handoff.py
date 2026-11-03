@@ -1,28 +1,36 @@
-# ruff: noqa: EM101, EM102, TRY003
-"""
-learning_transient_handoff.py
-
-Publish and validate immutable transient teacher handoff snapshots.
+"""Publish and validate immutable transient teacher handoff snapshots.
 
 Responsibilities:
-  - Copy selected Stage-A checkpoint and scaling artifacts immutably
-  - Bind copied bytes and semantic compatibility evidence in a strict manifest
+  - Hard-link the selected Stage-A checkpoint and copy its scaling artifact into the snapshot
+  - Bind the snapshot bytes and semantic compatibility evidence in a strict manifest
   - Validate target admission before any continuation state is restored
 
 Design principles:
   - Publication uses a sibling temporary directory and atomic rename
+  - The checkpoint link fails closed: a filesystem that cannot link publishes no snapshot instead of a second copy
+  - Checkpoints are only ever replaced by rename, so a later best checkpoint of the source never changes the linked snapshot bytes
   - Existing snapshots are accepted only when byte-identical and valid
   - Compatibility separates scientific state from comparison execution policy
 
 This module does NOT:
   - Construct models, fit scalers, or restore checkpoint state
   - Choose source runs or infer target budgets
+
+Notes:
+  Snapshot layout:
+    handoff/ beneath the source A0 run contains manifest.json,
+    best_checkpoint.pt, and normalizer.pt. Publication hard-links the selected
+    checkpoint and copies the fitted scaling artifact into a temporary sibling
+    directory, then atomically renames that directory to publish the run-local
+    snapshot.
+
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
 import uuid
 from collections.abc import Mapping
@@ -31,7 +39,7 @@ from typing import Any
 
 from src import common
 
-_HANDOFF_DIRECTORY = "stage_a_handoff"
+HANDOFF_DIRECTORY = "handoff"
 _MANIFEST_FILENAME = "manifest.json"
 _CHECKPOINT_FILENAME = "best_checkpoint.pt"
 _SCALING_FILENAME = "normalizer.pt"
@@ -52,7 +60,8 @@ def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
         or (device_type == "cuda" and (not isinstance(gpu_model, str) or not gpu_model))
         or (device_type == "cpu" and gpu_model is not None)
     ):
-        raise ValueError("Teacher handoff device evidence must be CPU or CUDA with an exact GPU model.")
+        msg = "Teacher handoff device evidence must be CPU or CUDA with an exact GPU model."
+        raise ValueError(msg)
     return {"device_type": device_type, "cuda_gpu_model": gpu_model}
 
 
@@ -61,12 +70,14 @@ def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
     required = {"task", "task_contract", "input_profile", "temporal", "model", "loss", "optimizer", "scheduler", "scaling", "run", "data", "training"}
     missing = required.difference(config)
     if missing:
-        raise ValueError(f"Transient handoff config lacks compatibility roots {sorted(missing)}.")
+        msg = f"Transient handoff config lacks compatibility roots {sorted(missing)}."
+        raise ValueError(msg)
     run = config["run"]
     training = config["training"]
     data = config["data"]
     if not all(isinstance(item, Mapping) for item in (run, training, data)):
-        raise TypeError("Transient handoff config run, data, and training must be mappings.")
+        msg = "Transient handoff config run, data, and training must be mappings."
+        raise TypeError(msg)
     return {
         "task": copy.deepcopy(config["task"]),
         "task_contract": copy.deepcopy(config["task_contract"]),
@@ -80,7 +91,10 @@ def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
         "deterministic": copy.deepcopy(run.get("deterministic")),
         "seed": copy.deepcopy(run.get("seed")),
         "amp": copy.deepcopy(training.get("mixed_precision")),
-        "datasets": {"train_dataset": copy.deepcopy(data.get("train_dataset")), "ood_datasets": copy.deepcopy(data.get("ood_datasets"))},
+        "datasets": {
+            "train_dataset": copy.deepcopy(data.get("train_dataset")),
+            "additional_evaluation_datasets": copy.deepcopy(data.get("additional_evaluation_datasets")),
+        },
     }
 
 
@@ -104,11 +118,14 @@ def publish_stage_a_handoff(
     checkpoint = common.paths.resolve_best_checkpoint_file(source)
     scaling = common.paths.resolve_normalizer_path(source)
     if not checkpoint.is_file() or not scaling.is_file():
-        raise FileNotFoundError("Stage-A handoff requires selected best_checkpoint.pt and normalizer.pt.")
+        msg = "Stage-A handoff requires selected best_checkpoint.pt and normalizer.pt."
+        raise FileNotFoundError(msg)
     if not isinstance(source_run_name, str) or not source_run_name:
-        raise ValueError("source_run_name must be non-empty.")
+        msg = "source_run_name must be non-empty."
+        raise ValueError(msg)
     if not isinstance(best_epoch, int) or best_epoch < 1 or not isinstance(global_step, int) or global_step < 0:
-        raise ValueError("Stage-A handoff best epoch and global step are invalid.")
+        msg = "Stage-A handoff best epoch and global step are invalid."
+        raise ValueError(msg)
     compatibility = compatibility_payload(config)
     manifest = {
         "schema_version": _SCHEMA_VERSION,
@@ -130,18 +147,19 @@ def publish_stage_a_handoff(
         "compatibility_digest": _canonical_digest(compatibility),
         "target_reset_policy": {"adapter": "fresh", "selection": "fresh", "global_step": "fresh", "history": "fresh"},
     }
-    destination = source / _HANDOFF_DIRECTORY
+    destination = source / HANDOFF_DIRECTORY
     if destination.exists():
         existing = validate_stage_a_handoff(destination, target_config=config, device=device, expected_source_run_name=source_run_name)
         if existing["files"]["checkpoint"]["sha256"] != common.serialization.file_sha256(checkpoint) or existing["files"]["scaling"][
             "sha256"
         ] != common.serialization.file_sha256(scaling):
-            raise FileExistsError("Existing Stage-A handoff is not byte-identical to the selected source artifacts.")
+            msg = "Existing Stage-A handoff is not byte-identical to the selected source artifacts."
+            raise FileExistsError(msg)
         return existing
-    temporary = source / f".{_HANDOFF_DIRECTORY}.{uuid.uuid4().hex}.tmp"
+    temporary = source / f".{HANDOFF_DIRECTORY}.{uuid.uuid4().hex}.tmp"
     temporary.mkdir()
     try:
-        shutil.copyfile(checkpoint, temporary / _CHECKPOINT_FILENAME)
+        os.link(checkpoint, temporary / _CHECKPOINT_FILENAME)
         shutil.copyfile(scaling, temporary / _SCALING_FILENAME)
         common.serialization.atomic_write_json(temporary / _MANIFEST_FILENAME, manifest)
         temporary.replace(destination)
@@ -165,7 +183,8 @@ def validate_local_teacher_handoff(
     except FileNotFoundError:
         raise
     except json.JSONDecodeError as error:
-        raise ValueError("Local teacher handoff manifest is invalid JSON.") from error
+        msg = "Local teacher handoff manifest is invalid JSON."
+        raise ValueError(msg) from error
     required = {
         "schema_version",
         "source_run_name",
@@ -184,10 +203,12 @@ def validate_local_teacher_handoff(
         "target_reset_policy",
     }
     if not isinstance(manifest, Mapping) or set(manifest) != required or manifest["schema_version"] != _SCHEMA_VERSION:
-        raise ValueError("Local teacher handoff manifest schema is invalid.")
+        msg = "Local teacher handoff manifest schema is invalid."
+        raise ValueError(msg)
     files = manifest["files"]
     if not isinstance(files, Mapping) or set(files) != {"checkpoint", "scaling"}:
-        raise ValueError("Local teacher handoff file manifest is invalid.")
+        msg = "Local teacher handoff file manifest is invalid."
+        raise ValueError(msg)
     scaling = files["scaling"]
     checkpoint = files["checkpoint"]
     if (
@@ -198,16 +219,21 @@ def validate_local_teacher_handoff(
         or checkpoint.get("filename") != _CHECKPOINT_FILENAME
         or not isinstance(checkpoint.get("sha256"), str)
     ):
-        raise ValueError("Local teacher handoff file entries are invalid.")
+        msg = "Local teacher handoff file entries are invalid."
+        raise ValueError(msg)
     if common.serialization.file_sha256(Path(local_normalizer_path)) != scaling["sha256"]:
-        raise ValueError("Local teacher scaling bytes do not match the teacher handoff manifest.")
+        msg = "Local teacher scaling bytes do not match the teacher handoff manifest."
+        raise ValueError(msg)
     compatibility = manifest["compatibility"]
     if not isinstance(compatibility, Mapping) or manifest["compatibility_digest"] != _canonical_digest(compatibility):
-        raise ValueError("Local teacher handoff compatibility digest is invalid.")
+        msg = "Local teacher handoff compatibility digest is invalid."
+        raise ValueError(msg)
     if dict(compatibility) != compatibility_payload(target_config):
-        raise ValueError("Local teacher handoff is scientifically incompatible with the target configuration.")
+        msg = "Local teacher handoff is scientifically incompatible with the target configuration."
+        raise ValueError(msg)
     if _device_evidence(manifest["device"]) != _device_evidence(device):
-        raise ValueError("Local teacher handoff device type or CUDA GPU model does not match the target runtime.")
+        msg = "Local teacher handoff device type or CUDA GPU model does not match the target runtime."
+        raise ValueError(msg)
     return copy.deepcopy(dict(manifest))
 
 
@@ -226,7 +252,8 @@ def validate_stage_a_handoff(
     except FileNotFoundError:
         raise
     except json.JSONDecodeError as error:
-        raise ValueError("Transient handoff manifest is invalid JSON.") from error
+        msg = "Transient handoff manifest is invalid JSON."
+        raise ValueError(msg) from error
     required = {
         "schema_version",
         "source_run_name",
@@ -245,23 +272,31 @@ def validate_stage_a_handoff(
         "target_reset_policy",
     }
     if not isinstance(manifest, Mapping) or set(manifest) != required or manifest["schema_version"] != _SCHEMA_VERSION:
-        raise ValueError("Transient handoff manifest schema is invalid.")
+        msg = "Transient handoff manifest schema is invalid."
+        raise ValueError(msg)
     if expected_source_run_name is not None and manifest["source_run_name"] != expected_source_run_name:
-        raise ValueError("Transient handoff source run name disagrees with target configuration.")
+        msg = "Transient handoff source run name disagrees with target configuration."
+        raise ValueError(msg)
     files = manifest["files"]
     if not isinstance(files, Mapping) or set(files) != {"checkpoint", "scaling"}:
-        raise ValueError("Transient handoff file manifest is invalid.")
+        msg = "Transient handoff file manifest is invalid."
+        raise ValueError(msg)
     for name, filename in (("checkpoint", _CHECKPOINT_FILENAME), ("scaling", _SCALING_FILENAME)):
         entry = files[name]
         if not isinstance(entry, Mapping) or entry.get("filename") != filename or not isinstance(entry.get("sha256"), str):
-            raise ValueError("Transient handoff file entry is invalid.")
+            msg = "Transient handoff file entry is invalid."
+            raise ValueError(msg)
         if common.serialization.file_sha256(path / filename) != entry["sha256"]:
-            raise ValueError(f"Transient handoff {name} bytes do not match its manifest.")
+            msg = f"Transient handoff {name} bytes do not match its manifest."
+            raise ValueError(msg)
     compatibility = manifest["compatibility"]
     if not isinstance(compatibility, Mapping) or manifest["compatibility_digest"] != _canonical_digest(compatibility):
-        raise ValueError("Transient handoff compatibility digest is invalid.")
+        msg = "Transient handoff compatibility digest is invalid."
+        raise ValueError(msg)
     if dict(compatibility) != compatibility_payload(target_config):
-        raise ValueError("Transient handoff is scientifically incompatible with the target configuration.")
+        msg = "Transient handoff is scientifically incompatible with the target configuration."
+        raise ValueError(msg)
     if _device_evidence(manifest["device"]) != _device_evidence(device):
-        raise ValueError("Transient handoff device type or CUDA GPU model does not match the target runtime.")
+        msg = "Transient handoff device type or CUDA GPU model does not match the target runtime."
+        raise ValueError(msg)
     return copy.deepcopy(dict(manifest))

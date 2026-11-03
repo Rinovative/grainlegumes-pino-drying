@@ -1,7 +1,4 @@
-"""
-learning_metrics.py
-
-Compute task-resolved PyTorch metrics for training and evaluation.
+"""Compute task-resolved PyTorch metrics for training and evaluation.
 
 Responsibilities:
   - Register and validate semantic metric identifiers
@@ -29,6 +26,7 @@ import numpy as np
 import torch
 
 from src import domain
+from src.learning import losses
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -896,20 +894,19 @@ class RelativeL2Metric(DatasetMetric):
 
 class RelativeH1Metric(RelativeL2Metric):
     """
-    Accumulate NeuralOp-compatible relative H1 values per sample.
+    Accumulate non-periodic relative H1 values per sample.
 
-    The registered NeuralOp H1 implementation uses the TaskSpec operator
-    dimensionality and is evaluated independently per sample before sample-mean
-    accumulation, preserving the declared ``sample_mean`` reduction.
+    The loss factory's relative H1 definition uses the TaskSpec operator
+    dimensionality and one-sided boundary differences; it is evaluated
+    independently per sample before sample-mean accumulation, preserving the
+    declared ``sample_mean`` reduction.
     """
 
     def __init__(self, definition: ResolvedMetric, *, device: torch.device) -> None:
         """Build the task-dimensional relative H1 implementation."""
-        from neuralop import H1Loss  # noqa: PLC0415
-
         super().__init__(definition, device=device)
-        self._implementation = H1Loss(
-            d=definition.operator_dimensionality,
+        self._implementation = losses.factory.build_relative_h1(
+            definition.operator_dimensionality,
             reduction="sum",
         )
 
@@ -1158,14 +1155,3 @@ def build_evaluation_metrics(
             msg = f"No dataset accumulator exists for metric identifier {kind!r}."
             raise ValueError(msg)
     return built
-
-
-def reset_metrics(metrics: dict[str, DatasetMetric]) -> None:
-    """Reset every configured dataset accumulator."""
-    for metric in metrics.values():
-        metric.reset()
-
-
-def finalize_metrics(metrics: dict[str, DatasetMetric]) -> dict[str, float]:
-    """Finalize every configured dataset accumulator exactly once."""
-    return {metric_id: metric.compute() for metric_id, metric in metrics.items()}

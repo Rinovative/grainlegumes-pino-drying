@@ -1,7 +1,4 @@
-"""
-evaluation_workspace.py
-
-Prepare automatic run-discovery workspaces for Evaluation notebooks.
+"""Prepare automatic run-discovery workspaces for Evaluation notebooks.
 
 Responsibilities:
   - Discover persisted experiments once and retain the normalized catalog
@@ -20,10 +17,20 @@ This module does NOT:
   - Generate, rebuild, upload, or delete Evaluation artifacts
   - Infer task, stage, Dataset, or protocol identity from directory names
   - Reimplement scientific metrics, plotting, or artifact admission
+
+Notes:
+  Workspace modes:
+    - Single-run mode admits every available role for one selected run and keeps missing, partial, or invalid artifact states visible without building
+      artifacts.
+    - Comparison mode offers only exact role and Dataset bindings shared by all selected runs, then loads the selected shared role.
+  Selection lifecycle:
+    - Run discovery is retained across widget changes; replacing a prepared workflow closes its previous session.
+
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
@@ -32,18 +39,20 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import ipywidgets as widgets
 
 from src import analysis, common
+from src.analysis.presentation import analysis_compute as compute
 
 from . import evaluation_run_discovery as run_discovery
 from . import evaluation_selection as selection
 from . import evaluation_workflow as workflow
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
 WorkspaceKind = Literal["single", "comparison"]
 
 _MINIMUM_COMPARISON_RUNS = 2
-_TRAINING_COMPARISON_ARM_COUNT = 3
+ArtifactRole = Literal["id", "additional_evaluation"]
+_ARTIFACT_ROLES: tuple[ArtifactRole, ArtifactRole] = ("id", "additional_evaluation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,18 +94,18 @@ def _dropdown(
 
 def _artifact_for_role(
     run: run_discovery.EvaluationRunDiscovery,
-    role: Literal["id", "ood"],
-) -> run_discovery.EvaluationArtifactInspection:
+    role: ArtifactRole,
+) -> run_discovery.EvaluationArtifactInspection | None:
     """Return one selected artifact inspection."""
-    return run.id_artifact if role == "id" else run.ood_artifact
+    return run.id_artifact if role == "id" else run.additional_artifact
 
 
 def _role_label(role: str) -> str:
-    """Return the exact shared ID/OOD presentation term."""
+    """Return the exact task-owned artifact presentation term."""
     labels = {
         "id": "ID",
-        "ood": "Near-family OOD",
-        "both": "ID + Near-family OOD",
+        "additional_evaluation": "Additional evaluation",
+        "both": "Both",
     }
     try:
         return labels[role]
@@ -105,13 +114,16 @@ def _role_label(role: str) -> str:
         raise ValueError(message) from error
 
 
-def _run_option_label(run: run_discovery.EvaluationRunDiscovery) -> str:
+def _run_option_label(run: run_discovery.EvaluationRunDiscovery, *, model_label: str | None = None) -> str:
     """Return one concise architecture, child-stage, and material label."""
     parts = [run.model_label]
+    parts.append(f"seed {run.seed}" if run.seed is not None else "seed unavailable")
     if run.stage is not None and run.stage.lower() not in run.model_label.lower():
         parts.append(run.stage)
+    if model_label is not None:
+        parts = [model_label]
     if run.dataset_label is not None:
-        material = run.dataset_label.removesuffix("_id").replace("_", " ")
+        material = run.dataset_label
         if material.lower() not in " ".join(parts).lower():
             parts.append(material)
     return " · ".join(parts)
@@ -146,17 +158,11 @@ def _compatibility_issues(
         "evaluation protocol": "evaluation_config_identity",
         "spatial stride": "spatial_stride",
     }
-    issues: list[str] = []
+    issues = [f"{run.model_label}: {reason}" for run in runs for reason in run.metadata_issues]
     for label, field in fields.items():
         values = {getattr(run, field) for run in runs}
         if len(values) > 1:
             issues.append(f"Selected runs have incompatible {label}.")
-    stages = {run.stage for run in runs}
-    exact_three_arm = (
-        {run.task for run in runs} == {"transient_drying"} and len(runs) == _TRAINING_COMPARISON_ARM_COUNT and stages == {"A0", "A+", "B"}
-    )
-    if len(stages) > 1 and not exact_three_arm:
-        issues.append("Selected runs have incompatible stage semantics.")
     return tuple(issues)
 
 
@@ -169,11 +175,29 @@ class _EvaluationWorkspaceController:
         *,
         kind: WorkspaceKind,
         title: str,
+        evaluation_compute_device: str,
+        comparison_output_dir: Path | str | None = None,
     ) -> None:
         """Create one run explorer without loading numerical payloads."""
         self.catalog = catalog
         self.kind = kind
         self.title = title
+        self.comparison_output_dir = None if comparison_output_dir is None else Path(comparison_output_dir).expanduser().resolve()
+        self.compute_preference = compute.AnalysisComputePreference(evaluation_compute_device)
+        self.compute_status = widgets.HTML(
+            f"<p><b>Analysis compute:</b> {escape(compute.selection_status(self.compute_preference.requested))}. "
+            "GPU work is limited to eligible transient aggregate error reductions; other views use CPU.</p>"
+        )
+        self._updating_compute = False
+        compute_options = tuple(dict.fromkeys((evaluation_compute_device, "auto", "cpu", "cuda", *compute.visible_cuda_options())))
+        self.compute_selector = widgets.Dropdown(
+            options=compute_options,
+            value=evaluation_compute_device,
+            description="Evaluation compute:",
+            style={"description_width": "initial"},
+            layout=widgets.Layout(width="auto"),
+        )
+        self.compute_selector.observe(self._compute_device_changed, names="value")
         self.state = selection.EvaluationSelectionState(
             catalog,
             comparison=kind == "comparison",
@@ -182,17 +206,19 @@ class _EvaluationWorkspaceController:
         self._updating = False
         self.status = widgets.HTML(layout=widgets.Layout(width="100%"))
         self.analysis = widgets.VBox()
+        run_labels = self._comparison_labels(catalog.runs)
+        options = tuple((_run_option_label(run, model_label=label), str(run.run_dir)) for run, label in zip(catalog.runs, run_labels, strict=True))
         if kind == "single":
             self.run = _dropdown(
-                tuple((_run_option_label(run), str(run.run_dir)) for run in catalog.runs),
+                options,
                 description="Run:",
             )
-            controls: tuple[widgets.Widget, ...] = (self.run,)
+            controls: tuple[widgets.Widget, ...] = (self.run, self.compute_selector)
             self.run.observe(self._single_run_changed, names="value")
             self._render_single()
         else:
             self.run_filter = widgets.SelectMultiple(
-                options=tuple((_run_option_label(run), str(run.run_dir)) for run in catalog.runs),
+                options=options,
                 description="Runs:",
                 style={"description_width": "initial"},
                 layout=widgets.Layout(width="420px", height="100px"),
@@ -201,7 +227,7 @@ class _EvaluationWorkspaceController:
                 (("Select compatible runs", None),),
                 description="Material/Dataset:",
             )
-            controls = (self.run_filter, self.dataset_filter)
+            controls = (self.run_filter, self.dataset_filter, self.compute_selector)
             self.run_filter.observe(self._comparison_runs_changed, names="value")
             self.dataset_filter.observe(self._comparison_dataset_changed, names="value")
             self._select_initial_comparison()
@@ -209,6 +235,7 @@ class _EvaluationWorkspaceController:
             (
                 widgets.HTML(f"<h2>{escape(title)}</h2>"),
                 widgets.VBox(controls),
+                self.compute_status,
                 self.status,
                 self.analysis,
             ),
@@ -221,6 +248,28 @@ class _EvaluationWorkspaceController:
             self._workflow.close()
             self._workflow = None
         self.analysis.children = ()
+
+    def _compute_device_changed(self, change: Mapping[str, object]) -> None:
+        """Update the one shared route while retaining mounted field choices."""
+        if self._updating_compute:
+            return
+        requested = change.get("new")
+        if not isinstance(requested, str):
+            return
+        try:
+            self.compute_preference.set_requested(requested)
+        except (ValueError, RuntimeError) as error:
+            self._updating_compute = True
+            try:
+                self.compute_selector.value = self.compute_preference.requested
+            finally:
+                self._updating_compute = False
+            self.compute_status.value = f"<p><b>Analysis compute unavailable:</b> {escape(str(error))}</p>"
+            return
+        self.compute_status.value = (
+            f"<p><b>Analysis compute:</b> {escape(compute.selection_status(requested))}. "
+            "GPU work is limited to eligible transient aggregate error reductions; other views use CPU.</p>"
+        )
 
     def _run_by_path(self, path: str | Path) -> run_discovery.EvaluationRunDiscovery:
         """Return one exact catalog run by resolved current path."""
@@ -245,25 +294,21 @@ class _EvaluationWorkspaceController:
     @staticmethod
     def _available_roles(
         run: run_discovery.EvaluationRunDiscovery,
-    ) -> tuple[Literal["id", "ood"], ...]:
+    ) -> tuple[ArtifactRole, ...]:
         """Return every complete or explicitly scoped artifact role for one run."""
         return tuple(
             role
-            for role in ("id", "ood")
-            if _artifact_for_role(
-                run,
-                cast("Literal['id', 'ood']", role),
-            ).state
-            in {"ready", "scoped_partial"}
+            for role in _ARTIFACT_ROLES
+            if (artifact := _artifact_for_role(run, role)) is not None and artifact.state in {"ready", "scoped_partial"}
         )
 
     @staticmethod
     def _artifact_role(
-        roles: Sequence[Literal["id", "ood"]],
+        roles: Sequence[ArtifactRole],
     ) -> selection.ArtifactRole:
         """Collapse an available role inventory into shared selection state."""
         admitted = tuple(roles)
-        if admitted == ("id", "ood"):
+        if admitted == ("id", "additional_evaluation"):
             return "both"
         if len(admitted) == 1:
             return admitted[0]
@@ -274,34 +319,23 @@ class _EvaluationWorkspaceController:
         *,
         task: str,
         dataset_name: str,
-        role: Literal["id", "ood"],
+        role: ArtifactRole,
+        declared_role: str | None = None,
     ) -> str:
-        """Project one exact Dataset identity to compact material-first text."""
+        """Display the authored Dataset name and its exact evaluation role."""
         projection = run_discovery.dataset_display_projection(
             task,
             dataset_name,
         )
-        suffix = "_id" if role == "id" else "_near_family_ood"
-        material_projection = projection.removesuffix(suffix)
-        material_ids = tuple(value for value in material_projection.split("+") if value)
-        try:
-            materials = tuple(
-                analysis.presentation.display_labels.material_display_label(
-                    material,
-                )
-                for material in material_ids
-            )
-        except (TypeError, ValueError):
-            materials = ()
-        material_text = " + ".join(materials) if materials else material_projection.replace("_", " ").replace("-", " ").capitalize()
-        return f"{material_text} · {_role_label(role)}"
+        role_text = analysis.presentation.display_labels.evaluation_role_display_label(declared_role) if declared_role else _role_label(role)
+        return f"{projection} · {role_text}"
 
     def _dataset_bindings(
         self,
         run: run_discovery.EvaluationRunDiscovery,
-    ) -> dict[str, tuple[str, Literal["id", "ood"]]]:
+    ) -> dict[str, tuple[str, ArtifactRole]]:
         """Return exact available Dataset choices and their artifact roles."""
-        bindings: dict[str, tuple[str, Literal["id", "ood"]]] = {}
+        bindings: dict[str, tuple[str, ArtifactRole]] = {}
         if run.dataset_id is not None and run.id_artifact.state == "ready":
             bindings[f"id:{run.dataset_id}"] = (
                 self._dataset_binding_label(
@@ -311,26 +345,27 @@ class _EvaluationWorkspaceController:
                 ),
                 "id",
             )
-        if run.ood_dataset_ids and run.ood_artifact.state == "ready":
-            identity = common.serialization.canonical_json_sha256({"source_dataset_ids": list(run.ood_dataset_ids)})
+        if run.additional_dataset_ids and run.additional_artifact is not None and run.additional_artifact.state == "ready":
+            identity = common.serialization.canonical_json_sha256({"source_dataset_ids": list(run.additional_dataset_ids)})
             labels = tuple(
                 self._dataset_binding_label(
                     task=run.task,
                     dataset_name=dataset_name,
-                    role="ood",
+                    role="additional_evaluation",
+                    declared_role=str(assignment["role"]),
                 )
-                for dataset_name in run.ood_dataset_ids
+                for dataset_name, assignment in zip(run.additional_dataset_ids, run.evaluation_assignments, strict=True)
             )
-            bindings[f"ood:{identity}"] = (
+            bindings[f"additional_evaluation:{identity}"] = (
                 " + ".join(dict.fromkeys(labels)),
-                "ood",
+                "additional_evaluation",
             )
         return bindings
 
     def _common_dataset_bindings(
         self,
         runs: Sequence[run_discovery.EvaluationRunDiscovery],
-    ) -> dict[str, tuple[str, Literal["id", "ood"]]]:
+    ) -> dict[str, tuple[str, ArtifactRole]]:
         """Return the exact available Material/Dataset intersection."""
         admitted = tuple(runs)
         if not admitted:
@@ -339,7 +374,7 @@ class _EvaluationWorkspaceController:
         keys = set(inventories[0])
         for inventory in inventories[1:]:
             keys.intersection_update(inventory)
-        result: dict[str, tuple[str, Literal["id", "ood"]]] = {}
+        result: dict[str, tuple[str, ArtifactRole]] = {}
         for key in sorted(keys):
             values = {inventory[key] for inventory in inventories}
             if len(values) == 1:
@@ -350,21 +385,25 @@ class _EvaluationWorkspaceController:
         self,
         run: run_discovery.EvaluationRunDiscovery,
         *,
-        selected_roles: Sequence[Literal["id", "ood"]],
+        selected_roles: Sequence[ArtifactRole],
         detail: str | None = None,
-        material_coverage: Sequence[tuple[str, Literal["id", "ood"]]] = (),
+        material_coverage: Sequence[tuple[str, str, ArtifactRole]] = (),
     ) -> str:
         """Return one compact EDA-aligned overview and lifecycle action."""
         del selected_roles
-        coverage_roles: tuple[Literal["id", "ood"], ...] = ("id", "ood")
+        coverage_roles = _ARTIFACT_ROLES
         coverage = (
             "; ".join(
-                f"{analysis.presentation.display_labels.material_role_display_label(material, role)} · "
-                f"{_artifact_state_label(_artifact_for_role(run, role))}"
-                for material, role in material_coverage
+                f"{analysis.presentation.display_labels.material_role_display_label(material, declared_role)} · "
+                f"{_artifact_state_label(cast('run_discovery.EvaluationArtifactInspection', _artifact_for_role(run, slot)))}"
+                for material, declared_role, slot in material_coverage
             )
             if material_coverage
-            else "; ".join(f"{_role_label(role)} · {_artifact_state_label(_artifact_for_role(run, role))}" for role in coverage_roles)
+            else "; ".join(
+                f"{_role_label(role)} · {_artifact_state_label(artifact)}"
+                for role in coverage_roles
+                if (artifact := _artifact_for_role(run, role)) is not None
+            )
         )
         rows = (
             (
@@ -376,6 +415,7 @@ class _EvaluationWorkspaceController:
             ("Model", run.model_label),
             ("Stage", run.stage or "—"),
             ("Seed", "—" if run.seed is None else str(run.seed)),
+            ("Metadata", "; ".join(run.metadata_issues) if run.metadata_issues else "Available"),
             ("Dataset", run.dataset_label or run.dataset_id or "unavailable"),
             (
                 "Protocol",
@@ -390,7 +430,7 @@ class _EvaluationWorkspaceController:
         table = "".join(
             f"<tr><th style='text-align:left;padding-right:1.25em'>{escape(label)}</th><td>{escape(value)}</td></tr>" for label, value in rows
         )
-        states = {artifact.state for artifact in (run.id_artifact, run.ood_artifact)}
+        states = {artifact.state for artifact in (run.id_artifact, run.additional_artifact) if artifact is not None}
         command = ""
         if states.intersection({"missing", "scoped_partial"}):
             command = f"<p><b>Generate full artifact coverage</b><br><code>{escape(run.artifact_command)}</code></p>"
@@ -437,7 +477,7 @@ class _EvaluationWorkspaceController:
             return
         if not selected_roles:
             self._clear_workflow()
-            states = {artifact.state for artifact in (run.id_artifact, run.ood_artifact)}
+            states = {artifact.state for artifact in (run.id_artifact, run.additional_artifact) if artifact is not None}
             if "generating" in states:
                 detail = "Artifact generation is active; completed staging payloads remain hidden until atomic publication."
             elif "invalid" in states:
@@ -450,16 +490,12 @@ class _EvaluationWorkspaceController:
                 detail=detail,
             )
             return
-        scoped_roles: tuple[Literal["id", "ood"], ...] = tuple(
-            cast("Literal['id', 'ood']", role)
-            for role in selected_roles
-            if _artifact_for_role(
-                run,
-                cast("Literal['id', 'ood']", role),
-            ).state
-            == "scoped_partial"
+        scoped_roles: tuple[ArtifactRole, ...] = tuple(
+            role for role in selected_roles if (artifact := _artifact_for_role(run, role)) is not None and artifact.state == "scoped_partial"
         )
-        artifact_roots: dict[workflow.ArtifactSelectionRole, Path] = {role: _artifact_for_role(run, role).root for role in scoped_roles}
+        artifact_roots: dict[workflow.ArtifactSelectionRole, Path] = {
+            role: artifact.root for role in scoped_roles if (artifact := _artifact_for_role(run, role)) is not None
+        }
         sections: Sequence[str] | str = ("sample_viewer",) if scoped_roles and run.task == "transient_drying" else "all"
         try:
             prepared = workflow.prepare_single_model_evaluation_workspace(
@@ -472,6 +508,7 @@ class _EvaluationWorkspaceController:
                 rebuild_incompatible=False,
                 sections=sections,
                 selection_state=self.state,
+                evaluation_compute_device=self.compute_preference,
             )
         except Exception as error:  # noqa: BLE001 -- bounded notebook status
             self._clear_workflow()
@@ -481,7 +518,7 @@ class _EvaluationWorkspaceController:
                 detail=f"Artifact admission failed ({type(error).__name__}): {error}",
             )
             return
-        unavailable = tuple(role for role in ("id", "ood") if role not in selected_roles)
+        unavailable = tuple(role for role in _ARTIFACT_ROLES if role not in selected_roles)
         availability_detail: str | None = None
         if scoped_roles:
             availability_detail = "Selected-case evidence is admitted for Single-case Evaluation only; aggregate coverage remains unavailable."
@@ -491,21 +528,23 @@ class _EvaluationWorkspaceController:
                 + ", ".join(_role_label(role) for role in unavailable)
                 + "."
             )
-        material_coverage: tuple[tuple[str, Literal["id", "ood"]], ...] = ()
+        material_coverage: tuple[tuple[str, str, ArtifactRole], ...] = ()
         session_inventory = getattr(getattr(prepared, "session", None), "partitioned_case_inventory", None)
         if callable(session_inventory):
             entries = tuple(cast("Any", session_inventory)())
-            unique: dict[tuple[str, Literal["id", "ood"]], tuple[int, int]] = {}
+            unique: dict[tuple[str, str, ArtifactRole], tuple[int, int]] = {}
             artifact_positions: dict[Path, int] = {}
             for entry in entries:
-                role = cast("Literal['id', 'ood']", entry.dataset_role)
+                role = cast("ArtifactRole", entry.dataset_role)
+                assignment = getattr(entry, "evaluation_assignment", None)
+                declared_role = str(assignment["role"]) if isinstance(assignment, Mapping) else role
                 artifact_position = artifact_positions.setdefault(
                     entry.artifact_root,
                     len(artifact_positions),
                 )
                 material_position = entry.dataset_name.find(entry.material_family)
                 unique.setdefault(
-                    (entry.material_family, role),
+                    (entry.material_family, declared_role, role),
                     (
                         artifact_position,
                         material_position if material_position >= 0 else len(entry.dataset_name),
@@ -583,9 +622,40 @@ class _EvaluationWorkspaceController:
     def _comparison_label(run: run_discovery.EvaluationRunDiscovery) -> str:
         """Return one concise architecture label with provenance as secondary text."""
         parts = [run.model_label]
+        parts.append(f"seed {run.seed}" if run.seed is not None else "seed unavailable")
         if run.stage is not None and run.stage.lower() not in run.model_label.lower():
             parts.append(run.stage)
         return " · ".join(parts)
+
+    @classmethod
+    def _comparison_labels(cls, runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
+        """Add readable family/config and pair context only to real label collisions."""
+        bases = tuple(cls._comparison_label(run) for run in runs)
+        labels = list(bases)
+        for base in set(bases):
+            positions = tuple(index for index, value in enumerate(bases) if value == base)
+            if len(positions) == 1:
+                continue
+            for index in positions:
+                run = runs[index]
+                context = tuple(value for value in (run.config_label, run.pair_label) if value)
+                labels[index] = " · ".join((base, *(context or (run.run_name,))))
+            duplicate_labels = {labels[index] for index in positions if labels.count(labels[index]) > 1}
+            for index in positions:
+                if labels[index] in duplicate_labels:
+                    labels[index] = f"{labels[index]} · {runs[index].run_name}"
+            remaining = tuple(index for index in positions if labels.count(labels[index]) > 1)
+            for index in remaining:
+                labels[index] = f"{labels[index]} · {runs[index].run_dir}"
+        return tuple(labels)
+
+    def _comparison_export_dir(self, selected: Sequence[run_discovery.EvaluationRunDiscovery]) -> Path | None:
+        """Choose an explicit override or one exact selected experiment's comparison folder."""
+        if self.comparison_output_dir is not None:
+            return self.comparison_output_dir
+        directories = {run.experiment_dir for run in selected}
+        directory = next(iter(directories)) if len(directories) == 1 else None
+        return directory / "comparison" if directory is not None else None
 
     def _render_comparison(self) -> None:
         """Render one task-compatible comparison on a concrete shared Dataset."""
@@ -611,13 +681,15 @@ class _EvaluationWorkspaceController:
         try:
             prepared = workflow.prepare_model_comparison_evaluation_workspace(
                 tuple(run.run_dir for run in selected),
-                labels=tuple(self._comparison_label(run) for run in selected),
+                labels=self._comparison_labels(selected),
+                export_dir=self._comparison_export_dir(selected),
                 expected_task=selected[0].task,
                 artifact_roles=(role,),
                 auto_build_missing=False,
                 rebuild_incompatible=False,
                 sections="all",
                 selection_state=self.state,
+                evaluation_compute_device=self.compute_preference,
             )
         except Exception as error:  # noqa: BLE001 -- bounded notebook status
             self._clear_workflow()
@@ -654,6 +726,8 @@ def prepare_evaluation_workspace(
     storage_root: Path | str | None = None,
     kind: WorkspaceKind,
     title: str,
+    evaluation_compute_device: str = "auto",
+    comparison_output_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkspace:
     """Discover runs once and prepare one automatic Evaluation notebook workspace."""
     if kind not in {"single", "comparison"}:
@@ -662,8 +736,10 @@ def prepare_evaluation_workspace(
     if experiments_root is not None and storage_root is not None:
         message = "Provide experiments_root or storage_root, not both."
         raise ValueError(message)
+    compute.resolve_analysis_device(evaluation_compute_device)
+    compute_status = compute.selection_status(evaluation_compute_device)
     root = Path(experiments_root) if experiments_root is not None else common.paths.get_experiments_root(storage_root=storage_root)
-    catalog = run_discovery.discover_evaluation_runs(root)
+    catalog = run_discovery.discover_evaluation_runs(root, storage_root=storage_root)
     if not catalog.groups:
         message = "No persisted Evaluation runs were discovered. Complete or inspect Training runs below the canonical experiments root."
         empty_catalog = run_discovery.EvaluationRunCatalog(
@@ -683,7 +759,7 @@ def prepare_evaluation_workspace(
             catalog=empty_catalog,
             selection_state=None,
             panel=placeholder,
-            summary_text=_summary(empty_catalog, kind=kind),
+            summary_text=_summary(empty_catalog, kind=kind) + f"\nAnalysis compute: {compute_status}",
             kind=kind,
             _controller=None,
         )
@@ -691,12 +767,14 @@ def prepare_evaluation_workspace(
         catalog,
         kind=kind,
         title=title,
+        evaluation_compute_device=evaluation_compute_device,
+        comparison_output_dir=comparison_output_dir,
     )
     return PreparedEvaluationWorkspace(
         catalog=catalog,
         selection_state=controller.state,
         panel=controller.panel,
-        summary_text=_summary(catalog, kind=kind),
+        summary_text=_summary(catalog, kind=kind) + f"\nAnalysis compute: {compute_status}",
         kind=kind,
         _controller=controller,
     )
@@ -707,6 +785,7 @@ def prepare_single_model_evaluation_workspace(
     experiments_root: Path | str | None = None,
     storage_root: Path | str | None = None,
     title: str = "Single-model Evaluation",
+    evaluation_compute_device: str = "auto",
 ) -> PreparedEvaluationWorkspace:
     """Prepare automatic single-model Evaluation without run-name cells."""
     return prepare_evaluation_workspace(
@@ -714,6 +793,7 @@ def prepare_single_model_evaluation_workspace(
         storage_root=storage_root,
         kind="single",
         title=title,
+        evaluation_compute_device=evaluation_compute_device,
     )
 
 
@@ -722,6 +802,8 @@ def prepare_model_comparison_evaluation_workspace(
     experiments_root: Path | str | None = None,
     storage_root: Path | str | None = None,
     title: str = "Model comparison",
+    evaluation_compute_device: str = "auto",
+    comparison_output_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkspace:
     """Prepare automatic compatible-run comparison without a Python run list."""
     return prepare_evaluation_workspace(
@@ -729,4 +811,6 @@ def prepare_model_comparison_evaluation_workspace(
         storage_root=storage_root,
         kind="comparison",
         title=title,
+        evaluation_compute_device=evaluation_compute_device,
+        comparison_output_dir=comparison_output_dir,
     )

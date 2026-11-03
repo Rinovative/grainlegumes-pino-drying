@@ -1,16 +1,16 @@
-"""
-generation_input_controls.py
+"""Build local canonical-dataset selectors for generation-input views.
 
-Build local canonical-dataset selectors for generation-input views.
 Responsibilities:
   - Bind Dataset A, Case A, Dataset B, and Case B controls
   - Default both datasets together and select the first two unique cases
   - Restrict A/B choices to compatible simulation profiles
   - Provide a local optional A/B map-scale lock and dataset-overview selector
+
 Design principles:
   - Visible labels are concise while values retain canonical immutable keys
   - Selector changes rerender automatically without an update button
   - Case arrays and empirical means load only when the active view renders
+
 This module does NOT:
   - Refresh discovery, construct tabs, render figures, or discover storage paths
   - Expose input-generation sources or lifecycle categories as datasets
@@ -19,17 +19,20 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import ipywidgets as widgets
 
+from src.analysis import ui
+
 from . import generation_input_selection as shared_selection
+from . import generation_input_sources as sources
+from .plots import generation_input_plot_atlas as atlas_plots
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
     from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
-    from src.analysis.generation_inputs import generation_input_sources as sources
 
 DATASET_SELECTOR_WIDTH_PX = 360
 DATASET_LABEL_WIDTH_PX = 78
@@ -73,6 +76,87 @@ class SelectedComparison:
     mean_b: diagnostics.DatasetDiagnostics
     same_dataset: bool
     lock_scale: bool
+
+
+class FieldAtlasControls:
+    """Bind a single admitted case and independently retained spatial fields."""
+
+    def __init__(
+        self,
+        catalog: sources.GenerationInputDatasetCatalog,
+        selection_state: shared_selection.GenerationInputSelectionState,
+    ) -> None:
+        """Use the common Case A selection without loading dataset means."""
+        if selection_state.catalog is not catalog:
+            message = "Atlas controls require the selection state's admitted catalog."
+            raise ValueError(message)
+        self._catalog = catalog
+        self._state = selection_state
+        self._callback: Callable[[], None] | None = None
+        self._updating = False
+        self._atlas: atlas_plots.GeneratedFieldAtlas | None = None
+        self._loaded_key: sources.CaseKey | None = None
+        self._selected_fields: tuple[str, ...] | None = None
+        self.dataset = widgets.Dropdown(description="Dataset:", options=catalog.dataset_options(), layout=_DATASET_LAYOUT)
+        self.case = widgets.Dropdown(description="Case:", layout=_CASE_LAYOUT)
+        self.fields = ui.components.ChannelCheckboxState(
+            title="Spatial fields",
+            callback=self._changed,
+            selection_getter=lambda: self._selected_fields,
+            selection_setter=self._retain_fields,
+        )
+        self._synchronize(selection_state.selection)
+        self.dataset.observe(self._dataset_changed, names="value")
+        self.case.observe(self._case_changed, names="value")
+        selection_state.observe(self._synchronize)
+
+    @property
+    def widget(self) -> widgets.VBox:
+        """Return one case row and the maintained independent field selector."""
+        return widgets.VBox((widgets.HBox((self.dataset, self.case), layout=_CONTROL_LAYOUT), self.fields.container))
+
+    def set_callback(self, callback: Callable[[], None]) -> None:
+        """Bind automatic rendering without eagerly opening scientific arrays."""
+        self._callback = callback
+
+    def _retain_fields(self, selected: tuple[str, ...]) -> None:
+        """Keep explicit field choices through case and view changes."""
+        self._selected_fields = selected
+
+    def _changed(self) -> None:
+        """Notify the active view after a complete semantic state update."""
+        if self._callback is not None and not self._updating:
+            self._callback()
+
+    def _dataset_changed(self, _change: object) -> None:
+        """Delegate canonical membership reconciliation to the shared owner."""
+        if not self._updating and self.dataset.value is not None:
+            self._state.select_dataset_a(self.dataset.value)
+
+    def _case_changed(self, _change: object) -> None:
+        """Select one admitted sparse case key through the shared owner."""
+        if not self._updating and self.case.value is not None:
+            self._state.select_case_a(self.case.value)
+
+    def _synchronize(self, selection: shared_selection.GenerationInputSelection) -> None:
+        """Update controls without recursive events or loading unrelated cases."""
+        self._updating = True
+        try:
+            self.dataset.value = selection.dataset_a_key
+            self.case.options = self._catalog.case_options(selection.dataset_a_key)
+            self.case.value = selection.case_a_key
+        finally:
+            self._updating = False
+        self._changed()
+
+    def selected_atlas(self) -> atlas_plots.GeneratedFieldAtlas:
+        """Prepare arrays and full-grid scales only when the selected case changes."""
+        key = self._state.selection.case_a_key
+        if self._atlas is None or self._loaded_key != key:
+            self._atlas = atlas_plots.prepare_field_atlas(self._catalog.load(key))
+            self._loaded_key = key
+            self.fields.rebind(tuple(self._atlas.fields), labels=self._atlas.labels)
+        return self._atlas
 
 
 def _dropdown(
@@ -439,4 +523,87 @@ class DatasetControls:
     def _on_value_change(self, _change: object) -> None:
         """Render after the selected dataset changes."""
         if self._callback is not None:
+            self._callback()
+
+
+class CampaignOutcomeControls:
+    """Filter a single discovered campaign checkpoint without storage reads."""
+
+    def __init__(self, catalog: sources.CampaignOutcomeCatalog) -> None:
+        """Retain exact candidate selection independently of successful Dataset pools."""
+        self.catalog = catalog
+        campaigns = tuple(sorted({(row["task"], row["source_name"]) for row in catalog.rows}))
+        self.campaign = widgets.Dropdown(options=[(f"{task}/{name}", (task, name)) for task, name in campaigns], description="Campaign:")
+        self.material = widgets.Dropdown(
+            options=[("All materials", None), *((name, name) for name in sorted({row["material_family"] for row in catalog.rows}))],
+            description="Material:",
+        )
+        self.outcome = widgets.Dropdown(
+            options=[("All outcomes", None), ("Successful", "successful"), ("Failed", "failed"), ("Pending", "pending")], description="Outcome:"
+        )
+        self.origin = widgets.Dropdown(
+            options=[("All origins", None), *((name, name) for name in sorted({row["origin"] for row in catalog.rows}))], description="Origin:"
+        )
+        parameters = sorted(
+            {
+                (name, str(unit))
+                for row in catalog.rows
+                for name, unit in (row.get("parameter_units") or {}).items()
+                if isinstance((row.get("parameters") or {}).get(name), (int, float))
+            }
+        )
+        self.parameter = widgets.Dropdown(
+            options=[("No parameter plot", None), *((f"{name} [{unit}]", (name, unit)) for name, unit in parameters)], description="Parameter:"
+        )
+        self.case = widgets.Dropdown(description="Evidence:")
+        self.widget = widgets.VBox(
+            (widgets.HBox((self.campaign, self.material)), widgets.HBox((self.outcome, self.origin)), self.case, self.parameter)
+        )
+        self._callback: Callable[[], None] | None = None
+        self._updating = False
+        self._rebind_case()
+        for widget in (self.campaign, self.material, self.outcome, self.origin):
+            widget.observe(self._filter_changed, names="value")
+        for widget in (self.case, self.parameter):
+            widget.observe(self._value_changed, names="value")
+
+    def set_callback(self, callback: Callable[[], None]) -> None:
+        """Bind one active-view update."""
+        self._callback = callback
+
+    def rows(self, *, all_outcomes: bool = False) -> tuple[dict[str, Any], ...]:
+        """Return metadata rows on exact user-selected campaign/material scope."""
+        if self.campaign.value is None:
+            return ()
+        task, name = self.campaign.value
+        return sources.query_campaign_outcomes(
+            self.catalog,
+            task=task,
+            source_name=name,
+            material_family=self.material.value,
+            outcome=None if all_outcomes else self.outcome.value,
+            origin=self.origin.value,
+        )
+
+    def _rebind_case(self) -> None:
+        """Preserve an exact selected candidate when filtering retains it."""
+        previous = self.case.value
+        rows = self.rows()
+        options = [(f"{row['material_family']}/{row['case_id']} — {row['outcome']}", (row["material_family"], row["case_id"])) for row in rows]
+        self._updating = True
+        try:
+            self.case.options = options
+            if previous in {value for _label, value in options}:
+                self.case.value = previous
+        finally:
+            self._updating = False
+
+    def _filter_changed(self, _change: dict[str, Any]) -> None:
+        """Rebind visible candidate evidence, then update only the active view."""
+        self._rebind_case()
+        self._value_changed({})
+
+    def _value_changed(self, _change: dict[str, Any]) -> None:
+        """Refresh a selected evidence record or optional parameter plot."""
+        if not self._updating and self._callback is not None:
             self._callback()

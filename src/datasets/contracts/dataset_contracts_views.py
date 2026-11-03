@@ -1,15 +1,15 @@
-"""
-dataset_contracts_views.py
+"""Define buildable Dataset views and uniform immutable contract inspection.
 
-Define buildable Dataset views and uniform immutable contract inspection.
 Responsibilities:
   - Register steady-flow and transient-drying Dataset-view identities
   - Normalize authoritative learned and transition contracts for inspection
   - Expose ordered fields, tensor groups, and runtime-resolved shape semantics
+
 Design principles:
   - Trainable-task registration remains owned by ``src.domain.tasks``
   - Generation supplies source-profile, membership, and regime vocabulary
   - Inspection reuses authoritative digests and never serializes a third contract
+
 This module does NOT:
   - Build packages, load HDF5 data, or register transient training behavior
   - Infer parameter relevance from filenames or mutable campaign membership
@@ -27,8 +27,8 @@ from . import dataset_contracts_identity as identity
 from . import dataset_contracts_transient as transient_contract
 
 DatasetViewId = Literal["steady_flow", "transient_drying"]
-PackageRegime: TypeAlias = generation.contracts.EvaluationRegime
-IdMembership: TypeAlias = generation.contracts.IdMembership
+PackageRegime: TypeAlias = generation.contracts.EvaluationRegime  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
+IdMembership: TypeAlias = generation.contracts.IdMembership  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 DatasetFieldPurpose = Literal["conditioning", "target", "archive"]
 SpatialShapeSemantics = Literal["runtime_dataset_identity", "runtime_source_hdf5"]
 TemporalSemantics = Literal["static_snapshot", "fixed_step_transition"]
@@ -37,7 +37,6 @@ DatasetContract = domain.tasks.spec.TaskSpec | transient_contract.TransientStepC
 
 PACKAGE_REGIMES: Final = cast("tuple[PackageRegime, ...]", generation.contracts.evaluation_regimes())
 ID_MEMBERSHIPS: Final = cast("tuple[IdMembership, ...]", generation.contracts.id_memberships())
-TECHNICAL_SMOKE_MEMBERSHIP: Final = "technical_smoke"
 
 _PROFILE_CONTRACTS: Final = tuple(
     generation.contracts.get_profile_contract(profile_id) for profile_id in generation.contracts.available_profile_ids()

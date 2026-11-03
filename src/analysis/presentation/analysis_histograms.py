@@ -1,7 +1,4 @@
-"""
-analysis_histograms.py
-
-Render maintained analysis histograms with exact constant-data semantics.
+"""Render maintained analysis histograms with exact constant-data semantics.
 
 Responsibilities:
   - Preserve caller-owned histogram normalization and styling

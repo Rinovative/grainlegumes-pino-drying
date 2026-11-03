@@ -1,15 +1,15 @@
-"""
-learning_temporal.py
+"""Validate and apply explicit temporal conditioning for transient learning.
 
-Validate and apply explicit temporal conditioning for transient learning.
 Responsibilities:
   - Declare supported temporal-conditioning identities
   - Admit exact conditioning mappings without hidden defaults
   - Normalize current regular time by the Dataset-configured horizon
+
 Design principles:
   - Dataset runtime owns physical time and the configured scientific horizon
   - Learning owns only the model-facing conditioning transformation
   - Disabled conditioning returns no feature rather than a fabricated constant
+
 This module does NOT:
   - Select transient samples, read HDF5 data, or infer a time scale
   - Concatenate temporal features into any particular model architecture
@@ -25,7 +25,7 @@ from typing import Any, Final, Literal, TypeAlias
 
 import torch
 
-TemporalConditioningKind: TypeAlias = Literal["normalized_current_time", "none"]
+TemporalConditioningKind: TypeAlias = Literal["normalized_current_time", "none"]  # noqa: UP040 -- public runtime aliases must remain their concrete typing or class objects
 TEMPORAL_CONDITIONING_KINDS: Final[tuple[TemporalConditioningKind, ...]] = (
     "normalized_current_time",
     "none",

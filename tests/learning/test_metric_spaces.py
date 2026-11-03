@@ -1,11 +1,13 @@
-# ruff: noqa: S101
-"""
-Protect named field selection, normalized/physical tensor routing, and metric units.
+"""Protect named field selection, normalized/physical tensor routing, and metric units.
 
-Synthetic processors show physical RMSE uses inverse-transformed channels and
-TaskSpec units while incompatible mixed-unit aggregates are rejected. Exact
-macro sufficient-statistic algebra is covered by ``test_metric_reduction``.
-these fixtures do not model training normalization quality.
+Responsibilities:
+  - Check named channels, physical inverse transforms, units, and mixed-unit rejection
+
+Design principles:
+  - Metric-space routing transforms physical tensors exactly once
+
+This module does NOT:
+  - Verify macro reduction algebra or training normalization quality
 """
 
 from __future__ import annotations
@@ -88,7 +90,7 @@ class UnitErrorModel(torch.nn.Module):
 
 def _metrics(*metric_ids: str) -> dict[str, learning.metrics.metrics.DatasetMetric]:
     """Build a selected subset of resolved default metrics."""
-    config = experiments.config.loader.resolve_config(configs.direct_config())
+    config = configs.resolve(configs.direct_config())
     selected = [metric for metric in config["evaluation"]["metrics"] if metric["id"] in metric_ids]
     config["evaluation"]["metrics"] = selected
     return learning.metrics.metrics.build_evaluation_metrics(
@@ -180,4 +182,4 @@ def test_incompatible_physical_aggregate_is_rejected() -> None:
     }
 
     with pytest.raises(ValueError, match="incompatible units"):
-        experiments.config.loader.resolve_config(raw)
+        configs.resolve(raw)

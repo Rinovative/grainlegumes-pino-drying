@@ -1,23 +1,21 @@
-# ruff: noqa: EM101, EM102, TRY003
-"""
-learning_transient_curriculum.py
-
-Define transient rollout curricula and strict matched-compute accounting.
+"""Define transient rollout curricula and strict stage-budget accounting.
 
 Responsibilities:
   - Select continuous self-fed rollout horizons and valid window origins
   - Persist private random sampling state at epoch boundaries
-  - Bind matched A+ and B arms to immutable teacher-handoff evidence
-  - Account completed optimizer work with CUDA-second or CPU-step clocks
+  - Bind A0, B, and A1 comparison arms to immutable teacher-handoff evidence
+  - Account completed optimizer work under epoch or measured train_seconds budgets
+  - Mark equally spaced validation points of a measured train_seconds budget
 
 Design principles:
-  - Compute progress, not epoch number, controls curriculum admission
+  - Curriculum progress follows the stage-epoch or matched train_seconds control
   - Shorter horizons retain positive probability after later milestones
-  - Controller state changes only after a successful optimizer report
+  - Completed groups retain measured compute and transition accounting, including AMP overflow groups
+  - Successful optimizer-step counters exclude overflow; budget completion follows the selected control
 
 This module does NOT:
   - Load teacher files, run model forwards, or mutate optimizers
-  - Treat CPU optimizer steps as device seconds
+  - Treat optimizer steps, device seconds, and committed training time as interchangeable
 """
 
 from __future__ import annotations
@@ -32,13 +30,26 @@ from typing import Any, ClassVar, Final, Literal, overload
 import torch
 
 TrainingStage = Literal["stage_a_teacher_forcing", "stage_b_self_fed"]
-ComparisonArm = Literal["A0", "A+", "B"]
-ClockKind = Literal["cuda_device_seconds", "optimizer_steps"]
-BudgetControl = Literal["matched_compute", "stage_epochs"]
+ComparisonArm = Literal["A0", "B", "A1"]
+ClockKind = Literal["cuda_device_seconds", "optimizer_steps", "train_seconds"]
+BudgetControl = Literal["stage_epochs", "train_seconds"]
 DEFAULT_ROLLOUT_LENGTHS: Final = (2, 4, 8, 16, 32)
 DEFAULT_MILESTONE_FRACTIONS: Final = (0.0, 0.2, 0.4, 0.6, 0.8)
 _CURRICULUM_SCHEMA_VERSION: Final = 1
-_CONTROLLER_SCHEMA_VERSION: Final = 1
+_CONTROLLER_SCHEMA_VERSION: Final = 4
+# Immutable controller semantics shared by checkpoint admission and the stage digest.
+_CONTROLLER_IDENTITY_FIELDS: Final = (
+    "arm",
+    "stage",
+    "clock_kind",
+    "config_digest",
+    "budget_control",
+    "planned_stage_epochs",
+    "teacher_handoff",
+    "planned_train_seconds",
+    "matched_receipt_sha256",
+    "evaluation_points",
+)
 _HANDOFF_SCHEMA_VERSION: Final = 1
 _SHA256_LENGTH: Final = 64
 
@@ -46,21 +57,24 @@ _SHA256_LENGTH: Final = 64
 def _sha256(value: Any, *, label: str) -> str:
     """Require one lowercase SHA-256 digest."""
     if not isinstance(value, str) or len(value) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{label} must be a lowercase 64-character SHA-256 digest.")
+        msg = f"{label} must be a lowercase 64-character SHA-256 digest."
+        raise ValueError(msg)
     return value
 
 
 def _positive_int(value: Any, *, label: str) -> int:
     """Require one positive integer."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{label} must be a positive integer.")
+        msg = f"{label} must be a positive integer."
+        raise ValueError(msg)
     return value
 
 
 def _nonnegative_int(value: Any, *, label: str) -> int:
     """Require one nonnegative integer."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer.")
+        msg = f"{label} must be a non-negative integer."
+        raise ValueError(msg)
     return value
 
 
@@ -81,7 +95,8 @@ def _finite_nonnegative(value: Any, *, label: str, allow_none: bool = False) -> 
     if value is None and allow_none:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0.0:
-        raise ValueError(f"{label} must be a finite non-negative number.")
+        msg = f"{label} must be a finite non-negative number."
+        raise ValueError(msg)
     return float(value)
 
 
@@ -108,7 +123,8 @@ class TeacherHandoffIdentity:
         for label in ("source_run_name", "model_kind", "input_profile"):
             value = getattr(self, label)
             if not isinstance(value, str) or not value:
-                raise ValueError(f"{label} must be a non-empty string.")
+                msg = f"{label} must be a non-empty string."
+                raise ValueError(msg)
         for label in ("source_checkpoint_sha256", "source_scaling_sha256", "task_contract_sha256", "tensorizer_sha256"):
             _sha256(getattr(self, label), label=label)
 
@@ -144,7 +160,8 @@ class TeacherHandoffIdentity:
             "input_profile",
         }
         if not isinstance(value, Mapping) or set(value) != expected or value["schema_version"] != _HANDOFF_SCHEMA_VERSION:
-            raise ValueError("Teacher handoff evidence does not match the current strict schema.")
+            msg = "Teacher handoff evidence does not match the current strict schema."
+            raise ValueError(msg)
         return cls(**{key: value[key] for key in expected if key != "schema_version"})
 
 
@@ -164,21 +181,26 @@ class RolloutCurriculum:
         if lengths == (1,):
             pass
         elif not lengths or tuple(sorted(set(lengths))) != lengths or any(length not in allowed for length in lengths):
-            raise ValueError("Curriculum lengths must be the Stage-A one-step horizon or increasing members of 2, 4, 8, 16, 32, optionally 64.")
+            msg = "Curriculum lengths must be the Stage-A one-step horizon or increasing members of 2, 4, 8, 16, 32, optionally 64."
+            raise ValueError(msg)
         elif lengths[: len(DEFAULT_ROLLOUT_LENGTHS)] != DEFAULT_ROLLOUT_LENGTHS and lengths != DEFAULT_ROLLOUT_LENGTHS[: len(lengths)]:
-            raise ValueError("Curriculum lengths must retain the canonical ordered prefix.")
+            msg = "Curriculum lengths must retain the canonical ordered prefix."
+            raise ValueError(msg)
         if len(self.milestone_fractions) != len(lengths) or self.milestone_fractions[0] != 0.0:
-            raise ValueError("Curriculum milestones must align with lengths and begin at zero.")
+            msg = "Curriculum milestones must align with lengths and begin at zero."
+            raise ValueError(msg)
         previous = -1.0
         for fraction in self.milestone_fractions:
             if not isinstance(fraction, (int, float)) or not 0.0 <= float(fraction) < 1.0 or float(fraction) <= previous:
-                raise ValueError("Curriculum milestones must be strictly increasing fractions in [0, 1).")
+                msg = "Curriculum milestones must be strictly increasing fractions in [0, 1)."
+                raise ValueError(msg)
             previous = float(fraction)
 
     def active_stage(self, progress: float) -> int:
         """Return the largest admitted stage at compute progress."""
         if not math.isfinite(progress) or not 0.0 <= progress <= 1.0:
-            raise ValueError("Curriculum progress must be finite in [0, 1].")
+            msg = "Curriculum progress must be finite in [0, 1]."
+            raise ValueError(msg)
         stage = 0
         for index, milestone in enumerate(self.milestone_fractions):
             if progress + 1.0e-12 >= milestone:
@@ -240,16 +262,23 @@ class RolloutCurriculumState:
         return horizon, origins
 
     def _sample_origins(self, *, available_length: int, horizon: int, batch_size: int) -> torch.Tensor:
-        """Sample valid early/middle/late origins without padding or replacement rules."""
+        """
+        Sample valid early/middle/late origins without padding or replacement rules.
+
+        The stratum of each sample rotates with the persisted draw index, so
+        consecutive draws cover all three strata for every batch size,
+        including the single-trajectory batches of a rare trajectory length.
+        """
         maximum = available_length - horizon
         if maximum < 0:
-            raise ValueError("Rollout horizon exceeds available sequence length.")
+            msg = "Rollout horizon exceeds available sequence length."
+            raise ValueError(msg)
         if maximum == 0:
             return torch.zeros(batch_size, dtype=torch.long)
         edges = ((0, maximum // 3), (maximum // 3 + 1, (2 * maximum) // 3), ((2 * maximum) // 3 + 1, maximum))
         draws: list[int] = []
         for index in range(batch_size):
-            low, high = edges[index % len(edges)]
+            low, high = edges[(self.draw_index + index) % len(edges)]
             if low > high:
                 low, high = 0, maximum
             draws.append(int(torch.randint(low, high + 1, (1,), generator=self.generator).item()))
@@ -286,7 +315,8 @@ class RolloutCurriculumState:
             or value["curriculum"] != self.curriculum.as_dict()
             or value["curriculum_digest"] != self.curriculum.digest
         ):
-            raise ValueError("Saved curriculum state does not match the configured curriculum.")
+            msg = "Saved curriculum state does not match the configured curriculum."
+            raise ValueError(msg)
         state = torch.tensor(value["generator_state"], dtype=torch.uint8)
         self.generator.set_state(state)
         self.draw_index = _nonnegative_int(value["draw_index"], label="draw_index")
@@ -294,37 +324,33 @@ class RolloutCurriculumState:
         self.max_horizon = _positive_int(value["max_horizon"], label="max_horizon")
         self.progress = float(_finite_nonnegative(value["progress"], label="progress"))
         if self.progress > 1.0:
-            raise ValueError("progress must not exceed one.")
+            msg = "progress must not exceed one."
+            raise ValueError(msg)
         milestones = value["completed_milestones"]
         if not isinstance(milestones, list) or any(not isinstance(index, int) for index in milestones):
-            raise ValueError("completed_milestones must be an integer list.")
+            msg = "completed_milestones must be an integer list."
+            raise ValueError(msg)
         self.completed_milestones = tuple(milestones)
 
 
 @dataclass(slots=True)
 class MatchedComputeController:
-    """Account completed work and derive the configured transient budget boundary."""
+    """Account completed optimizer work and derive the configured transient budget boundary."""
 
     arm: ComparisonArm
     stage: TrainingStage
     clock_kind: ClockKind
     config_digest: str
-    budget_control: BudgetControl = "matched_compute"
+    budget_control: BudgetControl = "stage_epochs"
     planned_stage_epochs: int | None = None
     completed_stage_epochs: int = 0
     teacher_handoff: TeacherHandoffIdentity | None = None
-    planned_teacher_forcing_budget_seconds: float | None = None
-    planned_teacher_forcing_budget_steps: int | None = None
-    rollout_reference_compute_seconds: float | None = None
-    rollout_reference_compute_steps: int | None = None
     post_handoff_optimizer_device_seconds: float | None = None
     post_handoff_optimizer_steps: int = 0
     successful_optimizer_steps: int = 0
     microbatches: int = 0
     processed_target_transitions: int = 0
     forward_transitions: int = 0
-    teacher_forcing_optimizer_device_seconds: float | None = None
-    teacher_forcing_optimizer_steps: int = 0
     wall_seconds: float = 0.0
     validation_seconds: float = 0.0
     peak_cuda_memory_bytes: int | None = None
@@ -333,118 +359,74 @@ class MatchedComputeController:
     crossing_microbatch: int | None = None
     best_within_budget_metric: float | None = None
     best_within_budget_epoch: int | None = None
+    planned_train_seconds: float | None = None
+    train_seconds: float = 0.0
+    matched_receipt_sha256: str | None = None
+    batch_cursor: int = 0
+    evaluation_points: int | None = None
+    evaluated_points: int = 0
 
     def __post_init__(self) -> None:
         """Validate immutable arm, clock, identity, and budget semantics."""
-        if self.arm not in {"A0", "A+", "B"} or self.stage not in {"stage_a_teacher_forcing", "stage_b_self_fed"}:
-            raise ValueError("Matched compute arm or stage is unsupported.")
-        if self.clock_kind not in {"cuda_device_seconds", "optimizer_steps"}:
-            raise ValueError("Matched compute clock kind is unsupported.")
-        if self.budget_control not in {"matched_compute", "stage_epochs"}:
-            raise ValueError("Transient budget control is unsupported.")
+        if self.arm not in {"A0", "B", "A1"} or self.stage not in {"stage_a_teacher_forcing", "stage_b_self_fed"}:
+            msg = "Transient comparison arm or stage is unsupported."
+            raise ValueError(msg)
+        if self.clock_kind not in {"cuda_device_seconds", "optimizer_steps", "train_seconds"}:
+            msg = "Transient accounting clock kind is unsupported."
+            raise ValueError(msg)
+        if self.budget_control not in {"stage_epochs", "train_seconds"}:
+            msg = "Transient budget control is unsupported."
+            raise ValueError(msg)
+        if (self.budget_control == "train_seconds") != (self.clock_kind == "train_seconds"):
+            msg = "Measured train_seconds budgets require the train_seconds clock and vice versa."
+            raise ValueError(msg)
         _sha256(self.config_digest, label="config_digest")
         _nonnegative_int(self.completed_stage_epochs, label="completed_stage_epochs")
         if self.budget_control == "stage_epochs":
             if self.planned_stage_epochs is None:
-                raise ValueError("Epoch-budgeted transient stages require planned_stage_epochs.")
+                msg = "Epoch-budgeted transient stages require planned_stage_epochs."
+                raise ValueError(msg)
             _positive_int(self.planned_stage_epochs, label="planned_stage_epochs")
             if self.completed_stage_epochs > self.planned_stage_epochs:
-                raise ValueError("completed_stage_epochs exceeds planned_stage_epochs.")
+                msg = "completed_stage_epochs exceeds planned_stage_epochs."
+                raise ValueError(msg)
         elif self.planned_stage_epochs is not None or self.completed_stage_epochs != 0:
-            raise ValueError("Matched-compute stages cannot carry epoch-budget state.")
+            msg = "Time-budgeted stages cannot carry epoch-budget state."
+            raise ValueError(msg)
         if self.arm == "A0" and self.teacher_handoff is not None:
-            raise ValueError("A0 must remain unmatched and cannot consume a teacher handoff.")
-        if self.arm in {"A+", "B"} and not isinstance(self.teacher_handoff, TeacherHandoffIdentity):
-            raise ValueError("Matched A+ and B arms require immutable teacher-handoff identity.")
+            msg = "A0 must remain unmatched and cannot consume a teacher handoff."
+            raise ValueError(msg)
+        if self.arm in {"B", "A1"} and not isinstance(self.teacher_handoff, TeacherHandoffIdentity):
+            msg = "B and A1 arms require immutable teacher-handoff identity."
+            raise ValueError(msg)
         if self.stage == "stage_b_self_fed" and self.arm != "B":
-            raise ValueError("Self-fed Stage B requires arm B.")
+            msg = "Self-fed Stage B requires arm B."
+            raise ValueError(msg)
         if self.stage == "stage_a_teacher_forcing" and self.arm == "B":
-            raise ValueError("Arm B requires self-fed Stage B.")
-        for label in (
-            "planned_teacher_forcing_budget_seconds",
-            "rollout_reference_compute_seconds",
-            "post_handoff_optimizer_device_seconds",
-            "teacher_forcing_optimizer_device_seconds",
-            "wall_seconds",
-            "validation_seconds",
-        ):
-            _finite_nonnegative(getattr(self, label), label=label, allow_none=label not in {"wall_seconds", "validation_seconds"})
-        for label in ("planned_teacher_forcing_budget_steps", "rollout_reference_compute_steps"):
-            value = getattr(self, label)
-            if value is not None:
-                _positive_int(value, label=label)
+            msg = "Arm B requires self-fed Stage B."
+            raise ValueError(msg)
+        for label in ("post_handoff_optimizer_device_seconds", "wall_seconds", "validation_seconds", "train_seconds"):
+            _finite_nonnegative(getattr(self, label), label=label, allow_none=label == "post_handoff_optimizer_device_seconds")
         for label in (
             "post_handoff_optimizer_steps",
             "successful_optimizer_steps",
             "microbatches",
             "processed_target_transitions",
             "forward_transitions",
-            "teacher_forcing_optimizer_steps",
+            "batch_cursor",
         ):
             _nonnegative_int(getattr(self, label), label=label)
-        matched_values = (
-            self.planned_teacher_forcing_budget_seconds,
-            self.planned_teacher_forcing_budget_steps,
-            self.rollout_reference_compute_seconds,
-            self.rollout_reference_compute_steps,
-        )
-        if self.budget_control == "stage_epochs" and any(value is not None for value in matched_values):
-            raise ValueError("Epoch-budgeted transient stages cannot carry matched-compute limits.")
-        if (
-            self.budget_control == "matched_compute"
-            and self.clock_kind == "cuda_device_seconds"
-            and self.planned_teacher_forcing_budget_seconds is None
-            and self.arm != "A0"
-        ):
-            raise ValueError("Matched CUDA arms require a planned teacher-forcing device-second budget.")
-        if (
-            self.budget_control == "matched_compute"
-            and self.clock_kind == "optimizer_steps"
-            and self.planned_teacher_forcing_budget_steps is None
-            and self.arm != "A0"
-        ):
-            raise ValueError("Matched CPU arms require a planned teacher-forcing optimizer-step budget.")
-
-    @property
-    def remaining_to_planned_teacher_forcing_budget_seconds(self) -> float | None:
-        """Return CUDA-only remaining teacher-forcing budget seconds."""
-        if (
-            self.clock_kind != "cuda_device_seconds"
-            or self.planned_teacher_forcing_budget_seconds is None
-            or self.post_handoff_optimizer_device_seconds is None
-        ):
-            return None
-        return max(0.0, self.planned_teacher_forcing_budget_seconds - self.post_handoff_optimizer_device_seconds)
-
-    @property
-    def remaining_teacher_forcing_compute_to_match_rollout_seconds(self) -> float | None:
-        """Return CUDA-only remaining teacher-forcing compute to rollout reference."""
-        if (
-            self.clock_kind != "cuda_device_seconds"
-            or self.rollout_reference_compute_seconds is None
-            or self.teacher_forcing_optimizer_device_seconds is None
-        ):
-            return None
-        return max(0.0, self.rollout_reference_compute_seconds - self.teacher_forcing_optimizer_device_seconds)
-
-    @property
-    def remaining_to_planned_teacher_forcing_budget_steps(self) -> int | None:
-        """Return CPU-only remaining planned successful optimizer steps."""
-        if self.clock_kind != "optimizer_steps" or self.planned_teacher_forcing_budget_steps is None:
-            return None
-        return max(0, self.planned_teacher_forcing_budget_steps - self.successful_optimizer_steps)
-
-    @property
-    def remaining_teacher_forcing_compute_to_match_rollout_steps(self) -> int | None:
-        """Return CPU-only remaining Stage-A successful steps to rollout reference."""
-        if self.clock_kind != "optimizer_steps" or self.rollout_reference_compute_steps is None:
-            return None
-        return max(0, self.rollout_reference_compute_steps - self.teacher_forcing_optimizer_steps)
-
-    @property
-    def remaining_steps(self) -> int | None:
-        """Return the compatibility alias for planned CPU remaining steps."""
-        return self.remaining_to_planned_teacher_forcing_budget_steps
+        if self.budget_control == "train_seconds":
+            _finite_nonnegative(self.planned_train_seconds, label="planned_train_seconds")
+            if self.planned_train_seconds is None or self.planned_train_seconds <= 0:
+                msg = "Matched B/A1 train_seconds target must be positive."
+                raise ValueError(msg)
+            if self.arm == "A1":
+                _sha256(self.matched_receipt_sha256, label="matched_receipt_sha256")
+        elif self.planned_train_seconds is not None or self.train_seconds != 0 or self.matched_receipt_sha256 is not None or self.batch_cursor:
+            msg = "Epoch-budgeted controllers cannot carry matched train_seconds state."
+            raise ValueError(msg)
+        self._validate_evaluation_points()
 
     @property
     def progress(self) -> float:
@@ -453,13 +435,37 @@ class MatchedComputeController:
             if self.planned_stage_epochs is None:
                 return 0.0
             return min(1.0, self.completed_stage_epochs / self.planned_stage_epochs)
-        if self.clock_kind == "cuda_device_seconds":
-            if self.planned_teacher_forcing_budget_seconds is None or self.planned_teacher_forcing_budget_seconds == 0.0:
-                return 0.0
-            return min(1.0, (self.post_handoff_optimizer_device_seconds or 0.0) / self.planned_teacher_forcing_budget_seconds)
-        if self.planned_teacher_forcing_budget_steps is None:
-            return 0.0
-        return min(1.0, self.successful_optimizer_steps / self.planned_teacher_forcing_budget_steps)
+        return min(1.0, self.train_seconds / (self.planned_train_seconds or 1.0))
+
+    def _validate_evaluation_points(self) -> None:
+        """Admit budget evaluation points only for measured train_seconds budgets."""
+        _nonnegative_int(self.evaluated_points, label="evaluated_points")
+        if self.evaluation_points is None:
+            if self.evaluated_points:
+                msg = "Controllers without budget evaluation points cannot record evaluated points."
+                raise ValueError(msg)
+        elif self.budget_control != "train_seconds":
+            msg = "Budget evaluation points apply only to measured train_seconds budgets."
+            raise ValueError(msg)
+        elif _positive_int(self.evaluation_points, label="evaluation_points") < self.evaluated_points:
+            msg = "evaluated_points exceeds evaluation_points."
+            raise ValueError(msg)
+
+    @property
+    def budget_evaluation_due(self) -> bool:
+        """Return whether the measured budget crossed an equally spaced point not yet validated.
+
+        Points sit at ``k / evaluation_points`` of the planned train_seconds, so B and
+        A1 see the same number of selection opportunities at the same budget fractions.
+        """
+        if self.evaluation_points is None:
+            return False
+        return math.floor(self.progress * self.evaluation_points) > self.evaluated_points
+
+    def record_budget_evaluation(self) -> None:
+        """Mark every budget point reached so far as validated."""
+        if self.evaluation_points is not None:
+            self.evaluated_points = min(self.evaluation_points, math.floor(self.progress * self.evaluation_points))
 
     def begin_epoch(self, *, epoch_index: int, total_epochs: int) -> None:
         """Advance completed-epoch progress without completing the active epoch early."""
@@ -468,9 +474,11 @@ class MatchedComputeController:
         epoch = _nonnegative_int(epoch_index, label="epoch_index")
         total = _positive_int(total_epochs, label="total_epochs")
         if total != self.planned_stage_epochs:
-            raise ValueError("Runtime total_epochs conflicts with the persisted stage budget.")
+            msg = "Runtime total_epochs conflicts with the persisted stage budget."
+            raise ValueError(msg)
         if epoch < self.completed_stage_epochs or epoch >= total:
-            raise ValueError("Runtime epoch progression conflicts with persisted stage-budget state.")
+            msg = "Runtime epoch progression conflicts with persisted stage-budget state."
+            raise ValueError(msg)
         self.completed_stage_epochs = epoch
 
     def record_completed_work(
@@ -485,13 +493,15 @@ class MatchedComputeController:
         epoch_index: int,
         microbatch_index: int,
         peak_cuda_memory_bytes: int | None = None,
+        train_seconds: float | None = None,
+        batch_cursor: int | None = None,
     ) -> None:
         """
         Account one completed optimizer group; success means parameters changed.
 
         All measured compute and logical transition evidence is retained for an
-        AMP-overflow group. Only successful optimizer-step counters exclude an
-        overflow because no parameter update occurred.
+        AMP-overflow group. Only the successful optimizer-step counter excludes
+        an overflow because no parameter update occurred.
         """
         if self.budget_complete:
             message = "Transient optimizer work cannot continue after the configured budget boundary."
@@ -503,25 +513,27 @@ class MatchedComputeController:
         if self.clock_kind == "cuda_device_seconds":
             seconds = _finite_nonnegative(optimizer_device_seconds, label="optimizer_device_seconds")
             self.post_handoff_optimizer_device_seconds = (self.post_handoff_optimizer_device_seconds or 0.0) + seconds
-            if self.stage == "stage_a_teacher_forcing":
-                self.teacher_forcing_optimizer_device_seconds = (self.teacher_forcing_optimizer_device_seconds or 0.0) + seconds
-        elif optimizer_device_seconds is not None:
-            message = "CPU matched-compute accounting must not report optimizer device seconds."
+        elif optimizer_device_seconds is not None and self.clock_kind != "train_seconds":
+            message = "CPU transient accounting must not report optimizer device seconds."
             raise ValueError(message)
         self.post_handoff_optimizer_steps += 1
         self.microbatches += microbatches
         self.processed_target_transitions += processed_target_transitions
         self.forward_transitions += forward_transitions
         self.wall_seconds += wall
+        if self.clock_kind == "train_seconds":
+            if train_seconds is None or batch_cursor is None:
+                msg = "Matched train_seconds work requires measured duration and batch cursor."
+                raise ValueError(msg)
+            self.train_seconds += _finite_nonnegative(train_seconds, label="train_seconds")
+            self.batch_cursor = _nonnegative_int(batch_cursor, label="batch_cursor")
         if peak_cuda_memory_bytes is not None:
             self.peak_cuda_memory_bytes = max(
                 self.peak_cuda_memory_bytes or 0, _nonnegative_int(peak_cuda_memory_bytes, label="peak_cuda_memory_bytes")
             )
         if successful:
             self.successful_optimizer_steps += 1
-            if self.stage == "stage_a_teacher_forcing":
-                self.teacher_forcing_optimizer_steps += 1
-        if self.budget_control == "matched_compute" and not self.budget_complete and self.progress >= 1.0:
+        if self.budget_control == "train_seconds" and not self.budget_complete and self.progress >= 1.0:
             self.budget_complete = True
             self.crossing_epoch = _nonnegative_int(epoch_index, label="epoch_index")
             self.crossing_microbatch = _nonnegative_int(microbatch_index, label="microbatch_index")
@@ -540,7 +552,8 @@ class MatchedComputeController:
             self.best_within_budget_epoch = epoch
         if self.budget_control == "stage_epochs":
             if self.planned_stage_epochs is None or epoch + 1 > self.planned_stage_epochs:
-                raise ValueError("Evaluation epoch exceeds the configured stage budget.")
+                msg = "Evaluation epoch exceeds the configured stage budget."
+                raise ValueError(msg)
             self.completed_stage_epochs = epoch + 1
             if self.completed_stage_epochs == self.planned_stage_epochs:
                 self.budget_complete = True
@@ -557,37 +570,32 @@ class MatchedComputeController:
     def load_state_dict(self, value: Mapping[str, Any]) -> None:
         """Restore only matching immutable controller semantics."""
         if not isinstance(value, Mapping):
-            raise TypeError("Saved transient budget state must be a mapping.")
-        expected = set(self.state_dict())
-        if set(value) != expected or value.get("schema_version") != _CONTROLLER_SCHEMA_VERSION:
-            raise ValueError("Saved transient budget state does not match the strict schema.")
+            msg = "Saved transient budget state must be a mapping."
+            raise TypeError(msg)
+        if set(value) != set(self.state_dict()) or value.get("schema_version") != _CONTROLLER_SCHEMA_VERSION:
+            msg = "Saved transient budget state does not match the strict schema."
+            raise ValueError(msg)
         candidate = dict(value)
         candidate.pop("schema_version")
         handoff = candidate["teacher_handoff"]
         candidate["teacher_handoff"] = None if handoff is None else TeacherHandoffIdentity.from_mapping(handoff)
         restored = MatchedComputeController(**candidate)
-        immutable = (
-            "arm",
-            "stage",
-            "clock_kind",
-            "config_digest",
-            "budget_control",
-            "planned_stage_epochs",
-            "teacher_handoff",
-            "planned_teacher_forcing_budget_seconds",
-            "planned_teacher_forcing_budget_steps",
-            "rollout_reference_compute_seconds",
-            "rollout_reference_compute_steps",
-        )
-        if any(getattr(restored, name) != getattr(self, name) for name in immutable):
-            raise ValueError("Saved transient budget state conflicts with configured semantic identity.")
+        if any(getattr(restored, name) != getattr(self, name) for name in _CONTROLLER_IDENTITY_FIELDS):
+            msg = "Saved transient budget state conflicts with configured semantic identity."
+            raise ValueError(msg)
         for name in self.__dataclass_fields__:
             setattr(self, name, getattr(restored, name))
 
 
 @dataclass(frozen=True, slots=True)
 class TransientTrainingSpec:
-    """Bind one transient stage to a model, controller, and evaluation horizon."""
+    """
+    Bind one transient stage to a model, controller, and curriculum.
+
+    ``trajectory_window`` is the window length the RNO cuts from whole
+    trajectories: its hidden state carries across consecutive windows while
+    gradients stop at each window boundary. Stateless models leave it ``None``.
+    """
 
     stage: TrainingStage
     model_kind: str
@@ -595,40 +603,36 @@ class TransientTrainingSpec:
     gradient_accumulation_steps: int = 1
     curriculum: RolloutCurriculum = field(default_factory=RolloutCurriculum)
     curriculum_seed: int = 0
-    fixed_evaluation_horizon: int = 32
+    trajectory_window: int | None = None
 
     def __post_init__(self) -> None:
         """Reject incompatible stage, controller, and horizon selections."""
         if self.model_kind not in {"fno", "uno", "rno"}:
-            raise ValueError("Transient model_kind must be fno, uno, or rno.")
+            msg = "Transient model_kind must be fno, uno, or rno."
+            raise ValueError(msg)
         _positive_int(self.gradient_accumulation_steps, label="gradient_accumulation_steps")
         _nonnegative_int(self.curriculum_seed, label="curriculum_seed")
-        _positive_int(self.fixed_evaluation_horizon, label="fixed_evaluation_horizon")
-        if self.fixed_evaluation_horizon not in self.curriculum.lengths:
-            raise ValueError("fixed_evaluation_horizon must be an admitted curriculum horizon.")
+        if (self.model_kind == "rno") != (self.trajectory_window is not None):
+            msg = "Exactly the recurrent RNO trains on trajectory windows."
+            raise ValueError(msg)
+        if self.trajectory_window is not None:
+            _positive_int(self.trajectory_window, label="trajectory_window")
+            if self.curriculum.lengths[-1] > self.trajectory_window:
+                msg = "Curriculum horizons must fit the trajectory window."
+                raise ValueError(msg)
         if self.stage != self.controller.stage:
-            raise ValueError("Training specification stage must match its compute controller.")
-        if self.stage == "stage_a_teacher_forcing" and self.controller.arm not in {"A0", "A+"}:
-            raise ValueError("Stage A supports only A0 or A+ arms.")
+            msg = "Training specification stage must match its compute controller."
+            raise ValueError(msg)
+        if self.stage == "stage_a_teacher_forcing" and self.controller.arm not in {"A0", "A1"}:
+            msg = "Stage A supports only the A0 or A1 arms."
+            raise ValueError(msg)
         if self.stage == "stage_b_self_fed" and self.controller.arm != "B":
-            raise ValueError("Stage B requires the B comparison arm.")
+            msg = "Stage B requires the B comparison arm."
+            raise ValueError(msg)
 
     @property
     def digest(self) -> str:
         """Return immutable task-stage semantic identity excluding mutable work."""
-        controller_fields = (
-            "arm",
-            "stage",
-            "clock_kind",
-            "config_digest",
-            "budget_control",
-            "planned_stage_epochs",
-            "teacher_handoff",
-            "planned_teacher_forcing_budget_seconds",
-            "planned_teacher_forcing_budget_steps",
-            "rollout_reference_compute_seconds",
-            "rollout_reference_compute_steps",
-        )
         return _canonical_digest(
             {
                 "stage": self.stage,
@@ -636,12 +640,12 @@ class TransientTrainingSpec:
                 "gradient_accumulation_steps": self.gradient_accumulation_steps,
                 "curriculum": self.curriculum.as_dict(),
                 "curriculum_seed": self.curriculum_seed,
-                "fixed_evaluation_horizon": self.fixed_evaluation_horizon,
+                "trajectory_window": self.trajectory_window,
                 "controller_identity": {
                     key: getattr(self.controller, key)
                     if key != "teacher_handoff"
                     else (None if self.controller.teacher_handoff is None else self.controller.teacher_handoff.as_dict())
-                    for key in controller_fields
+                    for key in _CONTROLLER_IDENTITY_FIELDS
                 },
             }
         )

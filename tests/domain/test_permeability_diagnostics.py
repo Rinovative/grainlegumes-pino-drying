@@ -1,4 +1,14 @@
-"""Exact symmetric permeability-tensor diagnostic contracts."""
+"""Exact symmetric permeability-tensor diagnostic contracts.
+
+Responsibilities:
+  - Check principal values of symmetric tensors and positive-definite admission
+
+Design principles:
+  - Analytic tensors establish exact diagnostic expectations
+
+This module does NOT:
+  - Generate random media or solve airflow equations
+"""
 
 from __future__ import annotations
 

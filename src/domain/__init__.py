@@ -3,7 +3,7 @@ Scientific field, moisture, permeability, physics, and task contracts.
 
 Provides:
 - field_sets: named input and output field collections
-- fields: field definitions, units, and tensor semantics
+- fields: canonical permeability and porosity field names
 - moisture: canonical dry-basis, wet-basis, and bulk-moisture conversions
 - permeability: permeability representations and validation
 - physics: boundary, derivative, and Brinkman operator services

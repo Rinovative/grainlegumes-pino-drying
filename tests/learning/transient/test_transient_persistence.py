@@ -1,5 +1,14 @@
-# ruff: noqa: NPY002, S101, PLR2004
-"""Protect transient completed-history admission and adapter rollback."""
+"""Protect transient completed-history admission and adapter rollback.
+
+Responsibilities:
+  - Check completed history, one-ahead crash reconciliation, live non-finite metric classification, exact restore, and handoff state
+
+Design principles:
+  - Late restore failures roll back common and adapter state transactionally
+
+This module does NOT:
+  - Allocate stage runs or discard incompatible history
+"""
 
 from __future__ import annotations
 
@@ -62,17 +71,18 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
         "resume_contract_digest": digest("resume"),
-        "dataset_ids": {"train": "synthetic-train", "ood": "synthetic-ood"},
-        "dataset_fingerprints": {"train": digest("train"), "ood": digest("ood")},
+        "dataset_ids": {"train": "synthetic-train", "additional_evaluation": "synthetic-additional-evaluation"},
+        "dataset_fingerprints": {"train": digest("train"), "additional_evaluation": digest("additional-evaluation")},
         "split_contract_digest": digest("split"),
         "split_membership_digests": {
             "train": digest("train-membership"),
             "scaling_train_one_step": digest("scaling-membership"),
-            "evaluation": digest("evaluation-membership"),
+            "validation": digest("validation-membership"),
             "id_test": digest("id-test-membership"),
-            "ood": digest("ood-membership"),
+            "additional_evaluation": digest("additional-evaluation-membership"),
         },
         "normalizer_sha256": digest("normalizer"),
+        "numerical_environment": learning.training.checkpoint.numerical_environment_identity(),
         "objective": {"id": "mse", "kind": "mse", "space": "normalized", "fields": ["w"], "reduction": "element_mean", "direction": "minimize"},
     }
 
@@ -157,6 +167,20 @@ def test_reconcile_history_repairs_only_one_ahead_crash_record(tmp_path: Any) ->
         history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
 
 
+@pytest.mark.parametrize("nonfinite", [float("inf"), float("nan")])
+def test_live_callback_classifies_nonfinite_metric_as_numerical_failure_without_persisting(tmp_path: Any, nonfinite: float) -> None:
+    """Raise FloatingPointError for a non-finite live metric while malformed values stay persistence errors."""
+    write_epoch = history.make_epoch_state_callback(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=_identity())
+    write_epoch(1, {"loss": 0.5, "id/physical/w_gr_rmse": 0.1})
+
+    with pytest.raises(FloatingPointError, match=r"id/physical/w_gr_rmse.*epoch 2"):
+        write_epoch(2, {"loss": 0.4, "id/physical/w_gr_rmse": nonfinite})
+    with pytest.raises(ValueError, match="finite numeric evidence"):
+        write_epoch(2, {"loss": 0.4, "id/physical/w_gr_rmse": "not-a-number"})  # type: ignore[dict-item]
+
+    assert len(json.loads(history.history_path(tmp_path).read_text(encoding="utf-8"))["epochs"]) == 1
+
+
 def _components(seed: int) -> tuple[nn.Module, AdamW, _StatefulLoss, DataLoader[Any]]:
     """Build compact stateful CPU components for exact restore."""
     torch.manual_seed(seed)
@@ -208,6 +232,7 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
     source_adapter = _Adapter(3)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
+        payload_kind="full",
         identity=identity,
         completed_epoch=1,
         global_step=1,
@@ -252,7 +277,7 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
         "loader": _loader_generator_state(loader).clone(),
         "adapter": adapter.state_dict(),
         "python": random.getstate(),
-        "numpy": copy.deepcopy(np.random.get_state()),
+        "numpy": copy.deepcopy(np.random.get_state()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         "torch": torch.get_rng_state().clone(),
     }
     with pytest.raises(RuntimeError, match="adapter restore failure"):
@@ -275,17 +300,18 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
     assert torch.equal(before["loader"], _loader_generator_state(loader))
     _assert_equal(before["adapter"], adapter.state_dict())
     _assert_equal(before["python"], random.getstate())
-    _assert_equal(before["numpy"], np.random.get_state())
+    _assert_equal(before["numpy"], np.random.get_state())  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
     assert torch.equal(before["torch"], torch.get_rng_state())
 
 
-def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter() -> None:
+def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     """Continue common optimization/RNG state while the target stage owns fresh adapter state."""
     identity = _identity("handoff")
     source_model, source_optimizer, source_loss, source_loader = _components(30)
     source_adapter = _Adapter(4)
     payload = learning.training.checkpoint.make_checkpoint(
         role="best",
+        payload_kind="full",
         identity=identity,
         completed_epoch=2,
         global_step=5,
@@ -324,3 +350,63 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter() -> 
     assert target_adapter.value == 9
     assert restored["source_global_step"] == 5
     assert restored["restored_common_state"]["global_step"] == 5
+
+    incompatible_runtime = copy.deepcopy(identity["numerical_environment"])
+    incompatible_runtime["numpy"] = "different-producing-runtime"
+    before = copy.deepcopy(model.state_dict())
+    monkeypatch.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: incompatible_runtime)
+    with pytest.raises(ValueError, match="identity is incompatible"):
+        learning.training.checkpoint.restore_handoff_checkpoint(
+            payload,
+            expected_source_identity=identity,
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            scaler=None,
+            amp_enabled=False,
+            loss=loss,
+            train_loader=loader,
+        )
+    _assert_equal(before, model.state_dict())
+
+
+def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
+    """A best without continuation state can never seed a B/A1 handoff."""
+    identity = _identity("evaluation-handoff")
+    source_model, source_optimizer, source_loss, source_loader = _components(50)
+    payload = learning.training.checkpoint.make_checkpoint(
+        role="best",
+        payload_kind="evaluation",
+        identity=identity,
+        completed_epoch=1,
+        global_step=2,
+        model=source_model,
+        optimizer=source_optimizer,
+        scheduler=None,
+        scaler=None,
+        amp_enabled=False,
+        loss=source_loss,
+        best_metric=0.3,
+        best_epoch=1,
+        objective_history=[{"epoch": 1, "objective_id": "mse", "value": 0.3}],
+        train_loader=source_loader,
+        runtime_device=torch.device("cpu"),
+        adapter=_Adapter(5),
+    )
+    assert set(payload).isdisjoint({"optimizer_state_dict", "python_rng_state", "train_loader_generator_state", "next_epoch"})
+    model, optimizer, loss, loader = _components(60)
+    before = copy.deepcopy(model.state_dict())
+
+    with pytest.raises(ValueError, match="payload_kind mismatch: expected 'full', got 'evaluation'"):
+        learning.training.checkpoint.restore_handoff_checkpoint(
+            payload,
+            expected_source_identity=identity,
+            model=model,
+            optimizer=optimizer,
+            scheduler=None,
+            scaler=None,
+            amp_enabled=False,
+            loss=loss,
+            train_loader=loader,
+        )
+    _assert_equal(before, model.state_dict())
