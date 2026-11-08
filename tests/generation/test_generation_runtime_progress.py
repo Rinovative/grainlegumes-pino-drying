@@ -400,22 +400,12 @@ def test_loader_is_read_only_and_marks_missing_malformed_and_stale(
 
 def test_checkout_log_reset_cannot_reuse_stale_solver_progress(tmp_path: Path) -> None:
     """Reset parser offsets and state when the owned startup log is truncated."""
-    identity = {
-        "schema_kind": "generation_campaign_runtime_progress",
-        "schema_version": 1,
-        "campaign_run_id": "campaign__0123456789abcdef",
-        "batch_name": "batch",
-        "batch_id": "batch-id",
-        "case_index": 1,
-        "case_id": "case_0001",
-        "slurm_job_id": "42",
-    }
     receipt = tmp_path / "42.json"
     stdout = tmp_path / "stdout.log"
     stdout.write_text("Time-Dependent Solver 1 in Transient Drying\n", encoding="utf-8")
-    reporter = progress.create_bound_runtime_progress_reporter(identity, receipt, hostname="node-a", stdout_path=stdout)
+    reporter = progress.RuntimeProgressReporter({"campaign_run_id": "campaign__0123456789abcdef"}, receipt, stdout_path=stdout)
     assert reporter.update(phase="starting_solver", force=True)
-    assert progress.load_bound_runtime_progress(identity, receipt)["phase"] == "transient_drying"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["phase"] == "transient_drying"
 
     stdout.write_text("Licensed number of users already reached\n", encoding="utf-8")
     reporter.reset_stdout(stdout)
@@ -427,7 +417,7 @@ def test_checkout_log_reset_cannot_reuse_stale_solver_progress(tmp_path: Path) -
         force=True,
     )
 
-    loaded = progress.load_bound_runtime_progress(identity, receipt)
+    loaded = json.loads(receipt.read_text(encoding="utf-8"))
     assert loaded["phase"] == "acquiring_comsol_license"
     assert loaded["parser_state"] == "unavailable"
     assert loaded["license_checkout_attempt_count"] == 2
@@ -489,29 +479,3 @@ def test_monitoring_failure_does_not_change_the_simulated_case_path(
         expected_run_id=prepared.workspace_run_id,
         expected_case_id=prepared.bundle.case_id,
     )
-
-
-def test_bound_progress_uses_common_schema_validation_and_freshness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Validate benchmark-shaped identities through the common v1 progress owner."""
-    identity = {
-        "schema_kind": "generation_campaign_runtime_progress",
-        "schema_version": 1,
-        "benchmark_run_id": "core_scaling_transient__0123456789abcdef",
-        "variant_id": "cores_08",
-        "cores_per_case": 8,
-        "case_role": "nominal",
-        "work_unit_id": "cores_08__measurement__nominal",
-        "slurm_job_id": "42",
-    }
-    receipt = tmp_path / "42.json"
-    started = datetime(2026, 8, 19, tzinfo=UTC)
-    monkeypatch.setattr(progress, "_utc_now", lambda: started)
-    reporter = progress.create_bound_runtime_progress_reporter(identity, receipt, hostname="node-a", started_at=started)
-    assert reporter.update(phase="preparing", force=True)
-
-    loaded = progress.load_bound_runtime_progress(identity, receipt, now=started + timedelta(seconds=5))
-    assert loaded["availability"] == "available"
-    assert loaded["hostname"] == "node-a"
-    assert loaded["age_seconds"] == 5.0
-    assert loaded["schema_version"] == 1
-    assert progress.load_bound_runtime_progress({**identity, "case_role": "natural"}, receipt)["reason"] == "invalid_or_unsupported"

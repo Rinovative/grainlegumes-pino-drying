@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check reconciliation, capacity categories, terminal evidence, and bounded human summaries
+  - Check that a successful case without its processed status fails closed for both tasks
   - Check the driver's live board: its cadence, its estimate and its marks for failed, replaced, and stuck cases
   - Check the per-case time window the status takes from the persisted resolved configuration
 
@@ -150,6 +151,7 @@ def test_resume_reconciles_during_atomic_status_recovery_publication(
     _patch_synthetic_input_references(monkeypatch, campaign)
     monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda *_args, **_kwargs: campaign)
     monkeypatch.setattr(lifecycle, "candidate_records", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(lifecycle, "replacement_policy", lambda *_args, **_kwargs: [])
     task = cluster.campaign_tasks(campaign)[0]
     batch = campaign.batch(task.batch_name)
     run_id = generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
@@ -169,7 +171,6 @@ def test_resume_reconciles_during_atomic_status_recovery_publication(
             "max_admission_cases": 1,
             "node_jobs": 2,
             "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": 5,
             "license_wait": _synthetic_retry_policy(),
         },
         "submission_intent": None,
@@ -444,7 +445,7 @@ def test_terminal_timestamp_writer_rejects_naive_canonical_value_before_write(
     assert recorded_at.utcoffset() is not None
     assert payload["normalized_utc_value"] == "2026-08-20T09:49:19+00:00"
     assert payload["dispatch_key"] == "101-1"
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 1
 
 
 def test_global_case_integrity_error_still_escapes_reconciliation(
@@ -629,12 +630,41 @@ def test_successful_transient_status_fails_without_final_bulk_moisture(
         lambda *_args, **_kwargs: processed,
     )
 
-    with pytest.raises(RuntimeError, match="lacks required canonical final bulk-moisture evidence"):
+    with pytest.raises(RuntimeError, match="lacks readable canonical final bulk-moisture evidence"):
         generation.campaign._successful_status_summary(
             batch,
             task,
             storage_root=tmp_path,
         )
+    # An existing but unreadable payload fails closed the same way instead of becoming a presentation reconciliation.
+    (processed / common.paths.GENERATION_RESULT_HDF5_FILENAME).write_bytes(b"not an HDF5 file")
+    with pytest.raises(RuntimeError, match="lacks readable canonical final bulk-moisture evidence"):
+        generation.campaign._successful_status_summary(
+            batch,
+            task,
+            storage_root=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("profile", ["steady_flow", "transient_drying"])
+def test_successful_case_without_processed_status_fails_closed_for_both_tasks(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: str,
+) -> None:
+    """A validated success always publishes its processed status, so its absence is a defect for either task, never an empty projection."""
+    config_path, _template = generation_config_factory(simulation_profile=profile)
+    campaign = generation.cases.config.load_campaign_config(config_path)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    processed = tmp_path / "processed" / task.case_id
+    evidence = common.paths.resolve_generation_result_evidence_directory(processed)
+    evidence.mkdir(parents=True)
+    monkeypatch.setattr(generation.campaign.batch_runtime, "processed_case_directory", lambda *_args, **_kwargs: processed)
+
+    with pytest.raises(RuntimeError, match=rf"{task.case_id} lacks required processed status evidence: {re.escape(str(evidence / 'status.json'))}"):
+        generation.campaign._successful_status_summary(batch, task, storage_root=tmp_path)
 
 
 def test_successful_completion_uses_admitted_processing_provenance(
@@ -785,8 +815,7 @@ def test_summary_renders_every_case_state_without_raw_machine_evidence() -> None
     status = {
         "campaign_run_id": "mixed__0123456789abcdef",
         "campaign_state": "running",
-        "admission_blocked": True,
-        "admission_block_reason": "solver_failure_threshold_exceeded",
+        "success_rate_stop": "Stopped by the minimum success rate s: chickpea (natural): k/n 0/2",
         "cases": [
             _active_case("case_0001", "610083", "hpc113", 120.0),
             _license_blocked_case(2),
@@ -808,7 +837,7 @@ def test_summary_renders_every_case_state_without_raw_machine_evidence() -> None
         "case_0004",
         "case_0005",
         "chickpea",
-        "solver_failure_threshold_exceeded",
+        "k/n 0/2",
     ):
         assert visible in rendered
     assert "case_0006" not in rendered
@@ -938,26 +967,6 @@ def test_summary_formatting_reads_no_files(monkeypatch: pytest.MonkeyPatch) -> N
     assert "case_0002" in rendered
 
 
-def test_completed_benchmark_status_prints_validated_final_markdown() -> None:
-    """Expose the persisted final benchmark result without recomputing it."""
-    rendered = status_service.format_benchmark_status_summary(
-        {
-            "suite_name": "core scaling",
-            "benchmark_run_id": "benchmark",
-            "state": "complete",
-            "wave_count": 4,
-            "work_units": [],
-            "final_summary": {
-                "path": "/evidence/summary.md",
-                "markdown": "# Validated benchmark result\n\nRecommended: 4 cores.\n",
-            },
-        }
-    )
-
-    assert "/evidence/summary.md" in rendered
-    assert "# Validated benchmark result" in rendered
-
-
 def _board_case(material: str, case_id: str, state: str, **extra: Any) -> dict[str, Any]:
     """Return one case of the canonical status with only the fields the live board reads."""
     return {
@@ -995,12 +1004,12 @@ def test_board_estimates_the_remaining_time_from_progress_and_the_median_finishe
     ]
     cases = [_board_running("case_0001", 56.0, 1000.0), *finished, _board_case("lentil", "case_0002", "never_started")]
     board = status_service.CampaignBoard(started=0.0, seats=2, verify_seconds=120.0)
-    text = board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=125.0)
+    text = board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=300.0)
     assert text is not None
     header, *lines = text.splitlines()
     # The running case needs 1000 s * (168 - 56) / 56 = 2000 s; the waiting case takes the 1800 s median on the free seat: max = 2000 s.
-    assert header == "Board  done 2  running 1  waiting 1  failed 0  of 4  elapsed 2 min  remaining ~33 min"
-    assert any(line.startswith("lentil    case_0001  running  33 %  56 h / 168 h  step 40 s") and line.endswith("ETA ~33 min") for line in lines)
+    assert header == "Board  done 2  running 1  waiting 1  failed 0  of 4  elapsed 5 min 00 s  remaining ~33 min 20 s"
+    assert any(line.startswith("lentil    case_0001  running  33 %  56 h / 168 h  step 40 s") and line.endswith("ETA ~33 min 20 s") for line in lines)
     assert any("case_0002  waiting  not started yet" in line for line in lines)
 
 
@@ -1008,10 +1017,10 @@ def test_board_gives_a_whole_case_to_one_seat() -> None:
     """One waiting case of 3600 s on eight free seats still takes 3600 s; it is never spread over the seats."""
     cases = [_board_case("lentil", "case_0001", "successful", elapsed="01:00:00"), _board_case("lentil", "case_0002", "never_started")]
     text = status_service.CampaignBoard(started=0.0, seats=8, verify_seconds=120.0).observe(
-        {"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=0.0
+        {"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=400.0
     )
     assert text is not None
-    assert text.splitlines()[0].endswith(f"remaining ~{status_service.format_duration(3600.0)}")
+    assert text.splitlines()[0].endswith(f"remaining ~{common.console.format_duration(3600.0)}")
 
 
 def test_campaign_status_carries_each_case_window_from_the_persisted_resolved_config_and_the_board_counts_past_its_start(
@@ -1039,17 +1048,76 @@ def test_campaign_status_carries_each_case_window_from_the_persisted_resolved_co
     assert "25 %  42 h / 168 h" in text
 
 
-def test_board_says_unknown_when_the_evidence_for_an_estimate_is_missing() -> None:
+def test_board_says_not_yet_estimable_when_the_evidence_for_an_estimate_is_missing() -> None:
     """Without a horizon, a running case, or a finished case to take the median from, the estimate is not guessed."""
     running = {"campaign_run_id": "run", "campaign_state": "active", "cases": [_board_running("case_0001", 56.0, 1000.0, horizon_hours=None)]}
     unknown_horizon = status_service.CampaignBoard(started=0.0, seats=2, verify_seconds=120.0).observe(running, now=0.0)
     assert unknown_horizon is not None
-    assert "remaining unknown" in unknown_horizon
-    assert "case_0001  running  transient drying  ETA unknown" in unknown_horizon
+    assert "ETA: not yet estimable" in unknown_horizon.splitlines()[0]
+    assert unknown_horizon.splitlines()[-1].endswith("case_0001  running  transient drying")
     waiting = {"campaign_run_id": "run", "campaign_state": "active", "cases": [_board_case("lentil", "case_0001", "scheduler_pending")]}
     no_median = status_service.CampaignBoard(started=0.0, seats=2, verify_seconds=120.0).observe(waiting, now=0.0)
     assert no_median is not None
-    assert "remaining unknown" in no_median
+    assert "ETA: not yet estimable" in no_median
+
+
+def test_board_prints_an_estimate_only_after_a_case_ended_and_only_below_ten_times_the_elapsed_time() -> None:
+    """The estimate of the first readings is noise: none before a case ended, none at or above 10 times the elapsed time."""
+    running = _board_running("case_0001", 56.0, 1000.0)  # needs 2000 s more
+    done = _board_case("chickpea", "case_0001", "successful", elapsed="00:01:00")  # shorter than the driver's elapsed time, which stays the basis
+
+    def header_and_case(cases: list[dict[str, Any]], now: float) -> tuple[str, str]:
+        board = status_service.CampaignBoard(started=0.0, seats=1, verify_seconds=120.0)
+        text = board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=now)
+        assert text is not None
+        lines = text.splitlines()
+        return lines[0], next(line for line in lines if "lentil" in line)
+
+    header, line = header_and_case([running], 1000.0)  # finite and 2 times the elapsed time, but no case ended yet
+    assert header.endswith("ETA: not yet estimable")
+    assert "ETA" not in line
+    header, line = header_and_case([running, done], 150.0)  # 2000 s is at least 10 times the 150 s elapsed
+    assert header.endswith("ETA: not yet estimable")
+    assert "ETA" not in line
+    header, line = header_and_case([running, done], 250.0)
+    assert header.endswith("remaining ~33 min 20 s")
+    assert line.endswith("ETA ~33 min 20 s")
+
+
+def test_board_estimates_after_a_driver_restart_from_the_measured_work_of_the_done_cases() -> None:
+    """A driver that restarted 60 s ago still estimates once four done cases of 1 h on two seats show 7200 s of measured work per seat."""
+    done = [_board_case("chickpea", f"case_{index:04d}", "successful", elapsed="01:00:00") for index in range(1, 5)]
+    waiting = [_board_case("lentil", f"case_{index:04d}", "never_started") for index in range(5, 7)]
+
+    def header(cases: list[dict[str, Any]]) -> str:
+        board = status_service.CampaignBoard(started=0.0, seats=2, verify_seconds=120.0)
+        text = board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": cases}, now=60.0)
+        assert text is not None
+        return text.splitlines()[0]
+
+    # Two waiting cases take one seat each: 3600 s is below 10 times the 7200 s basis, but above 10 times the driver's own 60 s.
+    assert header([*done, *waiting]).endswith(f"remaining ~{common.console.format_duration(3600.0)}")
+    assert header(waiting).endswith("ETA: not yet estimable")
+
+
+def test_board_prints_one_timestamped_line_per_case_that_changes_its_group() -> None:
+    """A case that fails and later settles to done is traceable: each change names old, new and reason, the old failure included."""
+    board = status_service.CampaignBoard(started=0.0, seats=1, verify_seconds=120.0)
+
+    def observe(case: dict[str, Any], now: float) -> str | None:
+        return board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": [case]}, now=now)
+
+    decided = _board_case("lentil", "case_0001", "failed", failure_reason="solver_error", terminal_decision="failed")
+    first = observe(decided, 0.0)
+    assert first is not None
+    assert "case lentil/case_0001" not in first  # the first sighting is the board itself, not a change
+    assert observe(decided, 10.0) is None
+    done = observe(_board_case("lentil", "case_0001", "successful", elapsed="00:01:00"), 20.0)
+    assert done is not None
+    (change,) = done.split("\n\n")[1:]
+    stamp, _, text = change.partition("  ")
+    assert datetime.fromisoformat(stamp).utcoffset() is not None
+    assert text == "case lentil/case_0001: failed -> done (took 1 min 00 s; was solver_error; decision recorded)"
 
 
 def test_board_names_the_typed_reason_and_the_exact_replacement_of_each_failed_slot() -> None:
@@ -1146,7 +1214,9 @@ def test_an_unverified_failure_reads_verifying_then_failed_and_the_board_reprint
     expired = board.observe(status, now=120.0)
     assert expired is not None
     assert "failed 1  of 1" in expired.splitlines()[0]
-    assert "verifying" not in expired
+    board, change = expired.split("\n\n")
+    assert "verifying" not in board
+    assert "case lentil/case_0001: verifying -> failed (" in change
     assert "lentil  case_0001  failed   completed_without_valid_case_evidence  decision recorded" in expired
 
 
@@ -1174,7 +1244,7 @@ def test_a_verifying_case_that_gets_its_result_reads_done_and_a_new_failure_star
     assert done is not None
     assert "done 1  running 0  waiting 0  failed 0  of 1" in done.splitlines()[0]
     assert "lentil  case_0001  done" in done
-    assert "verifying" not in done
+    assert "verifying" not in done.split("\n\n")[0]
     again = board.observe({"campaign_run_id": "run", "campaign_state": "active", "cases": [unverified]}, now=20.0)
     assert again is not None
     assert "lentil  case_0001  verifying  step ended, result not yet visible" in again

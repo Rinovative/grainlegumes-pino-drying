@@ -99,11 +99,7 @@ def campaign_unresolved_gates(
     """Return exact authored-value and profile-mapping gates for one campaign."""
     campaign_path = Path(path).expanduser().resolve()
     raw = _yaml(campaign_path) if authored_value is None else authored_value
-    primary_missing = (
-        _primary_missing(campaign_path, authored_value=raw)
-        if raw.get("schema_kind") == "generation_source_campaign" or raw.get("campaign_purpose") == "source_generation"
-        else []
-    )
+    primary_missing = _primary_missing(campaign_path, authored_value=raw) if raw.get("schema_kind") == "generation_source_campaign" else []
     mapping_missing = _profile_mapping_missing(campaign_path, authored_value=raw)
     return {
         "missing_production_keys": sorted(primary_missing),

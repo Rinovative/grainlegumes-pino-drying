@@ -4,6 +4,7 @@ Responsibilities:
   - Parse explicit configuration, case, campaign, and publication commands
   - Dispatch reusable generation services without duplicating their domain logic
   - Emit machine-readable command results to their callers and one plain line per case and node-worker outcome to the node log
+  - Print one summary line for a campaign resume; its manifest stays in the campaign's execution record
   - Link a campaign node job's own logs into its campaign when the node worker starts
   - Propagate terminal failures
 
@@ -20,6 +21,7 @@ This module does NOT:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shlex
@@ -31,8 +33,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src import common
-from src.generation import generation_benchmark as benchmark_service
-from src.generation import generation_benchmark_config as benchmark_config
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_status as campaign_status_service
 from src.generation import generation_readiness as readiness_service
@@ -40,7 +40,6 @@ from src.generation import generation_run as run_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_input as input_service
-from src.generation.contracts import generation_contracts_descriptors as contracts_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
@@ -54,7 +53,7 @@ from src.generation.runtime import generation_runtime_workspace as workspace_ser
 from src.generation.validation import generation_validation_sentinels as sentinel_service
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 _PROCESS_STARTED = time.monotonic()  # one command is one process, so this is the start of a case step
 
@@ -66,10 +65,33 @@ def _case_label(args: argparse.Namespace) -> str:
     return f"{material} case_{args.case_index:04d}"
 
 
-def _case_end_line(args: argparse.Namespace, status: str) -> str:
-    """Return the one searchable line that ends a case step in the node log."""
-    duration = campaign_status_service.format_duration(time.monotonic() - _PROCESS_STARTED)
-    return f"CASE END {_case_label(args)} {status} {duration}"
+def _case_end_line(args: argparse.Namespace, status: str, reason: str | None = None) -> str:
+    """Return the one searchable line that ends a case step in the node log: end time, duration and, for a failure, its reason."""
+    duration = common.console.format_duration(time.monotonic() - _PROCESS_STARTED)
+    line = f"CASE END {_case_label(args)} {status} at {common.console.format_timestamp()} after {duration}"
+    return line if reason is None else f"{line}: {reason}"
+
+
+def _resume_summary(manifest: Mapping[str, Any], *, reclassified: Sequence[Mapping[str, Any]], storage_root: Path | None) -> dict[str, Any]:
+    """Return the one-line outcome of a campaign resume; the full manifest stays in the campaign's execution record.
+
+    The controller reads the identity, the state and the compute request with its reason from this line. Each dispatch
+    record that this resume's feed ``reclassified`` as not started, collected inside its feeder lock, shows up with its
+    reason instead of the whole record list.
+    """
+    run_directory = campaign_evidence.campaign_run_directory(manifest["campaign_run_id"], storage_root=storage_root)
+    summary: dict[str, Any] = {
+        "at": common.console.format_timestamp(),
+        "campaign_run_id": manifest["campaign_run_id"],
+        "state": manifest["state"],
+        "submissions": dict(collections.Counter(record["status"] for record in manifest["submissions"])),
+        "reclassified": [f"{record['case']['case_id']}: {record['error']}" for record in reclassified],
+        "record": str(common.paths.resolve_generation_run_manifest_path(common.paths.resolve_generation_execution_directory(run_directory))),
+    }
+    if manifest.get("continuation_requires_compute") is True:
+        summary["continuation_requires_compute"] = True
+        summary["continuation_reason"] = manifest["continuation_reason"]
+    return summary
 
 
 def _add_storage_arguments(parser: argparse.ArgumentParser, *, include_work: bool = False) -> None:
@@ -194,7 +216,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     resolve_run = subparsers.add_parser(
         "resolve-generation-run",
-        help="resolve one campaign or benchmark into the common immutable run plan",
+        help="resolve one campaign into the immutable run plan",
     )
     resolve_run.add_argument("config", type=Path)
     resolve_run.add_argument("--authored-value-json", type=json.loads)
@@ -214,154 +236,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         action="store_true",
         help="validate structure and report unresolved launch gates without executing",
     )
-
-    subparsers.add_parser(
-        "list-campaigns",
-        help="discover Generation campaigns by schema kind without relying on filenames",
-    )
-
-    inspect_benchmark = subparsers.add_parser(
-        "inspect-core-benchmark",
-        help="resolve the same-case core-scaling suite without materializing inputs",
-    )
-    inspect_benchmark.add_argument("suite", type=Path)
-    inspect_benchmark.add_argument("--require-executable", action="store_true")
-
-    resolve_benchmark = subparsers.add_parser(
-        "resolve-core-benchmark-run",
-        help="resolve the deterministic benchmark runtime identity without mutation",
-    )
-    resolve_benchmark.add_argument("suite", type=Path)
-    resolve_benchmark.add_argument("--git-commit", required=True)
-    resolve_benchmark.add_argument("--comsol-version-output", required=True)
-
-    preflight_benchmark = subparsers.add_parser(
-        "preflight-core-benchmark",
-        help="persist benchmark-owned exact-source and runtime preflight evidence",
-    )
-    preflight_benchmark.add_argument("suite", type=Path)
-    preflight_benchmark.add_argument("--git-commit", required=True)
-    preflight_benchmark.add_argument("--storage-root", type=Path, required=True)
-    preflight_benchmark.add_argument("--scratch-root", type=Path, required=True)
-    preflight_benchmark.add_argument("--comsol-version-output", required=True)
-    preflight_benchmark.add_argument(
-        "--comsol-executable-path",
-        type=Path,
-        required=True,
-    )
-
-    plan_benchmark = subparsers.add_parser(
-        "plan-core-benchmark",
-        help="reuse standalone preflight and print isolated Slurm submissions",
-    )
-    plan_benchmark.add_argument("suite", type=Path)
-    plan_benchmark.add_argument("--git-commit", required=True)
-    plan_benchmark.add_argument("--storage-root", type=Path, required=True)
-    plan_benchmark.add_argument("--scratch-root", type=Path, required=True)
-    plan_benchmark.add_argument("--comsol-version-output", required=True)
-    plan_benchmark.add_argument(
-        "--comsol-executable-path",
-        type=Path,
-        required=True,
-    )
-
-    materialize_benchmark = subparsers.add_parser(
-        "materialize-core-benchmark-inputs",
-        help="materialize the canonical benchmark input without submitting work",
-    )
-    materialize_benchmark.add_argument("suite", type=Path)
-    materialize_benchmark.add_argument("--git-commit", required=True)
-    materialize_benchmark.add_argument("--storage-root", type=Path, required=True)
-    materialize_benchmark.add_argument("--scratch-root", type=Path, required=True)
-    materialize_benchmark.add_argument("--comsol-version-output", required=True)
-    materialize_benchmark.add_argument(
-        "--comsol-executable-path",
-        type=Path,
-        required=True,
-    )
-
-    submit_benchmark = subparsers.add_parser(
-        "submit-core-benchmark",
-        help="submit the standalone shared-case core-scaling benchmark",
-    )
-    submit_benchmark.add_argument("suite", type=Path)
-    submit_benchmark.add_argument("--git-commit", required=True)
-    submit_benchmark.add_argument("--storage-root", type=Path, required=True)
-    submit_benchmark.add_argument("--scratch-root", type=Path, required=True)
-    submit_benchmark.add_argument("--comsol-version-output", required=True)
-    submit_benchmark.add_argument(
-        "--comsol-executable-path",
-        type=Path,
-        required=True,
-    )
-
-    run_benchmark = subparsers.add_parser(
-        "run-core-benchmark-case",
-        help="run one isolated, identity-checked benchmark representative case",
-    )
-    run_benchmark.add_argument("benchmark_run_id")
-    run_benchmark.add_argument("sweep_id")
-    run_benchmark.add_argument("variant_id")
-    run_benchmark.add_argument("variant_attempt", type=int)
-    run_benchmark.add_argument("case_role")
-    run_benchmark.add_argument("--storage-root", type=Path, required=True)
-    run_benchmark.add_argument("--work-root", type=Path, required=True)
-
-    benchmark_status = subparsers.add_parser(
-        "core-benchmark-status",
-        help="reconstruct benchmark work-unit and scheduler state",
-    )
-    benchmark_status.add_argument("benchmark_run_id")
-    benchmark_status.add_argument("--no-scheduler", action="store_true")
-    benchmark_status.add_argument("--format", choices=("json", "state", "summary", "monitor"), default="json")
-    benchmark_status.add_argument("--storage-root", type=Path, required=True)
-
-    resume_benchmark = subparsers.add_parser(
-        "resume-core-benchmark",
-        help="submit only benchmark cases without successful evidence",
-    )
-    resume_benchmark.add_argument("benchmark_run_id")
-    resume_benchmark.add_argument("--storage-root", type=Path, required=True)
-    resume_benchmark.add_argument("--scratch-root", type=Path)
-
-    cancel_benchmark = subparsers.add_parser(
-        "cancel-core-benchmark",
-        help="cancel only Slurm jobs owned by one core benchmark",
-    )
-    cancel_benchmark.add_argument("benchmark_run_id")
-    cancel_benchmark.add_argument("--force", action="store_true")
-    cancel_benchmark.add_argument("--storage-root", type=Path, required=True)
-
-    finalize_benchmark = subparsers.add_parser(
-        "finalize-core-benchmark",
-        help="publish per-run and aggregate core-scaling evidence",
-    )
-    finalize_benchmark.add_argument("benchmark_run_id")
-    finalize_benchmark.add_argument("--storage-root", type=Path, required=True)
-
-    benchmark_source_status = subparsers.add_parser(
-        "core-benchmark-source-status",
-        help="report benchmark CPU source and cleanup state",
-    )
-    benchmark_source_status.add_argument("benchmark_run_id")
-    benchmark_source_status.add_argument("--no-scheduler", action="store_true")
-    benchmark_source_status.add_argument("--format", choices=("json", "tsv"), default="json")
-    benchmark_source_status.add_argument("--storage-root", type=Path, required=True)
-
-    validate_benchmark = subparsers.add_parser(
-        "validate-core-benchmark",
-        help="validate terminal benchmark evidence and dataset isolation",
-    )
-    validate_benchmark.add_argument("benchmark_run_id")
-    validate_benchmark.add_argument("--storage-root", type=Path, required=True)
-
-    summarize_benchmark = subparsers.add_parser(
-        "core-benchmark-summary",
-        help="display the terminal benchmark summary",
-    )
-    summarize_benchmark.add_argument("benchmark_run_id")
-    summarize_benchmark.add_argument("--format", choices=("json", "markdown"), default="json")
-    summarize_benchmark.add_argument("--storage-root", type=Path, required=True)
 
     preflight = subparsers.add_parser(
         "preflight",
@@ -514,12 +388,12 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     amend_replacements = subparsers.add_parser(
         "amend-replacement-pool",
-        help="explicitly raise one original batch's replacement capacity, with its reason",
+        help="explicitly lower one original batch's minimum success rate, with its reason",
     )
     amend_replacements.add_argument("campaign_run_id")
     amend_replacements.add_argument("--material", required=True)
     amend_replacements.add_argument("--regime", required=True)
-    amend_replacements.add_argument("--capacity", type=int, required=True, help="total replacement candidates the batch may use")
+    amend_replacements.add_argument("--minimum-success-rate", type=float, required=True, help="new rate s, 0 < s <= 1, below the current one")
     amend_replacements.add_argument("--reason", required=True)
     _add_storage_arguments(amend_replacements)
 
@@ -698,37 +572,6 @@ def _campaign_summary(
     return summary
 
 
-def _campaign_catalog() -> dict[str, Any]:
-    """Return discovered campaign metadata and an optional unique workflow view."""
-    repository = common.paths.get_project_root().resolve()
-    campaigns = config_service.discover_campaign_configs(
-        repository,
-        require_executable=False,
-    )
-    records: list[dict[str, Any]] = []
-    for campaign in campaigns:
-        profile_contract = contracts_service.get_profile_contract(campaign.profile.id)
-        profile_kind = "transient" if profile_contract.transient_fields else "stationary"
-        records.append(
-            {
-                "source_path": str(campaign.source_path),
-                "repository_path": campaign.source_path.relative_to(repository).as_posix(),
-                "campaign_name": campaign.campaign_name,
-                "source_name": campaign.source_name,
-                "campaign_purpose": campaign.campaign_purpose,
-                "simulation_profile": campaign.profile.id,
-                "profile_kind": profile_kind,
-                "execution_site": campaign.execution_values["site"],
-            }
-        )
-    result: dict[str, Any] = {
-        "schema_kind": "generation_campaign_catalog",
-        "schema_version": 1,
-        "campaigns": records,
-    }
-    return result
-
-
 def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
     if args.command == "resolve-generation-run":
@@ -741,162 +584,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             execution_overrides=_execution_overrides(args),
         )
         print(json.dumps(run_plan.to_payload(), sort_keys=True))
-        return 0
-    if args.command == "list-campaigns":
-        print(json.dumps(_campaign_catalog(), sort_keys=True))
-        return 0
-    if args.command == "inspect-core-benchmark":
-        inspection = benchmark_config.inspect_core_benchmark(
-            args.suite,
-            require_executable=args.require_executable,
-        )
-        print(json.dumps(inspection, sort_keys=True))
-        return 0
-    if args.command == "resolve-core-benchmark-run":
-        identity = benchmark_service.resolve_core_benchmark_runtime_identity(
-            args.suite,
-            git_commit=args.git_commit,
-            comsol_version_output=args.comsol_version_output,
-        )
-        print(json.dumps(identity, sort_keys=True))
-        return 0
-    if args.command == "preflight-core-benchmark":
-        preflight = benchmark_service.preflight_core_benchmark(
-            args.suite,
-            git_commit=args.git_commit,
-            storage_root=args.storage_root,
-            scratch_root=args.scratch_root,
-            comsol_version_output=args.comsol_version_output,
-            comsol_executable_path=args.comsol_executable_path,
-        )
-        print(json.dumps(preflight, sort_keys=True))
-        return 0
-    if args.command == "plan-core-benchmark":
-        benchmark_plan = benchmark_service.plan_core_benchmark(
-            args.suite,
-            git_commit=args.git_commit,
-            storage_root=args.storage_root,
-            scratch_root=args.scratch_root,
-            comsol_version_output=args.comsol_version_output,
-            comsol_executable_path=args.comsol_executable_path,
-        )
-        print(json.dumps(benchmark_plan, sort_keys=True))
-        return 0
-    if args.command == "materialize-core-benchmark-inputs":
-        manifest = benchmark_service.prepare_core_benchmark(
-            args.suite,
-            git_commit=args.git_commit,
-            storage_root=args.storage_root,
-            scratch_root=args.scratch_root,
-            comsol_version_output=args.comsol_version_output,
-            comsol_executable_path=args.comsol_executable_path,
-        )
-        print(json.dumps(manifest, sort_keys=True))
-        return 0
-    if args.command == "submit-core-benchmark":
-        manifest = benchmark_service.submit_core_benchmark(
-            args.suite,
-            git_commit=args.git_commit,
-            storage_root=args.storage_root,
-            scratch_root=args.scratch_root,
-            comsol_version_output=args.comsol_version_output,
-            comsol_executable_path=args.comsol_executable_path,
-        )
-        print(json.dumps(manifest, sort_keys=True))
-        return 0
-    if args.command == "run-core-benchmark-case":
-        result = benchmark_service.run_core_benchmark_case(
-            args.benchmark_run_id,
-            args.sweep_id,
-            args.variant_id,
-            args.variant_attempt,
-            args.case_role,
-            storage_root=args.storage_root,
-            work_root=args.work_root,
-        )
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    if args.command == "core-benchmark-status":
-        status = benchmark_service.core_benchmark_status(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            query_scheduler=not args.no_scheduler,
-        )
-        if args.format == "state":
-            print(status["state"])
-        elif args.format == "summary":
-            print(campaign_status_service.format_benchmark_status_summary(status))
-        elif args.format == "monitor":
-            print(campaign_status_service.format_benchmark_monitor(status, max_active_cases=8))
-        else:
-            print(json.dumps(status, sort_keys=True))
-        return 0
-    if args.command == "resume-core-benchmark":
-        manifest = benchmark_service.resume_core_benchmark(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            scratch_root=args.scratch_root,
-        )
-        print(json.dumps(manifest, sort_keys=True))
-        return 0
-    if args.command == "cancel-core-benchmark":
-        receipt = benchmark_service.cancel_core_benchmark(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            force=args.force,
-        )
-        print(json.dumps(receipt, sort_keys=True))
-        return 0
-    if args.command == "finalize-core-benchmark":
-        summary = benchmark_service.finalize_core_benchmark(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(summary, sort_keys=True))
-        return 0
-    if args.command == "core-benchmark-source-status":
-        status = benchmark_service.core_benchmark_source_status(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-            query_scheduler=not args.no_scheduler,
-        )
-        if args.format == "json":
-            print(json.dumps(status, sort_keys=True))
-        else:
-            print(
-                "\t".join(
-                    (
-                        "source-status",
-                        status["run_id"],
-                        status["run_state"],
-                        status["source_state"],
-                        str(status["reclaimable_bytes"]),
-                        status["cleanup_eligibility"],
-                        str(status["active_slurm"]),
-                    )
-                )
-            )
-        return 0
-    if args.command == "validate-core-benchmark":
-        result = benchmark_service.validate_core_benchmark(
-            args.benchmark_run_id,
-            storage_root=args.storage_root,
-        )
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    if args.command == "core-benchmark-summary":
-        if args.format == "json":
-            summary = benchmark_service.load_core_benchmark_summary(
-                args.benchmark_run_id,
-                storage_root=args.storage_root,
-            )
-            print(json.dumps(summary, sort_keys=True))
-        else:
-            markdown = benchmark_service.load_core_benchmark_markdown(
-                args.benchmark_run_id,
-                storage_root=args.storage_root,
-            )
-            print(markdown, end="")
         return 0
     if args.command == "preflight":
         report = preflight_service.run_cpu_preflight(
@@ -997,23 +684,25 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(path)
         return 0
     if args.command == "amend-replacement-pool":
-        amendment = campaign_runtime.amend_replacement_capacity(
+        amendment = campaign_runtime.amend_minimum_success_rate(
             args.campaign_run_id,
             args.material,
             args.regime,
-            capacity=args.capacity,
+            minimum_success_rate=args.minimum_success_rate,
             reason=args.reason,
             storage_root=args.storage_root,
         )
         print(json.dumps(amendment, sort_keys=True))
         return 0
     if args.command == "resume-campaign":
+        reclassified: list[Mapping[str, Any]] = []
         manifest = campaign_runtime.resume_campaign(
             args.campaign_run_id,
             storage_root=args.storage_root,
             metadata_only=args.metadata_only,
+            reclassified=reclassified,
         )
-        print(json.dumps(manifest, sort_keys=True))
+        print(json.dumps(_resume_summary(manifest, reclassified=reclassified, storage_root=args.storage_root), sort_keys=True))
         return 0
     if args.command == "record-worker-interruption":
         path = campaign_runtime.record_worker_interruption(
@@ -1179,12 +868,10 @@ def _cli_error_payload(
         "campaign_run_id",
         "steady_campaign_run_id",
         "transient_campaign_run_id",
-        "benchmark_run_id",
         "batch_name",
         "case_id",
         "case_index",
         "config",
-        "suite",
         "storage_root",
     ):
         value = getattr(args, name, None)
@@ -1213,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
     previous_term: Any = None
-    if args.command in {"run-campaign-case", "run-core-benchmark-case"}:
+    if args.command == "run-campaign-case":
         previous_term = signal.getsignal(signal.SIGTERM)
         signal.signal(
             signal.SIGTERM,
@@ -1232,7 +919,7 @@ def main(argv: list[str] | None = None) -> int:
                 # (stall, timeout, solver error) is fully stated by that line and gets no JSON error event.
                 reason = str(error).splitlines()[0] if str(error) else type(error).__name__
                 print(f"{_case_label(args)} stopped: {reason}", file=sys.stderr)
-                print(_case_end_line(args, "failed"))
+                print(_case_end_line(args, "failed", reason))
                 classified = getattr(error, "runtime_reason", None) is not None
             if not classified:
                 print(

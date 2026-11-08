@@ -27,17 +27,15 @@ from support.source_tree import FrozenProject, tampered
 
 _CAMPAIGN_RUN_ID = "source~steady_flow~lentil-350+chickpea-350+kidney-bean-350__ref-range__lhs-seed-9300"
 _CANONICAL_CAMPAIGN_RUN_ID = "source~transient_drying~lentil-50+chickpea-50+kidney-bean-20__ref-range__lhs-seed-9200"
-_BENCHMARK_RUN_ID = "core_scaling_transient__0123456789abcdef"
 _NODE_ARGUMENTS = ("campaign-case", _CAMPAIGN_RUN_ID, "batch", "1", "2")
 
 
-@pytest.mark.parametrize("arguments", [(), ("--candidate",)])
-def test_native_provisioning_requires_slurm(arguments: tuple[str, ...]) -> None:
+def test_native_provisioning_requires_slurm() -> None:
     """Refuse environment creation outside a scheduler allocation."""
     environment = os.environ.copy()
     environment.pop("SLURM_JOB_ID", None)
     script = Path(__file__).resolve().parents[2] / "scripts/provision_native.sh"
-    result = subprocess.run(["bash", str(script), *arguments], env=environment, capture_output=True, text=True, check=False)  # noqa: S603, S607 -- test-owned executable and controlled argument vector; no shell interpolation
+    result = subprocess.run(["bash", str(script)], env=environment, capture_output=True, text=True, check=False)  # noqa: S603, S607 -- test-owned executable and controlled argument vector; no shell interpolation
     assert result.returncode == 2
     assert "Slurm allocation" in result.stderr
 
@@ -78,7 +76,6 @@ def native_worker(frozen_project: FrozenProject, tmp_path: Path) -> tuple[Path, 
         "GENERATION_COMSOL_EXECUTABLE": "comsol",
         "GENERATION_ATTEMPT_INDEX": "1",
         "GENERATION_CAMPAIGN_RUN_ID": _CAMPAIGN_RUN_ID,
-        "GENERATION_BENCHMARK_RUN_ID": _BENCHMARK_RUN_ID,
     }
     environment["PATH"] = f"{binary}{os.pathsep}{environment['PATH']}"
     return tree, environment, command_log
@@ -100,7 +97,6 @@ def _run_node(tree: Path, environment: dict[str, str], *arguments: str) -> subpr
     [
         ("campaign-case", (_CAMPAIGN_RUN_ID, "batch", "1", "2"), "run-campaign-case"),
         ("campaign-case", (_CANONICAL_CAMPAIGN_RUN_ID, "transient_drying__lentil__natural", "1", "2"), "run-campaign-case"),
-        ("benchmark-case", (_BENCHMARK_RUN_ID, "sweep_1", "cores_02", "1", "case_01"), "run-core-benchmark-case"),
     ],
 )
 def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
@@ -112,12 +108,7 @@ def test_spooled_worker_uses_shared_source_native_modules_and_cleans_scratch(
 ) -> None:
     """Run the worker from Slurm's spool path with only shared source beside it."""
     repository, environment, command_log = native_worker
-    if script == "campaign-case":
-        environment["GENERATION_CAMPAIGN_RUN_ID"] = arguments[0]
-    else:
-        # A benchmark case runs only as a step of its sweep node job.
-        environment["GENERATION_BENCHMARK_RUN_ID"] = arguments[0]
-        environment["SLURM_STEP_ID"] = "7"
+    environment["GENERATION_CAMPAIGN_RUN_ID"] = arguments[0]
     spooled = tmp_path / "slurm_script"
     shutil.copy2(repository / "scripts/generation_node.sh", spooled)
     result = subprocess.run(  # noqa: S603 -- test-owned executable and controlled argument vector; no shell interpolation
@@ -154,7 +145,6 @@ def test_worker_start_sweeps_only_own_marked_scratch_of_finished_jobs(
         return directory
 
     stale_case = make("vp2-generation-111.AAAAAA")
-    stale_benchmark = make("vp2-benchmark-112-nominal.BBBBBB")
     active = make("vp2-generation-222.CCCCCC")
     unmarked = make("vp2-generation-333.DDDDDD", marked=False)
     foreign = make("other-444.EEEEEE")
@@ -191,14 +181,12 @@ def test_worker_start_sweeps_only_own_marked_scratch_of_finished_jobs(
     assert result.returncode == 0, result.stderr
     assert not stale_case.exists()
     assert not Path(f"{stale_case}.lock").exists()
-    assert not stale_benchmark.exists()
     assert active.exists()
     assert unmarked.exists()
     assert foreign.exists()
     assert without_lock.exists()
     assert starting.exists()
     assert str(stale_case) in result.stderr
-    assert str(stale_benchmark) in result.stderr
     assert str(active) not in result.stderr
     assert str(starting) not in result.stderr
 

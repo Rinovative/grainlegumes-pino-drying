@@ -208,7 +208,8 @@ def test_full_policy_retains_failure_evidence(
     retained = attempt.payload["retained_inventory"]
     assert "payload/model.mph" in retained
     assert "payload/solved.mph" in retained
-    assert "payload/runtime/solver.log" in retained
+    assert "payload/runtime/stdout.log" in retained
+    assert "payload/runtime/solver.log" not in retained  # the combined copy would repeat the retained stdout and stderr
     assert all(f"payload/{relative}" in retained for relative in exported)
     assert "payload/runtime/case.h5" in retained
     assert not any(path.name == "_SUCCESS" for path in attempt.directory.rglob("*"))
@@ -276,7 +277,6 @@ def test_license_only_full_payload_is_safely_compacted(
         campaign_purpose="source_generation",
     )
     license_text = "Could not obtain license for 'Brinkman Equations (br)'.\nLicensed number of users already reached.\nLicense error: -4."
-    prepared.runtime_directory.joinpath("solver.log").write_text(license_text, encoding="utf-8")
     prepared.runtime_directory.joinpath("stdout.log").write_text(license_text, encoding="utf-8")
     attempt = _publish_oversized_license_attempt(
         config,
@@ -314,7 +314,7 @@ def test_license_cleanup_refuses_unique_scientific_output(
         tmp_path,
         campaign_purpose="source_generation",
     )
-    prepared.runtime_directory.joinpath("solver.log").write_text(
+    prepared.runtime_directory.joinpath("stdout.log").write_text(
         "Could not obtain license for 'Brinkman Equations (br)'. Licensed number of users already reached. License error: -4.",
         encoding="utf-8",
     )
@@ -412,11 +412,11 @@ def test_production_solver_failure_is_compact_and_hash_admitted(
 
     assert attempt.payload["retention_policy"] == "compact"
     retained = attempt.payload["retained_inventory"]
-    assert "payload/runtime/solver.log" in retained
+    assert "payload/runtime/stdout.log" in retained
     assert "payload/model.mph" not in retained
     assert "payload/solved.mph" not in retained
     assert all(f"payload/{relative}" not in retained for relative in exported)
-    for name in ("solver.log", "stdout.log", "stderr.log"):
+    for name in ("stdout.log", "stderr.log"):
         retained_log = (attempt.directory / "payload/runtime" / name).read_bytes()
         assert len(retained_log) <= maximum_log_bytes
         assert retained_log.startswith(b"HEAD-")
@@ -426,8 +426,8 @@ def test_production_solver_failure_is_compact_and_hash_admitted(
         assert gzip.decompress(complete.read_bytes()) == b"HEAD-" + b"x" * maximum_log_bytes + b"-TAIL\n"
         assert f"payload/runtime/{name}.gz" in retained
     assert "payload/runtime/solver_steps.csv" in retained
-    solver_log = attempt.directory / "payload/runtime/solver.log"
-    solver_log.write_text("tampered\n", encoding="utf-8")
+    stdout_log = attempt.directory / "payload/runtime/stdout.log"
+    stdout_log.write_text("tampered\n", encoding="utf-8")
     with pytest.raises(ValueError, match="artifact identity"):
         attempt_service.load_attempt(attempt.directory)
 
@@ -475,7 +475,7 @@ def test_conversion_and_publication_failures_follow_the_solver_failure_compactio
 
     assert attempt.payload["retention_policy"] == "compact"
     retained = attempt.payload["retained_inventory"]
-    assert {"payload/runtime/solver.log", "payload/runtime/status.json", "payload/runtime/processing_provenance.json"} <= set(retained)
+    assert {"payload/runtime/stdout.log", "payload/runtime/status.json", "payload/runtime/processing_provenance.json"} <= set(retained)
     omitted_payload = {"payload/model.mph", "payload/solved.mph", "payload/runtime/case.h5", *(f"payload/{relative}" for relative in exported)}
     assert omitted_payload.isdisjoint(retained)
     assert set(attempt.payload["intentionally_omitted_artifacts"]) == {"model.mph", "solved.mph", "runtime/case.h5", *exported}

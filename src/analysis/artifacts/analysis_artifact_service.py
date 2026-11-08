@@ -1,16 +1,20 @@
 """Discover, validate, rebuild, generate, and reuse split-aware run artifacts.
 
 Responsibilities:
-  - Admit completed runs by explicit current path, skipping Optuna trial leaves by their recorded layout
+  - Admit completed runs by explicit current path, skipping Optuna trial leaves by their recorded layout and refusing one selected as the target
   - Skip non-completed leaves while discovering an unselected root, and refuse them when selected by name
   - Bind caches to exact checkpoint/config/normalizer/dataset/split identity
+  - Stamp steady artifacts with the running analysis producer and refuse a complete target or stage of other analysis code
   - Reject partial or semantically mismatched caches without substitution
   - Rebuild only explicit exact targets and propagate every material failure
-  - Load valid artifacts or generate only missing roles through one public service
+  - Load valid artifacts or generate only missing roles through one build flow shared by both tasks
 
 Design principles:
   - Saved split membership is always required
   - Provenance is published last as the cache completion marker
+  - One deterministic stage per target survives failures; the role validator of evaluation_artifact_loader admits
+    the stage, every cache hit, and the published target
+  - The required timing block is written into the stage before validation, so a timing failure publishes nothing
   - Rebuild publishes a validated replacement only for the requested target
   - Local notebook orchestration never invokes tracking uploads
 
@@ -27,14 +31,13 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from numbers import Integral, Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 import numpy as np
@@ -42,10 +45,11 @@ import pandas as pd
 import torch
 
 from src import common, domain, experiments
-from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 from . import analysis_artifact_performance as artifact_performance
+from . import analysis_artifact_plan as artifact_plan
 from . import contracts, generation, timing, transient
 
 if TYPE_CHECKING:
@@ -68,34 +72,6 @@ class ArtifactCacheError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class RunArtifactPlan:
-    """
-    Bind one evaluable run to the exact ID and additional evaluation Datasets it persisted.
-
-    Parameters
-    ----------
-    run_dir : pathlib.Path
-        Current evaluable run whose config and saved split metadata were validated.
-    id_dataset_name : str
-        Logical training Dataset supplying the saved ID-test membership.
-    additional_evaluation_dataset_name : str | None
-        Combined logical identity of the saved additional evaluation membership,
-        or None when no evaluation Dataset declared OOD cases.
-
-    Notes
-    -----
-    The dataclass is frozen so a validated plan cannot be retargeted in place.
-
-    """
-
-    run_dir: Path
-    id_dataset_name: str
-    additional_evaluation_dataset_name: str | None
-    scientific_run_name: str
-    task: str = "steady_flow"
-
-
-@dataclass(frozen=True)
 class ArtifactRequest:
     """
     Describe the complete request identity expected from one artifact target.
@@ -107,7 +83,7 @@ class ArtifactRequest:
         generation, and runtime request evidence. Generated aggregate/results
         are deliberately absent until artifact publication.
     source_indices : tuple[int, ...]
-        Exact complete ordered final-dataset membership saved by the run.
+        Exact ordered membership as positions in the ordered concatenation of the role's complete source Datasets.
     batch_size : int
         Saved resolved evaluation batch size used by online and artifact inference.
     case_ids : tuple[str, ...]
@@ -124,6 +100,15 @@ class ArtifactRequest:
     source_indices: tuple[int, ...]
     batch_size: int
     case_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TargetBuild:
+    """Task-specific steps of one locked target build; the shared flow owns staging, timing, admission and publication."""
+
+    case_ids: tuple[str, ...]
+    generate: Callable[[Path, artifact_performance.ArtifactProgressReporter], None]
+    finish_stage: Callable[[Path], None]
 
 
 @dataclass(frozen=True)
@@ -217,12 +202,19 @@ def cleanup_runtime(device: torch.device) -> None:
         torch.cuda.ipc_collect()
 
 
+def _refuse_optuna_trial(run_dir: Path) -> None:
+    """Refuse an explicitly selected Optuna trial leaf: trials keep no checkpoints and have no artifacts."""
+    if common.paths.resolve_run_config_path(run_dir).is_file():
+        contracts.refuse_optuna_trial(_load_run_config(run_dir), label=str(run_dir))
+
+
 def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iterable[Path]:
     """Yield validated saved leaves, optionally selected by persisted scientific names.
 
     Without a name selection, a leaf whose summary reports a status other than
     ``completed`` is skipped with one printed line; a selected name is admitted
-    strictly and refused with the resume hint.
+    strictly and refused with the resume hint. Optuna trial leaves below the root
+    are skipped; a root that is itself a trial leaf is refused.
     """
     root = Path(root).expanduser()
     selected = {common.paths.validate_logical_name(name, label="run_name") for name in (run_names or ())}
@@ -236,6 +228,8 @@ def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iter
             candidates.append(Path(directory))
             children.clear()  # Run artifacts belong to this leaf, not another saved run.
     candidates.sort()
+    if root in candidates:
+        _refuse_optuna_trial(root)
     found: set[str] = set()
     for candidate in candidates:
         config = _load_run_config(candidate) if common.paths.resolve_run_config_path(candidate).is_file() else None
@@ -268,85 +262,18 @@ def _load_run_config(run_dir: Path) -> Mapping[str, Any]:
     return config
 
 
-def _load_data_config(run_dir: Path) -> Mapping[str, Any]:
-    """Load the data section from current config.yaml."""
-    config_path = common.paths.resolve_run_config_path(run_dir)
-    data_cfg = _load_run_config(run_dir).get("data")
-    if not isinstance(data_cfg, Mapping):
-        msg = f"config.yaml must contain a data mapping: {config_path}"
-        raise TypeError(msg)
-    return data_cfg
-
-
-def _required_config_dataset_name(data_cfg: Mapping[str, Any], key: str) -> str:
-    """Return a required single dataset name from config data."""
-    value = data_cfg.get(key)
-    return common.paths.validate_logical_name(value, label=f"config.yaml data.{key}")
-
-
-def load_run_artifact_plan(run_dir: Path) -> RunArtifactPlan:
+def load_run_artifact_plan(run_dir: Path) -> artifact_plan.ArtifactPlan:
     """
-    Resolve the exact ID and additional evaluation artifact Datasets owned by an evaluable run.
-
-    Parameters
-    ----------
-    run_dir : pathlib.Path
-        Current evaluable run containing config, split, normalizer, best checkpoint,
-        and summary evidence.
-
-    Returns
-    -------
-    RunArtifactPlan
-        Frozen run path and logical dataset names taken from saved split identity.
+    Admit an evaluable run of either task and return its artifact roles from the saved split.
 
     Raises
     ------
     FileNotFoundError, TypeError, ValueError, RuntimeError
-        If the run is incomplete or config dataset names disagree with the
-        authoritative ``split_indices.pt`` metadata.
-
-    Notes
-    -----
-    Output naming therefore uses the same saved identity consumed by inference.
-    Config text alone never retargets artifacts.
+        If the run is incomplete, an Optuna trial, or its config disagrees with ``split_indices.pt``.
 
     """
     run_dir = Path(run_dir).expanduser().resolve()
-    admitted = experiments.run.validate_evaluable_run(run_dir)
-    if admitted["config"].get("task") == "transient_drying":
-        transient_plan = transient.transient_artifact_plan_from_completed(
-            admitted,
-            run_dir=run_dir,
-        )
-        return RunArtifactPlan(
-            run_dir=run_dir,
-            id_dataset_name=transient_plan.id_role.dataset_name,
-            additional_evaluation_dataset_name=(None if transient_plan.additional_role is None else transient_plan.additional_role.dataset_name),
-            scientific_run_name=transient_plan.run_name,
-            task="transient_drying",
-        )
-
-    data_cfg = _load_data_config(run_dir)
-    from src import datasets  # noqa: PLC0415
-
-    split_contract = datasets.preprocessing.splits.admit_split_contract(admitted["split_indices"])
-    id_dataset_name = split_contract.id_test.source.dataset_id
-    configured_id_dataset = _required_config_dataset_name(data_cfg, "train_dataset")
-    if configured_id_dataset != id_dataset_name:
-        msg = (
-            "config.yaml data.train_dataset does not match split_indices.pt metadata.\n"
-            f"config:   {configured_id_dataset}\n"
-            f"metadata: {id_dataset_name}"
-        )
-        raise RuntimeError(msg)
-    return RunArtifactPlan(
-        run_dir=run_dir,
-        id_dataset_name=id_dataset_name,
-        additional_evaluation_dataset_name=(
-            None if split_contract.additional_evaluation is None else split_contract.additional_evaluation.source.dataset_id
-        ),
-        scientific_run_name=str(admitted["scientific_run_name"]),
-    )
+    return artifact_plan.artifact_plan_from_completed(experiments.run.validate_evaluable_run(run_dir), run_dir=run_dir)
 
 
 def _artifact_save_root(
@@ -463,68 +390,30 @@ def _indices_sha256(indices: Iterable[int]) -> str:
     return contracts.ordered_indices_sha256(indices)
 
 
-def _validate_bound_dataset_manifests(
-    source_datasets: Sequence[Any],
-    *,
-    dataset_names: Sequence[str],
-    dataset_root: Path,
-) -> None:
-    """Validate each exact current Dataset selection against its saved payload."""
-    from src import datasets  # noqa: PLC0415
-
-    if not source_datasets or len(source_datasets) != len(dataset_names):
-        msg = "Artifact source datasets and names must be non-empty and aligned."
-        raise ValueError(msg)
-    for source_dataset, dataset_name in zip(source_datasets, dataset_names, strict=True):
-        dataset_identity = getattr(source_dataset, "identity", None)
-        if not isinstance(dataset_identity, datasets.contracts.identity.DatasetIdentity):
-            msg = f"Dataset package {dataset_name!r} must expose a verified identity."
-            raise TypeError(msg)
-        source_payload = getattr(source_dataset, "data", None)
-        source_provenance = source_payload.get("source_provenance") if isinstance(source_payload, Mapping) else None
-        if not isinstance(source_provenance, Mapping):
-            msg = f"Dataset package {dataset_name!r} must expose source provenance."
-            raise TypeError(msg)
-        if source_provenance.get("schema_kind") != datasets.packages.DATASET_PACKAGE_SCHEMA_KIND:
-            msg = f"Dataset package {dataset_name!r} lacks a current selection manifest provenance."
-            raise ValueError(msg)
-        datasets.packages.manifest.load_steady_package_manifest(
-            dataset_name,
-            dataset_identity=dataset_identity,
-            dataset_path=source_dataset.path,
-            metadata_root=dataset_root,
-        )
-
-
-def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
+def _build_artifact_request(
     *,
     run_dir: Path,
-    dataset_name: str,
-    split: ArtifactSplit,
+    role: artifact_plan.ArtifactRolePlan,
     device_resolution: DeviceResolution,
-    dataset_root: Path,
 ) -> ArtifactRequest:
     """
     Build and validate the complete semantic request for one artifact cache.
 
     This boundary admits the evaluable run, its exact saved split membership,
-    the source dataset identity, the resolved task/objective, model capacity,
-    normalizer, physics semantics, and runtime device decision. Filesystem
-    locations, mtimes, and byte sizes are intentionally excluded from the
+    the saved source dataset identity, the resolved task/objective, model capacity,
+    normalizer, physics semantics, and runtime device decision. The current sources
+    are opened and checked against that identity by inference when they are generated.
+    Filesystem locations, mtimes, and byte sizes are intentionally excluded from the
     scientific identity so equivalent relocations remain comparable.
 
     Parameters
     ----------
     run_dir : pathlib.Path
         Evaluable run whose immutable evidence owns the artifacts.
-    dataset_name : str
-        Dataset identity expected for the selected split role.
-    split : {"eval", "additional_evaluation"}
-        Saved ID-test or additional evaluation membership to materialize.
+    role : ArtifactRolePlan
+        Saved ID-test or additional-evaluation role to materialize, all sources in split order.
     device_resolution : DeviceResolution
         Already resolved execution-device decision.
-    dataset_root : pathlib.Path
-        Root used only to resolve and validate the source dataset.
 
     Returns
     -------
@@ -540,7 +429,9 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     """
     run_dir = Path(run_dir).expanduser().resolve()
     admitted = experiments.run.validate_evaluable_run(run_dir)
-    raw_split_contract = admitted["split_indices"]
+    if artifact_plan.artifact_plan_from_completed(admitted, run_dir=run_dir).role(role.split) != role:
+        msg = f"Requested {role.split!r} artifact role does not match the saved split of this run."
+        raise RuntimeError(msg)
     run_config = admitted["config"]
     summary = admitted["summary"]
     data_cfg = run_config.get("data")
@@ -577,68 +468,7 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
         normalizer_state,
         output_fields=task.output_names,
     )
-    from src import datasets  # noqa: PLC0415
-
-    train_dataset_name = _required_config_dataset_name(data_cfg, "train_dataset")
-    if split == "eval":
-        source_dataset_names: tuple[str, ...] = (train_dataset_name,)
-    else:
-        components = datasets.runtime.training.additional_evaluation_components(
-            train_dataset_name,
-            tuple(data_cfg["additional_evaluation_datasets"]),
-            storage_root=common.paths.storage_root_for_datasets_root(dataset_root),
-        )
-        source_dataset_names = tuple(dataset_id for dataset_id, _ in components)
-    if not source_dataset_names:
-        msg = "This run has no additional evaluation Datasets."
-        raise RuntimeError(msg)
-    expected_dataset_name = datasets.contracts.identity.combined_dataset_id(source_dataset_names)
-    if expected_dataset_name != dataset_name:
-        msg = f"Requested dataset {dataset_name!r} does not match configured source identity {expected_dataset_name!r}."
-        raise RuntimeError(msg)
-    source_datasets = [
-        datasets.runtime.steady.create_dataset(
-            common.paths.resolve_dataset_path(task.id, source_name, dataset_root=dataset_root),
-            task=task,
-        )
-        for source_name in source_dataset_names
-    ]
-    source_dataset = datasets.preprocessing.splits.combine_identity_datasets(source_datasets)
-    expected_identity = getattr(source_dataset, "identity", None)
-    if not isinstance(expected_identity, datasets.contracts.identity.DatasetIdentity):
-        msg = "Combined artifact source must expose a verified DatasetIdentity."
-        raise TypeError(msg)
-    split_contract = (
-        datasets.preprocessing.splits.admit_split_contract(raw_split_contract, train_identity=expected_identity)
-        if split == "eval"
-        else datasets.preprocessing.splits.admit_split_contract(raw_split_contract, additional_evaluation_identity=expected_identity)
-    )
-    role_evidence = split_contract.id_test if split == "eval" else split_contract.role("additional_evaluation")
-    saved_dataset_name = common.paths.validate_logical_name(
-        role_evidence.source.dataset_id,
-        label=f"split_indices.pt {split} dataset_id",
-    )
-    if saved_dataset_name != dataset_name:
-        msg = f"Requested dataset {dataset_name!r} does not match saved {split!r} dataset {saved_dataset_name!r}."
-        raise RuntimeError(msg)
-
-    full_source_indices = role_evidence.index_values
-    dataset_full_count = role_evidence.full_count
-    if role_evidence.count != len(full_source_indices):
-        msg = f"Saved {split!r} count does not match its admitted ordered membership."
-        raise RuntimeError(msg)
-    if dataset_full_count != expected_identity.sample_count:
-        msg = f"Saved {split!r} full count does not match the verified dataset sample count."
-        raise RuntimeError(msg)
-
-    effective_count = len(full_source_indices)
-    effective_source_indices = full_source_indices
-    effective_case_ids = tuple(expected_identity.sample_ids[index] for index in full_source_indices)
-    _validate_bound_dataset_manifests(
-        source_datasets,
-        dataset_names=source_dataset_names,
-        dataset_root=dataset_root,
-    )
+    source_indices = role.source_indices
     metrics = evaluation_cfg.get("metrics")
     if not isinstance(metrics, list):
         msg = "config.yaml evaluation.metrics must be a list."
@@ -680,6 +510,7 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
     provenance: dict[str, Any] = {
         "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": contracts.ARTIFACT_SCHEMA_VERSION,
+        "producer": contracts.analysis_producer(task.id),
         "run": {
             "name": admitted["scientific_run_name"],
             "task": task.id,
@@ -691,21 +522,15 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
             "selected_checkpoint_role": admitted["selected_checkpoint_role"],
         },
         "model": model_provenance,
-        "split_role": split,
-        "dataset": {
-            "name": dataset_name,
-            "full_case_count": dataset_full_count,
-            "fingerprint": expected_identity.fingerprint,
-            "data_contract_digest": expected_identity.data_contract_digest,
-            "saved_membership_digest": role_evidence.membership_digest,
-        },
+        "split_role": role.split,
+        "dataset": role.dataset_provenance(),
         "selection": {
-            "index_key": "id_test_indices" if split == "eval" else "additional_evaluation_indices",
-            "full_selected_case_count": len(full_source_indices),
-            "effective_case_count": effective_count,
+            "index_key": "id_test_indices" if role.split == "eval" else "additional_evaluation_indices",
+            "full_selected_case_count": len(source_indices),
+            "effective_case_count": len(source_indices),
             "generation_limit": None,
-            "full_ordered_source_indices_sha256": _indices_sha256(full_source_indices),
-            "effective_ordered_source_indices_sha256": _indices_sha256(effective_source_indices),
+            "full_ordered_source_indices_sha256": _indices_sha256(source_indices),
+            "effective_ordered_source_indices_sha256": _indices_sha256(source_indices),
         },
         "normalizer": {
             "sha256": admitted["normalizer_sha256"],
@@ -742,78 +567,27 @@ def _build_artifact_request(  # noqa: C901, PLR0912, PLR0915
             "inference_batch_size": batch_size,
             "compression": "numpy savez_compressed",
         },
-        "runtime": {
-            **device_resolution.as_dict(),
-            "batch_size": batch_size,
-        },
+        "runtime": contracts.runtime_provenance(device_resolution.as_dict(), inference_batch_size=batch_size),
+        "artifact_kind": contracts.STEADY_ARTIFACT_KIND,
     }
     if physics_provenance is not None:
         provenance["physics"] = physics_provenance
     return ArtifactRequest(
         provenance=provenance,
-        source_indices=effective_source_indices,
+        source_indices=source_indices,
         batch_size=batch_size,
-        case_ids=effective_case_ids,
+        case_ids=role.case_ids,
     )
-
-
-def _read_artifact_provenance(path: Path) -> Mapping[str, Any]:
-    """
-    Read one provenance JSON object through the cache-admission exception boundary.
-
-    Filesystem, decoding, and non-object payload failures are normalized to
-    :class:`ArtifactCacheError` because an observed completion marker must be
-    wholly trustworthy before reuse.
-    """
-    try:
-        with path.open(encoding="utf-8") as file:
-            payload = json.load(file)
-    except (OSError, json.JSONDecodeError) as error:
-        msg = f"Artifact provenance is unreadable: {path}: {error}"
-        raise ArtifactCacheError(msg) from error
-    if not isinstance(payload, Mapping):
-        msg = f"Artifact provenance must contain a JSON object: {path}"
-        raise ArtifactCacheError(msg)
-    return payload
-
-
-def _scientific_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the centralized positive evaluation-artifact identity payload."""
-    return contracts.artifact_identity_payload(provenance)
-
-
-def _require_current_provenance_schema(provenance: Mapping[str, Any]) -> None:
-    """Require the exact current artifact and provenance schema versions."""
-    versions = (
-        (
-            "provenance_schema_version",
-            contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        ),
-        ("artifact_schema_version", contracts.ARTIFACT_SCHEMA_VERSION),
-    )
-    for field, expected in versions:
-        value = provenance.get(field)
-        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
-            msg = f"Artifact provenance has an unsupported {field}."
-            raise ArtifactCacheError(msg)
 
 
 def _runtime_identities(request: ArtifactRequest) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return the minimal dataset and model identities bound to timing."""
     run = request.provenance.get("run")
-    dataset = request.provenance.get("dataset")
-    selection = request.provenance.get("selection")
-    if not isinstance(run, Mapping) or not isinstance(dataset, Mapping) or not isinstance(selection, Mapping):
+    if not isinstance(run, Mapping):
         msg = "Artifact request lacks timing identity provenance."
         raise TypeError(msg)
     return (
-        {
-            "name": dataset.get("name"),
-            "fingerprint": dataset.get("fingerprint"),
-            "data_contract_digest": dataset.get("data_contract_digest"),
-            "saved_membership_digest": dataset.get("saved_membership_digest"),
-            "effective_ordered_source_indices_sha256": selection.get("effective_ordered_source_indices_sha256"),
-        },
+        timing.runtime_dataset_identity(request.provenance),
         {
             "run_name": run.get("name"),
             "effective_config_digest": run.get("effective_config_digest"),
@@ -822,49 +596,16 @@ def _runtime_identities(request: ArtifactRequest) -> tuple[dict[str, Any], dict[
     )
 
 
-def _validate_runtime_comparison_request(
-    payload: Mapping[str, Any],
-    *,
-    request: ArtifactRequest,
-) -> dict[str, Any]:
-    """Bind operational timing to the current model and saved membership."""
-    validated = timing.validate_runtime_comparison(payload)
-    dataset_identity, model_identity = _runtime_identities(request)
-    if validated["dataset_identity"] != dataset_identity or validated["model_identity"] != model_identity:
-        msg = "Runtime comparison disagrees with artifact dataset or model identity."
-        raise ArtifactCacheError(msg)
-    if validated["split_role"] != request.provenance.get("split_role"):
-        msg = "Runtime comparison disagrees with the saved split role."
-        raise ArtifactCacheError(msg)
-    if validated["measurement"]["batch_size"] != request.batch_size:
-        msg = "Runtime comparison disagrees with the saved evaluation batch size."
-        raise ArtifactCacheError(msg)
-    if [case["case_id"] for case in validated["cases"]] != list(request.case_ids):
-        msg = "Runtime comparison case IDs disagree with saved membership."
-        raise ArtifactCacheError(msg)
-    if [case["source_index"] for case in validated["cases"]] != list(request.source_indices):
-        msg = "Runtime comparison source indices disagree with saved membership."
-        raise ArtifactCacheError(msg)
-    return validated
-
-
-def _report_runtime_comparison(
-    *,
-    save_root: Path,
-    request: ArtifactRequest,
-) -> None:
-    """Report timing availability without mutating the scientific DataFrame."""
-    try:
-        payload = _validate_runtime_comparison_request(
-            timing.load_runtime_comparison(save_root),
-            request=request,
-        )
-    except (ArtifactCacheError, RuntimeError, TypeError, ValueError) as error:
-        print(f"timing unavailable (scientific artifacts stay valid; --rebuild measures again): {error}")
+def _report_admitted_target(frame: pd.DataFrame) -> None:
+    """Print the warning and timing lines both tasks share for one admitted target."""
+    provenance = frame.attrs["artifact_provenance"]
+    report = provenance[timing.TIMING_KEY]["report"]
+    validity_contract.report_invalid_predictions(provenance["evaluation"]["prediction_validity"])
+    if frame.attrs["artifact_kind"] == "transient_sequence":
+        measured = len(report["cases"])
     else:
-        measured = payload["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"]
-        matched = payload["aggregates"]["comsol_process_to_batch_amortized_forward_ratio"]["count"]
-        print(f"timing validated: {measured} measured, {matched} matched to COMSOL")
+        measured = report["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"]
+    print(f"timing validated: neural-operator runtime measured for {measured} cases")
 
 
 def _cache_has_outputs(*, save_root: Path, parquet_path: Path, npz_dir: Path) -> bool:
@@ -884,19 +625,6 @@ def _cache_has_outputs(*, save_root: Path, parquet_path: Path, npz_dir: Path) ->
             any(npz_dir.glob(".*.tmp")),
         )
     )
-
-
-def _require_identity_values(df: pd.DataFrame, column: str) -> tuple[int, ...]:
-    """Return an integer artifact identity column without coercion."""
-    if column not in df.columns:
-        msg = f"Cached Parquet is missing required identity column {column!r}."
-        raise ArtifactCacheError(msg)
-
-    values = df.loc[:, column].tolist()
-    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in values):
-        msg = f"Cached Parquet column {column!r} must contain only integers."
-        raise ArtifactCacheError(msg)
-    return tuple(int(value) for value in values)
 
 
 def _require_metadata_without_identity(raw_meta: Any, *, label: str) -> dict[str, Any]:
@@ -1047,12 +775,12 @@ def _require_npz_string_vector(value: np.ndarray, *, label: str) -> tuple[str, .
     return tuple(items)
 
 
-def _require_finite_npz_array(value: np.ndarray, *, label: str, rank: int) -> np.ndarray:
-    """Return a numeric finite NPZ array with the required rank."""
+def _require_finite_npz_array(value: np.ndarray, *, label: str, rank: int, finite: bool = True) -> np.ndarray:
+    """Return a numeric NPZ array with the required rank; ``finite=False`` admits a non-finite prediction's values."""
     if value.ndim != rank or not np.issubdtype(value.dtype, np.number) or np.issubdtype(value.dtype, np.bool_):
         msg = f"{label} must be a rank-{rank} numeric array."
         raise ArtifactCacheError(msg)
-    if not np.isfinite(value).all():
+    if finite and not np.isfinite(value).all():
         msg = f"{label} contains non-finite values."
         raise ArtifactCacheError(msg)
     return value
@@ -1065,14 +793,17 @@ def _validate_npz_payload(
     source_index: int,
     split_local_index: int,
     contract: _EvaluatorArtifactContract,
+    prediction_validity: Mapping[str, Any],
 ) -> tuple[dict[str, Any], tuple[str, ...] | None]:
     """
-    Validate one per-case NPZ against its row identity and evaluator contract.
+    Validate one per-case NPZ against its row identity, validity document and evaluator contract.
 
-    Generic tasks require exact input/output field declarations and finite raw,
-    prediction, target, and error tensors. Steady Brinkman tasks additionally
-    require permeability, boundary pressure, coordinates, and residual arrays
-    with the declared grid shape. Object arrays and undeclared keys are rejected.
+    Generic tasks require exact input/output field declarations, finite raw and
+    target tensors, and a stored prediction whose recomputed validity equals the
+    row document. Prediction, error and residual arrays may be non-finite only for
+    a NONFINITE case. Steady Brinkman tasks additionally require permeability,
+    boundary pressure, coordinates, and residual arrays with the declared grid
+    shape. Object arrays and undeclared keys are rejected.
 
     Returns
     -------
@@ -1180,9 +911,10 @@ def _validate_npz_payload(
         msg = f"Cached NPZ declared fields or units do not match evaluator provenance: {path}"
         raise ArtifactCacheError(msg)
 
-    prediction = _require_finite_npz_array(payload["pred"], label=f"Cached NPZ {path} pred", rank=3)
+    finite = prediction_validity["status"] == validity_contract.VALID
+    prediction = _require_finite_npz_array(payload["pred"], label=f"Cached NPZ {path} pred", rank=3, finite=finite)
     target = _require_finite_npz_array(payload["gt"], label=f"Cached NPZ {path} gt", rank=3)
-    error_array = _require_finite_npz_array(payload["err"], label=f"Cached NPZ {path} err", rank=3)
+    error_array = _require_finite_npz_array(payload["err"], label=f"Cached NPZ {path} err", rank=3, finite=finite)
     inputs = _require_finite_npz_array(payload["x_raw"], label=f"Cached NPZ {path} x_raw", rank=3)
     raw_targets = _require_finite_npz_array(payload["y_raw"], label=f"Cached NPZ {path} y_raw", rank=3)
     expected_prediction_channels = len(expected_artifact_fields)
@@ -1192,13 +924,17 @@ def _validate_npz_payload(
     if prediction.shape[0] != expected_prediction_channels:
         msg = f"Cached NPZ prediction channels do not match the task artifact schema: {path}"
         raise ArtifactCacheError(msg)
+    recomputed = validity_contract.build_field_prediction_validity(prediction[: len(contract.output_fields)], channels=contract.output_fields)
+    if recomputed != prediction_validity:
+        msg = f"Cached NPZ prediction contradicts its prediction validity document: {path}"
+        raise ArtifactCacheError(msg)
     if inputs.shape[0] != len(contract.input_fields) or raw_targets.shape[0] != len(contract.output_fields):
         msg = f"Cached NPZ raw tensor channels do not match declared task fields: {path}"
         raise ArtifactCacheError(msg)
     if inputs.shape[1:] != raw_targets.shape[1:] or prediction.shape[1:] != raw_targets.shape[1:]:
         msg = f"Cached NPZ raw and prediction spatial shapes differ: {path}"
         raise ArtifactCacheError(msg)
-    if not np.allclose(error_array, prediction - target, rtol=1e-6, atol=1e-8):
+    if not np.allclose(error_array, prediction - target, rtol=1e-6, atol=1e-8, equal_nan=True):
         msg = f"Cached NPZ err is not pred - gt: {path}"
         raise ArtifactCacheError(msg)
 
@@ -1235,86 +971,17 @@ def _validate_npz_payload(
                 payload[name],
                 label=f"Cached NPZ {path} {name}",
                 rank=2,
+                finite=finite,
             )
             if residual.shape != spatial_shape:
                 msg = f"Cached NPZ {name} shape does not match the task grid: {path}"
                 raise ArtifactCacheError(msg)
-        flux_balance = _require_finite_npz_array(payload["flux_balance"], label=f"Cached NPZ {path} flux_balance", rank=1)
+        flux_balance = _require_finite_npz_array(payload["flux_balance"], label=f"Cached NPZ {path} flux_balance", rank=1, finite=finite)
         if flux_balance.shape != spatial_shape[:1]:
             msg = f"Cached NPZ flux_balance must hold one value per grid row: {path}"
             raise ArtifactCacheError(msg)
 
     return metadata, kappa_names
-
-
-def _require_finite_parquet_columns(df: pd.DataFrame, columns: Iterable[str]) -> None:
-    """Require real, finite scalar metric values in every selected Parquet column."""
-    for column in columns:
-        values = df.loc[:, column].tolist()
-        if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
-            msg = f"Cached Parquet column {column!r} must contain only real numbers."
-            raise ArtifactCacheError(msg)
-        if not np.isfinite(np.asarray(values, dtype=float)).all():
-            msg = f"Cached Parquet column {column!r} contains non-finite values."
-            raise ArtifactCacheError(msg)
-
-
-def _require_optional_inference_times(df: pd.DataFrame) -> None:
-    """Require inference times to be null (CPU) or finite non-negative numbers."""
-    for value in df.loc[:, "inference_time_ms"].tolist():
-        if value is None or (isinstance(value, Real) and np.isnan(float(value))):
-            continue
-        if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(float(value)) or float(value) < 0.0:
-            msg = "Cached Parquet inference_time_ms values must be null or finite non-negative numbers."
-            raise ArtifactCacheError(msg)
-
-
-def _parquet_schema(contract: _EvaluatorArtifactContract) -> tuple[set[str], tuple[str, ...]]:
-    """
-    Derive the closed Parquet schema and numeric validation set for one task.
-
-    Generic tasks receive task-named physical and normalized sufficient evidence,
-    predictive diagnostics, and declared group metrics. The steady-Brinkman
-    contract additionally requires speed, permeability, and dimensionless
-    momentum, flux-balance, and pressure-boundary diagnostics.
-    """
-    common = {
-        "artifact_schema_version",
-        "task_id",
-        "output_fields",
-        "output_units",
-        "case_index",
-        "source_index",
-        "split_local_index",
-        "npz_path",
-        "meta",
-        "inference_time_ms",
-    }
-    physical_columns = tuple(column for field in contract.output_fields for column in contracts.physical_statistic_columns(field))
-    normalized_columns = tuple(column for field in contract.output_fields for column in contracts.normalized_statistic_columns(field))
-    if contract.is_steady_brinkman:
-        metrics: tuple[str, ...] = (
-            "rel_l2",
-            "rel_h1",
-            *physical_columns,
-            *normalized_columns,
-            *contract.group_metric_columns,
-            "physical_rmse_speed_magnitude",
-            "momentum_residual_mse",
-            "flux_balance_mse",
-            "pressure_boundary_mse",
-            "pressure_inlet_mse",
-            "pressure_outlet_mean_square",
-        )
-        return common | set(metrics) | {"kappa_names"}, metrics
-    metrics = (
-        "rel_l2",
-        "rel_h1",
-        *physical_columns,
-        *normalized_columns,
-        *contract.group_metric_columns,
-    )
-    return common | set(metrics), metrics
 
 
 def _require_parquet_string_sequence(value: Any, *, label: str) -> tuple[str, ...]:
@@ -1327,272 +994,82 @@ def _require_parquet_string_sequence(value: Any, *, label: str) -> tuple[str, ..
     return tuple(value)
 
 
-def _load_validated_artifact_cache(  # noqa: C901, PLR0912, PLR0915
-    *,
-    save_root: Path,
-    parquet_path: Path,
-    npz_dir: Path,
-    request: ArtifactRequest,
-) -> pd.DataFrame:
+def _validate_staged_case_payloads(stage: Path, *, request: ArtifactRequest, dataset_name: str) -> None:
     """
-    Load an artifact cache only after validating all persisted evidence.
+    Open every staged steady NPZ once and bind its arrays and metadata to the staged rows.
 
-    Validation covers the provenance schema and scientific request, the digest
-    manifest, the exact Parquet schema and aggregate, ordered saved-split
-    membership, one-to-one NPZ membership, per-case payloads, and metadata
-    agreement between both storage formats. No partial or merely readable cache
-    is accepted as reusable.
-
-    Parameters
-    ----------
-    save_root, parquet_path, npz_dir : pathlib.Path
-        Exact cache root and its staged or published payload locations.
-    request : ArtifactRequest
-        Current semantic identity and ordered source membership.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Validated table annotated with its artifact root and full provenance.
-
-    Raises
-    ------
-    ArtifactCacheError
-        If any provenance, digest, schema, aggregate, identity, membership, or
-        payload invariant is violated.
-
+    This writer-side content check complements the shared role validator, which
+    binds schemas, digests, provenance and membership without opening arrays; the
+    published digests then carry the checked bytes to every later cache hit and read.
     """
-    provenance_path = contracts.artifact_provenance_path(save_root)
-    if not provenance_path.is_file():
-        msg = f"Existing artifact cache has no provenance sidecar: {provenance_path}. Refusing to trust or overwrite invalid/partial artifacts."
-        raise ArtifactCacheError(msg)
-    if not parquet_path.is_file():
-        msg = f"Artifact cache is incomplete (Parquet missing): {parquet_path}"
-        raise ArtifactCacheError(msg)
-
-    stored_provenance = dict(_read_artifact_provenance(provenance_path))
-    _require_current_provenance_schema(stored_provenance)
-    stored_outputs = stored_provenance.pop("outputs", None)
-    stored_aggregate = stored_provenance.pop("aggregate", None)
-    expected_scientific = _scientific_provenance(request.provenance)
-    actual_scientific = _scientific_provenance(stored_provenance)
-    if actual_scientific != expected_scientific:
-        expected_json = json.dumps(expected_scientific, indent=2, sort_keys=True)
-        actual_json = json.dumps(actual_scientific, indent=2, sort_keys=True)
-        msg = (
-            f"Artifact provenance is incompatible: {provenance_path}\n"
-            f"Expected:\n{expected_json}\nActual:\n{actual_json}\n"
-            "Refusing to trust or overwrite the existing cache."
-        )
-        raise ArtifactCacheError(msg)
-
-    try:
-        computed_outputs = contracts.artifact_output_manifest(save_root)
-    except (OSError, RuntimeError) as error:
-        msg = f"Artifact payload digest manifest cannot be recomputed for {save_root}: {error}"
-        raise ArtifactCacheError(msg) from error
-    if stored_outputs != computed_outputs:
-        msg = (
-            f"Artifact payload digest manifest mismatch: {provenance_path}. "
-            "Refusing to trust or overwrite changed, missing, or unexpected payload files."
-        )
-        raise ArtifactCacheError(msg)
-
     contract = _evaluator_artifact_contract(request.provenance)
-    try:
-        df = pd.read_parquet(parquet_path)
-    except Exception as error:
-        msg = f"Cached Parquet is unreadable: {parquet_path}: {error}"
-        raise ArtifactCacheError(msg) from error
-
-    expected_columns, finite_metric_columns = _parquet_schema(contract)
-    actual_columns = list(df.columns)
-    if not df.columns.is_unique or set(actual_columns) != expected_columns:
-        missing = sorted(expected_columns.difference(actual_columns))
-        unexpected = sorted(set(actual_columns).difference(expected_columns))
-        msg = f"Cached Parquet schema mismatch: missing={missing}, unexpected={unexpected}, duplicate_columns={not df.columns.is_unique}."
+    rows = pd.read_parquet(stage / f"{dataset_name}.parquet")
+    if len(rows) != len(request.source_indices):
+        msg = f"Staged Parquet has {len(rows)} rows, but {len(request.source_indices)} were expected."
         raise ArtifactCacheError(msg)
-    _require_finite_parquet_columns(df, finite_metric_columns)
-    _require_optional_inference_times(df)
-    schema_values = _require_identity_values(df, "artifact_schema_version")
-    if schema_values != (contracts.ARTIFACT_SCHEMA_VERSION,) * len(df):
-        msg = "Cached Parquet rows do not declare the current artifact schema version."
-        raise ArtifactCacheError(msg)
-    if tuple(df.loc[:, "task_id"].tolist()) != (contract.task_id,) * len(df):
-        msg = "Cached Parquet task_id values do not match evaluator provenance."
-        raise ArtifactCacheError(msg)
-    for row_position in range(len(df)):
-        row_fields = _require_parquet_string_sequence(
-            df.iloc[row_position].loc["output_fields"],
-            label=f"Cached Parquet row {row_position} output_fields",
-        )
-        row_units = _require_parquet_string_sequence(
-            df.iloc[row_position].loc["output_units"],
-            label=f"Cached Parquet row {row_position} output_units",
-        )
-        if row_fields != contract.output_fields or row_units != contract.output_units:
-            msg = f"Cached Parquet row {row_position} output fields/units do not match evaluator provenance."
-            raise ArtifactCacheError(msg)
-
-    output_groups = [{"id": group_id, "fields": list(fields)} for group_id, fields in contract.output_groups]
-    try:
-        computed_aggregate = contracts.aggregate_normalized_group_macro_rmse(
-            df,
-            output_groups=output_groups,
-            train_standard_deviations=contract.train_standard_deviations,
-            normalization_denominator_floor=contract.normalization_denominator_floor,
-        )
-    except (KeyError, TypeError, ValueError, RuntimeError, FloatingPointError) as error:
-        msg = f"Cached Parquet group-objective evidence is invalid: {error}"
-        raise ArtifactCacheError(msg) from error
-    if stored_aggregate != computed_aggregate:
-        msg = "Artifact aggregate does not match physical Parquet sufficient statistics and saved train scales."
-        raise ArtifactCacheError(msg)
-    evaluator = request.provenance.get("evaluator")
-    objective = evaluator.get("objective") if isinstance(evaluator, Mapping) else None
-    if not isinstance(objective, Mapping):
-        msg = "Artifact evaluator must declare the resolved primary objective."
-        raise ArtifactCacheError(msg)
-    objective_fields = objective.get("fields")
-    resolved_objective_fields = contract.output_fields if objective_fields == "all" else tuple(objective_fields or ())
-    expected_semantics = {
-        "id": computed_aggregate["objective_id"],
-        "kind": computed_aggregate["kind"],
-        "space": computed_aggregate["space"],
-        "reduction": computed_aggregate["reduction"],
-        "direction": computed_aggregate["direction"],
-    }
-    actual_semantics = {key: objective.get(key) for key in expected_semantics}
-    if actual_semantics != expected_semantics or resolved_objective_fields != contract.output_fields:
-        msg = "Artifact aggregate definition contradicts the resolved primary objective."
-        raise ArtifactCacheError(msg)
-
-    expected_source_indices = request.source_indices
-    expected_split_local_indices = tuple(range(len(expected_source_indices)))
-    expected_case_indices = tuple(source_index + 1 for source_index in expected_source_indices)
-    if len(df) != len(expected_source_indices):
-        msg = f"Cached Parquet has {len(df)} rows, but {len(expected_source_indices)} were expected."
-        raise ArtifactCacheError(msg)
-    if _require_identity_values(df, "source_index") != expected_source_indices:
-        msg = "Cached Parquet ordered source_index values do not match the selected saved split."
-        raise ArtifactCacheError(msg)
-    if _require_identity_values(df, "split_local_index") != expected_split_local_indices:
-        msg = "Cached Parquet split_local_index values are not the expected contiguous saved-split order."
-        raise ArtifactCacheError(msg)
-    if _require_identity_values(df, "case_index") != expected_case_indices:
-        msg = "Cached Parquet case_index values do not equal source_index + 1."
-        raise ArtifactCacheError(msg)
-
-    expected_npz_paths = tuple(npz_dir / name for name in dataframe.dataset_case_payload_filenames(request.case_ids))
-    actual_npz_paths = tuple(sorted(npz_dir.glob("*.npz")))
-    if {_normalise_path(path) for path in actual_npz_paths} != {_normalise_path(path) for path in expected_npz_paths}:
-        msg = f"Cached NPZ membership/count does not match the selected split: expected {len(expected_npz_paths)}, found {len(actual_npz_paths)}."
-        raise ArtifactCacheError(msg)
-
-    for row_position, (source_index, split_local_index, case_index, expected_npz_path) in enumerate(
-        zip(
-            expected_source_indices,
-            expected_split_local_indices,
-            expected_case_indices,
-            expected_npz_paths,
-            strict=True,
-        )
-    ):
-        row = df.iloc[row_position]
-        raw_npz_path = row.loc["npz_path"]
-        try:
-            resolved_npz_path = contracts.resolve_case_payload_path(
-                save_root,
-                raw_npz_path,
-                expected_filename=expected_npz_path.name,
-            )
-        except (FileNotFoundError, TypeError, ValueError) as error:
-            msg = f"Cached Parquet npz_path mismatch at row {row_position}: {raw_npz_path!r}: {error}"
-            raise ArtifactCacheError(msg) from error
-        if _normalise_path(resolved_npz_path) != _normalise_path(expected_npz_path):
-            msg = f"Cached Parquet npz_path resolves outside current membership at row {row_position}."
-            raise ArtifactCacheError(msg)
-        parquet_metadata = _require_metadata_without_identity(
-            row.loc["meta"],
-            label=f"Cached Parquet row {row_position}",
-        )
-        npz_metadata, npz_kappa_names = _validate_npz_payload(
-            expected_npz_path,
-            case_index=case_index,
+    names = contracts.dataset_case_payload_filenames(request.case_ids)
+    for position, (source_index, name) in enumerate(zip(request.source_indices, names, strict=True)):
+        row = rows.iloc[position]
+        metadata, kappa_names = _validate_npz_payload(
+            stage / "npz" / name,
+            case_index=source_index + 1,
             source_index=source_index,
-            split_local_index=split_local_index,
+            split_local_index=position,
             contract=contract,
+            prediction_validity=validity_contract.admit_field_prediction_validity(row.loc["prediction_validity"], channels=contract.output_fields),
         )
-        if parquet_metadata != npz_metadata:
-            msg = f"Cached Parquet and NPZ metadata differ at row {row_position}."
+        if _require_metadata_without_identity(row.loc["meta"], label=f"Staged Parquet row {position}") != metadata:
+            msg = f"Staged Parquet and NPZ metadata differ at row {position}."
             raise ArtifactCacheError(msg)
-        if contract.is_steady_brinkman:
-            parquet_kappa_names = _require_parquet_string_sequence(
-                row.loc["kappa_names"],
-                label=f"Cached Parquet row {row_position} kappa_names",
-            )
-            if parquet_kappa_names != npz_kappa_names:
-                msg = f"Cached Parquet and NPZ kappa_names differ at row {row_position}."
-                raise ArtifactCacheError(msg)
-
-    df.loc[:, "npz_path"] = [str(path.resolve()) for path in expected_npz_paths]
-    df.attrs["artifact_root"] = str(save_root.resolve())
-    df.attrs["artifact_provenance"] = {
-        **stored_provenance,
-        "aggregate": stored_aggregate,
-        "outputs": stored_outputs,
-    }
-    return df
+        if contract.is_steady_brinkman and _require_parquet_string_sequence(row.loc["kappa_names"], label=f"Staged row {position}") != kappa_names:
+            msg = f"Staged Parquet and NPZ kappa_names differ at row {position}."
+            raise ArtifactCacheError(msg)
 
 
-def _create_artifact_staging_root(save_root: Path) -> Path:
-    """Create one unique sibling staging directory for a locked target build."""
+def _artifact_stage_root(save_root: Path) -> Path:
+    """Return the one deterministic sibling stage of a target; it survives a failed build for inspection or reuse."""
     save_root.parent.mkdir(parents=True, exist_ok=True)
-    return Path(
-        tempfile.mkdtemp(
-            dir=save_root.parent,
-            prefix=f".{save_root.name}.staging.",
-        )
-    )
+    return contracts.artifact_stage_path(save_root)
 
 
-def _transient_resume_staging_root(save_root: Path) -> Path:
-    """Return the one deterministic sibling retained for resumable transient work."""
-    save_root.parent.mkdir(parents=True, exist_ok=True)
-    return save_root.parent / f".{save_root.name}.transient-resume"
+def _recorded_marker(marker: Path) -> object:
+    """Return one parsed completion marker, or None when it is unreadable, so the freshness guard reports it as malformed."""
+    try:
+        return json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
-def _clear_transient_resume_staging_root(staging_root: Path) -> None:
-    """Remove one exact resumable stage after refusing symbolic indirection."""
-    if staging_root.is_symlink():
-        message = f"Refusing to rebuild through a symbolic transient resume stage: {staging_root}"
+def _clear_artifact_stage(stage: Path) -> None:
+    """Remove one exact stage after refusing symbolic indirection."""
+    if stage.is_symlink():
+        message = f"Refusing to rebuild through a symbolic artifact stage: {stage}"
         raise ValueError(message)
-    if not staging_root.exists():
-        return
-    shutil.rmtree(staging_root)
+    if stage.exists():
+        shutil.rmtree(stage)
 
 
 def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Path) -> None:
     """
-    Atomically publish one validated sibling stage at an exact run-owned target.
+    Publish one validated sibling stage at an exact run-owned target.
 
-    The stage must carry its provenance completion marker. An existing target is
-    first renamed to a unique backup. If publication fails, that backup is moved
-    back before the exception escapes. A successful replacement removes the
+    The stage must carry its provenance completion marker. A new target appears
+    in one atomic rename. An existing target is first renamed to a unique backup,
+    so it is briefly absent but never mixed. If publication fails, that backup is
+    moved back before the exception escapes. A successful replacement removes the
     backup on a best-effort basis.
 
     Raises
     ------
     ValueError
-        If the stage is not the expected uniquely named sibling of the target.
+        If the stage is not the deterministic stage sibling of the target.
     ArtifactCacheError
         If the stage lacks its completion marker.
 
     """
     _analysis_root, target = _validated_artifact_target(run_dir=run_dir, save_root=save_root)
     stage = _normalise_path(staging_root)
-    expected_resume = f".{target.name}.transient-resume"
-    if stage.parent != target.parent or (not stage.name.startswith(f".{target.name}.staging.") and stage.name != expected_resume):
+    if stage != contracts.artifact_stage_path(target):
         msg = f"Artifact staging root is not the expected sibling of the exact target: {stage}"
         raise ValueError(msg)
     if not contracts.artifact_provenance_path(stage).is_file():
@@ -1616,198 +1093,137 @@ def _publish_staged_artifact(*, run_dir: Path, save_root: Path, staging_root: Pa
                 shutil.rmtree(backup)
 
 
-def _transient_progress_reporter(
+def _progress_reporter(
     *,
     completed: Mapping[str, Any],
-    role: transient.TransientArtifactRolePlan,
+    task: str,
+    total_cases: int,
+    split: str,
     device_resolution: DeviceResolution,
     output_root: Path,
 ) -> artifact_performance.ArtifactProgressReporter:
-    """Build one compact reporter from already-admitted runtime metadata."""
+    """Build and start the one progress reporter both tasks share from admitted run metadata."""
     config = completed.get("config")
     training = config.get("training") if isinstance(config, Mapping) else None
-    raw_stage = None
-    if isinstance(training, Mapping):
-        raw_stage = training.get("comparison_arm") or training.get("stage")
-    stage_label = str(raw_stage or "run")
-    run_name = completed.get("scientific_run_name")
+    raw_stage = training.get("comparison_arm") or training.get("stage") if isinstance(training, Mapping) else None
     reporter = artifact_performance.ArtifactProgressReporter(
-        task="transient_drying",
-        run=str(run_name or "transient_run"),
-        stage_label=stage_label,
+        task=task,
+        run=str(completed.get("scientific_run_name") or "run"),
+        stage_label=str(raw_stage or "run"),
         checkpoint_label="best",
         device=device_resolution.device,
-        dtype="float32",
-        total_cases=sum(len(case_ids) for case_ids in role.case_ids_by_source),
-        split=role.dataset_role,
+        dtype=contracts.INFERENCE_PRECISION,
+        total_cases=total_cases,
+        split=split,
         output_root=output_root,
     )
     reporter.startup()
     return reporter
 
 
-def _run_or_load_transient_artifacts_locked(
+def _transient_target_build(
     *,
     run_dir: Path,
-    dataset_name: str,
-    split: ArtifactSplit,
+    completed: Mapping[str, Any],
+    role: artifact_plan.ArtifactRolePlan,
     device_resolution: DeviceResolution,
     dataset_root: Path,
-    rebuild: bool,
     evaluation_spatial_stride: int,
-) -> pd.DataFrame:
-    """Load or atomically generate one completed transient sequence artifact."""
-    from src.analysis.evaluation import (  # noqa: PLC0415
-        evaluation_transient_artifact as sequence_artifact,
+) -> _TargetBuild:
+    """Bind the transient sequence writer, which resumes an incomplete stage case by case."""
+    from src.analysis.evaluation import evaluation_transient_artifact as sequence_artifact  # noqa: PLC0415
+
+    def generate(stage: Path, reporter: artifact_performance.ArtifactProgressReporter) -> None:
+        transient.generate_transient_role_artifact(
+            run_dir=run_dir,
+            role=role,
+            device_resolution=device_resolution,
+            dataset_root=dataset_root,
+            staging_root=stage,
+            completed=completed,
+            evaluation_spatial_stride=evaluation_spatial_stride,
+            progress_reporter=reporter,
+        )
+
+    return _TargetBuild(
+        case_ids=role.case_ids,
+        generate=generate,
+        finish_stage=sequence_artifact.cleanup_transient_resume_metadata,
     )
 
-    completed = experiments.run.validate_completed_run(run_dir)
-    plan = transient.transient_artifact_plan_from_completed(
-        completed,
-        run_dir=run_dir,
-    )
-    if split not in {"eval", "additional_evaluation"}:
-        msg = "Transient artifact split must be eval or additional_evaluation."
-        raise ValueError(msg)
-    role = plan.id_role if split == "eval" else plan.additional_role
-    if role is None:
-        msg = "Completed transient run has no saved additional Evaluation artifact role."
-        raise FileNotFoundError(msg)
-    if role.dataset_name != dataset_name:
-        msg = f"Requested transient dataset {dataset_name!r} does not match saved {split!r} identity {role.dataset_name!r}."
-        raise RuntimeError(msg)
-    save_root = _artifact_save_root(
-        run_dir=run_dir,
-        dataset_name=dataset_name,
-        split=split,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
-    parquet_path = save_root / f"{dataset_name}.parquet"
-    npz_dir = save_root / "npz"
 
-    def admit(root: Path) -> Any:
-        try:
-            return transient.validate_transient_role_artifact_index(
-                root,
-                completed=completed,
-                role=role,
-                evaluation_spatial_stride=evaluation_spatial_stride,
-            )
-        except (
-            FileNotFoundError,
-            OSError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as error:
-            msg = (
-                "Transient artifact cache is incompatible for "
-                f"{run_dir.name}/{split}/{dataset_name}: {type(error).__name__}: {error}. "
-                "Rerun only this exact target with --rebuild."
-            )
-            raise ArtifactCacheError(msg) from error
+def _steady_target_build(
+    *,
+    run_dir: Path,
+    task: domain.tasks.spec.TaskSpec,
+    role: artifact_plan.ArtifactRolePlan,
+    device_resolution: DeviceResolution,
+    dataset_root: Path,
+    save_root: Path,
+) -> _TargetBuild:
+    """Bind the steady writer; batch-amortized timing cannot resume per case, so an incomplete stage restarts whole."""
+    request = _build_artifact_request(run_dir=run_dir, role=role, device_resolution=device_resolution)
+    split = role.split
+    dataset_name = role.dataset_name
 
-    if not rebuild and _cache_has_outputs(
-        save_root=save_root,
-        parquet_path=parquet_path,
-        npz_dir=npz_dir,
-    ):
-        print(f"artifacts for {run_dir.name} | split {split} | dataset {dataset_name}")
-        print(f"      run_dir={run_dir}")
-        print(f"      save_root={save_root}")
-        loaded = admit(save_root)
-        frame = loaded.frame
-        frame.attrs["artifact_root"] = str(save_root.resolve())
-        frame.attrs["artifact_provenance"] = dict(loaded.provenance)
-        frame.attrs["artifact_kind"] = "transient_sequence"
-        frame.attrs["transient_sequence_index"] = loaded
-        frame.attrs["transient_unavailable_horizons"] = loaded.unavailable_horizons
-        frame.attrs["transient_scaling_state"] = deepcopy(completed["normalizer_state"])
-        print(f"[LOAD] {run_dir.name} | {split} | {dataset_name} (validated transient sequence cache)")
-        return frame
+    def generate(stage: Path, reporter: artifact_performance.ArtifactProgressReporter) -> None:
+        from src import learning  # noqa: PLC0415
 
-    if not rebuild and save_root.exists():
-        if save_root.is_symlink() or not save_root.is_dir():
-            message = f"Transient artifact target is unsafe; rerun with --rebuild: {save_root}"
-            raise ArtifactCacheError(message)
-        if any(save_root.iterdir()):
-            message = f"Transient artifact target contains incomplete or conflicting evidence; rerun this exact target with --rebuild: {save_root}"
-            raise ArtifactCacheError(message)
-
-    reporter = _transient_progress_reporter(
-        completed=completed,
-        role=role,
-        device_resolution=device_resolution,
-        output_root=save_root,
-    )
-    staging_root: Path | None = None
-    published: Any | None = None
-    try:
-        staging_root = _transient_resume_staging_root(save_root)
-        if rebuild:
-            _clear_transient_resume_staging_root(staging_root)
-        staged_marker = contracts.artifact_provenance_path(staging_root)
-        if staged_marker.is_file() and not staged_marker.is_symlink():
-            with reporter.phase("finalization"):
-                staged = admit(staging_root)
-                sequence_artifact.cleanup_transient_resume_metadata(staging_root)
-            material_by_case = {summary.case_id: str(summary.identity["material_family"]) for summary in staged.summaries}
-            for case_id in staged.case_ids:
-                reporter.case_reused(
-                    case_id=case_id,
-                    material=material_by_case[case_id],
-                )
-        else:
-            staged = transient.generate_transient_role_artifact(
+        _clear_artifact_stage(stage)
+        timing_cases: list[dict[str, Any]] = []
+        with reporter.phase("model_setup"):
+            model, loader, processor, device = learning.inference.context.load_inference_context_with_resolution(
                 run_dir=run_dir,
-                role=role,
                 device_resolution=device_resolution,
                 dataset_root=dataset_root,
-                staging_root=staging_root,
-                completed=completed,
-                evaluation_spatial_stride=evaluation_spatial_stride,
-                progress_reporter=reporter,
+                split=role.split_role,
+                batch_size=request.batch_size,
             )
-        with reporter.phase("validation"):
-            transient.validate_staged_transient_role_artifact(
-                staged,
-                completed=completed,
-                role=role,
-                evaluation_spatial_stride=evaluation_spatial_stride,
+        try:
+            with reporter.phase("inference"):
+                timing.warm_up_forward(
+                    representative_batch=next(iter(loader)),
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    passes=timing.WARMUP_PASSES,
+                )
+                generation.generate_artifacts(
+                    task=task,
+                    model=model,
+                    loader=loader,
+                    processor=processor,
+                    device=device,
+                    save_root=stage,
+                    publication_root=save_root,
+                    dataset_name=dataset_name,
+                    provenance=request.provenance,
+                    case_ids=request.case_ids,
+                    timing_cases=timing_cases,
+                    progress_reporter=reporter,
+                )
+            dataset_identity, model_identity = _runtime_identities(request)
+            report = timing.build_runtime_comparison(
+                split_role=split,
+                dataset_identity=dataset_identity,
+                model_identity=model_identity,
+                neural_runtime=timing.neural_runtime_metadata(device_metadata=device_resolution.as_dict(), model=model),
+                batch_size=request.batch_size,
+                cases=timing_cases,
+                comsol_timing=None,
+                batch_manifest_sha256=None,
+                unavailable_reason="current Dataset selection has no aggregate simulation timing snapshot",
             )
-        with reporter.phase("publication"):
-            _publish_staged_artifact(
-                run_dir=run_dir,
-                save_root=save_root,
-                staging_root=staging_root,
-            )
-            published = admit(save_root)
-        snapshot = reporter.final_snapshot()
-        sequence_artifact.publish_transient_operational_performance(
-            save_root,
-            snapshot,
-        )
-        reporter.done(snapshot)
-    except BaseException:
-        reporter.failure(phase="preflight" if staging_root is None else None)
-        raise
-    finally:
-        # A deterministic transient resume stage is intentionally retained on failure.
-        # Successful publication moves it into the exact target, so no cleanup is needed.
-        cleanup_runtime(device_resolution.device)
-    if published is None:
-        message = "Transient artifact publication did not complete."
-        raise RuntimeError(message)
-    frame = published.frame
-    with contracts.artifact_provenance_path(save_root).open("r", encoding="utf-8") as handle:
-        final_provenance = json.load(handle)
-    frame.attrs["artifact_root"] = str(save_root.resolve())
-    frame.attrs["artifact_provenance"] = final_provenance
-    frame.attrs["artifact_kind"] = "transient_sequence"
-    frame.attrs["transient_sequence_index"] = published
-    frame.attrs["transient_unavailable_horizons"] = published.unavailable_horizons
-    frame.attrs["transient_scaling_state"] = deepcopy(completed["normalizer_state"])
-    return frame
+        finally:
+            del model, loader, processor
+            cleanup_runtime(device)
+        timing.write_stage_timing(stage, {"report": report})
+
+    return _TargetBuild(
+        case_ids=request.case_ids,
+        generate=generate,
+        finish_stage=lambda stage: _validate_staged_case_payloads(stage, request=request, dataset_name=dataset_name),
+    )
 
 
 def _run_or_load_artifacts_locked(
@@ -1855,148 +1271,130 @@ def _run_or_load_artifacts_locked(
     -----
     - Artifacts cached in analysis/id or analysis/additional_evaluation/<dataset_name>/.
     - ID and additional evaluation always use saved split membership.
-    - Missing, incompatible or partial cache provenance fails loudly and is never overwritten.
-    - Inference and generation failures propagate to the caller.
+    - One validator (``evaluation_artifact_loader.admit_role_artifact``) admits the stage, a cache hit and the published target.
+    - The deterministic stage ``.<target>.stage`` survives a failure; a complete stage is reused only after admission,
+      an incomplete one resumes per case (transient) or restarts whole (steady).
+    - The timing block is written into the stage before validation, so a timing failure publishes nothing.
 
     """
+    from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
+
     dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
-    task = experiments.config.loader.validate_resolved_task_contract(_load_run_config(run_dir))
-    if task.id == "transient_drying":
-        if split not in {"eval", "additional_evaluation"}:
-            msg = "Transient artifact split must be eval or additional_evaluation."
-            raise ValueError(msg)
-        return _run_or_load_transient_artifacts_locked(
-            run_dir=run_dir,
-            dataset_name=dataset_name,
-            split=split,
-            device_resolution=device_resolution,
-            dataset_root=dataset_root,
-            rebuild=rebuild,
-            evaluation_spatial_stride=evaluation_spatial_stride,
-        )
     if split not in {"eval", "additional_evaluation"}:
-        msg = "Steady artifact split must be eval or additional_evaluation."
+        msg = "Artifact split must be eval or additional_evaluation."
         raise ValueError(msg)
-    if evaluation_spatial_stride != 1:
+    completed = experiments.run.validate_completed_run(run_dir)
+    task = experiments.config.loader.validate_resolved_task_contract(completed["config"])
+    if task.id != "transient_drying" and evaluation_spatial_stride != 1:
         msg = "Non-unit --evaluation-spatial-stride is supported only for transient_drying artifacts."
         raise ValueError(msg)
-
-    save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split)
-    npz_dir = save_root / "npz"
-    parquet_path = save_root / f"{dataset_name}.parquet"
-
-    request = _build_artifact_request(
-        run_dir=run_dir,
-        dataset_name=dataset_name,
-        split=split,
-        device_resolution=device_resolution,
-        dataset_root=dataset_root,
-    )
-    print(f"artifacts for {run_dir.name} | split {split} | dataset {dataset_name}")
+    plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_dir)
+    role = plan.role(split)
+    if role.dataset_name != dataset_name:
+        msg = f"Requested dataset {dataset_name!r} does not match the saved {split!r} artifact Dataset {role.dataset_name!r}."
+        raise RuntimeError(msg)
+    save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split, evaluation_spatial_stride=evaluation_spatial_stride)
+    label = artifact_performance.split_label(split)
+    print(f"artifacts for {run_dir.name} | {label} | dataset {dataset_name}")
     print(f"      run_dir={run_dir}")
     print(f"      save_root={save_root}")
 
-    if not rebuild and _cache_has_outputs(save_root=save_root, parquet_path=parquet_path, npz_dir=npz_dir):
-        print(f"[VALIDATE] {run_dir.name} | {split} | {dataset_name} (existing cache)")
-        df = _load_validated_artifact_cache(
-            save_root=save_root,
-            parquet_path=parquet_path,
-            npz_dir=npz_dir,
-            request=request,
+    def admit(root: Path) -> pd.DataFrame:
+        try:
+            return artifact_loader.admit_role_artifact(
+                run_dir,
+                completed,
+                selection_role="id" if split == "eval" else "additional_evaluation",
+                root=root,
+                evaluation_spatial_stride=evaluation_spatial_stride,
+            ).frame
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+            msg = (
+                f"Artifact cache is incompatible for {run_dir.name}/{split}/{dataset_name}: {type(error).__name__}: {error}. "
+                "Rerun only this exact target with --rebuild."
+            )
+            raise ArtifactCacheError(msg) from error
+
+    unit = f"{run_dir.name}/{split}/{dataset_name}"
+    if not rebuild and _cache_has_outputs(save_root=save_root, parquet_path=save_root / f"{dataset_name}.parquet", npz_dir=save_root / "npz"):
+        print(f"[VALIDATE] {run_dir.name} | {label} | {dataset_name} (existing cache)")
+        frame = admit(save_root)
+        # Admission validated the recorded producer as evidence; only this requested result is compared with the running code.
+        contracts.require_current_analysis(frame.attrs.get("artifact_provenance"), task_id=task.id, unit=f"Artifact {unit}")
+        print(f"[LOAD] {run_dir.name} | {label} | {dataset_name} (validated cache)")
+        _report_admitted_target(frame)
+        return frame
+    if not rebuild and save_root.exists() and (save_root.is_symlink() or not save_root.is_dir()):
+        msg = f"Artifact target is unsafe; rerun only this exact target with --rebuild: {save_root}"
+        raise ArtifactCacheError(msg)
+    # Generating beside a published role of other analysis code would leave the run with two producers; --rebuild replaces them all.
+    if not rebuild and (
+        sibling := _sibling_from_other_analysis(
+            run_dir=run_dir, plan=plan, task_id=task.id, split=split, evaluation_spatial_stride=evaluation_spatial_stride
         )
-        _report_runtime_comparison(save_root=save_root, request=request)
-        print(f"[LOAD] {run_dir.name} | {split} | {dataset_name} (validated scientific cache)")
-        return df
+    ):
+        msg = (
+            f"Artifact {unit} would leave {run_dir.name} with two analysis producers: its published {sibling} artifact "
+            "comes from other analysis code; rebuild the run's artifacts with --rebuild."
+        )
+        raise ArtifactCacheError(msg)
+    stage_marker = contracts.artifact_provenance_path(contracts.artifact_stage_path(save_root))
+    if not rebuild and stage_marker.is_file():
+        # A complete stage would be published as this requested result, so it must come from the running analysis code.
+        contracts.require_current_analysis(_recorded_marker(stage_marker), task_id=task.id, unit=f"Artifact stage {unit}")
 
-    staging_root = _create_artifact_staging_root(save_root)
-    staging_npz_dir = staging_root / "npz"
-    staging_parquet_path = staging_root / f"{dataset_name}.parquet"
-    timing_cases: list[dict[str, Any]] = []
-    timing_enabled = True
-    try:
-        from src import learning  # noqa: PLC0415
-
-        model, loader, processor, device = learning.inference.context.load_inference_context_with_resolution(
+    build = (
+        _transient_target_build(
             run_dir=run_dir,
+            completed=completed,
+            role=role,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
-            split="id_test" if split == "eval" else "additional_evaluation",
-            batch_size=request.batch_size,
+            evaluation_spatial_stride=evaluation_spatial_stride,
         )
-        try:
-            if timing_enabled:
-                try:
-                    representative_batch = next(iter(loader))
-                    timing.warm_up_forward(
-                        representative_batch=representative_batch,
-                        model=model,
-                        processor=processor,
-                        device=device,
-                        passes=timing.WARMUP_PASSES,
-                    )
-                except (KeyError, OSError, RuntimeError, StopIteration, TypeError, ValueError) as error:
-                    timing_enabled = False
-                    print(f"timing warmup unavailable (generation continues): {error}")
-            generation.generate_artifacts(
-                task=task,
-                model=model,
-                loader=loader,
-                processor=processor,
-                device=device,
-                save_root=staging_root,
-                publication_root=save_root,
-                dataset_name=dataset_name,
-                provenance=request.provenance,
-                case_ids=request.case_ids,
-                timing_cases=timing_cases if timing_enabled else None,
-            )
-            if timing_enabled:
-                try:
-                    dataset_identity, model_identity = _runtime_identities(request)
-                    comparison = timing.build_runtime_comparison(
-                        split_role=split,
-                        dataset_identity=dataset_identity,
-                        model_identity=model_identity,
-                        neural_runtime=timing.neural_runtime_metadata(
-                            device_metadata=device_resolution.as_dict(),
-                            model=model,
-                        ),
-                        batch_size=request.batch_size,
-                        cases=timing_cases,
-                        comsol_timing=None,
-                        batch_manifest_sha256=None,
-                        unavailable_reason="current Dataset selection has no aggregate simulation timing snapshot",
-                    )
-                    timing.write_runtime_comparison(staging_root, comparison)
-                except (ArtifactCacheError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-                    print(f"timing record not published (generation continues): {error}")
-        finally:
-            del model, loader, processor
-            cleanup_runtime(device)
-
-        _load_validated_artifact_cache(
-            save_root=staging_root,
-            parquet_path=staging_parquet_path,
-            npz_dir=staging_npz_dir,
-            request=request,
-        )
-        _publish_staged_artifact(
+        if task.id == "transient_drying"
+        else _steady_target_build(
             run_dir=run_dir,
+            task=task,
+            role=role,
+            device_resolution=device_resolution,
+            dataset_root=dataset_root,
             save_root=save_root,
-            staging_root=staging_root,
         )
-    finally:
-        if staging_root.exists():
-            shutil.rmtree(staging_root)
-
-    result = _load_validated_artifact_cache(
-        save_root=save_root,
-        parquet_path=parquet_path,
-        npz_dir=npz_dir,
-        request=request,
     )
-    _report_runtime_comparison(save_root=save_root, request=request)
-    return result
+    reporter = _progress_reporter(
+        completed=completed,
+        task=task.id,
+        total_cases=len(build.case_ids),
+        split=split,
+        device_resolution=device_resolution,
+        output_root=save_root,
+    )
+    stage = _artifact_stage_root(save_root)
+    try:
+        if rebuild:
+            _clear_artifact_stage(stage)
+        if contracts.artifact_provenance_path(stage).is_file():
+            with reporter.phase("finalization"):
+                for case_id in build.case_ids:
+                    reporter.case_reused(case_id=case_id, material=case_id.split("__", 1)[0])
+        else:
+            build.generate(stage, reporter)
+        timing.write_stage_timing(stage, {"operational_performance": reporter.final_snapshot()})
+        with reporter.phase("validation"):
+            build.finish_stage(stage)
+            admit(stage)
+        with reporter.phase("publication"):
+            _publish_staged_artifact(run_dir=run_dir, save_root=save_root, staging_root=stage)
+            frame = admit(save_root)
+        reporter.done()
+    except BaseException:
+        reporter.failure()
+        raise
+    finally:
+        cleanup_runtime(device_resolution.device)
+    _report_admitted_target(frame)
+    return frame
 
 
 def validate_artifact_upload_source(
@@ -2040,79 +1438,33 @@ def validate_artifact_upload_source(
     if _normalise_path(validated_target) != _normalise_path(root):
         msg = f"Artifact upload target does not resolve to the explicit artifact root: {root}"
         raise ArtifactCacheError(msg)
+    from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
+
     completed = experiments.run.validate_completed_run(run_path)
-    config = completed["config"]
-    task = experiments.config.loader.validate_resolved_task_contract(config)
-    if task.id == "transient_drying":
-        plan = transient.transient_artifact_plan_from_completed(
-            completed,
-            run_dir=run_path,
-        )
-        analysis_root = common.paths.resolve_analysis_root(run_path).resolve()
-        id_stride = _artifact_target_stride(
-            root,
-            analysis_root=analysis_root,
-            split="eval",
-            dataset_name=plan.id_role.dataset_name,
-        )
-        additional_stride = (
-            None
-            if plan.additional_role is None
-            else _artifact_target_stride(
-                root,
-                analysis_root=analysis_root,
-                split="additional_evaluation",
-                dataset_name=plan.additional_role.dataset_name,
-            )
-        )
-        if id_stride is not None:
-            role = plan.id_role
-            evaluation_spatial_stride = id_stride
-        elif plan.additional_role is not None and additional_stride is not None:
-            role = plan.additional_role
-            evaluation_spatial_stride = additional_stride
-        else:
-            msg = "Transient artifact upload target does not match a saved Evaluation-grid role."
-            raise ArtifactCacheError(msg)
-        try:
-            loaded = transient.validate_transient_role_artifact(
-                root,
-                completed=completed,
-                role=role,
-                evaluation_spatial_stride=evaluation_spatial_stride,
-            )
-        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
-            msg = f"Transient artifact upload source is incompatible: {type(error).__name__}: {error}"
-            raise ArtifactCacheError(msg) from error
-        return loaded.provenance
-
-    provenance_path = contracts.artifact_provenance_path(root)
-    provenance = dict(_read_artifact_provenance(provenance_path))
-    _require_current_provenance_schema(provenance)
-    stored_outputs = provenance.get("outputs")
-    try:
-        computed_outputs = contracts.artifact_output_manifest(root)
-    except (OSError, RuntimeError) as error:
-        msg = f"Artifact upload source payload manifest cannot be recomputed: {root}: {error}"
-        raise ArtifactCacheError(msg) from error
-    if stored_outputs != computed_outputs:
-        msg = f"Artifact upload source payload manifest mismatch: {provenance_path}"
-        raise ArtifactCacheError(msg)
-
-    summary = completed["summary"]
-    run_identity = provenance.get("run")
-    expected_identity = {
-        "name": config["run"]["name"],
-        "task": task.id,
-        "task_contract_digest": task.contract_digest,
-        "effective_config_digest": summary["effective_config_digest"],
-        "best_checkpoint_sha256": summary["best_checkpoint_sha256"],
-        "normalizer_sha256": summary["normalizer_sha256"],
+    plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_path)
+    analysis_root = common.paths.resolve_analysis_root(run_path).resolve()
+    strides = {
+        role.split: _artifact_target_stride(root, analysis_root=analysis_root, split=role.split, dataset_name=role.dataset_name)
+        for role in (plan.id_role, plan.additional_role)
+        if role is not None
     }
-    if not isinstance(run_identity, Mapping) or {key: run_identity.get(key) for key in expected_identity} != expected_identity:
-        msg = "Artifact upload source is not current for the authoritative completed run."
+    matched = [(split, stride) for split, stride in strides.items() if stride is not None]
+    if not matched:
+        msg = "Artifact upload target does not match a saved Evaluation-grid role."
         raise ArtifactCacheError(msg)
-    return provenance
+    split, stride = matched[0]
+    try:
+        loaded = artifact_loader.admit_role_artifact(
+            run_path,
+            completed,
+            selection_role="id" if split == "eval" else "additional_evaluation",
+            root=root,
+            evaluation_spatial_stride=stride,
+        )
+    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+        msg = f"Artifact upload source is incompatible: {type(error).__name__}: {error}"
+        raise ArtifactCacheError(msg) from error
+    return cast("Mapping[str, Any]", loaded.frame.attrs["artifact_provenance"])
 
 
 def run_or_load_artifacts(
@@ -2149,7 +1501,8 @@ def run_or_load_artifacts(
     Returns
     -------
     pandas.DataFrame
-        Strict current artifact table carrying validated provenance attrs.
+        The role frame admitted by the shared role validator, as
+        ``load_run_artifacts`` returns it, with validated provenance attrs.
 
     Raises
     ------
@@ -2163,9 +1516,12 @@ def run_or_load_artifacts(
 
     Notes
     -----
-    Both the run writer lease and target-specific lock serialize publication.
-    Rebuilds generate and validate a sibling stage before replacing the target.
-    Provenance remains the final completion marker.
+    The shared run reader lease excludes lifecycle writers; one run-wide artifact
+    lock serializes the builds of one run, and the target-specific lock marks the
+    target's active writer for run inspection. Rebuilds generate and validate a sibling stage before replacing the target.
+    Provenance remains the final completion marker. Without ``rebuild``, a target
+    is not generated beside the run's other published role when that role
+    records other analysis code, so one run never gains a second producer.
 
     """
     logical_dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
@@ -2181,6 +1537,8 @@ def run_or_load_artifacts(
     lock_path = _artifact_lock_path(run_dir=run_dir, save_root=save_root)
     with (
         experiments.run.run_reader_lease(run_dir),
+        # Builds of one run are serialized, so the sibling producer check still holds when this target is published.
+        common.locking.exclusive_file_lock(common.paths.resolve_artifact_lock_path(common.paths.resolve_analysis_root(run_dir)), blocking=True),
         common.locking.exclusive_file_lock(lock_path, blocking=True),
     ):
         current_completion = _completion_marker_identity(completion_path)
@@ -2196,43 +1554,41 @@ def run_or_load_artifacts(
         )
 
 
-def _transient_wandb_publication_evidence(
+def _validated_upload_roots(
     *,
-    plan: RunArtifactPlan,
+    plan: artifact_plan.ArtifactPlan,
     id_frame: pd.DataFrame,
     additional_frame: pd.DataFrame | None,
-    evaluation_spatial_stride: int = 1,
-) -> dict[str, bool | float | int | str]:
-    """Validate every transient role before reducing bounded W&B evidence."""
-    if (plan.additional_evaluation_dataset_name is None) is not (additional_frame is None):
-        msg = "Transient W&B publication requires matching saved additional Evaluation identity and frame availability."
+    evaluation_spatial_stride: int,
+) -> dict[ArtifactSplit, Path]:
+    """Validate every published role and bind its frame before any observer starts."""
+    if (plan.additional_role is None) is not (additional_frame is None):
+        msg = "W&B publication requires matching saved additional Evaluation identity and frame availability."
         raise ArtifactCacheError(msg)
-    role_specs: list[tuple[str, ArtifactSplit, str, pd.DataFrame]] = [
-        ("id", "eval", plan.id_dataset_name, id_frame),
-    ]
-    if plan.additional_evaluation_dataset_name is not None and additional_frame is not None:
-        role_specs.append(("additional_evaluation", "additional_evaluation", plan.additional_evaluation_dataset_name, additional_frame))
-
-    frames: dict[str, pd.DataFrame] = {}
-    for role, split, dataset_name, frame in role_specs:
-        artifact_root = _artifact_save_root(
+    role_specs: list[tuple[ArtifactSplit, str, pd.DataFrame]] = [("eval", plan.id_role.dataset_name, id_frame)]
+    if plan.additional_role is not None and additional_frame is not None:
+        role_specs.append(("additional_evaluation", plan.additional_role.dataset_name, additional_frame))
+    roots: dict[ArtifactSplit, Path] = {}
+    for split, dataset_name, frame in role_specs:
+        root = _artifact_save_root(
             run_dir=plan.run_dir,
             dataset_name=dataset_name,
             split=split,
             evaluation_spatial_stride=evaluation_spatial_stride,
         )
-        validated = validate_artifact_upload_source(
-            run_dir=plan.run_dir,
-            artifact_root=artifact_root,
-        )
+        validated = validate_artifact_upload_source(run_dir=plan.run_dir, artifact_root=root)
         frame_provenance = frame.attrs.get("artifact_provenance")
         if not isinstance(frame_provenance, Mapping) or common.serialization.canonical_json_sha256(
             frame_provenance
         ) != common.serialization.canonical_json_sha256(validated):
-            msg = f"Transient {role.upper()} frame provenance is not the validated upload source."
+            msg = f"The {split} frame provenance is not the validated upload source."
             raise ArtifactCacheError(msg)
-        frames[role] = frame
+        roots[split] = root
+    return roots
 
+
+def _transient_wandb_summary(frames: Mapping[str, pd.DataFrame]) -> dict[str, bool | float | int | str]:
+    """Reduce validated transient role frames to the bounded W&B summary."""
     from src.analysis.evaluation import transient_session  # noqa: PLC0415
 
     evaluation = transient_session.TransientEvaluationSession(frames)
@@ -2242,15 +1598,54 @@ def _transient_wandb_publication_evidence(
         evaluation.close()
 
 
+def _steady_wandb_summary(frames: Mapping[str, pd.DataFrame]) -> dict[str, bool | float | int | str]:
+    """
+    Reduce validated steady role frames to the bounded W&B summary structure both tasks share.
+
+    Per role it carries case validity and the objective's finite-support counts; the objective and
+    per-field RMSE appear only when available, so a missing value never reads as zero. Identity and
+    timing keys follow the transient publication vocabulary.
+    """
+    provenances = {role: frame.attrs["artifact_provenance"] for role, frame in frames.items()}
+    reports = [provenance[timing.TIMING_KEY]["report"] for provenance in provenances.values()]
+    run = provenances["id"]["run"]
+    forward = [case["batch_amortized_neural_operator_forward_s"] for report in reports for case in report["cases"]]
+    component = "evaluation/timing/component/batch_amortized_neural_operator_forward_seconds"
+    values: dict[str, bool | float | int | str] = {
+        "evaluation/identity/checkpoint_sha256": run["best_checkpoint_sha256"],
+        "evaluation/identity/checkpoint_epoch": run["best_checkpoint_epoch"],
+        "evaluation/identity/model_kind": provenances["id"]["model"]["kind"],
+        "evaluation/identity/dataset_sha256": common.serialization.canonical_json_sha256({role: p["dataset"] for role, p in provenances.items()}),
+        "evaluation/timing/device": "|".join(sorted({report["neural_runtime"]["resolved_device"] for report in reports})),
+        "evaluation/timing/precision": "|".join(sorted({report["neural_runtime"]["inference_dtype"] for report in reports})),
+        "evaluation/timing/warmup_passes": reports[0]["measurement"]["warmup_passes"],
+        "evaluation/timing/hardware_identity_sha256": common.serialization.canonical_json_sha256([report["neural_runtime"] for report in reports]),
+        f"{component}/available_count": len(forward),
+        f"{component}/median_seconds": float(np.median(forward)),
+    }
+    for role, provenance in provenances.items():
+        aggregate, counts = provenance["aggregate"], provenance["evaluation"]["prediction_validity"]["status_counts"]
+        values[f"evaluation/identity/dataset/{role}/name"] = provenance["dataset"]["name"]
+        values[f"evaluation/{role}/valid_case_count"] = counts[validity_contract.VALID]
+        values[f"evaluation/{role}/nonfinite_case_count"] = counts[validity_contract.NONFINITE]
+        values.update({f"evaluation/{role}/{name}": aggregate[name] for name in validity_contract.SUPPORT_COUNT_FIELDS})
+        if aggregate["available"]:
+            values[f"evaluation/{role}/normalized_group_macro_rmse"] = aggregate["value"]
+            for field, statistics in aggregate["field_statistics"].items():
+                values[f"evaluation/{role}/normalized_rmse_{field}"] = statistics["normalized_rmse"]
+                values[f"evaluation/{role}/physical_rmse_{field}"] = statistics["physical_rmse"]
+    return values
+
+
 def _upload_published_artifacts(
     *,
-    plan: RunArtifactPlan,
+    plan: artifact_plan.ArtifactPlan,
     device_resolution: DeviceResolution,
     id_frame: pd.DataFrame,
     additional_frame: pd.DataFrame | None = None,
     evaluation_spatial_stride: int = 1,
 ) -> None:
-    """Publish only configured steady media or bounded transient summaries."""
+    """Publish both tasks' provenance files and bounded Evaluation summary, then steady curated media."""
     config = _load_run_config(plan.run_dir)
     settings = config.get("tracking", {}).get("wandb")
     if not isinstance(settings, Mapping):
@@ -2261,17 +1656,15 @@ def _upload_published_artifacts(
         return
 
     task = experiments.config.loader.validate_resolved_task_contract(config)
-    transient_evidence: dict[str, bool | float | int | str] | None = None
-    if (plan.additional_evaluation_dataset_name is None) is not (additional_frame is None):
-        msg = "W&B publication requires matching saved additional Evaluation identity and frame availability."
-        raise ArtifactCacheError(msg)
-    if task.id == "transient_drying":
-        transient_evidence = _transient_wandb_publication_evidence(
-            plan=plan,
-            id_frame=id_frame,
-            additional_frame=additional_frame,
-            evaluation_spatial_stride=evaluation_spatial_stride,
-        )
+    artifact_roots = _validated_upload_roots(
+        plan=plan,
+        id_frame=id_frame,
+        additional_frame=additional_frame,
+        evaluation_spatial_stride=evaluation_spatial_stride,
+    )
+    is_transient = task.id == "transient_drying"
+    frames = {"id": id_frame} if additional_frame is None else {"id": id_frame, "additional_evaluation": additional_frame}
+    evidence = (_transient_wandb_summary if is_transient else _steady_wandb_summary)(frames)
 
     started_at = datetime.now(UTC)
     runtime_session_id = uuid4().hex
@@ -2300,41 +1693,21 @@ def _upload_published_artifacts(
         resume=True,
         persisted_run_id=persisted_run_id,
         previous_last_logged_epoch=last_logged_epoch,
+        previous_evaluation_summary_keys=experiments.tracking.persisted_evaluation_summary_keys(summary),
         state_updater=state_updater,
     )
     upload_error: BaseException | None = None
     try:
-        if transient_evidence is not None:
-            session.log_transient_evaluation_summary(transient_evidence)
-        else:
-            artifact_specs: list[tuple[ArtifactSplit, str]] = [("eval", plan.id_dataset_name)]
-            if plan.additional_evaluation_dataset_name is not None:
-                artifact_specs.append(("additional_evaluation", plan.additional_evaluation_dataset_name))
-            artifact_roots = {
-                split: _artifact_save_root(
-                    run_dir=plan.run_dir,
-                    dataset_name=dataset_name,
-                    split=split,
-                )
-                for split, dataset_name in artifact_specs
-            }
-            for artifact_root in artifact_roots.values():
-                validate_artifact_upload_source(
-                    run_dir=plan.run_dir,
-                    artifact_root=artifact_root,
-                )
-                session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
-
-            from src.analysis.evaluation import evaluation_dataframe  # noqa: PLC0415
+        for artifact_root in artifact_roots.values():
+            session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
+        session.log_evaluation_summary(evidence)
+        if not is_transient:
             from src.analysis.presentation import curated  # noqa: PLC0415
 
+            # Admitted role frames are already the evaluation frames the loader returns.
             datasets_eval = {
-                f"{plan.run_dir.name} ID": evaluation_dataframe.build_eval_df(id_frame),
-                **(
-                    {}
-                    if additional_frame is None
-                    else {f"{plan.run_dir.name} additional evaluation": evaluation_dataframe.build_eval_df(additional_frame)}
-                ),
+                f"{plan.run_dir.name} ID": id_frame,
+                **({} if additional_frame is None else {f"{plan.run_dir.name} additional evaluation": additional_frame}),
             }
             with tempfile.TemporaryDirectory(prefix="grainlegumes-curated-analysis-") as temporary_directory:
                 bundle = curated.render_curated_analysis(
@@ -2409,6 +1782,16 @@ class PreparedRunArtifacts:
     artifact_device: str | None
 
 
+def invalid_prediction_note(*runs: PreparedRunArtifacts) -> str | None:
+    """Return ``valid V of N`` over the selected roles of ``runs`` when any prediction is invalid, else ``None``."""
+    return validity_contract.invalid_prediction_note(
+        artifact.frame.attrs["artifact_provenance"]
+        for run in runs
+        for artifact in (run.loaded_run.id_artifact, run.loaded_run.additional_artifact)
+        if artifact is not None
+    )
+
+
 def load_or_build_run_artifacts(
     run_dir: Path | str,
     *,
@@ -2427,8 +1810,13 @@ def load_or_build_run_artifacts(
     any model reconstruction. Missing roles use ``device_resolution`` unchanged
     when supplied; otherwise the explicit device policy is resolved once. Partial,
     corrupt, stale, or incompatible roles fail unless ``rebuild_incompatible``
-    deliberately authorizes exact-target replacement. This service never uploads
-    to W&B or changes lifecycle status.
+    deliberately authorizes exact-target replacement. Existing roles are read as
+    historical evidence, but the selected roles of one run must share one analysis
+    producer: when they disagree, or when a missing role would be generated beside
+    a role of other analysis code, that role is rebuilt first under
+    ``rebuild_incompatible`` and the preparation is refused before any build
+    otherwise. This service
+    never uploads to W&B or changes lifecycle status.
     """
     from src import learning  # noqa: PLC0415
     from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
@@ -2456,13 +1844,13 @@ def load_or_build_run_artifacts(
     plan = load_run_artifact_plan(path)
     allowed_roles = {"id", "additional_evaluation"}
     default_roles: tuple[Literal["id", "additional_evaluation"], ...] = (
-        ("id", "additional_evaluation") if plan.additional_evaluation_dataset_name is not None else ("id",)
+        ("id", "additional_evaluation") if plan.additional_role is not None else ("id",)
     )
     roles: tuple[Literal["id", "additional_evaluation"], ...] = artifact_roles if artifact_roles is not None else default_roles
     if not roles or len(set(roles)) != len(roles) or set(roles).difference(allowed_roles):
         msg = f"artifact_roles must contain unique values from {sorted(allowed_roles)}."
         raise ValueError(msg)
-    if "additional_evaluation" in roles and plan.additional_evaluation_dataset_name is None:
+    if "additional_evaluation" in roles and plan.additional_role is None:
         msg = "Completed run has no saved additional Evaluation artifact role."
         raise ValueError(msg)
     overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
@@ -2494,25 +1882,38 @@ def load_or_build_run_artifacts(
     for _attempt in range(len(roles) + 1):
         try:
             loaded = artifact_loader.load_run_artifacts(path, artifact_roles=roles)
-            for role in roles:
-                actions.setdefault(role, "reused")
-            return PreparedRunArtifacts(
-                loaded_run=loaded,
-                role_actions=actions,
-                artifact_device=(str(resolution.device) if resolution is not None else None),
-            )
         except artifact_loader.MissingEvaluationArtifactsError as error:
             split_role = getattr(error, "role", None)
             selected_role = "id" if split_role == "eval" else split_role if split_role == "additional_evaluation" else None
-            if not auto_build_missing or selected_role not in roles:
+            if not auto_build_missing or selected_role is None or selected_role not in roles:
                 raise
             rebuild = False
             action = "generated"
+            older = _older_sibling_to_rebuild(
+                path=path, plan=plan, split=split_by_role[selected_role], roles=roles, rebuild_incompatible=rebuild_incompatible
+            )
+            if older is not None:
+                selected_role, rebuild, action = older, True, "rebuilt"
         except artifact_loader.IncompatibleEvaluationArtifactsError as error:
             split_role = getattr(error, "role", None)
             selected_role = "id" if split_role == "eval" else split_role if split_role == "additional_evaluation" else None
             if not rebuild_incompatible or selected_role not in roles:
                 raise
+            rebuild = True
+            action = "rebuilt"
+        else:
+            # Existing roles are historical evidence; building beside them must not leave one run with two analysis producers.
+            selected_role = _role_from_other_analysis(loaded, plan.task)
+            if selected_role is None:
+                for role in roles:
+                    actions.setdefault(role, "reused")
+                return PreparedRunArtifacts(
+                    loaded_run=loaded,
+                    role_actions=actions,
+                    artifact_device=(str(resolution.device) if resolution is not None else None),
+                )
+            if not rebuild_incompatible:
+                raise _two_producers_error(path, selected_role)
             rebuild = True
             action = "rebuilt"
 
@@ -2521,13 +1922,9 @@ def load_or_build_run_artifacts(
             raise RuntimeError(msg)
         if resolution is None:
             resolution = learning.device.resolve_device(device_policy, path="device_policy")
-        dataset_name = plan.id_dataset_name if selected_role == "id" else plan.additional_evaluation_dataset_name
-        if dataset_name is None:
-            msg = f"Selected artifact role {selected_role!r} has no saved Dataset identity."
-            raise RuntimeError(msg)
         run_or_load_artifacts(
             run_dir=path,
-            dataset_name=dataset_name,
+            dataset_name=plan.role("eval" if selected_role == "id" else "additional_evaluation").dataset_name,
             split=split_by_role[selected_role],
             device_resolution=resolution,
             dataset_root=current_dataset_root,
@@ -2538,12 +1935,95 @@ def load_or_build_run_artifacts(
     raise RuntimeError(msg)
 
 
+def _role_from_other_analysis(loaded: LoadedRunArtifacts, task_id: str) -> Literal["id", "additional_evaluation"] | None:
+    """Return a loaded role not produced by the running analysis code when the loaded roles disagree, otherwise None."""
+    recorded = {
+        role: contracts.validate_analysis_producer(artifact.frame.attrs["artifact_provenance"].get("producer"))["analysis_sha256"]
+        for role, artifact in (("id", loaded.id_artifact), ("additional_evaluation", loaded.additional_artifact))
+        if artifact is not None
+    }
+    if len(set(recorded.values())) <= 1:
+        return None
+    current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
+    return next(cast("Literal['id', 'additional_evaluation']", role) for role, digest in recorded.items() if digest != current)
+
+
+def _sibling_from_other_analysis(
+    *,
+    run_dir: Path,
+    plan: artifact_plan.ArtifactPlan,
+    task_id: str,
+    split: ArtifactSplit,
+    evaluation_spatial_stride: int = 1,
+) -> ArtifactSplit | None:
+    """Return the run's other published split when its recorded analysis implementation is not the running one, otherwise None."""
+    sibling: ArtifactSplit = "additional_evaluation" if split == "eval" else "eval"
+    if sibling == "additional_evaluation" and plan.additional_role is None:
+        return None
+    root = _artifact_save_root(
+        run_dir=run_dir, dataset_name=plan.role(sibling).dataset_name, split=sibling, evaluation_spatial_stride=evaluation_spatial_stride
+    )
+    marker = contracts.artifact_provenance_path(root)
+    if not marker.is_file():
+        return None
+    recorded = _recorded_marker(marker)
+    producer = recorded.get("producer") if isinstance(recorded, Mapping) else None
+    digest = producer.get("analysis_sha256") if isinstance(producer, Mapping) else None
+    return None if digest == contracts.ANALYSIS_PROJECTIONS[task_id].sha256() else sibling
+
+
+def _older_sibling_to_rebuild(
+    *,
+    path: Path,
+    plan: artifact_plan.ArtifactPlan,
+    split: ArtifactSplit,
+    roles: tuple[Literal["id", "additional_evaluation"], ...],
+    rebuild_incompatible: bool,
+) -> Literal["id", "additional_evaluation"] | None:
+    """Return the selected role of other analysis code to rebuild before a missing split is generated beside it; refuse when not authorized."""
+    sibling = _sibling_from_other_analysis(run_dir=path, plan=plan, task_id=plan.task, split=split)
+    if sibling is None:
+        return None
+    role: Literal["id", "additional_evaluation"] = "id" if sibling == "eval" else "additional_evaluation"
+    if not rebuild_incompatible or role not in roles:
+        raise _two_producers_error(path, role)
+    return role
+
+
+def _two_producers_error(path: Path, role: str) -> ArtifactCacheError:
+    """Return the refusal of a preparation that would leave one run with two analysis producers."""
+    return ArtifactCacheError(
+        f"Preparing the artifacts of {path} would leave the run with two analysis producers; rebuild its {role} role with --rebuild."
+    )
+
+
 def _publish_scoped_transient_stage(*, target: Path, stage: Path) -> None:
     """Publish one validated scoped stage without overwriting a concurrent target."""
     if target.exists() or target.is_symlink():
         message = f"Scoped artifact output appeared concurrently: {target}"
         raise FileExistsError(message)
     stage.replace(target)
+
+
+def _require_staged_selection(stage: Path, selected_role: artifact_plan.ArtifactRolePlan) -> None:
+    """Refuse a complete scoped stage of an earlier attempt whose persisted selection or analysis code differs from this request."""
+    document = json.loads(contracts.artifact_provenance_path(stage).read_text(encoding="utf-8"))
+    evaluation = document.get("evaluation") if isinstance(document, dict) else None
+    scope = evaluation.get("scope") if isinstance(evaluation, dict) else None
+    staged = scope.get("selected_case_ids") if isinstance(scope, dict) else None
+    requested = [case_id for source_case_ids in selected_role.case_ids_by_source for case_id in source_case_ids]
+    remedy = "delete the stale stage and rerun (bounded generation takes no --rebuild)."
+    if staged != requested:
+        msg = f"Scoped artifact stage {stage} holds cases {staged}, but this request selects {requested}; {remedy}"
+        raise ValueError(msg)
+    # The complete stage would be published as this request's result, so it must come from the running analysis code.
+    producer = document.get("producer") if isinstance(document, dict) else None
+    common.code_identity.require_current_implementation(
+        contracts.ANALYSIS_PROJECTIONS["transient_drying"],
+        producer.get("analysis_sha256") if isinstance(producer, Mapping) else None,
+        unit=f"Scoped artifact stage {stage}",
+        remedy=remedy,
+    )
 
 
 def build_scoped_transient_artifact(
@@ -2579,13 +2059,10 @@ def build_scoped_transient_artifact(
         raise ValueError(msg)
 
     path = Path(run_dir).expanduser().resolve(strict=True)
+    _refuse_optuna_trial(path)
     plan = transient.load_transient_artifact_plan(path)
-    saved_role = plan.id_role if split == "id" else plan.additional_role
-    if saved_role is None:
-        msg = "The completed transient run has no saved additional Evaluation role."
-        raise FileNotFoundError(msg)
-    available = tuple(case_id for source_case_ids in saved_role.case_ids_by_source for case_id in source_case_ids)
-    selected_ids = available[:1] if one_case else requested
+    saved_role = plan.role("eval" if split == "id" else "additional_evaluation")
+    selected_ids = saved_role.case_ids[:1] if one_case else requested
     selected_role = transient.select_transient_role_cases(
         saved_role,
         selected_ids,
@@ -2612,33 +2089,39 @@ def build_scoped_transient_artifact(
         path="device_policy",
     )
     completed = experiments.run.validate_completed_run(path)
-    reporter = _transient_progress_reporter(
+    reporter = _progress_reporter(
         completed=completed,
-        role=selected_role,
+        task="transient_drying",
+        total_cases=len(selected_ids),
+        split=split,
         device_resolution=resolution,
         output_root=target,
     )
-    stage: Path | None = None
+    stage = _artifact_stage_root(target)
     loaded: sequence_artifact.TransientSequenceArtifactIndex | None = None
     try:
-        stage = _create_artifact_staging_root(target)
         with experiments.run.run_reader_lease(path):
-            staged = transient.generate_transient_role_artifact(
-                run_dir=path,
-                role=selected_role,
-                saved_role=saved_role,
-                device_resolution=resolution,
-                dataset_root=dataset_root,
-                staging_root=stage,
-                completed=completed,
-                evaluation_spatial_stride=resolved_evaluation_stride,
-                progress_reporter=reporter,
-            )
-            with reporter.phase("validation"):
-                transient.validate_staged_transient_role_artifact(
-                    staged,
-                    completed=completed,
+            if not contracts.artifact_provenance_path(stage).is_file():
+                transient.generate_transient_role_artifact(
+                    run_dir=path,
                     role=selected_role,
+                    saved_role=saved_role,
+                    device_resolution=resolution,
+                    dataset_root=dataset_root,
+                    staging_root=stage,
+                    completed=completed,
+                    evaluation_spatial_stride=resolved_evaluation_stride,
+                    progress_reporter=reporter,
+                )
+            else:
+                _require_staged_selection(stage, selected_role)
+            timing.write_stage_timing(stage, {"operational_performance": reporter.final_snapshot()})
+            with reporter.phase("validation"):
+                sequence_artifact.cleanup_transient_resume_metadata(stage)
+                transient.validate_scoped_transient_role_artifact_index(
+                    stage,
+                    completed=completed,
+                    saved_role=saved_role,
                     evaluation_spatial_stride=resolved_evaluation_stride,
                 )
         lock_path = target.parent / f".{target.name}.scoped.lock"
@@ -2653,18 +2136,11 @@ def build_scoped_transient_artifact(
                 saved_role=saved_role,
                 evaluation_spatial_stride=resolved_evaluation_stride,
             )
-        snapshot = reporter.final_snapshot()
-        sequence_artifact.publish_transient_operational_performance(
-            target,
-            snapshot,
-        )
-        reporter.done(snapshot)
+        reporter.done()
     except BaseException:
-        reporter.failure(phase="preflight" if stage is None else None)
+        reporter.failure()
         raise
     finally:
-        if stage is not None and stage.exists():
-            shutil.rmtree(stage)
         cleanup_runtime(resolution.device)
     if loaded is None:
         msg = "Scoped transient artifact validation did not complete."
@@ -2721,11 +2197,10 @@ def build_artifacts(
     Notes
     -----
     Each saved cache role is locally authoritative. Persisted W&B settings are
-    the sole publication opt-in. Steady runs upload validated ID and additional
-    evaluation provenance with curated media. Transient runs validate ID and any saved
-    additional role before observer initialization, then log only one bounded aggregate
-    scalar/string summary without provenance files or media. Any requested online
-    or offline observer failure propagates.
+    the sole publication opt-in. Both tasks validate every published role before
+    observer initialization and upload its provenance file; steady runs add curated
+    media, transient runs one bounded aggregate scalar/string summary. Any requested
+    online or offline observer failure propagates.
 
     """
     from src import learning  # noqa: PLC0415
@@ -2741,7 +2216,7 @@ def build_artifacts(
         common.paths.record_job_log_owner(plan.run_dir)
         id_frame = run_or_load_artifacts(
             run_dir=plan.run_dir,
-            dataset_name=plan.id_dataset_name,
+            dataset_name=plan.id_role.dataset_name,
             split="eval",
             device_resolution=device_resolution,
             dataset_root=dataset_root,
@@ -2750,10 +2225,10 @@ def build_artifacts(
         )
         additional_frame: pd.DataFrame | None = None
         role_results = {"eval": id_frame}
-        if plan.additional_evaluation_dataset_name is not None:
+        if plan.additional_role is not None:
             additional_frame = run_or_load_artifacts(
                 run_dir=plan.run_dir,
-                dataset_name=plan.additional_evaluation_dataset_name,
+                dataset_name=plan.additional_role.dataset_name,
                 split="additional_evaluation",
                 device_resolution=device_resolution,
                 dataset_root=dataset_root,

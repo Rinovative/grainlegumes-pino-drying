@@ -2,19 +2,13 @@
 # Create one fresh locked native environment inside a Slurm CPU allocation.
 set -euo pipefail
 
-environment_name=native
-case "${1:-}" in
-  '') ;;
-  --candidate) environment_name=native-candidate ;;
-  *) printf 'Usage: bash %s [--candidate]\n' "$0" >&2; exit 2 ;;
-esac
-[[ $# -le 1 && "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || {
-  printf 'Provisioning requires a Slurm allocation and at most one argument.\n' >&2
+[[ $# -eq 0 && "${SLURM_JOB_ID:-}" =~ ^[0-9]+$ ]] || {
+  printf 'Provisioning requires a Slurm allocation and takes no argument.\n' >&2
   exit 2
 }
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 runtime_root="$(realpath -e -- "${repository_root}/../runtime")"
-export UV_PROJECT_ENVIRONMENT="${runtime_root}/venvs/${environment_name}"
+export UV_PROJECT_ENVIRONMENT="${runtime_root}/venvs/native"
 [[ ! -e "${UV_PROJECT_ENVIRONMENT}" && ! -L "${UV_PROJECT_ENVIRONMENT}" ]] || {
   printf 'Fresh provisioning requires an absent target: %s\n' "${UV_PROJECT_ENVIRONMENT}" >&2
   exit 1

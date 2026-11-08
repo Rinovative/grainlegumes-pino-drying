@@ -13,6 +13,7 @@ Design principles:
   - Residual metrics are dimensionless; pressure-drop evidence stays in pascals
   - Complete or bounded case reductions are owned by EvaluationSession
   - Display clipping never changes immutable residual or pressure evidence
+  - Per-case distributions leave out non-finite cases, which the invalid-prediction warning names
 
 This module does NOT:
   - Recompute residual equations, derivatives, crops, or boundary masks
@@ -32,6 +33,7 @@ import pandas as pd
 from matplotlib.lines import Line2D
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
@@ -50,10 +52,10 @@ _RESIDUAL_LABELS = {
 
 
 def _values(frame: pd.DataFrame, column: str, max_cases: int) -> np.ndarray:
-    """Return finite non-negative scalar evidence from one saved prefix."""
-    values = np.asarray(pd.to_numeric(frame.iloc[:max_cases][column], errors="raise"), dtype=float)
-    if values.size == 0 or not np.isfinite(values).all() or np.any(values < 0.0):
-        msg = f"Physical metric {column!r} must be finite and non-negative."
+    """Return the non-negative values of one saved prefix without its non-finite cases."""
+    values = validity_contract.finite_case_values(pd.to_numeric(frame.iloc[:max_cases][column], errors="raise"))
+    if np.any(values < 0.0):
+        msg = f"Physical metric {column!r} must be non-negative."
         raise ValueError(msg)
     return values
 
@@ -81,7 +83,7 @@ def build_physical_consistency_summary_table(datasets: Mapping[str, pd.DataFrame
         for metric in dataframe.STEADY_PHYSICS_METRICS:
             values = _values(frame, metric, len(frame))
             for statistic, reducer in statistics:
-                row[f"{metric} {statistic}"] = float(reducer(values))
+                row[f"{metric} {statistic}"] = float(reducer(values)) if values.size else float("nan")
         rows.append(row)
     return pd.DataFrame(rows).set_index("Model")
 
@@ -196,7 +198,7 @@ def _pressure_drop_values(
         summary = summaries[id(frame)]
         declared = cast("np.ndarray", summary.pressure_declared)
         absolute = cast("np.ndarray", summary.pressure_absolute_error)
-        result[label] = absolute / (np.abs(declared) + 1e-12)
+        result[label] = validity_contract.finite_case_values(absolute / (np.abs(declared) + 1e-12))
     return result
 
 

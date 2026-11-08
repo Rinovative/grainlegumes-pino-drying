@@ -3,7 +3,7 @@
 Responsibilities:
   - Check campaign continuations, source snapshots, and storage containment
   - Check that a public run freezes the source, including uncommitted changes, and submits its controller as a driver job from the login node
-  - Check that the public replacement-capacity amendment is a read-only admission delegating to the service operation
+  - Check that the public minimum-success-rate amendment is a read-only admission delegating to the service operation
   - Check the printed stages, the live board cadence, and the one plain report of an expected failure
   - Check the failure context from plan resolution on, that a failing status suggests no dry run, and that logs follow the campaign
     as soon as it exists
@@ -49,7 +49,7 @@ _SOURCE = "steady_flow_source__fedcba9876543210"
 _REPLACEMENT = "steady_flow_replacement__1234567890abcdef"
 _COMPLETION = "completion__" + "a" * 24
 _DIGEST = "b" * 64
-_CONFIG = "configs/01_generation/standalone/steady_flow/test.yaml"
+_CONFIG = "configs/02_datasets/steady_flow/test.yaml"
 _CANONICAL = "source~steady_flow~lentil-d1__reference-range__lhs-s9910"
 
 
@@ -245,17 +245,20 @@ def test_canonical_campaign_survives_a_deficit_that_the_reconciliation_plans_awa
     assert _operations(port).count("resume-campaign") == 2
 
 
-def test_canonical_campaign_fails_on_an_unfillable_deficit_with_the_capacity_message(port: FakePort, monkeypatch: Any) -> None:
-    """A decided failure whose slot no replacement can fill ends the driver once reconciliation plans nothing more."""
+def test_canonical_campaign_fails_on_an_unfillable_deficit_with_the_success_rate_stop(port: FakePort, monkeypatch: Any) -> None:
+    """A decided failure whose slot no replacement can fill ends the driver once reconciliation plans nothing more, naming the stop."""
     monkeypatch.setattr("src.generation.generation_controller.time.sleep", lambda _: None)
     _advance_clock_per_read(monkeypatch)
     unfilled = _canonical_status(
         campaign_state=_QUIESCENT, case_states=("failed", "successful"), terminal_decisions=("failed", "successful"), replacement_deficit=1
     )
+    unfilled = json.dumps({**json.loads(unfilled), "success_rate_stop": "Stopped: lentil (natural): k/n 1/2. Lower s with amend-replacements."})
     port.responses["submit-campaign"] = [_resumed()]
     port.responses["campaign-status"] = [unfilled, unfilled, unfilled]
     port.responses["resume-campaign"] = [_resumed(), _resumed()]
-    with pytest.raises(GenerationControllerError, match=r"cannot reach its target without more replacement capacity.*amend-replacements"):
+    with pytest.raises(
+        GenerationControllerError, match=r"1 unfilled success slot\(s\) and no pending or running job\. Stopped: .*amend-replacements"
+    ):
         GenerationController(port).run(_canonical_plan(), _CONFIG)
     assert _operations(port)[-5:] == ["campaign-status", "resume-campaign", "campaign-status", "resume-campaign", "campaign-status"]
 
@@ -374,7 +377,7 @@ def test_public_run_freezes_the_dirty_source_and_submits_its_controller_as_a_dri
 ) -> None:
     """A run on the login node admits uncommitted changes, resolves the plan, and submits the controller from the tree instead of running it."""
     config_path, _template = generation_config_factory(simulation_profile="transient_drying", natural_count=4)
-    repository = config_path.parents[4]
+    repository = config_path.parents[3]
     relative = config_path.relative_to(repository)
     campaign_name = config_service.load_campaign_config(config_path).source_name
     commit = "a" * 40
@@ -460,7 +463,7 @@ def test_public_run_inside_a_source_tree_runs_the_controller(monkeypatch: pytest
 def test_public_amend_replacements_delegates_without_freezing_the_source(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Capacity amendments admit the source read-only, like fail-case, and pass every field to the service operation."""
+    """Rate amendments admit the source read-only, like fail-case, and pass every field to the service operation."""
     calls: list[tuple[str, tuple[str, ...], bool | None]] = []
     admissions: list[bool] = []
 
@@ -470,7 +473,7 @@ def test_public_amend_replacements_delegates_without_freezing_the_source(
 
     def call(_host: host_service.GenerationHost, operation: str, *arguments: str, scheduled: bool | None = None, **_kwargs: Any) -> str:
         calls.append((operation, arguments, scheduled))
-        return json.dumps({"capacity": 3}) + "\n"
+        return json.dumps({"minimum_success_rate": 0.8}) + "\n"
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -479,7 +482,7 @@ def test_public_amend_replacements_delegates_without_freezing_the_source(
     monkeypatch.setattr(public_cli.host_service, "admit_source", admit)
     monkeypatch.setattr(host_service.GenerationHost, "call", call)
 
-    def command(run_id: str, capacity: str) -> list[str]:
+    def command(run_id: str) -> list[str]:
         return [
             "amend-replacements",
             run_id,
@@ -487,18 +490,17 @@ def test_public_amend_replacements_delegates_without_freezing_the_source(
             "lentil",
             "--regime",
             "natural",
-            "--capacity",
-            capacity,
+            "--minimum-success-rate",
+            "0.8",
             "--reason",
             "after first failure",
         ]
 
-    assert public_cli.main(command(_CANONICAL, "3")) == 0
-    assert json.loads(capsys.readouterr().out) == {"capacity": 3}
+    assert public_cli.main(command(_CANONICAL)) == 0
+    assert json.loads(capsys.readouterr().out) == {"minimum_success_rate": 0.8}
     assert admissions == [False]
-    assert calls == [("amend-replacement-pool", (*command(_CANONICAL, "3")[1:], "--storage-root", str(tmp_path / "storage")), False)]
-    assert public_cli.main(command(_CANONICAL, "0")) == 2
-    assert public_cli.main(command(_RUN, "3")) == 2
+    assert calls == [("amend-replacement-pool", (*command(_CANONICAL)[1:], "--storage-root", str(tmp_path / "storage")), False)]
+    assert public_cli.main(command(_RUN)) == 2
     assert len(calls) == 1
 
 
@@ -582,7 +584,7 @@ class FakePort:
         return self.repository / relative, relative
 
     def comsol_version(self, module: str, executable: str) -> str:
-        """Return fixed native runtime identity for benchmark decisions."""
+        """Return fixed native runtime identity."""
         assert module == "Comsol/v6.4"
         assert executable == "comsol"
         return "COMSOL Multiphysics 6.4.0.293"
@@ -595,12 +597,11 @@ class FakePort:
         operation: str,
         *arguments: str,
         scheduled: bool | None = None,
-        benchmark_preflight: bool = False,
         partition: str = "standard",
         wall_time: str = "02:00:00",
     ) -> str:
         """Return one queued response or the default persisted service state."""
-        del benchmark_preflight, partition, wall_time
+        del partition, wall_time
         self.calls.append((operation, arguments, scheduled))
         queued = self.responses.get(operation)
         if queued:
@@ -737,12 +738,14 @@ def test_executing_controller_schedules_only_explicit_compute_continuation(
     assert len(metadata_calls) == (0 if initial_compute else 2 if needs_compute else 3)
 
 
-def test_failed_campaign_restart_preserves_admission_and_scientific_flags(port: FakePort) -> None:
-    """Following reported continuation keeps the original constraints."""
+@pytest.mark.parametrize("field", ["success_rate_stop", "admission_cap_stop"])
+def test_blocked_campaign_names_its_stop_and_its_restart_preserves_admission_and_scientific_flags(port: FakePort, field: str) -> None:
+    """A blocked campaign reports its success-rate or cap stop from its status; following the continuation keeps the original constraints."""
     plan = _canonical_plan()
     plan.payload["scientific_overrides"] = {"materials": ["lentil"], "cases_per_material": 4, "duration_hours": 4, "revision": "producer-fix"}
-    port.responses["submit-campaign"] = [json.dumps({"campaign_run_id": _CANONICAL, "state": "failure_threshold_reached"})]
-    with pytest.raises(GenerationControllerError) as failure:
+    port.responses["submit-campaign"] = [json.dumps({"campaign_run_id": _CANONICAL, "state": "blocked"})]
+    port.responses["campaign-status"] = [json.dumps({"campaign_run_id": _CANONICAL, field: "Stopped: lentil (natural): k/n 1/4."})]
+    with pytest.raises(GenerationControllerError, match=r"blocked\. Stopped: lentil \(natural\): k/n 1/4") as failure:
         GenerationController(port).run(plan, _CONFIG, max_admission_cases=2)
     continuation = failure.value.report()
     assert "--revision producer-fix" in continuation
@@ -762,7 +765,7 @@ def test_normal_resource_flags_reach_inspection_submission_and_restart(port: Fak
         "no_retry": True,
         "max_admission_cases": 4,
     }
-    port.responses["submit-campaign"] = [json.dumps({"campaign_run_id": _CANONICAL, "state": "failure_threshold_reached"})]
+    port.responses["submit-campaign"] = [json.dumps({"campaign_run_id": _CANONICAL, "state": "submission_unknown"})]
     with pytest.raises(GenerationControllerError) as failure:
         GenerationController(port).run(plan, _CONFIG, max_admission_cases=4)
     for operation in ("validate-config", "prepare-campaign-inputs", "submit-campaign"):
@@ -782,7 +785,7 @@ def _route_public_plan_through_service_cli(monkeypatch: Any, config_path: Path) 
     """Run the public command from the test repository and resolve its plan through the service parser and planner."""
     from src.generation.cli import cli_generation as service_cli  # noqa: PLC0415 -- exact public/service boundary under test
 
-    repository = config_path.parents[4]
+    repository = config_path.parents[3]
     monkeypatch.chdir(repository)
     monkeypatch.setattr(host_service.HostLayout, "resolve", lambda _repository: SimpleNamespace(repository=repository))
     monkeypatch.setattr(host_service, "admit_source", lambda *_args, **_kwargs: _admission(repository, commit="a" * 40))
@@ -863,7 +866,7 @@ def test_public_normal_resource_dry_run_resolves_exact_budget(
 
 
 def test_scheduler_footprint_takes_the_largest_campaign_and_the_driver_time_as_given() -> None:
-    """A run of several campaigns asks for the largest node job of any of them; a benchmark plan has no campaign footprint."""
+    """A run of several campaigns asks for the largest node job of any of them."""
 
     def values(node_jobs: int, cores: int, memory: str, wall_time: str) -> dict[str, Any]:
         return {"site": {"cores_per_node": cores}, "cluster": {"node_jobs": node_jobs, "node_job_memory": memory, "node_job_wall_time": wall_time}}
@@ -940,6 +943,8 @@ def test_authored_campaign_uses_existing_controller_and_reports_admission_state(
     run_parts = common.paths.campaign_run_parts(_CANONICAL)
     assert run_parts is not None
     assert result.source_name == run_parts[1]
+    with pytest.raises(ValueError, match=f"Run {_RUN!r} is not a canonical campaign run"):
+        _ = LeafResult(_RUN, result.kind, result.purpose).source_name
     assert _operations(port).count("resolve-generation-run") == 1
     for operation, arguments, _scheduled in port.calls:
         if operation in {"resolve-generation-run", "validate-config", "prepare-campaign-inputs", "submit-campaign"}:
@@ -997,15 +1002,15 @@ def test_scheduled_host_reuses_only_its_actual_allocated_node(
     assert len(seen) == 1
 
 
-def test_allocated_host_preserves_worker_failure_and_benchmark_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_allocated_host_preserves_worker_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Direct reuse still runs the guarded node worker and exposes its failure."""
     repository = tmp_path / "repository"
     worker = repository / "scripts/generation_node.sh"
     worker.parent.mkdir(parents=True)
     worker.write_text(
         "#!/bin/sh\n"
-        'test "$2" = benchmark-preflight || exit 99\n'
-        'test "$3" = materialize-core-benchmark-inputs || exit 98\n'
+        'test "$2" = cli || exit 99\n'
+        'test "$3" = prepare-campaign-inputs || exit 98\n'
         "printf 'partial output\\n'\n"
         "printf 'source guard rejected\\n' >&2\n"
         "exit 23\n"
@@ -1017,9 +1022,9 @@ def test_allocated_host_preserves_worker_failure_and_benchmark_mode(tmp_path: Pa
     monkeypatch.setattr(host_service.socket, "gethostname", lambda: "hpc119")
 
     with pytest.raises(host_service.GenerationCommandError, match="source guard rejected") as failure:
-        host.call("materialize-core-benchmark-inputs", scheduled=True, benchmark_preflight=True)
+        host.call("prepare-campaign-inputs", scheduled=True)
     assert failure.value.returncode == 23
-    logs = list(layout.logs.glob("python-materialize-core-benchmark-inputs.*.out"))
+    logs = list(layout.logs.glob("python-prepare-campaign-inputs.*.out"))
     assert len(logs) == 1
     assert logs[0].read_text() == "partial output\n"
 
@@ -1169,7 +1174,7 @@ def test_board_appears_on_a_state_change_and_after_the_interval_but_not_at_every
     finished = _live_status(_live_case("case_0001", "successful", elapsed="00:10:00"), _live_case("case_0002", simulated=50.0))
     _poll(port, monkeypatch, [two(100.0), two(200.0), two(300.0), finished], seconds_per_poll=150.0)
     first, second, third = _boards(capsys.readouterr().out)
-    assert first[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 0 s  remaining unknown")
+    assert first[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 0 s  ETA: not yet estimable")
     assert any("3 %" in line and "0.02778 h / 1 h" in line for line in first)
     assert any("case_0002  waiting  not started yet" in line for line in first)
     assert second[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 5 min")
@@ -1181,11 +1186,11 @@ def test_board_appears_on_a_state_change_and_after_the_interval_but_not_at_every
 def test_a_default_horizon_campaign_shows_progress_from_the_status_horizon(
     port: FakePort, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Without a --duration-hours override, each case's persisted time window gives its progress past the start and its estimate."""
+    """Without a --duration-hours override, each case's persisted time window gives its progress past the start."""
     case = _live_case("case_0001", simulated=25 * 3600.0, physical_start_hours=24.0, physical_horizon_hours=4.0)
     _poll(port, monkeypatch, [_live_status(case)], seconds_per_poll=1.0)
     (board,) = _boards(capsys.readouterr().out)
-    assert any("case_0001" in line and "25 %" in line and "ETA ~30 min" in line for line in board)
+    assert any("case_0001" in line and "25 %" in line and "1 h / 4 h" in line for line in board)
 
 
 @pytest.mark.parametrize("failing", ["prepare-campaign-inputs", "submit-campaign"])
@@ -1341,36 +1346,21 @@ def test_an_expected_failure_carries_its_stage_and_continuation_for_the_one_plai
     assert GenerationControllerError("plain").report() == "plain"
 
 
-_BENCHMARK_RUN = "core_benchmark__0123456789abcdef"
-_BENCHMARK_SITE = {**_resources()["execution_resources"]["site"], "poll_interval_seconds": 1, "cores_per_node": 32}
-
-
-@pytest.mark.parametrize("step", ["plan resolution", "preflight", "benchmark"])
-def test_a_failure_before_or_during_a_benchmark_carries_its_stage_and_next_command(
+@pytest.mark.parametrize("step", ["plan resolution", "preflight"])
+def test_a_failure_before_a_run_carries_its_stage_and_the_dry_run_that_checks_the_config_again(
     port: FakePort, capsys: pytest.CaptureFixture[str], step: str
 ) -> None:
-    """Plan resolution and preflight name the dry run that checks the config again; a started benchmark names its rerun."""
-    port.responses["inspect-core-benchmark"] = [json.dumps({"resource_contract": _BENCHMARK_SITE})]
-    port.responses["resolve-core-benchmark-run"] = [json.dumps({"benchmark_run_id": _BENCHMARK_RUN})]
-    port.responses["validate-core-benchmark"] = [GenerationCommandError("validate-core-benchmark", 1, "absent")]
+    """Plan resolution and preflight name the dry run that checks the config again."""
     controller = GenerationController(port)
-    benchmark = RunPlan("benchmark", _BENCHMARK_RUN, _CONFIG, "core_benchmark", "transient_drying", (), {"run_kind": "benchmark"})
     if step == "plan resolution":
         port.responses["resolve-generation-run"] = [GenerationCommandError("resolve-generation-run", 2, "invalid config")]
         with pytest.raises(GenerationCommandError):
             controller.plan(_CONFIG)
-        expected = f"FAILED: plan resolution\nNext: ./scripts/generation run {_CONFIG} --dry-run"
-    elif step == "preflight":
+    else:
         port.responses["validate-config"] = [GenerationCommandError("validate-config", 2, "invalid resources")]
         with pytest.raises(GenerationCommandError):
             controller.preflight(_canonical_plan())
-        expected = f"FAILED: preflight\nNext: ./scripts/generation run {_CONFIG} --dry-run"
-    else:
-        port.responses["materialize-core-benchmark-inputs"] = [GenerationCommandError("materialize-core-benchmark-inputs", 3, "boom")]
-        with pytest.raises(GenerationCommandError):
-            controller.run(benchmark, _CONFIG)
-        expected = f"FAILED: benchmark input readiness\nbenchmark_run_id: {_BENCHMARK_RUN}\nNext: ./scripts/generation run {_CONFIG}"
-    assert capsys.readouterr().err.startswith(expected)
+    assert capsys.readouterr().err.startswith(f"FAILED: {step}\nNext: ./scripts/generation run {_CONFIG} --dry-run")
 
 
 def test_a_failing_status_suggests_no_dry_run(port: FakePort, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

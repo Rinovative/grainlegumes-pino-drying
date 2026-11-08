@@ -3,6 +3,7 @@ Shared filesystem and atomic-publication infrastructure.
 
 Provides:
 - code_identity: declared scientific-code projections and their syntax digests
+- console: human-readable timestamps and durations for log lines
 - identity_registry: one-owner bindings of content digests to existing targets
 - locking: process-safe file and directory coordination
 - names: compact path-safe number and text name tokens
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import common_code_identity as code_identity
+    from . import common_console as console
     from . import common_identity_registry as identity_registry
     from . import common_locking as locking
     from . import common_names as names
@@ -27,6 +29,7 @@ if TYPE_CHECKING:
 
 _MODULES = {
     "code_identity": "common_code_identity",
+    "console": "common_console",
     "identity_registry": "common_identity_registry",
     "locking": "common_locking",
     "names": "common_names",
@@ -34,7 +37,7 @@ _MODULES = {
     "random": "common_random",
     "serialization": "common_serialization",
 }
-__all__ = ["code_identity", "identity_registry", "locking", "names", "paths", "random", "serialization"]
+__all__ = ["code_identity", "console", "identity_registry", "locking", "names", "paths", "random", "serialization"]
 
 
 def __getattr__(name: str) -> object:

@@ -1,9 +1,10 @@
 """
-Identity-bound Dataset splitting and train-only normalization services.
+Identity-bound Dataset splitting and train-only scaling services.
 
 Provides:
-- normalization: normalizer fitting, reconstruction, and artifact admission
-- splits: deterministic split and membership contracts
+- normalization: steady normalizer fitting, reconstruction, and preprocessing specification
+- scaling: shared scaling identity, fit-or-load cache, and persisted scaling artifact admission
+- splits: the one persisted split schema of both tasks and its admission
 """
 
 from __future__ import annotations
@@ -13,13 +14,15 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import dataset_preprocessing_normalization as normalization
+    from . import dataset_preprocessing_scaling as scaling
     from . import dataset_preprocessing_splits as splits
 
 _MODULES = {
     "normalization": "dataset_preprocessing_normalization",
+    "scaling": "dataset_preprocessing_scaling",
     "splits": "dataset_preprocessing_splits",
 }
-__all__ = ["normalization", "splits"]
+__all__ = ["normalization", "scaling", "splits"]
 
 
 def __getattr__(name: str) -> object:

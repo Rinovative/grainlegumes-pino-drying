@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
-  - Copy and byte-verify one raw case, admitted from canonical storage or supplied by a caller that owns its inputs
+  - Copy and byte-verify one raw case admitted from canonical storage
   - Generate case-local adapters and copy a digest-verified COMSOL model
   - Preserve cleanup boundaries when preparation fails
 
@@ -83,11 +83,8 @@ def _resolve_raw_source(
     *,
     storage_root: Path,
     input_generation_id: str | None,
-    raw_case_directory: Path | None,
 ) -> tuple[Path, str]:
     """Return the raw case directory to copy and the input-generation identity it is recorded under."""
-    if raw_case_directory is not None:
-        return raw_case_directory, input_service.configured_input_generation_id(config)
     case_id = config.case_id(case_index)
     try:
         reference = (
@@ -120,16 +117,14 @@ def _materialize_raw_bundle(
     *,
     storage_root: Path,
     input_generation_id: str | None,
-    raw_case_directory: Path | None,
 ) -> tuple[case_service.CaseBundle, str, Path]:
-    """Copy and re-verify one raw case, admitted from canonical storage or supplied as a bundle, into isolated scratch."""
+    """Copy and re-verify one raw case admitted from canonical storage into isolated scratch."""
     case_id = config.case_id(case_index)
     source_directory, source_id = _resolve_raw_source(
         config,
         case_index,
         storage_root=storage_root,
         input_generation_id=input_generation_id,
-        raw_case_directory=raw_case_directory,
     )
     source_case_json = source_directory / "case.json"
     payload = json.loads(source_case_json.read_text(encoding="utf-8"))
@@ -183,22 +178,14 @@ def prepare_case_work_directory(
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
     input_generation_id: str | None = None,
-    raw_case_directory: Path | None = None,
 ) -> PreparedCase:
     """
     Prepare a fresh case directory beside a digest-verified disposable model.
 
     A supplied input-generation identity selects an already admitted persisted
-    input source, as campaign cases do under newer code. Without it the case is
-    bound to the exact active source commit. A supplied raw case directory (one
-    generated case bundle: ``case.json`` plus its declared input files) replaces
-    canonical admission for callers that own their inputs, such as the core
-    benchmark; it is copied and verified byte for byte like an admitted source
-    and is mutually exclusive with an input-generation identity.
+    input source, as campaign cases do. Without it the case is bound to the
+    exact active source commit.
     """
-    if raw_case_directory is not None and input_generation_id is not None:
-        message = "A supplied raw case directory and an input-generation identity are mutually exclusive."
-        raise ValueError(message)
     case_id = config.case_id(case_index)
     _require_template_digest(
         config.template_path,
@@ -225,7 +212,6 @@ def prepare_case_work_directory(
             work_directory,
             storage_root=storage,
             input_generation_id=input_generation_id,
-            raw_case_directory=raw_case_directory,
         )
         shutil.copyfile(config.template_path, model_path)
         _require_template_digest(

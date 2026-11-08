@@ -30,8 +30,12 @@ Notes:
       the physical start and horizon of its batch's persisted resolved configuration, its exact ``parent_failed_case_id``
       and its typed failure reason.
   Feed cycle order:
-    - Plan replacements for failed slots within the replacement capacity; when none remains and every candidate is
-      decided, end ``blocked`` after the scheduler read, draining every open node job as a completion does.
+    - Plan replacements for the failed slots of every batch its minimum success rate does not stop; a decision recorded
+      meanwhile that closes a batch's deficit or stops it ends planning for that batch only. One later read of the
+      candidates decides the stop set, the effective admission cap (a recorded null cap follows each batch's current
+      rate) and blocking. When a stopped batch stays below its count, or the cap holds back a needed candidate after a
+      recorded failure, and every admitted candidate is decided, end ``blocked`` after the scheduler read, draining every
+      open node job as a completion does.
     - Resolve an interrupted node-job submission, read the scheduler, then observe ended node jobs and finish pending leases.
     - Finish interrupted drains and interrupted dispatches before any new work.
     - Reconcile every case, decide each validly published case whose step ended undecided, and check completion by candidate decisions.
@@ -72,6 +76,7 @@ from src import common
 from .cases import generation_cases_admission as admission_service
 from .cases import generation_cases_config as config_service
 from .cases import generation_cases_input as input_service
+from .contracts import generation_contracts_profiles as profiles
 from .contracts import generation_contracts_source as source_service
 from .publication import generation_publication_attempt as attempt_service
 from .publication import generation_publication_campaign_evidence as campaign_evidence
@@ -103,7 +108,7 @@ _TERMINAL_FAILURE_STATES: Final = frozenset(
 _TERMINAL_ACCOUNTING_STATES: Final = frozenset({"COMPLETED", *_TERMINAL_FAILURE_STATES})
 _ACTIVE_PENDING_STATE: Final = "PENDING"
 _ATTEMPT_INDEX_ENVIRONMENT: Final = "GENERATION_ATTEMPT_INDEX"
-_CANCELLATION_SCHEMA_VERSION: Final = 2
+_CANCELLATION_SCHEMA_VERSION: Final = 1
 _CANCEL_STATES: Final = frozenset({"cancel_requested", "force_cancel_requested"})
 _DISPATCH_BINDING_WAIT_SECONDS: Final = 120.0  # NFS visibility of the dispatch record to a step that starts right after its ticket
 _DISPATCH_BINDING_POLL_SECONDS: Final = 2.0
@@ -115,7 +120,7 @@ _NOT_STARTED_GRACE_SECONDS: Final = (
 )
 _DISPATCH_TICKETS_PER_CASE_SLOT: Final = 2  # unresolved dispatches per node job: two per concurrent case slot keep the next steps queued
 _ALIVE_NODE_JOB_STATES: Final = frozenset({"PENDING", "RUNNING", "CONFIGURING"})
-_SETTLED_CAMPAIGN_STATES: Final = frozenset({"complete", "completed_with_failures", "staged", "failure_threshold_reached", "blocked"})
+_SETTLED_CAMPAIGN_STATES: Final = frozenset({"complete", "completed_with_failures", "staged", "blocked"})
 _MAX_CONTROLLER_HANDLE_BYTES: Final = 255
 _RECONCILIATION_PROGRESS_DELAY_SECONDS: Final = 2.0
 _RECONCILIATION_PROGRESS_HEARTBEAT_SECONDS: Final = 30.0
@@ -127,6 +132,7 @@ _MATERIAL_JOB_CODES: Final = {
     "rapeseed": "rapeseed",
     "sunflower_seed": "sunflower",
 }
+_PROFILE_JOB_CODES: Final = {profiles.STEADY_FLOW_PROFILE: "sf", profiles.TRANSIENT_DRYING_PROFILE: "td"}
 _TERMINAL_TIMESTAMP_OWNER: Final = "generation_campaign.terminal_timestamp_normalization.v1"
 _CASE_RECONCILIATION_OWNER: Final = "generation_campaign.case_reconciliation.v1"
 _MAX_RECONCILIATION_REASON_CHARACTERS: Final = 512
@@ -252,11 +258,11 @@ def _repository_relative_campaign_config(campaign: config_service.CampaignConfig
 
 
 def _submission_config(campaign: config_service.CampaignConfig) -> dict[str, Any]:
-    """Return the compact feeder and one-case allocation contract."""
+    """Return the compact feeder and one-case allocation contract; a null ``max_admission_cases`` is derived (``_admission_cap``)."""
     submission = campaign.execution_values["submission"]
     cluster = campaign.execution_values["cluster"]
     return {
-        "max_admission_cases": int(submission["max_admission_cases"]),
+        "max_admission_cases": submission["max_admission_cases"],
         "poll_interval_seconds": int(submission["poll_interval_seconds"]),
         "node_jobs": int(cluster["node_jobs"]),
         "cores_per_case": int(cluster["cores_per_case"]),
@@ -264,7 +270,6 @@ def _submission_config(campaign: config_service.CampaignConfig) -> dict[str, Any
         "memory_per_case": cluster["memory_per_case"],
         "node_job_memory": cluster["node_job_memory"],
         "node_job_wall_time": cluster["node_job_wall_time"],
-        "maximum_failed_cases": int(campaign.execution_values["runtime"]["maximum_failed_cases"]),
         "license_wait": copy.deepcopy(campaign.execution_values["runtime"]["license_wait"]),
         "partition": cluster["partition"],
         "scheduler_options": list(cluster["scheduler_options"]),
@@ -274,11 +279,6 @@ def _submission_config(campaign: config_service.CampaignConfig) -> dict[str, Any
 def _node_ticket_capacity(submission_config: Mapping[str, Any]) -> int:
     """Return the unresolved dispatches one node job may hold: two per concurrent case slot."""
     return _DISPATCH_TICKETS_PER_CASE_SLOT * int(submission_config["concurrent_cases_per_node"])
-
-
-def _maximum_dispatch_capacity(submission_config: Mapping[str, Any]) -> int:
-    """Return the unresolved dispatches all node jobs of the campaign may hold together."""
-    return int(submission_config["node_jobs"]) * _node_ticket_capacity(submission_config)
 
 
 _EXECUTION_RESOURCE_PATHS = (
@@ -325,7 +325,7 @@ def _assert_execution_resource_compatibility(original: Mapping[str, Any], reques
 
 def _execution_binding(manifest: Mapping[str, Any], *, submission_index: int | None = None) -> dict[str, Any]:
     """Return the exact source and resources owning one submission epoch."""
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 evidence boundary
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- evidence boundary
 
     epochs = lifecycle_service.execution_epochs(manifest)
     if epochs:
@@ -454,8 +454,12 @@ def _task_from_payload(
 
 
 def _profile_job_code(campaign: config_service.CampaignConfig) -> str:
-    """Return the compact readable profile component for Slurm names."""
-    return "td" if campaign.profile.id == "transient_drying" else "sf"
+    """Return the compact readable profile component for Slurm names; a profile outside the registry has none."""
+    code = _PROFILE_JOB_CODES.get(campaign.profile.id)
+    if code is None:
+        message = f"Unknown simulation profile {campaign.profile.id!r} for a Slurm job name. Available profiles: {', '.join(_PROFILE_JOB_CODES)}."
+        raise ValueError(message)
+    return code
 
 
 def _step_name(
@@ -543,9 +547,9 @@ def _new_campaign_manifest(
     }
     snapshot_path = os.environ.get("GENERATION_SOURCE_SNAPSHOT")
     snapshot_sha256 = os.environ.get("GENERATION_SOURCE_SNAPSHOT_SHA256")
-    if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION and snapshot_path is not None:
+    if snapshot_path is not None:
         if snapshot_sha256 is None:
-            message = "Canonical campaign source snapshot lacks its exact manifest hash."
+            message = "Campaign source snapshot lacks its exact manifest hash."
             raise ValueError(message)
         manifest["source_snapshot"] = {
             "path": snapshot_path,
@@ -579,7 +583,6 @@ def plan_campaign(
     time_limit, required_seconds = cluster_service.case_step_limits(float(campaign.execution_values["runtime"]["timeout_seconds"]))
     return {
         "schema_kind": "generation_campaign_plan",
-        "schema_version": 2,
         "state": "planned",
         "filesystem_mutated": False,
         "campaign_run_id": run_id,
@@ -683,25 +686,6 @@ def _owned_current_user_queue_rows(
             raise ValueError(message)
         rows[job_id] = fields
     return rows
-
-
-def query_active_scheduler_job_ids(
-    job_ids: Sequence[str],
-) -> tuple[str, ...]:
-    """Return exact persisted jobs still visible for the current Slurm user."""
-    persisted = tuple(job_ids)
-    if len(persisted) != len(set(persisted)) or any(not isinstance(job_id, str) or _JOB_ID_PATTERN.fullmatch(job_id) is None for job_id in persisted):
-        message = "Scheduler liveness query received malformed persisted job IDs."
-        raise ValueError(message)
-    if not persisted:
-        return ()
-    command = _current_user_squeue_command("%i|%T")
-    output, error = _scheduler_output(command)
-    if error is not None:
-        message = f"squeue failed for the current scheduler user: {error}"
-        raise RuntimeError(message)
-    active = _owned_current_user_queue_rows(output, owned_job_ids=persisted, exact_field_count=2)
-    return tuple(job_id for job_id in persisted if job_id in active)
 
 
 def _parse_scheduler_rows(output: str, *, field_count: int) -> dict[str, list[str]]:
@@ -982,7 +966,7 @@ def _submit_node_job(
     config = _active_submission_config(manifest)
     site = campaign.execution_values["site"]
     cores_per_node = int(site["cores_per_node"])
-    exclusions = cluster_service.standard_node_exclusions(str(config["partition"]), cores_per_node, match="at_least")
+    exclusions = cluster_service.standard_node_exclusions(str(config["partition"]), cores_per_node)
     token = secrets.token_hex(8)
     record: dict[str, Any] = {
         "token": token,
@@ -1628,25 +1612,17 @@ def _admitted_case_attempt(
         attempt.payload.get("campaign_run_id"),
         label="attempt campaign_run_id",
     )
-    current_run_identity_valid = (
-        attempt.payload.get("campaign_run_id") == attempt_run_id
-        and attempt_run_id == current_run_id
-        and attempt.payload.get("solver_git_commit") == manifest["git_commit"]
-    )
     started = _started_dispatches(_task_submissions(manifest, task))
-    owned: list[Mapping[str, Any]] = []
-    if common.paths.campaign_run_parts(current_run_id) is not None:
-        owned = [
-            record
-            for record in started
-            if record["job_id"] == attempt.payload.get("job_id") and record["submission_index"] == attempt.payload.get("submission_index")
-        ]
-        current_run_identity_valid = (
-            attempt_run_id == current_run_id
-            and len(owned) == 1
-            and attempt.payload.get("solver_git_commit")
-            == _execution_binding(manifest, submission_index=int(owned[0]["submission_index"]))["git_commit"]
-        )
+    owned = [
+        record
+        for record in started
+        if record["job_id"] == attempt.payload.get("job_id") and record["submission_index"] == attempt.payload.get("submission_index")
+    ]
+    current_run_identity_valid = (
+        attempt_run_id == current_run_id
+        and len(owned) == 1
+        and attempt.payload.get("solver_git_commit") == _execution_binding(manifest, submission_index=int(owned[0]["submission_index"]))["git_commit"]
+    )
     if (
         not current_run_identity_valid
         or any(attempt.payload.get(key) != value for key, value in expected.items())
@@ -1733,11 +1709,9 @@ def _successful_status_summary(
         task,
         storage_root=storage_root,
     )
-    if not status_path.exists() and batch.profile.id == "transient_drying":
-        message = f"Successful transient case lacks required processed status evidence: {status_path}"
-        raise RuntimeError(message)
     if not status_path.exists():
-        return _empty_successful_status_summary()
+        message = f"Successful case {task.case_id} lacks required processed status evidence: {status_path}"
+        raise RuntimeError(message)
     if status_path.is_symlink() or not status_path.is_file():
         message = f"Processed case status path is unsafe: {status_path}"
         raise RuntimeError(message)
@@ -1776,13 +1750,9 @@ def _successful_status_summary(
                 canonical_case_path,
             )
         except (FileNotFoundError, OSError, TypeError, ValueError) as error:
-            if canonical_case_path.exists():
-                raise _successful_status_reconciliation_error(
-                    task,
-                    canonical_case_path,
-                    str(error),
-                ) from error
-            message = f"Successful transient case lacks required canonical final bulk-moisture evidence: {canonical_case_path}"
+            # The bulk moisture comes from the scientific payload, not from a presentation sidecar: an unreadable
+            # payload fails closed like a missing one, so admission and the cases view agree on every success.
+            message = f"Successful transient case lacks readable canonical final bulk-moisture evidence: {canonical_case_path}"
             raise RuntimeError(message) from error
     return {
         "quality_flag_count": count,
@@ -1911,7 +1881,7 @@ def _successful_completion_at(
 
 
 _TERMINAL_TIMESTAMP_SCHEMA_KIND: Final = "generation_terminal_timestamp_projection"
-_TERMINAL_TIMESTAMP_SCHEMA_VERSION: Final = 2
+_TERMINAL_TIMESTAMP_SCHEMA_VERSION: Final = 1
 _TERMINAL_TIMESTAMP_KEYS: Final = frozenset(
     {
         "schema_kind",
@@ -1957,12 +1927,12 @@ def _validate_terminal_timestamp_evidence(
     dispatch_key: str,
     path: Path,
 ) -> dict[str, Any]:
-    """Validate one exact schema-version-2 external timestamp projection of a dispatch."""
+    """Validate one exact external timestamp projection of a dispatch."""
     if (
         not isinstance(payload, dict)
         or set(payload) != _TERMINAL_TIMESTAMP_KEYS
         or payload.get("schema_kind") != _TERMINAL_TIMESTAMP_SCHEMA_KIND
-        or payload.get("schema_version") != _TERMINAL_TIMESTAMP_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), _TERMINAL_TIMESTAMP_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != manifest["campaign_run_id"]
         or payload.get("batch_id") != task.batch_id
         or payload.get("case_id") != task.case_id
@@ -2216,7 +2186,7 @@ def _case_reconciliation_payload(
     source_sha256: str,
     recorded_at: str,
 ) -> dict[str, Any]:
-    """Build one bounded schema-version-1 case-local classification receipt."""
+    """Build one bounded case-local classification receipt."""
     reason = " ".join(str(error).split())
     if len(reason) > _MAX_RECONCILIATION_REASON_CHARACTERS:
         reason = f"{reason[: _MAX_RECONCILIATION_REASON_CHARACTERS - 3].rstrip()}..."
@@ -2255,7 +2225,7 @@ def _validate_case_reconciliation_evidence(
         not isinstance(payload, dict)
         or set(payload) != _CASE_RECONCILIATION_KEYS
         or payload.get("schema_kind") != _CASE_RECONCILIATION_SCHEMA_KIND
-        or payload.get("schema_version") != _CASE_RECONCILIATION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), _CASE_RECONCILIATION_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != manifest["campaign_run_id"]
         or payload.get("batch_id") != task.batch_id
         or payload.get("case_id") != task.case_id
@@ -2820,41 +2790,6 @@ def _task_state(  # noqa: C901, PLR0912, PLR0915 -- centralized case evidence re
     }
 
 
-def _finalize_completed_batches(
-    campaign: config_service.CampaignConfig,
-    *,
-    storage_root: Path | str | None,
-    task_views: Sequence[Mapping[str, Any]] | None = None,
-) -> bool:
-    """Publish ready batch manifests from one reconciliation or one bounded fallback."""
-    all_complete = True
-    for batch in campaign.batches:
-        expected = {(batch.batch_id, case_index) for case_index in batch.case_indices}
-        if task_views is None:
-            references = input_service.admit_configured_input_references(
-                batch,
-                storage_root=storage_root,
-                validation_depth="evidence",
-            )
-            complete = all(
-                batch_runtime.completed_case_is_valid(
-                    batch,
-                    case_index,
-                    storage_root=storage_root,
-                    input_reference=references[case_index],
-                )
-                for case_index in batch.case_indices
-            )
-        else:
-            matching = {(str(view["batch_id"]), int(view["case_index"])): view for view in task_views if view.get("batch_id") == batch.batch_id}
-            complete = set(matching) == expected and all(view["state"] == "successful" for view in matching.values())
-        if complete:
-            batch_runtime.finalize_batch(batch, storage_root=storage_root)
-        else:
-            all_complete = False
-    return all_complete
-
-
 def _case_reconciliation_failed_view(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
@@ -2942,10 +2877,7 @@ def _campaign_input_references(
     admitted: Mapping[str, Mapping[int, admission_service.InputCaseReference]] | None = None,
 ) -> dict[str, dict[int, admission_service.InputCaseReference]]:
     """Admit each immutable input batch once for one campaign operation, reusing the references already ``admitted``."""
-    canonical = campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
-    expected_batches = {
-        batch.batch_name for batch in campaign.batches if not (canonical and isinstance(batch.scientific_values.get("supplemental_design"), dict))
-    }
+    expected_batches = {batch.batch_name for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict)}
     if set(input_sources) != expected_batches:
         message = "Campaign input-source batch membership disagrees with the active campaign."
         raise RuntimeError(message)
@@ -2954,7 +2886,7 @@ def _campaign_input_references(
         if admitted is not None and batch.batch_name in admitted:
             references[batch.batch_name] = dict(admitted[batch.batch_name])
             continue
-        if canonical and batch.batch_name not in input_sources:
+        if batch.batch_name not in input_sources:
             references[batch.batch_name] = input_service.admit_configured_input_references(
                 batch,
                 storage_root=storage_root,
@@ -3229,11 +3161,20 @@ def _prepare_supplemental_inputs(
     *,
     storage_root: Path | str | None,
     metadata_only: bool,
-) -> tuple[bool, str | None]:
-    """Admit prepared replacements or defer their spatial input generation."""
+) -> str | None:
+    """Admit prepared replacements or defer their spatial input generation; return the reason a compute feed is required.
+
+    A batch gets one replacement per failed slot once all its originals are decided, unless its minimum success rate
+    stops it. A decision recorded meanwhile that closes the deficit or stops the batch ends planning for that batch only.
+    """
     from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical feeder boundary
     from src.generation.cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- replacement deficit owner
 
+    stopped = frozenset(
+        str(item["batch_id"])
+        for item in lifecycle_service.replacement_policy(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+        if item["stopped"]
+    )
     for replacement in (batch for batch in campaign.batches if isinstance(batch.scientific_values.get("supplemental_design"), dict)):
         if metadata_only:
             try:
@@ -3244,12 +3185,11 @@ def _prepare_supplemental_inputs(
                     git_commit=str(manifest["git_commit"]),
                 )
             except FileNotFoundError:
-                return False, "supplemental_inputs_missing"
+                return "supplemental_inputs_missing"
         else:
             input_service.generate_input_cases(replacement, len(replacement.case_indices), storage_root=storage_root)
     originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
-    waiting_for_capacity = False
-    for original in originals:
+    for original in (batch for batch in originals if batch.batch_id not in stopped):
         while True:
             records = [
                 row
@@ -3259,21 +3199,102 @@ def _prepare_supplemental_inputs(
             primaries = [row for row in records if row["reservation"]["origin"] == "primary"]
             if len(primaries) != len(original.case_indices) or any(row["decision"] is None for row in primaries):
                 break
-            deficit = selection_service.replacement_deficit(records, target=len(original.case_indices))
-            if deficit < 1:
-                break
-            used = sum(row["reservation"]["origin"] == "replacement" for row in records)
-            high_water = lifecycle_service.replacement_pool_high_water(
-                campaign.profile.id, campaign.source_name, original.batch_id, storage_root=storage_root
-            )
-            if used >= high_water:
-                waiting_for_capacity = True
+            if selection_service.replacement_deficit(records, target=len(original.case_indices)) < 1:
                 break
             if metadata_only:
-                return False, "replacement_input_generation"
-            replacement = lifecycle_service.materialize_replacement_batch(campaign, original.batch_id, storage_root=storage_root)
+                return "replacement_input_generation"
+            try:
+                replacement = lifecycle_service.materialize_replacement_batch(campaign, original.batch_id, storage_root=storage_root)
+            except lifecycle_service.NoReplacementError:
+                break
             input_service.generate_input_cases(replacement, len(replacement.case_indices), storage_root=storage_root)
-    return waiting_for_capacity, None
+    return None
+
+
+def _original_batch_ids(campaign: config_service.CampaignConfig) -> dict[str, str]:
+    """Map every execution batch to its original batch: a replacement to its parent, an original to itself."""
+    designs = {batch.batch_id: batch.scientific_values.get("supplemental_design") for batch in campaign.batches}
+    return {batch_id: str(design["parent_batch_id"]) if isinstance(design, dict) else batch_id for batch_id, design in designs.items()}
+
+
+def _admission_cap(submission_config: Mapping[str, Any], campaign: config_service.CampaignConfig, policy: Sequence[Mapping[str, Any]]) -> int:
+    """Return the effective admission cap of one recorded submission config: a recorded integer stays, ``null`` is derived.
+
+    A derived cap is the Dataset plan default, each original batch's count plus the failures it tolerates at its current
+    rate, so a lowered rate raises it. Only a campaign whose every original batch carries a plan-registered first amendment
+    records ``null``; any other is refused.
+
+    Raises
+    ------
+    RuntimeError
+        If the cap is ``null`` but an original batch has no plan-registered rate.
+
+    """
+    from src.generation.cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- admission default owner
+
+    if submission_config["max_admission_cases"] is not None:
+        return int(submission_config["max_admission_cases"])
+    if not all(item["amendments"] and item["amendments"][0]["registered_by"] == "plan" for item in policy):
+        msg = "A derived admission cap (max_admission_cases null) requires a plan-registered rate for every original batch."
+        raise RuntimeError(msg)
+    counts = {batch.batch_id: len(batch.case_indices) for batch in campaign.batches}
+    return selection_service.default_admission_cap((counts[item["batch_id"]], item["minimum_success_rate"]) for item in policy)
+
+
+def _candidate_key(campaign: config_service.CampaignConfig, reservation: Mapping[str, Any]) -> tuple[str, int]:
+    """Return the execution batch and case index under which one reserved candidate is admitted."""
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical execution-batch owner
+
+    return lifecycle_service.execution_batch(campaign, reservation).batch_id, int(str(reservation["case_id"]).removeprefix("case_"))
+
+
+def _held_by_admission_cap(
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+    candidate_records: Sequence[Mapping[str, Any]],
+    stopped: Collection[str],
+    cap: int,
+) -> bool:
+    """Return whether ``cap`` fresh admissions hold back an undecided candidate of a batch that its success rate does not stop."""
+    admitted = _fresh_admission_case_keys(manifest)
+    return len(admitted) >= cap and any(
+        row["decision"] is None and row["reservation"]["batch_id"] not in stopped and _candidate_key(campaign, row["reservation"]) not in admitted
+        for row in candidate_records
+    )
+
+
+def _campaign_blocked(
+    manifest: Mapping[str, Any],
+    campaign: config_service.CampaignConfig,
+    candidate_records: Sequence[Mapping[str, Any]],
+    stopped: Collection[str],
+    *,
+    cap: int,
+) -> bool:
+    """Return whether a stopped batch or the admission cap keeps the campaign below its counts while no admissible candidate is undecided.
+
+    A stopped batch admits no fresh candidate of its own, and no batch does once ``cap`` fresh candidates are admitted,
+    so such never admitted candidates stay undecided without blocking; every admitted candidate, of any batch, must be
+    decided first. The cap blocks only after a recorded failure: a failure-free capped subset settles ``staged``.
+    """
+    admitted = _fresh_admission_case_keys(manifest)
+    capped = len(admitted) >= cap
+    for row in (row for row in candidate_records if row["decision"] is None):
+        if (row["reservation"]["batch_id"] not in stopped and not capped) or _candidate_key(campaign, row["reservation"]) in admitted:
+            return False
+    if any(row["decision"] is not None and row["decision"]["outcome"] == "failed" for row in candidate_records) and _held_by_admission_cap(
+        manifest, campaign, candidate_records, stopped, cap
+    ):
+        return True
+    return any(
+        sum(
+            row["reservation"]["batch_id"] == batch.batch_id and row["decision"] is not None and row["decision"]["outcome"] == "successful"
+            for row in candidate_records
+        )
+        < len(batch.case_indices)
+        for batch in campaign.batches
+        if batch.batch_id in stopped
+    )
 
 
 def _reconcile_success_decisions(
@@ -3343,7 +3364,7 @@ def _reconcile_runtime_failure_decisions(
     it belongs to the case's latest started dispatch, that dispatch has terminal step accounting, and no dispatch of the
     case is active. Anything else, an unclassified solver failure included, waits for an explicit decision.
     """
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 terminal decision owner
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- terminal decision owner
 
     if manifest["submission_intent"] is not None or manifest["node_job_intent"] is not None:
         return False
@@ -3364,7 +3385,7 @@ def _reconcile_runtime_failure_decisions(
     return recorded
 
 
-def feed_campaign(  # noqa: PLR0911 -- the sole feeder returns once per settled, deferred, or dispatched outcome
+def feed_campaign(
     run_id: str,
     *,
     storage_root: Path | str | None = None,
@@ -3374,11 +3395,13 @@ def feed_campaign(  # noqa: PLR0911 -- the sole feeder returns once per settled,
     resolved_campaign: config_service.CampaignConfig | None = None,
     explicit_submission: bool = False,
     metadata_only: bool = False,
+    reclassified: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reconcile jobs; metadata-only continuation defers input generation and batch admission.
 
     A compute-required return is transient command evidence, never a persisted
     campaign state. The scheduled caller re-enters this same sole feeder lock.
+    ``reclassified`` receives, inside that lock, the dispatch records this feed persisted as not started.
     """
     lock_path = common.paths.resolve_generation_submission_lock_path(campaign_evidence.campaign_run_directory(run_id, storage_root=storage_root))
     with common.locking.exclusive_file_lock(lock_path, blocking=False):
@@ -3390,39 +3413,49 @@ def feed_campaign(  # noqa: PLR0911 -- the sole feeder returns once per settled,
             _apply_cancellation(manifest, resolved_campaign, force=False, explicit=False, storage_root=storage_root)
             return manifest
         campaign = campaign_evidence.campaign_from_manifest(manifest) if resolved_campaign is None else resolved_campaign
-        blocked = False
-        if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-            from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 append-only feeder boundary
+        # The frozen plan copies its recorded producer identity, so continuation must compare it with the running Source implementation.
+        common.code_identity.require_current_implementation(
+            source_service.GENERATION_SOURCE_PROJECTION,
+            (campaign.producer_identity or {}).get("source_implementation_sha256"),
+            unit=f"Source campaign {campaign.source_name!r}",
+            remedy="finish it in its bound source tree or start a new Source with --revision <label>",
+        )
+        from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- append-only feeder boundary
 
-            waiting_for_capacity, compute_reason = _prepare_supplemental_inputs(
-                manifest,
-                campaign,
-                storage_root=storage_root,
-                metadata_only=metadata_only,
-            )
-            if compute_reason is not None:
-                return _compute_required_continuation(manifest, reason=compute_reason)
-            campaign = lifecycle_service.campaign_from_frozen_run(manifest)
-            binding = _execution_binding(manifest)
-            if "execution_values" in binding:
-                campaign = lifecycle_service.campaign_with_execution(campaign, binding["execution_values"])
-            blocked = waiting_for_capacity and not any(
-                row["decision"] is None
-                for row in lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-            )
+        compute_reason = _prepare_supplemental_inputs(
+            manifest,
+            campaign,
+            storage_root=storage_root,
+            metadata_only=metadata_only,
+        )
+        if compute_reason is not None:
+            return _compute_required_continuation(manifest, reason=compute_reason)
+        campaign = lifecycle_service.campaign_from_frozen_run(manifest)
+        binding = _execution_binding(manifest)
+        if "execution_values" in binding:
+            campaign = lifecycle_service.campaign_with_execution(campaign, binding["execution_values"])
+        records = lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+        policy = lifecycle_service.replacement_policy(campaign.profile.id, campaign.source_name, storage_root=storage_root, records=records)
+        stopped = frozenset(str(item["batch_id"]) for item in policy if item["stopped"])
+        max_admission_cases = _admission_cap(binding["submission_config"], campaign, policy)
+        blocked = _campaign_blocked(manifest, campaign, records, stopped, cap=max_admission_cases)
         tasks = cluster_service.campaign_tasks(campaign)
         if not _recover_node_job_intent(manifest, storage_root=storage_root):
             return manifest
         scheduler = _scheduler_evidence(manifest["slurm_job_ids"])
         _require_scheduler_evidence(scheduler)
+        known = {int(record["submission_index"]) for record in manifest["submissions"] if record["status"] == "not_started"}
         _maintain_node_jobs(manifest, campaign, scheduler, storage_root=storage_root)
         scheduler = _persist_not_started_dispatches(
-            manifest,
-            _dispatch_evidence(manifest, scheduler, storage_root=storage_root),
-            storage_root=storage_root,
+            manifest, _dispatch_evidence(manifest, scheduler, storage_root=storage_root), storage_root=storage_root
         )
+        if reclassified is not None:
+            # Both ways a feed reclassifies a dispatch (an interrupted dispatch, a dispatch proven never started) run above.
+            reclassified.extend(
+                record for record in manifest["submissions"] if record["status"] == "not_started" and int(record["submission_index"]) not in known
+            )
         if blocked:
-            # Every candidate is decided and no replacement remains: drain the open node jobs as a completion does.
+            # Every admitted candidate is decided and a stopped batch or the cap keeps a count unreached: drain the node jobs as a completion does.
             return _settle_campaign(manifest, "blocked", scheduler, storage_root=storage_root)
         submission_index = _submission_index(manifest)
         task_views, pending_jobs, running_jobs = _reconciled(
@@ -3436,72 +3469,59 @@ def feed_campaign(  # noqa: PLR0911 -- the sole feeder returns once per settled,
             tasks=tasks,
             submission_index=submission_index,
         )
-        successful = [view for view in task_views if view["state"] == "successful"]
-        operational_retries: tuple[Mapping[str, Any], ...] = ()
-        if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-            reconciled = _reconcile_success_decisions(
-                manifest,
-                campaign,
-                task_views,
-                lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root),
-                scheduler,
-                metadata_only=metadata_only,
-                storage_root=storage_root,
+        reconciled = _reconcile_success_decisions(
+            manifest,
+            campaign,
+            task_views,
+            lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root),
+            scheduler,
+            metadata_only=metadata_only,
+            storage_root=storage_root,
+        )
+        if reconciled is None:
+            return _compute_required_continuation(manifest, reason="success_decision_reconciliation")
+        # A new failure decision frees its slot. The next feed plans the replacement (or ends blocked) before it can
+        # dispatch, so this feed neither drains an idle node job nor settles.
+        if _reconcile_runtime_failure_decisions(manifest, campaign, reconciled, scheduler, storage_root=storage_root):
+            return manifest
+        candidate_records = reconciled
+        originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+        complete = all(row["decision"] is not None for row in candidate_records) and all(
+            sum(row["reservation"]["origin"] == "primary" and row["reservation"]["batch_id"] == batch.batch_id for row in candidate_records)
+            == len(batch.case_indices)
+            and sum(
+                row["decision"] is not None and row["decision"]["outcome"] == "successful" and row["reservation"]["batch_id"] == batch.batch_id
+                for row in candidate_records
             )
-            if reconciled is None:
-                return _compute_required_continuation(manifest, reason="success_decision_reconciliation")
-            # A new failure decision frees its slot. The next feed plans the replacement (or ends blocked) before it can
-            # dispatch, so this feed neither drains an idle node job nor settles.
-            if _reconcile_runtime_failure_decisions(manifest, campaign, reconciled, scheduler, storage_root=storage_root):
-                return manifest
-            candidate_records = reconciled
-            originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
-            complete = all(row["decision"] is not None for row in candidate_records) and all(
-                sum(row["reservation"]["origin"] == "primary" and row["reservation"]["batch_id"] == batch.batch_id for row in candidate_records)
-                == len(batch.case_indices)
-                and sum(
-                    row["decision"] is not None and row["decision"]["outcome"] == "successful" and row["reservation"]["batch_id"] == batch.batch_id
-                    for row in candidate_records
-                )
-                >= len(batch.case_indices)
-                for batch in originals
-            )
-            if complete:
-                from .publication import generation_publication_catalog as catalog_service  # noqa: PLC0415 -- derived view of the settled campaign
+            >= len(batch.case_indices)
+            for batch in originals
+        )
+        if complete:
+            from .publication import generation_publication_catalog as catalog_service  # noqa: PLC0415 -- derived view of the settled campaign
 
-                lifecycle_service.seal_selected_pool(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-                common.serialization.atomic_write_text(
-                    common.paths.resolve_generation_campaign_directory(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-                    / common.paths.GENERATION_CASES_VIEW_FILENAME,
-                    catalog_service.campaign_cases_csv(campaign.profile.id, campaign.source_name, storage_root=storage_root),
-                )
-                return _settle_campaign(manifest, "complete", scheduler, storage_root=storage_root)
-        if campaign.schema_version != config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION and len(successful) == len(task_views):
-            if metadata_only:
-                return _compute_required_continuation(manifest, reason="batch_artifact_admission")
-            _finalize_completed_batches(
-                campaign,
-                storage_root=storage_root,
-                task_views=task_views,
+            lifecycle_service.seal_selected_pool(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+            common.serialization.atomic_write_text(
+                common.paths.resolve_generation_campaign_directory(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+                / common.paths.GENERATION_CASES_VIEW_FILENAME,
+                catalog_service.campaign_cases_csv(campaign.profile.id, campaign.source_name, storage_root=storage_root),
             )
             return _settle_campaign(manifest, "complete", scheduler, storage_root=storage_root)
         if any(view["state"] == "scheduler_unknown" for view in task_views):
             return _set_campaign_state(manifest, "scheduler_unknown", storage_root=storage_root)
         if any(view["state"] == "license_blocked" and view["license_wait_exhausted"] is True for view in task_views):
             return _settle_campaign(manifest, "license_wait_exhausted", scheduler, storage_root=storage_root)
-        if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-            operational_retries = _unexpected_operational_failure_views(campaign, candidate_records, task_views, scheduler)
-            if operational_retries and not explicit_submission:
-                first = operational_retries[0]
-                message = (
-                    "Campaign stopped automatic feeding after an unexpected controller or publication error "
-                    f"for {first['case_id']} in Slurm step dispatch {first['latest_job_id']}. "
-                    "Inspect the retained attempt, then explicitly rerun the same campaign config to retry."
-                )
-                raise RuntimeError(message)
-            if explicit_submission and any(str(view["latest_job_id"]) not in scheduler["accounted"] for view in operational_retries):
-                msg = "An explicit operational retry requires terminal step accounting for its previous dispatch."
-                raise RuntimeError(msg)
+        operational_retries = _unexpected_operational_failure_views(campaign, candidate_records, task_views, scheduler)
+        if operational_retries and not explicit_submission:
+            first = operational_retries[0]
+            message = (
+                "Campaign stopped automatic feeding after an unexpected controller or publication error "
+                f"for {first['case_id']} in Slurm step dispatch {first['latest_job_id']}. "
+                "Inspect the retained attempt, then explicitly rerun the same campaign config to retry."
+            )
+            raise RuntimeError(message)
+        if explicit_submission and any(str(view["latest_job_id"]) not in scheduler["accounted"] for view in operational_retries):
+            msg = "An explicit operational retry requires terminal step accounting for its previous dispatch."
+            raise RuntimeError(msg)
 
         return _fill_submission_capacity(
             manifest,
@@ -3516,6 +3536,8 @@ def feed_campaign(  # noqa: PLR0911 -- the sole feeder returns once per settled,
             tasks=tasks,
             submission_index=submission_index,
             operational_retries=operational_retries,
+            stopped=stopped,
+            max_admission_cases=max_admission_cases,
         )
 
 
@@ -3615,116 +3637,6 @@ def _fresh_admission_case_keys(manifest: Mapping[str, Any]) -> frozenset[tuple[s
     }
     keys.update(_admission_reservation_keys(manifest))
     return frozenset(keys)
-
-
-def _admission_summary(
-    manifest: Mapping[str, Any],
-    task_views: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Return disjoint logical admission occupancy components."""
-    categories: dict[str, set[tuple[str, int]]] = {
-        "pending": set(),
-        "starting": set(),
-        "license_waiting": set(),
-        "acquiring_license": set(),
-    }
-    for view in task_views:
-        if not _view_consumes_admission(view):
-            continue
-        key = _task_identity_key(view)
-        runtime = view.get("runtime_progress")
-        acquiring = view.get("license_retry_active") is True or (
-            view.get("state") == "active" and isinstance(runtime, dict) and runtime.get("phase") in {"starting_solver", "acquiring_comsol_license"}
-        )
-        if acquiring:
-            category = "acquiring_license"
-        elif view["state"] == "license_blocked":
-            category = "license_waiting"
-        elif view["state"] == "pending":
-            category = "pending"
-        else:
-            category = "starting"
-        categories[category].add(key)
-    for key in _admission_reservation_keys(manifest):
-        for values in categories.values():
-            values.discard(key)
-        categories["starting"].add(key)
-    intent = _submission_intent(manifest)
-    if intent is not None:
-        key, mode = intent
-        for values in categories.values():
-            values.discard(key)
-        categories["acquiring_license" if mode == "license_retry" else "starting"].add(key)
-    components = {name: len(values) for name, values in categories.items()}
-    admission_count = sum(components.values())
-    expected = len(_logical_admission_case_keys(manifest, task_views))
-    if admission_count != expected:
-        message = "Campaign admission components do not match logical membership."
-        raise RuntimeError(message)
-    maximum = int(_active_submission_config(manifest)["max_admission_cases"])
-    return {
-        "count": admission_count,
-        "maximum": maximum,
-        "components": components,
-    }
-
-
-def _failure_population_counts(
-    task_views: Sequence[Mapping[str, Any]],
-) -> dict[str, int]:
-    """Return precise disjoint failure and operational populations."""
-    return {
-        "solver_failed": sum(
-            view["state"] == "failed" and view.get("failure_stage") == "solver" and view.get("temporary_license_retry") is None for view in task_views
-        ),
-        "technical_runtime_timed_out": sum(view["state"] == "timed_out" and view.get("temporary_license_retry") is None for view in task_views),
-        "conversion_failed": sum(view["state"] == "conversion_failed" for view in task_views),
-        "publication_failed": sum(view["state"] == "publication_failed" for view in task_views),
-        "case_reconciliation_failed": sum(view["state"] == "case_reconciliation_failed" for view in task_views),
-        "license_blocked": sum(view["state"] == "license_blocked" for view in task_views),
-    }
-
-
-def _solver_failure_threshold_exceeded(
-    task_views: Sequence[Mapping[str, Any]],
-    *,
-    maximum_failed_cases: int,
-) -> bool:
-    """Return whether solver failures and timeouts exceed the configured budget."""
-    counts = _failure_population_counts(task_views)
-    return counts["solver_failed"] + counts["technical_runtime_timed_out"] > maximum_failed_cases
-
-
-def _normal_admission_status(
-    manifest: Mapping[str, Any],
-    task_views: Sequence[Mapping[str, Any]],
-) -> tuple[bool, str | None]:
-    """Return whether eligible fresh work is prevented from admission."""
-    restart_available = any(view["state"] in {"cancelled", "interrupted"} for view in task_views)
-    fresh_available = any(view["state"] == "never_started" for view in task_views)
-    if not restart_available and not fresh_available:
-        return False, None
-    submission_config = _active_submission_config(manifest)
-    if manifest.get("submission_intent") is not None or manifest.get("node_job_intent") is not None:
-        return True, "submission_intent_unresolved"
-    if sum(view["state"] in {"pending", "active"} for view in task_views) >= _maximum_dispatch_capacity(submission_config):
-        return True, "node_capacity_reached"
-    admission_count = len(_logical_admission_case_keys(manifest, task_views))
-    maximum_admission_cases = int(submission_config["max_admission_cases"])
-    if admission_count > maximum_admission_cases or len(_fresh_admission_case_keys(manifest)) > maximum_admission_cases:
-        return True, "max_admission_cases_exceeded"
-    if fresh_available and len(_fresh_admission_case_keys(manifest)) >= maximum_admission_cases:
-        return True, "max_admission_cases_reached"
-    if (
-        fresh_available
-        and not restart_available
-        and _solver_failure_threshold_exceeded(
-            task_views,
-            maximum_failed_cases=int(submission_config["maximum_failed_cases"]),
-        )
-    ):
-        return True, "solver_failure_threshold_exceeded"
-    return False, None
 
 
 def _parse_utc_timestamp(value: str, *, label: str) -> datetime:
@@ -3874,7 +3786,6 @@ def _preverified_repository_commit(
 
 
 def _settled_admission_state(
-    campaign: config_service.CampaignConfig,
     task_views: Sequence[Mapping[str, Any]],
     *,
     fresh_admission_cases: int,
@@ -3882,8 +3793,7 @@ def _settled_admission_state(
 ) -> str:
     """Distinguish a successful capped subset from unresolved case failures."""
     staged = (
-        campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
-        and fresh_admission_cases >= max_admission_cases
+        fresh_admission_cases >= max_admission_cases
         and any(view["state"] == "successful" for view in task_views)
         and any(view["state"] == "never_started" for view in task_views)
         and all(view["state"] in {"successful", "never_started"} for view in task_views)
@@ -3920,13 +3830,17 @@ def _fill_submission_capacity(
     tasks: Sequence[cluster_service.CampaignTask] | None = None,
     submission_index: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]] | None = None,
     operational_retries: Sequence[Mapping[str, Any]] = (),
+    stopped: Collection[str] = (),
+    max_admission_cases: int,
 ) -> dict[str, Any]:
-    """Dispatch owned retries and admit fresh cases within one logical pool, submitting a node job on a free seat when none has room."""
+    """Dispatch owned retries and admit fresh cases within one logical pool, submitting a node job on a free seat when none has room.
+
+    A case of a ``stopped`` original batch is never admitted fresh; its admitted cases still run, restart and retry.
+    ``max_admission_cases`` is the feed's effective cap (``_admission_cap``).
+    """
     effective_submission = _active_submission_config(manifest)
-    max_admission_cases = int(effective_submission["max_admission_cases"])
     node_job_limit = int(effective_submission["node_jobs"])
     ticket_capacity = _node_ticket_capacity(effective_submission)
-    maximum_failed_cases = int(effective_submission["maximum_failed_cases"])
     repository_verified = _preverified_repository_commit(
         manifest,
         verified_repository_commit,
@@ -3981,14 +3895,14 @@ def _fill_submission_capacity(
     reserved = deque(
         view for view in task_views if view["state"] in {"admission_waiting", "never_started"} and _task_identity_key(view) in reservation_keys
     )
+    original_batch_ids = _original_batch_ids(campaign)
     unsent = deque(
         view
         for view in task_views
-        if view["state"] == "never_started" and _task_identity_key(view) not in reservation_keys and _task_identity_key(view) not in not_started_keys
-    )
-    circuit_breaker_tripped = _solver_failure_threshold_exceeded(
-        task_views,
-        maximum_failed_cases=maximum_failed_cases,
+        if view["state"] == "never_started"
+        and _task_identity_key(view) not in reservation_keys
+        and _task_identity_key(view) not in not_started_keys
+        and original_batch_ids[str(view["batch_id"])] not in stopped
     )
     has_license_blocked = any(view["state"] == "license_blocked" for view in task_views)
     if len(admission_keys) > max_admission_cases or len(fresh_admission_keys) > max_admission_cases:
@@ -3997,7 +3911,7 @@ def _fill_submission_capacity(
 
     while True:
         next_unsent = unsent[0] if unsent else None
-        fresh_allowed = next_unsent is not None and not circuit_breaker_tripped and len(fresh_admission_keys) < max_admission_cases
+        fresh_allowed = next_unsent is not None and len(fresh_admission_keys) < max_admission_cases
         if not (retries or restarts or reserved or fresh_allowed):
             break
         target = _dispatch_target(scheduler, open_jobs, unresolved, capacity=ticket_capacity, submitted_now=submitted_now)
@@ -4058,11 +3972,8 @@ def _fill_submission_capacity(
         next_state = "active"
     elif has_license_blocked:
         next_state = "license_blocked"
-    elif circuit_breaker_tripped and next_unsent is not None:
-        next_state = "failure_threshold_reached"
     else:
         next_state = _settled_admission_state(
-            campaign,
             task_views,
             fresh_admission_cases=len(fresh_admission_keys),
             max_admission_cases=max_admission_cases,
@@ -4109,13 +4020,12 @@ def submit_campaign(
         message = f"Shared repository commit {current_commit} does not match requested commit {requested_commit}."
         raise RuntimeError(message)
     run_id = campaign_run_id(campaign, git_commit=requested_commit)
-    if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-        if campaign.total_case_count != sum(campaign.selected_targets.values()):
-            message = "Canonical campaign submission requires its complete material success-target plan."
-            raise ValueError(message)
-        from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- versioned campaign creation boundary
+    if campaign.total_case_count != sum(campaign.selected_targets.values()):
+        message = "Campaign submission requires its complete material success-target plan."
+        raise ValueError(message)
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- campaign creation boundary
 
-        lifecycle_service.create_campaign(campaign, storage_root=storage_root)
+    lifecycle_service.create_campaign(campaign, storage_root=storage_root)
     if max_admission_cases is not None:
         if isinstance(max_admission_cases, bool) or max_admission_cases < 1:
             msg = "max_admission_cases override must be a positive integer."
@@ -4194,35 +4104,33 @@ def submit_campaign(
                     "submission_config",
                 }
             )
-            if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-                immutable_keys.discard("source_snapshot")  # Origin stays frozen; new sources belong to execution epochs.
-                immutable_keys.discard("campaign_config")  # Authored plan location is recovery evidence, independent of science.
+            immutable_keys.discard("source_snapshot")  # Origin stays frozen; new sources belong to execution epochs.
+            immutable_keys.discard("campaign_config")  # Authored plan location is recovery evidence, independent of science.
             if any(existing[key] != intent[key] for key in immutable_keys):
                 message = f"Existing campaign-run manifest conflicts with {run_id!r}."
                 raise FileExistsError(message)
             cancelled_continuation = existing["state"] in {"cancel_requested", "force_cancel_requested"}
             if cancelled_continuation:
                 _require_terminal_campaign_jobs(existing, action="continue a cancelled campaign")
-            if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-                requested = _requested_execution_binding(campaign, requested_commit)
-                previous = _execution_binding(existing)
-                from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- exact v2 continuation evidence
-
-                frozen = lifecycle_service.load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-                _assert_execution_resource_compatibility(frozen["execution_values"], campaign.execution_values)
-                if int(requested["submission_config"]["max_admission_cases"]) < int(previous["submission_config"]["max_admission_cases"]):
-                    msg = "Campaign admission capacity cannot decrease below its latest recorded execution epoch."
-                    raise ValueError(msg)
-                source_changed = any(
-                    requested[key] != previous[key] for key in ("git_commit", "source_sha256", "source_snapshot", "source_snapshot_sha256")
-                )
-                resources_changed = requested["execution_config_digest"] != previous["execution_config_digest"]
-                if (source_changed or resources_changed) and existing["state"] != "complete":
-                    _require_explicit_source_transition(run_id, source_changed=source_changed)
-                    if not cancelled_continuation:
-                        _require_terminal_campaign_jobs(existing, action="change execution binding")
-                    source_service.validate_admitted_source_before_publication()
-                    lifecycle_service.append_execution_epoch(existing, requested)
+            requested = _requested_execution_binding(campaign, requested_commit)
+            previous = _execution_binding(existing)
+            frozen = lifecycle_service.load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+            _assert_execution_resource_compatibility(frozen["execution_values"], campaign.execution_values)
+            # Effective caps at the current rates, so a switch between an explicit and a derived cap only must not decrease it.
+            policy = lifecycle_service.replacement_policy(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+            if _admission_cap(requested["submission_config"], campaign, policy) < _admission_cap(previous["submission_config"], campaign, policy):
+                msg = "Campaign admission capacity cannot decrease below its latest recorded execution epoch."
+                raise ValueError(msg)
+            source_changed = any(
+                requested[key] != previous[key] for key in ("git_commit", "source_sha256", "source_snapshot", "source_snapshot_sha256")
+            )
+            resources_changed = requested["execution_config_digest"] != previous["execution_config_digest"]
+            if (source_changed or resources_changed) and existing["state"] != "complete":
+                _require_explicit_source_transition(run_id, source_changed=source_changed)
+                if not cancelled_continuation:
+                    _require_terminal_campaign_jobs(existing, action="change execution binding")
+                source_service.validate_admitted_source_before_publication()
+                lifecycle_service.append_execution_epoch(existing, requested)
             if cancelled_continuation:
                 source_service.validate_admitted_source_before_publication()
                 existing["state"] = "active"
@@ -4230,8 +4138,7 @@ def submit_campaign(
         else:
             source_service.validate_admitted_source_before_publication()
             common.serialization.atomic_write_json(path, intent)
-            if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-                lifecycle_service.append_execution_epoch(intent, _requested_execution_binding(campaign, requested_commit))
+            lifecycle_service.append_execution_epoch(intent, _requested_execution_binding(campaign, requested_commit))
     return feed_campaign(
         run_id,
         storage_root=storage_root,
@@ -4251,12 +4158,13 @@ def resume_campaign(
     status_callback: Callable[[Mapping[str, Any]], None] | None = None,
     progress: Callable[[Mapping[str, Any]], None] | None = None,
     metadata_only: bool = False,
+    reclassified: list[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Continue one canonical frozen campaign through its sole scheduler feeder."""
+    """Continue one canonical frozen campaign through its sole scheduler feeder; ``reclassified`` is passed to it."""
     if common.paths.campaign_run_parts(run_id) is None:
         message = "Campaign resume requires a canonical source campaign execution handle."
         raise ValueError(message)
-    result = feed_campaign(run_id, storage_root=storage_root, progress=progress, metadata_only=metadata_only)
+    result = feed_campaign(run_id, storage_root=storage_root, progress=progress, metadata_only=metadata_only, reclassified=reclassified)
     if status_callback is not None:
         status_callback(campaign_status(run_id, storage_root=storage_root))
     return result
@@ -4273,7 +4181,7 @@ def declare_candidate_failure(
 ) -> Path:
     """Explicitly terminalize one failed solver/validation candidate after exact admission."""
     if common.paths.campaign_run_parts(run_id) is None:
-        message = "Explicit candidate failure decisions require a canonical v2 campaign."
+        message = "Explicit candidate failure decisions require a canonical source campaign."
         raise ValueError(message)
     if re.fullmatch(r"[a-z][a-z0-9_]*", reason_code) is None or not detail.strip():
         message = "Terminal candidate failure requires a stable reason code and non-empty detail."
@@ -4283,7 +4191,7 @@ def declare_candidate_failure(
         message = "A candidate decision cannot be declared during uncertain submission or after campaign completion."
         raise RuntimeError(message)
     campaign = campaign_evidence.campaign_from_manifest(manifest)
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 terminal decision owner
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- terminal decision owner
 
     records = [
         row
@@ -4322,7 +4230,7 @@ def _failure_decision_blocker(
     manifest: Mapping[str, Any], campaign: config_service.CampaignConfig, record: Mapping[str, Any], scheduler: Mapping[str, Any]
 ) -> str | None:
     """Return why one undecided candidate cannot take a failed decision now, or ``None`` when its exhausted attempt allows one."""
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 terminal decision owner
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- terminal decision owner
 
     attempts = record["attempts"]
     if not attempts or attempts[-1]["class"] not in {"solver", "validation"} or attempts[-1]["retryable"] is not False:
@@ -4344,7 +4252,7 @@ def _record_failure_decision(
     storage_root: Path | str | None,
 ) -> Path:
     """Commit the failed terminal decision of one admitted candidate with its input, attempt, and provenance evidence."""
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 terminal decision owner
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- terminal decision owner
 
     material, case_id = str(record["reservation"]["material_family"]), str(record["reservation"]["case_id"])
     attempts = record["attempts"]
@@ -4403,25 +4311,25 @@ def _record_failure_decision(
     )
 
 
-def amend_replacement_capacity(
+def amend_minimum_success_rate(
     run_id: str,
     material: str,
     regime: str,
     *,
-    capacity: int,
+    minimum_success_rate: float,
     reason: str,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Explicitly raise one original batch's total replacement capacity for a campaign run.
+    """Explicitly lower one original batch's minimum success rate for a campaign run and record why.
 
-    Dataset plans pre-register their capacity at campaign creation; this operation
-    serves campaigns without one and records its amendment as explicit.
+    Dataset plans pre-register their rate at campaign creation, other campaigns start at 1; this operation records
+    every later lowering as explicit, so a stopped batch admits candidates again while its bound reaches the new rate.
     """
     parts = common.paths.campaign_run_parts(run_id)
     if parts is None:
-        message = "Replacement capacity amendments require a canonical v2 campaign."
+        message = "Minimum success rate amendments require a canonical source campaign."
         raise ValueError(message)
-    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- v2 capacity amendment owner
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- rate amendment owner
 
     task, campaign_name = parts
     plan = lifecycle_service.load_campaign_plan(task, campaign_name, storage_root=storage_root)
@@ -4430,17 +4338,16 @@ def amend_replacement_capacity(
         message = f"Campaign {campaign_name!r} has no unique original batch for material {material!r} and regime {regime!r}."
         raise ValueError(message)
     batch_id = str(matches[0]["batch_id"])
-    previous = lifecycle_service.replacement_pool_high_water(task, campaign_name, batch_id, storage_root=storage_root)
-    high_water = lifecycle_service.amend_replacement_pool(
-        task, campaign_name, batch_id, high_water=capacity, reason=reason, storage_root=storage_root
+    previous, current = lifecycle_service.amend_minimum_success_rate(
+        task, campaign_name, batch_id, minimum_success_rate=minimum_success_rate, reason=reason, storage_root=storage_root
     )
     return {
         "campaign_run_id": run_id,
         "material_family": material,
         "sampling_regime": regime,
         "batch_id": batch_id,
-        "previous_capacity": previous,
-        "capacity": high_water,
+        "previous_minimum_success_rate": previous,
+        "minimum_success_rate": current,
     }
 
 
@@ -4455,7 +4362,7 @@ def _load_cancellation_receipt(run_id: str, *, storage_root: Path | str | None) 
     )
     if (
         raw.get("schema_kind") != "generation_campaign_cancellations"
-        or raw.get("schema_version") != _CANCELLATION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(raw.get("schema_version"), _CANCELLATION_SCHEMA_VERSION)
         or raw.get("campaign_run_id") != run_id
         or not isinstance(raw.get("attempts"), list)
     ):
@@ -4634,7 +4541,6 @@ def record_worker_interruption(
     path = directory / f"{dispatch.dispatch_key}.json"
     payload = {
         "schema_kind": "generation_worker_interruption",
-        "schema_version": 2,
         "campaign_run_id": run_id,
         "git_commit": manifest["git_commit"],
         "recorded_at": _utc_now(),
@@ -4645,54 +4551,6 @@ def record_worker_interruption(
     }
     common.serialization.atomic_write_json(path, payload)
     return path
-
-
-def _batch_status(
-    batch: config_service.GenerationConfig,
-    task_views: Sequence[Mapping[str, Any]],
-    *,
-    storage_root: Path | str | None,
-) -> dict[str, Any]:
-    """Return persistent per-batch case counts and terminal evidence."""
-    selected = [view for view in task_views if view["batch_name"] == batch.batch_name]
-    state_root = _batch_state_directory(
-        batch,
-        storage_root=storage_root,
-    )
-    quarantine = state_root / "quarantine"
-    terminal_path = (
-        batch_runtime.batch_meta_directory(
-            batch,
-            storage_root=storage_root,
-        )
-        / "batch_manifest.json"
-    )
-    failure_counts = _failure_population_counts(selected)
-    return {
-        "batch_name": batch.batch_name,
-        "batch_id": batch.batch_id,
-        "planned": len(selected),
-        "successful": sum(view["state"] == "successful" for view in selected),
-        "active": sum(view["state"] == "active" for view in selected),
-        "pending": sum(view["state"] == "pending" for view in selected),
-        "admission_waiting": sum(view["state"] == "admission_waiting" for view in selected),
-        "never_started": sum(view["state"] == "never_started" for view in selected),
-        "solver_failed": failure_counts["solver_failed"],
-        "timed_out": failure_counts["technical_runtime_timed_out"],
-        "exports_failed": sum(view["state"] == "exports_failed" for view in selected),
-        "conversion_failed": failure_counts["conversion_failed"],
-        "publication_failed": failure_counts["publication_failed"],
-        "case_reconciliation_failed": failure_counts["case_reconciliation_failed"],
-        "cancelled": sum(view["state"] == "cancelled" for view in selected),
-        "interrupted": sum(view["state"] == "interrupted" for view in selected),
-        "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in selected),
-        "license_blocked": sum(view["state"] == "license_blocked" for view in selected),
-        "license_retry_eligible": sum(view["state"] == "license_blocked" and view["license_retry_eligible"] is True for view in selected),
-        "scheduler_unknown": sum(view["state"] == "scheduler_unknown" for view in selected),
-        "quarantined": (len(tuple(quarantine.iterdir())) if quarantine.is_dir() else 0),
-        "terminal_manifest": str(terminal_path),
-        "terminal_manifest_available": terminal_path.is_file(),
-    }
 
 
 def _node_job_status(
@@ -4782,154 +4640,48 @@ def _public_task_view(view: Mapping[str, Any], terminal_decision: str | None) ->
     return {**view, "state": state, "classified_state": classified_state, "terminal_decision": terminal_decision}
 
 
-def _campaign_status_from_snapshot(
+def _success_rate_stop(
     run_id: str,
-    *,
+    originals: Sequence[config_service.GenerationConfig],
+    policy: Sequence[Mapping[str, Any]],
+) -> str | None:
+    """Name every stopped original batch below its count with k/n, its bound and s, and both ways out; ``None`` without one."""
+    from .cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- success-rate bound owner
+
+    targets = {batch.batch_id: len(batch.case_indices) for batch in originals}
+    stopped = [item for item in policy if item["stopped"] and item["successful"] < targets[item["batch_id"]]]
+    if not stopped:
+        return None
+    batches = "; ".join(
+        f"{item['material_family']} ({item['sampling_regime']}): k/n {item['successful']}/{item['decided']}, upper bound "
+        f"{selection_service.success_rate_upper_bound(item['successful'], item['decided']):.3f} < s {item['minimum_success_rate']:g}"
+        for item in stopped
+    )
+    return (
+        f"Stopped by the minimum success rate s (one-sided {selection_service.SUCCESS_RATE_CONFIDENCE:.0%} Clopper-Pearson upper bound "
+        f"of the success rate below s), so no fresh candidate is admitted: {batches}. Either fix the cause and start a new Source "
+        "(`--revision LABEL`; a Dataset plan with `--new-source --revision LABEL`), or lower s with "
+        f"`./scripts/generation amend-replacements {run_id} --material MATERIAL --regime REGIME --minimum-success-rate S --reason TEXT` "
+        "and rerun the same command."
+    )
+
+
+def _admission_cap_stop(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
-    scheduler: Mapping[str, Any],
-    task_views: Sequence[Mapping[str, Any]],
-    pending_jobs: int,
-    running_jobs: int,
-    node_jobs: Sequence[Mapping[str, Any]],
-    storage_root: Path | str | None,
-) -> dict[str, Any]:
-    """Project one already acquired reconciliation snapshot into public status."""
-    batches = [
-        _batch_status(
-            batch,
-            task_views,
-            storage_root=storage_root,
-        )
-        for batch in campaign.batches
-    ]
-    failure_counts = _failure_population_counts(task_views)
-    count_states = {
-        "planned": len(task_views),
-        "successful": sum(view["state"] == "successful" for view in task_views),
-        "active": sum(view["state"] == "active" for view in task_views),
-        "pending": sum(view["state"] == "pending" for view in task_views),
-        "admission_waiting": sum(view["state"] == "admission_waiting" for view in task_views),
-        "never_started": sum(view["state"] == "never_started" for view in task_views),
-        "solver_failed": failure_counts["solver_failed"],
-        "timed_out": failure_counts["technical_runtime_timed_out"],
-        "exports_failed": sum(view["state"] == "exports_failed" for view in task_views),
-        "conversion_failed": failure_counts["conversion_failed"],
-        "publication_failed": failure_counts["publication_failed"],
-        "case_reconciliation_failed": failure_counts["case_reconciliation_failed"],
-        "cancelled": sum(view["state"] == "cancelled" for view in task_views),
-        "interrupted": sum(view["state"] == "interrupted" for view in task_views),
-        "quality_flagged": sum(int(view["quality_flag_count"]) > 0 for view in task_views),
-        "license_blocked": failure_counts["license_blocked"],
-    }
-    unknown_cases = sum(view["state"] == "scheduler_unknown" for view in task_views)
-    license_retry_eligible_cases = sum(view["state"] == "license_blocked" and view["license_retry_eligible"] is True for view in task_views)
-    unresolved_failure_states = {
-        "failed",
-        "timed_out",
-        "exports_failed",
-        "conversion_failed",
-        "publication_failed",
-        "case_reconciliation_failed",
-    }
-    unresolved_cases = sum(view["state"] in unresolved_failure_states for view in task_views)
-    unresolved_solver_failures = failure_counts["solver_failed"] + failure_counts["technical_runtime_timed_out"]
-    maximum_failed_cases = int(_active_submission_config(manifest)["maximum_failed_cases"])
-    circuit_breaker_tripped = _solver_failure_threshold_exceeded(
-        task_views,
-        maximum_failed_cases=maximum_failed_cases,
+    records: Sequence[Mapping[str, Any]],
+    policy: Sequence[Mapping[str, Any]],
+    cap: int,
+) -> str | None:
+    """Name the effective admission ``cap`` that holds back a blocked campaign's needed candidates and the way out; ``None`` otherwise."""
+    if manifest["state"] != "blocked":
+        return None
+    if not _held_by_admission_cap(manifest, campaign, records, {str(item["batch_id"]) for item in policy if item["stopped"]}, cap):
+        return None
+    return (
+        f"Stopped at the admission cap: {len(_fresh_admission_case_keys(manifest))} fresh candidates are admitted of max_admission_cases "
+        f"{cap}, and a remaining success slot needs another. Rerun the same command with a larger `--max-admission-cases`."
     )
-    admission_blocked, admission_block_reason = _normal_admission_status(manifest, task_views)
-    publication_complete = all(batch["terminal_manifest_available"] for batch in batches)
-    has_scheduler_activity = bool(pending_jobs or running_jobs or count_states["active"] or count_states["pending"])
-    all_successful = count_states["successful"] == count_states["planned"]
-    cancellation_requested = manifest["state"] in {
-        "cancel_requested",
-        "force_cancel_requested",
-    }
-
-    if has_scheduler_activity:
-        state = "running"
-        next_command = f"status {run_id}"
-    elif manifest["submission_intent"] is not None or manifest["node_job_intent"] is not None or unknown_cases:
-        state = "submission_pending_or_unknown"
-        next_command = f"status {run_id}"
-    elif count_states["license_blocked"]:
-        state = "license_blocked"
-        next_command = f"status {run_id}"
-    elif all_successful and publication_complete:
-        state = "successful"
-        next_command = f"status {run_id}"
-    elif cancellation_requested:
-        state = "cancelled"
-        next_command = f"run {manifest['campaign_config']}"
-    elif count_states["never_started"] or count_states["cancelled"] or count_states["interrupted"] or license_retry_eligible_cases:
-        state = "feeding"
-        next_command = f"resume {run_id}"
-    elif unresolved_cases:
-        state = "completed_with_failures"
-        next_command = f"resume {run_id}"
-    else:
-        state = "feeding"
-        next_command = f"feed-campaign {run_id}"
-
-    failed_cases = unresolved_cases
-    public_task_views = [_public_task_view(view, None) for view in task_views]
-    admission = _admission_summary(manifest, task_views)
-    work_unit_counts = {
-        state: sum(view["state"] == state for view in public_task_views)
-        for state in (
-            "successful",
-            "running",
-            "scheduler_pending",
-            "license_blocked",
-            "admission_waiting",
-            "never_started",
-            "failed",
-        )
-    }
-    work_unit_counts["total"] = len(public_task_views)
-    return {
-        "campaign_run_id": run_id,
-        "campaign_state": state,
-        "campaign_purpose": campaign.campaign_purpose,
-        "git_commit": manifest["git_commit"],
-        "execution_config_digest": manifest.get("execution_config_digest"),
-        "slurm_job_ids": manifest["slurm_job_ids"],
-        "node_jobs": list(node_jobs),
-        "open_node_jobs": sum(job["open"] for job in node_jobs),
-        "node_job_intent": manifest["node_job_intent"],
-        "scheduler_log_directory": manifest["scheduler_log_directory"],
-        "submission_config": manifest["submission_config"],
-        "counts": count_states,
-        "planned_cases": count_states["planned"],
-        "completed_cases": count_states["successful"],
-        "failed_cases": failed_cases,
-        "pending_jobs": pending_jobs,
-        "running_jobs": running_jobs,
-        "unsent_cases": count_states["never_started"],
-        "unknown_cases": unknown_cases,
-        "license_blocked_cases": count_states["license_blocked"],
-        "status_artifact_recovery_count": sum(int(view.get("status_artifact_recovery_count", 0)) for view in task_views),
-        "admission": admission,
-        "license_retry_eligible_cases": license_retry_eligible_cases,
-        "failure_counts": failure_counts,
-        "unresolved_solver_failed_cases": unresolved_solver_failures,
-        "admission_blocked": admission_blocked,
-        "admission_block_reason": admission_block_reason,
-        "maximum_failed_cases": maximum_failed_cases,
-        "failure_circuit_breaker_tripped": circuit_breaker_tripped,
-        "cancellation_requested": cancellation_requested,
-        "squeue": manifest_scheduler_view(scheduler["squeue"]),
-        "sacct": manifest_scheduler_view(scheduler["sacct"]),
-        "sacct_steps": manifest_scheduler_view(scheduler["sacct_steps"]),
-        "batches": batches,
-        "cases": public_task_views,
-        "work_unit_counts": work_unit_counts,
-        "remote_storage_root": manifest["remote_storage_root"],
-        "campaign_meta_directory": manifest["campaign_meta_directory"],
-        "suggested_next_command": next_command,
-    }
 
 
 def campaign_status(
@@ -4955,87 +4707,77 @@ def campaign_status(
         storage_root=storage_root,
     )
     node_jobs = _node_job_status(manifest, scheduler, storage_root=storage_root)
-    if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-        from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical status evidence
-        from src.generation.cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- canonical selected counts
+    from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical status evidence
+    from src.generation.cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- canonical selected counts
 
-        records = lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-        by_case = {(row["reservation"]["material_family"], row["reservation"]["case_id"]): row for row in records}
-        originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
-        by_batch = {
-            batch.batch_id: selection_service.candidate_summary(
-                [row for row in records if row["reservation"]["batch_id"] == batch.batch_id], target=len(batch.case_indices)
-            )
-            for batch in originals
-        }
-        counts = {
-            key: sum(summary[key] for summary in by_batch.values())
-            for key in (
-                "primary",
-                "replacement",
-                "successful",
-                "terminal_failed",
-                "active",
-                "retryable",
-                "pending_validation",
-                "active_or_retryable",
-                "selected",
-                "surplus",
-                "replacement_deficit",
-            )
-        }
-        windows = {batch.batch_name: _persisted_time_window(batch, storage_root=storage_root) for batch in campaign.batches}
-        return {
-            "campaign_run_id": run_id,
-            "campaign_state": manifest["state"],
-            "campaign_name": campaign.campaign_name,
-            "source_name": campaign.source_name,
-            "campaign_purpose": campaign.campaign_purpose,
-            "root_seed": campaign.root_seed,
-            "counts": counts,
-            "batches": by_batch,
-            "cases": [
-                {
-                    **_public_task_view(view, None),
-                    **_candidate_lineage(by_case.get((view["material"], view["case_id"]))),  # carries the recorded terminal_decision
-                    **windows[view["batch_name"]],
-                }
-                for view in task_views
-            ],
-            "pending_jobs": pending_jobs,
-            "running_jobs": running_jobs,
-            "slurm_job_ids": list(manifest["slurm_job_ids"]),
-            "node_jobs": node_jobs,
-            "open_node_jobs": sum(job["open"] for job in node_jobs),
-            "node_job_intent": manifest["node_job_intent"],
-            "submission_unknown": manifest["submission_intent"] is not None
-            or manifest["node_job_intent"] is not None
-            or manifest["state"] == "submission_unknown",
-            "suggested_next_command": (
-                f"./scripts/generation status {run_id}"
-                if campaign.authored_value is not None
-                else f"./scripts/generation run {manifest['campaign_config']}"
-            ),
-        }
-    return _campaign_status_from_snapshot(
-        run_id,
-        manifest=manifest,
-        campaign=campaign,
-        scheduler=scheduler,
-        task_views=task_views,
-        pending_jobs=pending_jobs,
-        running_jobs=running_jobs,
-        node_jobs=node_jobs,
-        storage_root=storage_root,
-    )
-
-
-def manifest_scheduler_view(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Return scheduler output without duplicating parsed internal maps."""
+    records = lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+    by_case = {(row["reservation"]["material_family"], row["reservation"]["case_id"]): row for row in records}
+    originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+    by_batch = {
+        batch.batch_id: selection_service.candidate_summary(
+            [row for row in records if row["reservation"]["batch_id"] == batch.batch_id], target=len(batch.case_indices)
+        )
+        for batch in originals
+    }
+    counts = {
+        key: sum(summary[key] for summary in by_batch.values())
+        for key in (
+            "primary",
+            "replacement",
+            "successful",
+            "terminal_failed",
+            "active",
+            "retryable",
+            "pending_validation",
+            "active_or_retryable",
+            "selected",
+            "surplus",
+            "replacement_deficit",
+        )
+    }
+    windows = {batch.batch_name: _persisted_time_window(batch, storage_root=storage_root) for batch in campaign.batches}
+    policy = lifecycle_service.replacement_policy(campaign.profile.id, campaign.source_name, storage_root=storage_root, records=records)
+    binding = _execution_binding(manifest)
+    cap = _admission_cap(binding["submission_config"], campaign, policy)
     return {
-        "command": list(value["command"]),
-        "output": value["output"],
-        "error": value["error"],
+        "campaign_run_id": run_id,
+        "campaign_state": manifest["state"],
+        "campaign_name": campaign.campaign_name,
+        "source_name": campaign.source_name,
+        "campaign_purpose": campaign.campaign_purpose,
+        "root_seed": campaign.root_seed,
+        "git_commit": binding["git_commit"],
+        "execution_config_digest": binding["execution_config_digest"],
+        # The active submission config as recorded (a null cap is derived); ``admission`` holds the effective cap.
+        "submission_config": binding["submission_config"],
+        "admission": {"count": len(_fresh_admission_case_keys(manifest)), "maximum": cap},
+        "counts": counts,
+        "batches": by_batch,
+        "replacement_policy": policy,
+        "success_rate_stop": _success_rate_stop(run_id, originals, policy),
+        "admission_cap_stop": _admission_cap_stop(manifest, campaign, records, policy, cap),
+        "cases": [
+            {
+                **_public_task_view(view, None),
+                **_candidate_lineage(by_case.get((view["material"], view["case_id"]))),  # carries the recorded terminal_decision
+                **windows[view["batch_name"]],
+            }
+            for view in task_views
+        ],
+        "pending_jobs": pending_jobs,
+        "running_jobs": running_jobs,
+        "slurm_job_ids": list(manifest["slurm_job_ids"]),
+        "node_jobs": node_jobs,
+        "open_node_jobs": sum(job["open"] for job in node_jobs),
+        "node_job_intent": manifest["node_job_intent"],
+        "submission_unknown": manifest["submission_intent"] is not None
+        or manifest["node_job_intent"] is not None
+        or manifest["state"] == "submission_unknown",
+        "suggested_next_command": (
+            f"./scripts/generation status {run_id}"
+            if campaign.authored_value is not None
+            else f"./scripts/generation run {manifest['campaign_config']}"
+        ),
     }
 
 
@@ -5154,7 +4896,7 @@ def run_campaign_case_job(
         message = "Campaign case worker checkout does not match its admitted execution source."
         raise RuntimeError(message)
     campaign = campaign_evidence.campaign_from_manifest(manifest)
-    if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION and "execution_values" in binding:
+    if "execution_values" in binding:
         from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- exact worker execution binding
 
         campaign = lifecycle_service.campaign_with_execution(campaign, binding["execution_values"])
@@ -5198,49 +4940,48 @@ def run_campaign_case_job(
             input_references=input_references,
         )
     except Exception as error:
-        if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-            from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- campaign case evidence boundary
+        from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- campaign case evidence boundary
 
-            attempts = [
-                row
-                for row in lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-                if row["reservation"]["material_family"] == batch.material_family and row["reservation"]["case_id"] == task.case_id
-            ]
-            if len(attempts) != 1:
-                message = "Campaign candidate reservation is missing during failed case reconciliation."
-                raise RuntimeError(message) from error
-            failure_stage = str(getattr(error, "failure_stage", "controller"))
-            failure_class = (
-                "solver"
-                if failure_stage == "solver"
-                else "validation"
-                if failure_stage in {"exports", "conversion"}
-                else "publication"
-                if failure_stage == "publication"
-                else "controller"
-            )
-            # A solver attempt records how the runtime classified the stop; the exception type stays in the evidence.
-            solver_reason = getattr(error, "runtime_reason", None) or lifecycle_service.UNCLASSIFIED_SOLVER_REASON
-            lifecycle_service.record_candidate_attempt(
-                campaign.profile.id,
-                campaign.source_name,
-                batch.material_family,
-                task.case_id,
-                attempt_index=len(attempts[0]["attempts"]) + 1,
-                stage=failure_stage,
-                failure_class=failure_class,
-                reason_code=solver_reason if failure_class == "solver" else type(error).__name__,
-                retryable=failure_class in {"controller", "publication"},
-                detail=str(error) or type(error).__name__,
-                evidence={**_dispatch_evidence_fields(dispatch), "exception_type": type(error).__name__},
-                storage_root=storage_root,
-            )
+        attempts = [
+            row
+            for row in lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+            if row["reservation"]["material_family"] == batch.material_family and row["reservation"]["case_id"] == task.case_id
+        ]
+        if len(attempts) != 1:
+            message = "Campaign candidate reservation is missing during failed case reconciliation."
+            raise RuntimeError(message) from error
+        failure_stage = str(getattr(error, "failure_stage", "controller"))
+        failure_class = (
+            "solver"
+            if failure_stage == "solver"
+            else "validation"
+            if failure_stage in {"exports", "conversion"}
+            else "publication"
+            if failure_stage == "publication"
+            else "controller"
+        )
+        # A solver attempt records how the runtime classified the stop; the exception type stays in the evidence.
+        solver_reason = getattr(error, "runtime_reason", None) or lifecycle_service.UNCLASSIFIED_SOLVER_REASON
+        lifecycle_service.record_candidate_attempt(
+            campaign.profile.id,
+            campaign.source_name,
+            batch.material_family,
+            task.case_id,
+            attempt_index=len(attempts[0]["attempts"]) + 1,
+            stage=failure_stage,
+            failure_class=failure_class,
+            reason_code=solver_reason if failure_class == "solver" else type(error).__name__,
+            retryable=failure_class in {"controller", "publication"},
+            detail=str(error) or type(error).__name__,
+            evidence={**_dispatch_evidence_fields(dispatch), "exception_type": type(error).__name__},
+            storage_root=storage_root,
+        )
         raise
-    if campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION and outcome.status in {"completed", "skipped"}:
+    if outcome.status in {"completed", "skipped"}:
         _record_success_decision(
             campaign, task, resources={**_dispatch_evidence_fields(dispatch), "allocated_cores": cores}, storage_root=storage_root
         )
-    elif campaign.schema_version == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION and outcome.status == "license_blocked":
+    elif outcome.status == "license_blocked":
         from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- campaign case evidence boundary
 
         records = [

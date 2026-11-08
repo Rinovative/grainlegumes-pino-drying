@@ -80,20 +80,23 @@ def inspect_dataset_package(
 
 
 def _source_outcome_lines(outcomes: list[Mapping[str, Any]]) -> list[str]:
-    """Show the original-candidate failure rate and replacement use of every contributing Source."""
+    """Show the original-candidate failure rate, replacement use and achieved success rate of every contributing Source."""
     result: list[str] = []
     for outcome in outcomes:
         result.append(f"Source outcomes of {outcome['source_name']} (full candidate table in --json):")
         for material, counts in outcome["materials"].items():
             policy = [item for item in outcome["replacement_policy"] if item["material_family"] == material]
-            planned = sum(item["planned_capacity"] for item in policy)
-            capacity = sum(item["high_water"] for item in policy)
+            achieved = ", ".join(
+                f"{item['successful']}/{item['decided']} decided successful against minimum {item['minimum_success_rate']:g}"
+                f"{' (stopped)' if item['stopped'] else ''}"
+                for item in policy
+            )
             original, failed = counts["original_candidates"], counts["original_failed"]
             rate = f"{failed / original:.1%}" if original else "n/a"
             result.append(
                 f"  {material}: original candidates failed {failed}/{original} ({rate}); "
-                f"replacements used {counts['replacement_candidates']} (failed {counts['replacement_failed']}) "
-                f"of capacity {capacity} (pre-registered {planned}); successful {counts['successful']}"
+                f"replacements used {counts['replacement_candidates']} (failed {counts['replacement_failed']}); "
+                f"successful {counts['successful']}; {achieved}"
             )
     return result
 
@@ -135,9 +138,7 @@ def format_dataset_inspection(report: Mapping[str, Any]) -> str:
     missing_inventory = recovery.get("missing_or_changed_untracked")
     missing_files = ", ".join(missing_inventory) or "none listed" if isinstance(missing_inventory, list) else "unknown (inventory not checked)"
     selection = report.get("selection") or {}
-    selection_summary = (
-        f"{selection.get('kind', 'unknown')}; seed {evidence(selection.get('root_seed'))}; counts {named_counts(selection.get('target_counts'))}"
-    )
+    selection_summary = f"{selection.get('kind', 'unknown')}; counts {named_counts(selection.get('target_counts'))}"
     manifest_path = Path(str(report["manifest"]))
     ancestors = manifest_path.parents  # <storage>/02_datasets/<task>/<dataset>/dataset_manifest.json
     in_datasets_area = (
@@ -308,11 +309,11 @@ def format_dataset_inspection(report: Mapping[str, Any]) -> str:
 
 def format_run_summary(result: Mapping[str, Any], *, seconds: float) -> str:
     """Present the outcome of one Dataset plan run in the driver: the published Dataset, its split, the failures and the time taken."""
-    from src.generation import generation_campaign_status as campaign_status  # noqa: PLC0415 -- concrete module, no alias for the duration format
+    from src import common  # noqa: PLC0415
 
     from .packages import dataset_packages_manifest as manifests  # noqa: PLC0415
 
-    duration = campaign_status.format_duration(seconds)
+    duration = common.console.format_duration(seconds)
     if result["status"] != "OK":
         return "\n".join(
             (
@@ -332,12 +333,20 @@ def format_run_summary(result: Mapping[str, Any], *, seconds: float) -> str:
         + f"  ({', '.join(f'{material}={role}' for material, role in fixed['material_roles'].items())})"
     )
     candidates = [candidate for outcome in manifest["source_outcomes"] for candidate in outcome["candidates"]]
-    replacements = {
-        (item["material_family"], item["parent_failed_case_id"]): item["case_id"] for item in candidates if item["origin"] == "replacement"
-    }
+    # Every replacement names its slot's failed primary; as on the live board, a failed case's successor is the first later
+    # replacement of the same slot, so a slot whose first replacement failed too reads as a chain.
+    slots: dict[tuple[str, str], list[str]] = {}
+    for item in candidates:
+        if item["origin"] == "replacement":
+            slots.setdefault((item["material_family"], item["parent_failed_case_id"]), []).append(item["case_id"])
+
+    def successor(item: Mapping[str, Any]) -> str | None:
+        slot = slots.get((item["material_family"], item["parent_failed_case_id"] or item["case_id"]), [])
+        return min((case_id for case_id in slot if case_id > item["case_id"]), default=None)
+
     failures = [
         f"  {item['material_family']} {item['case_id']}: {item['failure_stage']} failure ({item['reason_code']}), "
-        + (f"replaced by {replacement}" if (replacement := replacements.get((item["material_family"], item["case_id"]))) else "no replacement")
+        + (f"replaced by {replacement}" if (replacement := successor(item)) else "no replacement")
         for item in candidates
         if item["outcome"] == "failed"
     ]
@@ -430,7 +439,7 @@ def _run_plan(parser: argparse.ArgumentParser, arguments: argparse.Namespace) ->
                 plan, execution_overrides=execution, driver_time=arguments.driver_time, driver_partition=arguments.driver_partition
             )
             print(json.dumps(footprint, sort_keys=True))
-            result = dataset_plan.preview_dataset_plan(plan, duration_hours=arguments.duration_hours, execution_overrides=execution)
+            result = dataset_plan.preview_dataset_plan(plan, execution_overrides=execution)
         else:
             invocation = [sys.executable, "-m", "src.datasets.dataset_packages", *sys.argv[1:]]
             from src import common  # noqa: PLC0415
@@ -443,7 +452,6 @@ def _run_plan(parser: argparse.ArgumentParser, arguments: argparse.Namespace) ->
                     invocation=invocation,
                     driver_partition=arguments.driver_partition,
                     driver_time=arguments.driver_time,
-                    duration_hours=arguments.duration_hours,
                     execution_overrides=execution,
                     continue_with_current_code=arguments.continue_with_current_code,
                 )
@@ -453,7 +461,6 @@ def _run_plan(parser: argparse.ArgumentParser, arguments: argparse.Namespace) ->
                     arguments.plan,
                     plan,
                     invocation=invocation,
-                    duration_hours=arguments.duration_hours,
                     execution_overrides=execution,
                 )
                 print(format_run_summary(result, seconds=time.monotonic() - started))

@@ -1,4 +1,4 @@
-"""Verify task-generic and steady-flow artifact generation against current provenance.
+"""Verify steady-flow artifact generation against current provenance.
 
 Responsibilities:
   - Check field and unit propagation, normalized statistics, dimensionless physics, and
@@ -13,18 +13,20 @@ This module does NOT:
 
 from __future__ import annotations
 
+import itertools
 import json
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+from support.synthetic_task import synthetic_split_payload
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-from src import analysis, datasets, domain, learning
+from src import analysis, common, datasets, domain, learning
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,27 +35,11 @@ _SYNTHETIC_INPUT_VALUE = 4.0
 _SYNTHETIC_METADATA_VALUE = 3.25
 # Campaign-local case number 3 and global Dataset position 5 differ on purpose.
 _CASE_ID = "lentil__case_0003__fe83e052fbf2"
-
-
-class _MappingDataset(Dataset[dict[str, Any]]):
-    """
-    Expose ordered synthetic artifact samples through ``DataLoader``.
-
-    The fixture deliberately implements only the map-style dataset boundary
-    needed to compare artifact output across different batch partitions.
-    """
-
-    def __init__(self, samples: list[dict[str, Any]]) -> None:
-        """Store synthetic samples in deterministic order."""
-        self.samples = samples
-
-    def __len__(self) -> int:
-        """Return the synthetic sample count."""
-        return len(self.samples)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        """Return one synthetic sample by position."""
-        return self.samples[index]
+_OTHER_CASE_ID = "field_pea__case_0001__0123456789ab"
+_THIRD_CASE_ID = "chickpea__case_0002__abcdef012345"
+_STEADY_SHAPE = (9, 11)
+_STEADY_INLET_PRESSURE = 2.0
+_NONFINITE_INDEX = (3, 4)
 
 
 class _IdentityNormalizer:
@@ -99,25 +85,6 @@ class _IdentityProcessor:
         return {**batch, "x": self.in_normalizer.transform(inputs)}
 
 
-class _Projection(nn.Module):
-    """
-    Project synthetic-task inputs into two deterministic output fields.
-
-    The fixed linear mapping gives the tests exact predictions while exercising
-    the ordinary ``nn.Module`` inference boundary used by artifact generation.
-    """
-
-    def __init__(self) -> None:
-        """Initialize the observed complete-batch forward sizes."""
-        super().__init__()
-        self.forward_batch_sizes: list[int] = []
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Map the leading two input channels to doubled predictions."""
-        self.forward_batch_sizes.append(int(value.shape[0]))
-        return 2.0 * value[:, :2]
-
-
 class _SteadyProjection(nn.Module):
     """Return a deterministic task-ordered manufactured steady-flow state."""
 
@@ -138,6 +105,16 @@ class _SteadyProjection(nn.Module):
         # A height-dependent v makes the cross-section flux balance observable.
         output_by_field[velocity.fields[1]] = 1e-3 * y_values
         return torch.stack([output_by_field[field] for field in self.task.output_names], dim=1)
+
+
+class _NonfiniteSteadyProjection(_SteadyProjection):
+    """Return the manufactured state with one NaN ``u`` value in the last case of each batch."""
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        """Replace exactly one velocity value by NaN without touching other cases."""
+        output = super().forward(value)
+        output[-1, self.task.output_names.index("u"), *_NONFINITE_INDEX] = float("nan")
+        return output
 
 
 def _save_dataset(root: Path, payload: dict[str, Any]) -> Path:
@@ -191,258 +168,110 @@ def _attach_objective_contract(
     }
 
 
-def test_generic_artifacts_preserve_task_fields_units_and_provenance(
+def _steady_artifact(
     tmp_path: Path,
-    synthetic_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Preserve a synthetic task's fields, units, provenance, and metadata.
-
-    A generic two-output fixture must produce current NPZ and Parquet evidence
-    without steady-flow columns, proving the artifact path remains task-generic.
-    """
-    task = synthetic_task
-    source_indices = [4]
-    provenance: dict[str, Any] = {
+    model: nn.Module,
+    *,
+    case_ids: tuple[str, ...] = (_CASE_ID,),
+    target: torch.Tensor | None = None,
+    call_case_ids: tuple[str, ...] | None = None,
+    source_meta: dict[str, Any] | None = None,
+    partition: tuple[int, ...] | None = None,
+) -> tuple[pd.DataFrame, Path, dict[str, Any]]:
+    """Generate one steady artifact of manufactured cases, batched by ``partition``, and return frame, root and request provenance."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    y_values = torch.linspace(0.0, 1.0, _STEADY_SHAPE[0])
+    x_values = torch.linspace(0.0, 2.0, _STEADY_SHAPE[1])
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    zeros = torch.zeros_like(x_grid)
+    coordinate_values = iter((x_grid, y_grid))
+    input_by_field: dict[str, torch.Tensor] = {}
+    for field in task.inputs:
+        if field.role == "coordinate":
+            input_by_field[field.name] = next(coordinate_values)
+        elif field.role == "permeability" and "cross_component" in field.representation:
+            input_by_field[field.name] = zeros
+        elif field.role == "permeability":
+            input_by_field[field.name] = torch.full_like(x_grid, -4.0)
+        elif field.role == "porosity":
+            input_by_field[field.name] = 0.25 + 0.25 * x_grid
+        elif field.role == "boundary":
+            input_by_field[field.name] = torch.where(y_grid == y_grid.amin(), _STEADY_INLET_PRESSURE, 0.0)
+        else:
+            msg = f"unsupported steady-flow fixture role: {field.role}"
+            raise AssertionError(msg)
+    count = len(case_ids)
+    inputs = torch.stack([input_by_field[field] for field in task.input_names], dim=0).unsqueeze(0).repeat(count, 1, 1, 1)
+    targets = torch.zeros((count, task.out_channels, *_STEADY_SHAPE)) if target is None else target.expand(count, -1, -1, -1)
+    sample_ids = [f"manufactured-{index}" for index in range(count)]
+    bounds = np.cumsum((0, *(partition or (count,)))).tolist()
+    loader = [
+        {
+            "x": inputs[start:stop],
+            "y": targets[start:stop],
+            "source_index": torch.arange(start, stop),
+            "split_local_index": torch.arange(start, stop),
+            "meta": source_meta or {"sample_id": sample_ids[start:stop]},
+        }
+        for start, stop in itertools.pairwise(bounds)
+    ]
+    root = tmp_path / "steady"
+    provenance = {
         "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-        "run": {"name": "synthetic", "task": task.id, "best_checkpoint_sha256": "abc"},
+        "run": {"name": "steady", "task": task.id},
+        "model": {"parameter_counts": {"total": 1, "trainable": 1}},
+        "split_role": "eval",
+        "dataset": _role_plan(case_ids).dataset_provenance(),
         "selection": {
-            "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(source_indices),
+            "effective_case_count": count,
+            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(range(count)),
         },
         "evaluator": {
             "input_fields": list(task.input_names),
+            "input_units": {field.name: field.unit for field in task.inputs},
             "output_fields": list(task.output_names),
             "output_units": {field.name: field.unit for field in task.outputs},
+            "physics_kind": task.physics.kind,
         },
+        "physics": analysis.artifacts.contracts.steady_physics_provenance(task),
     }
     _attach_objective_contract(provenance, task=task)
-    inputs = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
-    targets = torch.ones(1, 2, 2, 2)
-    loader = [
-        {
-            "x": inputs,
-            "y": targets,
-            "source_index": torch.tensor([4]),
-            "split_local_index": torch.tensor([0]),
-            "meta": {"label": ["synthetic-case"], "quality": torch.tensor([7])},
-        }
-    ]
-    processor = _IdentityProcessor(task)
-    save_root = tmp_path / "analysis" / "id"
-
-    frame, parquet_path = analysis.artifacts.generation.generate_artifacts(
+    frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
         task=task,
-        model=_Projection(),
+        model=model,
         loader=loader,
-        processor=processor,
+        processor=_IdentityProcessor(task),
         device=torch.device("cpu"),
-        save_root=save_root,
-        dataset_name="synthetic_train",
+        save_root=root,
+        dataset_name="steady",
         provenance=provenance,
-        case_ids=[_CASE_ID],
+        case_ids=list(case_ids if call_case_ids is None else call_case_ids),
     )
+    return frame, root, provenance
 
-    assert parquet_path.is_file()
-    assert frame.loc[0, "npz_path"] == f"npz/{_CASE_ID}.npz"
-    assert frame.loc[0, "case_index"] == 5
-    assert frame.columns.is_unique
-    assert {
-        "rel_l2",
-        "rel_h1",
-        "physical_rmse_response_a",
-        "physical_rmse_response_b",
-        "normalized_sse_response_a",
-        "normalized_count_response_a",
-        "normalized_rmse_response_a",
-        "normalized_sse_response_b",
-        "normalized_count_response_b",
-        "normalized_rmse_response_b",
-    }.issubset(frame.columns)
-    assert not {
-        "momentum_residual_mse",
-        "flux_balance_mse",
-        "pressure_boundary_mse",
-    }.intersection(frame.columns)
-    npz_path = save_root / "npz" / f"{_CASE_ID}.npz"
-    with np.load(npz_path, allow_pickle=False) as payload:
-        assert int(payload["case_index"]) == 5
-        assert payload["input_fields"].tolist() == list(task.input_names)
-        assert payload["output_fields"].tolist() == list(task.output_names)
-        assert payload["output_units"].tolist() == ["unit_out_a", "unit_out_b"]
-        assert payload["artifact_fields"].tolist() == list(task.output_names)
-        assert payload["artifact_units"].tolist() == ["unit_out_a", "unit_out_b"]
-        metadata = json.loads(str(payload["meta"].item()))
-        assert not {"case_index", "source_index", "split_local_index"}.intersection(metadata)
 
-    stored_provenance = json.loads((save_root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
-    stored_outputs = stored_provenance.pop("outputs")
-    stored_aggregate = stored_provenance.pop("aggregate")
-    assert stored_provenance == provenance
-    assert stored_outputs == analysis.artifacts.contracts.artifact_output_manifest(save_root)
-    assert stored_aggregate == analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
-        frame,
-        output_groups=task.output_groups,
-        train_standard_deviations=dict.fromkeys(task.output_names, 1.0),
-        normalization_denominator_floor=0.0,
+def _role_plan(case_ids: tuple[str, ...]) -> Any:
+    """Return a one-source ID role over ``case_ids`` in their given order."""
+    return analysis.artifacts.plan.ArtifactRolePlan(
+        split="eval",
+        dataset_role="id",
+        dataset_name="steady",
+        source_dataset_ids=("steady",),
+        source_identities=({"dataset_id": "steady", "case_ids": list(case_ids)},),
+        case_ids_by_source=(tuple(case_ids),),
+        membership_digests=("c" * 64,),
     )
 
 
-def test_group_objective_matches_online_and_artifacts_across_partitions(
-    tmp_path: Path,
-    synthetic_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Match group-objective evidence across runtime and artifact chunking.
-
-    Equivalent three-case inputs use two partition schemes and two loader batch
-    sizes. SSE/count aggregation, row order, and stored provenance must agree.
-    """
-    task = synthetic_task
-    fields = task.output_names
-    prediction = (
-        torch.tensor(
-            [
-                [1.0, 0.0],
-                [3.0, 4.0],
-                [0.0, 8.0],
-            ],
-            dtype=torch.float32,
-        )
-        .reshape(3, 2, 1, 1)
-        .expand(-1, -1, 2, 2)
+def _staged_request(provenance: dict[str, Any], case_ids: tuple[str, ...]) -> Any:
+    """Return the writer-side request that binds staged rows to their NPZ payloads."""
+    return analysis.artifacts.service.ArtifactRequest(
+        provenance=provenance,
+        source_indices=tuple(range(len(case_ids))),
+        batch_size=len(case_ids),
+        case_ids=case_ids,
     )
-    target = torch.zeros_like(prediction)
-    objective_spec = next(metric for metric in task.default_metrics if metric.id == "normalized_group_macro_rmse")
-    train_standard_deviations = dict.fromkeys(fields, 1.0)
-    definition = learning.metrics.metrics.ResolvedMetric(
-        id=objective_spec.id,
-        kind=objective_spec.kind,
-        space=objective_spec.space,
-        fields=fields,
-        field_indices=tuple(range(len(fields))),
-        reduction=objective_spec.reduction,
-        direction=objective_spec.direction,
-        unit="1",
-        operator_dimensionality=2,
-        groups=task.output_groups,
-        field_standard_deviations=tuple(train_standard_deviations[field] for field in fields),
-    )
-
-    runtime_values: list[float] = []
-    for chunks in ((2, 1), (1, 1, 1)):
-        metric = learning.metrics.metrics.GroupMacroRMSEMetric(
-            definition,
-            device=torch.device("cpu"),
-        )
-        start = 0
-        for batch_index, size in enumerate(chunks):
-            stop = start + size
-            metric.update(
-                prediction[start:stop],
-                target[start:stop],
-                space="physical",
-                batch_index=batch_index,
-            )
-            start = stop
-        runtime_values.append(metric.compute())
-
-    physical_rows = analysis.artifacts.generation.physical_case_statistics(
-        prediction,
-        target,
-        output_fields=fields,
-    )
-    normalized_rows = analysis.artifacts.generation.normalized_case_statistics(
-        prediction,
-        target,
-        output_fields=fields,
-    )
-    rows = [{**physical_row, **normalized_row} for physical_row, normalized_row in zip(physical_rows, normalized_rows, strict=True)]
-    aggregate = analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
-        pd.DataFrame(rows),
-        output_groups=task.output_groups,
-        train_standard_deviations=train_standard_deviations,
-        normalization_denominator_floor=0.0,
-    )
-    per_case_macro_mean = float(pd.DataFrame(rows)[[f"normalized_rmse_{field}" for field in fields]].mean(axis=1).mean())
-
-    source_indices = [5, 1, 8]
-    inputs = torch.zeros(3, len(task.input_names), 2, 2)
-    inputs[:, :2] = prediction / 2.0
-    samples = [
-        {
-            "x": inputs[index],
-            "y": target[index],
-            "source_index": source_index,
-            "split_local_index": index,
-            "meta": {"label": f"case-{source_index}"},
-        }
-        for index, source_index in enumerate(source_indices)
-    ]
-    artifact_frames: list[pd.DataFrame] = []
-    artifact_values: list[float] = []
-    forward_batch_sizes: list[list[int]] = []
-    preprocessed_batch_sizes: list[list[int]] = []
-    for batch_size in (2, 1):
-        root = tmp_path / f"batch-{batch_size}"
-        provenance = {
-            "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-            "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-            "run": {"name": "synthetic", "task": task.id},
-            "selection": {
-                "effective_case_count": len(source_indices),
-                "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256(source_indices),
-            },
-            "evaluator": {
-                "input_fields": list(task.input_names),
-                "output_fields": list(fields),
-                "output_units": {field.name: field.unit for field in task.outputs},
-            },
-        }
-        _attach_objective_contract(provenance, task=task)
-        processor = _IdentityProcessor(task)
-        model = _Projection()
-        frame, _ = analysis.artifacts.generation.generate_artifacts(
-            task=task,
-            model=model,
-            loader=DataLoader(_MappingDataset(samples), batch_size=batch_size, shuffle=False),
-            processor=processor,
-            device=torch.device("cpu"),
-            save_root=root,
-            dataset_name="synthetic",
-            provenance=provenance,
-            case_ids=[f"lentil__case_{source_index:04d}__{source_index:012x}" for source_index in source_indices],
-        )
-        stored = json.loads((root / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
-        artifact_frames.append(frame)
-        artifact_values.append(float(stored["aggregate"]["value"]))
-        forward_batch_sizes.append(model.forward_batch_sizes)
-        preprocessed_batch_sizes.append(processor.preprocessed_batch_sizes)
-
-    assert forward_batch_sizes == [[2, 1], [1, 1, 1]]
-    assert preprocessed_batch_sizes == forward_batch_sizes
-    assert runtime_values[0] == pytest.approx(runtime_values[1], rel=0.0, abs=1e-15)
-    assert aggregate["value"] == pytest.approx(runtime_values[0], rel=0.0, abs=1e-15)
-    assert artifact_values == pytest.approx(runtime_values, rel=0.0, abs=1e-15)
-    assert aggregate["value"] != pytest.approx(per_case_macro_mean)
-    expected_element_count = prediction.shape[0] * prediction.shape[2] * prediction.shape[3]
-    for field in fields:
-        assert aggregate["field_statistics"][field]["normalized_element_count"] == expected_element_count
-    pd.testing.assert_frame_equal(
-        artifact_frames[0].drop(columns=["npz_path", "inference_time_ms"]),
-        artifact_frames[1].drop(columns=["npz_path", "inference_time_ms"]),
-    )
-    for field in fields:
-        for columns in (
-            analysis.artifacts.contracts.physical_statistic_columns(field),
-            analysis.artifacts.contracts.normalized_statistic_columns(field),
-        ):
-            sse_column, count_column, rmse_column = columns
-            assert artifact_frames[0][sse_column].tolist() == pytest.approx([row[sse_column] for row in rows])
-            assert artifact_frames[0][count_column].tolist() == [row[count_column] for row in rows]
-            assert artifact_frames[0][rmse_column].tolist() == pytest.approx([row[rmse_column] for row in rows])
-    assert artifact_frames[0]["source_index"].tolist() == source_indices
 
 
 def test_steady_artifact_stores_dimensionless_physics_semantics(tmp_path: Path) -> None:
@@ -461,69 +290,9 @@ def test_steady_artifact_stores_dimensionless_physics_semantics(tmp_path: Path) 
     velocity_units = {task.field(field).unit for field in velocity_fields}
     assert len(velocity_units) == 1
     velocity_unit = next(iter(velocity_units))
-    height, width = 9, 11
-    y_values = torch.linspace(0.0, 1.0, height)
-    x_values = torch.linspace(0.0, 2.0, width)
-    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
-    zeros = torch.zeros_like(x_grid)
-    inlet_pressure = 2.0
-    coordinate_values = iter((x_grid, y_grid))
-    input_by_field: dict[str, torch.Tensor] = {}
-    for field in task.inputs:
-        if field.role == "coordinate":
-            input_by_field[field.name] = next(coordinate_values)
-        elif field.role == "permeability" and "cross_component" in field.representation:
-            input_by_field[field.name] = zeros
-        elif field.role == "permeability":
-            input_by_field[field.name] = torch.full_like(x_grid, -4.0)
-        elif field.role == "porosity":
-            input_by_field[field.name] = 0.25 + 0.25 * x_grid
-        elif field.role == "boundary":
-            input_by_field[field.name] = torch.where(y_grid == y_grid.amin(), inlet_pressure, 0.0)
-        else:
-            msg = f"unsupported steady-flow fixture role: {field.role}"
-            raise AssertionError(msg)
-    inputs = torch.stack([input_by_field[field] for field in task.input_names], dim=0).unsqueeze(0)
-    targets = torch.zeros((1, task.out_channels, height, width))
-    loader = [
-        {
-            "x": inputs,
-            "y": targets,
-            "source_index": torch.tensor([0]),
-            "split_local_index": torch.tensor([0]),
-            "meta": {"sample_id": ["manufactured"]},
-        }
-    ]
-    processor = _IdentityProcessor(task)
-    root = tmp_path / "steady"
-    provenance = {
-        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-        "run": {"name": "steady", "task": task.id},
-        "selection": {
-            "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
-        },
-        "evaluator": {
-            "input_fields": list(task.input_names),
-            "output_fields": list(task.output_names),
-            "output_units": {field.name: field.unit for field in task.outputs},
-            "physics_kind": task.physics.kind,
-        },
-        "physics": analysis.artifacts.contracts.steady_physics_provenance(task),
-    }
-    _attach_objective_contract(provenance, task=task)
-    frame, _parquet_path = analysis.artifacts.generation.generate_artifacts(
-        task=task,
-        model=_SteadyProjection(task),
-        loader=loader,
-        processor=processor,
-        device=torch.device("cpu"),
-        save_root=root,
-        dataset_name="steady",
-        provenance=provenance,
-        case_ids=[_CASE_ID],
-    )
+    height, width = _STEADY_SHAPE
+    inlet_pressure = _STEADY_INLET_PRESSURE
+    frame, root, _provenance = _steady_artifact(tmp_path, _SteadyProjection(task))
     row = frame.iloc[0]
     required_scalars = {
         "momentum_residual_mse",
@@ -564,6 +333,166 @@ def test_steady_artifact_stores_dimensionless_physics_semantics(tmp_path: Path) 
     assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
 
 
+def test_steady_artifact_rel_h1_is_the_training_h1_on_the_cropped_interior(tmp_path: Path) -> None:
+    """
+    Bind the artifact ``rel_h1`` to the shared NeuralOp H1 implementation.
+
+    Each field is cropped to the EVAL_PAD interior first; the metric is the mean over
+    fields of the loss-factory relative H1 with physical spacing (dy, dx) = (1/8, 1/5) m.
+    """
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    y_values = torch.linspace(0.0, 1.0, _STEADY_SHAPE[0])
+    x_values = torch.linspace(0.0, 2.0, _STEADY_SHAPE[1])
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    target = torch.stack([1.0 + 0.3 * (index + 1) * torch.sin(2.0 * x_grid + y_grid) + y_grid**2 for index in range(task.out_channels)]).unsqueeze(0)
+    model = _SteadyProjection(task)
+    frame, _root, _provenance = _steady_artifact(tmp_path, model, target=target)
+
+    inputs = {"x": x_grid[None, None], "y": y_grid[None, None]}
+    prediction = model(torch.cat([inputs[name] if name in inputs else torch.zeros_like(x_grid)[None, None] for name in task.input_names], dim=1))
+    crop = analysis.artifacts.contracts.EVAL_PAD
+    relative_h1 = learning.losses.factory.build_relative_h1(2, reduction="mean", grid_spacing=(0.125, 0.2))
+    expected = [
+        float(relative_h1(prediction[:, c : c + 1, crop:-crop, crop:-crop], target[:, c : c + 1, crop:-crop, crop:-crop]))
+        for c in range(task.out_channels)
+    ]
+    assert frame["rel_h1"].iloc[0] == pytest.approx(sum(expected) / len(expected), rel=1e-5)
+
+
+@pytest.mark.parametrize("partition", [(2, 1), (1, 1, 1)], ids=("unequal", "single-case"))
+def test_steady_artifact_rows_and_objective_do_not_depend_on_the_batch_partition(tmp_path: Path, partition: tuple[int, ...]) -> None:
+    """
+    Keep per-case rows and the group objective independent of how distinct cases are batched.
+
+    Unequal batches must neither weight batches equally nor assign one case's metrics to another.
+    """
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    case_ids = (_CASE_ID, _OTHER_CASE_ID, _THIRD_CASE_ID)
+    y_values = torch.linspace(0.0, 1.0, _STEADY_SHAPE[0])
+    x_values = torch.linspace(0.0, 2.0, _STEADY_SHAPE[1])
+    y_grid, x_grid = torch.meshgrid(y_values, x_values, indexing="ij")
+    channels = torch.arange(1, task.out_channels + 1, dtype=torch.float32)[:, None, None]
+    target = torch.stack([1.0 + 0.4 * (case + 1) * torch.sin(channels * x_grid + y_grid) for case in range(len(case_ids))])
+    model = _SteadyProjection(task)
+    whole, _root, _provenance = _steady_artifact(tmp_path / "whole", model, case_ids=case_ids, target=target)
+    split, _root, _provenance = _steady_artifact(tmp_path / "split", model, case_ids=case_ids, target=target, partition=partition)
+
+    metric_columns = [column for column in whole.columns if whole[column].dtype.kind == "f"]
+    assert whole["rel_l2"].nunique() == len(case_ids)
+    pd.testing.assert_frame_equal(split[metric_columns], whole[metric_columns], rtol=1e-6)
+    whole_value = whole.attrs["artifact_provenance"]["aggregate"]["value"]
+    assert split.attrs["artifact_provenance"]["aggregate"]["value"] == pytest.approx(whole_value, rel=1e-9)
+
+
+def test_non_steady_task_is_rejected_by_artifact_generation(tmp_path: Path, synthetic_task: domain.tasks.spec.TaskSpec) -> None:
+    """Refuse every task other than steady flow before any payload is written."""
+    with pytest.raises(ValueError, match="supports only task"):
+        analysis.artifacts.generation.generate_artifacts(
+            task=synthetic_task,
+            model=nn.Identity(),
+            loader=[],
+            processor=_IdentityProcessor(synthetic_task),
+            device=torch.device("cpu"),
+            save_root=tmp_path / "target",
+            dataset_name="synthetic_train",
+            provenance={},
+            case_ids=[],
+        )
+    assert not (tmp_path / "target").exists()
+
+
+def test_steady_artifact_rejects_case_ids_not_matching_membership(tmp_path: Path) -> None:
+    """Reject case IDs that do not cover the saved membership one to one before any payload is written."""
+    with pytest.raises(ValueError, match="exactly match"):
+        _steady_artifact(tmp_path, _SteadyProjection(domain.tasks.steady_flow.STEADY_FLOW), call_case_ids=(_CASE_ID, _OTHER_CASE_ID))
+    assert not (tmp_path / "steady").exists()
+
+
+def test_steady_artifact_rejects_source_metadata_duplicating_artifact_identity(tmp_path: Path) -> None:
+    """Reject a forged ``case_index`` in source metadata so it cannot replace the membership-derived identity."""
+    with pytest.raises(KeyError, match="reserved artifact identity"):
+        _steady_artifact(tmp_path, _SteadyProjection(domain.tasks.steady_flow.STEADY_FLOW), source_meta={"case_index": 99})
+
+
+def test_steady_artifact_publishes_a_nonfinite_case_with_counts_instead_of_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Classify a non-finite steady prediction, store it unchanged and report counts instead of metric values."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    case_ids = (_CASE_ID, _OTHER_CASE_ID)
+    frame, root, provenance = _steady_artifact(tmp_path, _NonfiniteSteadyProjection(task), case_ids=case_ids)
+
+    documents = [json.loads(text) for text in frame["prediction_validity"]]
+    assert [document["status"] for document in documents] == [validity_contract.VALID, validity_contract.NONFINITE]
+    assert documents[1]["channels"]["u"]["nan_count"] == 1
+    assert documents[1]["first_invalid"] == {"kind": "NONFINITE", "channel": "u", "channel_index": 1, "spatial_index": list(_NONFINITE_INDEX)}
+    record_metrics = ["rel_l2", "momentum_residual_mse", "physical_sse_p", "normalized_rmse_v", "normalized_velocity_vector_rmse"]
+    assert np.isfinite(frame.loc[0, record_metrics].to_numpy(dtype=float)).all()
+    assert np.isnan(frame.loc[1, record_metrics].to_numpy(dtype=float)).all()
+    assert frame.loc[1, "physical_count_u"] == _STEADY_SHAPE[0] * _STEADY_SHAPE[1]
+    with np.load(root / "npz" / f"{_OTHER_CASE_ID}.npz", allow_pickle=False) as payload:
+        assert np.isnan(payload["pred"][1, *_NONFINITE_INDEX])
+
+    stored = json.loads(analysis.artifacts.contracts.artifact_provenance_path(root).read_text(encoding="utf-8"))
+    aggregate = stored["aggregate"]
+    required = len(case_ids) * len(task.output_names) * _STEADY_SHAPE[0] * _STEADY_SHAPE[1]
+    assert (aggregate["available"], aggregate["value"], aggregate["field_statistics"], aggregate["group_statistics"]) == (False, None, None, None)
+    assert [aggregate[name] for name in ("required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count")] == [
+        required,
+        required,
+        required - 1,
+        1,
+    ]
+    evidence = stored["evaluation"]["prediction_validity"]
+    assert evidence["status_counts"] == {"VALID": 1, "FINITE_BUT_PHYSICALLY_INVALID": 0, "NONFINITE": 1}
+
+    analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids), dataset_name="steady")
+    loaded = analysis.evaluation.artifact_loader._read_artifact_root(root)
+    assert loaded.attrs[analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_ID] == aggregate
+
+    capsys.readouterr()
+    validity_contract.report_invalid_predictions(evidence)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "[WARNING] artifact completed with invalid predictions | valid=1 | finite_but_physically_invalid=0 | nonfinite=1"
+    assert f"case={_OTHER_CASE_ID} | status=NONFINITE | channels=u | first_channel=u | first_index=[3, 4]" in lines[1]
+    assert validity_contract.invalid_prediction_note([stored]) == "valid 1 of 2"
+
+
+def test_steady_payload_contradicting_its_validity_document_is_refused_on_write_and_read(tmp_path: Path) -> None:
+    """Corruption stays an error: changed arrays fail the writer check and the digest, relabelled documents fail the reader."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    case_ids = (_CASE_ID, _OTHER_CASE_ID)
+    _frame, root, provenance = _steady_artifact(tmp_path, _NonfiniteSteadyProjection(task), case_ids=case_ids)
+    for case_id, position, value, message in (
+        (_OTHER_CASE_ID, (1, *_NONFINITE_INDEX), 0.0, "contradicts its prediction validity document"),
+        (_CASE_ID, (0, 0, 0), np.inf, "pred contains non-finite values"),
+    ):
+        path = root / "npz" / f"{case_id}.npz"
+        original = path.read_bytes()
+        with np.load(path, allow_pickle=False) as payload:
+            arrays = {name: payload[name] for name in payload.files}
+        arrays["pred"][position] = value
+        np.savez_compressed(path, **arrays)
+        with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=message):
+            analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids), dataset_name="steady")
+        # Cache hits and reads admit published bytes through the same output-manifest digests.
+        with pytest.raises(ValueError, match="output manifest does not match"):
+            analysis.evaluation.artifact_loader._read_artifact_root(root)
+        path.write_bytes(original)
+
+    provenance_path = analysis.artifacts.contracts.artifact_provenance_path(root)
+    stored = json.loads(provenance_path.read_text(encoding="utf-8"))
+    parquet_path = root / "steady.parquet"
+    table = pd.read_parquet(parquet_path)
+    table.loc[1, "prediction_validity"] = table.loc[0, "prediction_validity"]
+    table.to_parquet(parquet_path, index=False)
+    stored["outputs"] = analysis.artifacts.contracts.artifact_output_manifest(root)
+    common.serialization.atomic_write_json(provenance_path, stored)
+    with pytest.raises(ValueError, match="valid predictions"):
+        analysis.evaluation.artifact_loader._read_artifact_root(root)
+
+
 def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
     """
     Reconstruct physical cross-permeability from its encoded ratio.
@@ -582,78 +511,6 @@ def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
     assert permeability["kappa"][0, :, 0, 0].tolist() == pytest.approx([1e-2, 2.5e-4, 1e-4])
 
 
-def test_generic_artifacts_reject_reserved_source_metadata(
-    tmp_path: Path,
-    synthetic_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """
-    Reject source metadata that duplicates artifact identity.
-
-    A forged ``case_index`` must raise before publication so user metadata cannot
-    replace the identity derived from ordered dataset membership.
-    """
-    task = synthetic_task
-    provenance = {
-        "selection": {
-            "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
-        }
-    }
-    _attach_objective_contract(provenance, task=task)
-    loader = [
-        {
-            "x": torch.zeros(1, 3, 2, 2),
-            "y": torch.zeros(1, 2, 2, 2),
-            "source_index": torch.tensor([0]),
-            "split_local_index": torch.tensor([0]),
-            "meta": {"case_index": 99},
-        }
-    ]
-    processor = _IdentityProcessor(task)
-
-    with pytest.raises(KeyError, match="reserved artifact identity"):
-        analysis.artifacts.generation.generate_artifacts(
-            task=task,
-            model=_Projection(),
-            loader=loader,
-            processor=processor,
-            device=torch.device("cpu"),
-            save_root=tmp_path / "target",
-            dataset_name="synthetic_train",
-            provenance=provenance,
-            case_ids=[_CASE_ID],
-        )
-
-
-def test_generic_artifacts_require_case_ids_matching_membership(
-    tmp_path: Path,
-    synthetic_task: domain.tasks.spec.TaskSpec,
-) -> None:
-    """Reject case IDs that do not cover the saved membership one to one before any payload is written."""
-    task = synthetic_task
-    provenance = {
-        "selection": {
-            "effective_case_count": 1,
-            "effective_ordered_source_indices_sha256": analysis.artifacts.contracts.ordered_indices_sha256([0]),
-        }
-    }
-    _attach_objective_contract(provenance, task=task)
-
-    with pytest.raises(ValueError, match="exactly match"):
-        analysis.artifacts.generation.generate_artifacts(
-            task=task,
-            model=_Projection(),
-            loader=[],
-            processor=_IdentityProcessor(task),
-            device=torch.device("cpu"),
-            save_root=tmp_path / "target",
-            dataset_name="synthetic_train",
-            provenance=provenance,
-            case_ids=[_CASE_ID, "field_pea__case_0001__0123456789ab"],
-        )
-    assert not (tmp_path / "target").exists()
-
-
 @pytest.mark.parametrize(
     "case_id",
     [
@@ -667,18 +524,18 @@ def test_generic_artifacts_require_case_ids_matching_membership(
 )
 def test_case_payload_filename_rejects_non_package_case_ids(case_id: str) -> None:
     """Name NPZ files only after the strict package case ID pattern accepted the ID."""
-    assert analysis.evaluation.dataframe.case_payload_filename(_CASE_ID) == f"{_CASE_ID}.npz"
+    assert analysis.artifacts.contracts.case_payload_filename(_CASE_ID) == f"{_CASE_ID}.npz"
     with pytest.raises(ValueError, match="package case ID"):
-        analysis.evaluation.dataframe.case_payload_filename(case_id)
+        analysis.artifacts.contracts.case_payload_filename(case_id)
 
 
 def test_dataset_case_payload_filenames_drop_dataset_qualifier_and_reject_repeats() -> None:
     """Combined evaluation Datasets keep the package case ID as file name and cannot repeat one."""
     other = "field_pea__case_0001__0123456789ab"
-    names = analysis.evaluation.dataframe.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", other])
+    names = analysis.artifacts.contracts.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", other])
     assert names == (f"{_CASE_ID}.npz", f"{other}.npz")
     with pytest.raises(ValueError, match="duplicate case payload names"):
-        analysis.evaluation.dataframe.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", f"ood_b::{_CASE_ID}"])
+        analysis.artifacts.contracts.dataset_case_payload_filenames([f"ood_a::{_CASE_ID}", f"ood_b::{_CASE_ID}"])
 
 
 def test_synthetic_task_flows_through_final_dataset_contract(
@@ -722,17 +579,8 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         outputs=outputs,
     )
     loaded = datasets.runtime.steady.create_dataset(_save_dataset(tmp_path, payload), task=synthetic_task)
-    retired_source = SimpleNamespace(
-        identity=loaded.identity,
-        data={"source_provenance": {"schema_kind": "simulation_batch_manifest"}},
-        path=loaded.path,
-    )
-    with pytest.raises(ValueError, match="current selection manifest provenance"):
-        analysis.artifacts.service._validate_bound_dataset_manifests(
-            (retired_source,),
-            dataset_names=("synthetic_train",),
-            dataset_root=tmp_path,
-        )
+    with pytest.raises(RuntimeError, match="contradicts its saved split Dataset identity"):
+        datasets.preprocessing.splits.require_source_identity(loaded, {"dataset_id": "synthetic_train"}, role="train", case_ids=("case_0000",))
     sample = loaded[0]
     assert sample["meta"] == expected_metadata
     generator = sample["meta"].get("generator")
@@ -771,11 +619,12 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
     monkeypatch.setattr(
         service,
         "load_run_artifact_plan",
-        lambda run: service.RunArtifactPlan(
+        lambda run: analysis.artifacts.plan.ArtifactPlan(
             run_dir=run,
-            id_dataset_name="dataset",
-            additional_evaluation_dataset_name=None,
-            scientific_run_name="same-scientific-name",
+            run_name="same-scientific-name",
+            task="steady_flow",
+            id_role=_role_plan(("case",)),
+            additional_role=None,
         ),
     )
     monkeypatch.setattr(service, "run_or_load_artifacts", lambda **kwargs: pd.DataFrame({"run": [str(kwargs["run_dir"])]}))
@@ -788,3 +637,34 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
     for run in runs:
         assert outputs[str(run.resolve())]["eval"]["run"].tolist() == [str(run)]
     assert owners_file.read_text(encoding="utf-8").splitlines() == [str(run.resolve()) for run in runs]
+
+
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+@pytest.mark.parametrize("part_count", [0, 2])
+def test_artifact_plan_projects_the_admitted_split_of_either_task(tmp_path: Path, task: str, part_count: int) -> None:
+    """Plan the ID role and one additional role over all split parts in split order, or none without parts."""
+    parts = (("ood_b", ("pea__case_0002__00000000000b",)), ("ood_a", ("chickpea__case_0001__00000000000a",)))[:part_count]
+    split = synthetic_split_payload(task, additional=parts)
+    completed = {"config": {"task": task, "run": {"name": "scientific-run"}, "data": {"train_dataset": "train_data"}}, "split_indices": split}
+    plan = analysis.artifacts.plan.artifact_plan_from_completed(completed, run_dir=tmp_path)
+    assert plan.id_role.source_dataset_ids == ("train_data",)
+    assert plan.id_role.case_ids == tuple(split["roles"]["id_test"]["case_ids"])
+    if not part_count:
+        assert plan.additional_role is None
+        with pytest.raises(FileNotFoundError, match="no saved additional Evaluation"):
+            plan.role("additional_evaluation")
+        return
+    role = plan.role("additional_evaluation")
+    assert role.source_dataset_ids == ("ood_b", "ood_a")
+    assert role.case_source_dataset_ids == ("ood_b", "ood_a")
+    assert role.dataset_name == datasets.contracts.identity.combined_dataset_id(("ood_b", "ood_a"))
+    assert [item["dataset_id"] for item in role.evaluation_assignments] == ["ood_b", "ood_a"]
+
+
+def test_artifact_plan_refuses_additional_parts_sharing_a_case_id(tmp_path: Path) -> None:
+    """Prevent additional Evaluation parts from colliding in case payload and timing identities."""
+    shared = ("chickpea__case_0001__00000000000a",)
+    split = synthetic_split_payload("steady_flow", additional=(("ood_a", shared), ("ood_b", shared)))
+    completed = {"config": {"task": "steady_flow", "run": {"name": "run"}, "data": {"train_dataset": "train_data"}}, "split_indices": split}
+    with pytest.raises(ValueError, match="share package case IDs"):
+        analysis.artifacts.plan.artifact_plan_from_completed(completed, run_dir=tmp_path)

@@ -6,6 +6,7 @@ Executable modules:
 - cli_config_preflight: configuration-preflight command
 - cli_device: runtime-device inspection command
 - cli_optuna: Optuna-study command
+- cli_probe: container and device probe command
 - cli_train: model-training command
 """
 

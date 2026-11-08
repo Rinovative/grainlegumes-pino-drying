@@ -20,27 +20,34 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 from support import transient_evaluation
+from support.synthetic_task import synthetic_split_payload
 from torch import nn
 
 from src import common, datasets
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.analysis.artifacts import analysis_artifact_performance as artifact_performance
+from src.analysis.artifacts import analysis_artifact_plan as artifact_plan
 from src.analysis.artifacts import analysis_artifact_service as artifact_service
+from src.analysis.artifacts import analysis_artifact_timing as artifact_timing
 from src.analysis.artifacts import analysis_artifact_transient as artifact_generator
-from src.analysis.evaluation import evaluation_dataframe
+from src.analysis.evaluation import evaluation_artifact_loader
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_transient_artifact as artifact
 from src.analysis.evaluation import evaluation_transient_rollout as rollout
 from src.analysis.evaluation import evaluation_transient_session as transient_session
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 from src.analysis.presentation import analysis_presentation_curated as curated
 from src.learning.inference import learning_inference_transient as inference
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # Strict package case IDs name the per-case NPZ files.
 _CASE_ID = "lentil__case_0001__000000000001"
@@ -116,10 +123,20 @@ def _spatial_identity(static: np.ndarray | None = None) -> dict[str, Any]:
     )
 
 
+def _dataset_identity(source_dataset_id: str = "transient_dataset") -> dict[str, Any]:
+    """Return the exact per-case Dataset identity the transient producer persists."""
+    return {
+        "artifact_dataset_name": "transient_dataset",
+        "source_dataset_id": source_dataset_id,
+        "saved_membership_digests": ["b" * 64],
+        "source_index_digest": "a" * 64,
+    }
+
+
 def _identity(*, model_kind: str = "rno") -> dict[str, Any]:
     return {
         "case_id": _CASE_ID,
-        "dataset_identity": {"dataset_id": "transient_dataset", "index_digest": "a" * 64},
+        "dataset_identity": _dataset_identity(),
         "dataset_role": "id",
         "evaluation_assignment": None,
         "material_family": "lentil",
@@ -140,8 +157,7 @@ def _identity(*, model_kind: str = "rno") -> dict[str, Any]:
         "parent_checkpoint": {"source_checkpoint_sha256": "e" * 64},
         "stage_a_handoff": {"source_checkpoint_sha256": "e" * 64},
         "matched_compute_manifest": {"planned": {}, "actual": {}},
-        "dataset_backend": "canonical_hdf5",
-        "pt_payload_identity": None,
+        "pt_payload_identity": "a" * 64,
         "evaluation_config_identity": "d" * 64,
         "timing_evidence_identity": "f" * 64,
     }
@@ -206,6 +222,43 @@ def _qualified_identity(case_id: str, material: str) -> dict[str, Any]:
         "material_family": material,
         "simulation_identity": {"package_case_id": case_id},
     }
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [lambda identity: identity.update(dataset_backend="pt_shards"), lambda identity: identity.update(pt_payload_identity="")],
+    ids=["dataset-backend", "empty-payload-identity"],
+)
+def test_sequence_identity_rejects_dataset_backend_and_requires_payload_identity(mutate: Any) -> None:
+    """A sequence identity names its PT payload and carries no storage-backend field."""
+    identity = _identity()
+    assert artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")["pt_payload_identity"] == "a" * 64
+    mutate(identity)
+    with pytest.raises((artifact.TransientSequenceArtifactError, TypeError)):
+        artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")
+
+
+@pytest.mark.parametrize(
+    "dataset_identity",
+    [
+        {"dataset_id": "transient_dataset", "index_digest": "a" * 64},
+        {"source_dataset_id": "foreign_dataset"},
+        {**_dataset_identity(), "extra": "field"},
+        {key: value for key, value in _dataset_identity().items() if key != "source_index_digest"},
+        {**_dataset_identity(), "source_dataset_id": ""},
+        {**_dataset_identity(), "saved_membership_digests": []},
+        {**_dataset_identity(), "saved_membership_digests": ["b" * 64, ""]},
+        {**_dataset_identity(), "saved_membership_digests": "b" * 64},
+    ],
+    ids=("old-shape", "source-only", "extra-key", "missing-index-digest", "empty-source", "no-digests", "empty-digest", "digest-text"),
+)
+def test_sequence_identity_requires_the_exact_producer_dataset_identity(dataset_identity: dict[str, Any]) -> None:
+    """Admit only the four-field Dataset identity the producer writes, with non-empty text and a non-empty digest list."""
+    identity = _identity()
+    artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")
+    identity["dataset_identity"] = dataset_identity
+    with pytest.raises((artifact.TransientSequenceArtifactError, TypeError)):
+        artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")
 
 
 def test_fail_fast_membership_admits_colliding_local_case_labels_by_qualified_identity() -> None:
@@ -290,7 +343,7 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
             "source_batch_id": "batch",
         },
     )
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
@@ -374,8 +427,7 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
                 role=role,
                 case=cast("Any", case),
                 canonical=canonical,
-                dataset_backend="canonical_hdf5",
-                pt_identity=None,
+                pt_identity="a" * 64,
                 runtime_identity={"scientific_solver_seconds": 1.0},
                 spatial_representation=_spatial_identity(),
             )
@@ -386,8 +438,7 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
         role=role,
         case=cast("Any", case),
         canonical=canonical,
-        dataset_backend="canonical_hdf5",
-        pt_identity=None,
+        pt_identity="a" * 64,
         runtime_identity={"scientific_solver_seconds": 1.0},
         spatial_representation=_spatial_identity(),
     )
@@ -409,7 +460,6 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
     package_case_id = "transient_drying__lentil__natural__case_0001"
     source = {
         "schema_kind": "generation_source_case_reference",
-        "schema_version": 1,
         "task": "transient_drying",
         "campaign_name": "campaign-1",
         "campaign_digest": "a" * 64,
@@ -438,7 +488,7 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
         return admitted
 
     monkeypatch.setattr(artifact_generator.generation.publication.catalog, "resolve_raw_case_reference", resolve)
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
@@ -515,7 +565,7 @@ def test_transient_artifact_rejects_manifest_source_drift(monkeypatch: pytest.Mo
         "resolve_raw_case_reference",
         lambda *_args, **_kwargs: SimpleNamespace(source_identity=source, design_provenance={"origin": "replacement"}),
     )
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="dataset",
@@ -666,84 +716,23 @@ def test_protocol_identity_covers_complete_transient_evaluation_configuration() 
     assert first != second
 
 
-@pytest.mark.parametrize(("with_additional", "primary_ood"), [(False, False), (True, False), (True, True)])
-def test_current_transient_plan_uses_saved_exact_membership_and_optional_additional(
-    tmp_path: Path, *, with_additional: bool, primary_ood: bool
-) -> None:
-    """Preserve one current split schema and an ordinary empty additional selection."""
-    evaluation_id = "train-dataset" if primary_ood else "additional-dataset"
-    additional_ids = [evaluation_id] if with_additional and not primary_ood else []
-    assignments = (
-        [{"dataset_id": evaluation_id, "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []}] if with_additional else []
-    )
-    completed = {
-        "config": {
-            "task": "transient_drying",
-            "run": {"name": "scientific-run"},
-            "data": {"train_dataset": "train-dataset", "additional_evaluation_datasets": additional_ids},
-        },
-        "split_indices": {
-            "schema_kind": datasets.runtime.transient_training.SPLIT_SCHEMA_KIND,
-            "schema_version": datasets.runtime.transient_training.SPLIT_SCHEMA_VERSION,
-            "dataset_identity": {
-                "train": {"dataset_id": "train-dataset", "index_digest": "a" * 64},
-                "additional_evaluation": [{"dataset_id": evaluation_id, "index_digest": "b" * 64}] if with_additional else [],
-            },
-            "roles": {
-                "id_test": {"case_ids": ["train-case"], "item_ids": ["train-case__step_0000"], "membership_digest": "c" * 64},
-                "additional_evaluation": {
-                    "parts": [{"case_ids": ["additional-case"], "item_ids": ["additional-case__step_0000"], "membership_digest": "d" * 64}]
-                    if with_additional
-                    else []
-                },
-            },
-            "evaluation_assignments": assignments,
-        },
-    }
-    plan = artifact_generator.transient_artifact_plan_from_completed(completed, run_dir=tmp_path)
-    assert plan.id_role.case_ids_by_source == (("train-case",),)
-    assert (plan.additional_role is not None) is with_additional
-    if with_additional:
-        assert plan.additional_role is not None
-        assert plan.additional_role.split == "additional_evaluation"
-        assert plan.additional_role.evaluation_assignments == tuple(assignments)
+def _run_plan(run_dir: Path, *, task: str, with_additional: bool) -> artifact_plan.ArtifactPlan:
+    """Return a one-source artifact plan with an optional one-source additional role."""
 
+    def role(split: Any, dataset_role: Any, dataset_id: str) -> artifact_plan.ArtifactRolePlan:
+        return artifact_plan.ArtifactRolePlan(
+            split=split,
+            dataset_role=dataset_role,
+            dataset_name=dataset_id,
+            source_dataset_ids=(dataset_id,),
+            source_identities=({"dataset_id": dataset_id},),
+            case_ids_by_source=((_CASE_ID,),),
+            membership_digests=("a" * 64,),
+        )
 
-def test_shared_artifact_owner_dispatches_transient_before_steady_assumptions(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-) -> None:
-    """Route transient generation through its sequence owner before steady requests."""
-    expected = pd.DataFrame({"sequence": [1]})
-    observed: dict[str, Any] = {}
-    monkeypatch.setattr(artifact_service, "_load_run_config", lambda _run_dir: {"task": "transient_drying"})
-    monkeypatch.setattr(
-        artifact_service.experiments.config.loader,
-        "validate_resolved_task_contract",
-        lambda _config: SimpleNamespace(id="transient_drying"),
-    )
-
-    def transient_owner(**kwargs: Any) -> pd.DataFrame:
-        observed.update(kwargs)
-        return expected
-
-    monkeypatch.setattr(artifact_service, "_run_or_load_transient_artifacts_locked", transient_owner)
-    monkeypatch.setattr(
-        artifact_service,
-        "_build_artifact_request",
-        lambda **_kwargs: pytest.fail("transient artifact dispatch reached the steady request owner"),
-    )
-    result = artifact_service._run_or_load_artifacts_locked(
-        run_dir=tmp_path / "run",
-        dataset_name="transient_dataset",
-        split="eval",
-        device_resolution=cast("Any", object()),
-        dataset_root=tmp_path / "datasets",
-        rebuild=False,
-    )
-    assert result is expected
-    assert observed["dataset_name"] == "transient_dataset"
-    assert observed["split"] == "eval"
+    additional = role("additional_evaluation", "additional_evaluation", "additional_dataset") if with_additional else None
+    id_role = role("eval", "id", "id_dataset")
+    return artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task=task, id_role=id_role, additional_role=additional)
 
 
 def _patch_publication_lifecycle(
@@ -838,191 +827,93 @@ def test_unconfigured_transient_publication_has_no_observer_side_effects(
         lambda *_args, **_kwargs: pytest.fail("unconfigured publication initialized W&B"),
     )
     artifact_service._upload_published_artifacts(
-        plan=artifact_service.RunArtifactPlan(
-            run_dir=tmp_path / "run",
-            id_dataset_name="id_dataset",
-            additional_evaluation_dataset_name=None,
-            scientific_run_name="run",
-        ),
+        plan=_run_plan(tmp_path / "run", task="transient_drying", with_additional=False),
         device_resolution=cast("Any", object()),
         id_frame=pd.DataFrame(),
     )
 
 
-@pytest.mark.parametrize("with_additional", [False, True])
-def test_transient_artifact_publication_logs_only_validated_bounded_summary(
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_artifact_publication_validates_every_role_before_uploading_its_provenance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Any,
-    *,
-    with_additional: bool,
+    task: str,
 ) -> None:
-    """Validate all roles before summary-only publication and exclude files/media."""
+    """Both tasks bind every role frame to its validated source, reduce and log one bounded summary, then steady adds media."""
     events: list[str] = []
-    payload: dict[str, bool | float | int | str] = {
-        "evaluation/0/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse": 0.25,
-        "evaluation/0/id/autonomous_full/full/cumulative/contributing_case_count": 3,
-        "evaluation/identity/backend": "canonical_hdf5",
-    }
-    frame_by_role = {"id": pd.DataFrame()}
-    provenance_by_role: dict[str, dict[str, Any]] = {"id": {"role": "id", "identity": "a" * 64}}
-    if with_additional:
-        frame_by_role["additional_evaluation"] = pd.DataFrame()
-        provenance_by_role["additional_evaluation"] = {"role": "additional_evaluation", "identity": "b" * 64}
-    for role, frame in frame_by_role.items():
-        frame.attrs["artifact_provenance"] = provenance_by_role[role]
-
-    def artifact_root(*, split: str, **_kwargs: Any) -> Any:
-        return tmp_path / split
+    frames = {"eval": pd.DataFrame({"value": [1.0]}), "additional_evaluation": pd.DataFrame({"value": [2.0]})}
+    for split, frame in frames.items():
+        frame.attrs["artifact_provenance"] = {"split": split}
 
     def validate(*, artifact_root: Any, **_kwargs: Any) -> dict[str, Any]:
-        role = "id" if artifact_root.name == "eval" else "additional_evaluation"
-        events.append(f"validate_{role}")
-        return provenance_by_role[role]
+        events.append(f"validate_{artifact_root.name}")
+        return {"split": artifact_root.name}
 
     class FakeTransientSession:
-        def __init__(self, frames: dict[str, pd.DataFrame]) -> None:
-            assert frames == frame_by_role
-            events.append("reduce_summary")
+        def __init__(self, frames_by_role: dict[str, pd.DataFrame]) -> None:
+            assert list(frames_by_role) == ["id", "additional_evaluation"]
 
         def wandb_publication_summary(self) -> dict[str, bool | float | int | str]:
-            return payload
+            events.append("reduce_summary")
+            return {"evaluation/0/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse": 0.25}
 
         def close(self) -> None:
-            events.append("close_summary")
+            pass
 
-    logged: list[dict[str, bool | float | int | str]] = []
+    def reduce_steady(role_frames: Mapping[str, pd.DataFrame]) -> dict[str, int]:
+        assert list(role_frames) == ["id", "additional_evaluation"]
+        assert role_frames["id"] is frames["eval"]
+        assert role_frames["additional_evaluation"] is frames["additional_evaluation"]
+        events.append("reduce_summary")
+        return {"evaluation/id/valid_case_count": 1}
+
     tracking_session = SimpleNamespace(
-        log_transient_evaluation_summary=lambda evidence: (events.append("log_summary"), logged.append(dict(evidence))),
-        upload_files=lambda _files: pytest.fail("transient publication uploaded provenance"),
-        upload_post_artifact=lambda **_kwargs: pytest.fail("transient publication uploaded media"),
+        log_evaluation_summary=lambda _evidence: events.append("log_summary"),
+        upload_files=lambda files: events.append(f"upload_{files['artifact_provenance'].parent.name}"),
+        upload_post_artifact=lambda **kwargs: events.append(f"media_{kwargs['artifact_root'].name}"),
         finish=lambda **_kwargs: events.append("finish_wandb"),
     )
-    config = {
-        "tracking": {
-            "wandb": {
-                "mode": "offline",
-                "upload": {"evaluation_artifacts": True},
-            }
-        }
-    }
-    monkeypatch.setattr(artifact_service, "_artifact_save_root", artifact_root)
+    config = {"tracking": {"wandb": {"mode": "offline", "upload": {"evaluation_artifacts": True}}}}
+    monkeypatch.setattr(artifact_service, "_artifact_save_root", lambda *, split, **_kwargs: tmp_path / split)
     monkeypatch.setattr(artifact_service, "validate_artifact_upload_source", validate)
     monkeypatch.setattr(transient_session, "TransientEvaluationSession", FakeTransientSession)
-    _patch_publication_lifecycle(
-        monkeypatch,
-        config=config,
-        task_id="transient_drying",
-        tracking_session=tracking_session,
-        events=events,
-    )
-    plan = artifact_service.RunArtifactPlan(
-        run_dir=tmp_path / "run",
-        id_dataset_name="id_dataset",
-        task="transient_drying",
-        additional_evaluation_dataset_name="additional_dataset" if with_additional else None,
-        scientific_run_name="run",
-    )
+    monkeypatch.setattr(artifact_service, "_steady_wandb_summary", reduce_steady)
+    monkeypatch.setattr(curated, "render_curated_analysis", lambda **_kwargs: SimpleNamespace(media_files={}, tables={}))
+    _patch_publication_lifecycle(monkeypatch, config=config, task_id=task, tracking_session=tracking_session, events=events)
+    plan = _run_plan(tmp_path / "run", task=task, with_additional=True)
     artifact_service._upload_published_artifacts(
         plan=plan,
         device_resolution=cast("Any", object()),
-        id_frame=frame_by_role["id"],
-        additional_frame=frame_by_role.get("additional_evaluation"),
+        id_frame=frames["eval"],
+        additional_frame=frames["additional_evaluation"],
     )
 
-    expected_roles = ["id", "additional_evaluation"] if with_additional else ["id"]
-    assert logged == [payload]
-    assert all(events.index(f"validate_{role}") < events.index("initialize_wandb") for role in expected_roles)
-    assert events.index("reduce_summary") < events.index("initialize_wandb") < events.index("log_summary")
-    assert events[-1] == "finish_wandb"
+    assert events == [
+        "validate_eval",
+        "validate_additional_evaluation",
+        "reduce_summary",
+        "append_runtime_session",
+        "initialize_wandb",
+        "upload_eval",
+        "upload_additional_evaluation",
+        "log_summary",
+        *(["media_eval"] if task == "steady_flow" else []),
+        "finish_wandb",
+    ]
 
-
-def test_steady_artifact_publication_retains_provenance_and_curated_media(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-) -> None:
-    """Preserve the existing steady ID/OOD file and curated-report lifecycle."""
-    events: list[str] = []
-    file_uploads: list[dict[str, Any]] = []
-    post_uploads: list[dict[str, Any]] = []
-    tracking_session = SimpleNamespace(
-        log_transient_evaluation_summary=lambda _evidence: pytest.fail("steady publication used transient summary"),
-        upload_files=lambda files: file_uploads.append(dict(files)),
-        upload_post_artifact=lambda **kwargs: post_uploads.append(dict(kwargs)),
-        finish=lambda **_kwargs: events.append("finish_wandb"),
-    )
-    config = {
-        "tracking": {
-            "wandb": {
-                "mode": "offline",
-                "upload": {"evaluation_artifacts": True},
-            }
-        }
-    }
-    monkeypatch.setattr(
-        artifact_service,
-        "_artifact_save_root",
-        lambda *, split, **_kwargs: tmp_path / split,
-    )
-    monkeypatch.setattr(
-        artifact_service,
-        "validate_artifact_upload_source",
-        lambda **_kwargs: {"validated": True},
-    )
-    monkeypatch.setattr(evaluation_dataframe, "build_eval_df", lambda frame: frame)
-    monkeypatch.setattr(
-        curated,
-        "render_curated_analysis",
-        lambda **_kwargs: SimpleNamespace(media_files={}, tables={}),
-    )
-    _patch_publication_lifecycle(
-        monkeypatch,
-        config=config,
-        task_id="steady_flow",
-        tracking_session=tracking_session,
-        events=events,
-    )
-    frame = pd.DataFrame({"value": [1.0]})
-    artifact_service._upload_published_artifacts(
-        plan=artifact_service.RunArtifactPlan(
-            run_dir=tmp_path / "run",
-            id_dataset_name="id_dataset",
-            additional_evaluation_dataset_name="ood_dataset",
-            scientific_run_name="run",
-        ),
-        device_resolution=cast("Any", object()),
-        id_frame=frame,
-        additional_frame=frame,
-    )
-
-    assert len(file_uploads) == 2
-    assert len(post_uploads) == 1
-    assert post_uploads[0]["artifact_root"] == tmp_path / "eval"
-    assert events[-1] == "finish_wandb"
-
-
-def test_multi_package_role_rejects_duplicate_package_case_identity() -> None:
-    """Prevent additional Evaluation package parts from colliding in sequence and timing identities."""
-    identities = (
-        {"dataset_id": "additional_a"},
-        {"dataset_id": "additional_b"},
-    )
-    evidence = (
-        {"case_ids": ["case"], "membership_digest": "a" * 64},
-        {"case_ids": ["case"], "membership_digest": "b" * 64},
-    )
-    with pytest.raises(ValueError, match="duplicate package-case"):
-        artifact_generator._role_plan(
-            split="additional_evaluation",
-            dataset_role="additional_evaluation",
-            dataset_ids=("additional_a", "additional_b"),
-            identities=identities,
-            role_evidence=evidence,
+    frames["additional_evaluation"].attrs["artifact_provenance"] = {"split": "stale"}
+    with pytest.raises(artifact_service.ArtifactCacheError, match="not the validated upload source"):
+        artifact_service._upload_published_artifacts(
+            plan=plan,
+            device_resolution=cast("Any", object()),
+            id_frame=frames["eval"],
+            additional_frame=frames["additional_evaluation"],
         )
 
 
 def test_scoped_role_selection_preserves_saved_order_and_rejects_unknown_cases() -> None:
     """Keep disposable case selection bounded to exact saved role membership."""
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="additional_evaluation",
         dataset_role="additional_evaluation",
         dataset_name="combined-additional",
@@ -1046,6 +937,57 @@ def test_scoped_role_selection_preserves_saved_order_and_rejects_unknown_cases()
         artifact_generator.select_transient_role_cases(role, ("missing",))
 
 
+def test_scoped_dataset_load_checks_the_fixed_partition_against_the_full_saved_membership(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept a valid one-case subset of a two-case part, because only the full saved membership is held to the manifest partition."""
+    saved = artifact_plan.ArtifactRolePlan(
+        split="eval",
+        dataset_role="id",
+        dataset_name="transient_dataset",
+        source_dataset_ids=("transient_dataset",),
+        source_identities=({"dataset_id": "transient_dataset", "index_digest": "a" * 64},),
+        case_ids_by_source=((_CASE_ID, _CASE_B),),
+        membership_digests=("b" * 64,),
+    )
+    binding = SimpleNamespace(
+        dataset_id="transient_dataset",
+        case_partition={"id_test": [_CASE_ID, _CASE_B]},
+        split_identity=lambda: {"dataset_id": "transient_dataset"},
+    )
+    representation = SimpleNamespace(spatial_stride=1)
+
+    class Candidate(datasets.runtime.transient.TransientPhysicalDataset):
+        """Stand in for a reopened full package: only its manifest binding and payload identity are read."""
+
+        def __init__(self) -> None:
+            self.manifest_binding = binding  # type: ignore[assignment]
+
+        @property
+        def payload_identity(self) -> dict[str, Any]:
+            return {"index_digest": "a" * 64}
+
+        def close(self) -> None:
+            pass
+
+    def select(_candidate: object, case_ids: tuple[str, ...]) -> SimpleNamespace:
+        cases = [{"package_case_id": case_id} for case_id in case_ids]
+        samples = [{"case_index": index} for index in range(len(case_ids))]
+        return SimpleNamespace(
+            payload={"cases": cases, "samples": samples}, sample_indices=range(len(case_ids)), spatial_representation=lambda: representation
+        )
+
+    monkeypatch.setattr(datasets.runtime.factory, "create_dataset", lambda _request: Candidate())
+    monkeypatch.setattr(datasets.runtime.transient, "select_transient_cases", select)
+    scoped = artifact_generator.select_transient_role_cases(saved, (_CASE_B,))
+
+    load = {"storage_root": Path("unused"), "spatial_representation": cast("Any", representation)}
+
+    loaded = artifact_generator._load_role_datasets(scoped, saved_role=saved, **load)
+
+    assert [dataset.payload["cases"][0]["package_case_id"] for dataset in loaded] == [_CASE_B]
+    with pytest.raises(RuntimeError, match="fixed partition"):
+        artifact_generator._load_role_datasets(scoped, saved_role=replace(saved, case_ids_by_source=((_CASE_ID,),)), **load)
+
+
 @pytest.mark.parametrize(
     ("training_stage", "comparison_arm"),
     [("a", "a0"), ("b", "b")],
@@ -1055,35 +997,16 @@ def test_artifact_evaluation_grid_resolution_defaults_original_and_honors_explic
     training_stage: str,
     comparison_arm: str,
 ) -> None:
-    """Reconcile stride-two Training evidence with original-grid default artifact inference."""
-    scaling = SimpleNamespace(
-        dataset_identity={
-            "spatial_stride": 2,
-            "canonical_spatial_shape": [251, 401],
-            "effective_spatial_shape": [126, 201],
-        },
-        spatial_shape=(126, 201),
-    )
-    monkeypatch.setattr(
-        artifact_generator.TransientScalingArtifact,
-        "from_state_dict",
-        lambda _state: scaling,
-    )
+    """Reconcile stride-two Training evidence from the admitted split with original-grid default artifact inference."""
+    monkeypatch.setattr(artifact_generator.TransientScalingArtifact, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(3, 4)))
+    view = {"spatial_stride": 2, "canonical_ny": 5, "canonical_nx": 7, "effective_ny": 3, "effective_nx": 4}
     completed = {
         "config": {
             "task": "transient_drying",
             "data": {"spatial_stride": 2},
             "training": {"stage": training_stage, "comparison_arm": comparison_arm},
         },
-        "split_indices": {
-            "spatial_view": {
-                "spatial_stride": 2,
-                "canonical_ny": 251,
-                "canonical_nx": 401,
-                "effective_ny": 126,
-                "effective_nx": 201,
-            }
-        },
+        "split_indices": synthetic_split_payload("transient_drying", spatial_view=view),
         "normalizer_state": {},
     }
 
@@ -1094,11 +1017,14 @@ def test_artifact_evaluation_grid_resolution_defaults_original_and_honors_explic
     )
 
     assert training.spatial_stride == 2
-    assert training.represented_shape == (126, 201)
+    assert training.represented_shape == (3, 4)
     assert default_evaluation.spatial_stride == 1
-    assert default_evaluation.represented_shape == (251, 401)
+    assert default_evaluation.represented_shape == (5, 7)
     assert sampled_evaluation.spatial_stride == 2
-    assert sampled_evaluation.represented_shape == (126, 201)
+    assert sampled_evaluation.represented_shape == (3, 4)
+    monkeypatch.setattr(artifact_generator.TransientScalingArtifact, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(5, 7)))
+    with pytest.raises(ValueError, match="fitted scaling shape"):
+        artifact_generator.resolve_transient_artifact_spatial_representations(completed)
 
 
 def test_evaluation_grid_variants_have_disjoint_rebuild_and_lock_targets(tmp_path: Path) -> None:
@@ -1139,7 +1065,7 @@ def test_transient_upload_admission_resolves_exact_grid_variant(
     run_dir = tmp_path / "run"
     artifact_root = run_dir / "analysis" / "grid_s2" / "id"
     artifact_root.mkdir(parents=True)
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="dataset",
@@ -1148,18 +1074,15 @@ def test_transient_upload_admission_resolves_exact_grid_variant(
         case_ids_by_source=((_CASE_ID,),),
         membership_digests=("a" * 64,),
     )
-    plan = artifact_generator.TransientArtifactPlan(
-        run_dir=run_dir,
-        run_name="run",
-        id_role=role,
-        additional_role=None,
-    )
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task="transient_drying", id_role=role, additional_role=None)
     completed = {"config": {"task": "transient_drying"}}
     observed: dict[str, object] = {}
 
-    def validate(_root: Path, **kwargs: object) -> SimpleNamespace:
-        observed.update(kwargs)
-        return SimpleNamespace(provenance={"validated": True})
+    def admit(_run_dir: Path, admitted: object, **kwargs: object) -> SimpleNamespace:
+        observed.update(kwargs, completed=admitted)
+        frame = pd.DataFrame()
+        frame.attrs["artifact_provenance"] = {"validated": True}
+        return SimpleNamespace(frame=frame)
 
     monkeypatch.setattr(artifact_service.experiments.run, "validate_completed_run", lambda _run_dir: completed)
     monkeypatch.setattr(
@@ -1167,8 +1090,8 @@ def test_transient_upload_admission_resolves_exact_grid_variant(
         "validate_resolved_task_contract",
         lambda _config: SimpleNamespace(id="transient_drying"),
     )
-    monkeypatch.setattr(artifact_generator, "transient_artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
-    monkeypatch.setattr(artifact_generator, "validate_transient_role_artifact", validate)
+    monkeypatch.setattr(artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(evaluation_artifact_loader, "admit_role_artifact", admit)
 
     provenance = artifact_service.validate_artifact_upload_source(
         run_dir=run_dir,
@@ -1177,7 +1100,8 @@ def test_transient_upload_admission_resolves_exact_grid_variant(
 
     assert provenance == {"validated": True}
     assert observed["completed"] is completed
-    assert observed["role"] is role
+    assert observed["selection_role"] == "id"
+    assert observed["root"] == artifact_root.resolve()
     assert observed["evaluation_spatial_stride"] == 2
 
 
@@ -1238,6 +1162,13 @@ def test_default_geometric_horizons_are_exact_transition_contracts() -> None:
     assert process_policy["bulk_moisture"]["available"] is True
     assert process_policy["stability_increment_growth_factor"] == 2.0
     assert process_policy["mass_balance"]["available"] is False
+
+
+def test_case_assembly_admits_exactly_the_artifact_dataset_roles() -> None:
+    """The rollout assembly shares the artifact's role vocabulary, so the additional-evaluation set is evaluable."""
+    assert rollout.assemble_transient_evaluation_case(_items(), dataset_role="additional_evaluation").dataset_role == "additional_evaluation"
+    with pytest.raises(ValueError, match="dataset_role must be 'id' or 'additional_evaluation'"):
+        rollout.assemble_transient_evaluation_case(_items(), dataset_role=cast("Any", "ood"))
 
 
 def test_prepared_evaluation_case_owns_and_guards_cpu_reference_states() -> None:
@@ -1428,6 +1359,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         replace(full[0], physical_times=invalid_times).validated()
 
     provenance = {
+        "producer": {"analysis_sha256": "9" * 64},
         "run": {
             "name": "run",
             "checkpoint_sha256": "b" * 64,
@@ -1445,6 +1377,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         "spatial_representation": {"schema_version": 1},
         "runtime": {"device": "cpu", "precision": "float32"},
         "lineage": {"strategy": "rollout"},
+        "timing": {"report": {"cases": []}, "component_availability": {}},
     }
     with pytest.raises(ValueError, match="unique available records"):
         artifact.write_transient_sequence_artifact(
@@ -1477,13 +1410,10 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
     with recorder.stage("inference"):
         recorder.increment("case_count")
         recorder.increment("forward_call_count", 3)
-    artifact.publish_transient_operational_performance(
-        tmp_path / "artifact",
-        recorder.snapshot(),
-    )
+    artifact_timing.write_stage_timing(tmp_path / "artifact", {"operational_performance": recorder.snapshot()})
     with_telemetry = artifact.load_transient_sequence_artifact_index(tmp_path / "artifact")
     assert with_telemetry.identity_sha256 == identity_before_telemetry
-    assert with_telemetry.provenance["runtime"]["operational_performance"]["counts"] == {
+    assert with_telemetry.provenance["timing"]["operational_performance"]["counts"] == {
         "case_count": 1,
         "forward_call_count": 3,
     }
@@ -1644,7 +1574,7 @@ def test_nonfinite_evaluation_completes_all_modes_with_unavailable_target(
         fixed_horizons=(1, 2),
     )
 
-    diagnostic = [record for record in evaluated.records if record.prediction_validity["status"] == transient_validity.NONFINITE]
+    diagnostic = [record for record in evaluated.records if record.prediction_validity["status"] == validity_contract.NONFINITE]
     assert {record.mode for record in diagnostic} == {
         "autonomous_full",
         "rolling_origin",
@@ -1657,7 +1587,7 @@ def test_nonfinite_evaluation_completes_all_modes_with_unavailable_target(
     assert np.isnan(full.scaled_model_outputs[0, 0, 0, 0])
     assert np.isposinf(full.scaled_model_outputs[0, 1, 0, 0])
     assert np.isneginf(full.scaled_model_outputs[0, 2, 0, 0])
-    assert evaluated.prediction_validity["status"] == transient_validity.NONFINITE
+    assert evaluated.prediction_validity["status"] == validity_contract.NONFINITE
     assert evaluated.model_calls == 7
 
 
@@ -1809,7 +1739,7 @@ def test_prediction_validity_classifies_each_finite_field_domain(
         origin_index=0,
     )
 
-    assert validity["status"] == transient_validity.FINITE_BUT_PHYSICALLY_INVALID
+    assert validity["status"] == validity_contract.FINITE_BUT_PHYSICALLY_INVALID
     assert validity["channels"][channel]["physically_invalid_finite_count"] == 1
     assert validity["first_invalid"]["channel"] == channel
     assert states[0, channel_index, 2, 2] == value
@@ -1838,10 +1768,10 @@ def _status_of(states: np.ndarray) -> str:
 @pytest.mark.parametrize(
     ("phi", "index", "status"),
     [
-        (1.09, (2, 2), transient_validity.VALID),
-        (5.6, (0, 0), transient_validity.VALID),
-        (-0.64, (1, 5), transient_validity.VALID),
-        (5.6, (2, 0), transient_validity.FINITE_BUT_PHYSICALLY_INVALID),
+        (1.09, (2, 2), validity_contract.VALID),
+        (5.6, (0, 0), validity_contract.VALID),
+        (-0.64, (1, 5), validity_contract.VALID),
+        (5.6, (2, 0), validity_contract.FINITE_BUT_PHYSICALLY_INVALID),
     ],
 )
 def test_physical_invalid_mask_phi_range_and_corner_blocks(phi: float, index: tuple[int, int], status: str) -> None:
@@ -1855,11 +1785,11 @@ def test_corner_nan_remains_nonfinite() -> None:
     """Corner exclusion does not hide non-finite values."""
     states = _validity_states()
     states[0, 1, 0, 0] = np.nan
-    assert _status_of(states) == transient_validity.NONFINITE
+    assert _status_of(states) == validity_contract.NONFINITE
 
 
-def test_prediction_validity_rejects_schema_version_one() -> None:
-    """Readers reject the superseded validity schema."""
+def test_prediction_validity_rejects_other_schema_version() -> None:
+    """Readers reject a validity document whose schema version is not 1."""
     states = _validity_states()
     zeros = np.zeros_like(states)
     validity = transient_validity.build_prediction_validity(
@@ -1872,8 +1802,9 @@ def test_prediction_validity_rejects_schema_version_one() -> None:
         origin_index=0,
     )
     assert validity["physical_contract"]["excluded_corner_block"] == 2
-    with pytest.raises(ValueError, match="schema_version 1 is unsupported"):
-        transient_validity.validate_prediction_validity_document({**validity, "schema_version": 1})
+    for version in (2, True, 1.0):  # JSON true and 1.0 must not pass as version 1.
+        with pytest.raises(ValueError, match=f"schema_version {version!r} is unsupported"):
+            transient_validity.validate_prediction_validity_document({**validity, "schema_version": version})
 
 
 def test_prediction_validity_classifies_valid_and_complete_nonfinite_fields() -> None:
@@ -1891,7 +1822,7 @@ def test_prediction_validity_classifies_valid_and_complete_nonfinite_fields() ->
         mode="autonomous_full",
         origin_index=0,
     )
-    assert valid["status"] == transient_validity.VALID
+    assert valid["status"] == validity_contract.VALID
 
     channel_index = artifact.STATE_ORDER.index("w_int")
     for values in (increments, states):
@@ -1905,7 +1836,7 @@ def test_prediction_validity_classifies_valid_and_complete_nonfinite_fields() ->
         mode="autonomous_full",
         origin_index=0,
     )
-    assert nonfinite["status"] == transient_validity.NONFINITE
+    assert nonfinite["status"] == validity_contract.NONFINITE
     assert nonfinite["channels"]["w_int"]["nan_count"] == 4
     assert nonfinite["stages"]["raw_scaled_model_output"]["channels"]["w_int"]["nan_count"] == 4
     assert np.isnan(states[:, channel_index]).all()
@@ -1935,7 +1866,7 @@ def test_prediction_validity_counts_ieee_values_and_uncomputed_tail_exactly() ->
         origin_index=0,
     )
 
-    assert validity["status"] == transient_validity.NONFINITE
+    assert validity["status"] == validity_contract.NONFINITE
     assert validity["computed_step_count"] == 2
     assert validity["uncomputed_step_count"] == 1
     assert validity["uncomputed_value_count"] == 8
@@ -1999,7 +1930,7 @@ def test_nonfinite_artifact_roundtrip_preserves_raw_values_and_unavailable_metri
 
     indexed = artifact.load_transient_sequence_artifact_index(root)
     summary = indexed.summaries[0]
-    assert summary.prediction_validity["status"] == transient_validity.NONFINITE
+    assert summary.prediction_validity["status"] == validity_contract.NONFINITE
     assert summary.metric_statistics is not None
     assert summary.metric_statistics["cumulative"]["available"] is False
     loaded = artifact.load_transient_sequence_artifact(root).records[0]
@@ -2054,9 +1985,9 @@ def test_load_admission_rejects_fabricated_nonfinite_on_finite_payload(tmp_path:
     validity = json.loads(json.dumps(loaded.prediction_validity))
     channel = validity["stages"]["raw_scaled_model_output"]["channels"][artifact.STATE_ORDER[0]]
     channel.update(finite_value_count=channel["finite_value_count"] - 1, nonfinite_value_count=1, nan_count=1)
-    validity["status"] = transient_validity.NONFINITE
+    validity["status"] = validity_contract.NONFINITE
     validity["first_invalid"] = {
-        "kind": transient_validity.NONFINITE,
+        "kind": validity_contract.NONFINITE,
         "stage": "raw_scaled_model_output",
         "mode": validity["mode"],
         "origin_index": validity["origin_index"],
@@ -2119,9 +2050,9 @@ def test_load_admission_rejects_step_counts_contradicting_availability(tmp_path:
         replace(loaded, prediction_validity=validity).validated()
 
 
-@pytest.mark.parametrize("old_version", [1, 2, 3, 4])
-def test_superseded_schema_versions_are_rejected(tmp_path: Path, old_version: int) -> None:
-    """Reject artifacts written before bundles dropped redundant arrays or were named by package case ID."""
+def test_other_artifact_schema_version_is_rejected(tmp_path: Path) -> None:
+    """Reject a transient sequence artifact whose provenance declares a schema version other than 1."""
+    old_version = 2
     root = tmp_path / "old-artifact"
     stager = artifact.TransientSequenceArtifactStager(root, dataset_name="transient_dataset", dataset_role="id")
     stager.write_case((_cache_test_record(_CASE_ID, mode="autonomous_full"),))
@@ -2324,7 +2255,7 @@ def test_finite_physical_invalidity_remains_eligible_for_raw_error_metrics(
     predicted[:, 1] = 0.5
     predicted[:, 2:] = 1.0
     predicted[1, 0, 0, 0] = 2_001.0
-    interior = np.pad(predicted, ((0, 0), (0, 0), (2, 2), (2, 2)), mode="edge")
+    interior = np.pad(predicted, np.asarray(((0, 0), (0, 0), (2, 2), (2, 2))), mode="edge")
     decoded = np.diff(interior, axis=0)
     validity = transient_validity.build_prediction_validity(
         scaled_model_outputs=decoded,
@@ -2335,7 +2266,7 @@ def test_finite_physical_invalidity_remains_eligible_for_raw_error_metrics(
         mode="autonomous_full",
         origin_index=0,
     )
-    assert validity["status"] == (transient_validity.FINITE_BUT_PHYSICALLY_INVALID)
+    assert validity["status"] == (validity_contract.FINITE_BUT_PHYSICALLY_INVALID)
 
     def normalize(value: np.ndarray, *, scaling: object) -> np.ndarray:
         del scaling
@@ -2396,6 +2327,7 @@ def test_artifact_rejects_reference_prediction_grid_identity_disagreement() -> N
 def _cache_test_provenance() -> dict[str, Any]:
     """Return the minimum strict provenance required for a cache fixture."""
     return {
+        "producer": {"analysis_sha256": "9" * 64},
         "run": {
             "name": "run",
             "checkpoint_sha256": "b" * 64,
@@ -2413,6 +2345,7 @@ def _cache_test_provenance() -> dict[str, Any]:
         "spatial_representation": {"schema_version": 1},
         "runtime": {"device": "cpu", "precision": "float32"},
         "lineage": {"strategy": "rollout"},
+        "timing": {"report": {"cases": []}, "component_availability": {}},
     }
 
 
@@ -2581,29 +2514,31 @@ def test_resumable_stager_rejects_self_digested_semantic_payload_tamper(
         )
 
 
-def test_resumed_case_evidence_restores_json_timing_collections() -> None:
-    """Restore tuple-valued timing evidence after its durable JSON round trip."""
+def _component_evidence(timing: dict[str, Any], prediction_validity: dict[str, Any]) -> dict[str, Any]:
+    """Return one case's component evidence with exactly the fields the generator writes."""
+    return {
+        "dataset_materialization_seconds": 0.005,
+        "generation": {},
+        "timing_case": timing,
+        "prediction_validity": prediction_validity,
+        "model_clock": "time.perf_counter",
+        "wall_clock": "time.perf_counter",
+        "diagnostic_benchmark": {},
+        "airflow_model": {"available": False, "reason": "compatible_airflow_model_not_selected"},
+        "drying_model": {"available": True, "source": "bounded_public_transient_full_rollout_benchmark"},
+        "surrogate_pipeline": {"available": False, "reason": "complete_airflow_to_drying_pipeline_not_selected"},
+    }
+
+
+def _resume_evidence_with_timing(timing: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return JSON round-tripped resume evidence carrying one timing case, and its prediction validity."""
     case_id = _CASE_ID
     record = _cache_test_record(case_id, mode="autonomous_full")
     prediction_validity = transient_validity.aggregate_case_prediction_validity(
         case_id=case_id,
         records=(record.prediction_validity,),
     )
-    timing_case = artifact_generator.transient_timing.TransientTimingCase(
-        case_id=case_id,
-        repetitions={"drying_no_rollout_model_seconds": (0.25,)},
-        device="cpu",
-        precision="float32",
-        dataset_backend="canonical_hdf5",
-        warmup_passes=1,
-    )
-    identity = {
-        "case_id": case_id,
-        "material_family": "lentil",
-        "simulation_identity": {"package_case_id": case_id},
-        "dataset_role": "id",
-        "spatial_representation": {"grid": "exact"},
-    }
+    identity = {**record.identity, "simulation_identity": {"package_case_id": case_id}}
     evidence = json.loads(
         json.dumps(
             {
@@ -2613,11 +2548,8 @@ def test_resumed_case_evidence_restores_json_timing_collections() -> None:
                 "material_family": "lentil",
                 "identity": identity,
                 "spatial_identity": identity["spatial_representation"],
-                "component_availability": {
-                    "prediction_validity": prediction_validity,
-                    "timing_case": artifact_generator.asdict(timing_case),
-                },
-                "timing_case": artifact_generator.asdict(timing_case),
+                "component_availability": _component_evidence(timing, prediction_validity),
+                "timing_case": timing,
                 "prediction_validity_records": [record.prediction_validity],
                 "spatial_compatibility": {
                     "architecture": {"decision": "SUPPORTED_EXACTLY"},
@@ -2627,16 +2559,153 @@ def test_resumed_case_evidence_restores_json_timing_collections() -> None:
             }
         )
     )
+    return evidence, prediction_validity
+
+
+def _resumable_timing_case() -> dict[str, Any]:
+    """Return the JSON-safe form of one valid timing case."""
+    timing_case = artifact_generator.transient_timing.TransientTimingCase(
+        case_id=_CASE_ID,
+        repetitions={"drying_no_rollout_model_seconds": (0.25,)},
+        device="cpu",
+        precision="float32",
+        pt_payload_identity="a" * 64,
+        warmup_passes=1,
+    )
+    return artifact_generator.asdict(timing_case)
+
+
+def test_resumed_case_evidence_restores_json_timing_collections() -> None:
+    """Restore tuple-valued timing evidence after its durable JSON round trip."""
+    evidence, prediction_validity = _resume_evidence_with_timing(_resumable_timing_case())
 
     restored = artifact_generator._restore_resumed_case_evidence(
         evidence,
-        case_id=case_id,
+        case_id=_CASE_ID,
         expected_material="lentil",
         dataset_role="id",
     )
 
     assert restored.timing_case.repetitions == {"drying_no_rollout_model_seconds": (0.25,)}
     assert restored.prediction_validity == prediction_validity
+
+
+def test_resumed_case_evidence_rejects_a_missing_payload_identity() -> None:
+    """Reject resume evidence whose timing case lacks the PT payload identity instead of coercing it to text."""
+    timing = {**_resumable_timing_case(), "pt_payload_identity": None}
+    evidence, _ = _resume_evidence_with_timing(timing)
+
+    with pytest.raises(TypeError, match="text fields"):
+        artifact_generator._restore_resumed_case_evidence(
+            evidence,
+            case_id=_CASE_ID,
+            expected_material="lentil",
+            dataset_role="id",
+        )
+
+
+@pytest.mark.parametrize(
+    ("identity_update", "message"),
+    [({"dataset_backend": "canonical_hdf5"}, "Sequence identity fields mismatch"), ({"pt_payload_identity": "b" * 64}, "contradicts its timing")],
+    ids=["identity-contract", "timing-binding"],
+)
+def test_resumed_case_evidence_requires_a_sequence_identity_bound_to_its_timing(identity_update: dict[str, Any], message: str) -> None:
+    """Reject resume evidence whose identity breaks the sequence contract or names another PT payload than its timing."""
+    evidence, _ = _resume_evidence_with_timing(_resumable_timing_case())
+    evidence["identity"].update(identity_update)
+
+    with pytest.raises(ValueError, match=message):
+        artifact_generator._restore_resumed_case_evidence(
+            evidence,
+            case_id=_CASE_ID,
+            expected_material="lentil",
+            dataset_role="id",
+        )
+
+
+def test_resumed_case_evidence_requires_the_producers_component_fields() -> None:
+    """Reject resume evidence whose component block lacks a field the generator writes, exactly as role admission does."""
+    evidence, _ = _resume_evidence_with_timing(_resumable_timing_case())
+    del evidence["component_availability"]["model_clock"]
+
+    with pytest.raises(ValueError, match="lacks the producer's fields"):
+        artifact_generator._restore_resumed_case_evidence(
+            evidence,
+            case_id=_CASE_ID,
+            expected_material="lentil",
+            dataset_role="id",
+        )
+
+
+def _role_timing_block() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one case's persisted timing block (report plus component evidence) as the generator writes it, and its validity."""
+    timing_case = artifact_generator.transient_timing.TransientTimingCase(
+        case_id=_CASE_ID,
+        repetitions={"drying_no_rollout_model_seconds": (0.25,)},
+        device="cpu",
+        precision="float32",
+        pt_payload_identity="a" * 64,
+        warmup_passes=1,
+    )
+    validity = {"status": "VALID"}
+    report = artifact_generator.transient_timing.build_transient_timing_report((timing_case,))
+    block = {
+        "report": artifact_generator.asdict(report),
+        "component_availability": {_CASE_ID: _component_evidence(artifact_generator.asdict(timing_case), validity)},
+    }
+    return json.loads(json.dumps(block)), validity
+
+
+def _admit_role_timing(block: dict[str, Any], validity: dict[str, Any], *, record_payload_identity: str = "a" * 64) -> None:
+    """Run the one role timing admission over a one-case role whose sequence records name the given PT payload identity."""
+    artifact_generator._validate_role_timing_evidence(
+        block,
+        expected_cases={_CASE_ID},
+        pt_identities={_CASE_ID: {record_payload_identity}},
+        expected_validity={_CASE_ID: validity},
+    )
+
+
+def test_role_timing_admission_accepts_the_generators_complete_block() -> None:
+    """The generator's own per-case component block and report pass the one role timing admission."""
+    _admit_role_timing(*_role_timing_block())
+
+
+@pytest.mark.parametrize(
+    ("break_block", "record_payload_identity", "message"),
+    [
+        (
+            lambda block: block["component_availability"].update({_CASE_ID: {"prediction_validity": {"status": "VALID"}}}),
+            "a" * 64,
+            "lacks the producer's",
+        ),
+        (lambda block: block["component_availability"][_CASE_ID].update(dataset_materialization_seconds=-1.0), "a" * 64, "finite non-negative"),
+        (lambda _block: None, "b" * 64, "contradicts its timing evidence"),
+        (
+            lambda block: block["component_availability"][_CASE_ID]["timing_case"].update(pt_payload_identity="b" * 64),
+            "a" * 64,
+            "contradicts its timing",
+        ),
+        (
+            lambda block: block["component_availability"][_CASE_ID]["prediction_validity"].update(status="NONFINITE"),
+            "a" * 64,
+            "contradicts its timing",
+        ),
+        (lambda block: block["component_availability"].update({"other-case": {}}), "a" * 64, "exact case membership"),
+    ],
+    ids=("partial-component", "negative-duration", "foreign-record-payload", "foreign-component-timing", "foreign-validity", "foreign-membership"),
+)
+def test_role_timing_admission_binds_report_components_and_sequence_records(
+    break_block: Any,
+    record_payload_identity: str,
+    message: str,
+) -> None:
+    """Refuse a block whose components lack producer fields or whose report, components and sequence records disagree on identity."""
+    block, validity = _role_timing_block()
+    break_block(block)
+
+    with pytest.raises(ValueError, match=message):
+        _admit_role_timing(block, validity, record_payload_identity=record_payload_identity)
 
 
 def test_resumable_stager_rejects_symbolic_staging_root(tmp_path: Path) -> None:
@@ -2655,68 +2724,10 @@ def test_resumable_stager_rejects_symbolic_staging_root(tmp_path: Path) -> None:
         )
 
 
-def test_service_requires_exact_rebuild_for_conflicting_partial_target(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Never replace incomplete canonical evidence without explicit rebuild."""
-    run_dir = tmp_path / "transient_drying" / "runs" / "synthetic-b"
-    save_root = run_dir / "analysis" / "id"
-    save_root.mkdir(parents=True)
-    (save_root / "partial.marker").write_text("partial\n", encoding="utf-8")
-    role = artifact_generator.TransientArtifactRolePlan(
-        split="eval",
-        dataset_role="id",
-        dataset_name="transient_dataset",
-        source_dataset_ids=("transient_dataset",),
-        source_identities=({"dataset_id": "transient_dataset"},),
-        case_ids_by_source=((_CASE_ID,),),
-        membership_digests=("a" * 64,),
-    )
-    plan = artifact_generator.TransientArtifactPlan(
-        run_dir=run_dir,
-        run_name="synthetic-b",
-        id_role=role,
-        additional_role=None,
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "validate_completed_run",
-        lambda _run_dir: {"config": {}, "normalizer_state": {}},
-    )
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "transient_artifact_plan_from_completed",
-        lambda *_args, **_kwargs: plan,
-    )
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "generate_transient_role_artifact",
-        lambda **_kwargs: pytest.fail("conflicting target reached generation"),
-    )
-
-    with pytest.raises(artifact_service.ArtifactCacheError, match="--rebuild"):
-        artifact_service._run_or_load_transient_artifacts_locked(
-            run_dir=run_dir,
-            dataset_name="transient_dataset",
-            split="eval",
-            device_resolution=cast(
-                "Any",
-                SimpleNamespace(device=torch.device("cpu")),
-            ),
-            dataset_root=tmp_path / "datasets",
-            rebuild=False,
-            evaluation_spatial_stride=1,
-        )
-
-
-def test_all_completed_generator_resume_skips_runtime_owners(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Finalize exact staged cases without reopening any inference-time owner."""
+def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Finalize exact staged cases without reopening any inference-time owner; return the resume identity the generator opened its stage with."""
     case_id = _CASE_ID
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
@@ -2758,12 +2769,13 @@ def test_all_completed_generator_resume_skips_runtime_owners(
         rollout_steps=2,
     )
     finalized: list[dict[str, Any]] = []
+    resume_identities: list[dict[str, Any]] = []
 
     class Stager:
         completed_case_ids = frozenset({case_id})
 
-        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            pass
+        def __init__(self, *_args: Any, resume_identity: Mapping[str, Any], **_kwargs: Any) -> None:
+            resume_identities.append(dict(resume_identity))
 
         def completed_case_evidence(self, value: str) -> dict[str, Any]:
             assert value == case_id
@@ -2807,7 +2819,14 @@ def test_all_completed_generator_resume_skips_runtime_owners(
     result = artifact_generator.generate_transient_role_artifact(
         run_dir=tmp_path / "run",
         role=role,
-        device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"), as_dict=dict)),
+        device_resolution=cast(
+            "Any",
+            SimpleNamespace(
+                device=torch.device("cpu"),
+                as_dict=dict,
+                metadata=SimpleNamespace(device_type="cpu", cuda_device_name=None, pytorch_version=torch.__version__),
+            ),
+        ),
         dataset_root=tmp_path / "02_datasets",
         staging_root=tmp_path / "stage",
         completed=completed,
@@ -2815,146 +2834,58 @@ def test_all_completed_generator_resume_skips_runtime_owners(
 
     assert result is not None
     assert len(finalized) == 1
+    return resume_identities[0]
 
 
-def test_service_retries_finalized_resume_stage_without_generator_or_inference(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Publish a completed private stage through finalization-only retry."""
-    run_dir = tmp_path / "transient_drying" / "runs" / "synthetic-b"
-    run_dir.mkdir(parents=True)
-    save_root = run_dir / "analysis" / "id"
-    staging_root = save_root.parent / f".{save_root.name}.transient-resume"
-    marker = artifact_contracts.artifact_provenance_path(staging_root)
-    marker.parent.mkdir(parents=True)
-    marker.write_text("{}\n", encoding="utf-8")
-    resume_descriptor = staging_root / artifact.TransientSequenceArtifactStager._RESUME_DESCRIPTOR
-    resume_descriptor.write_text("{}\n", encoding="utf-8")
-    resume_manifests = staging_root / artifact.TransientSequenceArtifactStager._CASE_MANIFEST_DIRECTORY
-    resume_manifests.mkdir()
-    (resume_manifests / "case-interrupted.json").write_text("{}\n", encoding="utf-8")
-    role = artifact_generator.TransientArtifactRolePlan(
-        split="eval",
-        dataset_role="id",
-        dataset_name="transient_dataset",
-        source_dataset_ids=("transient_dataset",),
-        source_identities=({"dataset_id": "transient_dataset"},),
-        case_ids_by_source=((_CASE_ID,),),
-        membership_digests=("a" * 64,),
-    )
-    plan = artifact_generator.TransientArtifactPlan(
-        run_dir=run_dir,
-        run_name="synthetic-b",
-        id_role=role,
-        additional_role=None,
-    )
-    completed = {
-        "config": {
-            "task": "transient_drying",
-            "training": {"stage": "b"},
-        },
-        "scientific_run_name": "synthetic-b",
-        "normalizer_state": {"schema_version": 1},
-    }
-    summary = SimpleNamespace(
-        case_id=_CASE_ID,
-        identity={"material_family": "lentil"},
-    )
-    frame = pd.DataFrame({"record_id": ["record"]})
-    staged = SimpleNamespace(
-        summaries=(summary,),
-        case_ids=(_CASE_ID,),
-        frame=frame,
-        provenance={"kind": "staged"},
-        unavailable_horizons=(),
-    )
-    reporter = artifact_performance.ArtifactProgressReporter(
-        task="transient_drying",
-        run="synthetic-b",
-        stage_label="b",
-        checkpoint_label="best",
-        device=torch.device("cpu"),
-        dtype="float32",
-        total_cases=1,
-        split="id",
-        output_root=save_root,
-    )
-    published_snapshots: list[dict[str, Any]] = []
-    admitted_roots: list[Path] = []
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "validate_completed_run",
-        lambda _run_dir: completed,
-    )
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "transient_artifact_plan_from_completed",
-        lambda *_args, **_kwargs: plan,
-    )
-    monkeypatch.setattr(
-        artifact_service,
-        "_transient_progress_reporter",
-        lambda **_kwargs: reporter,
-    )
+def test_all_completed_generator_resume_skips_runtime_owners(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Finalize exact staged cases without reopening any inference-time owner."""
+    _run_all_completed_resume(tmp_path, monkeypatch)
 
-    def admit(root: Path, **_kwargs: Any) -> Any:
-        admitted_roots.append(root)
-        return staged
 
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "validate_transient_role_artifact_index",
-        admit,
-    )
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "generate_transient_role_artifact",
-        lambda **_kwargs: pytest.fail("finalization-only retry invoked artifact generation or inference"),
-    )
-    monkeypatch.setattr(
-        artifact_service.transient,
-        "validate_staged_transient_role_artifact",
-        lambda index, **_kwargs: index,
-    )
+def _run_analysis(monkeypatch: pytest.MonkeyPatch, digest: str) -> None:
+    """Make ``digest`` the running transient analysis implementation."""
+    running = SimpleNamespace(name="analysis_transient_drying", sha256=lambda: digest)
+    monkeypatch.setitem(artifact_generator.contracts.ANALYSIS_PROJECTIONS, "transient_drying", running)
 
-    def publish(**_kwargs: Any) -> None:
-        final_marker = artifact_contracts.artifact_provenance_path(save_root)
-        final_marker.parent.mkdir(parents=True, exist_ok=True)
-        final_marker.write_text("{}\n", encoding="utf-8")
 
-    monkeypatch.setattr(
-        artifact_service,
-        "_publish_staged_artifact",
-        publish,
-    )
-    monkeypatch.setattr(
-        artifact,
-        "publish_transient_operational_performance",
-        lambda _root, snapshot: published_snapshots.append(dict(snapshot)),
-    )
-    monkeypatch.setattr(artifact_service, "cleanup_runtime", lambda _device: None)
+def test_partial_stage_resumes_only_with_the_analysis_code_that_started_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The resume identity binds the analysis digest instead of the source tree; other analysis code refuses the stage unchanged."""
+    stager = artifact.TransientSequenceArtifactStager  # the generator run below replaces the module attribute with a fake
+    identities = []
+    for position, digest in enumerate(("a" * 64, "b" * 64)):
+        _run_analysis(monkeypatch, digest)
+        identities.append(_run_all_completed_resume(tmp_path / str(position), monkeypatch))
+    assert [identity["producer"] for identity in identities] == [{"analysis_sha256": "a" * 64}, {"analysis_sha256": "b" * 64}]
+    assert {key for key in identities[0] if identities[0][key] != identities[1][key]} == {"producer"}
+    assert "source_tree_id" not in identities[0]
 
-    result = artifact_service._run_or_load_transient_artifacts_locked(
-        run_dir=run_dir,
-        dataset_name="transient_dataset",
-        split="eval",
-        device_resolution=cast("Any", SimpleNamespace(device=torch.device("cpu"))),
-        dataset_root=tmp_path / "datasets",
-        rebuild=False,
-        evaluation_spatial_stride=1,
-    )
+    run_root = tmp_path / "partial"
+    monkeypatch.setattr(artifact_generator.sequence_artifact, "TransientSequenceArtifactStager", stager)
+    stager(run_root / "stage", dataset_name="transient_dataset", dataset_role="id", resume_identity=identities[0])
+    before = {path: path.read_bytes() for path in sorted((run_root / "stage").rglob("*")) if path.is_file()}
+    _run_analysis(monkeypatch, "b" * 64)
+    with pytest.raises(ValueError, match=r"analysis_transient_drying implementation changed \(recorded a{12}, current b{12}\); .*--rebuild"):
+        _run_all_completed_resume(run_root, monkeypatch)
+    assert {path: path.read_bytes() for path in sorted((run_root / "stage").rglob("*")) if path.is_file()} == before
+    _run_analysis(monkeypatch, "a" * 64)
+    assert _run_all_completed_resume(run_root, monkeypatch) == identities[0]
 
-    assert result is frame
-    assert admitted_roots == [staging_root, save_root]
-    assert not resume_descriptor.exists()
-    assert not resume_manifests.exists()
-    assert len(published_snapshots) == 1
-    counts = published_snapshots[0]["counts"]
-    assert counts["case_count"] == 1
-    assert counts["reused_case_count"] == 1
-    assert counts["forward_call_count"] == 0
-    assert counts["timed_forward_call_count"] == 0
+
+def test_transient_artifact_identity_excludes_the_executing_source_tree(tmp_path: Path) -> None:
+    """The scientific identity ignores runtime facts, so a differing executing tree alone never changes it."""
+    identities = []
+    for position, tree_id in enumerate((None, "a" * 12 + "-" + "b" * 12)):
+        provenance = _cache_test_provenance()
+        provenance["runtime"]["source_tree_id"] = tree_id
+        stored = artifact.write_transient_sequence_artifact(
+            tmp_path / str(position),
+            dataset_name="transient_dataset",
+            dataset_role="id",
+            records=(_cache_test_record(_CASE_ID, mode="autonomous_full"),),
+            provenance=provenance,
+        )
+        identities.append(stored.identity_sha256)
+    assert identities[0] == identities[1]
 
 
 def test_resumable_stager_rejects_incompatible_partial_identity(tmp_path: Path) -> None:
@@ -2980,7 +2911,7 @@ def test_scoped_index_validator_requires_exact_noncanonical_scope(
     tmp_path: Path,
 ) -> None:
     """Reject malformed scoped evidence before admitting selected role membership."""
-    saved_role = artifact_generator.TransientArtifactRolePlan(
+    saved_role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
@@ -3035,47 +2966,6 @@ def test_scoped_index_validator_requires_exact_noncanonical_scope(
     )
 
     assert admitted.case_ids == (_CASE_ID,)
-
-
-def test_transient_reader_remains_backward_compatible_with_compressed_npz(
-    tmp_path: Any,
-) -> None:
-    """Admit prior deflated NPZ bundles through the unchanged strict reader."""
-    root = tmp_path / "compressed"
-    artifact.write_transient_sequence_artifact(
-        root,
-        dataset_name="transient_dataset",
-        dataset_role="id",
-        records=(
-            _cache_test_record(_CASE_ID, mode="autonomous_full"),
-            _cache_test_record(
-                _CASE_ID,
-                mode="teacher_forced_one_step",
-            ),
-        ),
-        provenance=_cache_test_provenance(),
-    )
-    payload_path = next((root / "npz").glob("*.npz"))
-    with np.load(payload_path, allow_pickle=False) as loaded:
-        payload = {name: loaded[name] for name in loaded.files}
-    temporary = payload_path.with_suffix(".compressed.npz")
-    np.savez_compressed(temporary, **payload)
-    temporary.replace(payload_path)
-    payload_digest = artifact.common.serialization.file_sha256(payload_path)
-    parquet_path = root / "transient_dataset.parquet"
-    frame = pd.read_parquet(parquet_path)
-    frame["payload_sha256"] = payload_digest
-    frame.to_parquet(parquet_path, index=False)
-    marker = artifact_contracts.artifact_provenance_path(root)
-    provenance = json.loads(marker.read_text())
-    provenance["outputs"] = artifact_contracts.artifact_output_manifest(root)
-    artifact.common.serialization.atomic_write_json(marker, provenance)
-
-    admitted = artifact.load_transient_sequence_artifact_index(root)
-
-    assert admitted.record(admitted.record_ids[0]).case_id == _CASE_ID
-    with zipfile.ZipFile(payload_path) as archive:
-        assert zipfile.ZIP_DEFLATED in {entry.compress_type for entry in archive.infolist()}
 
 
 def test_transient_artifact_index_lazily_opens_case_payloads_and_closes_lru_entries(
@@ -3232,9 +3122,8 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
         identity["dataset_role"] = role
         identity["material_family"] = material
         identity["dataset_identity"] = {
-            "dataset_id": f"dataset_{material}",
-            "source_dataset_id": f"dataset_{material}",
-            "index_digest": material.ljust(64, "a")[:64],
+            **_dataset_identity(f"dataset_{material}"),
+            "source_index_digest": material.ljust(64, "a")[:64],
         }
         identity["evaluation_assignment"] = (
             None
@@ -3441,7 +3330,7 @@ def test_cuda_model_timing_uses_event_abstraction(monkeypatch: pytest.MonkeyPatc
     assert seconds == pytest.approx(0.0125)
 
 
-def test_generator_timing_adapter_preserves_stable_runtime_and_backend_evidence() -> None:
+def test_generator_timing_adapter_preserves_stable_runtime_and_payload_evidence() -> None:
     """Map public rollout clocks and stable Generation timing without private parsing."""
     benchmark = rollout.TransientRolloutBenchmark(
         case_id="case",
@@ -3466,8 +3355,7 @@ def test_generator_timing_adapter_preserves_stable_runtime_and_backend_evidence(
                 "transient_drying_solver_seconds": "not_persisted",
             },
         },
-        dataset_backend="pt_shards",
-        pt_identity={"receipt_digest": "a" * 64},
+        pt_identity="a" * 64,
         runtime_metadata={
             "resolved_device": "cpu",
             "processor": "test-cpu",
@@ -3480,16 +3368,14 @@ def test_generator_timing_adapter_preserves_stable_runtime_and_backend_evidence(
     assert adapted.cold_timings["drying_no_rollout_model_seconds"] == 9.0
     assert adapted.repetitions["comsol_process_seconds"] == (30.0,)
     assert adapted.unavailable_reasons["airflow_no_model_seconds"] == "compatible_airflow_model_not_selected"
-    assert adapted.dataset_backend == "pt_shards"
-    assert adapted.pt_payload_identity is not None
+    assert adapted.pt_payload_identity == "a" * 64
 
     truncated = artifact_generator._timing_case(
         case_id="case",
         benchmark=benchmark,
         expected_model_calls=4,
         generation_timing={},
-        dataset_backend="pt_shards",
-        pt_identity=None,
+        pt_identity="b" * 64,
         runtime_metadata={
             "resolved_device": "cpu",
             "processor": "test-cpu",
@@ -3510,7 +3396,7 @@ def test_scoped_transient_artifact_rejects_output_below_run_bundle(
     """Keep disposable debug payloads completely outside immutable run bundles."""
     run_dir = tmp_path / "completed-run"
     run_dir.mkdir()
-    role = artifact_generator.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
@@ -3519,12 +3405,7 @@ def test_scoped_transient_artifact_rejects_output_below_run_bundle(
         case_ids_by_source=((_CASE_ID,),),
         membership_digests=("a" * 64,),
     )
-    plan = artifact_generator.TransientArtifactPlan(
-        run_dir=run_dir,
-        run_name="scientific-run",
-        id_role=role,
-        additional_role=None,
-    )
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, additional_role=None)
     monkeypatch.setattr(
         artifact_service.transient,
         "load_transient_artifact_plan",
@@ -3541,30 +3422,80 @@ def test_scoped_transient_artifact_rejects_output_below_run_bundle(
         )
 
 
-@pytest.mark.parametrize(
-    "simulation",
-    [
-        {"package_case_id": _CASE_ID, "generation_case_id": "case_0001"},
-        {"package_case_id": "wrong-case"},
-        None,
-        [],
-    ],
-)
-def test_role_validator_binds_exact_package_identity(
-    simulation: object,
+class _ReachedStageReuseError(Exception):
+    """Mark that scoped generation passed the staged-selection check and began reusing a complete stage."""
+
+
+def test_scoped_transient_build_reuses_a_complete_stage_only_for_the_same_selection(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Admit qualified membership and reject missing or conflicting simulation evidence."""
-    case_id = _CASE_ID
-    role = artifact_generator.TransientArtifactRolePlan(
+    """A complete stage left for other cases is neither reused nor published for a new request; the same selection is reused."""
+    run_dir = tmp_path / "completed-run"
+    run_dir.mkdir()
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="transient_dataset",
         source_dataset_ids=("transient_dataset",),
         source_identities=({"dataset_id": "transient_dataset"},),
-        case_ids_by_source=((case_id,),),
+        case_ids_by_source=((_CASE_ID, _CASE_B),),
         membership_digests=("a" * 64,),
     )
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, additional_role=None)
+    monkeypatch.setattr(artifact_service.transient, "load_transient_artifact_plan", lambda _path: plan)
+    monkeypatch.setattr(
+        artifact_service.experiments.run, "validate_completed_run", lambda _path: {"scientific_run_name": "scientific-run", "config": {}}
+    )
+    monkeypatch.setattr(artifact_service.transient, "generate_transient_role_artifact", lambda **_kwargs: pytest.fail("regenerated a complete stage"))
+
+    def reuse(*_args: object, **_kwargs: object) -> None:
+        raise _ReachedStageReuseError
+
+    monkeypatch.setattr(artifact_service.timing, "write_stage_timing", reuse)
+    target = tmp_path / "scoped"
+    stage = artifact_contracts.artifact_stage_path(target)
+    stage.mkdir()
+    marker = artifact_contracts.artifact_provenance_path(stage)
+
+    def write_marker(analysis_sha256: str) -> None:
+        document = {"evaluation": {"scope": {"selected_case_ids": [_CASE_ID]}}, "producer": {"analysis_sha256": analysis_sha256}}
+        marker.write_text(json.dumps(document), encoding="utf-8")
+
+    write_marker(artifact_contracts.ANALYSIS_PROJECTIONS["transient_drying"].sha256())
+
+    def build(case_ids: list[str]) -> None:
+        artifact_service.build_scoped_transient_artifact(
+            run_dir=run_dir,
+            dataset_root=tmp_path / "02_datasets",
+            output_root=target,
+            split="id",
+            case_ids=case_ids,
+            device_policy="cpu",
+        )
+
+    with pytest.raises(ValueError, match=rf"holds cases \['{_CASE_ID}'\].*selects \['{_CASE_B}'\].*--rebuild"):
+        build([_CASE_B])
+    assert not target.exists()
+    with pytest.raises(_ReachedStageReuseError):
+        build([_CASE_ID])
+    # The same selection built by other analysis code is not published as this request's result.
+    write_marker("0" * 64)
+    with pytest.raises(ValueError, match=r"analysis_transient_drying implementation changed.*delete the stale stage"):
+        build([_CASE_ID])
+    assert not target.exists()
+
+
+def _validate_role_records(
+    monkeypatch: pytest.MonkeyPatch,
+    role: artifact_plan.ArtifactRolePlan,
+    identities: dict[str, dict[str, Any]],
+    timing: tuple[dict[str, Any], dict[str, Any]] | None = None,
+) -> None:
+    """Run the complete role-evidence validator over one record per case carrying only the given identity fields.
+
+    Without ``timing`` the independently covered role timing admission is inert; with a ``(timing block, case validity)`` pair it runs unchanged.
+    """
     completed = {
         "scientific_run_name": "test-run",
         "effective_config_digest": "b" * 64,
@@ -3575,22 +3506,16 @@ def test_role_validator_binds_exact_package_identity(
         "config": {"evaluation": {}},
     }
     protocol_identity = artifact.evaluation_protocol_identity({})
-    record = SimpleNamespace(
-        case_id=case_id,
-        identity={
-            "simulation_identity": simulation,
-            "evaluation_config_identity": protocol_identity,
-        },
+    records = tuple(
+        SimpleNamespace(case_id=case_id, identity={**identity, "evaluation_config_identity": protocol_identity})
+        for case_id, identity in identities.items()
     )
-    predicted_validity = {"cases": {case_id: {}}}
+    timing_block, validity = (
+        ({"report": {}, "component_availability": {case_id: {"prediction_validity": {}} for case_id in identities}}, {}) if timing is None else timing
+    )
+    predicted_validity = {"cases": dict.fromkeys(identities, validity)}
     provenance = {
-        "dataset": {
-            "source_dataset_ids": list(role.source_dataset_ids),
-            "source_identities": [dict(value) for value in role.source_identities],
-            "case_ids_by_source": [list(values) for values in role.case_ids_by_source],
-            "membership_digests": list(role.membership_digests),
-            "evaluation_assignments": [dict(value) for value in role.evaluation_assignments],
-        },
+        "dataset": role.dataset_provenance(),
         "run": {
             "name": completed["scientific_run_name"],
             "effective_config_digest": completed["effective_config_digest"],
@@ -3617,15 +3542,21 @@ def test_role_validator_binds_exact_package_identity(
                 "fabricated_prediction_count": 0,
                 "c_unavailable_reasons": ["test-owned unavailable airflow surrogate"],
             },
-            "component_availability": {case_id: {"prediction_validity": {}}},
-            "timing_report": {},
+        },
+        "runtime": artifact_contracts.runtime_provenance(
+            {"requested_policy": "cpu", "resolved_device": "cpu", "device_type": "cpu", "pytorch_version": "test"},
+            inference_batch_size=1,
+        ),
+        "timing": {
+            **timing_block,
+            "operational_performance": artifact_performance.ArtifactPerformanceRecorder(device="cpu", dtype="float32").snapshot(),
         },
     }
     loaded = SimpleNamespace(
         dataset_name=role.dataset_name,
         dataset_role=role.dataset_role,
         provenance=provenance,
-        summaries=(record,),
+        summaries=records,
         unavailable_horizons=(),
     )
     # Independently covered physical/protocol services are inert here. The complete
@@ -3635,23 +3566,127 @@ def test_role_validator_binds_exact_package_identity(
     monkeypatch.setattr(artifact_generator, "_validate_role_spatial_representation", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(artifact_generator, "_validate_sequence_inventory", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(artifact_generator, "_role_prediction_validity_from_records", lambda *_args, **_kwargs: predicted_validity)
-    monkeypatch.setattr(
-        artifact_generator.transient_timing,
-        "admit_transient_timing_report",
-        lambda _value: SimpleNamespace(cases=(SimpleNamespace(case_id=case_id),)),
+    if timing is None:
+        monkeypatch.setattr(artifact_generator, "_validate_role_timing_evidence", lambda *_args, **_kwargs: None)
+    artifact_generator._validate_transient_role_evidence(cast("Any", loaded), completed=completed, role=role)
+
+
+@pytest.mark.parametrize(
+    "simulation",
+    [
+        {"package_case_id": _CASE_ID, "generation_case_id": "case_0001"},
+        {"package_case_id": "wrong-case"},
+        None,
+        [],
+    ],
+)
+def test_role_validator_binds_exact_package_identity(
+    simulation: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit qualified membership and reject missing or conflicting simulation evidence."""
+    role = artifact_plan.ArtifactRolePlan(
+        split="eval",
+        dataset_role="id",
+        dataset_name="transient_dataset",
+        source_dataset_ids=("transient_dataset",),
+        source_identities=({"dataset_id": "transient_dataset", "index_digest": "a" * 64},),
+        case_ids_by_source=((_CASE_ID,),),
+        membership_digests=("b" * 64,),
     )
-    if isinstance(simulation, dict) and simulation.get("package_case_id") == case_id:
-        artifact_generator._validate_transient_role_evidence(cast("Any", loaded), completed=completed, role=role)
+    identities = {_CASE_ID: {"simulation_identity": simulation, "dataset_identity": _dataset_identity()}}
+    if isinstance(simulation, dict) and simulation.get("package_case_id") == _CASE_ID:
+        _validate_role_records(monkeypatch, role, identities)
     else:
         with pytest.raises(ValueError, match="qualified Dataset package identity"):
-            artifact_generator._validate_transient_role_evidence(cast("Any", loaded), completed=completed, role=role)
+            _validate_role_records(monkeypatch, role, identities)
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        {"artifact_dataset_name": "other-name"},
+        {"source_dataset_id": "part-b", "source_index_digest": "e" * 64},
+        {"saved_membership_digests": ["d" * 64, "c" * 64]},
+    ],
+    ids=("artifact-name", "other-part", "membership-digests"),
+)
+def test_role_validator_binds_each_record_to_its_owning_split_part(foreign: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse a record whose Dataset identity differs from the saved split part that owns its case, even when it is self-consistent."""
+    role = artifact_plan.ArtifactRolePlan(
+        split="additional_evaluation",
+        dataset_role="additional_evaluation",
+        dataset_name="combined",
+        source_dataset_ids=("part-a", "part-b"),
+        source_identities=(
+            {"dataset_id": "part-a", "index_digest": "a" * 64},
+            {"dataset_id": "part-b", "index_digest": "e" * 64},
+        ),
+        case_ids_by_source=(("case-a",), ("case-b",)),
+        membership_digests=("c" * 64, "d" * 64),
+    )
+
+    def identity(case_id: str, source_dataset_id: str, source_index_digest: str) -> dict[str, Any]:
+        return {
+            "simulation_identity": {"package_case_id": case_id},
+            "dataset_identity": {
+                "artifact_dataset_name": "combined",
+                "source_dataset_id": source_dataset_id,
+                "saved_membership_digests": ["c" * 64, "d" * 64],
+                "source_index_digest": source_index_digest,
+            },
+        }
+
+    identities = {"case-a": identity("case-a", "part-a", "a" * 64), "case-b": identity("case-b", "part-b", "e" * 64)}
+    _validate_role_records(monkeypatch, role, identities)
+    identities["case-a"]["dataset_identity"].update(foreign)
+    with pytest.raises(ValueError, match="contradicts its saved split part"):
+        _validate_role_records(monkeypatch, role, identities)
+
+
+def test_role_validator_admits_timing_only_when_it_matches_the_sequence_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Role admission, not the later upload, refuses incomplete component evidence and a payload identity foreign to the sequence record."""
+    role = artifact_plan.ArtifactRolePlan(
+        split="eval",
+        dataset_role="id",
+        dataset_name="transient_dataset",
+        source_dataset_ids=("transient_dataset",),
+        source_identities=({"dataset_id": "transient_dataset", "index_digest": "a" * 64},),
+        case_ids_by_source=((_CASE_ID,),),
+        membership_digests=("b" * 64,),
+    )
+    identity = {"simulation_identity": {"package_case_id": _CASE_ID}, "dataset_identity": _dataset_identity(), "pt_payload_identity": "a" * 64}
+    _validate_role_records(monkeypatch, role, {_CASE_ID: identity}, timing=_role_timing_block())
+
+    foreign = {**identity, "pt_payload_identity": "b" * 64}
+    with pytest.raises(ValueError, match="contradicts its timing evidence"):
+        _validate_role_records(monkeypatch, role, {_CASE_ID: foreign}, timing=_role_timing_block())
+    block, validity = _role_timing_block()
+    block["component_availability"][_CASE_ID] = {"prediction_validity": validity}
+    with pytest.raises(ValueError, match="lacks the producer's"):
+        _validate_role_records(monkeypatch, role, {_CASE_ID: identity}, timing=(block, validity))
 
 
 def test_role_validator_rejects_an_optuna_trial_before_binding_any_evidence() -> None:
-    """A trial keeps no checkpoints, so evidence validation names that instead of failing on missing checkpoint identity."""
-    completed = {"config": {"task": "transient_drying", "run": {"layout": {"trial": "0000__study"}}}}
+    """A trial keeps no checkpoints, so evidence validation gives the steady path's refusal instead of failing on missing checkpoints."""
+    layout = {
+        "task": "transient_drying",
+        "dataset": "dataset-id",
+        "family": "optuna",
+        "config_name": "fno_study",
+        "model_label": "fno_m2x2_h4_l1",
+        "seed": 17,
+        "revision": None,
+        "budget_epochs": 3,
+        "stage": "single",
+        "pair": None,
+        "trial": "0001__fno_m2x2_h4_l1__lr-0p001",
+        "a0_id": "a" * 16,
+        "branch_id": None,
+    }
+    completed = {"config": {"task": "transient_drying", "run": {"layout": layout}}}
 
-    with pytest.raises(RuntimeError, match="trials keep no checkpoints"):
+    with pytest.raises(ValueError, match=r"Optuna trial.*no artifacts.*parent study.*training run"):
         artifact_generator._validate_transient_role_evidence(cast("Any", object()), completed=completed, role=cast("Any", object()))
 
 
@@ -3677,8 +3712,9 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     metadata = transient_evaluation.production_frame((transient_evaluation.sequence_record("autonomous_full", "full"),), artifact_root=str(root))
     provenance = _cache_test_provenance()
     # The shared fixture keys timing evidence by the case ID "case"; bind it to this artifact's package case ID.
-    fixture_evaluation = json.dumps(metadata.attrs["artifact_provenance"]["evaluation"]).replace('"case"', json.dumps(_CASE_ID))
-    provenance["evaluation"].update(json.loads(fixture_evaluation))
+    fixture = json.loads(json.dumps(metadata.attrs["artifact_provenance"]).replace('"case"', json.dumps(_CASE_ID)))
+    provenance["evaluation"].update(fixture["evaluation"])
+    provenance["timing"] = fixture["timing"]
     provenance["dataset"].update(metadata.attrs["artifact_provenance"]["dataset"])
     fitted_scaling = artifact_generator.TransientScalingArtifact.from_state_dict(transient_evaluation.scaling_state())
     statistics = artifact_generator._record_metric_statistics(record, scaling=fitted_scaling)
@@ -3728,3 +3764,48 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     assert after == before  # Interacting neither writes figures nor changes scientific inputs.
     evaluation.close()
     plt.close("all")
+
+
+def _invalid_role_validity(*, valid: int, invalid: int) -> dict[str, Any]:
+    """Return role validity evidence whose invalid cases lose their first state channel at step 4."""
+    channels = {name: {"nonfinite_value_count": 0, "physically_invalid_finite_count": 0} for name in artifact.STATE_ORDER}
+    channels[artifact.STATE_ORDER[0]]["physically_invalid_finite_count"] = 3
+    bad = {
+        "status": validity_contract.FINITE_BUT_PHYSICALLY_INVALID,
+        "channels": channels,
+        "first_invalid": {"rollout_step": 4, "physical_time": 4.0},
+    }
+    cases = {f"bad_{index}": bad for index in range(invalid)} | {f"ok_{index}": {"status": validity_contract.VALID} for index in range(valid)}
+    counts = {validity_contract.VALID: valid, validity_contract.FINITE_BUT_PHYSICALLY_INVALID: invalid, validity_contract.NONFINITE: 0}
+    return {"case_count": valid + invalid, "status_counts": counts, "cases": cases}
+
+
+def test_invalid_predictions_are_reported_and_summarized_as_valid_of_total(capsys: pytest.CaptureFixture[str]) -> None:
+    """Name the valid count, each invalid case and its first invalid step; print nothing for valid roles."""
+    validity_contract.report_invalid_predictions(_invalid_role_validity(valid=1, invalid=1))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("[WARNING] artifact completed with invalid predictions | valid=1 | finite_but_physically_invalid=1")
+    assert f"case=bad_0 | status=FINITE_BUT_PHYSICALLY_INVALID | channels={artifact.STATE_ORDER[0]} | first_step=4" in lines[1]
+
+    validity_contract.report_invalid_predictions(_invalid_role_validity(valid=2, invalid=0))
+    assert capsys.readouterr().out == ""
+
+    provenances = [{"evaluation": {"prediction_validity": _invalid_role_validity(valid=0, invalid=2)}}]
+    assert validity_contract.invalid_prediction_note(provenances) == "valid 0 of 2"
+    assert validity_contract.invalid_prediction_note([{"evaluation": {"prediction_validity": _invalid_role_validity(valid=2, invalid=0)}}]) is None
+
+
+def test_cached_transient_role_repeats_the_invalid_prediction_warning_and_timing_line(capsys: pytest.CaptureFixture[str]) -> None:
+    """A later load of a cached artifact is as loud about invalid predictions as its generation was."""
+    frame = pd.DataFrame()
+    frame.attrs["artifact_kind"] = "transient_sequence"
+    frame.attrs["artifact_provenance"] = {
+        "evaluation": {"prediction_validity": _invalid_role_validity(valid=0, invalid=2)},
+        "timing": {"report": {"cases": [{}, {}]}},
+    }
+
+    artifact_service._report_admitted_target(frame)
+
+    output = capsys.readouterr().out
+    assert "[WARNING] artifact completed with invalid predictions | valid=0 | finite_but_physically_invalid=2" in output
+    assert "runtime measured for 2 cases" in output

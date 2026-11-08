@@ -26,7 +26,9 @@ from src.learning.transient.learning_transient_contracts import (
 )
 from src.learning.transient.learning_transient_scaling import (
     TransientScalingArtifact,
+    admit_transient_scaling_state,
     fit_transient_scaling,
+    preprocessing_spec,
 )
 from src.learning.transient.learning_transient_tensorizer import (
     TransientTensorizer,
@@ -518,6 +520,54 @@ def test_scaling_serialization_is_strict_and_device_independent() -> None:
     changed_embedding["tensorizer"]["positional_embedding"] = "grid"
     with pytest.raises(ValueError, match="tensorizer identity"):
         TransientScalingArtifact.from_state_dict(changed_embedding)
+
+
+def _expected_identity(artifact: TransientScalingArtifact) -> dict[str, Any]:
+    """Return the envelope scaling identity that exactly matches one artifact's repeated identity fields."""
+    y_size, x_size = artifact.spatial_shape
+    return {
+        "dataset": copy.deepcopy(dict(artifact.dataset_identity)),
+        "train_membership_digest": artifact.train_membership_digest,
+        "preprocessing": preprocessing_spec(
+            tensorizer=artifact.tensorizer,
+            scale_mode=artifact.scale_mode,
+            spatial_view={
+                "spatial_stride": 1,
+                "canonical_ny": y_size,
+                "canonical_nx": x_size,
+                "effective_ny": y_size,
+                "effective_nx": x_size,
+            },
+        ),
+    }
+
+
+def _changed_identity(identity: dict[str, Any], field: str) -> dict[str, Any]:
+    """Return the expected identity with exactly one field replaced by a foreign value."""
+    changed = copy.deepcopy(identity)
+    preprocessing = changed["preprocessing"]
+    if field == "dataset_identity":
+        changed["dataset"]["dataset_id"] = "foreign"
+    elif field == "train_membership_digest":
+        changed["train_membership_digest"] = _digest("foreign-membership")
+    elif field == "tensorizer":
+        preprocessing["tensorizer"] = _spec(temporal="none").as_dict()
+    elif field == "scale_mode":
+        preprocessing["scale_mode"] = "delta_rms"
+    else:
+        preprocessing["spatial_view"]["effective_nx"] += 1
+    return changed
+
+
+@pytest.mark.parametrize("field", ["dataset_identity", "train_membership_digest", "tensorizer", "scale_mode", "spatial_shape"])
+def test_scaling_state_is_admitted_only_under_every_repeated_envelope_identity(field: str) -> None:
+    """Refuse a state whose repeated identity field differs from the envelope identity, naming the field."""
+    artifact = _artifact()
+    identity = _expected_identity(artifact)
+
+    assert admit_transient_scaling_state(artifact.state_dict(), identity=identity).digest == artifact.digest
+    with pytest.raises(ValueError, match=field):
+        admit_transient_scaling_state(artifact.state_dict(), identity=_changed_identity(identity, field))
 
 
 def test_scaling_rejects_direct_runtime_dtype_mismatch() -> None:

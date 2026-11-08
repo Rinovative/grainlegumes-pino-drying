@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Exercise compact CPU training, completed bundles, relocation, resume, and ID/additional artifacts
+  - Exercise one real Optuna trial whose study signature equals the dry run's and whose trial validates unpatched
 
 Design principles:
   - Synthetic lifecycle evidence binds exact persisted identities before model forward
@@ -25,7 +26,7 @@ import pandas as pd
 import pytest
 import torch
 from neuralop.models import FNO
-from support import configs
+from support import configs, optuna_trials, run_state
 from support.synthetic_task import build_synthetic_selection_provenance, save_steady_package
 
 from src import analysis, common, datasets, domain, experiments, learning
@@ -44,8 +45,18 @@ _OOD_PROVENANCE = build_synthetic_selection_provenance(
     material_family="chickpea",
     material_role="ood",
 )
+_SECOND_OOD_PROVENANCE = build_synthetic_selection_provenance(
+    dataset_name="tiny_steady_ood_second",
+    sample_ids=tuple(f"field_pea__case_{index + 1:04d}__{index + 11:012x}" for index in range(2)),
+    material_family="field_pea",
+    material_role="ood",
+)
 _ID_DATASET, _ID_DIGEST = datasets.contracts.identity.package_identity_from_provenance(_ID_PROVENANCE)
-_OOD_DATASET, _OOD_DIGEST = datasets.contracts.identity.package_identity_from_provenance(_OOD_PROVENANCE)
+_OOD_DATASET, _ = datasets.contracts.identity.package_identity_from_provenance(_OOD_PROVENANCE)
+_SECOND_OOD_DATASET, _ = datasets.contracts.identity.package_identity_from_provenance(_SECOND_OOD_PROVENANCE)
+_PROVENANCES = {_ID_DATASET: _ID_PROVENANCE, _OOD_DATASET: _OOD_PROVENANCE, _SECOND_OOD_DATASET: _SECOND_OOD_PROVENANCE}
+# The one additional-evaluation role covers both OOD Datasets in configured order.
+_ADDITIONAL_DATASET = datasets.contracts.identity.combined_dataset_id((_OOD_DATASET, _SECOND_OOD_DATASET))
 # Both axes hold at least the 10 points spectral Fourier continuation needs.
 _SHAPE = (12, 12)
 _ARTIFACT_CROP = 2
@@ -130,7 +141,7 @@ def _training_dataset_payload(
     offsets: tuple[float, ...],
 ) -> dict[str, Any]:
     """Build one final version-1 synthetic dataset entirely in memory."""
-    provenance = _ID_PROVENANCE if dataset_id == _ID_DATASET else _OOD_PROVENANCE
+    provenance = _PROVENANCES[dataset_id]
     sample_ids = [entry["package_case_id"] for entry in provenance["source_case_identities"]]
     cases = [_case_components(task, case_id=case_id, offset=offset) for case_id, offset in zip(sample_ids, offsets, strict=True)]
     return datasets.contracts.identity.build_training_dataset_payload(
@@ -157,41 +168,26 @@ def _save_dataset(root: Path, metadata_root: Path, payload: dict[str, Any]) -> P
     return save_steady_package(root, payload)
 
 
-def test_steady_manifest_preview_rejects_unsafe_or_changed_payload(tmp_path: Path) -> None:
-    """Bind a metadata-only digest to current immutable manifest and payload bytes."""
+def test_steady_manifest_rejects_unsafe_or_changed_payload(tmp_path: Path) -> None:
+    """Bind the one manifest reader to the folder's own immutable payload bytes."""
     task = domain.tasks.registry.get_task("steady_flow")
     dataset_root = tmp_path / "02_datasets"
-    metadata_root = dataset_root
     payload = _training_dataset_payload(task, dataset_id=_ID_DATASET, offsets=(0.0, 1.0, 4.0, 10.0))
-    path = _save_dataset(dataset_root, metadata_root, payload)
-    summary = datasets.contracts.metadata.load_dataset_metadata_summary(
-        _ID_DATASET,
-        task=task,
-        dataset_root=dataset_root,
-        metadata_root=metadata_root,
-    )
-    assert summary.dataset_digest == _ID_DIGEST
-    assert summary.sample_count == len(payload["sample_ids"])
+    path = _save_dataset(dataset_root, dataset_root, payload)
+    manifest = datasets.packages.load_package_manifest("steady_flow", _ID_DATASET, storage_root=tmp_path)
+    assert manifest["dataset_digest"] == _ID_DIGEST
+    assert manifest["sample_count"] == len(payload["sample_ids"])
+    assert manifest["derived_payload_sha256"] is None
     external_payload = tmp_path / "external_payload.pt"
     path.rename(external_payload)
     path.symlink_to(external_payload)
     with pytest.raises(FileNotFoundError, match="payload is missing or unsafe"):
-        datasets.contracts.metadata.load_dataset_metadata_summary(
-            _ID_DATASET,
-            task=task,
-            dataset_root=dataset_root,
-            metadata_root=metadata_root,
-        )
+        datasets.packages.load_package_manifest("steady_flow", _ID_DATASET, storage_root=tmp_path)
     path.unlink()
     external_payload.rename(path)
     path.write_bytes(path.read_bytes() + b"changed")
     with pytest.raises(ValueError, match="payload bytes disagree"):
-        datasets.contracts.metadata.load_dataset_metadata_summary(
-            _ID_DATASET,
-            task=task,
-            dataset_root=dataset_root,
-            metadata_root=metadata_root,
-        )
+        datasets.packages.load_package_manifest("steady_flow", _ID_DATASET, storage_root=tmp_path)
 
 
 def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
@@ -201,7 +197,15 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
     The recipe retains production semantic validation, splitting, normalization,
     metrics, checkpoints, and paths while reducing only model/data size and duration.
     """
-    raw = configs.direct_config(model_kind="fno", physics_enabled=False)
+    config = configs.resolve(_tiny_request())
+    config["paths"]["dataset_root"] = str(dataset_root)
+    config["paths"]["output_root"] = str(output_root)
+    return config
+
+
+def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
+    """Return the request of the smallest one-epoch CPU FNO experiment on the ID and named OOD Datasets."""
+    raw = configs.direct_config(model_kind="fno", physics_enabled=False, workflow=workflow)
     raw["run"].update(
         {
             "seed": 23,
@@ -211,7 +215,7 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
     raw["data"].update(
         {
             "train_dataset": _ID_DATASET,
-            "additional_evaluation_datasets": [_OOD_DATASET],
+            "additional_evaluation_datasets": [_OOD_DATASET, _SECOND_OOD_DATASET],
             "batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
@@ -224,6 +228,8 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
             "n_modes": [2, 2],
             "hidden_channels": 4,
             "n_layers": 1,
+            "positional_embedding": None,
+            "domain_padding": 0.1,
         },
     }
     raw["loss"]["data"].update(
@@ -247,14 +253,10 @@ def _tiny_config(*, dataset_root: Path, output_root: Path) -> dict[str, Any]:
             "epochs": 1,
             "evaluation_interval": 1,
             "additional_evaluation_interval": 1,
-            "mixed_precision": False,
         }
     )
     raw["tracking"]["wandb"]["mode"] = "disabled"
-    config = configs.resolve(raw)
-    config["paths"]["dataset_root"] = str(dataset_root)
-    config["paths"]["output_root"] = str(output_root)
-    return config
+    return raw
 
 
 def _refresh_summary_digest(
@@ -356,6 +358,7 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
     )
     _save_dataset(dataset_root, metadata_root, id_payload)
     _save_dataset(dataset_root, metadata_root, ood_payload)
+    _save_dataset(dataset_root, metadata_root, _training_dataset_payload(task, dataset_id=_SECOND_OOD_DATASET, offsets=(40.0, 41.0)))
 
     config = _tiny_config(dataset_root=dataset_root, output_root=output_root)
     assert config["tracking"]["wandb"]["mode"] == "disabled"
@@ -380,6 +383,8 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
     _make_last_checkpoint_distinct(run_dir)
     completed = experiments.run.validate_completed_run(run_dir)
     summary = completed["summary"]
+    # One epoch of one two-sample optimizer group.
+    assert summary["training_work"] == {"optimizer_steps": 1, "gradient_predictions": 2}
     assert summary["runtime_device"]["requested_policy"] == "cpu"
     assert summary["runtime_device"]["resolved_device"] == "cpu"
     assert len(summary["runtime_sessions"]) == 1
@@ -429,28 +434,27 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     protects the integration seams without substituting for unit formula/race coverage.
     """
     lifecycle = completed_lifecycle
-    split = lifecycle.completed["split_indices"]
+    split = datasets.preprocessing.splits.admit_split(lifecycle.completed["split_indices"])
     seed_plan = experiments.run.build_seed_plan(lifecycle.config["run"]["seed"])
     rebuilt = experiments.config.loader.create_dataloaders_from_config(
         lifecycle.config,
         seed_plan=seed_plan,
     )
-    for key in ("train_indices", "validation_indices", "id_test_indices", "additional_evaluation_indices"):
-        assert torch.equal(rebuilt["split_indices"][key], split[key])
-    assert split["metadata"]["split_seed"] == common.random.derive_subseed(9, "split")
-    assert split["metadata"]["case_partition"] == _ID_PROVENANCE["case_partition"]
+    assert datasets.preprocessing.splits.admit_split(rebuilt["split_indices"]) == split
+    assert split.split_seed == common.random.derive_subseed(9, "split")
+    assert dict(split.case_partition) == _ID_PROVENANCE["case_partition"]
+    assert [part.dataset_id for part in split.additional_evaluation] == [_OOD_DATASET, _SECOND_OOD_DATASET]
 
-    train_indices = split["train_indices"]
+    train_indices = split.train.indices
     normalizer_artifact = torch.load(
         common.paths.resolve_normalizer_path(lifecycle.run_dir),
         map_location="cpu",
         weights_only=False,
     )
-    train_identity = split["metadata"]["datasets"]["train"]
-    assert normalizer_artifact["dataset_id"] == train_identity["dataset_id"]
-    assert normalizer_artifact["dataset_fingerprint"] == train_identity["fingerprint"]
-    assert normalizer_artifact["train_membership_digest"] == split["metadata"]["membership_digests"]["train"]
-    assert normalizer_artifact["train_sample_count"] == train_indices.numel()
+    scaling_identity = normalizer_artifact["identity"]
+    assert scaling_identity["dataset"]["dataset_id"] == split.train.dataset_id
+    assert scaling_identity["dataset"]["fingerprint"] == split.train.dataset["fingerprint"]
+    assert scaling_identity["train_membership_digest"] == split.train.membership_digest
     normalizer = normalizer_artifact["state"]
     expected_input_mean = lifecycle.id_payload["inputs"][train_indices].mean(
         dim=(0, 2, 3),
@@ -490,7 +494,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert device.type == "cpu"
     selected_dataset = loader.dataset
     assert isinstance(selected_dataset, learning.inference.context.IndexedSubset)
-    assert torch.equal(selected_dataset.source_indices, split["id_test_indices"])
+    assert torch.equal(selected_dataset.source_indices, split.id_test.indices)
     in_normalizer = processor.in_normalizer
     assert in_normalizer is not None
     assert torch.equal(
@@ -510,11 +514,14 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     )
     frames = generated[str(lifecycle.run_dir.resolve())]
     assert set(frames) == {"eval", "additional_evaluation"}
-    for role, index_key in (("eval", "id_test_indices"), ("additional_evaluation", "additional_evaluation_indices")):
+    role_evidence: dict[analysis.artifacts.plan.ArtifactSplit, Any] = {"eval": (split.id_test,), "additional_evaluation": split.additional_evaluation}
+    plan = analysis.artifacts.plan.artifact_plan_from_completed(lifecycle.completed, run_dir=lifecycle.run_dir)
+    for role, evidence in role_evidence.items():
         frame = frames[role]
         assert not frame.empty
         assert frame.columns.is_unique
-        assert frame["source_index"].tolist() == split[index_key].tolist()
+        assert frame["source_index"].tolist() == list(plan.role(role).source_indices)
+        assert frame["source_dataset_id"].tolist() == [part.dataset_id for part in evidence for _ in part.case_ids]
         assert all(Path(path).is_file() for path in frame["npz_path"])
         sufficient_statistics = {
             f"{space}_{statistic}_{field}"
@@ -539,8 +546,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             assert payload["artifact_units"].tolist() == [*output_units, speed_unit]
             assert {"Rx", "Ry", "flux_balance", "coordinates"}.issubset(payload.files)
             assert frame.iloc[0]["flux_balance_mse"] == pytest.approx(float(np.mean(payload["flux_balance"] ** 2)))
-        enriched = analysis.evaluation.dataframe.build_eval_df(frame)
-        assert enriched.attrs["output_units"] == output_units
+        assert frame.attrs["output_units"] == output_units
         artifact_provenance = frame.attrs["artifact_provenance"]
         artifact_summary = analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
             frame,
@@ -548,7 +554,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             train_standard_deviations=train_standard_deviations,
             normalization_denominator_floor=float(artifact_provenance["normalizer"]["denominator_floor"]),
         )
-        assert enriched.attrs[objective_id] == artifact_summary
+        assert frame.attrs[objective_id] == artifact_summary
         if role == "eval":
             # ID artifacts evaluate ID-test membership; checkpoint selection used validation.
             continue
@@ -561,15 +567,15 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     id_target = common.paths.resolve_id_analysis_dir(lifecycle.run_dir)
     ood_target = common.paths.resolve_additional_evaluation_analysis_dir(
         lifecycle.run_dir,
-        _OOD_DATASET,
+        _ADDITIONAL_DATASET,
     )
     targets = (id_target, ood_target)
     assert (id_target / f"{_ID_DATASET}.parquet").is_file()
-    assert (ood_target / f"{_OOD_DATASET}.parquet").is_file()
-    loaded_id = analysis.evaluation.dataframe.load_evaluation_artifact(id_target)
+    assert (ood_target / f"{_ADDITIONAL_DATASET}.parquet").is_file()
+    loaded_id = analysis.evaluation.artifact_loader._read_artifact_root(id_target)
     assert loaded_id.attrs["provenance_complete"] is True
     assert loaded_id.attrs["artifact_root"] == str(id_target.resolve())
-    assert loaded_id["source_index"].tolist() == split["id_test_indices"].tolist()
+    assert loaded_id["source_index"].tolist() == list(split.id_test.index_values)
     for role, target in zip(("eval", "additional_evaluation"), targets, strict=True):
         stored_provenance = json.loads((target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         assert stored_provenance["outputs"] == analysis.artifacts.contracts.artifact_output_manifest(target)
@@ -579,8 +585,8 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert stored_provenance["runtime"]["requested_policy"] == "cpu"
         assert stored_provenance["runtime"]["resolved_device"] == "cpu"
         assert stored_provenance["run"]["best_checkpoint_sha256"] == lifecycle.completed["summary"]["best_checkpoint_sha256"]
-        split_role = "id_test" if role == "eval" else role
-        assert stored_provenance["dataset"]["saved_membership_digest"] == split["metadata"]["membership_digests"][split_role]
+        assert stored_provenance["dataset"]["membership_digests"] == [part.membership_digest for part in role_evidence[role]]
+        assert stored_provenance["dataset"]["source_identities"] == [dict(part.dataset) for part in role_evidence[role]]
         assert stored_provenance["normalizer"]["sha256"] == lifecycle.completed["summary"]["normalizer_sha256"]
         assert stored_provenance["evaluator"]["group_objective_evidence"]["squared_error_accumulation_dtype"] == "float64"
         physics = stored_provenance["physics"]
@@ -588,7 +594,6 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert physics["task_contract_digest"] == domain.tasks.registry.get_task("steady_flow").contract_digest
         assert physics["derivatives"] == {
             "kind": "physical",
-            "extension": "none",
             "operator_axes": [2, 3],
             "grid_axes": ["y", "x"],
         }
@@ -597,7 +602,8 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert physics["continuity_kind"] == "cross_section_flux_balance"
         assert physics["scalar_definitions"]["flux_balance_mse"] == {"formula": "mean(flux_balance**2)", "unit": "1"}
         assert physics["residual_evaluation_region"]["residual_arrays"] == "full grid"
-        runtime_comparison = analysis.artifacts.timing.load_runtime_comparison(target)
+        timing_block = analysis.artifacts.timing.timing_block(stored_provenance, records=frozenset({"report"}))
+        runtime_comparison = timing_block["report"]
         assert runtime_comparison["split_role"] == role
         assert runtime_comparison["measurement"] == {
             "clock": "time.perf_counter_ns",
@@ -610,7 +616,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
 
     id_provenance = json.loads((id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
     assert id_provenance["selection"]["index_key"] == "id_test_indices"
-    assert id_provenance["selection"]["effective_case_count"] == split["id_test_indices"].numel()
+    assert id_provenance["selection"]["effective_case_count"] == split.id_test.count
 
     for target in targets:
         (target / "cache_marker.txt").write_text("preserve", encoding="utf-8")
@@ -624,36 +630,27 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["additional_evaluation"], frames["additional_evaluation"])
     assert _artifact_inventory(targets) == before_cache
 
-    runtime_path = id_target / analysis.artifacts.timing.RUNTIME_COMPARISON_FILENAME
-    valid_runtime = runtime_path.read_bytes()
-    runtime_path.unlink()
-    without_runtime = analysis.artifacts.service.run_or_load_artifacts(
-        run_dir=lifecycle.run_dir,
-        dataset_name=_ID_DATASET,
-        split="eval",
-        device_resolution=learning.device.resolve_device("cpu"),
-        dataset_root=lifecycle.dataset_root,
-    )
-    pd.testing.assert_frame_equal(without_runtime, frames["eval"])
-    assert not runtime_path.exists()
-    runtime_path.write_bytes(valid_runtime)
-
-    incompatible_runtime = json.loads(valid_runtime)
-    incompatible_runtime["dataset_identity"]["fingerprint"] = "incompatible"
-    common.serialization.atomic_write_json(runtime_path, incompatible_runtime)
-    with_incompatible_runtime = analysis.artifacts.service.run_or_load_artifacts(
-        run_dir=lifecycle.run_dir,
-        dataset_name=_ID_DATASET,
-        split="eval",
-        device_resolution=learning.device.resolve_device("cpu"),
-        dataset_root=lifecycle.dataset_root,
-    )
-    pd.testing.assert_frame_equal(with_incompatible_runtime, frames["eval"])
-    assert runtime_path.read_bytes() != valid_runtime
-    runtime_path.write_bytes(valid_runtime)
-
     provenance_path = id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME
     valid_provenance = provenance_path.read_text(encoding="utf-8")
+    for remove_timing in (True, False):
+        altered_provenance = json.loads(valid_provenance)
+        if remove_timing:
+            del altered_provenance[analysis.artifacts.timing.TIMING_KEY]
+        else:
+            altered_provenance[analysis.artifacts.timing.TIMING_KEY]["report"]["split_role"] = "altered"
+        common.serialization.atomic_write_json(provenance_path, altered_provenance)
+        altered_timing_cache = _artifact_inventory((id_target,))
+        with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match="--rebuild"):
+            analysis.artifacts.service.run_or_load_artifacts(
+                run_dir=lifecycle.run_dir,
+                dataset_name=_ID_DATASET,
+                split="eval",
+                device_resolution=learning.device.resolve_device("cpu"),
+                dataset_root=lifecycle.dataset_root,
+            )
+        assert _artifact_inventory((id_target,)) == altered_timing_cache
+        provenance_path.write_text(valid_provenance, encoding="utf-8")
+
     provenance_path.write_text("{}\n", encoding="utf-8")
     incompatible_cache = _artifact_inventory((id_target,))
     with pytest.raises(
@@ -676,7 +673,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     corrupted_parquet_cache = _artifact_inventory((id_target,))
     with pytest.raises(
         analysis.artifacts.service.ArtifactCacheError,
-        match="payload digest manifest mismatch",
+        match="output manifest does not match",
     ):
         analysis.artifacts.service.run_or_load_artifacts(
             run_dir=lifecycle.run_dir,
@@ -693,7 +690,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     corrupted_cache = _artifact_inventory((id_target,))
     with pytest.raises(
         analysis.artifacts.service.ArtifactCacheError,
-        match="payload digest manifest mismatch",
+        match="output manifest does not match",
     ):
         analysis.artifacts.service.run_or_load_artifacts(
             run_dir=lifecycle.run_dir,
@@ -733,6 +730,27 @@ def _copy_without_analysis(source: Path, destination: Path) -> Path:
     if analysis_root.exists():
         shutil.rmtree(analysis_root)
     return destination
+
+
+def test_additional_part_whose_package_changed_since_training_is_refused(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+) -> None:
+    """Refuse the additional-evaluation role when one part's current package differs from its saved split identity."""
+    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run")
+    dataset_root = tmp_path / "02_datasets"
+    shutil.copytree(completed_lifecycle.dataset_root, dataset_root)
+    task = domain.tasks.registry.get_task("steady_flow")
+    _save_dataset(dataset_root, dataset_root, _training_dataset_payload(task, dataset_id=_SECOND_OOD_DATASET, offsets=(40.0, 42.0)))
+    with pytest.raises(RuntimeError, match=rf"{_SECOND_OOD_DATASET!r} contradicts its saved split Dataset identity"):
+        analysis.artifacts.service.run_or_load_artifacts(
+            run_dir=run_dir,
+            dataset_name=_ADDITIONAL_DATASET,
+            split="additional_evaluation",
+            device_resolution=learning.device.resolve_device("cpu"),
+            dataset_root=dataset_root,
+        )
+    assert not common.paths.resolve_additional_evaluation_analysis_dir(run_dir, _ADDITIONAL_DATASET).exists()
 
 
 def _rewrite_parquet_npz_paths(artifact_root: Path, values: list[str]) -> None:
@@ -816,33 +834,33 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
 
     with monkeypatch.context() as drift:
         drift.setattr(learning.inference.context, "load_inference_context_with_resolution", original_inference)
-        drift.setattr(learning.training.checkpoint, "scientific_implementation_digest", lambda _task: "0" * 64)
-        with pytest.raises(ValueError, match=r"Checkpoint run identity|Initial run layout identity"):
-            experiments.run.validate_completed_run(moved)
-        with pytest.raises(ValueError, match=r"Checkpoint run identity|Initial run layout identity"):
-            experiments.run.validate_evaluable_run(moved)
+        # Training code changed after the run: reading it stays admitted on its recorded evidence, continuing it is refused.
+        run_state.drift_training_code(drift, "steady_flow")
+        before_drift = _artifact_inventory((moved,))
+        experiments.run.validate_completed_run(moved)
+        experiments.run.validate_evaluable_run(moved)
+        learning.inference.context.load_inference_context_with_resolution(
+            run_dir=moved,
+            dataset_root=completed_lifecycle.dataset_root,
+            split="validation",
+            device_resolution=learning.device.resolve_device("cpu"),
+        )
+        assert analysis.evaluation.artifact_loader.load_run_artifacts(moved).selected_checkpoint_sha256 == checkpoint_digest
         # Exercise the same continuation service used by ordinary resolved launches.
-        with pytest.raises(ValueError, match=r"Checkpoint run identity|Initial run layout identity"):
+        with pytest.raises(ValueError, match=r"training_steady_flow implementation changed .*--revision <label>"):
             experiments.run._run_resolved_experiment(
                 copy.deepcopy(completed_lifecycle.config),
                 config_path=common.paths.resolve_run_config_path(moved),
                 resume=moved,
                 device_resolution=learning.device.resolve_device("cpu"),
             )
-        with pytest.raises(ValueError, match=r"Checkpoint run identity|Initial run layout identity"):
-            learning.inference.context.load_inference_context_with_resolution(
-                run_dir=moved,
-                dataset_root=completed_lifecycle.dataset_root,
-                split="eval",
-                device_resolution=learning.device.resolve_device("cpu"),
-            )
+        assert _artifact_inventory((moved,)) == before_drift
 
-        def unexpected_execution_identity() -> Any:
-            msg = "Saved prediction reading must not query the current numerical environment."
-            raise AssertionError(msg)
-
-        drift.setattr(learning.training.checkpoint, "numerical_environment_identity", unexpected_execution_identity)
-        drift.setattr(learning.inference.context, "load_inference_context_with_resolution", unexpected_inference)
+    with monkeypatch.context() as drift:
+        environment = learning.training.checkpoint.numerical_environment_identity()
+        drift.setattr(learning.training.checkpoint, "numerical_environment_identity", lambda: {**environment, "torch": "0.0.0"})
+        with pytest.raises(ValueError, match="Checkpoint run identity"):
+            experiments.run.validate_evaluable_run(moved)
         before_read = _artifact_inventory((moved,))
         reread = analysis.evaluation.artifact_loader.load_run_artifacts(moved)
         assert reread.id_artifact is not None
@@ -856,7 +874,7 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         assert prepared_read.artifact_device is None
         assert prepared_read.loaded_run.selected_checkpoint_sha256 == checkpoint_digest
 
-        # Reader contracts still bind the published evaluator under execution drift.
+        # Reader contracts still bind the published evaluator under numerical-environment drift.
         provenance_path = analysis.artifacts.contracts.artifact_provenance_path(loaded.id_artifact.root)
         original_provenance = provenance_path.read_bytes()
         provenance = json.loads(original_provenance)
@@ -893,7 +911,6 @@ def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
     config_path = common.paths.resolve_run_config_path(run_dir)
     config = experiments.config.loader.load_yaml(config_path)
     config["tracking"]["wandb"]["workflow"] = "optuna_trial"
-    config["tracking"]["wandb"]["study"] = "portable_fixture_study"
     config["tracking"]["wandb"].update(experiments.config.loader.derive_wandb_organization(config))
     config["run"]["layout"].update({"family": "optuna", "config_name": "portable_fixture_study"})
     trial = experiments.config.naming.trial_leaf(7, config, {})
@@ -924,7 +941,7 @@ def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
             "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
             "study_name": "portable_fixture_study",
             "trial_number": 7,
-            "sampled_parameters": {"model.params.hidden_channels": 4},
+            "sampled_parameters": {"hidden_channels": 4},
             "overrides": {"optimizer.lr": 1.0e-3},
             "study_role": "optimization",
         }
@@ -933,36 +950,46 @@ def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
     return config
 
 
-def test_completed_optuna_trial_moves_outside_study_without_origin_services(
+def test_completed_optuna_trial_moved_outside_its_study_stays_a_trial_without_artifacts(
     completed_lifecycle: CompletedLifecycle,
     tmp_path: Path,
 ) -> None:
-    """Move and rename a completed trial while preserving its origin metadata."""
+    """A moved, renamed trial keeps its origin metadata and is refused by artifact planning like a transient trial."""
     trial_dir = _copy_without_analysis(
         completed_lifecycle.run_dir,
         tmp_path / "study" / "trials" / "trial_000007",
     )
-    config = _rewrite_as_optuna_trial(trial_dir)
-    experiments.run.validate_completed_run(trial_dir)
+    _rewrite_as_optuna_trial(trial_dir)
     original_summary = experiments.run.read_run_summary(trial_dir)
     moved = tmp_path / "promoted" / "paper_trial_b"
     moved.parent.mkdir()
     trial_dir.rename(moved)
 
-    prepared = analysis.artifacts.service.load_or_build_run_artifacts(
-        moved,
-        dataset_root=completed_lifecycle.dataset_root,
-        device_policy="cpu",
-    )
-    loaded = prepared.loaded_run
-    assert loaded.scientific_run_name == config["run"]["name"]
-    assert loaded.storage_alias == "paper_trial_b"
-    assert loaded.run_dir == moved.resolve()
-    assert prepared.role_actions == {"id": "generated", "additional_evaluation": "generated"}
-    assert not (tmp_path / "study" / "study.db").exists()
-    assert loaded.summary is not None
+    completed = experiments.run.validate_completed_run(moved)
     for key in ("study_name", "trial_number", "sampled_parameters", "overrides", "study_role"):
-        assert loaded.summary[key] == original_summary[key]
+        assert completed["summary"][key] == original_summary[key]
+    with pytest.raises(ValueError, match="is an Optuna trial"):
+        analysis.artifacts.service.load_or_build_run_artifacts(moved, dataset_root=completed_lifecycle.dataset_root, device_policy="cpu")
+    assert not common.paths.resolve_analysis_root(moved).exists()
+
+
+def test_optuna_trial_records_the_dry_run_signature_and_validates_without_patches(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-trial steady study binds the Dataset evidence of its dry run, and its trial is admitted like any completed run."""
+    monkeypatch.setenv("STORAGE_ROOT", str(completed_lifecycle.dataset_root.parent))
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    request = configs.optuna_config()
+    request["study"].update(n_trials=1, pruner={"kind": "none"})
+    request["experiment"] = _tiny_request(workflow="optuna_trial")
+    request["search_space"] = {"optimizer.lr": {"name": "learning_rate", "kind": "float", "low": 1.0e-3, "high": 2.0e-3, "log": True}}
+
+    completed = optuna_trials.run_one_trial_study(request, directory=tmp_path)
+
+    # Completed-run validation admitted the saved normalizer as the steady run artifact.
+    assert completed["config"]["data"]["train_dataset"] == _ID_DATASET
 
 
 def test_bundle_without_best_checkpoint_is_not_evaluable(
@@ -1001,7 +1028,7 @@ def test_rerunning_an_authored_request_with_more_epochs_continues_the_run_in_pla
         _copy_without_analysis(completed_lifecycle.run_dir, destination)
     saved = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(destination))
     raw = copy.deepcopy(saved)
-    for key in ("task_contract", "paths"):
+    for key in ("task_contract", "paths", "producer"):
         raw.pop(key)
     for key in ("name", "naming_schema_version", "layout"):
         raw["run"].pop(key)
@@ -1091,7 +1118,23 @@ def _mutate_split_identity(run_dir: Path, dataset_root: Path) -> None:
     del dataset_root
     path = common.paths.resolve_split_indices_path(run_dir)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["train_indices"] = payload["train_indices"].flip(0)
+    payload["roles"]["train"]["case_ids"].reverse()
+    common.serialization.atomic_torch_save(payload, path)
+    _refresh_summary_digest(
+        run_dir,
+        summary_key="split_indices_sha256",
+        artifact_path=path,
+    )
+
+
+def _mutate_split_datasets(run_dir: Path, dataset_root: Path) -> None:
+    """Drop the last additional Evaluation part, leaving an admissible split that no longer matches config.yaml."""
+    del dataset_root
+    path = common.paths.resolve_split_indices_path(run_dir)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    aligned = (payload["dataset_identity"]["additional_evaluation"], payload["roles"]["additional_evaluation"]["parts"])
+    for parts in (*aligned, payload["evaluation_assignments"]):
+        parts.pop()
     common.serialization.atomic_torch_save(payload, path)
     _refresh_summary_digest(
         run_dir,
@@ -1144,10 +1187,11 @@ def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
     [
         (_mutate_task_identity, "split_indices.pt task_contract_digest"),
         (_mutate_config_identity, "canonical generated leaf"),
-        (_mutate_dataset_identity, "dataset fingerprint mismatch"),
-        (_mutate_split_identity, "membership disagrees with the Dataset case partition"),
+        (_mutate_dataset_identity, "Dataset payload bytes disagree with manifest"),
+        (_mutate_split_identity, "train membership digest mismatch"),
+        (_mutate_split_datasets, "Saved split Datasets do not match the configured"),
         (_mutate_checkpoint_identity, "Checkpoint run identity"),
-        (_mutate_checkpoint_schema, "Historical or malformed checkpoint schema_kind/schema_version is unsupported"),
+        (_mutate_checkpoint_schema, "Malformed or unsupported checkpoint schema_kind/schema_version"),
         (_remove_run_schema, "Unsupported or missing run summary schema"),
     ],
     ids=(
@@ -1155,6 +1199,7 @@ def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
         "config",
         "dataset",
         "split",
+        "split-datasets",
         "checkpoint",
         "checkpoint-schema",
         "run-schema",
@@ -1168,14 +1213,14 @@ def test_saved_run_mismatches_are_rejected_before_forward(
     match: str,
 ) -> None:
     """
-    Corrupt one of seven saved task/config/dataset/split/checkpoint/run-schema layers.
+    Corrupt one saved task/config/dataset/split/split-Dataset/checkpoint/run-schema layer.
 
     Every parametrized mutation keeps unrelated outer evidence valid where needed
     but must fail its owning admission check before FNO forward, proving the complete
     saved-run identity chain is fail-closed.
     """
     run_dir = tmp_path / "run"
-    dataset_root = tmp_path / "datasets"
+    dataset_root = tmp_path / "02_datasets"
     shutil.copytree(completed_lifecycle.run_dir, run_dir)
     shutil.copytree(completed_lifecycle.dataset_root, dataset_root)
     mutate(run_dir, dataset_root)

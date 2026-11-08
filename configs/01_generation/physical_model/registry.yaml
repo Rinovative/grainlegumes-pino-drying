@@ -11,7 +11,7 @@ parameters:
     block: airflow
     ood_group: bed
     report_symbol: \bar{\kappa}
-    description: Mean scalar bed permeability used by the lognormal permeability field.
+    description: Scale of the lognormal scalar bed permeability, its expected value for a standard Gaussian structure field; the realised domain mean of a case differs.
     classification: sampled
     profile_applicability:
     - steady_flow
@@ -155,7 +155,7 @@ parameters:
     block: airflow
     ood_group: bed
     report_symbol: a_{\max}
-    description: Maximum permeability anisotropy ratio.
+    description: Principal-permeability ratio k1/k2 at unit anisotropy strength and maximal background magnitude; the local ratio is r = 1 + strength*(max_ratio - 1)*|b|^exponent with the normalized background magnitude |b| <= 1, and the principal permeabilities are kappa*sqrt(r) and kappa/sqrt(r).
     classification: sampled
     profile_applicability:
     - steady_flow
@@ -246,7 +246,7 @@ parameters:
     block: airflow
     ood_group: operation
     report_symbol: \bar{p}_{\mathrm{in}}
-    description: Mean inlet pressure boundary magnitude.
+    description: Base inlet pressure; the inlet profile is this value times (1 + shape), and the sinusoidal and Gaussian shape terms are not mean-free, so it is not the realised inlet mean.
     classification: sampled
     profile_applicability:
     - steady_flow
@@ -349,7 +349,7 @@ parameters:
     block: airflow
     ood_group: operation
     report_symbol: a_{p,\mathrm{lin}}
-    description: Relative linear inlet-pressure trend.
+    description: Relative linear inlet-pressure trend along x on the inlet edge.
     classification: sampled
     profile_applicability:
     - steady_flow

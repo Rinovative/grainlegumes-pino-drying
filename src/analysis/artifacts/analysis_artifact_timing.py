@@ -3,10 +3,11 @@
 Responsibilities:
   - Measure synchronized neural forward passes after explicit warmup
   - Validate COMSOL timing snapshots and runtime comparison schemas
-  - Build, publish, and load artifact-local runtime sidecars
+  - Own the required non-identity timing block of both tasks' completion markers and write it into unpublished stages
 
 Design principles:
-  - Timing evidence is identity-bound and separate from scientific payload digests
+  - Timing evidence is bound to run and membership but never part of scientific artifact identity
+  - Timing is written into the stage before publication, so a timing failure publishes nothing
   - Device synchronization and inference dtype are recorded explicitly
   - Unavailable COMSOL evidence remains an explicit validated state
 
@@ -33,7 +34,10 @@ import torch
 
 from src import common, generation
 
-RUNTIME_COMPARISON_FILENAME = "runtime_comparison.json"
+from . import analysis_artifact_contracts as contracts
+from . import analysis_artifact_performance as artifact_performance
+
+TIMING_KEY = "timing"
 SIMULATION_TIMING_SCHEMA_KIND = "simulation_batch_timing"
 RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
 SCHEMA_VERSION = 1
@@ -52,10 +56,6 @@ _RUNTIME_COMPARISON_BOUNDARIES = {
 }
 _SHA256_HEX_LENGTH = 64
 _SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
-
-
-def _is_schema_version(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value == SCHEMA_VERSION
 
 
 def _duration(value: Any, *, label: str, positive: bool = True) -> float:
@@ -271,7 +271,7 @@ def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
     if (
         set(payload) != required
         or payload.get("schema_kind") != SIMULATION_TIMING_SCHEMA_KIND
-        or not _is_schema_version(payload.get("schema_version"))
+        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
     ):
         msg = "Simulation batch timing has an invalid schema."
         raise ValueError(msg)
@@ -337,6 +337,16 @@ def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
             msg = "Simulation timing aggregates must be derived from valid case records."
             raise ValueError(msg)
     return payload
+
+
+def runtime_dataset_identity(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the Dataset identity a runtime comparison binds: role name, every source part and the ordered membership."""
+    dataset = provenance["dataset"]
+    return {
+        "name": dataset["name"],
+        "dataset_provenance_sha256": common.serialization.canonical_json_sha256(dataset),
+        "effective_ordered_source_indices_sha256": provenance["selection"]["effective_ordered_source_indices_sha256"],
+    }
 
 
 def _validate_identity(value: Any, *, fields: set[str], label: str) -> dict[str, Any]:
@@ -488,7 +498,7 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     if (
         set(payload) != required
         or payload.get("schema_kind") != RUNTIME_COMPARISON_SCHEMA_KIND
-        or not _is_schema_version(payload.get("schema_version"))
+        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
     ):
         msg = "Runtime comparison has an invalid schema."
         raise ValueError(msg)
@@ -497,13 +507,7 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         raise ValueError(msg)
     _validate_identity(
         payload.get("dataset_identity"),
-        fields={
-            "name",
-            "fingerprint",
-            "data_contract_digest",
-            "saved_membership_digest",
-            "effective_ordered_source_indices_sha256",
-        },
+        fields={"name", "dataset_provenance_sha256", "effective_ordered_source_indices_sha256"},
         label="dataset_identity",
     )
     _validate_identity(
@@ -636,25 +640,26 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     return payload
 
 
-def runtime_comparison_path(save_root: str | Path) -> Path:
-    """Return the operational sidecar path for one artifact target."""
-    return Path(save_root) / RUNTIME_COMPARISON_FILENAME
+def timing_block(provenance: Mapping[str, Any], *, records: frozenset[str]) -> dict[str, Any]:
+    """
+    Return the required non-identity timing block of one canonical artifact of either task.
+
+    The block holds the task's timing records (``records``) and the operational
+    performance snapshot; both stay outside the scientific artifact identity.
+    """
+    block = provenance.get(TIMING_KEY)
+    expected = records | {"operational_performance"}
+    if not isinstance(block, Mapping) or set(block) != expected:
+        found = sorted(block) if isinstance(block, Mapping) else type(block).__name__
+        msg = f"Artifact timing block must hold exactly {sorted(expected)}, found {found}; rerun the exact target with --rebuild."
+        raise ValueError(msg)
+    artifact_performance.validate_operational_performance(block["operational_performance"])
+    return dict(block)
 
 
-def write_runtime_comparison(save_root: str | Path, payload: Mapping[str, Any]) -> Path:
-    """Atomically publish one validated operational comparison sidecar."""
-    return common.serialization.atomic_write_json(
-        runtime_comparison_path(save_root),
-        validate_runtime_comparison(payload),
-    )
-
-
-def load_runtime_comparison(save_root: str | Path) -> dict[str, Any]:
-    """Load one strictly validated operational comparison sidecar."""
-    path = runtime_comparison_path(save_root)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        msg = f"Runtime comparison sidecar is missing or unreadable: {path}: {error}"
-        raise RuntimeError(msg) from error
-    return validate_runtime_comparison(payload)
+def write_stage_timing(stage_root: str | Path, entries: Mapping[str, Any]) -> None:
+    """Merge operational timing into one unpublished stage marker; scientific provenance and payloads stay untouched."""
+    marker = contracts.artifact_provenance_path(Path(stage_root))
+    document = json.loads(marker.read_text(encoding="utf-8"))
+    document[TIMING_KEY] = {**document.get(TIMING_KEY, {}), **entries}
+    common.serialization.atomic_write_json(marker, document)

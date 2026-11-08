@@ -21,7 +21,8 @@ import numpy as np
 import pytest
 import torch
 
-from src import datasets, experiments, learning
+from src import experiments, learning
+from src.learning.transient.learning_transient_curriculum import RolloutCurriculum, RolloutCurriculumState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,6 +40,24 @@ def test_labeled_subseeds_are_stable_distinct_and_reproducible() -> None:
 
     assert first == reverse
     assert len(first) == len(set(first.values()))
+
+
+def test_curriculum_draws_follow_the_derived_seed_of_each_arm() -> None:
+    """
+    Draw rollout lengths from the seed plan's A0 and B curriculum seeds.
+
+    The same run seed reproduces its draws, another run seed and the other arm draw
+    different sequences, so replicates do not share one rollout-length sequence.
+    """
+    curriculum = RolloutCurriculum(lengths=(2, 4, 8, 16, 32), milestone_fractions=(0.0, 0.2, 0.4, 0.6, 0.8))
+
+    def draws(run_seed: int, label: str) -> list[int]:
+        state = RolloutCurriculumState.create(curriculum, seed=experiments.run.build_seed_plan(run_seed)[label])
+        return [state.select(progress=1.0, available_length=32, batch_size=1)[0] for _ in range(32)]
+
+    assert draws(19, "curriculum_a0") == draws(19, "curriculum_a0")
+    assert draws(19, "curriculum_a0") != draws(19, "curriculum_b")
+    assert draws(19, "curriculum_a0") != draws(23, "curriculum_a0")
 
 
 def test_process_seed_reproduces_python_numpy_torch_and_model_init() -> None:
@@ -109,7 +128,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
     config: dict[str, Any] = {
         "task": "synthetic",
         "run": {"name": "run", "seed": 23, "deterministic": True, "device": "cpu"},
-        "training": {"epochs": 1, "mixed_precision": False},
+        "training": {"epochs": 1},
         "tracking": {"wandb": {"mode": "disabled"}},
         "evaluation": {
             "objective": {
@@ -135,43 +154,22 @@ def test_model_subseed_is_applied_immediately_before_construction(
         seed_calls.append(seed)
 
     monkeypatch.setattr(experiments.run, "seed_process", capture_seed)
+    # The stub config carries no data, optimizer or loss sections for the start block, which consumes no randomness.
+    monkeypatch.setattr(experiments.run.console.ConsoleReporter, "startup", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         experiments.run.config_loader,
         "create_dataloaders_from_config",
+        # The construction-order test stays isolated from Dataset identity: the loaders hand over an opaque scaling artifact.
         lambda *_args, **_kwargs: {
             "data_processor": _Processor(),
-            "split_indices": {"train_indices": torch.tensor([0]), "validation_indices": torch.tensor([1]), "id_test_indices": torch.tensor([2])},
+            "scaling_artifact": {"state": _Processor().state_dict()},
+            "split_indices": {},
         },
     )
-    synthetic_task = object()
     monkeypatch.setattr(
         experiments.run.config_loader,
         "validate_resolved_task_contract",
-        lambda _config: synthetic_task,
-    )
-
-    synthetic_split_contract = object()
-    monkeypatch.setattr(
-        datasets.preprocessing.splits,
-        "admit_split_contract",
-        lambda _payload: synthetic_split_contract,
-    )
-
-    def build_normalizer_artifact(
-        processor: _Processor,
-        *,
-        task: object,
-        split_contract: object,
-    ) -> dict[str, Any]:
-        """Keep the construction-order test isolated from dataset identity."""
-        assert task is synthetic_task
-        assert split_contract is synthetic_split_contract
-        return {"state": processor.state_dict()}
-
-    monkeypatch.setattr(
-        datasets.preprocessing.normalization,
-        "build_normalizer_artifact",
-        build_normalizer_artifact,
+        lambda _config: object(),
     )
 
     class ConstructionReachedError(RuntimeError):

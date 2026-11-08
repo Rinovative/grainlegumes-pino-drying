@@ -979,7 +979,6 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
     config_path, _template = generation_config_factory(
         executable=fake_comsol,
         scheduler_kind="slurm",
-        maximum_failed_cases=0,
         in_allocation_maximum_window_seconds=0.05,
         in_allocation_pause_after_capacity_failure_seconds=0.01,
     )
@@ -1030,19 +1029,6 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
     assert window["outcome"] == "window_exhausted"
     assert window["reason"] == "in_allocation_license_window_exhausted"
     assert window["recent_checkout_summaries"][-1]["process_exit_code"] == -signal.SIGTERM
-    assert (
-        generation.campaign._solver_failure_threshold_exceeded(
-            [
-                {
-                    "state": "license_blocked",
-                    "failure_stage": "solver",
-                    "temporary_license_retry": wait,
-                }
-            ],
-            maximum_failed_cases=0,
-        )
-        is False
-    )
 
 
 @pytest.mark.integration

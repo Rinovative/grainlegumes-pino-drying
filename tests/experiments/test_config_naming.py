@@ -39,7 +39,10 @@ def _fd_config() -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("relative", "expected"),
     [
-        (f"{_TREE}/steady_flow/experiments/model_selection/fno_m4x5_h8_l2.yaml", ("steady_flow", "model_selection", "fno_m4x5_h8_l2")),
+        (
+            f"{_TREE}/steady_flow/experiments/architecture_comparison/fno_m4x5_h8_l2.yaml",
+            ("steady_flow", "architecture_comparison", "fno_m4x5_h8_l2"),
+        ),
         (f"{_TREE}/transient_drying/optuna/uno_a0_search.yaml", ("transient_drying", "optuna", "uno_a0_search")),
     ],
 )
@@ -94,7 +97,7 @@ def test_model_label_marks_physics_and_derivative_family() -> None:
     assert naming.model_family(finite_difference) == "pi-fno"
 
     raw = configs.direct_config(model_kind="uno", physics_enabled=True)
-    raw["loss"]["physics"]["derivatives"] = {"kind": "spectral", "extension": "fourier_continuation"}
+    raw["loss"]["physics"]["derivatives"] = {"kind": "spectral"}
     spectral = configs.resolve(raw)
     assert naming.model_label(spectral).startswith("pi-uno_m4x5_h8_l5_s")
     assert naming.model_label(spectral).endswith("__spec")
@@ -115,7 +118,7 @@ def test_config_name_may_equal_or_extend_the_model_label(name: str) -> None:
     """The model label, optionally followed by a double-underscore variant, names a config."""
     config = configs.resolve(configs.direct_config())
 
-    naming.validate_config_name(naming.ConfigSource("steady_flow", "model_selection", name), config)
+    naming.validate_config_name(naming.ConfigSource("steady_flow", "architecture_comparison", name), config)
 
 
 @pytest.mark.parametrize("name", ["fno_m4x5_h8_l2_lr-low", "fno_m4x5_h8_l3", "pi-fno_m4x5_h8_l2__fd", "lr-low__fno_m4x5_h8_l2", "request"])
@@ -124,16 +127,16 @@ def test_config_name_must_start_with_the_model_label(name: str) -> None:
     config = configs.resolve(configs.direct_config())
 
     with pytest.raises(loader.ConfigError, match=r"fno_m4x5_h8_l2__"):
-        naming.validate_config_name(naming.ConfigSource("steady_flow", "model_selection", name), config)
+        naming.validate_config_name(naming.ConfigSource("steady_flow", "architecture_comparison", name), config)
 
 
 def test_physics_configs_need_their_physics_label_and_studies_are_exempt() -> None:
     """A physics-enabled config must be named pi-...; an Optuna study may carry any name."""
     config = _fd_config()
 
-    naming.validate_config_name(naming.ConfigSource("steady_flow", "model_selection", "pi-fno_m4x5_h8_l2__fd__lr-low"), config)
+    naming.validate_config_name(naming.ConfigSource("steady_flow", "architecture_comparison", "pi-fno_m4x5_h8_l2__fd__lr-low"), config)
     with pytest.raises(loader.ConfigError, match="pi-fno_m4x5_h8_l2__fd"):
-        naming.validate_config_name(naming.ConfigSource("steady_flow", "model_selection", "fno_m4x5_h8_l2"), config)
+        naming.validate_config_name(naming.ConfigSource("steady_flow", "architecture_comparison", "fno_m4x5_h8_l2"), config)
     naming.validate_config_name(naming.ConfigSource("steady_flow", "optuna", "pi-fno_search"), config)
 
 

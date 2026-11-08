@@ -26,7 +26,7 @@ import tarfile
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -35,7 +35,6 @@ from support.synthetic_task import build_synthetic_selection_provenance
 from src.datasets import dataset_packages as facade
 from src.datasets import packages as package_facade
 from src.datasets.contracts import dataset_contracts_identity as identity
-from src.datasets.contracts import dataset_contracts_metadata as metadata
 from src.datasets.contracts import dataset_contracts_partition as partition
 from src.datasets.packages import dataset_packages_builder as builder
 from src.datasets.packages import dataset_packages_manifest as manifests
@@ -44,8 +43,6 @@ from src.datasets.packages import dataset_packages_selection as selection
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-    from src.domain.tasks.domain_task_spec import TaskSpec
 
 
 @pytest.fixture
@@ -154,7 +151,7 @@ def test_dataset_identity_excludes_labels_and_selection_method_but_binds_convers
     _identifier, digest = identity.package_identity_from_provenance(original)
     renamed = copy.deepcopy(original)
     renamed["dataset_name"] = "another_label"
-    renamed["selection"] = {"kind": "seed_ranked", "root_seed": 3}
+    renamed["selection"] = {"kind": "design_order", "source_names": ["another_source"], "target_counts": {"lentil": 3}}
     renamed["producer_evidence"]["source_snapshot"]["git_commit"] = "d" * 40
     assert identity.package_identity_from_provenance(renamed)[1] == digest
     renamed["builder_identity"]["implementation_sha256"] = "e" * 64
@@ -287,8 +284,7 @@ def test_inspection_exposes_parameters_and_recovery_without_tensor_loading(
     manifest = {
         **provenance,
         "selection": {
-            "kind": "seed_ranked",
-            "root_seed": 17,
+            "kind": "design_order",
             "source_names": [source["source_name"]],
             "target_counts": {"lentil": 1},
         },
@@ -307,7 +303,7 @@ def test_inspection_exposes_parameters_and_recovery_without_tensor_loading(
     assert report["producer"]["source_recovery"]["manifest_verified"] is True
     readable = facade.format_dataset_inspection(report)
     assert "Dataset: fixture" in readable
-    assert "Selection: seed_ranked; seed 17; counts lentil=1" in readable
+    assert "Selection: design_order; counts lentil=1" in readable
     assert "Sources, in Dataset order:" in readable
     assert source["source_name"] in readable
     assert "Generation root/candidate seeds:" in readable
@@ -496,7 +492,7 @@ def test_producer_verification_rejects_added_source_and_resurrected_deletion(sna
         module["verify_source_snapshot"](Path(receipt["snapshot_path"]), repository)
 
 
-def test_actual_interpreter_change_rejects_admission_but_documentation_is_compatible(
+def test_historical_conversion_digest_is_admitted_after_code_drift_but_malformed_evidence_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -513,30 +509,15 @@ def test_actual_interpreter_change_rejects_admission_but_documentation_is_compat
         "source_case_count": 1,
         "transition_count": 0,
         "payload_sha256": reproduction.common.serialization.file_sha256(payload),
+        "derived_payload_sha256": None,
     }
-    projection = reproduction.DATASET_CONVERSION_PROJECTIONS["steady_flow"]
-    executing_source = Path(reproduction.__file__).resolve().parents[2]
-    copied_source = tmp_path / "selected-source"
-    for relative in projection.members(executing_source):
-        destination = copied_source / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(executing_source / relative, destination)
-    monkeypatch.setattr(
-        reproduction,
-        "conversion_implementation_sha256",
-        lambda view: reproduction.DATASET_CONVERSION_PROJECTIONS[view].sha256(copied_source),
-    )
-    assert reproduction.conversion_implementation_sha256("steady_flow") == provenance["builder_identity"]["implementation_sha256"]
-    (copied_source / "README.md").write_text("Unrelated human documentation changes.\n")
-    interpreter = copied_source / "datasets/runtime/dataset_runtime_steady.py"
-    text = interpreter.read_text()
-    interpreter.write_text(text.replace("Return one task-ordered pair and a defensive metadata copy.", "Explain the same task-ordered pair."))
-    assert reproduction.conversion_implementation_sha256("steady_flow") == provenance["builder_identity"]["implementation_sha256"]
+    # Consumption compares the recorded conversion digest with nothing the running code computes.
+    monkeypatch.setattr(reproduction, "conversion_implementation_sha256", lambda _view: "f" * 64)
     manifests.validate_manifest_content(manifest, task="steady_flow", dataset_id=dataset_id, payload_path=payload)
-    interpreter.write_text(text.replace('"x": self.inputs[index]', '"x": self.inputs[index] * 2'))
-    assert reproduction.conversion_implementation_sha256("steady_flow") != provenance["builder_identity"]["implementation_sha256"]
-    with pytest.raises(ValueError, match="implementation changed"):
-        manifests.validate_manifest_content(manifest, task="steady_flow", dataset_id=dataset_id, payload_path=payload)
+    malformed = copy.deepcopy(manifest)
+    malformed["builder_identity"]["implementation_sha256"] = "F" * 64
+    with pytest.raises(ValueError, match="Dataset builder implementation must be a 64-character lowercase"):
+        manifests.validate_manifest_content(malformed, task="steady_flow", dataset_id=dataset_id, payload_path=payload)
 
 
 def test_fresh_reconstruction_output_reads_dependencies_without_mutating_them(tmp_path: Path) -> None:
@@ -591,15 +572,8 @@ def test_steady_metadata_reads_manifest_and_payload_in_same_folder(tmp_path: Pat
         selection_request={"selection": {"kind": "exact"}},
         storage_root=tmp_path,
     )
-    manifest = metadata._load_manifest(manifest_path.parent, dataset_id=dataset_id, dataset_path=payload_path)
+    manifest = manifests.read_dataset_manifest(manifest_path.parent, task="steady_flow", dataset_id=dataset_id, payload_path=payload_path)
     assert manifest["dataset_digest"] == digest
-    with pytest.raises(ValueError, match="same Dataset root"):
-        metadata.load_dataset_metadata_summary(
-            dataset_id,
-            task=cast("TaskSpec", SimpleNamespace(id="steady_flow")),
-            dataset_root=tmp_path / "02_datasets",
-            metadata_root=tmp_path / "other",
-        )
 
 
 def test_external_reconstruction_refuses_targets_appearing_during_build(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -644,23 +618,25 @@ def test_external_reconstruction_refuses_targets_appearing_during_build(tmp_path
     assert not (tmp_path / "absent-target").exists()
 
 
-def test_reuse_validates_changed_ranked_claim_without_reranking_unchanged_method(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reuse_validates_changed_ordered_claim_without_reselecting_unchanged_method(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     provenance = _provenance()
-    method = {"kind": "seed_ranked", "source_names": ["source_1"], "target_counts": {"lentil": 1}, "root_seed": 17}
+    # The declared Source must name the campaign the synthetic source cases reference.
+    source_name = "physical_synthetic_source"
+    method = {"kind": "design_order", "source_names": [source_name], "target_counts": {"lentil": 1}}
     provenance["selection"] = method
     dataset_id, digest = identity.package_identity_from_provenance(provenance)
     prefix = {**provenance, "dataset_id": dataset_id, "dataset_digest": digest, "payload_filename": "dataset.pt", "source_case_count": 1}
     reference = {"case_id": "case_1"}
     request = {"selection": method, "source_task": "steady_flow", "source_cases": [reference]}
 
-    def ranked(_task: str, _names: list[str], counts: dict[str, int], *, root_seed: int, **_kwargs: Any) -> tuple:
-        return (reference,) if counts == {"lentil": 1} and root_seed == 17 else ()
+    def ordered(_task: str, names: list[str], counts: dict[str, int], **_kwargs: Any) -> tuple:
+        return (reference,) if names == [source_name] and counts == {"lentil": 1} else ()
 
     def payload(path: Path) -> dict[str, int]:
         path.write_bytes(b"immutable fixture")
         return {"sample_count": 1, "transition_count": 0}
 
-    monkeypatch.setattr(selection, "select_ranked_cases", ranked)
+    monkeypatch.setattr(selection, "select_ordered_cases", ordered)
     args = {
         "dataset_id": dataset_id,
         "task": "steady_flow",
@@ -672,15 +648,15 @@ def test_reuse_validates_changed_ranked_claim_without_reranking_unchanged_method
     _payload, manifest_path, reused, _manifest = builder._publish(**args)
     assert reused is False
     before = manifest_path.read_bytes()
-    for changed in ({**method, "root_seed": 18}, {**method, "target_counts": {"lentil": 2}}):
-        with pytest.raises(ValueError, match="Seed-ranked Dataset source cases disagree"):
+    for changed in ({**method, "source_names": ["source_2"]}, {**method, "target_counts": {"lentil": 2}}):
+        with pytest.raises(ValueError, match="Design-order Dataset source cases disagree"):
             builder._publish(**{**args, "selection_request": {**request, "selection": changed}, "prefix": {**prefix, "selection": changed}})
         assert manifest_path.read_bytes() == before
 
-    def forbidden_rerank(*_args: Any, **_kwargs: Any) -> tuple:
-        pytest.fail("Unchanged immutable selection must not rerank a mutable Source pool")
+    def forbidden_reselect(*_args: Any, **_kwargs: Any) -> tuple:
+        pytest.fail("Unchanged immutable selection must not reselect from a mutable Source pool")
 
-    monkeypatch.setattr(selection, "select_ranked_cases", forbidden_rerank)
+    monkeypatch.setattr(selection, "select_ordered_cases", forbidden_reselect)
     assert builder._publish(**args)[2] is True
     assert manifest_path.read_bytes() == before
 
@@ -738,7 +714,7 @@ def test_readable_dataset_name_binds_fixed_roles_membership_and_seed() -> None:
     assert identity.package_identity_from_provenance(changed)[1] != digest
     corrupt = copy.deepcopy(provenance)
     corrupt["case_partition"]["train"] = ["b"]
-    with pytest.raises(ValueError, match="cover source cases once"):
+    with pytest.raises(ValueError, match="roles must be disjoint"):
         identity.package_identity_from_provenance(corrupt)
 
 
@@ -766,15 +742,32 @@ def test_content_digest_ignores_split_seeds_but_binds_membership() -> None:
     assert identity.package_content_digest(moved) != baseline
 
 
+def _training_manifest(*, partitioned: bool = True) -> dict[str, Any]:
+    """Return manifest evidence of a training Dataset with three ID cases and one held-out material."""
+    materials = {"a": "lentil", "b": "lentil", "c": "lentil", "primary-ood": "pea"}
+    fixed = partition.build_fixed_partition(
+        tuple(materials),
+        material_by_case=materials,
+        material_roles={"lentil": "id", "pea": "ood"},
+        recipe={"kind": "exact", "train": ["a"], "validation": ["b"], "id_test": ["c"]},
+        seed_input=1,
+        seed=1,
+    )
+    return {
+        "case_partition": fixed if partitioned else None,
+        "source_case_identities": [{"package_case_id": case, "source": {"material_family": material}} for case, material in materials.items()],
+    }
+
+
 def test_declared_evaluation_assignments_are_metadata_only_and_ordered(monkeypatch: pytest.MonkeyPatch) -> None:
 
     manifests_by_id: dict[str, dict[str, Any]] = {
-        "train": {"case_partition": {"ood": ["primary-ood"]}},
+        "train": _training_manifest(),
         "external-b": {"case_partition": {"ood": ["b-ood"]}},
         "external-a": {"case_partition": {"ood": ["a-ood"]}},
-        "primary-only": {"case_partition": {"ood": ["primary-ood"]}},
+        "primary-only": _training_manifest(),
         "no-ood": {"case_partition": {"ood": []}},
-        "no-partition": {"case_partition": None},
+        "no-partition": _training_manifest(partitioned=False),
     }
     calls: list[tuple[str, Path | str | None]] = []
 
@@ -801,7 +794,7 @@ def test_declared_evaluation_assignments_are_metadata_only_and_ordered(monkeypat
     assert package_facade.declared_evaluation_assignments("steady_flow", "primary-only") == [{**expected[-1], "dataset_id": "primary-only"}]
 
     calls.clear()
-    with pytest.raises(ValueError, match="must declare a fixed case partition"):
+    with pytest.raises(ValueError, match="has no fixed case partition with Train cases"):
         manifests.declared_evaluation_assignments("steady_flow", "no-partition")
     with pytest.raises(ValueError, match="non-empty fixed OOD partition"):
         manifests.declared_evaluation_assignments("steady_flow", "train", ("no-ood",))

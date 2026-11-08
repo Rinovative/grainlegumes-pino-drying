@@ -1,7 +1,7 @@
 """Define generic runtime defaults around task-owned semantic contracts.
 
 Responsibilities:
-  - Provide generic run, data-loader, optimizer, scheduler, and training defaults
+  - Provide generic run, data-loader, optimizer, and scheduler defaults
   - Project task losses and metric definitions into generic config defaults
   - Return serializable defaults for strict experiment resolution
 
@@ -26,7 +26,6 @@ from src import domain
 RUN_DEFAULTS: dict[str, Any] = {
     "seed": 9,
     "revision": None,
-    "deterministic": True,
     "device": "auto",
 }
 
@@ -40,10 +39,7 @@ DATA_RUNTIME_DEFAULTS: dict[str, Any] = {
 
 PHYSICS_LOSS_DEFAULTS: dict[str, Any] = {
     "enabled": False,
-    "derivatives": {
-        "kind": "spectral",
-        "extension": "fourier_continuation",
-    },
+    "derivatives": {"kind": "physical"},
     "interior_crop": 2,
     "momentum_weight": {
         "target": 1.0,
@@ -68,29 +64,16 @@ OPTIMIZER_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 SCHEDULER_DEFAULTS: dict[str, dict[str, Any]] = {
-    "reduce_on_plateau": {
-        "kind": "reduce_on_plateau",
-        "factor": 0.5,
-        "patience": 20,
-        "min_lr": 1.0e-8,
-    }
-}
-
-TRAINING_DEFAULTS: dict[str, Any] = {
-    "epochs": 600,
-    "evaluation_interval": 5,
-    "additional_evaluation_interval": 5,
-    "mixed_precision": False,
+    "reduce_on_plateau": {"kind": "reduce_on_plateau"},
 }
 
 WANDB_ENTITY = "Rinovative-Hub"
-WANDB_REPOSITORY_PROJECT = "grainlegumes-pino-drying"
 WANDB_TASK_PROJECTS = {
-    "steady_flow": WANDB_REPOSITORY_PROJECT,
-    "transient_drying": "grainlegumes-pino-drying-transient",
+    "steady_flow": "grainlegumes-pino-airflow",
+    "transient_drying": "grainlegumes-pino-drying",
 }
 WANDB_MAX_TAGS = 2
-WANDB_METRIC_SCHEMA_VERSION = 3
+WANDB_METRIC_SCHEMA_VERSION = 1
 WANDB_WORKFLOWS = (
     "train",
     "optuna_trial",
@@ -101,7 +84,6 @@ TRACKING_DEFAULTS: dict[str, Any] = {
     "wandb": {
         "mode": "online",
         "workflow": "train",
-        "study": None,
         "project": WANDB_TASK_PROJECTS["steady_flow"],
         "entity": WANDB_ENTITY,
         "tags": [],
@@ -142,15 +124,10 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
         return {
             "run": RUN_DEFAULTS,
             "data": {
-                "additional_evaluation_fraction": 1.0,
                 "batch_size": 2,
-                "num_workers": 2,
+                "num_workers": 0,
                 "pin_memory": True,
-                "persistent_workers": True,
-                "spatial_stride": 1,
-                "transient_backend_preference": "pt_shards",
-                "transient_backend_required": False,
-                "hdf5_cache_size": 0,
+                "persistent_workers": False,
             },
             "input_profile": task.primary_input_profile,
             "temporal": {"sampling": {"mode": "one_step_transition"}, "temporal_conditioning": {"kind": "none"}},
@@ -170,14 +147,10 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
             "optimizer": OPTIMIZER_DEFAULTS["adamw"],
             "scheduler": SCHEDULER_DEFAULTS["reduce_on_plateau"],
             "training": {
-                "epochs": 100,
-                "evaluation_interval": 1,
-                "additional_evaluation_interval": 1,
-                "mixed_precision": False,
                 "stage": "a",
                 "comparison_arm": "a0",
                 "gradient_accumulation_steps": 1,
-                "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": 9},
+                "curriculum": {"lengths": [1], "milestone_fractions": [0.0]},
                 "teacher_handoff": None,
             },
             "tracking": {
@@ -204,6 +177,6 @@ def get_task_defaults(task_id: str) -> dict[str, Any]:
         },
         "optimizer": OPTIMIZER_DEFAULTS["adamw"],
         "scheduler": SCHEDULER_DEFAULTS["reduce_on_plateau"],
-        "training": TRAINING_DEFAULTS,
+        "training": {},
         "tracking": TRACKING_DEFAULTS,
     }

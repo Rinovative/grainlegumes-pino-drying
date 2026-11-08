@@ -32,7 +32,6 @@ __all__ = [
     "DeviceResolutionError",
     "DeviceRuntimeMetadata",
     "resolve_device",
-    "validate_mixed_precision_device",
 ]
 
 
@@ -40,7 +39,7 @@ class DeviceResolutionError(RuntimeError):
     """
     Represent failure to satisfy a valid runtime-device requirement.
 
-    This covers unusable strict CUDA and the CUDA-only mixed-precision boundary.
+    This covers unusable strict CUDA.
     Unlike ``DevicePolicyError``, the requested vocabulary was already valid.
     """
 
@@ -254,37 +253,3 @@ def resolve_device(policy: Any, *, path: str = "device") -> DeviceResolution:
         if requested == "cuda":
             raise
         return _cpu_resolution(requested)
-
-
-def validate_mixed_precision_device(
-    enabled: Any,
-    resolution: DeviceResolution,
-    *,
-    path: str = "training.mixed_precision",
-) -> None:
-    """
-    Require the current CUDA-only mixed-precision contract.
-
-    Parameters
-    ----------
-    enabled : Any
-        Resolved mixed-precision setting.
-    resolution : DeviceResolution
-        Concrete runtime device decision.
-    path : str, optional
-        Semantic config path included in errors.
-
-    Raises
-    ------
-    TypeError
-        If the setting is not a boolean.
-    DeviceResolutionError
-        If mixed precision is requested for a non-CUDA resolution.
-
-    """
-    if type(enabled) is not bool:
-        msg = f"{path} must be boolean, got {enabled!r}."
-        raise TypeError(msg)
-    if enabled and resolution.device_type != "cuda":
-        msg = f"{path}=true requires a resolved CUDA device. CPU autocast is not supported by this runtime contract."
-        raise DeviceResolutionError(msg)

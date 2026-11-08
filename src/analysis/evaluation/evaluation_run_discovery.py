@@ -8,7 +8,7 @@ Responsibilities:
   - Return deterministic catalog evidence and bounded per-candidate issues
 
 Design principles:
-  - Persisted config, summary, and parent records remain authoritative
+  - Persisted config, summary, saved split, and parent records remain authoritative; current Dataset manifests are never consulted
   - Discovery never contacts tracking services or infers scientific identity
   - One malformed candidate cannot prevent inspection of unrelated runs
 
@@ -220,7 +220,7 @@ def _manifest_paths_are_present(outputs: object, *, root: Path) -> bool:
 def _artifact_payload_is_current(payload: Mapping[str, Any], *, root: Path, task: str) -> bool:
     """Return whether one marker has recognized schema, task, and output paths."""
     artifact_schema = payload.get("artifact_schema_version")
-    if payload.get("provenance_schema_version") != artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(payload.get("provenance_schema_version"), artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION):
         return False
     run = payload.get("run")
     run_task = _text(run.get("task")) if isinstance(run, Mapping) else None
@@ -231,7 +231,7 @@ def _artifact_payload_is_current(payload: Mapping[str, Any], *, root: Path, task
         if payload.get("artifact_kind") == transient_artifact.TRANSIENT_ARTIFACT_KIND
         else artifact_contracts.ARTIFACT_SCHEMA_VERSION
     )
-    return artifact_schema == expected_schema and _manifest_paths_are_present(
+    return common.serialization.is_schema_version(artifact_schema, expected_schema) and _manifest_paths_are_present(
         payload.get("outputs"),
         root=root,
     )
@@ -251,9 +251,10 @@ def _artifact_writer_active(root: Path) -> bool:
 
 def _artifact(root: Path, *, role: Literal["id", "additional_evaluation"], task: str) -> EvaluationArtifactInspection:
     """Inspect one canonical marker, staging lease, and payload inventory without arrays."""
-    stages = tuple(candidate for candidate in root.parent.glob(f".{root.name}.staging.*") if candidate.is_dir() and not candidate.is_symlink())
+    stage = artifact_contracts.artifact_stage_path(root)
+    staged = stage.is_dir() and not stage.is_symlink()
     if not root.exists():
-        if stages:
+        if staged:
             state: ArtifactState = "generating" if _artifact_writer_active(root) else "invalid"
             return EvaluationArtifactInspection(
                 role,
@@ -279,7 +280,7 @@ def _artifact(root: Path, *, role: Literal["id", "additional_evaluation"], task:
         )
     marker = artifact_contracts.artifact_provenance_path(root)
     if not marker.is_file() or marker.is_symlink():
-        state = "generating" if stages and _artifact_writer_active(root) else "invalid"
+        state = "generating" if staged and _artifact_writer_active(root) else "invalid"
         return EvaluationArtifactInspection(
             role,
             root,
@@ -305,11 +306,11 @@ def _artifact(root: Path, *, role: Literal["id", "additional_evaluation"], task:
             None,
             frozenset(),
         )
-    capabilities = {"aggregate"}
+    capabilities = {"aggregate", "timing"}
     if role == "id":
         capabilities.add("case_fields")
     if payload.get("artifact_kind") == "transient_sequence":
-        capabilities.update({"trajectory", "rollout", "timing", "case_fields"})
+        capabilities.update({"trajectory", "rollout", "case_fields"})
     return EvaluationArtifactInspection(
         role,
         root,
@@ -484,7 +485,6 @@ def _run_from_leaf(
     run_dir: Path,
     *,
     scoped_candidates: tuple[_ScopedArtifactCandidate, ...] = (),
-    storage_root: Path | str | None = None,
 ) -> EvaluationRunDiscovery | None:
     """Build one leaf record from its authoritative config and summary files; Optuna trials yield none."""
     config = _read_yaml(run_dir / common.paths.RUN_CONFIG_FILENAME)
@@ -516,20 +516,18 @@ def _run_from_leaf(
         raise ValueError(message)
     data_mapping = _optional_mapping(config.get("data"))
     additional: tuple[str, ...] = ()
-    assignments: tuple[dict[str, Any], ...] = ()
+    assignments: tuple[Mapping[str, Any], ...] = ()
+    additional_identity: str | None = None
     metadata_issues: tuple[str, ...] = ()
-    if task in {"steady_flow", "transient_drying"}:
+    if common.paths.resolve_split_indices_path(run_dir).is_file():  # A run that ended before its split was persisted has no additional role.
         try:
-            declared = datasets.packages.declared_evaluation_assignments(
-                task,
-                data_mapping["train_dataset"],
-                data_mapping.get("additional_evaluation_datasets", ()),
-                storage_root=storage_root,
-            )
-            assignments = tuple(dict(value) for value in declared)
-            additional = tuple(value["dataset_id"] for value in assignments)
-        except (OSError, ValueError, TypeError, KeyError) as error:
-            metadata_issues = (f"Dataset metadata unavailable: {type(error).__name__}: {error}",)
+            split = datasets.preprocessing.splits.read_saved_split(run_dir)
+        except (OSError, ValueError, TypeError) as error:
+            metadata_issues = (f"Saved split unavailable: {type(error).__name__}: {error}",)
+        else:
+            additional = tuple(part.dataset_id for part in split.additional_evaluation)
+            assignments = split.evaluation_assignments
+            additional_identity = split.additional_evaluation_name
     training_mapping = _optional_mapping(config.get("training"))
     model_mapping = _optional_mapping(config.get("model"))
     parameter_mapping = _optional_mapping(model_mapping.get("params"))
@@ -540,7 +538,6 @@ def _run_from_leaf(
     latest = run_dir / common.paths.RUN_LAST_CHECKPOINT_FILENAME
     best_digest = _checkpoint(best)
     id_root = common.paths.resolve_id_analysis_dir(run_dir)
-    additional_identity = datasets.contracts.identity.combined_dataset_id(additional) if additional else None
     additional_root = (
         common.paths.resolve_additional_evaluation_analysis_dir(run_dir, additional_identity)
         if additional_identity is not None
@@ -696,7 +693,7 @@ def _require_current_parent(record: EvaluationRunDiscovery, parent: Mapping[str,
         raise ValueError(message)
 
 
-def discover_evaluation_runs(experiments_root: Path | str, *, storage_root: Path | str | None = None) -> EvaluationRunCatalog:
+def discover_evaluation_runs(experiments_root: Path | str) -> EvaluationRunCatalog:
     """Discover all persisted Evaluation leaves below one experiments root read-only."""
     root = Path(experiments_root).expanduser().resolve(strict=False)
     if not root.exists():
@@ -710,11 +707,7 @@ def discover_evaluation_runs(experiments_root: Path | str, *, storage_root: Path
         if not (run_dir / common.paths.RUN_SUMMARY_FILENAME).is_file():
             continue
         try:
-            record = _run_from_leaf(
-                run_dir.resolve(),
-                scoped_candidates=scoped_candidates,
-                storage_root=storage_root,
-            )
+            record = _run_from_leaf(run_dir.resolve(), scoped_candidates=scoped_candidates)
             if record is None:
                 continue
             parent = parent_by_child.get(record.run_dir)

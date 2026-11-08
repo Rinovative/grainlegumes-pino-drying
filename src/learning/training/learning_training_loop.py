@@ -6,6 +6,7 @@ Responsibilities:
   - Consume the resolved semantic objective for scheduler and best-metric updates
   - Manage checkpoints, histories, and reproducibility state
   - Preserve matched-comparison sampler cursors and committed optimizer-group timing
+  - Count each run's committed optimizer groups and gradient-carrying predictions at the group commit boundary
   - Invoke optional epoch-end callbacks for local lifecycle observers
 
 Design principles:
@@ -32,10 +33,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
-from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader, Sampler
 
-from src import common, datasets
+from src import common, datasets, experiments
 from src.learning.metrics import learning_metrics as metric_impl
 
 from . import learning_training_checkpoint as checkpoints
@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 TensorBatch = dict[str, torch.Tensor]
 _TRANSIENT_VIEW_RANK = 5
+_SAMPLER_STATE_SCHEMA_VERSION = 1
+LAST_CHECKPOINT_INTERVAL_SECONDS = 30 * 60  # bounds training lost to a crash; a multi-GB full-state write per epoch costs more
 EpochEndCallback = Callable[[int, dict[str, float]], None]
 EpochStateCallback = Callable[[int, dict[str, float]], None]
 
@@ -109,11 +111,22 @@ class MatchedPermutationSampler(Sampler[list[int]]):
 
     def state_dict(self) -> dict[str, Any]:
         """Return the exact mid-epoch continuation contract."""
-        return {"schema_version": 1, "size": self.size, "epoch": self.epoch, "permutation": list(self.permutation), "cursor": self.cursor}
+        return {
+            "schema_version": _SAMPLER_STATE_SCHEMA_VERSION,
+            "size": self.size,
+            "epoch": self.epoch,
+            "permutation": list(self.permutation),
+            "cursor": self.cursor,
+        }
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Reject missing, duplicated, or out-of-range sample positions."""
-        if set(state) != {"schema_version", "size", "epoch", "permutation", "cursor"} or state["schema_version"] != 1 or state["size"] != self.size:
+        keys = {"schema_version", "size", "epoch", "permutation", "cursor"}
+        if (
+            set(state) != keys
+            or not common.serialization.is_schema_version(state["schema_version"], _SAMPLER_STATE_SCHEMA_VERSION)
+            or state["size"] != self.size
+        ):
             msg = "Matched sampler state schema or Dataset length differs."
             raise ValueError(msg)
         permutation = state["permutation"]
@@ -288,17 +301,6 @@ def _require_adapter_step(step: Any) -> tuple[torch.Tensor, dict[str, torch.Tens
     return loss, dict(components), cast("int", counts[0]), cast("int", counts[1]), cast("int", counts[2]), consumed
 
 
-def _next_adapter_step(steps: Iterator[Any], *, use_amp: bool, scaler: Any | None) -> Any | None:
-    """Compute the next adapter microbatch under the loop's autocast policy, or return None when exhausted."""
-    try:
-        if use_amp and scaler is not None:
-            with torch.autocast(device_type="cuda"):
-                return next(steps)
-        return next(steps)
-    except StopIteration:
-        return None
-
-
 def _cuda_timing_events(device: torch.device) -> tuple[Any, Any]:
     """Return a recorded start and an unrecorded end CUDA event, or no events on CPU."""
     if device.type != "cuda":
@@ -309,14 +311,6 @@ def _cuda_timing_events(device: torch.device) -> tuple[Any, Any]:
     return start, end
 
 
-def _backward_weighted(loss: torch.Tensor, weight: int, *, use_amp: bool, scaler: Any | None) -> None:
-    """Backpropagate one transition-weighted microbatch loss, scaled when AMP is active."""
-    if use_amp and scaler is not None:
-        scaler.scale(loss * weight).backward()
-    else:
-        (loss * weight).backward()
-
-
 def _train_adapter_one_epoch(  # noqa: C901, PLR0915
     model: nn.Module,
     train_loader: DataLoader,
@@ -325,8 +319,6 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
     device: torch.device,
     adapter: Any,
     *,
-    scaler: Any | None,
-    use_amp: bool,
     max_optimizer_steps: int | None = None,
     max_train_seconds: float | None = None,
 ) -> dict[str, float]:
@@ -344,7 +336,7 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
         raise ValueError(msg)
     model.train()
     sums: dict[str, float] = {}
-    samples = processed = forwarded = microbatches = groups = successful_steps = 0
+    samples = processed = forwarded = microbatches = groups = optimizer_steps = committed_predictions = 0
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     started = time.perf_counter()
@@ -361,28 +353,19 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
 
     def reached_operational_cap() -> bool:
         return bool(
-            (max_optimizer_steps is not None and successful_steps >= max_optimizer_steps)
+            (max_optimizer_steps is not None and optimizer_steps >= max_optimizer_steps)
             or (max_train_seconds is not None and adapter.budget_state()["train_seconds"] >= max_train_seconds)
         )
 
     def finish() -> None:
-        nonlocal groups, successful_steps, group, group_loader_wait
+        nonlocal groups, optimizer_steps, committed_predictions, group, group_loader_wait
         if not group:
             return
         total = sum(item[0] for item in group)
-        if use_amp and scaler is not None:
-            scaler.unscale_(optimizer)
         for parameter in model.parameters():
             if parameter.grad is not None:
                 parameter.grad.div_(total)
-        if use_amp and scaler is not None:
-            scale_before = float(scaler.get_scale())
-            scaler.step(optimizer)
-            scaler.update()
-            successful = float(scaler.get_scale()) >= scale_before
-        else:
-            optimizer.step()
-            successful = True
+        optimizer.step()
         optimizer.zero_grad()
         if device.type == "cuda":
             group[-1][3].record(torch.cuda.current_stream(device))
@@ -399,7 +382,6 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
         train_seconds = max(0.0, time.perf_counter() - group_started - group_loader_wait) if matched_sampler is not None else None
         adapter.record_optimizer_work(
             OptimizerWork(
-                successful=successful,
                 microbatches=len(group),
                 processed_target_transitions=total,
                 forward_transitions=sum(item[1] for item in group),
@@ -411,7 +393,8 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
             )
         )
         groups += 1
-        successful_steps += int(successful)
+        optimizer_steps += 1
+        committed_predictions += total
         group = []
         group_loader_wait = 0.0
 
@@ -440,11 +423,11 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
         budget_complete = False
         while True:
             start_event, end_event = _cuda_timing_events(device)
-            step = _next_adapter_step(steps, use_amp=use_amp, scaler=scaler)
+            step = next(steps, None)
             if step is None:
                 break
             loss, components, count, targets, forward, consumed = _require_adapter_step(step)
-            _backward_weighted(loss, targets, use_amp=use_amp, scaler=scaler)
+            (loss * targets).backward()
             if end_event is not None and len(group) + 1 < accumulation:
                 end_event.record(torch.cuda.current_stream(device))
             for name, value in components.items():
@@ -483,7 +466,9 @@ def _train_adapter_one_epoch(  # noqa: C901, PLR0915
         "train/loss_data": averaged.get("data", averaged["total"]),
         "system/train_duration_seconds": duration,
         "system/train_samples_per_second": samples / duration,
-        "optimizer_steps": float(successful_steps),
+        "optimizer_steps": float(optimizer_steps),
+        "committed_optimizer_groups": float(groups),
+        "gradient_predictions": float(committed_predictions),
         "transient/train/samples": float(samples),
         "transient/train/processed_target_transitions": float(processed),
         "transient/train/forward_transitions": float(forwarded),
@@ -503,8 +488,6 @@ def train_one_epoch(
     loss_fn: nn.Module,
     device: torch.device,
     data_processor: Any | None = None,
-    scaler: Any | None = None,
-    use_amp: bool = False,
     adapter: Any | None = None,
     max_optimizer_steps: int | None = None,
     max_train_seconds: float | None = None,
@@ -528,17 +511,13 @@ def train_one_epoch(
     train_loader : DataLoader
         Loader providing mapping batches with ``x`` and ``y`` tensors.
     optimizer : Optimizer
-        Optimizer stepped once per finite batch, subject to AMP overflow skips.
+        Optimizer stepped once per finite batch.
     loss_fn : torch.nn.Module
         Conventional loss or semantic composition exposing named components.
     device : torch.device
         Concrete device receiving each prepared batch.
     data_processor : Any | None, optional
         Processor switched to training mode before preprocessing each batch.
-    scaler : Any | None, optional
-        CUDA gradient scaler required when ``use_amp`` is true.
-    use_amp : bool, optional
-        Whether to execute CUDA autocast and scaled optimization.
 
     adapter : Any | None, optional
         Task-owned batch and continuation-state adapter; mutually exclusive with data_processor where accepted.
@@ -550,25 +529,21 @@ def train_one_epoch(
     Returns
     -------
     dict[str, float]
-        Stable per-epoch training telemetry plus an internal optimizer-step
-        count consumed by the checkpoint lifecycle.
+        Stable per-epoch training telemetry plus internal optimizer-step,
+        committed-group and gradient-prediction counts consumed by the
+        checkpoint lifecycle. A steady sample is one gradient prediction, a
+        transient target transition is one.
 
     Raises
     ------
     ValueError
-        If AMP is requested without CUDA or a scaler.
+        If an adapter and a data processor are both supplied.
     FloatingPointError
         If any batch loss is non-finite before optimizer mutation.
     RuntimeError
         If the loader is empty or physics component telemetry is incomplete.
 
     """
-    if use_amp and device.type != "cuda":
-        msg = "Mixed-precision training requires a concrete CUDA device. CPU autocast is unsupported."
-        raise ValueError(msg)
-    if use_amp and scaler is None:
-        msg = "Mixed-precision training requires a CUDA GradScaler."
-        raise ValueError(msg)
     if adapter is not None:
         if data_processor is not None:
             msg_0 = "Adapter training and data_processor are mutually exclusive."
@@ -580,8 +555,6 @@ def train_one_epoch(
             loss_fn,
             device,
             adapter,
-            scaler=scaler,
-            use_amp=use_amp,
             max_optimizer_steps=max_optimizer_steps,
             max_train_seconds=max_train_seconds,
         )
@@ -589,7 +562,7 @@ def train_one_epoch(
     model.train()
     component_sums: dict[str, float] = {}
     sample_count = 0
-    optimizer_steps = 0
+    optimizer_steps = committed_groups = committed_predictions = 0
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -599,23 +572,14 @@ def train_one_epoch(
         batch_samples = _training_batch_size(batch)
         optimizer.zero_grad()
 
-        if use_amp and scaler is not None:
-            with torch.autocast(device_type=device.type):
-                pred = model(batch["x"])
-                loss = _compute_loss(loss_fn, pred, batch)
-            _require_finite_training_loss(loss)
-            scale_before = float(scaler.get_scale())
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer_steps += int(float(scaler.get_scale()) >= scale_before)
-        else:
-            pred = model(batch["x"])
-            loss = _compute_loss(loss_fn, pred, batch)
-            _require_finite_training_loss(loss)
-            loss.backward()
-            optimizer.step()
-            optimizer_steps += 1
+        pred = model(batch["x"])
+        loss = _compute_loss(loss_fn, pred, batch)
+        _require_finite_training_loss(loss)
+        loss.backward()
+        optimizer.step()
+        optimizer_steps += 1
+        committed_groups += 1
+        committed_predictions += batch_samples
 
         raw_components = getattr(loss_fn, "last_components", {})
         components = (
@@ -649,6 +613,8 @@ def train_one_epoch(
         "system/train_duration_seconds": train_duration,
         "system/train_samples_per_second": train_samples_per_second,
         "optimizer_steps": float(optimizer_steps),
+        "committed_optimizer_groups": float(committed_groups),
+        "gradient_predictions": float(committed_predictions),
     }
     if bool(getattr(loss_fn, "physics_enabled", False)):
         required = {"momentum", "continuity", "boundary"}
@@ -1018,7 +984,6 @@ def evaluate_selected_checkpoint(
     checkpoint_identity: Mapping[str, Any],
     best_checkpoint_path: Path | str,
     scheduler_expected: bool,
-    amp_expected: bool,
     max_physics_cases: int,
     adapter: Any | None = None,
 ) -> dict[str, Any]:
@@ -1029,7 +994,6 @@ def evaluate_selected_checkpoint(
         expected_role="best",
         payload_kind=checkpoints.best_payload_kind(config),
         scheduler_expected=scheduler_expected,
-        amp_expected=amp_expected,
         require_best=True,
         adapter_expected=adapter is not None,
     )
@@ -1113,19 +1077,35 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     data_processor: Any | None = None,
     scheduler: ReduceLROnPlateau | None = None,
     save_dir: Path | str | None = None,
-    use_amp: bool = False,
     resume_from: Path | str | None = None,
     epoch_end_callback: EpochEndCallback | None = None,
     epoch_state_callback: EpochStateCallback | None = None,
     checkpoint_identity: Mapping[str, Any] | None = None,
-    scaler: Any | None = None,
     adapter: Any | None = None,
     max_steps: int | None = None,
     max_train_seconds: float | None = None,
     operational_timing: dict[str, Any] | None = None,
+    training_work: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """
-    Train through exact completed-epoch checkpoints.
+    Train through exact completed-epoch checkpoints with a bounded ``last`` cadence.
+
+    ``last_checkpoint.pt`` is published at the end of a completed epoch that (1)
+    brought a new best, (2) ends the loop, (3) finds no ``last`` in the run
+    directory yet (the first epoch of a run or stage), or (4) comes at least
+    ``LAST_CHECKPOINT_INTERVAL_SECONDS`` of monotonic time after this invocation's
+    previous ``last`` (or its start). A new best's ``best_checkpoint.pt`` is
+    written together with that ``last``: both files are written and flushed to
+    temporary siblings first, then renamed back to back (best, then last), so a
+    crash or failure before the renames keeps the previous consistent pair; only
+    a crash between the two renames leaves best newer than last, which run
+    admission refuses to resume and completed finalization rejects. Every normal
+    return therefore has a ``last`` for its terminal epoch.
+    A crash loses the epochs since the newest ``last`` (one interval plus the
+    epoch and write in progress): resume continues from it and trains them again.
+    An Optuna trial (its config records ``run.layout.trial``) never resumes and so
+    never writes a ``last``: a new best is published alone by a single rename, and
+    the result reports no ``last_checkpoint_path`` and no ``next_epoch``.
 
     Parameters
     ----------
@@ -1144,22 +1124,21 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         Configured objective scheduler.
     save_dir : Path | str | None, optional
         Canonical run directory. Required for lifecycle execution.
-    use_amp : bool, optional
-        Request CUDA automatic mixed precision.
     resume_from : Path | str | None, optional
         Exact ``last_checkpoint.pt`` continuation source.
     epoch_end_callback : Callable | None, optional
-        Callback invoked after every completed epoch is safely checkpointed.
-        ID, OOD, and physics values are present only when their shared predicate
-        is due under each phase's independently resolved interval.
+        Callback invoked after every completed epoch once its evidence is durable:
+        a new best is published, adapter history is written, and ``last`` is
+        published when a new best, the first epoch, the loop's end, or the interval calls for it
+        (``checkpoint/last_published``). ID, OOD, and physics values are present
+        only when their shared predicate is due under each phase's independently
+        resolved interval.
     epoch_state_callback : Callable | None, optional
         Adapter-only callback invoked after all completed-epoch evidence is known
-        and before ``last_checkpoint.pt`` publication. It owns durable local
-        history that may safely be truncated to the preceding checkpoint on resume.
+        and before any ``last_checkpoint.pt`` publication of that epoch. It owns
+        durable local history that resume truncates to the restored checkpoint.
     checkpoint_identity : Mapping[str, Any] | None, optional
         Immutable task/config/dataset/split/objective identity.
-    scaler : Any | None, optional
-        Injected scaler for focused tests. Normally constructed internally.
 
     adapter : Any | None, optional
         Task-owned batch and continuation-state adapter; mutually exclusive with data_processor where accepted.
@@ -1170,11 +1149,15 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     operational_timing : dict[str, Any] | None, optional
         Attempt-owned measurement sink retained even if checkpoint publication fails.
+    training_work : dict[str, int] | None, optional
+        Attempt-owned sink of the run's cumulative ``training_work`` counts, current at
+        every epoch boundary, so the caller can publish them when the run ends with an exception.
 
     Returns
     -------
     dict[str, Any]
-        Completed progress, best/last paths, finite objective, and history.
+        Completed progress, best/last paths, finite objective, history, and the
+        run's cumulative ``training_work`` counts.
 
     Raises
     ------
@@ -1188,7 +1171,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         checkpoint_capture_and_publication_seconds=0.0,
         checkpoint_capture_and_publication_attempts=0,
         epoch_duration_scope=(
-            "epoch_start_through_training_evaluation_best_checkpoint_and_physics; excludes_epoch_state_last_checkpoint_and_observers"
+            "epoch_start_through_training_evaluation_best_capture_and_physics; excludes_epoch_state_checkpoint_writes_and_observers"
         ),
     )
     if save_dir is None:
@@ -1266,24 +1249,16 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         msg = f"Configured evaluation objective {objective_id!r} is absent from evaluation metrics."
         raise KeyError(msg)
 
-    if type(use_amp) is not bool:
-        msg = f"use_amp must be boolean, got {use_amp!r}."
-        raise TypeError(msg)
-    if use_amp and device.type != "cuda":
-        msg = "training.mixed_precision=true requires a resolved CUDA device. CPU autocast is unsupported."
-        raise ValueError(msg)
-    amp_enabled = use_amp
-    if amp_enabled and scaler is None:
-        scaler = GradScaler("cuda")
-    if not amp_enabled and scaler is not None:
-        msg = "A scaler was supplied while CUDA AMP is inactive."
-        raise ValueError(msg)
-
     best_metric: float | None = None
     best_epoch: int | None = None
     objective_history: list[dict[str, Any]] = []
     terminal_epoch_metrics: dict[str, float] = {}
     global_step = 0
+    # Committed optimizer groups and the predictions that entered the loss
+    # with a gradient; a fresh run or stage starts at zero, a resume continues its last checkpoint's counts.
+    training_work = {} if training_work is None else training_work
+    training_work.clear()
+    training_work.update(dict.fromkeys(sorted(checkpoints.TRAINING_WORK_KEYS), 0))
     start_epoch_index = 0
     resumed_partial = False
     finalize_only = False
@@ -1296,7 +1271,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             expected_role="last",
             payload_kind="full",
             scheduler_expected=scheduler is not None,
-            amp_expected=amp_enabled,
             require_best=False,
             adapter_expected=adapter is not None,
         )
@@ -1306,8 +1280,6 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=scaler,
-            amp_enabled=amp_enabled,
             loss=train_loss,
             train_loader=train_loader,
             adapter=adapter,
@@ -1315,6 +1287,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         )
         start_epoch_index = int(restored["next_epoch"]) - 1
         global_step = int(restored["global_step"])
+        training_work.update(restored["training_work"])
         best_metric = restored["best_metric"]
         best_epoch = restored["best_epoch"]
         objective_history = list(restored["objective_history"])
@@ -1342,7 +1315,11 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     best_path = common.paths.resolve_best_checkpoint_file(run_dir)
     last_path = common.paths.resolve_last_checkpoint_file(run_dir)
+    # Admission gives the run one writer, so staged files of an earlier crashed publication are ours to drop.
+    checkpoints.discard_staged_checkpoints(best_path, last_path)
+    trial_run = experiments.run.is_trial_config(config)
     session_started = time.perf_counter()
+    last_published_at = time.monotonic()
 
     # The terminal epoch of a finalize-only resume is the one its last checkpoint recorded.
     completed_epoch = int(last_payload["completed_epoch"]) if finalize_only else start_epoch_index
@@ -1373,18 +1350,19 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                 train_loss,
                 device,
                 data_processor,
-                scaler,
-                amp_enabled,
                 adapter=adapter,
                 max_optimizer_steps=(max_steps - global_step if max_steps is not None else None),
                 max_train_seconds=max_train_seconds,
             )
         optimizer_steps = int(train_metrics.pop("optimizer_steps"))
         global_step += optimizer_steps
+        training_work["optimizer_steps"] += int(train_metrics.pop("committed_optimizer_groups"))
+        training_work["gradient_predictions"] += int(train_metrics.pop("gradient_predictions"))
 
         evaluated: dict[str, float] = {}
         id_metrics: dict[str, float] = {}
         current_metric: float | None = None
+        best_payload: dict[str, Any] | None = None
         operational_partial = bool(
             isinstance(matched_sampler, MatchedPermutationSampler)
             and matched_sampler.cursor < matched_sampler.size
@@ -1484,18 +1462,15 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                         model=model,
                         optimizer=optimizer,
                         scheduler=scheduler,
-                        scaler=scaler,
-                        amp_enabled=amp_enabled,
                         loss=train_loss,
                         best_metric=best_metric,
                         best_epoch=best_epoch,
                         objective_history=objective_history,
                         train_loader=train_loader,
                         runtime_device=device,
+                        training_work=training_work,
                         adapter=adapter,
                     )
-                    with _training_phase("best_checkpoint", completed_epoch):
-                        checkpoints.save_checkpoint(best_payload, best_path)
 
         if should_evaluate_diagnostic and diagnostic_loader is not None:
             _synchronize_device(device)
@@ -1557,43 +1532,64 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             with _training_phase("epoch_state", completed_epoch):
                 epoch_state_callback(completed_epoch, copy.deepcopy(terminal_epoch_metrics))
 
-        with _checkpoint_publication_timer(timing, device):
-            last_payload = checkpoints.make_checkpoint(
-                role="last",
-                payload_kind="full",
-                identity=identity,
-                completed_epoch=completed_epoch,
-                global_step=global_step,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                amp_enabled=amp_enabled,
-                loss=train_loss,
-                best_metric=best_metric,
-                best_epoch=best_epoch,
-                objective_history=objective_history,
-                train_loader=train_loader,
-                runtime_device=device,
-                adapter=adapter,
-                batch_progress=(
-                    {
-                        "epoch": completed_epoch,
-                        "cursor": matched_sampler.cursor,
-                        "size": matched_sampler.size,
-                        "complete": matched_sampler.cursor == matched_sampler.size,
-                    }
-                    if isinstance(matched_sampler, MatchedPermutationSampler)
-                    else None
-                ),
-            )
-            with _training_phase("last_checkpoint", completed_epoch):
-                checkpoints.save_checkpoint(last_payload, last_path)
-        terminal_epoch_metrics["checkpoint/last_published"] = 1.0
+        # One predicate both exits the loop and forces the terminal last, so the two cannot drift.
+        ends_loop = (
+            completed_epoch == n_epochs
+            or operational_partial
+            or (adapter is not None and (bool(adapter.should_stop()) or bool(train_metrics.get("transient/train/operational_cap_reached"))))
+        )
+        # A new best is published only together with its last, so a published best is never newer than the
+        # newest last; the first epoch of a run or stage gets one, so an early crash leaves a resumable run.
+        publish_last = not trial_run and (
+            ends_loop
+            or best_payload is not None
+            or not last_path.exists()
+            or time.monotonic() - last_published_at >= LAST_CHECKPOINT_INTERVAL_SECONDS
+        )
+        if trial_run and best_payload is not None:
+            # A trial never resumes: its new best is the only file, published by one rename.
+            with _checkpoint_publication_timer(timing, device), _training_phase("best_checkpoint", completed_epoch):
+                checkpoints.save_checkpoints((best_payload, best_path))
+        if publish_last:
+            with _checkpoint_publication_timer(timing, device):
+                last_payload = checkpoints.make_checkpoint(
+                    role="last",
+                    payload_kind="full",
+                    identity=identity,
+                    completed_epoch=completed_epoch,
+                    global_step=global_step,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    loss=train_loss,
+                    best_metric=best_metric,
+                    best_epoch=best_epoch,
+                    objective_history=objective_history,
+                    train_loader=train_loader,
+                    runtime_device=device,
+                    training_work=training_work,
+                    adapter=adapter,
+                    batch_progress=(
+                        {
+                            "epoch": completed_epoch,
+                            "cursor": matched_sampler.cursor,
+                            "size": matched_sampler.size,
+                            "complete": matched_sampler.cursor == matched_sampler.size,
+                        }
+                        if isinstance(matched_sampler, MatchedPermutationSampler)
+                        else None
+                    ),
+                )
+                with _training_phase("last_checkpoint", completed_epoch):
+                    # Both files are staged before either rename, so a failure keeps the previous pair.
+                    best_publication = ((best_payload, best_path),) if best_payload is not None else ()
+                    checkpoints.save_checkpoints(*best_publication, (last_payload, last_path))
+            last_published_at = time.monotonic()
+        terminal_epoch_metrics["checkpoint/last_published"] = float(publish_last)
         if epoch_end_callback is not None and not operational_partial:
             with _training_phase("epoch_observers", completed_epoch):
                 epoch_end_callback(completed_epoch, terminal_epoch_metrics)
-        if adapter is not None and (adapter.should_stop() or bool(train_metrics.get("transient/train/operational_cap_reached"))):
+        if ends_loop:
             break
 
     terminal_epoch = completed_epoch
@@ -1625,6 +1621,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             "last_checkpoint_path": str(last_path),
             "status": "budget_unmet",
             "operational_timing": copy.deepcopy(timing),
+            "training_work": dict(training_work),
             "train_seconds": budget_state.get("train_seconds"),
             "target_train_seconds": budget_state.get("planned_train_seconds"),
         }
@@ -1634,30 +1631,29 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         expected_role="best",
         payload_kind=best_kind,
         scheduler_expected=scheduler is not None,
-        amp_expected=amp_enabled,
         require_best=True,
         adapter_expected=adapter is not None,
     )
-    last_checkpoint = checkpoints.load_checkpoint(
-        last_path,
-        expected_identity=identity,
-        expected_role="last",
-        payload_kind="full",
-        scheduler_expected=scheduler is not None,
-        amp_expected=amp_enabled,
-        require_best=True,
-        adapter_expected=adapter is not None,
-    )
-    if last_checkpoint["completed_epoch"] != terminal_epoch:
-        msg = "Last checkpoint does not represent the configured terminal epoch."
-        raise RuntimeError(msg)
-    if best_checkpoint["best_metric"] != last_checkpoint["best_metric"] or best_checkpoint["best_epoch"] != last_checkpoint["best_epoch"]:
-        msg = "Best and last checkpoints disagree about the selected objective state."
-        raise RuntimeError(msg)
+    if not trial_run:
+        last_checkpoint = checkpoints.load_checkpoint(
+            last_path,
+            expected_identity=identity,
+            expected_role="last",
+            payload_kind="full",
+            scheduler_expected=scheduler is not None,
+            require_best=True,
+            adapter_expected=adapter is not None,
+        )
+        if last_checkpoint["completed_epoch"] != terminal_epoch:
+            msg = "Last checkpoint does not represent the configured terminal epoch."
+            raise RuntimeError(msg)
+        if best_checkpoint["best_metric"] != last_checkpoint["best_metric"] or best_checkpoint["best_epoch"] != last_checkpoint["best_epoch"]:
+            msg = "Best and last checkpoints disagree about the selected objective state."
+            raise RuntimeError(msg)
 
     return {
         "completed_epoch": terminal_epoch,
-        "next_epoch": last_payload["next_epoch"],
+        "next_epoch": None if trial_run else last_payload["next_epoch"],
         "global_step": global_step,
         "best_epoch": best_epoch,
         "best_metric": best_metric,
@@ -1667,9 +1663,10 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         "terminal_metrics": {key: value for key, value in terminal_epoch_metrics.items() if key.startswith("train/")},
         "checkpoint_path": str(best_path),
         "best_checkpoint_path": str(best_path),
-        "last_checkpoint_path": str(last_path),
+        "last_checkpoint_path": None if trial_run else str(last_path),
         "status": "completed",
         "operational_timing": copy.deepcopy(timing),
+        "training_work": dict(training_work),
         **(
             {"train_seconds": adapter.budget_state()["train_seconds"], "target_train_seconds": adapter.budget_state()["planned_train_seconds"]}
             if matched_protocol and adapter is not None

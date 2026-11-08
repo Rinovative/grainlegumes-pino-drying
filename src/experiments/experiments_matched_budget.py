@@ -86,7 +86,7 @@ def build_b_receipt(
         "objective": b_config["evaluation"]["objective"],
         "initialization": protocol["initialization"],
         "train_seconds": train_seconds,
-        "optimizer_steps": controller["successful_optimizer_steps"],
+        "optimizer_steps": controller["post_handoff_optimizer_steps"],
         "optimizer_groups": controller["post_handoff_optimizer_steps"],
         "terminal_epoch": b_summary["terminal_epoch"],
         "terminal_batch_cursor": controller.get("batch_cursor"),
@@ -99,7 +99,7 @@ def build_b_receipt(
 
 def validate_b_receipt(value: object) -> dict[str, Any]:
     """Validate an immutable receipt without opening training artifacts."""
-    if not isinstance(value, dict) or value.get("schema_version") != _SCHEMA_VERSION:
+    if not isinstance(value, dict) or not common.serialization.is_schema_version(value.get("schema_version"), _SCHEMA_VERSION):
         msg = "B train budget receipt schema is unsupported."
         raise ValueError(msg)
     if value.get("schema_kind") != _SCHEMA_KIND or value.get("protocol") != _PROTOCOL_MATCHED or value.get("clock_kind") != _CLOCK_SECONDS:

@@ -2,13 +2,13 @@
 
 Responsibilities:
   - Infer uniform-grid spacing from explicit coordinate tensors
-  - Compute physical-space and FFT-based gradients and divergences
-  - Apply explicit spectral extension, spatial-axis, and crop semantics
+  - Compute gradients and divergences through neuralop FiniteDiff (physical) and FourierDiff (spectral)
+  - Fix spatial-axis order, Fourier-continuation parameters, and interior-crop semantics
 
 Design principles:
   - Grid spacing and spatial axes are explicit at every numerical boundary
   - Cartesian-grid admission fails closed before an equation is evaluated
-  - Caller shape, dtype, and device are restored after internal FFT work
+  - Library axis order is mapped to the project's (y, x) convention at each library call
 
 This module does NOT:
   - Bind task field names, transform normalized data, or select loss weights
@@ -18,24 +18,23 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from functools import cache
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
 
 from . import domain_physics_contracts as physics_contracts
 
-if TYPE_CHECKING:
-    from neuralop.layers.fourier_continuation import FCLegendre
-
 SpatialAxes = tuple[int, int]
 _MIN_SPATIAL_POINTS = 2
 # Fourier-continuation contract: Legendre fit through 5 boundary points per side
-# and 50 smooth continuation points per axis (neuraloperator defaults).
+# and 50 smooth continuation points per axis, passed explicitly to FourierDiff.
 FOURIER_CONTINUATION_MATCHING_POINTS = 5
 FOURIER_CONTINUATION_ADDITIONAL_POINTS = 50
+# FiniteDiff one-sided edge stencils read four consecutive points.
+_FINITE_DIFFERENCE_MIN_POINTS = 4
 _SPATIAL_AXIS_COUNT = 2
 _UNIFORM_TOLERANCE = 1e-5
 _RECTILINEAR_EPSILON_FACTOR = 32.0
@@ -98,13 +97,12 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
     Validate a differentiable real field and return normalized spatial axes.
 
     The function does not copy data. Each declared spatial dimension must have
-    at least two points, the minimum of the physical stencil; Fourier
-    continuation checks its larger boundary-fit minimum separately.
+    at least two points; operators check their larger stencil minimum separately.
 
     Raises
     ------
     TypeError
-        If ``field`` is not a floating-point ``torch.Tensor``.
+        If ``field`` is not a float32 or float64 ``torch.Tensor``.
     ValueError
         If the axes are invalid or either spatial dimension is shorter than two.
 
@@ -112,8 +110,8 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
     if not isinstance(field, Tensor):
         msg = f"Derivative fields must be torch.Tensor instances, got {type(field).__name__}."
         raise TypeError(msg)
-    if not field.is_floating_point():
-        msg = f"Derivative fields must use a floating dtype, got {field.dtype}."
+    if field.dtype not in {torch.float32, torch.float64}:
+        msg = f"Derivative fields must be float32 or float64, got {field.dtype}."
         raise TypeError(msg)
     normalized = normalize_spatial_axes(field.ndim, axes)
     if any(field.shape[axis] < _MIN_SPATIAL_POINTS for axis in normalized):
@@ -122,9 +120,12 @@ def _validate_field(field: Tensor, axes: SpatialAxes) -> SpatialAxes:
     return normalized
 
 
-def _spacing_tensor(spacing: float | Tensor, *, reference: Tensor, label: str) -> Tensor:
+def _spacing_float(spacing: float | Tensor, *, reference: Tensor, label: str) -> float:
     """
-    Convert one physical spacing to a scalar on the reference dtype and device.
+    Return one validated physical spacing as the host scalar the library operators take.
+
+    Conversion follows the reference dtype and device. Transferring the scalar
+    to the host does not move or copy the differentiated field.
 
     Raises
     ------
@@ -137,21 +138,11 @@ def _spacing_tensor(spacing: float | Tensor, *, reference: Tensor, label: str) -
     if value.numel() != 1:
         msg = f"{label} must be scalar, got shape {tuple(value.shape)}."
         raise ValueError(msg)
-    if not bool(torch.isfinite(value).item()) or not bool((value > 0).item()):
-        msg = f"{label} must be finite and positive, got {float(value.detach().cpu().item())}."
+    host_value = float(value.detach().cpu().item())
+    if not math.isfinite(host_value) or host_value <= 0.0:
+        msg = f"{label} must be finite and positive, got {host_value}."
         raise ValueError(msg)
-    return value.reshape(())
-
-
-def _spacing_float(spacing: float | Tensor, *, reference: Tensor, label: str) -> float:
-    """
-    Return validated physical spacing as the host scalar required by FFT grids.
-
-    Validation and dtype conversion first follow ``reference``. Transferring the
-    scalar to the host does not move or copy the differentiated field.
-    """
-    value = _spacing_tensor(spacing, reference=reference, label=label)
-    return float(value.detach().cpu().item())
+    return host_value
 
 
 def _divergence(
@@ -341,7 +332,7 @@ def crop_interior(field: Tensor, crop: int, *, axes: SpatialAxes = (-2, -1)) -> 
 @dataclass(frozen=True, slots=True)
 class PhysicalDerivatives:
     """
-    Compute finite-difference physical-space derivatives with ``torch.gradient``.
+    Compute finite-difference physical-space derivatives with ``neuralop.FiniteDiff``.
 
     The frozen operator preserves input shape, dtype, and device, uses explicit
     x/y spacing, and supports no boundary extension. Grid admission and interior
@@ -368,8 +359,8 @@ class PhysicalDerivatives:
         Parameters
         ----------
         field : torch.Tensor
-            Real floating scalar field with at least two points on each declared
-            spatial axis and arbitrary leading dimensions.
+            Real float32 or float64 scalar field with at least four points on
+            each declared spatial axis and arbitrary leading dimensions.
         spacing_x, spacing_y : float or torch.Tensor
             Finite positive scalar physical spacings.
 
@@ -382,23 +373,34 @@ class PhysicalDerivatives:
         Raises
         ------
         TypeError
-            If ``field`` is not a real floating tensor.
+            If ``field`` is not a float32 or float64 tensor.
         ValueError
             If axes, spatial lengths, or either spacing violate the operator
             contract.
 
         Notes
         -----
-        ``torch.gradient`` supplies centered interior differences and its
-        supported one-sided edge stencil. No boundary cells are cropped.
+        ``FiniteDiff`` supplies second-order centered interior differences and
+        third-order one-sided edge stencils. No boundary cells are cropped.
 
         """
-        y_axis, x_axis = _validate_field(field, self.axes)
-        dx = _spacing_tensor(spacing_x, reference=field, label="spacing_x")
-        dy = _spacing_tensor(spacing_y, reference=field, label="spacing_y")
-        derivative_x = torch.gradient(field, dim=x_axis)[0] / dx
-        derivative_y = torch.gradient(field, dim=y_axis)[0] / dy
-        return derivative_x, derivative_y
+        # neuraloperator is imported lazily so dependency-light domain consumers,
+        # such as Generation contracts, do not load the ML stack on import.
+        from neuralop.losses.differentiation import FiniteDiff  # noqa: PLC0415
+
+        normalized_axes = _validate_field(field, self.axes)
+        dx = _spacing_float(spacing_x, reference=field, label="spacing_x")
+        dy = _spacing_float(spacing_y, reference=field, label="spacing_y")
+        moved = field.movedim(normalized_axes, (-2, -1))
+        if min(moved.shape[-2:]) < _FINITE_DIFFERENCE_MIN_POINTS:
+            msg = f"Finite differences require at least {_FINITE_DIFFERENCE_MIN_POINTS} points per spatial axis, got shape {tuple(field.shape)}."
+            raise ValueError(msg)
+        # FiniteDiff differentiates the first spatial axis with ``dx`` (our y).
+        operator = FiniteDiff(dim=2, h=(dy, dx), periodic_in_x=False, periodic_in_y=False)  # pyright: ignore[reportArgumentType] -- neuralop is unannotated; h accepts one spacing per axis
+        return (
+            operator.dy(moved).movedim((-2, -1), normalized_axes),
+            operator.dx(moved).movedim((-2, -1), normalized_axes),
+        )
 
     def divergence(
         self,
@@ -414,72 +416,21 @@ class PhysicalDerivatives:
 @dataclass(frozen=True, slots=True)
 class SpectralDerivatives:
     """
-    Compute FFT derivatives on periodic or Fourier-continued fields.
+    Compute FFT derivatives on Fourier-continued fields with ``neuralop.FourierDiff``.
 
     Frequencies are scaled by physical spacing. Fourier continuation appends a
     smooth Legendre-fitted continuation to both spatial axes, so non-periodic
     fields become smooth periodic signals without jumps or slope kinks, and
-    crops back to the original domain. Stable internal precision is cast back to
-    the caller dtype/device.
+    crops back to the original domain. The result keeps the caller dtype/device.
 
     Attributes
     ----------
-    extension : Literal["none", "fourier_continuation"]
-        ``"none"`` assumes periodic input. ``"fourier_continuation"`` smoothly
-        extends both axes before the FFT.
     axes : tuple[int, int]
         Declared ``(y, x)`` axes, normalized and validated per operation.
 
-    Raises
-    ------
-    ValueError
-        If ``extension`` is not ``"none"`` or ``"fourier_continuation"``.
-
     """
 
-    extension: physics_contracts.SpectralExtension = "fourier_continuation"
     axes: SpatialAxes = (-2, -1)
-
-    def __post_init__(self) -> None:
-        """Validate the spectral extension identifier."""
-        if self.extension not in {"none", "fourier_continuation"}:
-            msg = f"Unknown spectral extension {self.extension!r}. Expected 'none' or 'fourier_continuation'."
-            raise ValueError(msg)
-
-    @staticmethod
-    def _gradient_last_axes(field: Tensor, dx: float, dy: float) -> tuple[Tensor, Tensor]:
-        """
-        Differentiate trailing periodic y/x axes with physically scaled FFT modes.
-
-        Parameters
-        ----------
-        field : torch.Tensor
-            Validated real field whose last two axes are y and x.
-        dx, dy : float
-            Positive physical spacings used to build angular wavenumbers.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor]
-            Periodic ``(d/dx, d/dy)`` fields with the original shape and dtype.
-
-        Notes
-        -----
-        Half and bfloat inputs use float32 FFT work arrays. Multiplication by
-        ``1j*k`` occurs in frequency space and ``irfft2`` restores real fields.
-
-        """
-        height, width = field.shape[-2:]
-        work_dtype = torch.float32 if field.dtype in {torch.float16, torch.bfloat16} else field.dtype
-        work = field.to(work_dtype)
-        frequencies_x = 2.0 * torch.pi * torch.fft.rfftfreq(width, d=dx, device=field.device, dtype=work_dtype)
-        frequencies_y = 2.0 * torch.pi * torch.fft.fftfreq(height, d=dy, device=field.device, dtype=work_dtype)
-        transformed = torch.fft.rfft2(work, dim=(-2, -1))
-        shape_x = (1,) * (field.ndim - 1) + (frequencies_x.numel(),)
-        shape_y = (1,) * (field.ndim - 2) + (frequencies_y.numel(), 1)
-        derivative_x = torch.fft.irfft2(1j * frequencies_x.reshape(shape_x) * transformed, s=(height, width))
-        derivative_y = torch.fft.irfft2(1j * frequencies_y.reshape(shape_y) * transformed, s=(height, width))
-        return derivative_x.to(field.dtype), derivative_y.to(field.dtype)
 
     def gradient(
         self,
@@ -493,7 +444,7 @@ class SpectralDerivatives:
         Parameters
         ----------
         field : torch.Tensor
-            Real floating scalar field with arbitrary leading dimensions.
+            Real float32 or float64 scalar field with arbitrary leading dimensions.
         spacing_x, spacing_y : float or torch.Tensor
             Finite positive scalar physical spacings.
 
@@ -505,7 +456,7 @@ class SpectralDerivatives:
         Raises
         ------
         TypeError
-            If ``field`` is not a real floating tensor.
+            If ``field`` is not a float32 or float64 tensor.
         ValueError
             If axes, spatial lengths, or either spacing violate the spectral
             operator contract.
@@ -513,31 +464,38 @@ class SpectralDerivatives:
         Notes
         -----
         Arbitrary spatial axes move to trailing y/x positions internally and are
-        restored on return. ``extension="none"`` assumes periodic data.
-        ``"fourier_continuation"`` requires at least
-        ``2 * FOURIER_CONTINUATION_MATCHING_POINTS`` points per axis, fits the
-        boundary samples of each axis, appends the smooth continuation, and
-        crops the derivative back to the original domain. Half and bfloat inputs
-        are continued in float32.
+        restored on return. Fourier continuation requires at least
+        ``2 * FOURIER_CONTINUATION_MATCHING_POINTS`` points per axis and fits the
+        boundary samples of each axis. ``FourierDiff`` spaces its grid by
+        ``L / n``, so the domain length passed is ``n * spacing``. It builds its
+        wavenumbers in torch's default dtype, so float64 fields carry float32
+        wavenumber rounding (relative about 1e-7, far below the discretization
+        error of the continuation).
 
         """
+        # neuraloperator is imported lazily so dependency-light domain consumers,
+        # such as Generation contracts, do not load the ML stack on import.
+        from neuralop.losses.differentiation import FourierDiff  # noqa: PLC0415
+
         normalized_axes = _validate_field(field, self.axes)
         dx = _spacing_float(spacing_x, reference=field, label="spacing_x")
         dy = _spacing_float(spacing_y, reference=field, label="spacing_y")
         moved = field.movedim(normalized_axes, (-2, -1))
-        if self.extension == "none":
-            derivative_x, derivative_y = self._gradient_last_axes(moved, dx, dy)
-        else:
-            minimum = 2 * FOURIER_CONTINUATION_MATCHING_POINTS
-            if min(moved.shape[-2:]) < minimum:
-                msg = f"Fourier continuation requires at least {minimum} points per spatial axis, got shape {tuple(field.shape)}."
-                raise ValueError(msg)
-            continuation = _fourier_continuation()
-            work_dtype = torch.float32 if moved.dtype in {torch.float16, torch.bfloat16} else moved.dtype
-            extended = continuation.extend(moved.to(work_dtype), dim=2)
-            extended_x, extended_y = self._gradient_last_axes(extended, dx, dy)
-            derivative_x = continuation.restrict(extended_x, dim=2).to(field.dtype)
-            derivative_y = continuation.restrict(extended_y, dim=2).to(field.dtype)
+        minimum = 2 * FOURIER_CONTINUATION_MATCHING_POINTS
+        if min(moved.shape[-2:]) < minimum:
+            msg = f"Fourier continuation requires at least {minimum} points per spatial axis, got shape {tuple(field.shape)}."
+            raise ValueError(msg)
+        height, width = moved.shape[-2:]
+        operator = FourierDiff(
+            dim=2,
+            L=(height * dy, width * dx),
+            use_fc="legendre",  # pyright: ignore[reportArgumentType] -- neuralop is unannotated; use_fc accepts a continuation name
+            fc_degree=FOURIER_CONTINUATION_MATCHING_POINTS,
+            fc_n_additional_pts=FOURIER_CONTINUATION_ADDITIONAL_POINTS,
+        )
+        # FourierDiff differentiates the first spatial axis with ``dx`` (our y).
+        derivative_x = operator.dy(moved).to(field.dtype)  # pyright: ignore[reportOptionalMemberAccess] -- dim=2 always returns a tensor
+        derivative_y = operator.dx(moved).to(field.dtype)  # pyright: ignore[reportOptionalMemberAccess] -- dim=2 always returns a tensor
         return (
             derivative_x.movedim((-2, -1), normalized_axes),
             derivative_y.movedim((-2, -1), normalized_axes),
@@ -554,35 +512,19 @@ class SpectralDerivatives:
         return _divergence(self, field_x, field_y, spacing_x, spacing_y)
 
 
-@cache
-def _fourier_continuation() -> FCLegendre:
-    """Return the shared stateless Legendre Fourier-continuation operator."""
-    # neuraloperator is imported lazily so dependency-light domain consumers,
-    # such as Generation contracts, do not load the ML stack on import.
-    from neuralop.layers.fourier_continuation import FCLegendre  # noqa: PLC0415
-
-    return FCLegendre(
-        d=FOURIER_CONTINUATION_MATCHING_POINTS,
-        n_additional_pts=FOURIER_CONTINUATION_ADDITIONAL_POINTS,
-    )
-
-
 def build_derivative_operator(
     kind: str,
     *,
-    extension: str,
     axes: SpatialAxes = (-2, -1),
 ) -> DerivativeOperator:
     """
-    Build a derivative operator from semantic identifiers.
+    Build a derivative operator from a semantic identifier.
 
     Parameters
     ----------
     kind : str
-        ``"physical"`` or ``"spectral"``.
-    extension : str
-        ``"none"`` or ``"fourier_continuation"``. Physical derivatives require
-        ``"none"``.
+        ``"physical"`` (finite differences) or ``"spectral"`` (FFT with
+        Fourier continuation).
     axes : tuple[int, int], optional
         ``(y_axis, x_axis)`` used by the operator.
 
@@ -594,11 +536,9 @@ def build_derivative_operator(
     Raises
     ------
     ValueError
-        If ``kind`` or ``extension`` is unsupported, including Fourier
-        continuation requested for physical differences.
+        If ``kind`` is unsupported.
 
     """
-    resolved_kind, resolved_extension = physics_contracts.validate_derivative_kind(kind, extension=extension)
-    if resolved_kind == "physical":
+    if physics_contracts.validate_derivative_kind(kind) == "physical":
         return PhysicalDerivatives(axes=axes)
-    return SpectralDerivatives(extension=resolved_extension, axes=axes)
+    return SpectralDerivatives(axes=axes)

@@ -38,7 +38,6 @@ from src.datasets import dataset_plan
 from src.datasets.contracts import dataset_contracts_partition as partition
 from src.datasets.packages import dataset_packages_builder as builder
 from src.datasets.packages import dataset_packages_manifest as manifests
-from src.datasets.packages import dataset_packages_transient_shards as shards
 from src.generation import generation_controller
 from src.generation.runtime import generation_runtime_host as host
 
@@ -55,7 +54,7 @@ def _base_plan(task: str = "transient_drying") -> dict[str, Any]:
     """Return a fresh test-owned Dataset plan; it only references the maintained Generation configs the loader reads."""
     return {
         "schema_kind": "dataset_plan",
-        "schema_version": 2,
+        "schema_version": 1,
         "task": task,
         "generation": {
             "sources_config": f"{_PHYSICAL_MODEL}/sources.yaml",
@@ -65,11 +64,10 @@ def _base_plan(task: str = "transient_drying") -> dict[str, Any]:
             "profile_config": f"{_PHYSICAL_MODEL}/profiles/{task}.yaml",
             "execution_config": "configs/01_generation/execution.yaml",
             "sampling": {"method": "lhs", "seed_base": 41},
-            "replacement_capacity": 1,
+            "minimum_success_rate": 0.8,
             "domain_profile": "reference_range",
         },
         "materials": {"lentil": {"count": 10, "role": "id"}, "chickpea": {"count": 10, "role": "id"}},
-        "selection_seed": 42,
         "split": {"seed": 7, "train_fraction": 0.5, "validation_fraction": 0.25, "id_test_fraction": 0.25},
     }
 
@@ -101,8 +99,8 @@ def _small_materials() -> dict[str, dict[str, Any]]:
     return {material: {"count": 3, "role": specification["role"]} for material, specification in _base_plan()["materials"].items()}
 
 
-def _small_plan(path: Path) -> dict[str, Any]:
-    return dataset_plan.load_dataset_plan(path, counts=("lentil=3", "chickpea=3"), split_fractions="1/3,1/3,1/3")
+def _small_plan(path: Path, *, duration_hours: float | None = None) -> dict[str, Any]:
+    return dataset_plan.load_dataset_plan(path, counts=("lentil=3", "chickpea=3"), split_fractions="1/3,1/3,1/3", duration_hours=duration_hours)
 
 
 def test_documented_defaults_and_small_overrides_preserve_authored_plan(plan_path: Path) -> None:
@@ -115,7 +113,6 @@ def test_documented_defaults_and_small_overrides_preserve_authored_plan(plan_pat
     preview = dataset_plan.preview_dataset_plan(defaults)
     assert defaults["materials"] == authored["materials"]
     assert defaults["generation"]["sampling"]["seed_base"] == authored["generation"]["sampling"]["seed_base"]
-    assert defaults["selection_seed"] == authored["selection_seed"]
     assert defaults["split"] == authored["split"]
     assert preview["split"]["seed"] == common.random.derive_subseed(authored["split"]["seed"], "split")
 
@@ -169,41 +166,38 @@ def test_dataset_name_is_computed_from_materials_split_domain_and_seed(tmp_path:
         dataset_plan.load_dataset_plan(path, counts=("lentil=2",))
 
 
-def test_replacement_capacity_is_authored_policy_that_sizes_admission_but_not_identity(tmp_path: Path) -> None:
-    """Capacity zero is the default; one integer or a mapping pre-registers replacements without changing name, seeds or split."""
+def test_minimum_success_rate_is_authored_policy_that_changes_neither_identity_nor_the_execution_overrides(tmp_path: Path) -> None:
+    """The rate changes neither name, seeds nor split; only an explicit cap is an override, the campaign derives the default from the rate."""
 
-    def with_capacity(value: object | None) -> dict[str, Any]:
-        def mutate(authored: dict[str, Any]) -> None:
-            authored["generation"].pop("replacement_capacity", None)
-            if value is not None:
-                authored["generation"]["replacement_capacity"] = value
+    def with_rate(rate: float) -> dict[str, Any]:
+        path = _write_plan(tmp_path, lambda authored: authored["generation"].update(minimum_success_rate=rate))
+        return dataset_plan.load_dataset_plan(path, counts=("lentil=3", "chickpea=30"), split_fractions="1/3,1/3,1/3")
 
-        return dataset_plan.load_dataset_plan(_write_plan(tmp_path, mutate), counts=("lentil=3", "chickpea=4"), split_fractions="1/3,1/3,1/3")
-
-    absent, everywhere, mapped = with_capacity(None), with_capacity(2), with_capacity({"lentil": 3})
-    assert absent["generation"]["replacement_capacity"] == {"lentil": 0, "chickpea": 0}
-    assert everywhere["generation"]["replacement_capacity"] == {"lentil": 2, "chickpea": 2}
-    assert mapped["generation"]["replacement_capacity"] == {"lentil": 3, "chickpea": 0}
-    assert absent["name"] == everywhere["name"] == mapped["name"]
-    assert [dataset_plan.effective_execution_overrides(plan)["max_admission_cases"] for plan in (absent, everywhere, mapped)] == [7, 11, 10]
-    assert dataset_plan.effective_execution_overrides(mapped, {"max_admission_cases": 5})["max_admission_cases"] == 5
-    campaigns = [dataset_plan.authored_campaign(plan) for plan in (absent, everywhere, mapped)]
-    assert [campaign["replacement_capacity"] for campaign in campaigns] == [
-        plan["generation"]["replacement_capacity"] for plan in (absent, everywhere, mapped)
-    ]
-    assert all(campaign["sampling"] == campaigns[0]["sampling"] for campaign in campaigns)
-    preview = dataset_plan.preview_dataset_plan(mapped)
-    assert preview["replacement_capacity"] == {"lentil": 3, "chickpea": 0}
-    assert preview["execution_overrides"]["max_admission_cases"] == 10
-    assert preview["split"] == dataset_plan.preview_dataset_plan(absent)["split"]
+    strict, tolerant = with_rate(1.0), with_rate(0.6)
+    assert strict["name"] == tolerant["name"]
+    assert dataset_plan.effective_execution_overrides() == {}
+    assert dataset_plan.effective_execution_overrides({"max_admission_cases": 5}) == {"max_admission_cases": 5}
+    with pytest.raises(ValueError, match="positive integer"):
+        dataset_plan.effective_execution_overrides({"max_admission_cases": None})
+    campaigns = [dataset_plan.authored_campaign(plan) for plan in (strict, tolerant)]
+    assert [campaign["minimum_success_rate"] for campaign in campaigns] == [1.0, 0.6]
+    assert campaigns[0]["sampling"] == campaigns[1]["sampling"]
+    preview = dataset_plan.preview_dataset_plan(tolerant)
+    assert (preview["minimum_success_rate"], preview["execution_overrides"]) == (0.6, {})
+    assert preview["split"] == dataset_plan.preview_dataset_plan(strict)["split"]
 
 
-@pytest.mark.parametrize("value", [-1, True, 1.5, "2", {"lentil": -1}, {"lentil": "1"}, {"field_pea": 1}])
-def test_replacement_capacity_rejects_unsupported_values(tmp_path: Path, value: object) -> None:
-    """Reject negative, non-integer and unknown-material capacities before any Generation work."""
-    path = _write_plan(tmp_path, lambda authored: authored["generation"].update(replacement_capacity=value))
-    with pytest.raises(ValueError, match="replacement_capacity"):
-        dataset_plan.load_dataset_plan(path)
+@pytest.mark.parametrize("value", [None, 0, 1.5, True, "0.9", {"lentil": 0.9}])
+def test_minimum_success_rate_is_required_and_rejects_unsupported_values(tmp_path: Path, value: object) -> None:
+    """Require one rate 0 < s <= 1 per plan and reject a missing, boolean, textual or per-material value before any Generation work."""
+
+    def mutate(authored: dict[str, Any]) -> None:
+        authored["generation"].pop("minimum_success_rate")
+        if value is not None:
+            authored["generation"]["minimum_success_rate"] = value
+
+    with pytest.raises(ValueError, match="minimum_success_rate"):
+        dataset_plan.load_dataset_plan(_write_plan(tmp_path, mutate))
 
 
 def test_revision_names_only_the_dataset_and_reuses_the_default_source(plan_path: Path) -> None:
@@ -287,12 +281,13 @@ def test_revision_label_follows_one_grammar_for_dataset_and_source(label: str, p
     assert accepted(lambda: dataset_plan.load_dataset_plan(plan_path, revision=label, new_source=True)) is expected
 
 
-def test_plan_schema_rejects_an_authored_name_and_the_old_version(tmp_path: Path) -> None:
-    """Schema 2 computes the name; a plan that still authors one is refused with a clear message."""
-    with pytest.raises(ValueError, match="exactly the fields"):
-        dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored.update(name="authored-name")))
-    with pytest.raises(ValueError, match=r"schema_version must be 2.*removed the authored name"):
-        dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored.update(schema_version=1)))
+def test_plan_schema_rejects_authored_name_selection_seed_and_other_versions(tmp_path: Path) -> None:
+    """The plan computes its name and orders membership by design; extra keys and other schema versions are refused."""
+    for extra in ({"name": "authored-name"}, {"selection_seed": 42}):
+        with pytest.raises(ValueError, match="exactly the fields"):
+            dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored, extra=extra: authored.update(extra)))
+    with pytest.raises(ValueError, match=r"schema_version must be 1, got 2"):
+        dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored.update(schema_version=2)))
     # The Source name is derived like the Dataset name; only --revision with --new-source varies it, never the YAML.
     for key in ("source_name", "revision"):
         with pytest.raises(ValueError, match="six maintained configs"):
@@ -307,7 +302,7 @@ def test_generation_projection_contains_physics_but_no_dataset_roles_or_split(pl
     assert campaign["sampling"]["seed_base"] == plan["generation"]["sampling"]["seed_base"]
     assert campaign["sampling"]["counts"] == {"natural": {"lentil": 3, "chickpea": 3}}
     assert set(campaign["materials"]) == {"lentil", "chickpea"}
-    assert not {"name", "dataset_name", "selection_seed", "selection", "roles", "split"} & campaign.keys()
+    assert not {"name", "dataset_name", "selection", "roles", "split"} & campaign.keys()
     assert all(isinstance(count, int) for count in campaign["sampling"]["counts"]["natural"].values())
 
 
@@ -318,8 +313,7 @@ def test_preview_does_not_construct_generation_controller(tmp_path: Path, plan_p
     monkeypatch.setattr(dataset_plan, "_controller", lambda: pytest.fail("preview constructed Generation"))
 
     summary = dataset_plan.preview_dataset_plan(
-        _small_plan(plan_path),
-        duration_hours=4,
+        _small_plan(plan_path, duration_hours=4),
         execution_overrides={"node_jobs": 1, "max_admission_cases": 6, "cores_per_case": 8},
     )
 
@@ -357,13 +351,12 @@ def test_live_run_submits_its_driver_from_the_campaign_tree_before_any_generatio
     submitted: list[dict[str, Any]] = []
     campaign_plan = SimpleNamespace(kind="campaign", identity="source~transient_drying~lentil-chickpea__abc")
     plan = _small_plan(plan_path)
-    plan["generation"]["replacement_capacity"] = {"lentil": 1, "chickpea": 0}
 
     class Controller:
         def authored_campaign_plan(self, _path: str, campaign: dict[str, Any], **kwargs: Any) -> SimpleNamespace:
             assert campaign == dataset_plan.authored_campaign(plan)
-            # Three plus three original candidates and the one pre-registered lentil replacement.
-            assert kwargs == {"scientific_overrides": None, "execution_overrides": {"max_admission_cases": 7}}
+            # Without an explicit cap the campaign derives its cap from the plan rate, so no override carries one.
+            assert kwargs == {"scientific_overrides": None, "execution_overrides": {}}
             return campaign_plan
 
         def submit_run_tree(self, plan: SimpleNamespace, **kwargs: Any) -> host.SubmittedLauncher:
@@ -457,14 +450,12 @@ def test_staged_generation_publishes_neither_dataset_nor_pt_and_retains_invocati
 
     monkeypatch.setattr(dataset_plan, "_controller", Controller)
     monkeypatch.setattr(builder, "build_dataset_selection", lambda **_kwargs: pytest.fail("STAGED run published a Dataset"))
-    monkeypatch.setattr(shards, "build_transient_shards", lambda *_args, **_kwargs: pytest.fail("STAGED run built PT"))
     execution = {"node_jobs": 1, "max_admission_cases": 6, "cores_per_case": 8}
 
     result = dataset_plan.run_dataset_plan(
         plan_path,
-        _small_plan(plan_path),
+        _small_plan(plan_path, duration_hours=4),
         invocation=invocation,
-        duration_hours=4,
         execution_overrides=execution,
     )
 
@@ -474,20 +465,18 @@ def test_staged_generation_publishes_neither_dataset_nor_pt_and_retains_invocati
     assert len(generation_calls) == 1
     assert generation_calls[0]["scientific_overrides"] == {"duration_hours": 4}
     assert generation_calls[0]["execution_overrides"] == execution
-    assert generation_calls[0]["max_admission_cases"] == 6
-    # Admission is always dirty-capable: the driver forwards no snapshot or strictness switches.
-    assert set(generation_calls[0]) == {"path", "campaign", "scientific_overrides", "execution_overrides", "max_admission_cases"}
+    # Admission is always dirty-capable: the driver forwards no snapshot or strictness switches; the explicit cap is an override.
+    assert set(generation_calls[0]) == {"path", "campaign", "scientific_overrides", "execution_overrides"}
 
 
-def test_complete_run_forwards_exact_selection_partition_and_builds_pt(plan_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bind publication to the plan's selection, fixed partition, and invocation before PT."""
+def test_complete_run_forwards_exact_selection_partition_and_invocation(plan_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the one publication to the plan's selection, fixed partition, and invocation."""
     monkeypatch.setenv("SLURM_JOB_ID", "test-allocation")
-    plan = _small_plan(plan_path)
+    plan = _small_plan(plan_path, duration_hours=4)
     invocation = ("python", "-m", "src.datasets.dataset_packages", "run", "plan.yaml", "--max-admission-cases", "6")
     execution = {"node_jobs": 1, "max_admission_cases": 6, "cores_per_case": 8}
     generation_calls: list[dict[str, Any]] = []
     publication_calls: list[dict[str, Any]] = []
-    pt_calls: list[str] = []
 
     class Controller:
         def run_authored_campaign(self, path: str, campaign: dict[str, Any], **kwargs: Any) -> SimpleNamespace:
@@ -498,31 +487,22 @@ def test_complete_run_forwards_exact_selection_partition_and_builds_pt(plan_path
         publication_calls.append({"request": request, **kwargs})
         return {"dataset_id": "dataset-id", "manifest_path": "manifest.json"}
 
-    def build_pt(dataset_id: str) -> dict[str, str]:
-        pt_calls.append(dataset_id)
-        return {"receipt_path": "transient_pt_shards/receipt.json"}
-
     monkeypatch.setattr(dataset_plan, "_controller", Controller)
     monkeypatch.setattr(builder, "build_dataset_selection", publish)
-    monkeypatch.setattr(shards, "build_transient_shards", build_pt)
 
     result = dataset_plan.run_dataset_plan(
         plan_path,
         plan,
         invocation=invocation,
-        duration_hours=4,
         execution_overrides=execution,
     )
 
     assert result["status"] == "OK"
     assert result["dataset"]["dataset_id"] == "dataset-id"
-    assert result["pt"]["receipt_path"] == "transient_pt_shards/receipt.json"
     assert generation_calls[0]["scientific_overrides"] == {"duration_hours": 4}
     assert generation_calls[0]["execution_overrides"] == execution
-    assert generation_calls[0]["max_admission_cases"] == 6
     assert publication_calls[0]["request"]["selection"] == {
-        "kind": "seed_ranked",
-        "root_seed": _base_plan()["selection_seed"],
+        "kind": "design_order",
         "source_names": ["lentil-chickpea__abc"],
         "target_counts": {"lentil": 3, "chickpea": 3},
     }
@@ -541,7 +521,7 @@ def test_complete_run_forwards_exact_selection_partition_and_builds_pt(plan_path
         "material_roles": {material: specification["role"] for material, specification in _small_materials().items()},
     }
     assert publication_calls[0]["plan_invocation"] == list(invocation)
-    assert pt_calls == ["dataset-id"]
+    assert len(publication_calls) == 1
 
 
 def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
@@ -556,7 +536,6 @@ def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     monkeypatch.setattr(dataset_plan, "_controller", lambda: pytest.fail("CLI admitted Generation"))
     monkeypatch.setattr(builder, "build_dataset_selection", lambda **_kwargs: pytest.fail("CLI published Dataset"))
-    monkeypatch.setattr(shards, "build_transient_shards", lambda *_args, **_kwargs: pytest.fail("CLI built PT"))
     arguments = [
         "dataset_packages",
         "run",
@@ -594,7 +573,7 @@ def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
     authored = _base_plan()
     assert preview["materials"] == _small_materials()
     assert preview["generation_seed_base"] == authored["generation"]["sampling"]["seed_base"]
-    assert preview["selection"] == {"kind": "seed_ranked", "seed": authored["selection_seed"]}
+    assert preview["selection"] == {"kind": "design_order"}
     assert preview["split"]["seed"] == common.random.derive_subseed(authored["split"]["seed"], "split")
     assert preview["physical_duration_hours_override"] == 4
     assert preview["execution_overrides"] == {"node_jobs": 1, "max_admission_cases": 6, "cores_per_case": 8}
@@ -736,6 +715,7 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
         "transition_count": 618,
     }
     failed = {"material_family": "lentil", "case_id": "case_0001", "origin": "primary", "parent_failed_case_id": None, "outcome": "failed"}
+    failed_replacement = {**failed, "case_id": "case_0003", "origin": "replacement", "parent_failed_case_id": "case_0001"}
     replacement = {
         "material_family": "lentil",
         "case_id": "case_0004",
@@ -751,7 +731,15 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
             "ood": [],
             "material_roles": {"lentil": "id", "chickpea": "id"},
         },
-        "source_outcomes": [{"candidates": [{**failed, "failure_stage": "solver", "reason_code": "stalled"}, replacement]}],
+        "source_outcomes": [
+            {
+                "candidates": [
+                    {**failed, "failure_stage": "solver", "reason_code": "stalled"},
+                    {**failed_replacement, "failure_stage": "solver", "reason_code": "stalled"},
+                    replacement,
+                ]
+            }
+        ],
     }
     seen: list[tuple[str, str, Path]] = []
 
@@ -760,9 +748,7 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
         return manifest
 
     _as_driver(monkeypatch, plan_path)
-    monkeypatch.setattr(
-        dataset_plan, "run_dataset_plan", lambda *_args, **_kwargs: {"status": "OK", "source_run": "run", "dataset": published, "pt": None}
-    )
+    monkeypatch.setattr(dataset_plan, "run_dataset_plan", lambda *_args, **_kwargs: {"status": "OK", "source_run": "run", "dataset": published})
     monkeypatch.setattr(manifests, "load_package_manifest_evidence", load)
     assert cli.main() == 0
     assert seen == [("transient_drying", "example-dataset", storage)]
@@ -773,7 +759,12 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
         "Contents: 6 Source cases; 618 samples; 618 transitions",
         "Split: train 4  validation 1  id_test 1  ood 0  (lentil=id, chickpea=id)",
     ]
-    assert lines[4:6] == ["Failures:", "  lentil case_0001: solver failure (stalled), replaced by case_0004"]
+    # A slot whose first replacement failed too reads as a chain, as on the live board.
+    assert lines[4:7] == [
+        "Failures:",
+        "  lentil case_0001: solver failure (stalled), replaced by case_0003",
+        "  lentil case_0003: solver failure (stalled), replaced by case_0004",
+    ]
     assert re.fullmatch(r"Duration: \d+ s", lines[-1])
 
 
@@ -827,19 +818,20 @@ def test_controller_factory_freezes_the_source_and_binds_its_evidence_to_every_c
 
 
 def test_steady_plan_requires_matching_profile(tmp_path: Path) -> None:
-    """Load the steady plan and reject a plan whose task contradicts its Generation profile."""
+    """Load the steady plan, refuse a time horizon it does not have, and reject a task that contradicts its profile."""
     plan = dataset_plan.load_dataset_plan(_write_plan(tmp_path, task="steady_flow"))
     assert plan["task"] == "steady_flow"
     assert "__h-" not in plan["name"]
-    assert "__h-" not in dataset_plan.load_dataset_plan(_write_plan(tmp_path, task="steady_flow"), duration_hours=4)["name"]
+    with pytest.raises(ValueError, match=r"--duration-hours.*'steady_flow'"):
+        dataset_plan.load_dataset_plan(_write_plan(tmp_path, task="steady_flow"), duration_hours=4)
     assert dataset_plan.authored_campaign(plan)["profile_config"].endswith("steady_flow.yaml")
     mismatched = _write_plan(tmp_path, lambda authored: authored.update(task="transient_drying"), task="steady_flow")
     with pytest.raises(ValueError, match="does not simulate the plan task"):
         dataset_plan.load_dataset_plan(mismatched)
 
 
-def test_complete_steady_run_publishes_partition_without_transient_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Publish the steady payload with its fixed partition, never build transient PT shards, and link the driver log only afterwards."""
+def test_complete_steady_run_publishes_partition_and_keeps_driver_log_outside(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Publish the steady payload with its fixed partition and never write into the published folder afterwards."""
     monkeypatch.setenv("SLURM_JOB_ID", "test-allocation")
     steady_path = _write_plan(tmp_path, task="steady_flow")
     plan = dataset_plan.load_dataset_plan(steady_path)
@@ -862,14 +854,14 @@ def test_complete_steady_run_publishes_partition_without_transient_shards(tmp_pa
 
     monkeypatch.setattr(dataset_plan, "_controller", Controller)
     monkeypatch.setattr(builder, "build_dataset_selection", publish)
-    monkeypatch.setattr(shards, "build_transient_shards", lambda _dataset_id: pytest.fail("steady plans build no transient shards"))
     monkeypatch.setattr(host, "current_job_log_files", lambda: (driver_log,))
 
     result = dataset_plan.run_dataset_plan(steady_path, plan, invocation=("python", "-m", "src.datasets.dataset_packages", "run"))
 
     assert result["status"] == "OK"
-    assert result["pt"] is None
-    assert (published / "logs" / driver_log.name).samefile(driver_log)
+    # The driver log keeps growing until the job ends, so it stays in its log area.
+    assert list(published.iterdir()) == []
+    assert driver_log.is_file()
     assert publication_calls[0]["request"]["dataset_view"] == "steady_flow"
     assert publication_calls[0]["partition_spec"]["material_roles"] == {
         material: specification["role"] for material, specification in plan["materials"].items()

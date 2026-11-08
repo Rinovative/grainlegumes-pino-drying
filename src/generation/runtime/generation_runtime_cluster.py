@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import getpass
 import math
-import operator
 import os
 import re
 import shlex
@@ -30,7 +29,7 @@ import socket
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final
 
 from src import common
 from src.generation.cases import generation_cases_config as config_service
@@ -512,11 +511,13 @@ def standard_node_exclusions(
     partition: str,
     cores_per_node: int,
     *,
-    match: Literal["exact", "at_least"],
     sinfo: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] = _run_sinfo,
 ) -> list[str]:
     """
-    Return the nodes of ``partition`` that a node job must exclude because their CPU count does not satisfy ``match``.
+    Return the nodes of ``partition`` that a node job must exclude because they have fewer CPUs than it requests.
+
+    Larger nodes stay admitted: production jobs request ``cores_per_node`` CPUs without ``--exclusive``, so other jobs may use the
+    remaining CPUs.
 
     Parameters
     ----------
@@ -524,28 +525,22 @@ def standard_node_exclusions(
         Slurm partition name.
     cores_per_node : int
         The CPUs per node the node job requests.
-    match : {"exact", "at_least"}
-        ``exact`` admits only nodes with exactly ``cores_per_node`` CPUs (measurements per node type); ``at_least`` also admits larger
-        nodes (production jobs request ``cores_per_node`` CPUs without ``--exclusive``, so other jobs may use the remaining CPUs).
     sinfo : Callable, optional
         Runs the full sinfo argument vector and returns its completed process; replaced by tests.
 
     Returns
     -------
     list[str]
-        Sorted unique node names whose CPU count is not admitted.
+        Sorted unique node names with fewer than ``cores_per_node`` CPUs.
 
     Raises
     ------
     ValueError
         If an argument is invalid.
     RuntimeError
-        If sinfo fails, its output is malformed, or no node satisfies ``match``.
+        If sinfo fails, its output is malformed, or no node has at least ``cores_per_node`` CPUs.
 
     """
-    if match not in ("exact", "at_least"):
-        message = f"match must be 'exact' or 'at_least', got {match!r}."
-        raise ValueError(message)
     cores = _positive_int(cores_per_node, label="cores_per_node")
     if not isinstance(partition, str) or _PARTITION_NAME.fullmatch(partition) is None:
         message = f"Partition must match {_PARTITION_NAME.pattern!r}, got {partition!r}."
@@ -572,11 +567,10 @@ def standard_node_exclusions(
             message = f"sinfo returned a malformed node line for partition {partition}: {line!r}"
             raise RuntimeError(message)
         cpus_by_node[fields[0]] = int(fields[1])
-    admitted = operator.ge if match == "at_least" else operator.eq
-    if not any(admitted(cpus, cores) for cpus in cpus_by_node.values()):
-        message = f"Partition {partition} has no node with {'at least' if match == 'at_least' else 'exactly'} {cores} CPUs."
+    if not any(cpus >= cores for cpus in cpus_by_node.values()):
+        message = f"Partition {partition} has no node with at least {cores} CPUs."
         raise RuntimeError(message)
-    return sorted(name for name, cpus in cpus_by_node.items() if not admitted(cpus, cores))
+    return sorted(name for name, cpus in cpus_by_node.items() if cpus < cores)
 
 
 def _run_squeue(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:

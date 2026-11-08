@@ -136,7 +136,9 @@ def _read_study_sessions(study: Path) -> dict[str, Any]:
         msg = f"Study session record is invalid JSON: {path}: {error}"
         raise run.RunLifecycleError(msg) from error
     valid = (
-        isinstance(payload, dict) and payload.get("schema_version") == _STUDY_SESSIONS_SCHEMA_VERSION and isinstance(payload.get("sessions"), list)
+        isinstance(payload, dict)
+        and common.serialization.is_schema_version(payload.get("schema_version"), _STUDY_SESSIONS_SCHEMA_VERSION)
+        and isinstance(payload.get("sessions"), list)
     )
     if not valid:
         msg = f"Unsupported or malformed study session record: {path}"
@@ -232,8 +234,8 @@ def admit_continuation(run_dirs: Iterable[Path], *, study: Path | None = None) -
     provenance = run.slurm_runtime_provenance()
     if provenance is None:
         msg = (
-            f"This {kind} is bound to source tree {bound}; continue it through scripts/slurm_ml.sh, "
-            "which uses that tree, or pass --continue-with-current-code."
+            f"This {kind} is bound to source tree {bound}; continue it through scripts/slurm_ml.sh, which uses that tree, "
+            "or through scripts/slurm_ml.sh with --continue-with-current-code to switch to the current code deliberately."
         )
         raise run.SourceBindingError(msg)
     current = run_identity.source_tree_name(provenance["source_commit"], provenance["source_worktree_sha256"])

@@ -229,7 +229,7 @@ def test_failed_attempt_retention_respects_full_and_compact_policy(generation_co
     work = tmp_path / "case"
     (work / "runtime").mkdir(parents=True)
     log = b"accepted solver progress\n" * 50_000
-    (work / "runtime" / "solver.log").write_bytes(log)
+    (work / "runtime" / "stdout.log").write_bytes(log)
     (work / "model.mph").write_bytes(b"input model")
     (work / "solved.mph").write_bytes(b"partial solved model")
     (work / "runtime" / "case.h5").write_bytes(b"present converted bytes")
@@ -240,8 +240,8 @@ def test_failed_attempt_retention_respects_full_and_compact_policy(generation_co
     assert full_omitted == []
     assert {Path("model.mph"), Path("solved.mph"), Path("runtime/case.h5")} <= set(full_paths)
     full_inventory = generation.publication.attempt._copy_retained(work, tmp_path / "full", full_paths, full_retention=True)
-    assert full_inventory["payload/runtime/solver.log"]["size_bytes"] == len(log)
-    assert (tmp_path / "full" / "payload" / "runtime" / "solver.log").read_bytes() == log
+    assert full_inventory["payload/runtime/stdout.log"]["size_bytes"] == len(log)
+    assert (tmp_path / "full" / "payload" / "runtime" / "stdout.log").read_bytes() == log
 
     compact_config = replace(config, execution_values={**config.execution_values, "retention_policy": "compact"})
     compact_policy, compact_paths, compact_omitted = generation.publication.attempt._retention_paths(compact_config, work_directory=work)
@@ -249,7 +249,7 @@ def test_failed_attempt_retention_respects_full_and_compact_policy(generation_co
     assert {"model.mph", "solved.mph", "runtime/case.h5"} <= set(compact_omitted)
     assert {Path("model.mph"), Path("solved.mph"), Path("runtime/case.h5")}.isdisjoint(compact_paths)
     compact_inventory = generation.publication.attempt._copy_retained(work, tmp_path / "compact", compact_paths, full_retention=False)
-    assert compact_inventory["payload/runtime/solver.log"]["size_bytes"] < len(log)
+    assert compact_inventory["payload/runtime/stdout.log"]["size_bytes"] < len(log)
 
 
 def test_attempt_index_rejects_symlinked_history_before_listing(
@@ -804,42 +804,6 @@ def test_missing_canonical_inputs_never_trigger_worker_generation(
     assert not tuple(storage.rglob("input_generation_manifest.json"))
 
 
-def test_supplied_raw_case_bundle_replaces_canonical_admission_and_stays_byte_verified(
-    generation_config_factory: Any,
-    tmp_path: Path,
-) -> None:
-    """A caller-owned bundle is copied and re-verified without canonical storage, an input-generation identity, or another case."""
-    config_path, _template = generation_config_factory()
-    config = generation.cases.config.load_generation_config(config_path, only_batch=_natural_batch_name("transient_drying"))
-    storage = tmp_path / "supplied bundle storage"
-    work = tmp_path / "supplied bundle work"
-    bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "supplied-bundle")
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        runtime_service.prepare_case_work_directory(
-            config,
-            1,
-            storage_root=storage,
-            work_root=work,
-            input_generation_id="input-" + "a" * 24,
-            raw_case_directory=bundle.directory,
-        )
-    prepared = runtime_service.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work, raw_case_directory=bundle.directory)
-    assert prepared.canonical_raw_directory == bundle.directory.resolve()
-    assert prepared.input_generation_id == generation.cases.input_generation.configured_input_generation_id(config)
-    assert prepared.bundle.simulation_case_id == bundle.simulation_case_id
-    assert {path.name for path in prepared.bundle.input_paths} == {path.name for path in bundle.input_paths}
-    assert all((prepared.work_directory / path.name).read_bytes() == path.read_bytes() for path in bundle.input_paths)
-    assert not tuple(storage.rglob("input_generation_manifest.json"))
-
-    with pytest.raises(generation.runtime.CasePreparationError, match="belongs to"):
-        runtime_service.prepare_case_work_directory(config, 2, storage_root=storage, work_root=work, raw_case_directory=bundle.directory)
-    victim = bundle.input_paths[0]
-    victim.write_bytes(victim.read_bytes() + b"tampered")
-    with pytest.raises(generation.runtime.CasePreparationError, match="Raw case input changed"):
-        runtime_service.prepare_case_work_directory(config, 1, storage_root=storage, work_root=work, raw_case_directory=bundle.directory)
-
-
 def test_steady_command_is_parameter_free(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -912,6 +876,8 @@ def test_solver_provenance_tracks_current_source_while_reusing_older_canonical_i
     assert publication["git_commit"] == input_commit
     assert execution["git_commit"] == processing["solver_git_commit"] == timing["git_commit"] == solver_commit
     assert processing["processing_git_commit"] == solver_commit
+    assert config.execution_values["runtime"]["stall_stop"] is not None
+    assert timing["stall_progress"] is None  # the shared execution sets a stall rule, but a stationary solve reports no simulated time
     generation.runtime.finalize_batch(config, storage_root=storage, input_references=reference)
     assert generation.runtime.validate_terminal_batch(config, storage_root=storage, input_references=reference)["git_commit"] == input_commit
 
@@ -1073,7 +1039,7 @@ def test_failure_timeout_missing_export_and_case_lock(
     assert failed_attempt.payload["process_exit_code"] == 7
     assert failed_attempt.payload["template"]["sha256"] == config.template_sha256
     assert failed_attempt.payload["retention_policy"] == "full"
-    assert "payload/runtime/solver.log" in failed_attempt.payload["retained_inventory"]
+    assert "payload/runtime/stdout.log" in failed_attempt.payload["retained_inventory"]
     steps = (failed_attempt.directory / "payload/runtime/solver_steps.csv").read_text(encoding="utf-8").splitlines()
     assert steps[1] == "1,1.6355,0.42589,18,6,18,1,0,0,4.8e-16,4.6e-16"
     cleanup = json.loads((failed_attempt.directory / "cleanup.json").read_text(encoding="utf-8"))
@@ -1802,7 +1768,7 @@ def test_current_case_dispatch_resolves_a_complete_campaign_step() -> None:
 
 
 def test_current_case_dispatch_is_none_outside_campaign_cases(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Invent no identity for a Slurm step without a campaign run, such as a benchmark step."""
+    """Invent no identity for a Slurm step without a campaign run."""
     assert dispatch_identity.current_case_dispatch(_dispatch_environment(GENERATION_CAMPAIGN_RUN_ID=None)) is None
     assert dispatch_identity.current_case_dispatch({"SLURM_JOB_ID": "5001", "SLURM_STEP_ID": "3"}) is None
     assert dispatch_identity.current_case_dispatch({}) is None

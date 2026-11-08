@@ -51,6 +51,7 @@ import numpy as np
 
 from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -143,8 +144,8 @@ class ArtifactKey:
         Exact completed-run scientific identity digests.
     split_role : str
         Explicit ``eval`` or ``additional_evaluation`` persisted role.
-    dataset_fingerprint, membership_digest : str
-        Dataset and effective ordered-membership identities.
+    dataset_digest, membership_digest : str
+        Digest of the role's source Dataset provenance and effective ordered-membership identity.
     manifest_digest : str
         Canonical digest of the persisted artifact output manifest.
     frame_digest : str
@@ -159,7 +160,7 @@ class ArtifactKey:
     checkpoint_digest: str
     normalizer_digest: str
     split_role: str
-    dataset_fingerprint: str
+    dataset_digest: str
     membership_digest: str
     manifest_digest: str
     frame_digest: str
@@ -453,7 +454,11 @@ class PrefixEvaluationSummary:
     Parameters
     ----------
     case_count : int
-        Exact saved-prefix case count.
+        Exact saved-prefix case count, including the left-out cases.
+    left_out_count : int
+        Prefix cases left out of every reduction because a reference or error value is non-finite. The whole
+        case is dropped and nothing is imputed, as in the other per-case views; the reductions use the remaining
+        ``used_count`` cases. When none remains, ``used_count`` is zero and every mapping below is empty.
     fields, units : tuple[str, ...]
         Learned output fields and aligned physical units.
     coordinate_unit : str
@@ -470,6 +475,7 @@ class PrefixEvaluationSummary:
     """
 
     case_count: int
+    left_out_count: int
     fields: tuple[str, ...]
     units: tuple[str, ...]
     coordinate_unit: str
@@ -479,6 +485,11 @@ class PrefixEvaluationSummary:
     boundary_region_error: Mapping[str, BinnedMeanSummary]
     spectra: Mapping[str, SpectralFieldSummary]
     magnitudes: Mapping[str, PrefixMagnitudeSummary]
+
+    @property
+    def used_count(self) -> int:
+        """Return how many prefix cases the reductions used."""
+        return self.case_count - self.left_out_count
 
 
 @dataclass(slots=True)
@@ -656,7 +667,7 @@ def _artifact_key(frame: pd.DataFrame) -> ArtifactKey:
         checkpoint_digest=str(run.get("best_checkpoint_sha256", "")),
         normalizer_digest=str(run.get("normalizer_sha256", "")),
         split_role=str(provenance.get("split_role", "")),
-        dataset_fingerprint=str(dataset.get("fingerprint", "")),
+        dataset_digest=_digest(dataset),
         membership_digest=str(selection["effective_ordered_source_indices_sha256"]),
         manifest_digest=manifest_digest,
         frame_digest=frame_digest,
@@ -2087,6 +2098,9 @@ class EvaluationSession:
         -----
         The projection is bounded by ``max_spill_bytes`` and deleted immediately
         after reduction. Only fixed-size summaries remain in the aggregate LRU.
+        A case with any non-finite reference or error value (a NONFINITE
+        prediction) is left out whole before any reduction, as in the other
+        per-case views; the summary counts the left-out cases.
 
         """
         self._statistics["prefix_scans"] += 1
@@ -2104,19 +2118,18 @@ class EvaluationSession:
             mode="w+",
             shape=(count, 2 * field_count + 2, height, width),
         )
-        spacings = np.empty((count, 2), dtype=np.float64)
-        coordinate_units: list[tuple[str, str]] = []
+        spacings = np.zeros((count, 2), dtype=np.float64)
+        used = 0
 
-        def consume(case: cases.EvaluationCase, position: int) -> None:
+        def consume(case: cases.EvaluationCase) -> None:
             """
-            Write one validated case into the bounded numerical projection.
+            Write one validated finite case into the next row of the bounded numerical projection.
 
             Parameters
             ----------
             case : EvaluationCase
-                Immutable validated prefix case.
-            position : int
-                Destination row in the session-owned projection.
+                Immutable validated prefix case. A case with any non-finite reference or error value is left out
+                whole and never imputed.
 
             Raises
             ------
@@ -2124,6 +2137,7 @@ class EvaluationSession:
                 If prefix cases do not share one learned-field grid shape.
 
             """
+            nonlocal used
             if (
                 case.reference.shape != first.reference.shape
                 or case.coordinate_units != first.coordinate_units
@@ -2132,31 +2146,33 @@ class EvaluationSession:
             ):
                 msg = "Bounded-prefix evaluation summaries require one exact shared grid within an artifact."
                 raise dataframe.ComparisonCompatibilityError(msg)
-            projection[position, :field_count] = case.reference
-            projection[position, field_count : 2 * field_count] = case.error
-            projection[position, -2] = _boundary_distance(case)
-            projection[position, -1] = _horizontal_boundary_fraction(case)
-            spacings[position] = cases.grid_spacing(case)
-            coordinate_units.append(case.coordinate_units)
+            if not validity_contract.finite_case_mask(np.concatenate((case.reference, case.error))[None])[0]:
+                return
+            projection[used, :field_count] = case.reference
+            projection[used, field_count : 2 * field_count] = case.error
+            projection[used, -2] = _boundary_distance(case)
+            projection[used, -1] = _horizontal_boundary_fraction(case)
+            spacings[used] = cases.grid_spacing(case)
+            used += 1
 
         try:
-            consume(first, 0)
+            consume(first)
             for position in range(1, count):
                 case = self._read_case(frame, position)
                 self._statistics["prefix_case_visits"] += 1
-                consume(case, position)
+                consume(case)
             projection.flush()
-            references = projection[:, :field_count]
-            errors = projection[:, field_count : 2 * field_count]
-            distances = projection[:, -2]
-            boundary_fractions = projection[:, -1]
+            references = projection[:used, :field_count]
+            errors = projection[:used, field_count : 2 * field_count]
+            distances = projection[:used, -2]
+            boundary_fractions = projection[:used, -1]
             local: dict[str, EmpiricalQuantileSummary] = {}
             target: dict[str, BinnedMedianSummary] = {}
             boundary: dict[str, BinnedMedianSummary] = {}
             boundary_regions: dict[str, BinnedMeanSummary] = {}
             spectra: dict[str, SpectralFieldSummary] = {}
             dx, dy = spacings[0]
-            if not np.allclose(spacings, spacings[0]):
+            if not np.allclose(spacings[:used], spacings[0]):
                 msg = "Spectral aggregation requires a shared grid and spacing within each artifact."
                 raise dataframe.ComparisonCompatibilityError(msg)
 
@@ -2179,7 +2195,7 @@ class EvaluationSession:
                 boundary_region_summary = _boundary_region_mean(boundary_fractions, np.abs(error))
                 spectral_values: dict[str, list[np.ndarray]] = {"reference": [], "prediction": [], "error": []}
                 frequency_reference: np.ndarray | None = None
-                for position in range(count):
+                for position in range(used):
                     for name, values in (
                         ("reference", reference[position]),
                         ("prediction", reference[position] + error[position]),
@@ -2200,7 +2216,8 @@ class EvaluationSession:
                 )
                 return local_summary, target_summary, boundary_summary, boundary_region_summary, spectrum
 
-            for field_index, field in enumerate(first.fields):
+            # Without a single finite case nothing is reduced: the empty mappings are the explicit unavailable state.
+            for field_index, field in enumerate(first.fields if used else ()):
                 reductions = reduce_field(
                     np.asarray(references[:, field_index]),
                     np.asarray(errors[:, field_index]),
@@ -2208,7 +2225,7 @@ class EvaluationSession:
                 local[field], target[field], boundary[field], boundary_regions[field], spectra[field] = reductions
 
             magnitude_summaries: dict[str, PrefixMagnitudeSummary] = {}
-            for group_id, component_fields, indices, unit in magnitude_specs:
+            for group_id, component_fields, indices, unit in magnitude_specs if used else ():
                 component_indices = np.asarray(indices)
                 magnitude_reference = np.sqrt(np.sum(np.asarray(references[:, component_indices]) ** 2, axis=1))
                 component_prediction = np.asarray(references[:, component_indices]) + np.asarray(errors[:, component_indices])
@@ -2223,14 +2240,15 @@ class EvaluationSession:
                     boundary_region_error=reductions[3],
                     spectrum=reductions[4],
                 )
-            if coordinate_units[0][0] != coordinate_units[0][1]:
+            if first.coordinate_units[0] != first.coordinate_units[1]:
                 msg = "Boundary distance requires x and y coordinates with the same physical unit."
                 raise dataframe.ComparisonCompatibilityError(msg)
             return PrefixEvaluationSummary(
                 case_count=count,
+                left_out_count=count - used,
                 fields=first.fields,
                 units=first.units,
-                coordinate_unit=coordinate_units[0][0],
+                coordinate_unit=first.coordinate_units[0],
                 local_relative_error=MappingProxyType(local),
                 target_magnitude_error=MappingProxyType(target),
                 boundary_distance_error=MappingProxyType(boundary),

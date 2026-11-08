@@ -41,6 +41,7 @@ from src import common
 GIT_COMMIT_ENVIRONMENT_VARIABLE = "GENERATION_GIT_COMMIT"
 SOURCE_TRANSITION_ENVIRONMENT_VARIABLE = "GENERATION_SOURCE_TRANSITION"
 EXPLICIT_SOURCE_TRANSITION = "explicit"
+SOURCE_SNAPSHOT_SCHEMA_VERSION = 1
 _GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 _SOURCE_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -277,7 +278,7 @@ def _validate_live_source_before_publication() -> None:  # noqa: C901, PLR0912 -
     if (
         not isinstance(payload, dict)
         or payload.get("schema_kind") != "generation_source_snapshot"
-        or payload.get("schema_version") != 1
+        or not common.serialization.is_schema_version(payload.get("schema_version"), SOURCE_SNAPSHOT_SCHEMA_VERSION)
         or payload.get("git_commit") != expected_commit
         or payload.get("source_fingerprint_sha256") != expected
     ):

@@ -29,6 +29,7 @@ import numpy as np
 from src import common
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff
+from src.generation.contracts import generation_contracts_source as source_service
 
 from . import generation_cases_case as case_service
 from . import generation_cases_config as config_service
@@ -64,7 +65,6 @@ INPUT_GENERATION_IDENTITY_FIELDS = (
     "sampling_regime",
     "case_input_config_digest",
     "scientific_config_digest",
-    "git_commit",
     "generator_version",
     "producer_identity",
     "case_schema_version",
@@ -73,10 +73,10 @@ INPUT_GENERATION_IDENTITY_FIELDS = (
     "template_sha256",
     "resolved_config_sha256",
 )
-INPUT_GENERATION_COMPATIBILITY_FIELDS = tuple(field for field in INPUT_GENERATION_IDENTITY_FIELDS if field != "git_commit")
 INPUT_MANIFEST_KEYS = frozenset(
     {
         *INPUT_GENERATION_IDENTITY_FIELDS,
+        "git_commit",  # provenance of the first publication, not part of the batch identity
         "batch_storage_name",
         "input_generation_id",
         "status",
@@ -569,7 +569,7 @@ def _validate_input_manifest_shape(
     if (
         set(manifest) != INPUT_MANIFEST_KEYS
         or manifest.get("schema_kind") != INPUT_BATCH_SCHEMA_KIND
-        or manifest.get("schema_version") != INPUT_BATCH_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(manifest.get("schema_version"), INPUT_BATCH_SCHEMA_VERSION)
         or manifest.get("status") != "ready"
         or not isinstance(generation_id, str)
         or (expected_input_generation_id is not None and generation_id != expected_input_generation_id)
@@ -582,6 +582,7 @@ def _validate_input_manifest_shape(
     ):
         message = "Input-generation manifest schema, lifecycle, or membership is invalid."
         raise ValueError(message)
+    source_service.validate_git_commit(manifest["git_commit"])
 
 
 def _validated_batch_locators(
@@ -674,7 +675,7 @@ def _load_input_batch_envelope(
         or resolved.get("campaign_purpose") != manifest["campaign_purpose"]
         or resolved.get("sampling_regime") != manifest["sampling_regime"]
         or resolved.get("generator_version") != manifest["generator_version"]
-        or manifest.get("case_schema_version") != case_service.CASE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(manifest.get("case_schema_version"), case_service.CASE_SCHEMA_VERSION)
         or manifest.get("case_contract_digest") != case_service.CASE_CONTRACT_DIGEST
         or not isinstance(resolved.get("reference_template"), Mapping)
         or resolved["reference_template"].get("sha256") != manifest["template_sha256"]
@@ -697,6 +698,9 @@ def _load_input_batch_envelope(
     supplemental = resolved.get("supplemental_design")
     stored_locator_regime = supplemental.get("batch_locator_regime") if isinstance(supplemental, Mapping) else None
     storage_parts = common.paths.campaign_batch_parts(batch_storage_name)
+    if storage_parts is None:
+        message = f"Input manifest batch locator is not a campaign locator: {batch_storage_name!r}."
+        raise ValueError(message)
     if (
         (locator_regime != manifest["sampling_regime"] and stored_locator_regime != locator_regime)
         or scientific_digest != manifest["scientific_config_digest"]
@@ -708,18 +712,7 @@ def _load_input_batch_envelope(
             scientific_digest,
         )
         != batch_id
-        or (
-            f"source~{profile_id}~{storage_parts[1]}~{manifest['material_family']}~{locator_regime}"
-            if storage_parts is not None
-            else config_service.build_batch_storage_name(
-                profile_id,
-                str(manifest["material_family"]),
-                str(manifest["sampling_regime"]),
-                str(manifest["campaign_purpose"]),
-                scientific_digest,
-            )
-        )
-        != batch_storage_name
+        or f"source~{profile_id}~{storage_parts[1]}~{manifest['material_family']}~{locator_regime}" != batch_storage_name
     ):
         message = "Resolved generation identities do not bind the input manifest."
         raise ValueError(message)
@@ -814,7 +807,6 @@ def _validate_input_case_record(
         "case_input_config_digest": manifest["case_input_config_digest"],
         "material_family": manifest["material_family"],
         "sampling_regime": manifest["sampling_regime"],
-        "git_commit": manifest["git_commit"],
         "generator_version": manifest["generator_version"],
     }
     template = case_payload.get("template")
@@ -866,23 +858,18 @@ def _load_input_batch_metadata(
         expected_names.add(str(record["case_id"]))
         normalized_records.append(record)
         case_payloads.append(case_payload)
-    campaign_layout = common.paths.campaign_batch_parts(str(envelope.manifest["batch_storage_name"])) is not None
     try:
         # A campaign material holds its cases beside the reserved _record/ and nothing else.
-        observed_entries = (
-            common.paths.generation_material_case_directories(envelope.raw_directory) if campaign_layout else tuple(envelope.raw_directory.iterdir())
-        )
+        observed_entries = common.paths.generation_material_case_directories(envelope.raw_directory)
     except ValueError:
         observed_entries = None
     observed_names = set() if observed_entries is None else {entry.name for entry in observed_entries}
     if (
         observed_entries is None
         or len(expected_names) != len(records)
-        or (not expected_names.issubset(observed_names) if campaign_layout else observed_names != expected_names)
+        or not expected_names.issubset(observed_names)
         or any(not _input_case_directory(envelope.raw_directory, case_id).is_dir() for case_id in expected_names)
     ):
-        if not campaign_layout:
-            _raise_for_execution_artifact(envelope.raw_directory)
         message = "Input-generation raw case membership is not exact."
         raise ValueError(message)
     return _InputBatchMetadata(

@@ -235,20 +235,15 @@ def test_load_case_timing_rejects_identity_schema_and_nonfinite_evidence(tmp_pat
         )
 
 
-def test_load_case_timing_keeps_legacy_solver_components_explicitly_unavailable(tmp_path: Path) -> None:
+def test_load_case_timing_rejects_a_sidecar_without_solver_timing(tmp_path: Path) -> None:
     _write_sidecars(tmp_path, include_solver_timing=False)
     case = _Case(tmp_path)
 
-    result = timing.load_case_timing(
-        cast("TerminalCaseEvidence", case),
-        batch=cast("TerminalBatchEvidence", _Batch(case)),
-    )
-
-    assert result.stationary_airflow_solver_seconds is None
-    assert result.transient_drying_solver_seconds is None
-    assert result.scientific_solver_seconds is None
-    assert result.comsol_solver_timing is None
-    assert result.as_dict()["component_timing_availability"]["scientific_solver_seconds"] == "unavailable_not_persisted"
+    with pytest.raises(ValueError, match="incomplete COMSOL solver-timing fields"):
+        timing.load_case_timing(
+            cast("TerminalCaseEvidence", case),
+            batch=cast("TerminalBatchEvidence", _Batch(case)),
+        )
 
 
 @pytest.mark.parametrize(

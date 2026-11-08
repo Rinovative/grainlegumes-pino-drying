@@ -4,7 +4,8 @@ Responsibilities:
   - Bind new Dataset publications to retained producing source and environment evidence
   - Reuse the admitted, tree-verified snapshot as producing source when running from a frozen source tree
   - Present Source parameters, seeds, model and regeneration boundaries in one inspection
-  - Declare the conversion code projection of each Dataset view and bind the converter implementation digest to it
+  - Declare the conversion code projection of each Dataset view and bind the converter implementation digest to it;
+    pure runtime readers belong to the model projection, not to conversion
 
 Design principles:
   - Existing source snapshots retain code bytes; the Dataset manifest owns provenance
@@ -37,14 +38,12 @@ _CONVERSION_FILES = (
     "common/common_code_identity.py",
     "common/common_serialization.py",
     "datasets/contracts/dataset_contracts_identity.py",
-    "datasets/contracts/dataset_contracts_metadata.py",
     "datasets/contracts/dataset_contracts_partition.py",
     "datasets/contracts/dataset_contracts_views.py",
     "datasets/packages/dataset_packages_builder.py",
     "datasets/packages/dataset_packages_generated_batch.py",
     "datasets/packages/dataset_packages_manifest.py",
     "datasets/packages/dataset_packages_planning.py",
-    "datasets/runtime/dataset_runtime_factory.py",
     "domain/domain_field_sets.py",
     "domain/domain_fields.py",
     "domain/tasks/domain_task_registry.py",
@@ -68,7 +67,6 @@ DATASET_CONVERSION_PROJECTIONS = {
         files=(
             *_CONVERSION_FILES,
             "datasets/contracts/dataset_contracts_transient.py",
-            "datasets/runtime/dataset_runtime_steady.py",
             "domain/physics/domain_physics_contracts.py",
             "domain/tasks/domain_task_steady_flow.py",
         ),
@@ -85,7 +83,6 @@ DATASET_CONVERSION_PROJECTIONS = {
             "datasets/contracts/dataset_contracts_transient.py",
             "datasets/packages/dataset_packages_trajectory.py",
             "datasets/packages/dataset_packages_transient_shards.py",
-            "datasets/runtime/dataset_runtime_transient.py",
             "domain/tasks/domain_task_transient_drying.py",
         ),
         excluded_markers=("steady",),
@@ -432,7 +429,7 @@ def inspect_dataset_reproduction(task: str, dataset_id: str, *, storage_root: Pa
         "case_partition": manifest["case_partition"],
         "plan_invocation": manifest["plan_invocation"],
         "source_outcomes": manifest["source_outcomes"],
-        "effective_request": _selection_request(manifest),
+        "effective_request": manifest_selection_request(manifest),
         "channel_contract": manifest["channel_contract"],
         "source_case_count": manifest["source_case_count"],
         "sample_count": manifest["sample_count"],
@@ -509,11 +506,12 @@ def rebuild_dataset(manifest_path: Path, *, storage_root: Path | str, output_dir
     task = raw["dataset_view"]
     payload = manifest_path.parent / common.paths.get_dataset_payload_filename(task)
     manifest = manifests.validate_manifest_content(raw, task=task, dataset_id=raw["dataset_id"], payload_path=payload, validate_payload_hash=False)
-    request = _selection_request(manifest)
+    request = manifest_selection_request(manifest)
     return builder.build_dataset_selection(request, storage_root=storage_root, reproduction_manifest=manifest, output_directory=output_directory)
 
 
-def _selection_request(manifest: dict[str, Any]) -> dict[str, Any]:
+def manifest_selection_request(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Project a manifest's recorded selection and ordered sources onto the selection request schema."""
     from . import dataset_packages_selection as selection  # noqa: PLC0415 -- single selection schema projection
 
     return {

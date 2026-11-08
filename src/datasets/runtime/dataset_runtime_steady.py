@@ -4,6 +4,7 @@ Responsibilities:
   - Load steady tensor payloads in authoritative TaskSpec channel order
   - Expose immutable identity-bound runtime selections without tensor copies
   - Apply exact experiment case selections to verified package samples
+  - Bind the payload's embedded provenance to its admitted manifest and carry the manifest binding
 
 Design principles:
   - TaskSpec remains the sole learned-channel contract
@@ -29,6 +30,7 @@ from torch.utils.data import Dataset
 
 from src import domain
 from src.datasets.contracts import dataset_contracts_identity as identity
+from src.datasets.packages import dataset_packages_manifest as package_manifest
 
 if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
@@ -80,6 +82,12 @@ class SteadyFlowDataset(Dataset[SteadyFlowItem]):
         )
         self.inputs = payload["inputs"]
         self.outputs = payload["outputs"]
+        self.manifest_binding: identity.ManifestBinding | None = None
+
+    @property
+    def payload_identity(self) -> dict[str, Any]:
+        """Return the identity the tensor payload states about itself, as bound into splits."""
+        return {"fingerprint": self.identity.fingerprint, "spatial_shape": list(self.identity.spatial_shape)}
 
     def __len__(self) -> int:
         """Return the verified ordered steady sample count."""
@@ -222,9 +230,8 @@ def select_dataset(
         Complete source or immutable identity-bound selection.
 
     """
-    if manifest["dataset_id"] != dataset.identity.dataset_id:
-        msg = "Steady Dataset manifest and payload identities disagree."
-        raise ValueError(msg)
+    package_manifest.validate_steady_payload_identity(manifest, dataset.identity)
+    dataset.manifest_binding = identity.manifest_binding(manifest)
     if case_ids is None:
         return dataset
     if not isinstance(case_ids, Sequence) or isinstance(case_ids, (str, bytes)) or not all(isinstance(value, str) for value in case_ids):

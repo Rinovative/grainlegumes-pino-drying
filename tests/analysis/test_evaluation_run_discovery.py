@@ -21,8 +21,9 @@ from typing import Any
 import ipywidgets as widgets
 import pytest
 import yaml
+from support.synthetic_task import synthetic_split_payload
 
-from src import common, datasets
+from src import common
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.analysis.evaluation import evaluation_run_discovery as discovery
 from src.analysis.evaluation import evaluation_selection as selection
@@ -34,15 +35,7 @@ from src.experiments import experiments_run_identity as identity
 def _metadata_config_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     """Use compact saved metadata while retaining exact parent content checks."""
     monkeypatch.setattr(identity.config_loader, "validate_resolved_config", lambda config: config)
-    monkeypatch.setattr(identity.config_loader, "validate_saved_artifact_config", lambda config: config)
     monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", identity.resolved_config_digest)
-    monkeypatch.setattr(
-        datasets.packages,
-        "declared_evaluation_assignments",
-        lambda _task, _train, additional=(), **_kwargs: [
-            {"dataset_id": name, "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []} for name in additional
-        ],
-    )
 
 
 def _write_run(
@@ -61,8 +54,9 @@ def _write_run(
     family: str | None = None,
     trial: str | None = None,
     seed: int = 17,
+    split: bool = True,
 ) -> Path:
-    """Write one compact persisted leaf without loading project services."""
+    """Write one compact persisted leaf; its saved split holds the ID Dataset plus one additional OOD part unless ``split`` is false."""
     stage_id = comparison_arm if comparison_arm in {"a0", "b", "a1"} else "a0" if stage == "a" else "b" if stage == "b" else "single"
     layout = {
         "task": task,
@@ -89,7 +83,7 @@ def _write_run(
         "model": {"kind": "fno", "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1}},
         "data": {
             "train_dataset": "dataset-id",
-            "additional_evaluation_datasets": ["dataset-ood"],
+            "additional_evaluation_datasets": [],  # The additional role comes from the saved split, never from these ids.
         },
     }
     if evaluation is not None:
@@ -118,6 +112,9 @@ def _write_run(
         encoding="utf-8",
     )
     (run_dir / "best_checkpoint.pt").write_bytes(b"best")
+    if split:
+        payload = synthetic_split_payload(task, train_dataset="dataset-id", additional=(("dataset-ood", ("chickpea__case_0001__00000000000a",)),))
+        common.serialization.atomic_torch_save(payload, common.paths.resolve_split_indices_path(run_dir))
     if artifact:
         second_root = run_dir / "analysis" / "additional_evaluation" / "dataset-ood"
         for artifact_root in (run_dir / "analysis" / "id", second_root):
@@ -316,6 +313,20 @@ def test_failed_runs_remain_visible_and_artifacts_report_missing_or_available(
     )
 
 
+def test_marker_with_boolean_artifact_schema_version_is_invalid(tmp_path: Path) -> None:
+    """Report a marker whose artifact schema version is JSON true as invalid, as the artifact loader refuses it."""
+    run_dir = _write_run(tmp_path, leaf="edited", artifact=True)
+    marker_path = run_dir / "analysis" / "id" / "artifact_provenance.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifact_schema_version"] = True
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+
+    record = next(item for item in catalog.runs if item.run_dir == run_dir.resolve())
+    assert record.id_artifact.state == "invalid"
+
+
 def test_marker_discovery_does_not_hash_numerical_payloads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -425,7 +436,7 @@ def test_discovery_reports_generating_only_for_active_staging_writer(
     """Distinguish active private staging from stale invalid evidence."""
     run_dir = _write_run(tmp_path, leaf="generating")
     target = run_dir / "analysis" / "id"
-    stage = target.parent / ".id.staging.active"
+    stage = target.parent / ".id.stage"
     stage.mkdir(parents=True)
     monkeypatch.setattr(
         discovery,
@@ -452,7 +463,7 @@ def test_canonical_ready_precedes_failed_staging_and_scoped_partial(
         run_name="scientific-canonical",
         artifact=True,
     )
-    failed_stage = run_dir / "analysis" / ".id.staging.failed"
+    failed_stage = run_dir / "analysis" / ".id.stage"
     failed_stage.mkdir()
     _write_scoped_artifact(tmp_path, run_dir=run_dir)
 
@@ -1136,23 +1147,42 @@ def test_comparison_export_uses_authoritative_common_experiment_without_writing(
     assert not (shared_dir / "comparison").exists()
 
 
-def test_missing_dataset_metadata_remains_visible_and_disables_actions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Show a saved run without claiming unknown Dataset roles or admitting outputs."""
-    run_dir = _write_run(tmp_path, leaf="missing-dataset")
+def test_additional_role_follows_the_saved_split_and_an_absent_split_has_none(tmp_path: Path) -> None:
+    """Name the additional artifact folder from the saved split, not config ids, and give a run without a split no role and no issue."""
+    with_split = _write_run(tmp_path, leaf="with-split", artifact=True)
+    without_split = _write_run(tmp_path, leaf="without-split", split=False)
 
-    def unavailable(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
-        message = "Dataset manifest absent"
-        raise FileNotFoundError(message)
-
-    monkeypatch.setattr(datasets.packages, "declared_evaluation_assignments", unavailable)
     catalog = discovery.discover_evaluation_runs(tmp_path)
+
+    by_dir = {run.run_dir: run for run in catalog.runs}
+    split_run = by_dir[with_split.resolve()]
+    assert split_run.additional_dataset_ids == ("dataset-ood",)
+    assert [item["dataset_id"] for item in split_run.evaluation_assignments] == ["dataset-ood"]
+    assert split_run.additional_artifact is not None
+    assert split_run.additional_artifact.root == with_split.resolve() / "analysis" / "additional_evaluation" / "dataset-ood"
+    assert split_run.additional_artifact.state == "ready"
+    bare_run = by_dir[without_split.resolve()]
+    assert bare_run.additional_dataset_ids == ()
+    assert bare_run.evaluation_assignments == ()
+    assert bare_run.additional_artifact is None
+    assert catalog.issues == ()
+
+
+def test_unreadable_saved_split_remains_visible_and_disables_actions(tmp_path: Path) -> None:
+    """Show a saved run without claiming unknown Dataset roles or admitting outputs."""
+    run_dir = _write_run(tmp_path, leaf="unreadable-split", artifact=True)
+    common.paths.resolve_split_indices_path(run_dir).write_bytes(b"not a saved split")
+
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+
     assert len(catalog.runs) == 1
     run = catalog.runs[0]
     assert run.run_dir == run_dir
     assert run.metadata_issues
-    assert "Dataset manifest absent" in run.metadata_issues[0]
-    assert not run.action_enabled
-    assert any("Dataset manifest absent" in issue.reason for issue in catalog.issues)
+    assert run.metadata_issues[0].startswith("Saved split unavailable: ValueError")
+    assert run.additional_artifact is None
+    assert not run.action_enabled  # The ID artifact is ready; only the unreadable split blocks the action.
+    assert any("Saved split unavailable" in issue.reason for issue in catalog.issues)
 
 
 def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

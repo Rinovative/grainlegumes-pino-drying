@@ -5,7 +5,7 @@ Responsibilities:
   - Check that a launcher driver is submitted from the bound tree of an existing campaign, restoring a pruned one, or from the current tree on request
   - Check that a driver job runs from its tree with the tree environment, an appending log, and a job lease
   - Check that job logs are hard-linked only into an existing owner and never replace or fail
-  - Check that node jobs and benchmark jobs are submitted only from a tree and lease it, even when the lease fails
+  - Check that node jobs are submitted only from a tree and lease it, even when the lease fails
   - Check that freezing is refused inside a Slurm allocation and that a bound campaign refuses other code without an explicit transition
 
 Design principles:
@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_service
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.generation_controller import GenerationController, RunPlan
@@ -135,45 +134,15 @@ def test_node_jobs_are_submitted_only_from_a_tree_and_leased_after_recording(fro
     assert lease.is_file()
 
 
-def test_benchmark_jobs_are_submitted_only_from_a_tree_and_lease_it(frozen_project: FrozenProject, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A benchmark job is refused before submission outside a tree; inside one its returned job ID leases the tree."""
-    with monkeypatch.context() as live:
-        live.delenv("SOURCE_TREE_ID", raising=False)
-        live.setattr(subprocess, "run", lambda *_args, **_kwargs: pytest.fail("a benchmark job was submitted from live code"))
-        with pytest.raises(RuntimeError, match="only from a frozen source tree"):
-            benchmark_service._submit(
-                ["sbatch", "--parsable", "benchmark.sh"], git_commit="a" * 40, run_id="core_scaling_transient__0123456789abcdef"
-            )
-    receipt = _enter_tree_mode(frozen_project, monkeypatch)
-    _fake_job_submission(monkeypatch, output="31338;cluster\n")
-    job_id = benchmark_service._submit(
-        ["sbatch", "--parsable", "benchmark.sh"], git_commit=receipt["git_commit"], run_id="core_scaling_transient__0123456789abcdef"
-    )
-
-    assert job_id == "31338"
-    assert (frozen_project.trees / ".leases" / receipt["tree_id"] / "31338").is_file()
-
-
-def _submit_and_lease_node_job(command: list[str], *, git_commit: str, **_identity: str) -> str:
-    """Submit a node job and lease its tree as the campaign dispatcher does; a failed lease is reported by its result."""
-    job_id = cluster_service.submit_node_job(command, git_commit=git_commit, environment={})
-    assert cluster_service.lease_executing_tree(job_id) is False
-    return job_id
-
-
-@pytest.mark.parametrize(
-    ("submit", "output"),
-    [(_submit_and_lease_node_job, "31337\n"), (benchmark_service._submit, "31337;cluster\n")],
-    ids=["campaign", "benchmark"],
-)
 def test_a_failed_lease_after_submission_keeps_the_job_id_and_warns_once(
-    frozen_project: FrozenProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], submit: Any, output: str
+    frozen_project: FrozenProject, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The job is already queued, so the lease failure only warns and the caller still receives and records the job ID."""
     receipt = _enter_tree_mode(frozen_project, monkeypatch)
-    _fake_job_submission(monkeypatch, output=output, lease_fails=True)
+    _fake_job_submission(monkeypatch, output="31337\n", lease_fails=True)
 
-    job_id = submit(["sbatch", "--parsable", "job.sh"], git_commit=receipt["git_commit"], run_id="core_scaling_transient__0123456789abcdef")
+    job_id = cluster_service.submit_node_job(["sbatch", "--parsable", "job.sh"], git_commit=receipt["git_commit"], environment={})
+    assert cluster_service.lease_executing_tree(job_id) is False
 
     assert job_id == "31337"
     warnings = capsys.readouterr().err.splitlines()

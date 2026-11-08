@@ -4,6 +4,7 @@ Responsibilities:
   - Digest complete resolved run configurations and authored config sources
   - Record exact Dataset IDs, content identities, grouping, and repository provenance
   - Read a frozen job's commit and dirty state from its source snapshot instead of Git
+  - Name the frozen source tree the executing process runs in, inside a Slurm ML container or in tree mode
   - Bind matched A0/B/A1 comparison children under one immutable parent record
   - Recover an exact childless parent after a failed pre-allocation launch
   - Reject reuse of a content group with different exact inputs
@@ -53,7 +54,6 @@ from .config import experiments_config_naming as config_naming
 
 EXPERIMENT_RECORD_SCHEMA_KIND: Final = "experiment_transient_parent"
 EXPERIMENT_RECORD_SCHEMA_VERSION: Final = 1
-_RUN_IDENTITY_SCHEMA_VERSION: Final = 1
 SLURM_PROVENANCE_VARIABLE: Final = "ML_SLURM_PROVENANCE"
 _SNAPSHOT_MANIFEST_FILENAME: Final = "snapshot.json"
 _EMPTY_DIFF_SHA256: Final = hashlib.sha256(b"").hexdigest()
@@ -102,8 +102,8 @@ def source_tree_name(source_commit: object, source_fingerprint_sha256: object) -
     return f"{source_commit[:_TREE_NAME_PART_LENGTH]}-{source_fingerprint_sha256[:_TREE_NAME_PART_LENGTH]}"
 
 
-def _frozen_source_evidence(raw_provenance: str) -> dict[str, str | bool | None]:
-    """Describe the frozen source a Slurm ML job runs from using its retained snapshot, never Git."""
+def _submitted_source(raw_provenance: str) -> tuple[Any, Any]:
+    """Return the unvalidated commit and fingerprint every worker operation records; ``source_tree_name`` validates them."""
     try:
         provenance = json.loads(raw_provenance)
     except json.JSONDecodeError as error:
@@ -112,8 +112,12 @@ def _frozen_source_evidence(raw_provenance: str) -> dict[str, str | bool | None]
     if not isinstance(provenance, Mapping):
         msg = f"{SLURM_PROVENANCE_VARIABLE} must contain a JSON object."
         raise TypeError(msg)
-    commit = provenance.get("source_commit")
-    fingerprint = provenance.get("source_worktree_sha256")
+    return provenance.get("source_commit"), provenance.get("source_worktree_sha256")
+
+
+def _frozen_source_evidence(raw_provenance: str) -> dict[str, str | bool | None]:
+    """Describe the frozen source a Slurm ML job runs from using its retained snapshot, never Git."""
+    commit, fingerprint = _submitted_source(raw_provenance)
     manifest_path = common.paths.get_source_snapshots_root() / source_tree_name(commit, fingerprint) / _SNAPSHOT_MANIFEST_FILENAME
     if manifest_path.is_symlink() or not manifest_path.is_file():
         msg = f"Source snapshot of the submitted job is missing: {manifest_path}"
@@ -176,6 +180,29 @@ def source_repository_evidence() -> dict[str, str | bool | None]:
     return {"commit": commit or None, "dirty": dirty}
 
 
+def executing_source_tree_id() -> str | None:
+    """
+    Return the frozen source tree this process executes in, or ``None`` outside one.
+
+    A Slurm ML job sees its tree only as the container's repository mount and never
+    ``SOURCE_TREE_ID``, so it is named from the submitted commit and fingerprint that
+    every worker operation records, artifact jobs included; any other process names
+    it through ``SOURCE_TREE_ID``.
+
+    Raises
+    ------
+    ValueError
+        If the job's provenance or ``SOURCE_TREE_ID`` cannot name a tree.
+    TypeError
+        If the job's provenance is not a JSON object.
+
+    """
+    raw_provenance = os.environ.get(SLURM_PROVENANCE_VARIABLE)
+    if raw_provenance is None:
+        return common.paths.source_tree_id()
+    return source_tree_name(*_submitted_source(raw_provenance))
+
+
 def authored_config_evidence(config_path: Path | str) -> dict[str, str]:
     """Return exact source path, basename, and content hash for one authored YAML."""
     requested = Path(config_path).expanduser()
@@ -217,14 +244,11 @@ def dataset_identity_evidence(config: Mapping[str, Any]) -> dict[str, Any]:
 def run_identity_evidence(config: Mapping[str, Any], *, config_path: Path | str) -> dict[str, Any]:
     """Build one exact run identity record for local summary publication."""
     run = config.get("run")
-    tracking = config.get("tracking")
-    wandb = tracking.get("wandb") if isinstance(tracking, Mapping) else None
-    if not isinstance(run, Mapping) or not isinstance(wandb, Mapping):
-        msg = "Resolved experiment config must contain run and tracking identity."
+    if not isinstance(run, Mapping):
+        msg = "Resolved experiment config must contain run identity."
         raise TypeError(msg)
     return {
         "schema_kind": "experiment_run_identity",
-        "schema_version": _RUN_IDENTITY_SCHEMA_VERSION,
         "parent_label": config_naming.parent_label(run["layout"]),
         "run_name": run["name"],
         "resolved_config_sha256": resolved_config_digest(config),
@@ -232,7 +256,6 @@ def run_identity_evidence(config: Mapping[str, Any], *, config_path: Path | str)
         "dataset_identity": dataset_identity_evidence(config),
         "seed": run["seed"],
         "layout": copy.deepcopy(run["layout"]),
-        "wandb_metric_schema_version": wandb.get("metric_schema_version", 1),
         "source_repository": source_repository_evidence(),
     }
 
@@ -348,7 +371,9 @@ def validate_transient_experiment_record(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _RECORD_KEYS:
         msg = "Transient experiment record keys do not match the current schema."
         raise ValueError(msg)
-    if value["schema_kind"] != EXPERIMENT_RECORD_SCHEMA_KIND or value["schema_version"] != EXPERIMENT_RECORD_SCHEMA_VERSION:
+    if value["schema_kind"] != EXPERIMENT_RECORD_SCHEMA_KIND or not common.serialization.is_schema_version(
+        value["schema_version"], EXPERIMENT_RECORD_SCHEMA_VERSION
+    ):
         msg = "Transient experiment record schema is unsupported."
         raise ValueError(msg)
     if value["topology"] != "a0_to_b_and_a1" or set(value["children"]) != {"stage_a0", "stage_b", "stage_a1"}:
@@ -458,7 +483,7 @@ def resolve_readonly_experiment_child(
         if config_path.is_symlink() or not config_path.is_file():
             msg = "Parent child config must be a regular file."
             raise ValueError(msg)
-        config = config_loader.validate_saved_artifact_config(config_loader.load_yaml(config_path))
+        config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
         if config["task"] != record["task"] or config["run"]["name"] != child["run_name"]:
             msg = "Parent child task/run identity contradicts its saved config."
             raise ValueError(msg)

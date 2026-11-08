@@ -236,3 +236,27 @@ sources:
   canonical_locator: local:project_sources/02-VM2_Vertiefungsprojekt_Rino_Moreno_Albertin-3-.pdf
   alternate_locators: []
   source_type: project_report
+- source_key: lentil_airflow_resistance_sokhansanj
+  citation: Sokhansanj, S., Falacinski, A. A., Sosulski, F. W., Jayas, D. S. & Tang,
+    J. (1990). Resistance of bulk lentils to airflow. Transactions of the ASAE.
+  identifier: AGRIS 65e01c87b766d82b18041512
+  canonical_locator: https://agris.fao.org/search/en/records/65e01c87b766d82b18041512
+  alternate_locators: []
+  source_type: journal_article
+- source_key: corn_airflow_anisotropy_kay
+  citation: Kay, R. L., Bern, C. J. & Hurburgh, C. R. (1989). Horizontal and vertical
+    airflow resistance of shelled corn at various bulk densities. Transactions of
+    the ASAE, 32(2), 733-736.
+  identifier: https://lib.dr.iastate.edu/abe_eng_pubs/395
+  canonical_locator: https://lib.dr.iastate.edu/abe_eng_pubs/395
+  alternate_locators:
+  - https://works.bepress.com/cjbern/17
+  source_type: journal_article
+- source_key: grain_bed_anisotropy_khatchatourian
+  citation: Khatchatourian, O. A., Toniazzo, N. A. & Gortyshov, Y. F. (2009). Simulation
+    of airflow in grain bulks under anisotropic conditions. Biosystems Engineering,
+    104(2), 205-215.
+  identifier: Biosystems Engineering 104(2):205-215
+  canonical_locator: https://www.sciencedirect.com/journal/biosystems-engineering/vol/104/issue/2
+  alternate_locators: []
+  source_type: journal_article

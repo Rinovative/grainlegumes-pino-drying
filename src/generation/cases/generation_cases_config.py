@@ -15,13 +15,15 @@ This module does NOT:
   - Generate samples or fields, execute COMSOL, or modify templates
 
 Notes:
-  Execution node-job contract (schema_version 2, no earlier version is read):
+  Execution node-job contract (schema_version 1):
     - execution.cluster holds the validated derived fields concurrent_cases_per_node
       (site.cores_per_node // cores_per_case) and node_job_memory (<int>G, concurrent_cases_per_node
       * memory_per_case + node_memory_overhead), next to the computed cores_per_node, scheduler_kind and partition
     - A node job above node_memory_limit, or one whose node_job_wall_time does not exceed
       timeout_seconds plus 600 s, is rejected; the concurrency is never reduced silently
     - The COMSOL batch licence arguments and the scheduler allocation options are pipeline-owned
+    - A Dataset plan's campaign without an explicit max_admission_cases resolves submission.max_admission_cases to null
+      (derived from its rates); every other campaign keeps the validated positive integer
 
 """
 
@@ -30,7 +32,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final
@@ -54,8 +56,11 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 CONFIG_SCHEMA_VERSION = 1
-CANONICAL_CAMPAIGN_SCHEMA_VERSION = 1
-EXECUTION_SCHEMA_VERSION = 2
+CAMPAIGN_SCHEMA_VERSION = 1
+EXECUTION_SCHEMA_VERSION = 1
+COMMON_SCHEMA_VERSION = 1
+CONDITIONING_SCHEMA_VERSION = 1
+OPERATIONS_SCHEMA_VERSION = 1
 _MAX_FILESYSTEM_COMPONENT_BYTES = 255
 PROFILE_SCHEMA_VERSION = 1
 CANONICAL_HDF5_SCHEMA_VERSION = 1
@@ -66,7 +71,6 @@ _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL = 1.0e-4
 _MAXIMUM_TRANSIENT_INITIAL_STATE_ATOL = 1.0e-10
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_RTOL = 1.0e-5
 _MAXIMUM_TRANSIENT_BULK_MOISTURE_ATOL = 1.0e-9
-_STORAGE_COMPONENT_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
 _WALL_TIME_PATTERN = re.compile(r"([0-9]+):([0-5][0-9]):([0-5][0-9])")
 _SLURM_MEMORY_PATTERN = re.compile(r"([1-9][0-9]*)([MGT])")
 _SLURM_MEMORY_UNIT_MIB = {"M": 1, "G": 1_024, "T": 1_024 * 1_024}
@@ -183,31 +187,6 @@ def build_batch_id(batch_name: str, scientific_config_digest: str) -> str:
     return f"{name}__{scientific_config_digest[:16]}"
 
 
-def build_batch_storage_name(
-    simulation_profile: str,
-    material_family: str,
-    sampling_regime: str,
-    campaign_purpose: str,
-    scientific_config_digest: str,
-) -> str:
-    """Build the flat semantic storage locator for one scientific batch."""
-    components = {
-        "simulation_profile": simulation_profile,
-        "material_family": material_family,
-        "sampling_regime": sampling_regime,
-        "campaign_purpose": campaign_purpose,
-    }
-    for label, value in components.items():
-        common.paths.validate_logical_name(value, label=label)
-        if _STORAGE_COMPONENT_PATTERN.fullmatch(value) is None:
-            message = f"{label} must be one canonical lowercase underscore-separated token."
-            raise ValueError(message)
-    if _SHA256_PATTERN.fullmatch(scientific_config_digest) is None:
-        message = "scientific_config_digest must be one lowercase SHA-256 digest."
-        raise ValueError(message)
-    return "__".join((*components.values(), scientific_config_digest[:16]))
-
-
 def resolve_batch_locators(
     simulation_profile: str,
     material_family: str,
@@ -245,9 +224,9 @@ def resolve_batch_locators(
     """
     batch_name = build_batch_name(simulation_profile, material_family, sampling_regime)
     design = scientific.get("supplemental_design")
-    if not isinstance(design, Mapping) or design.get("schema_version") != CANONICAL_CAMPAIGN_SCHEMA_VERSION:
+    if design is None:
         return batch_name, sampling_regime
-    ordinal = design.get("candidate_ordinal")
+    ordinal = design.get("candidate_ordinal") if isinstance(design, Mapping) else None
     if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
         message = "Canonical replacement design has an invalid candidate ordinal."
         raise ValueError(message)
@@ -361,7 +340,6 @@ class CampaignConfig:
     dataset_packages: tuple[dict[str, Any], ...]
     duplicate_case_input_policy: str
     execution_values: dict[str, Any]
-    schema_version: int
     root_seed: int
     sampling_mode: str
     selected_targets: dict[str, int]
@@ -420,8 +398,7 @@ class CampaignConfig:
             for batch in self.batches
             if batch.profile.id == profile_id and batch.material_family == material_family and batch.sampling_regime == sampling_regime
         )
-        if self.schema_version == CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-            matches = tuple(batch for batch in matches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+        matches = tuple(batch for batch in matches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
         if len(matches) > 1:
             message = (
                 "Campaign batch identities are ambiguous for "
@@ -928,7 +905,10 @@ def _validate_storage(value: Any) -> dict[str, Any]:
         label="common.storage.converter_version",
         minimum=1,
     )
-    if storage["schema_version"] != CANONICAL_HDF5_SCHEMA_VERSION or storage["converter_version"] != CANONICAL_HDF5_CONVERTER_VERSION:
+    if (
+        not common.serialization.is_schema_version(storage["schema_version"], CANONICAL_HDF5_SCHEMA_VERSION)
+        or storage["converter_version"] != CANONICAL_HDF5_CONVERTER_VERSION
+    ):
         msg = f"Canonical storage must use schema {CANONICAL_HDF5_SCHEMA_VERSION} and converter {CANONICAL_HDF5_CONVERTER_VERSION!r}."
         raise GenerationConfigError(msg)
     if storage["compression"] != "gzip":
@@ -1045,7 +1025,9 @@ def _validate_common(
         "storage",
     }
     _exact_keys(common_config, required=expected, optional={"schedule_time", "schedule_time_provenance"}, label="generation common configuration")
-    if common_config["schema_kind"] != "generation_common" or common_config["schema_version"] != 1:
+    if common_config["schema_kind"] != "generation_common" or not common.serialization.is_schema_version(
+        common_config["schema_version"], COMMON_SCHEMA_VERSION
+    ):
         message = "Unsupported generation common configuration schema."
         raise GenerationConfigError(message)
     common_config["generator_version"] = _integer(
@@ -1147,7 +1129,7 @@ def _validate_steady_flow_conditioning(
     )
     if (
         conditioning["schema_kind"] != "steady_flow_conditioning"
-        or conditioning["schema_version"] != 1
+        or not common.serialization.is_schema_version(conditioning["schema_version"], CONDITIONING_SCHEMA_VERSION)
         or conditioning["exhaustive"] is not True
         or conditioning["stationary_solution_contract_id"] != "vp2_stationary_airflow_v1"
     ):
@@ -1307,7 +1289,7 @@ def _validate_profile_config(
     )
     if (
         config["schema_kind"] != "generation_profile"
-        or config["schema_version"] != PROFILE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(config["schema_version"], PROFILE_SCHEMA_VERSION)
         or config["simulation_profile"] != profile.id
     ):
         message = "Generation profile configuration schema or profile identity is invalid."
@@ -1437,7 +1419,9 @@ def _validate_operations(
         "parameter_values",
     }
     _exact_keys(operations, required=expected, optional=set(), label="generation operations configuration")
-    if operations["schema_kind"] != "generation_operations" or operations["schema_version"] != 1:
+    if operations["schema_kind"] != "generation_operations" or not common.serialization.is_schema_version(
+        operations["schema_version"], OPERATIONS_SCHEMA_VERSION
+    ):
         message = "Unsupported generation operations schema."
         raise GenerationConfigError(message)
     if operations["operation_id"] != "fixed_bed":
@@ -1792,11 +1776,10 @@ def _require_execution_schema(execution: Mapping[str, Any]) -> None:
     if execution.get("schema_kind") != "generation_execution":
         msg = "Unsupported generation execution configuration schema."
         raise GenerationConfigError(msg)
-    if execution.get("schema_version") != EXECUTION_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(execution.get("schema_version"), EXECUTION_SCHEMA_VERSION):
         msg = (
             f"Generation execution configuration schema_version {execution.get('schema_version')!r} is not supported; "
-            f"schema_version {EXECUTION_SCHEMA_VERSION} (node jobs: runtime.license_wait, cluster.node_jobs, cluster.memory_per_case, "
-            "cluster.node_job_wall_time) is required and no earlier version is read."
+            f"schema_version {EXECUTION_SCHEMA_VERSION} is required."
         )
         raise GenerationConfigError(msg)
 
@@ -1853,7 +1836,6 @@ def _apply_execution_overrides(value: Any, requested: Mapping[str, Any] | None) 
             license_wait = execution["runtime"]["license_wait"]
             license_wait["enabled"] = False
             license_wait["in_allocation_retry"]["enabled"] = False
-            execution["runtime"]["maximum_failed_cases"] = 1
     return execution
 
 
@@ -1899,7 +1881,6 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
         required={
             "timeout_seconds",
             "graceful_stop_reserve_seconds",
-            "maximum_failed_cases",
             "extra_arguments",
             "license_wait",
         },
@@ -1914,11 +1895,6 @@ def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
     if not 0.0 < runtime["graceful_stop_reserve_seconds"] < runtime["timeout_seconds"]:
         message = "execution.runtime.graceful_stop_reserve_seconds must be positive and shorter than timeout_seconds."
         raise GenerationConfigError(message)
-    runtime["maximum_failed_cases"] = _integer(
-        runtime["maximum_failed_cases"],
-        label="execution.runtime.maximum_failed_cases",
-        minimum=0,
-    )
     if "stall_stop" in runtime:
         runtime["stall_stop"] = _validated_stall_stop(runtime["stall_stop"])
     runtime["license_wait"] = _validated_license_wait(runtime["license_wait"])
@@ -2374,6 +2350,14 @@ def _validate_campaign_header(
 ) -> dict[str, Any]:
     """Validate one concise campaign and derive its canonical material union."""
     campaign = _mapping(value, label="generation campaign configuration")
+    if campaign.get("schema_kind") != "generation_source_campaign" or not common.serialization.is_schema_version(
+        campaign.get("schema_version"), CAMPAIGN_SCHEMA_VERSION
+    ):
+        message = (
+            f"Unsupported generation campaign schema in {source_path}: found {campaign.get('schema_kind')!r} version "
+            f"{campaign.get('schema_version')!r}, expected 'generation_source_campaign' version {CAMPAIGN_SCHEMA_VERSION}."
+        )
+        raise GenerationConfigError(message)
     required = {
         "schema_kind",
         "schema_version",
@@ -2387,10 +2371,7 @@ def _validate_campaign_header(
         "domain_profile",
         "sampling",
     }
-    _exact_keys(campaign, required=required, optional={"revision", "replacement_capacity"}, label="generation campaign configuration")
-    if campaign["schema_kind"] != "generation_source_campaign" or campaign["schema_version"] != 1:
-        message = "Unsupported generation campaign schema."
-        raise GenerationConfigError(message)
+    _exact_keys(campaign, required=required, optional={"revision", "minimum_success_rate"}, label="generation campaign configuration")
     campaign["campaign_purpose"] = "source_generation"
     _campaign_references(campaign, source_path=source_path)
     campaign["materials"] = _name_list(campaign["materials"], label="campaign.materials", allow_empty=False)
@@ -2420,7 +2401,6 @@ def _build_batch(
     execution: Mapping[str, Any],
     campaign_id: str,
     campaign_name: str,
-    campaign_schema_version: int,
     campaign_purpose: str,
     material_role: str,
     evaluation_regime: str,
@@ -2543,8 +2523,7 @@ def _build_batch(
         "available_learning_views": list(profile.available_learning_views),
         "airflow_source": profile.airflow_source,
     }
-    if campaign_schema_version == CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-        scientific["case_index_start"] = case_start
+    scientific["case_index_start"] = case_start
     if profile.id == profiles.TRANSIENT_DRYING_PROFILE:
         scientific.update(
             {
@@ -2573,18 +2552,10 @@ def _build_batch(
     scientific_digest = compute_scientific_config_digest(scientific)
     case_input_digest = compute_case_input_config_digest(scientific)
     batch_id = build_batch_id(batch_name, scientific_digest)
-    batch_storage_name = build_batch_storage_name(
-        profile.id,
-        material_family,
-        sampling_regime,
-        campaign_purpose,
-        scientific_digest,
-    )
-    if campaign_schema_version == CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-        batch_storage_name = f"source~{profile.id}~{campaign_name}~{material_family}~{sampling_regime}"
-        if len(batch_storage_name.encode("ascii")) > _MAX_FILESYSTEM_COMPONENT_BYTES:
-            message = "Canonical campaign batch locator exceeds the filesystem component limit."
-            raise GenerationConfigError(message)
+    batch_storage_name = f"source~{profile.id}~{campaign_name}~{material_family}~{sampling_regime}"
+    if len(batch_storage_name.encode("ascii")) > _MAX_FILESYSTEM_COMPONENT_BYTES:
+        message = "Campaign batch locator exceeds the filesystem component limit."
+        raise GenerationConfigError(message)
     return GenerationConfig(
         source_path=source_path,
         profile=profile,
@@ -2629,34 +2600,26 @@ def _apply_design_overrides(campaign: dict[str, Any], overrides: Mapping[str, An
         campaign["sampling"]["counts"]["natural"] = dict.fromkeys(campaign["materials"], count)
 
 
-def resolve_replacement_capacity(authored: Mapping[str, Any] | None, *, materials: Sequence[str]) -> dict[str, int]:
-    """Resolve the pre-registered replacement capacity per material; absent means zero.
-
-    Parameters
-    ----------
-    authored : Mapping[str, Any] | None
-        Authored campaign values, whose optional ``replacement_capacity`` maps a
-        material to its non-negative replacement count per original batch.
-    materials : Sequence[str]
-        The campaign's final materials; every capacity key must belong to them.
-
-    Returns
-    -------
-    dict[str, int]
-        An explicit capacity for every material.
+def validate_minimum_success_rate(value: Any, *, label: str) -> float:
+    """Return one admitted minimum success rate s, a real number with 0 < s <= 1 that is neither a boolean nor a mapping.
 
     Raises
     ------
     GenerationConfigError
-        If the mapping names an unselected material or a count is not a non-negative integer.
+        If ``value`` is not such a number.
 
     """
-    declared = _mapping({} if authored is None else authored.get("replacement_capacity", {}), label="campaign.replacement_capacity")
-    unknown = sorted(set(declared).difference(materials))
-    if unknown:
-        message = f"campaign.replacement_capacity names materials outside the campaign: {unknown}."
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0:
+        message = f"{label} must be a number s with 0 < s <= 1, got {value!r}."
         raise GenerationConfigError(message)
-    return {material: _integer(declared.get(material, 0), label=f"campaign.replacement_capacity.{material}", minimum=0) for material in materials}
+    return float(value)
+
+
+def authored_minimum_success_rate(authored: Mapping[str, Any] | None) -> float | None:
+    """Return the minimum success rate a Dataset plan pre-registers for every original batch, or ``None`` without one."""
+    if authored is None or "minimum_success_rate" not in authored:
+        return None
+    return validate_minimum_success_rate(authored["minimum_success_rate"], label="campaign.minimum_success_rate")
 
 
 def _validated_stall_stop(value: Any) -> dict[str, float]:
@@ -2716,10 +2679,10 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         message = f"Unsupported scientific run overrides: {sorted(unknown_overrides)}."
         raise GenerationConfigError(message)
     _apply_design_overrides(campaign, overrides)
-    if authored_value is None and "replacement_capacity" in campaign:
-        message = "replacement_capacity is pre-registered by a Dataset plan; add capacity to other campaigns with amend-replacements."
+    if authored_value is None and "minimum_success_rate" in campaign:
+        message = "minimum_success_rate is pre-registered by a Dataset plan; lower it for other campaigns with amend-replacements."
         raise GenerationConfigError(message)
-    resolve_replacement_capacity(campaign, materials=campaign["materials"])
+    plan_rate = authored_minimum_success_rate(campaign)
     registry_config = _load_yaml(
         campaign["registry_config"],
         label="generation parameter registry",
@@ -2772,8 +2735,10 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         campaign_purpose=campaign_purpose,
         execution_overrides=execution_overrides,
     )
+    if plan_rate is not None and "max_admission_cases" not in (execution_overrides or {}):
+        # Without an explicit cap a Dataset plan's campaign records none; it derives the cap from its batches' current rates.
+        execution["submission"]["max_admission_cases"] = None
     campaign_name = ""
-    campaign_schema_version = campaign["schema_version"]
 
     resolved_materials: dict[str, dict[str, Any]] = {}
     material_digests: dict[str, str] = {}
@@ -2908,9 +2873,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
                     material=resolved_materials[material_family],
                     sampling_regime=sampling_regime,
                     case_count=count,
-                    case_start=(
-                        material_case_offsets.get(material_family, 0) + 1 if campaign_schema_version == CANONICAL_CAMPAIGN_SCHEMA_VERSION else 1
-                    ),
+                    case_start=material_case_offsets.get(material_family, 0) + 1,
                     campaign_seed=campaign_seed,
                     sampling_method=str(sampling["method"]),
                     parameter_ood=parameter_ood,
@@ -2922,14 +2885,12 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
                     execution=execution,
                     campaign_id=campaign_id,
                     campaign_name=campaign_name,
-                    campaign_schema_version=campaign_schema_version,
                     campaign_purpose=campaign_purpose,
                     material_role=material_role,
                     evaluation_regime=evaluation_regime,
                 )
             )
-            if campaign_schema_version == CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-                material_case_offsets[material_family] = material_case_offsets.get(material_family, 0) + count
+            material_case_offsets[material_family] = material_case_offsets.get(material_family, 0) + count
     batch_names = [batch.batch_name for batch in batches]
     if len(batch_names) != len(set(batch_names)):
         message = "Campaign planned duplicate batch names."
@@ -3011,7 +2972,6 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         dataset_packages=dataset_packages,
         duplicate_case_input_policy=duplicate_case_input_policy,
         execution_values=execution,
-        schema_version=campaign["schema_version"],
         root_seed=campaign_seed,
         sampling_mode=str(sampling["method"]),
         selected_targets=selected_targets,
@@ -3076,64 +3036,6 @@ def discover_profile_template_identities(
         message = f"No maintained Generation profile templates were discovered under {profile_root}."
         raise ValueError(message)
     return dict(sorted(identities.items()))
-
-
-def discover_campaign_configs(
-    repository_root: Path | str | None = None,
-    *,
-    require_executable: bool = False,
-) -> tuple[CampaignConfig, ...]:
-    """
-    Discover Generation campaigns by schema kind in deterministic path order.
-
-    Parameters
-    ----------
-    repository_root : Path | str | None, optional
-        Repository tree to inspect. The configured project root is used by
-        default.
-    require_executable : bool, optional
-        Require every discovered campaign to pass executable mapping gates.
-
-    Returns
-    -------
-    tuple[CampaignConfig, ...]
-        Resolved campaigns ordered by repository-relative source path.
-
-    Notes
-    -----
-    Discovery is presentation-only. Source paths and discovery order do not
-    enter campaign scientific identity. Non-campaign YAML is ignored.
-
-    """
-    root = common.paths.get_project_root().resolve() if repository_root is None else Path(repository_root).expanduser().resolve()
-    if not root.is_dir():
-        message = f"Campaign discovery root is not a directory: {root}"
-        raise NotADirectoryError(message)
-    campaign_paths: list[Path] = []
-    for candidate in root.rglob("*.yaml"):
-        if not candidate.is_file() or candidate.is_symlink():
-            continue
-        try:
-            source = candidate.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        try:
-            raw = yaml.safe_load(source)
-        except yaml.YAMLError as error:
-            if "schema_kind: generation_source_campaign" in source:
-                message = f"Could not inspect declared Generation campaign {candidate}."
-                raise GenerationConfigError(message) from error
-            continue
-        if isinstance(raw, Mapping) and raw.get("schema_kind") == "generation_source_campaign":
-            campaign_paths.append(candidate.resolve())
-    campaign_paths.sort(key=lambda candidate: candidate.relative_to(root).as_posix())
-    return tuple(
-        load_campaign_config(
-            campaign_path,
-            require_executable=require_executable,
-        )
-        for campaign_path in campaign_paths
-    )
 
 
 def load_generation_config(

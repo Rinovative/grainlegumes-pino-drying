@@ -112,7 +112,7 @@ def validate_case_payload_schema(payload: dict[str, Any]) -> None:
     if missing or unknown:
         msg = f"case.json schema is invalid: missing={missing}, unknown={unknown}."
         raise ValueError(msg)
-    if payload["schema_kind"] != CASE_SCHEMA_KIND or payload["schema_version"] != CASE_SCHEMA_VERSION:
+    if payload["schema_kind"] != CASE_SCHEMA_KIND or not common.serialization.is_schema_version(payload["schema_version"], CASE_SCHEMA_VERSION):
         msg = "case.json schema kind or version is invalid."
         raise ValueError(msg)
     profile = payload["simulation_profile"]

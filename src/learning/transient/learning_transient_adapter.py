@@ -234,7 +234,6 @@ class TransientTrainingAdapter:
             msg = "work must be an OptimizerWork."
             raise TypeError(msg)
         self.spec.controller.record_completed_work(
-            successful=work.successful,
             optimizer_device_seconds=work.optimizer_device_seconds,
             microbatches=work.microbatches,
             processed_target_transitions=work.processed_target_transitions,
@@ -308,7 +307,6 @@ class TransientTrainingAdapter:
             "completed_stage_epochs": controller.completed_stage_epochs,
             "post_handoff_optimizer_device_seconds": controller.post_handoff_optimizer_device_seconds,
             "post_handoff_optimizer_steps": controller.post_handoff_optimizer_steps,
-            "successful_optimizer_steps": controller.successful_optimizer_steps,
             "processed_target_transitions": controller.processed_target_transitions,
             "forward_transitions": controller.forward_transitions,
             "wall_seconds": controller.wall_seconds,
@@ -564,11 +562,12 @@ def build_transient_training_adapter(
     *,
     scaling: Any,
     device: torch.device,
+    curriculum_seed: int,
     teacher_handoff: TeacherHandoffIdentity | None = None,
     matched_train_seconds: float | None = None,
     matched_receipt_sha256: str | None = None,
 ) -> TransientTrainingAdapter:
-    """Build one fresh task adapter from resolved transient runtime semantics."""
+    """Build one fresh task adapter from resolved transient runtime semantics and the arm's derived curriculum seed."""
     training = config.get("training")
     temporal = config.get("temporal")
     profile = config.get("input_profile")
@@ -635,7 +634,7 @@ def build_transient_training_adapter(
         controller=controller,
         gradient_accumulation_steps=int(training["gradient_accumulation_steps"]),
         curriculum=curriculum,
-        curriculum_seed=int(curriculum_data["seed"]),
+        curriculum_seed=curriculum_seed,
         trajectory_window=trajectory_window,
     )
     return TransientTrainingAdapter(tensorizer=TransientTensorizer(tensorizer_spec, scaling.to(device)), spec=spec)

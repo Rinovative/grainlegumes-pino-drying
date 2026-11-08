@@ -25,10 +25,13 @@ model:
       - 2
     - - 2
       - 2
+    lifting_channel_ratio: 2  # U-NO lifting width relative to hidden_channels.
+    projection_channel_ratio: 2  # U-NO projection width relative to hidden_channels.
     channel_mlp_skip: linear  # Channel-MLP skip connection type.
 
 optimizer:
-  lr: 0.0005319714363424885  # Initial learning rate; controls the optimizer update scale.
+  # Placeholder until the uno_a0_search study selects it.
+  lr: 0.0005319714363424885 # Initial learning rate; controls the optimizer update scale.
 
 training:
   a0:

@@ -14,13 +14,14 @@ Design principles:
   - No test contacts a real scheduler: fake Slurm executables precede every real one on PATH
 
 This module does NOT:
-  - Run COMSOL, the case launcher, or campaign and benchmark dispatch logic
+  - Run COMSOL, the case launcher, or campaign dispatch logic
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -330,7 +331,6 @@ def _release(harness: Harness, seq: int) -> None:
         {"env": {"GENERATION_X": "a,b"}},
         {"env": {"GENERATION_X": "a\0b"}},
         {"kind": "other"},
-        {"success_target": 0},
         {"seq": 0},
         {"seq": 1_000_000},
     ],
@@ -538,40 +538,6 @@ def test_free_cores_are_refilled_in_strict_sequence_order(harness: Harness) -> N
 
     result = run.execute(VirtualTime(hook))
     assert (result.reason, result.started, result.finished) == ("stop_ticket", 3, 3)
-
-
-def test_success_target_replaces_failed_candidates_and_skips_the_rest(harness: Harness) -> None:
-    """Only successes plus running steps below the target start; a failure frees its place, the target skips the rest."""
-    harness.write(*(harness.ticket(seq, cores=1, success_target=2) for seq in (1, 2, 3, 4)), harness.ticket(5, group=1, cores=1))
-    harness.stop(6)
-    run = Run(harness)
-
-    def hook(virtual: VirtualTime) -> None:
-        if virtual.sleeps == 3:
-            assert run.launches == [1, 2], "eight free cores, but two running candidates already cover the target"
-            run.processes[1].finish(7)
-            run.processes[2].finish()
-        if virtual.sleeps == 6:
-            assert run.launches == [1, 2, 3]
-            run.processes[3].finish()
-        if virtual.sleeps == 9:
-            assert run.launches == [1, 2, 3, 5]
-            run.processes[5].finish()
-
-    result = run.execute(VirtualTime(hook))
-    assert (result.reason, result.started, result.finished) == ("stop_ticket", 4, 4)
-    skipped = harness.finished(4)
-    assert (skipped["outcome"], skipped["started_at"], skipped["exit_code"]) == ("skipped", None, None)
-    assert harness.started() == [1, 2, 3, 5]
-    assert harness.exit_record()["skipped"] == 1
-
-
-def test_a_group_must_keep_one_success_target(harness: Harness) -> None:
-    """Tickets of one group that disagree on the success target stop the worker as invalid."""
-    harness.write(harness.ticket(1, success_target=2), harness.ticket(2, success_target=3))
-    harness.stop(3)
-    result = Run(harness).execute(VirtualTime())
-    assert result.reason == "invalid_ticket"
 
 
 def test_group_barrier_separates_core_variants(harness: Harness) -> None:
@@ -905,6 +871,10 @@ def test_cli_links_a_campaign_node_job_log_and_a_failed_link_keeps_the_exit_code
     assert "Warning: could not link job logs" in capsys.readouterr().err
 
 
+_DURATION = r"(?:\d+ s|\d+ min \d\d s|\d+ h \d\d min)"
+_ISO_WITH_ZONE = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d"
+
+
 def _run_case_step(monkeypatch: pytest.MonkeyPatch, case_job: Callable[..., Any]) -> int:
     """Run the run-campaign-case command of one lentil case with a test-owned case job."""
     monkeypatch.setattr(cli_generation.campaign_runtime, "run_campaign_case_job", case_job)
@@ -912,12 +882,11 @@ def _run_case_step(monkeypatch: pytest.MonkeyPatch, case_job: Callable[..., Any]
 
 
 def test_a_finished_case_step_ends_with_one_searchable_line(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """The outcome of a case step is one CASE END line with material, case, status, and duration, not a JSON record."""
+    """The outcome of a case step is one CASE END line with material, case, status, end time with zone and duration, not a JSON record."""
     assert _run_case_step(monkeypatch, lambda *_args, **_kwargs: SimpleNamespace(status="completed")) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert captured.out.startswith("CASE END lentil case_0003 completed ")
-    assert captured.out.count("\n") == 1
+    assert re.fullmatch(rf"CASE END lentil case_0003 completed at {_ISO_WITH_ZONE} after {_DURATION}\n", captured.out)
 
 
 def test_a_failed_case_step_names_its_reason_in_words_before_the_failure_record(
@@ -934,7 +903,7 @@ def test_a_failed_case_step_names_its_reason_in_words_before_the_failure_record(
     reason, record = captured.err.splitlines()
     assert reason == f"lentil case_0003 stopped: {failure}"
     assert json.loads(record)["message"] == failure
-    assert captured.out.startswith("CASE END lentil case_0003 failed ")
+    assert re.fullmatch(rf"CASE END lentil case_0003 failed at {_ISO_WITH_ZONE} after {_DURATION}: {failure}\n", captured.out)
 
 
 def test_a_classified_case_stop_is_stated_once_in_words_without_a_json_error_event(
@@ -949,7 +918,7 @@ def test_a_classified_case_stop_is_stated_once_in_words_without_a_json_error_eve
     assert _run_case_step(monkeypatch, fail) == 2
     captured = capsys.readouterr()
     assert captured.err.splitlines() == [f"lentil case_0003 stopped: {stalled}"]
-    assert captured.out.startswith("CASE END lentil case_0003 failed ")
+    assert re.fullmatch(rf"CASE END lentil case_0003 failed at {_ISO_WITH_ZONE} after {_DURATION}: {re.escape(stalled)}\n", captured.out)
 
 
 def test_an_unclassified_case_execution_error_keeps_its_json_error_event(
@@ -1113,24 +1082,18 @@ def _sinfo(stdout: str, returncode: int = 0) -> Callable[[Any], subprocess.Compl
 _MIXED_NODES = "hpc02|32\nhpc01|32\nhpc10|64\nhpc12|36\nhpc09|16\nhpc10|64\n\nhpc11|128\n"
 
 
-def test_standard_node_exclusions_exact_return_the_other_node_types() -> None:
-    """Exact matching excludes every node whose CPU count differs from the node type, sorted and unique."""
-    assert cluster.standard_node_exclusions("standard", 32, match="exact", sinfo=_sinfo(_MIXED_NODES)) == ["hpc09", "hpc10", "hpc11", "hpc12"]
-    assert cluster.standard_node_exclusions("standard", 32, match="exact", sinfo=_sinfo("hpc01|32\n")) == []
-
-
-def test_standard_node_exclusions_at_least_keep_the_larger_nodes() -> None:
-    """At-least matching excludes only the nodes with fewer CPUs than the node type."""
-    assert cluster.standard_node_exclusions("standard", 32, match="at_least", sinfo=_sinfo(_MIXED_NODES)) == ["hpc09"]
-    assert cluster.standard_node_exclusions("standard", 32, match="at_least", sinfo=_sinfo("hpc01|36\n")) == []
+def test_standard_node_exclusions_keep_the_larger_nodes() -> None:
+    """Only the nodes with fewer CPUs than the node job requests are excluded, sorted and unique."""
+    assert cluster.standard_node_exclusions("standard", 32, sinfo=_sinfo(_MIXED_NODES)) == ["hpc09"]
+    assert cluster.standard_node_exclusions("standard", 32, sinfo=_sinfo("hpc01|36\n")) == []
 
 
 @pytest.mark.parametrize(
     ("stdout", "returncode", "match"),
     [
         ("hpc01|32\n", 1, "status 1"),
-        ("hpc01|64\n", 0, "no node with exactly 32"),
-        ("", 0, "no node with exactly 32"),
+        ("hpc01|16\nhpc02|24\n", 0, "no node with at least 32"),
+        ("", 0, "no node with at least 32"),
         ("hpc01 32\n", 0, "malformed"),
         ("hpc01|many\n", 0, "malformed"),
         ("hpc01|32|x\n", 0, "malformed"),
@@ -1139,15 +1102,9 @@ def test_standard_node_exclusions_at_least_keep_the_larger_nodes() -> None:
     ],
 )
 def test_standard_node_exclusions_fail_closed(stdout: str, returncode: int, match: str) -> None:
-    """A failing or ambiguous sinfo, or a partition without the node type, is an error."""
+    """A failing or ambiguous sinfo, or a partition without a large enough node, is an error."""
     with pytest.raises(RuntimeError, match=match):
-        cluster.standard_node_exclusions("standard", 32, match="exact", sinfo=_sinfo(stdout, returncode))
-
-
-def test_standard_node_exclusions_at_least_fail_closed_when_every_node_is_smaller() -> None:
-    """At-least matching refuses a partition whose nodes all have fewer CPUs than the node type."""
-    with pytest.raises(RuntimeError, match="no node with at least 32"):
-        cluster.standard_node_exclusions("standard", 32, match="at_least", sinfo=_sinfo("hpc01|16\nhpc02|24\n"))
+        cluster.standard_node_exclusions("standard", 32, sinfo=_sinfo(stdout, returncode))
 
 
 def test_standard_node_exclusions_report_a_missing_sinfo_and_reject_bad_arguments() -> None:
@@ -1157,12 +1114,9 @@ def test_standard_node_exclusions_report_a_missing_sinfo_and_reject_bad_argument
         message = "no sinfo"
         raise FileNotFoundError(message)
 
-    unknown_rule: Any = "atleast"
     with pytest.raises(RuntimeError, match="no sinfo"):
-        cluster.standard_node_exclusions("standard", 32, match="exact", sinfo=missing)
+        cluster.standard_node_exclusions("standard", 32, sinfo=missing)
     with pytest.raises(ValueError, match="Partition"):
-        cluster.standard_node_exclusions("a b", 32, match="exact", sinfo=_sinfo(""))
+        cluster.standard_node_exclusions("a b", 32, sinfo=_sinfo(""))
     with pytest.raises(ValueError, match="cores_per_node"):
-        cluster.standard_node_exclusions("standard", 0, match="exact", sinfo=_sinfo(""))
-    with pytest.raises(ValueError, match="match"):
-        cluster.standard_node_exclusions("standard", 32, match=unknown_rule, sinfo=_sinfo(""))
+        cluster.standard_node_exclusions("standard", 0, sinfo=_sinfo(""))

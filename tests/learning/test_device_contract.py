@@ -1,8 +1,7 @@
 """Protect shared requested-versus-resolved runtime device behavior at every boundary.
 
 Responsibilities:
-  - Check requested/resolved devices, CPU silence, fallback, precision, and immutable resume
-    admission
+  - Check requested/resolved devices, CPU silence, fallback, and immutable resume admission
 
 Design principles:
   - Explicit hardware failure never silently falls back or mutates saved runs
@@ -145,18 +144,6 @@ def test_invalid_device_values_fail_at_the_exact_semantic_path() -> None:
             configs.resolve(raw)
 
 
-def test_cpu_mixed_precision_is_rejected_before_scaler_construction() -> None:
-    """
-    Validate mixed precision against one resolved CPU device.
-
-    The boundary must reject it before scaler construction because the maintained
-    training contract implements AMP only for CUDA.
-    """
-    resolution = learning.device.resolve_device("cpu")
-    with pytest.raises(learning.device.DeviceResolutionError, match="CPU autocast is not supported"):
-        learning.device.validate_mixed_precision_device(True, resolution)
-
-
 def test_cuda_determinism_policy_is_operation_aware_and_never_mutates_config() -> None:
     """Reject known strict CUDA conflicts while admitting supported effective operations."""
     cuda = _mock_cuda_resolution()
@@ -172,10 +159,7 @@ def test_cuda_determinism_policy_is_operation_aware_and_never_mutates_config() -
 
     spectral_raw = configs.direct_config(model_kind="fno", physics_enabled=True)
     spectral_raw["run"]["deterministic"] = True
-    spectral_raw["loss"]["physics"]["derivatives"] = {
-        "kind": "spectral",
-        "extension": "fourier_continuation",
-    }
+    spectral_raw["loss"]["physics"]["derivatives"] = {"kind": "spectral"}
     spectral = configs.resolve(spectral_raw)
     experiments.run.validate_deterministic_model_device_policy(spectral, cuda)
     assert spectral["run"]["deterministic"] is True

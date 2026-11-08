@@ -14,42 +14,27 @@ Design principles:
 This module does NOT:
   - Relax Source, Dataset, reference, scaling or grid admission
   - Clamp predictions, run models or publish sequence payloads
+  - Own the status vocabulary and channel count format shared with steady flow
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from numbers import Integral, Real
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, cast
 
 import numpy as np
 
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
-PREDICTION_VALIDITY_SCHEMA_VERSION: Final = 2
-VALID: Final = "VALID"
-FINITE_BUT_PHYSICALLY_INVALID: Final = "FINITE_BUT_PHYSICALLY_INVALID"
-NONFINITE: Final = "NONFINITE"
-PredictionValidityStatus = Literal[
-    "VALID",
-    "FINITE_BUT_PHYSICALLY_INVALID",
-    "NONFINITE",
-]
-PREDICTION_VALIDITY_STATUSES: Final[tuple[PredictionValidityStatus, ...]] = (
-    VALID,
-    FINITE_BUT_PHYSICALLY_INVALID,
-    NONFINITE,
-)
+from . import evaluation_prediction_validity as validity_contract
+
 STATE_ORDER: Final = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
 TEMPERATURE_RANGE_K: Final = (0.0, 2_000.0)
 PHI_RANGE: Final = (0.0, 1.10)
 EXCLUDED_CORNER_BLOCK: Final = 2
-_STATUS_PRECEDENCE: Final = {
-    VALID: 0,
-    FINITE_BUT_PHYSICALLY_INVALID: 1,
-    NONFINITE: 2,
-}
+_STATUS_PRECEDENCE: Final[dict[str, int]] = {status: rank for rank, status in enumerate(validity_contract.PREDICTION_VALIDITY_STATUSES)}
 _STAGE_NAMES: Final = (
     "raw_scaled_model_output",
     "decoded_physical_increment",
@@ -130,23 +115,12 @@ def _channel_counts(
     *,
     physical_invalid: np.ndarray | None,
 ) -> dict[str, dict[str, int]]:
-    """Count exact computed values per channel without filtering."""
-    counts: dict[str, dict[str, int]] = {}
-    for channel_index, channel in enumerate(STATE_ORDER):
-        values = array[available, channel_index]
-        finite = np.isfinite(values)
-        channel_counts = {
-            "total_value_count": int(values.size),
-            "finite_value_count": int(finite.sum()),
-            "nonfinite_value_count": int((~finite).sum()),
-            "nan_count": int(np.isnan(values).sum()),
-            "positive_infinity_count": int(np.isposinf(values).sum()),
-            "negative_infinity_count": int(np.isneginf(values).sum()),
-        }
-        if physical_invalid is not None:
-            channel_counts["physically_invalid_finite_count"] = int(physical_invalid[available, channel_index].sum())
-        counts[channel] = channel_counts
-    return counts
+    """Count exact computed values per state channel without filtering."""
+    return validity_contract.channel_counts(
+        array[available],
+        STATE_ORDER,
+        physical_invalid=None if physical_invalid is None else physical_invalid[available],
+    )
 
 
 def _first_invalid(
@@ -167,7 +141,7 @@ def _first_invalid(
             if locations.size:
                 channel, y_index, x_index = (int(item) for item in locations[0])
                 return {
-                    "kind": "NONFINITE",
+                    "kind": validity_contract.NONFINITE,
                     "stage": stage_name,
                     "mode": mode,
                     "origin_index": origin_index,
@@ -182,7 +156,7 @@ def _first_invalid(
         if locations.size:
             channel, y_index, x_index = (int(item) for item in locations[0])
             return {
-                "kind": "FINITE_BUT_PHYSICALLY_INVALID",
+                "kind": validity_contract.FINITE_BUT_PHYSICALLY_INVALID,
                 "stage": "reconstructed_state",
                 "mode": mode,
                 "origin_index": origin_index,
@@ -239,11 +213,11 @@ def build_prediction_validity(
     nonfinite_count = sum(int((~np.isfinite(values[available])).sum()) for _name, values in stages)
     physical_invalid_count = int(physical_invalid[available].sum())
     if nonfinite_count:
-        status: PredictionValidityStatus = NONFINITE
+        status: validity_contract.PredictionValidityStatus = validity_contract.NONFINITE
     elif physical_invalid_count:
-        status = FINITE_BUT_PHYSICALLY_INVALID
+        status = validity_contract.FINITE_BUT_PHYSICALLY_INVALID
     else:
-        status = VALID
+        status = validity_contract.VALID
     computed_steps = int(available.sum())
     uncomputed_steps = len(available) - computed_steps
     if uncomputed_steps and not nonfinite_count:
@@ -261,7 +235,7 @@ def build_prediction_validity(
         for name, values in stages
     }
     result = {
-        "schema_version": PREDICTION_VALIDITY_SCHEMA_VERSION,
+        "schema_version": validity_contract.PREDICTION_VALIDITY_SCHEMA_VERSION,
         "status": status,
         "count_scope": "all_evaluation_grid_cells_in_computed_model_outputs",
         "mode": mode,
@@ -284,13 +258,6 @@ def build_prediction_validity(
     }
     common.serialization.canonical_json_sha256(result)
     return result
-
-
-def _require_schema_version(version: Any) -> None:
-    """Reject superseded or unknown validity schema versions."""
-    if version != PREDICTION_VALIDITY_SCHEMA_VERSION:
-        msg = f"Prediction validity schema_version {version!r} is unsupported; expected {PREDICTION_VALIDITY_SCHEMA_VERSION}."
-        raise ValueError(msg)
 
 
 def validate_prediction_validity_document(  # noqa: C901, PLR0912
@@ -319,9 +286,9 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
     if set(document) != required:
         msg = "Prediction validity fields do not match the schema."
         raise ValueError(msg)
-    _require_schema_version(document["schema_version"])
+    validity_contract.require_schema_version(document["schema_version"])
     if (
-        document["status"] not in PREDICTION_VALIDITY_STATUSES
+        document["status"] not in validity_contract.PREDICTION_VALIDITY_STATUSES
         or document["count_scope"] != "all_evaluation_grid_cells_in_computed_model_outputs"
         or not isinstance(document["mode"], str)
         or not document["mode"]
@@ -342,44 +309,6 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         msg = "Prediction validity step counts are contradictory."
         raise ValueError(msg)
 
-    def admit_channels(
-        raw: Any,
-        *,
-        physical_validity_defined: bool,
-    ) -> dict[str, Any]:
-        if not isinstance(raw, Mapping) or set(raw) != set(STATE_ORDER):
-            msg = "Prediction validity channels do not match state order."
-            raise ValueError(msg)
-        expected_fields = {
-            "total_value_count",
-            "finite_value_count",
-            "nonfinite_value_count",
-            "nan_count",
-            "positive_infinity_count",
-            "negative_infinity_count",
-        }
-        if physical_validity_defined:
-            expected_fields.add("physically_invalid_finite_count")
-        result: dict[str, Any] = {}
-        for channel in STATE_ORDER:
-            counts = raw[channel]
-            if (
-                not isinstance(counts, Mapping)
-                or set(counts) != expected_fields
-                or any(isinstance(item, bool) or not isinstance(item, Integral) or int(item) < 0 for item in counts.values())
-            ):
-                msg = "Prediction validity channel counts are invalid."
-                raise ValueError(msg)
-            if (
-                counts["total_value_count"] != counts["finite_value_count"] + counts["nonfinite_value_count"]
-                or counts["nonfinite_value_count"] != counts["nan_count"] + counts["positive_infinity_count"] + counts["negative_infinity_count"]
-                or (physical_validity_defined and counts["physically_invalid_finite_count"] > counts["finite_value_count"])
-            ):
-                msg = "Prediction validity channel count arithmetic is invalid."
-                raise ValueError(msg)
-            result[channel] = dict(counts)
-        return result
-
     stages = document["stages"]
     if not isinstance(stages, Mapping) or set(stages) != set(_STAGE_NAMES):
         msg = "Prediction validity stages do not match the schema."
@@ -397,15 +326,9 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
             raise ValueError(msg)
         admitted_stages[stage_name] = {
             "physical_validity_defined": defined,
-            "channels": admit_channels(
-                stage["channels"],
-                physical_validity_defined=defined,
-            ),
+            "channels": validity_contract.admit_channel_counts(stage["channels"], STATE_ORDER, physical_validity_defined=defined),
         }
-    channels = admit_channels(
-        document["channels"],
-        physical_validity_defined=True,
-    )
+    channels = validity_contract.admit_channel_counts(document["channels"], STATE_ORDER, physical_validity_defined=True)
     if channels != admitted_stages["reconstructed_state"]["channels"]:
         msg = "Prediction validity reconstructed channel counts disagree."
         raise ValueError(msg)
@@ -424,12 +347,16 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
     if document["uncomputed_step_count"] and not total_nonfinite:
         msg = "Prediction validity uncomputed tails require preserved non-finite evidence."
         raise ValueError(msg)
-    expected_status = NONFINITE if total_nonfinite else (FINITE_BUT_PHYSICALLY_INVALID if total_physical else VALID)
+    expected_status = (
+        validity_contract.NONFINITE
+        if total_nonfinite
+        else (validity_contract.FINITE_BUT_PHYSICALLY_INVALID if total_physical else validity_contract.VALID)
+    )
     if document["status"] != expected_status:
         msg = "Prediction validity status contradicts its counts."
         raise ValueError(msg)
     first = document["first_invalid"]
-    if expected_status == VALID:
+    if expected_status == validity_contract.VALID:
         if first is not None:
             msg = "Valid prediction evidence cannot identify an invalid value."
             raise ValueError(msg)
@@ -448,7 +375,7 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
             "channel_index",
             "spatial_index",
         }
-        or first["kind"] not in {NONFINITE, FINITE_BUT_PHYSICALLY_INVALID}
+        or first["kind"] not in {validity_contract.NONFINITE, validity_contract.FINITE_BUT_PHYSICALLY_INVALID}
         or first["stage"] not in _STAGE_NAMES
         or first["mode"] != document["mode"]
         or first["origin_index"] != document["origin_index"]
@@ -477,7 +404,7 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
             msg = "Prediction validity first-invalid sequence coordinates are invalid."
             raise ValueError(msg)
         stage_counts = admitted_stages[str(first["stage"])]["channels"][str(first["channel"])]
-        if first["kind"] == NONFINITE:
+        if first["kind"] == validity_contract.NONFINITE:
             if stage_counts["nonfinite_value_count"] < 1:
                 msg = "Prediction validity first non-finite value lacks counted evidence."
                 raise ValueError(msg)
@@ -588,7 +515,7 @@ def validate_persisted_state_prediction_validity(
     )
     state_stage = first["stage"] == "reconstructed_state"
     # A raw or decoded non-finite value always reaches the state at the same element.
-    upstream_reaches_state = first["kind"] == NONFINITE and not bool(
+    upstream_reaches_state = first["kind"] == validity_contract.NONFINITE and not bool(
         np.isfinite(states[(step - 1, STATE_ORDER.index(first["channel"]), *first["spatial_index"])])
     )
     # A persisted NaN was a raw NaN at the same element, so the earliest one bounds the writer's
@@ -615,7 +542,7 @@ def aggregate_case_prediction_validity(
         raise ValueError(msg)
     admitted = [validate_prediction_validity_document(record) for record in records]
     status = cast(
-        "PredictionValidityStatus",
+        "validity_contract.PredictionValidityStatus",
         max(
             (str(value["status"]) for value in admitted),
             key=_STATUS_PRECEDENCE.__getitem__,
@@ -663,7 +590,7 @@ def aggregate_case_prediction_validity(
         )
     )
     result = {
-        "schema_version": PREDICTION_VALIDITY_SCHEMA_VERSION,
+        "schema_version": validity_contract.PREDICTION_VALIDITY_SCHEMA_VERSION,
         "case_id": case_id,
         "status": status,
         "unique_prediction_chain_count": len(admitted),

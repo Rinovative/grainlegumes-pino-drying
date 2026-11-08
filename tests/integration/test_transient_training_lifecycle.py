@@ -3,6 +3,7 @@
 Responsibilities:
   - Exercise compact transient packages, scaling, A0/B/A1 lifecycle, A0 budget identity, and model optimizer paths
   - Exercise best-checkpoint payload kinds and the refusal of non-completed B runs for evaluation
+  - Exercise one real A0 Optuna trial whose study signature equals the dry run's and whose trial and history validate
 
 Design principles:
   - Persisted PT data and explicit conditioning survive canonical source removal
@@ -19,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import torch
 import yaml
-from support import configs
+from support import configs, optuna_trials, run_state
 from support.generation_fixtures import successful_source_case
 from torch.optim.adamw import AdamW
 
@@ -112,7 +113,7 @@ def test_steady_selection_reuses_matching_sources_and_rejects_fixed_conditioning
     def request(name: str, sources: list[dict[str, str]]) -> dict[str, Any]:
         return {
             "schema_kind": "dataset_selection_request",
-            "schema_version": 2,
+            "schema_version": selection.SELECTION_SCHEMA_VERSION,
             "source_task": "steady_flow",
             "dataset_name": name,
             "dataset_view": "steady_flow",
@@ -205,9 +206,10 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
     assert receipt["publication_identity"] == {
         "dataset_id": id_dataset_id,
         "dataset_digest": manifest["dataset_digest"],
-        "manifest_sha256": receipt["package_manifest_sha256"],
         "index_digest": receipt["index_digest"],
     }
+    receipt_path = datasets.packages.transient_shards.transient_shard_directory(id_dataset_id, storage_root=root) / "receipt.json"
+    assert manifest["derived_payload_sha256"] == common.serialization.file_sha256(receipt_path)
     assert receipt["transition_count"] >= 2
     tensorizer = TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none"))
     loaders = datasets.runtime.transient_training.create_transient_training_loaders(
@@ -215,19 +217,16 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
         additional_evaluation_dataset_ids=[],
         tensorizer=tensorizer,
         train_sampling=one_step,
-        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0, hdf5_cache_size=0),
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        model_sha256="a" * 64,
         storage_root=str(root),
-        transient_backend_preference="pt_shards",
-        transient_backend_required=True,
-        additional_evaluation_fraction=1.0,
     )
     try:
-        assert loaders.runtime_provenance["train"] == "pt_shards"
-        assert loaders.scaling_artifact.spatial_shape == (16, 16)
+        assert loaders.data_processor.spatial_shape == (16, 16)
         assert loaders.split["roles"]["train"]["case_ids"] == transient_package["case_partition"]["train"]
         assert loaders.split["roles"]["id_test"]["case_ids"] == transient_package["case_partition"]["id_test"]
         assert loaders.additional_evaluation is None
-        assert loaders.dataset_identity["train"]["dataset_id"] == id_dataset_id
+        assert loaders.split["dataset_identity"]["train"]["dataset_id"] == id_dataset_id
     finally:
         for value in (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test):
             if value is not None:
@@ -243,19 +242,11 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
 
     campaign = transient_package["source_campaign"]
     selectors = transient_package["source_selectors"]
-    ranked = list(
-        selection.select_ranked_cases(
-            "transient_drying",
-            [campaign],
-            {"lentil": 4},
-            root_seed=31,
-            storage_root=root,
-        )
-    )
-    method = {"kind": "seed_ranked", "root_seed": 31, "source_names": [campaign], "target_counts": {"lentil": 4}}
+    ranked = list(selection.select_ordered_cases("transient_drying", [campaign], {"lentil": 4}, storage_root=root))
+    method = {"kind": "design_order", "source_names": [campaign], "target_counts": {"lentil": 4}}
     ranked_request = {
         "schema_kind": "dataset_selection_request",
-        "schema_version": 2,
+        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "transient_drying",
         "dataset_name": "transient_ranked_lifecycle",
         "dataset_view": "transient_drying",
@@ -265,20 +256,6 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
     published_ranked = datasets.packages.build_dataset_selection(ranked_request, storage_root=root)
     assert published_ranked["status"] == "complete"
     assert datasets.packages.load_package_manifest("transient_drying", published_ranked["dataset_id"], storage_root=root)["selection"] == method
-    other_seed = next(
-        seed
-        for seed in range(32, 100)
-        if list(
-            selection.select_ranked_cases(
-                "transient_drying",
-                [campaign],
-                {"lentil": 4},
-                root_seed=seed,
-                storage_root=root,
-            )
-        )
-        != ranked
-    )
     excluded = next(reference for reference in selectors if reference not in ranked)
     substituted = [*ranked[:-1], excluded]
     for position, change in enumerate(
@@ -286,14 +263,15 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
             {"source_cases": list(reversed(ranked))},
             {"source_cases": substituted},
             {"selection": {**method, "target_counts": {"lentil": 3}}},
-            {"selection": {**method, "root_seed": other_seed}},
         )
     ):
-        # A fresh name reaches the ranked-claim check instead of the name-binding guard.
+        # A fresh name reaches the ordered-claim check instead of the name-binding guard.
         claimed = {**ranked_request, **change, "dataset_name": f"transient_ranked_false_claim_{position}"}
-        with pytest.raises(ValueError, match="Seed-ranked Dataset source cases disagree"):
+        with pytest.raises(ValueError, match="Design-order Dataset source cases disagree"):
             datasets.packages.build_dataset_selection(claimed, storage_root=root)
-    monkeypatch.setattr(selection, "select_ranked_cases", lambda *_args, **_kwargs: pytest.fail("immutable reuse recomputed the changed source pool"))
+    monkeypatch.setattr(
+        selection, "select_ordered_cases", lambda *_args, **_kwargs: pytest.fail("immutable reuse recomputed the changed source pool")
+    )
     reused_ranked = datasets.packages.build_dataset_selection(ranked_request, storage_root=root)
     assert reused_ranked["dataset_id"] == published_ranked["dataset_id"]
     assert reused_ranked["status"] == "reused"
@@ -316,7 +294,6 @@ def _authored_fno_plan(
             "train_dataset": train_dataset,
             "additional_evaluation_datasets": [],
             "batch_size": 2,
-            "transient_backend_required": True,
         }
     )
     raw["model"]["params"].update({"n_modes": [8, 8], "hidden_channels": 8, "n_layers": 1, "lifting_channel_ratio": 1, "projection_channel_ratio": 1})
@@ -330,7 +307,7 @@ def _authored_fno_plan(
             "train_seconds": train_seconds,
             "lr_scale": lr_scale,
             "sampling": {"mode": "rollout_window", "rollout_length": 2, "window_stride": 1, "window_offset": 0},
-            "curriculum": {"lengths": [2], "milestone_fractions": [0.0], "seed": 9},
+            "curriculum": {"lengths": [2], "milestone_fractions": [0.0]},
         }
     )
     raw["training"]["a1"].update({"max_epochs": 64, "lr_scale": lr_scale})
@@ -379,6 +356,8 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     )
     assert manifest["model_kind"] == "fno"
     assert b_summary["status"] == "completed"
+    assert a_summary["seed_plan"] == b_summary["seed_plan"] == a1_summary["seed_plan"]
+    assert a_summary["seed_plan"]["curriculum_a0"] != a_summary["seed_plan"]["curriculum_b"]
     assert b_summary["terminal_controller"]["budget_control"] == "train_seconds"
     assert b_summary["terminal_controller"]["budget_complete"] is True
     assert b_summary["terminal_controller"]["train_seconds"] > 0
@@ -386,7 +365,7 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     assert b_summary["terminal_controller"]["post_handoff_optimizer_steps"] == 1
     assert b_summary["terminal_controller"]["best_within_budget_metric"] == b_summary["best_metric"]
     assert b_summary["terminal_controller"]["best_within_budget_epoch"] + 1 == b_summary["best_epoch"]
-    assert b_summary["global_step"] == b_summary["terminal_controller"]["successful_optimizer_steps"]
+    assert b_summary["global_step"] == b_summary["terminal_controller"]["post_handoff_optimizer_steps"]
     assert b_summary["global_step"] == 1
     assert a_summary["global_step"] >= 1
     assert b_summary["terminal_curriculum"]["draw_index"] > 0
@@ -407,6 +386,27 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
         a0_dir=a0_dir,
         config=a0["config"],
     )
+
+
+def test_a0_optuna_trial_records_the_dry_run_signature_and_validates_its_history(
+    transient_package: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-trial A0 study binds the Dataset evidence of its dry run; its trial is admitted with its epoch history."""
+    monkeypatch.setenv("STORAGE_ROOT", str(transient_package["root"]))
+    request = configs.optuna_transient_a0_config()
+    request["study"].update(n_trials=1, pruner={"kind": "none"})
+    request["experiment"]["data"]["train_dataset"] = transient_package["train_dataset"]
+    request["experiment"]["training"]["epochs"] = 1
+    request["experiment"]["training"]["stage_schedule"]["total_epochs"] = 1
+    request["search_space"] = {"optimizer.lr": {"name": "learning_rate", "kind": "float", "low": 1.0e-3, "high": 2.0e-3, "log": True}}
+
+    completed = optuna_trials.run_one_trial_study(request, directory=tmp_path)
+
+    (completed["run_dir"] / "history.json").unlink()
+    with pytest.raises(experiments.run.RunLifecycleError, match="history"):
+        experiments.run.validate_completed_run(completed["run_dir"])
 
 
 def _saved_learning_rates(run_dir: Path) -> tuple[float, float]:
@@ -461,6 +461,17 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
     assert first["result"]["status"] == "budget_unmet"
     assert first["result"]["global_step"] == 1
     assert _saved_learning_rates(b_dir) == pytest.approx((restored_rate * _LR_SCALE,) * 2)
+    # B counts its own work from zero; A0's committed groups are not carried across the handoff.
+    first_work = experiments.run.read_run_summary(b_dir)["training_work"]
+    assert first_work["optimizer_steps"] == 1
+    assert first_work["gradient_predictions"] > 0
+    with monkeypatch.context() as drift:
+        # An A0 trained by other training code is no longer a valid teacher for continuing B.
+        run_state.drift_training_code(drift, "transient_drying")
+        before_drift = {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()}
+        with pytest.raises(ValueError, match=r"A0 .*: training_transient_drying implementation changed"):
+            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir, max_steps=2)
+        assert {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()} == before_drift
     with monkeypatch.context() as interruption:
         interruption.setattr(learning.training.loop, "train_loop", _interrupt_training)
         with pytest.raises(KeyboardInterrupt):
@@ -470,6 +481,9 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
 
     assert resumed["result"]["status"] == "budget_unmet"
     assert resumed["result"]["global_step"] == 2
+    resumed_work = experiments.run.read_run_summary(b_dir)["training_work"]
+    assert resumed_work["optimizer_steps"] == 2
+    assert resumed_work["gradient_predictions"] > first_work["gradient_predictions"]
     assert _saved_learning_rates(b_dir) == pytest.approx((restored_rate * _LR_SCALE,) * 2)
     # One batch per epoch: the resumed second step ends at B's epoch cap, which validates and selects a best.
     assert resumed["result"]["best_epoch"] == 2
@@ -496,7 +510,6 @@ def _resolved_direct_model_config(
             "train_dataset": train_dataset,
             "additional_evaluation_datasets": [],
             "batch_size": 1,
-            "transient_backend_required": True,
         }
     )
     resolved["scheduler"] = None
@@ -515,7 +528,7 @@ def _resolved_direct_model_config(
         resolved["temporal"]["sampling"] = {"mode": "trajectory", "rollout_length": 2}
         resolved["training"].update(
             {
-                "curriculum": {"lengths": [2], "milestone_fractions": [0.0], "seed": 9},
+                "curriculum": {"lengths": [2], "milestone_fractions": [0.0]},
             }
         )
         resolved["model"]["params"].update({"n_modes": [8, 8], "hidden_channels": 4, "n_layers": 1})
@@ -543,18 +556,17 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
         additional_evaluation_dataset_ids=config["data"]["additional_evaluation_datasets"],
         tensorizer=tensorizer,
         train_sampling=sampling,
-        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0, hdf5_cache_size=0),
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        model_sha256="a" * 64,
         storage_root=str(root),
-        transient_backend_preference="pt_shards",
-        transient_backend_required=True,
-        additional_evaluation_fraction=1.0,
     )
     device = learning.device.resolve_device("cuda").device
     try:
         adapter = transient_adapter.build_transient_training_adapter(
             config,
-            scaling=loaders.scaling_artifact,
+            scaling=loaders.data_processor,
             device=device,
+            curriculum_seed=9,
         )
         raw_batch = next(iter(loaders.train))
         batch = adapter.prepare_batch(raw_batch, device=device, training=True)

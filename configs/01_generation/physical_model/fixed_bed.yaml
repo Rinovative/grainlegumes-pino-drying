@@ -20,7 +20,7 @@ boundary_schedule:
     max_relative_humidity: 0.90
 # Named operation/profile coordinates with natural and optional parameter-OOD supports. Nominals and supports use each registry transform.
 parameter_values:
-  # Mean inlet-pressure level; its unit and transform are declared by the parameter registry.
+  # Base inlet-pressure level (inlet profile = this value * (1 + shape)); its unit and transform are declared by the parameter registry.
   pressure_bc.mean:
     lower: 250.0
     upper: 750.0
@@ -132,7 +132,7 @@ parameter_values:
       source_refs:
       - pino_airflow_project
       note: Potentially weak after component aggregation; the narrow near-zero tail is rejected.
-  # First-order vertical inlet-pressure trend amplitude.
+  # Amplitude of the linear inlet-pressure trend along x on the inlet edge.
   pressure_bc.linear_amp:
     lower: -0.03
     upper: 0.03
@@ -460,20 +460,22 @@ parameter_values:
       source_refs:
       - pino_airflow_project
       note: May be visually weak after normalization; sentinel field test required.
-  # Upper anisotropy ratio of the permeability tensor.
+  # Principal-permeability ratio at unit strength: local r = 1 + strength*(max_ratio - 1)*|b|^exponent, |b| <= 1; k1 = kappa*sqrt(r), k2 = kappa/sqrt(r), k1/k2 = r.
   permeability.anisotropy.max_ratio:
     lower: 1.2
-    upper: 3.0
+    upper: 2.2
     ood:
-    - lower: 3.8
-      upper: 5.0
-    nominal: 2.0
+    - lower: 2.6
+      upper: 3.2
+    nominal: 1.6
     distribution: uniform_in_registry_transform_space
     provenance:
-      evidence: project_baseline
+      evidence: literature_transfer
       source_refs:
-      - pino_airflow_project
-      note: Interacts with tensor strength.
+      - lentil_airflow_resistance_sokhansanj
+      - corn_airflow_anisotropy_kay
+      - grain_bed_anisotropy_khatchatourian
+      note: Measured directional airflow resistance of lentil beds (horizontal about half of vertical, ratio about 2) and shelled corn (horizontal 45-58 % of vertical, ratio about 1.7-2.2); the anisotropy grows as grains become less spherical; the cited evidence gives no directional ratios for chickpea or kidney bean, so the range is transferred across the legume materials; the OOD band exceeds the measured ratios; interacts with strength and exponent.
   # Exponent mapping bed structure magnitude to permeability anisotropy.
   permeability.anisotropy.exponent:
     lower: 0.8

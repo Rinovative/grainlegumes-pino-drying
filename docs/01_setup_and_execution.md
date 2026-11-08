@@ -23,7 +23,7 @@ Every level of `storage/` has one role, and every name is computed from content 
 ```text
 storage/
   01_generation/
-    <task>/<campaign>/                                 lentil-3+chickpea-3__ref-range__lhs-seed-9220: design size per material, domain, sampling, seed; `__h-<hours>` only for a horizon that deviates from the configured one
+    <task>/<campaign>/                                 lentil-3+chickpea-3+kidney-bean-2__ref-range__lhs-seed-9200: design size per material, domain, sampling, seed; `__h-<hours>` only for a horizon that deviates from the configured one
       <material>/case_NNNN/                            inputs/, result/ (+ evidence/); _record/ with reservation.json, decision.json, attempts/
       <material>/_record/<regime>/                     design manifests and resolved generation config
       logs/                                            hard links of the campaign's driver, node-job and helper logs
@@ -64,7 +64,7 @@ srun --partition standard --cpus-per-task 2 --mem 8G --time 01:00:00 \
   bash scripts/provision_native.sh
 ```
 
-The provisioner installs the locked dependencies with `uv` 0.11.7 into an absent `runtime/venvs/native`; an existing environment is used as it is. The ML image is built from `container/Apptainer.def` and placed at `runtime/containers/grainlegumes-pino-drying.sif`.
+The provisioner takes no argument and installs the locked dependencies with `uv` 0.11.7 only into an absent `runtime/venvs/native`; it refuses an existing environment (remove the old one to reprovision). The ML image is built from `container/Apptainer.def` and placed at `runtime/containers/grainlegumes-pino-drying.sif`.
 
 ## Generation commands
 
@@ -72,12 +72,12 @@ The provisioner installs the locked dependencies with `uv` 0.11.7 into an absent
 
 | Command | Purpose |
 | --- | --- |
-| `run CONFIG` | Start or continue a Source campaign or benchmark by submitting its controller as a Slurm driver job (`--dry-run` prints the plan and checks readiness) |
+| `run CONFIG` | Start or continue a Source campaign by submitting its controller as a Slurm driver job (`--dry-run` prints the plan and checks readiness) |
 | `status CONFIG_OR_RUN_ID` | Show campaign state |
 | `cancel RUN_ID` | Cancel a campaign |
 | `inputs CONFIG` | Prepare selected physical inputs without COMSOL |
 | `fail-case RUN_ID MATERIAL CASE_ID --reason-code CODE --detail TEXT` | Record an inspected candidate as failed |
-| `amend-replacements RUN_ID --material M --regime R --capacity K --reason TEXT` | Raise a batch's total replacement capacity, with its reason |
+| `amend-replacements RUN_ID --material M --regime R --minimum-success-rate S --reason TEXT` | Lower a batch's minimum success rate, with its reason |
 
 `run` freezes the source, including uncommitted changes, on the login node and submits the controller as its own CPU job (`--driver-partition`, `--driver-time`); the controller runs the cases with native COMSOL as job steps of `cluster.node_jobs` node jobs (default two, at most four; a per-user cap on the shared 32-core `standard` nodes; the COMSOL batch licence counts once per user across all hosts), and rerunning the same command continues the campaign. For learning data, use the Dataset plan in [Datasets](03_datasets.md); [Generation reference](06_generation_reference.md) covers Source-only campaigns.
 
@@ -96,7 +96,7 @@ The provisioner installs the locked dependencies with `uv` 0.11.7 into an absent
 | `--partition`, `--cpus-per-task`, `--mem`, `--time` | Slurm resources |
 | `--gres gpu:TYPE:1` | GPU type `v100`, `rtxa6000` or `rtx6000ada` (GPU mode only) |
 | `train`, `optuna`, `artifacts`, `probe` | Operation and its CLI arguments |
-| `--continue-with-current-code` | `train` and `optuna` only: continue an existing run or study with the current code instead of the code it last ran in ([Training](04_training.md#continue-extend-and-resume)) |
+| `--continue-with-current-code` | `train` and `optuna` only: continue an existing run or study with the current code instead of the code it last ran in; the code-identity checks still apply ([Training](04_training.md#continue-extend-and-resume)) |
 
 The wrapper runs the configuration preflight before submission. Every job runs from a frozen, read-only copy of the code, `runtime/sources/COMMIT12-FINGERPRINT12/`, restored from the snapshot in `storage/source_snapshots/` (see [Generation reference](06_generation_reference.md)); only the launcher uses `repo/` and Git, and later edits in `repo/` do not reach submitted jobs. The worker verifies the tree against its snapshot without Git and records source commit, worktree digest, source tree and image digest with the job. Logs go to `runtime/logs/ml/slurm-<jobid>.out` and `.err`, written in append mode so a requeue never truncates them. When the container exits, the job also hard-links both files into `logs/` of every run stage (A0, B, A1), Optuna study root and artifact-processed run folder it wrote, so they outlive the cleanup of `runtime/logs/` and go away with their data; a link that cannot be made is a warning at the end of the `.err`. A job killed outright (SIGKILL, node loss) cannot link and leaves its logs in `runtime/logs/` only. `probe` checks the container and the ML CLIs without opening Datasets.
 

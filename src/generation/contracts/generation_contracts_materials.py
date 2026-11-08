@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
 _MATERIAL_CONFIG_PARTS: Final = ("configs", "01_generation", "physical_model", "materials")
+_MATERIAL_SCHEMA_VERSION: Final = 1
 _PARAMETER_REGISTRY_SCHEMA_VERSION: Final = 1
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.smooth_len_rel",
@@ -97,7 +98,9 @@ def available_material_families() -> tuple[str, ...]:
             message = f"Generation material configuration must be a mapping: {path}."
             raise TypeError(message)
         family = validate_material_family(payload.get("material_family"))
-        if payload.get("schema_kind") != "generation_material" or payload.get("schema_version") != 1:
+        if payload.get("schema_kind") != "generation_material" or not common.serialization.is_schema_version(
+            payload.get("schema_version"), _MATERIAL_SCHEMA_VERSION
+        ):
             message = f"Unsupported generation material schema: {path}."
             raise ValueError(message)
         if family != path.stem:
@@ -284,7 +287,9 @@ def validate_semantic_registry(
         {"schema_kind", "schema_version", "parameters"},
         label="generation parameter registry",
     )
-    if config["schema_kind"] != "generation_parameter_registry" or config["schema_version"] != _PARAMETER_REGISTRY_SCHEMA_VERSION:
+    if config["schema_kind"] != "generation_parameter_registry" or not common.serialization.is_schema_version(
+        config["schema_version"], _PARAMETER_REGISTRY_SCHEMA_VERSION
+    ):
         message = "Unsupported generation parameter-registry schema."
         raise ValueError(message)
     raw = _mapping(config["parameters"], label="generation parameter registry.parameters")
@@ -991,7 +996,9 @@ def resolve_material_definition(
     }
     _exact_keys(material, expected, label="material configuration")
     family = validate_material_family(material["material_family"])
-    if material["schema_kind"] != "generation_material" or material["schema_version"] != 1:
+    if material["schema_kind"] != "generation_material" or not common.serialization.is_schema_version(
+        material["schema_version"], _MATERIAL_SCHEMA_VERSION
+    ):
         message = "Unsupported role-neutral material configuration schema."
         raise ValueError(message)
     scope = _validate_material_scope(material["material_scope"], label=f"material {family}.material_scope")

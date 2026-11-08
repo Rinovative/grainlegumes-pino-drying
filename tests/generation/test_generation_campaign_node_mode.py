@@ -2,9 +2,11 @@
 
 Responsibilities:
   - Check the node-job seat choice, submission order, lease result, and recovery of interrupted submissions
+  - Check that each registered profile has its own Slurm job code and an unknown profile is refused
   - Check dispatch capacity, ticket contents, dispatch order, recovery at each crash point, and draining
-  - Check the run.json schema version 2 validators and the refusal of schema version 1
+  - Check the run.json validators and the refusal of another schema version
   - Check the per-dispatch scheduler view, not-started persistence, worker binding, cancellation replay, licence retry, and node-job status
+  - Check that the rendered status of a live campaign shows its active resources, admission cap and admission count
   - Check that every validly published case gets exactly one success decision, from its worker or else from the feeder
   - Check that the feeder's automatic failure decision skips every ineligible attempt, dispatch, and pending intent
 
@@ -56,12 +58,23 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
+@pytest.mark.parametrize(("profile", "code"), [("steady_flow", "sf"), ("transient_drying", "td"), ("coupled_flow", None)])
+def test_a_registered_profile_has_an_explicit_slurm_job_code_and_an_unknown_one_is_refused(profile: str, code: str | None) -> None:
+    """The step name carries the profile's own code; a profile outside the registry is a defect, not silently the steady one."""
+    campaign: Any = SimpleNamespace(profile=SimpleNamespace(id=profile))
+    if code is None:
+        with pytest.raises(ValueError, match="coupled_flow"):
+            generation.campaign._profile_job_code(campaign)
+    else:
+        assert generation.campaign._profile_job_code(campaign) == code
+
+
 def test_first_feed_submits_a_node_job_and_dispatches_ticketed_case_steps(generation_config_factory: Any, world: FakeSlurm) -> None:
     """The intent, node directory, sbatch, lease, and ticket publish in order and leave the exact persisted contract."""
     campaign = make_campaign(generation_config_factory, natural_count=2)
     manifest = submit(campaign, world)
 
-    assert manifest["schema_version"] == campaign_evidence.RUN_MANIFEST_SCHEMA_VERSION == 2
+    assert manifest["schema_version"] == campaign_evidence.RUN_MANIFEST_SCHEMA_VERSION == 1
     assert "scheduler_job_name" not in manifest
     assert manifest["state"] == "active"
     assert manifest["node_job_intent"] is None
@@ -414,10 +427,10 @@ def test_plan_reports_node_job_resources_without_mutation(generation_config_fact
 
 
 def _valid_run(run_id: str) -> dict[str, Any]:
-    """Return a minimal consistent schema-2 run record with one submitted node job and one dispatched case step."""
+    """Return a minimal consistent run record with one submitted node job and one dispatched case step."""
     return {
         "schema_kind": "generation_campaign_run",
-        "schema_version": 2,
+        "schema_version": 1,
         "campaign_run_id": run_id,
         "slurm_job_ids": ["7001"],
         "node_job_intent": None,
@@ -486,7 +499,7 @@ _MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], object], str]] = {
     ),
     "stop_ticket_without_draining": (lambda run: run["node_jobs"][0].update(stop_ticket_seq=1), "node-job record 1 is inconsistent"),
     "node_job_intent_names_nothing": (lambda run: run.update(node_job_intent=NODE_ID), "node-job intent is inconsistent"),
-    "predates_node_mode": (lambda run: run.update(schema_version=1), "predates node mode"),
+    "unsupported_schema_version": (lambda run: run.update(schema_version=2), "Unsupported or malformed campaign-run manifest"),
 }
 
 
@@ -522,19 +535,19 @@ def test_scheduler_ownership_reader_refuses_while_a_node_job_submission_is_unres
         campaign_evidence.load_campaign_scheduler_job_ids(run_id, storage_root=world.storage)
 
 
-def test_run_manifest_of_schema_one_is_refused_for_execution_resume_admission_and_tree_restore(
+def test_run_manifest_of_another_schema_is_refused_for_execution_resume_admission_and_tree_restore(
     generation_config_factory: Any, world: FakeSlurm
 ) -> None:
-    """A run.json written before node mode is neither continued, resumed, read for ownership, nor used to restore a source tree."""
+    """A run.json of another schema version is neither continued, resumed, read for ownership, nor used to restore a source tree."""
     campaign = make_campaign(generation_config_factory)
     world.add_foreign_job("gen-seat-1", "6001")
     world.add_foreign_job("gen-seat-2", "6002")
     created = submit(campaign, world)
     run_id = created["campaign_run_id"]
     path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=world.storage)
-    legacy = {key: value for key, value in created.items() if key not in {"node_jobs", "node_job_intent"}}
-    legacy.update(schema_version=1, scheduler_job_name="sf-campaign-abcd")
-    path.write_text(json.dumps(legacy), encoding="utf-8")
+    other_schema = {key: value for key, value in created.items() if key not in {"node_jobs", "node_job_intent"}}
+    other_schema.update(schema_version=2, scheduler_job_name="sf-campaign-abcd")
+    path.write_text(json.dumps(other_schema), encoding="utf-8")
 
     refusals: list[Callable[[], Any]] = [
         lambda: campaign_evidence.load_campaign_run(run_id, storage_root=world.storage),
@@ -546,7 +559,7 @@ def test_run_manifest_of_schema_one_is_refused_for_execution_resume_admission_an
         lambda: generation.campaign.bound_source_snapshot(run_id, storage_root=world.storage),
     ]
     for refuse in refusals:
-        with pytest.raises(ValueError, match="predates node mode"):
+        with pytest.raises(ValueError, match="Unsupported or malformed campaign-run manifest"):
             refuse()
     assert world.sbatch_arguments() == []
 
@@ -614,8 +627,6 @@ def test_step_accounting_not_the_allocation_decides_the_state_of_each_dispatch(
         assert (restart["mode"], restart["attempt_index"], restart["ticket_seq"], restart["status"]) == ("resume", 2, 2, "dispatched")
     else:
         assert len(after["submissions"]) == 1
-    if reason == "scheduler_out_of_memory":
-        assert generation.campaign._failure_population_counts([_status_case(campaign, world)])["solver_failed"] == 1
 
 
 def test_finished_receipt_without_step_accounting_proves_a_launch_failure_only_after_the_grace(
@@ -895,11 +906,11 @@ def test_case_worker_binds_to_its_dispatch_and_fails_closed_otherwise(
 
 
 def _campaign_with_dispatched_replacement(generation_config_factory: Any, world: FakeSlurm) -> tuple[Any, dict[str, Any]]:
-    """Fail the only original of a capacity-one campaign and let the feeder dispatch its replacement as submission 2."""
+    """Fail the only original of an s = 0.9 campaign (bound 0.95 after one failure) and let the feeder dispatch its replacement."""
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=1, max_admission_cases=4, node_jobs=1, cores_per_node=2
     )
-    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "replacement_capacity": {"lentil": 1}}
+    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.9}
     campaign = generation.cases.config.load_campaign_config(config_path, authored_value=authored)
     first = submit(campaign, world)
     run_id = first["campaign_run_id"]
@@ -1050,6 +1061,10 @@ def test_status_lists_every_node_job_and_counts_dispatches(generation_config_fac
     text = status_formatting.format_campaign_status_summary(status)
     assert "Node job: seat=1  job=7001  state=PENDING  unresolved=4" in text
     assert "Node job: seat=2  job=7002  state=RUNNING  node=hpc9  unresolved=2" in text
+    # The live campaign's active resources, its explicit cap 8 and its six fresh admissions are all known to the service.
+    assert "Resources: cores_per_case=1  node_jobs=2  concurrent_cases_per_node=2  max_admission_cases=8" in text
+    assert "Admission: 6/8" in text
+    assert "unavailable" not in text.split("Node job:")[0]
 
 
 def test_ended_node_job_is_listed_as_not_open(generation_config_factory: Any, world: FakeSlurm) -> None:
@@ -1137,7 +1152,7 @@ def test_an_observed_node_job_end_survives_accounting_retention(generation_confi
 
 
 def _publish_valid_case(monkeypatch: pytest.MonkeyPatch, campaign: Any, manifest: dict[str, Any], storage: Path) -> None:
-    """Make the only case a valid canonical publication: its HDF5 exists and the batch runtime admits and validates it."""
+    """Make the only case a valid canonical publication: its HDF5, processed status and timing exist and the batch runtime admits and validates it."""
     task = cluster.campaign_tasks(campaign)[0]
     batch = campaign.batch(task.batch_name)
     source = generation.campaign._persisted_input_sources(manifest)[task.batch_name]
@@ -1148,6 +1163,10 @@ def _publish_valid_case(monkeypatch: pytest.MonkeyPatch, campaign: Any, manifest
     artifact = processed / common.paths.GENERATION_RESULT_HDF5_FILENAME
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"synthetic canonical case")
+    evidence = common.paths.resolve_generation_result_evidence_directory(processed)
+    evidence.mkdir()
+    (evidence / "status.json").write_text(json.dumps({"quality_flag_count": 0}), encoding="utf-8")
+    (evidence / "timing.json").write_text(json.dumps({"runtime_s": 1.0}), encoding="utf-8")
     provenance = {
         "input_generation_id": reference.source_id,
         "case_input_id": reference.case_input_id,

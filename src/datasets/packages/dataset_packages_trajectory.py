@@ -41,6 +41,7 @@ import h5py
 import numpy as np
 
 from src import common, generation
+from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 if TYPE_CHECKING:
@@ -509,7 +510,7 @@ def _status_evidence(
     if (
         not isinstance(status, dict)
         or status.get("schema_kind") != "simulation_case_status"
-        or status.get("schema_version") != generation.publication.storage.STATUS_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(status.get("schema_version"), generation.publication.storage.STATUS_SCHEMA_VERSION)
     ):
         message = f"Transient status sidecar schema is invalid: {status_path}."
         raise TransientDataContractError(message)
@@ -724,10 +725,7 @@ def _case_record(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], float]:
     """Validate one source and return case, transition, and horizon records."""
     path = source.path.expanduser().resolve()
-    observed_sha256 = common.serialization.file_sha256(path)
-    if observed_sha256 != source.expected_sha256:
-        message = f"Transient source content differs from package admission: {path}."
-        raise TransientDataContractError(message)
+    identity.require_admitted_source_bytes(path, source.expected_sha256)
     with h5py.File(path, "r") as handle:
         profile = _validate_source_metadata(source, handle)
         layout = resolve_transient_case_layout(
@@ -745,7 +743,7 @@ def _case_record(
     record = {
         "package_case_id": source.package_case_id,
         "source_relative_path": _safe_relative_source(path, source_root),
-        "source_hdf5_sha256": observed_sha256,
+        "source_hdf5_sha256": source.expected_sha256,
         "source_status_sha256": status["status_sha256"],
         "case_input_id": source.expected_case_input_id,
         "simulation_case_id": source.expected_simulation_case_id,
@@ -877,7 +875,7 @@ def load_transient_index(path: Path) -> dict[str, Any]:
     horizon = payload["configured_regular_horizon"]
     if (
         payload["schema_kind"] != TRANSIENT_INDEX_SCHEMA_KIND
-        or payload["schema_version"] != TRANSIENT_INDEX_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload["schema_version"], TRANSIENT_INDEX_SCHEMA_VERSION)
         or payload["dataset_view"] != "transient_drying"
         or not isinstance(payload["dataset_name"], str)
         or not payload["dataset_name"]

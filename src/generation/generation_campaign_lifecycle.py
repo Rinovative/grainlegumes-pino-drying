@@ -6,8 +6,10 @@ Responsibilities:
   - Record distinct operational attempts and terminal candidate decisions
   - Require a solver attempt's reason to be the runtime's typed stop reason (stalled, timed_out, solver_error) or unclassified
   - Derive deterministic selected-success membership from canonical evidence
-  - Pre-register the authored replacement capacity at creation and append later explicit amendments with their reason
+  - Pre-register a Dataset plan's minimum success rate per original batch at creation and append later explicit lowerings with their reason
+  - Report each original batch's minimum success rate, its amendment history, its decided counts and whether it is stopped
   - Resolve the execution batch that carries each reserved candidate's scheduler and input identity
+  - Derive a batch's next replacement design, or raise one exception when its deficit is closed or its rate stops it
 
 Design principles:
   - Candidate IDs are never recycled after a failure
@@ -16,7 +18,7 @@ Design principles:
 
 This module does NOT:
   - Sample fields, submit Slurm jobs, convert COMSOL output, or package Datasets
-  - Rewrite historical campaign runs or delete unsuccessful case evidence
+  - Rewrite recorded campaign runs or delete unsuccessful case evidence
 """
 
 from __future__ import annotations
@@ -39,13 +41,16 @@ from src.generation.contracts import generation_contracts_material_registry as m
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _ORIGINS: Final = frozenset({"primary", "replacement"})
 _ATTEMPT_CLASSES: Final = frozenset({"solver", "validation", "submission", "license", "filesystem", "publication", "controller"})
-_ATTEMPT_SCHEMA: Final = ("generation_candidate_attempt", 2)
+_ATTEMPT_SCHEMA: Final = ("generation_candidate_attempt", 1)
 # A solver attempt's reason is the runtime's own classification of the stop (its RuntimeFailureReason) or ``unclassified``.
 RUNTIME_SOLVER_REASONS: Final = frozenset({"stalled", "timed_out", "solver_error"})
 UNCLASSIFIED_SOLVER_REASON: Final = "unclassified"
 _CAMPAIGN_PLAN_SCHEMA_VERSION: Final = 1
-_AMENDMENT_SCHEMA_VERSION: Final = 2
+_AMENDMENT_SCHEMA: Final = ("generation_minimum_success_rate_amendment", 1)
+_EPOCH_SCHEMA_VERSION: Final = 1
 _AMENDMENT_SOURCES: Final = frozenset({"plan", "explicit"})
+# A batch without a recorded amendment, a campaign without a Dataset plan, stops at its first terminal failure.
+DEFAULT_MINIMUM_SUCCESS_RATE: Final = 1.0
 _EPOCH_OWNED_FIELDS: Final = frozenset(
     {"schema_kind", "schema_version", "campaign_run_id", "campaign_digest", "epoch_index", "first_submission_index", "previous_sha256"}
 )
@@ -54,6 +59,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from src.generation.cases import generation_cases_config as config_service
+
+
+class NoReplacementError(RuntimeError):
+    """The batch needs or admits no replacement now: its success deficit is closed or its minimum success rate stops it."""
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -82,8 +91,10 @@ def _write_new_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _require_attempt_contract(attempt: Mapping[str, Any], *, label: object) -> None:
     """Reject an attempt record of another schema or a solver attempt without a typed runtime reason."""
-    if (attempt.get("schema_kind"), attempt.get("schema_version")) != _ATTEMPT_SCHEMA or (
-        attempt.get("class") == "solver" and attempt.get("reason_code") not in {*RUNTIME_SOLVER_REASONS, UNCLASSIFIED_SOLVER_REASON}
+    if (
+        attempt.get("schema_kind") != _ATTEMPT_SCHEMA[0]
+        or not common.serialization.is_schema_version(attempt.get("schema_version"), _ATTEMPT_SCHEMA[1])
+        or (attempt.get("class") == "solver" and attempt.get("reason_code") not in {*RUNTIME_SOLVER_REASONS, UNCLASSIFIED_SOLVER_REASON})
     ):
         msg = f"Candidate attempt is not a schema-{_ATTEMPT_SCHEMA[1]} record with a typed solver reason: {label}."
         raise ValueError(msg)
@@ -159,7 +170,7 @@ def _resolved_plan(campaign: config_service.CampaignConfig) -> dict[str, Any]:
     """Capture every case-generating value required for independent inspection."""
     plan: dict[str, Any] = {
         "schema_kind": "generation_source_campaign_plan",
-        "schema_version": 1,
+        "schema_version": _CAMPAIGN_PLAN_SCHEMA_VERSION,
         "task": campaign.profile.id,
         "campaign_name": campaign.campaign_name,
         "source_name": campaign.source_name,
@@ -216,12 +227,9 @@ def create_campaign(
 ) -> Path:
     """Create or reattach to a same-name, same-science campaign.
 
-    The authored ``replacement_capacity`` is pre-registered only when the campaign
-    is created, once per original batch; reattaching must repeat it exactly.
+    A Dataset plan's ``minimum_success_rate`` is pre-registered only when the
+    campaign is created, once per original batch; reattaching must repeat it exactly.
     """
-    if campaign.schema_version != _CAMPAIGN_PLAN_SCHEMA_VERSION:
-        msg = "The campaign-local lifecycle requires a canonical schema-v2 configuration."
-        raise ValueError(msg)
     root = _root(campaign.profile.id, campaign.source_name, storage_root)
     plan_path = common.paths.resolve_generation_campaign_plan_path(root)
     expected = _resolved_plan(campaign)
@@ -241,10 +249,10 @@ def create_campaign(
             if observed_batches != expected_batches:
                 msg = f"Campaign {campaign.source_name!r} conflicts with its frozen case design."
                 raise ValueError(msg)
-            _register_authored_capacity(root, expected, _authored_capacity(campaign), creating=False, storage_root=storage_root)
+            _register_authored_rate(root, expected, _authored_rate(campaign), creating=False, storage_root=storage_root)
         else:
             # Register before the plan so an interrupted creation retries into the same state.
-            _register_authored_capacity(root, expected, _authored_capacity(campaign), creating=True, storage_root=storage_root)
+            _register_authored_rate(root, expected, _authored_rate(campaign), creating=True, storage_root=storage_root)
             _write_new_json(plan_path, expected)
     return root
 
@@ -253,7 +261,9 @@ def load_campaign_plan(task: str, campaign_name: str, *, storage_root: Path | st
     """Read the frozen resolved plan without reopening mutable YAML."""
     root = _root(task, campaign_name, storage_root)
     plan = _read_json(common.paths.resolve_generation_campaign_plan_path(root))
-    if plan.get("schema_kind") != "generation_source_campaign_plan" or plan.get("schema_version") != _CAMPAIGN_PLAN_SCHEMA_VERSION:
+    if plan.get("schema_kind") != "generation_source_campaign_plan" or not common.serialization.is_schema_version(
+        plan.get("schema_version"), _CAMPAIGN_PLAN_SCHEMA_VERSION
+    ):
         msg = f"Unsupported frozen campaign plan: {root}."
         raise ValueError(msg)
     if (
@@ -270,6 +280,15 @@ def load_campaign_plan(task: str, campaign_name: str, *, storage_root: Path | st
     return plan
 
 
+def _campaign_parts(manifest: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the task and Source name of a canonical campaign handle; execution epochs exist for no other handle."""
+    parts = common.paths.campaign_run_parts(str(manifest["campaign_run_id"]))
+    if parts is None:
+        msg = "Execution epochs are reserved for canonical campaigns."
+        raise ValueError(msg)
+    return parts
+
+
 def _validate_execution_epoch(
     record: Mapping[str, Any],
     manifest: Mapping[str, Any],
@@ -281,7 +300,7 @@ def _validate_execution_epoch(
     """Check one epoch before either admitting or publishing its immutable bytes."""
     if (
         record.get("schema_kind") != "generation_campaign_execution_epoch"
-        or record.get("schema_version") != 1
+        or not common.serialization.is_schema_version(record.get("schema_version"), _EPOCH_SCHEMA_VERSION)
         or record.get("campaign_run_id") != manifest["campaign_run_id"]
         or record.get("campaign_digest") != manifest["campaign_digest"]
         or record.get("epoch_index") != index
@@ -306,11 +325,8 @@ def _validate_execution_epoch(
 
 def execution_epochs(manifest: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
     """Admit epochs with nondecreasing starts; later equal-start epochs supersede idle ones."""
-    parts = common.paths.campaign_run_parts(str(manifest["campaign_run_id"]))
-    if parts is None:
-        return ()
     storage = Path(str(manifest["remote_storage_root"]))
-    directory = _epochs_directory(_root(*parts, storage))
+    directory = _epochs_directory(_root(*_campaign_parts(manifest), storage))
     if not directory.exists():
         return ()
     if directory.is_symlink() or not directory.is_dir():
@@ -341,11 +357,7 @@ def append_execution_epoch(manifest: Mapping[str, Any], record: Mapping[str, Any
     if _EPOCH_OWNED_FIELDS.intersection(record):
         msg = "Execution epoch caller cannot override generated identity or submission boundaries."
         raise ValueError(msg)
-    parts = common.paths.campaign_run_parts(str(manifest["campaign_run_id"]))
-    if parts is None:
-        msg = "Execution epochs are reserved for canonical campaigns."
-        raise ValueError(msg)
-    root = _root(*parts, Path(str(manifest["remote_storage_root"])))
+    root = _root(*_campaign_parts(manifest), Path(str(manifest["remote_storage_root"])))
     previous = execution_epochs(manifest)
     previous_path = _epochs_directory(root) / f"epoch_{len(previous):04d}.json"
     previous_sha = None if not previous else hashlib.sha256(previous_path.read_bytes()).hexdigest()
@@ -353,7 +365,7 @@ def append_execution_epoch(manifest: Mapping[str, Any], record: Mapping[str, Any
     payload = {
         **record,
         "schema_kind": "generation_campaign_execution_epoch",
-        "schema_version": 1,
+        "schema_version": _EPOCH_SCHEMA_VERSION,
         "campaign_run_id": manifest["campaign_run_id"],
         "campaign_digest": manifest["campaign_digest"],
         "epoch_index": len(previous) + 1,
@@ -521,7 +533,6 @@ def reserve_candidate(
                 raise ValueError(msg)
             reservation = {
                 "schema_kind": "generation_candidate_reservation",
-                "schema_version": 1,
                 "task": task,
                 "campaign_name": campaign_name,
                 "campaign_digest": plan["campaign_digest"],
@@ -670,7 +681,6 @@ def decide_candidate(
             path,
             {
                 "schema_kind": "generation_candidate_decision",
-                "schema_version": 1,
                 "case_id": case_id,
                 "outcome": outcome,
                 "stage": stage,
@@ -758,7 +768,8 @@ def load_selected_pool(task: str, campaign_name: str, *, storage_root: Path | st
         msg = f"Canonical selected pool is missing or unsafe: {path}."
         raise FileNotFoundError(msg)
     recorded = _read_json(path)
-    if recorded != _selected_pool_receipt(task, campaign_name, storage_root=storage_root):
+    expected = _selected_pool_receipt(task, campaign_name, storage_root=storage_root)
+    if recorded != expected or not common.serialization.is_schema_version(recorded["schema_version"], expected["schema_version"]):
         msg = "Canonical selected pool differs from its frozen plan and selected decisions."
         raise ValueError(msg)
     return recorded
@@ -773,58 +784,54 @@ def seal_selected_pool(task: str, campaign_name: str, *, storage_root: Path | st
     return receipt
 
 
-def _replacement_amendments(directory: Path, batch_id: str) -> tuple[dict[str, Any], ...]:
-    """Read one batch's explicit, append-only replacement capacity history from its design directory."""
+def _rate_amendments(directory: Path, batch_id: str) -> tuple[dict[str, Any], ...]:
+    """Read one batch's append-only minimum-success-rate history from its design directory; each explicit amendment lowers the rate."""
     if directory.is_symlink() or directory.parent.is_symlink():
-        msg = "Replacement capacity evidence contains a symlink."
+        msg = "Minimum success rate evidence contains a symlink."
         raise ValueError(msg)
     paths = sorted(directory.glob("amendment_*.json")) if directory.is_dir() else ()
     records = tuple(_read_json(path) for path in paths)
-    if any(
-        record.get("schema_kind") != "generation_replacement_pool_amendment"
-        or record.get("schema_version") != _AMENDMENT_SCHEMA_VERSION
-        or record.get("batch_id") != batch_id
-        or record.get("amendment_index") != index
-        or record.get("registered_by") not in _AMENDMENT_SOURCES
-        or (record["registered_by"] == "plan" and index != 1)
-        or not isinstance(record.get("reason"), str)
-        or not record["reason"].strip()
-        or record.get("high_water") != int(record.get("previous_high_water", -1)) + int(record.get("added_capacity", -1))
-        or int(record["added_capacity"]) < 1
-        or (index > 1 and record["previous_high_water"] != records[index - 2]["high_water"])
-        for index, record in enumerate(records, start=1)
-    ):
-        msg = "Replacement capacity amendments are malformed or discontinuous."
-        raise ValueError(msg)
+    current = DEFAULT_MINIMUM_SUCCESS_RATE
+    for index, record in enumerate(records, start=1):
+        rate = record.get("minimum_success_rate")
+        if (
+            record.get("schema_kind") != _AMENDMENT_SCHEMA[0]
+            or not common.serialization.is_schema_version(record.get("schema_version"), _AMENDMENT_SCHEMA[1])
+            or record.get("batch_id") != batch_id
+            or type(record.get("amendment_index")) is not int
+            or record["amendment_index"] != index
+            or record.get("registered_by") not in _AMENDMENT_SOURCES
+            or not isinstance(record.get("reason"), str)
+            or not record["reason"].strip()
+            or not isinstance(rate, float)
+            or not 0.0 < rate <= 1.0
+            or (record["registered_by"] == "plan" and index != 1)
+            or (record["registered_by"] == "explicit" and rate >= current)
+        ):
+            msg = "Minimum success rate amendments are malformed or do not lower the rate."
+            raise ValueError(msg)
+        current = rate
     return records
 
 
 def _frozen_batch(plan: Mapping[str, Any], batch_id: str) -> Mapping[str, Any]:
-    """Return the one original batch of a frozen plan that owns a replacement capacity."""
+    """Return the one original batch of a frozen plan that owns a minimum success rate."""
     matches = [batch for batch in plan["batches"] if batch["batch_id"] == batch_id]
     if len(matches) != 1:
-        msg = "Replacement capacity requires one frozen batch identity."
+        msg = "A minimum success rate requires one frozen batch identity."
         raise ValueError(msg)
     return matches[0]
 
 
 def _batch_amendments(batch: Mapping[str, Any], *, storage_root: Path | str | None) -> tuple[dict[str, Any], ...]:
-    """Read the validated capacity history of one frozen original batch."""
+    """Read the validated minimum-success-rate history of one frozen original batch."""
     directory = common.paths.resolve_generation_replacements_directory(batch["batch_storage_name"], storage_root=storage_root)
-    return _replacement_amendments(directory, batch["batch_id"])
+    return _rate_amendments(directory, batch["batch_id"])
 
 
-def replacement_pool_high_water(
-    task: str,
-    campaign_name: str,
-    batch_id: str,
-    *,
-    storage_root: Path | str | None = None,
-) -> int:
-    """Read the last explicit replacement capacity amendment for one batch."""
-    plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
-    amendments = _batch_amendments(_frozen_batch(plan, batch_id), storage_root=storage_root)
-    return int(amendments[-1]["high_water"]) if amendments else 0
+def _current_rate(amendments: Sequence[Mapping[str, Any]]) -> float:
+    """Return the rate of the last amendment, else the fail-closed default."""
+    return float(amendments[-1]["minimum_success_rate"]) if amendments else DEFAULT_MINIMUM_SUCCESS_RATE
 
 
 def replacement_policy(
@@ -832,27 +839,35 @@ def replacement_policy(
     campaign_name: str,
     *,
     storage_root: Path | str | None = None,
+    records: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Report every original batch's pre-registered capacity and its complete amendment history."""
+    """Report every original batch's minimum success rate, its amendment history, its decided counts and whether it is stopped.
+
+    ``successful`` (k) and ``decided`` (n) count the batch's originals and replacements with a terminal decision, read
+    from ``records`` when the caller decides on that same snapshot; a stopped batch admits no fresh candidate of its own
+    until an amendment lowers its rate below the bound.
+    """
     plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
+    records = candidate_records(task, campaign_name, storage_root=storage_root) if records is None else records
     policy: list[dict[str, Any]] = []
     for batch in plan["batches"]:
         amendments = _batch_amendments(batch, storage_root=storage_root)
+        rate = _current_rate(amendments)
+        successful, decided = selection_service.decided_counts([row for row in records if row["reservation"]["batch_id"] == batch["batch_id"]])
         policy.append(
             {
                 "material_family": batch["material_family"],
                 "sampling_regime": batch["sampling_regime"],
                 "batch_id": batch["batch_id"],
                 "sampling_algorithm": "sobol",
-                "planned_capacity": int(amendments[0]["high_water"]) if amendments and amendments[0]["registered_by"] == "plan" else 0,
-                "high_water": int(amendments[-1]["high_water"]) if amendments else 0,
+                "minimum_success_rate": rate,
                 "amendments": [
-                    {
-                        key: amendment[key]
-                        for key in ("amendment_index", "previous_high_water", "added_capacity", "high_water", "registered_by", "reason")
-                    }
+                    {key: amendment[key] for key in ("amendment_index", "minimum_success_rate", "registered_by", "reason")}
                     for amendment in amendments
                 ],
+                "successful": successful,
+                "decided": decided,
+                "stopped": selection_service.success_rate_stopped(successful, decided, minimum_success_rate=rate),
             }
         )
     return policy
@@ -863,107 +878,100 @@ def _append_amendment(
     plan: Mapping[str, Any],
     batch: Mapping[str, Any],
     *,
-    high_water: int,
+    rate: float,
     reason: str,
     registered_by: str,
     storage_root: Path | str | None,
-) -> int:
-    """Append one capacity amendment while the caller holds the controller lock."""
+) -> float:
+    """Append one minimum-success-rate amendment while the caller holds the controller lock; return the batch's current rate."""
     if common.paths.resolve_generation_selected_pool_path(root).exists():
-        msg = "A sealed selected-success pool cannot extend its replacement capacity."
+        msg = "A sealed selected-success pool cannot change its minimum success rate."
         raise RuntimeError(msg)
     amendments = _batch_amendments(batch, storage_root=storage_root)
-    previous = int(amendments[-1]["high_water"]) if amendments else 0
-    if high_water < previous:
-        msg = "Replacement high-water cannot decrease or rewrite an earlier design prefix."
-        raise ValueError(msg)
-    if high_water == previous:
-        return previous
+    current = _current_rate(amendments)
     if registered_by == "plan" and amendments:
-        msg = "A pre-registered plan capacity must be the first amendment of its batch."
+        msg = "A pre-registered plan rate must be the first amendment of its batch."
+        raise ValueError(msg)
+    if registered_by == "explicit" and rate == current:
+        return current
+    if registered_by == "explicit" and rate > current:
+        msg = f"A minimum success rate can only be lowered: {rate} is above the current {current}."
         raise ValueError(msg)
     index = len(amendments) + 1
     directory = common.paths.resolve_generation_replacements_directory(batch["batch_storage_name"], storage_root=storage_root)
     _write_new_json(
         directory / f"amendment_{index:04d}.json",
         {
-            "schema_kind": "generation_replacement_pool_amendment",
-            "schema_version": _AMENDMENT_SCHEMA_VERSION,
+            "schema_kind": _AMENDMENT_SCHEMA[0],
+            "schema_version": _AMENDMENT_SCHEMA[1],
             "campaign_digest": plan["campaign_digest"],
             "batch_id": batch["batch_id"],
             "amendment_index": index,
-            "previous_high_water": previous,
-            "added_capacity": high_water - previous,
-            "high_water": high_water,
-            "sampling_algorithm": "sobol",
+            "minimum_success_rate": rate,
             "registered_by": registered_by,
             "reason": reason.strip(),
         },
     )
-    return high_water
+    return rate
 
 
-def amend_replacement_pool(
+def amend_minimum_success_rate(
     task: str,
     campaign_name: str,
     batch_id: str,
     *,
-    high_water: int,
+    minimum_success_rate: float,
     reason: str,
     storage_root: Path | str | None = None,
-) -> int:
-    """Explicitly raise one batch's prefix-stable replacement candidate limit and record why."""
-    if isinstance(high_water, bool) or not isinstance(high_water, int) or high_water < 1:
-        msg = "Replacement high-water must be a positive integer."
-        raise ValueError(msg)
+) -> tuple[float, float]:
+    """Explicitly lower one original batch's minimum success rate and record why; return the previous and the current rate.
+
+    Repeating the current rate records nothing; a higher rate and a sealed selected pool are refused.
+    """
+    from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config validation
+
+    rate = config_service.validate_minimum_success_rate(minimum_success_rate, label="Minimum success rate amendment")
     if not isinstance(reason, str) or not reason.strip():
-        msg = "A replacement capacity amendment requires a non-empty reason."
+        msg = "A minimum success rate amendment requires a non-empty reason."
         raise ValueError(msg)
     plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
     batch = _frozen_batch(plan, batch_id)
     root = _root(task, campaign_name, storage_root)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
-        return _append_amendment(root, plan, batch, high_water=high_water, reason=reason, registered_by="explicit", storage_root=storage_root)
+        previous = _current_rate(_batch_amendments(batch, storage_root=storage_root))
+        return previous, _append_amendment(root, plan, batch, rate=rate, reason=reason, registered_by="explicit", storage_root=storage_root)
 
 
-def _authored_capacity(campaign: config_service.CampaignConfig) -> dict[str, int]:
-    """Resolve the replacement capacity pre-registered by the campaign's authored plan."""
+def _authored_rate(campaign: config_service.CampaignConfig) -> float | None:
+    """Resolve the minimum success rate pre-registered by the campaign's Dataset plan, or ``None`` without a plan."""
     from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config materialization
 
-    return config_service.resolve_replacement_capacity(campaign.authored_value, materials=list(campaign.selected_targets))
+    return config_service.authored_minimum_success_rate(campaign.authored_value)
 
 
-def _register_authored_capacity(
+def _register_authored_rate(
     root: Path,
     plan: Mapping[str, Any],
-    capacity: Mapping[str, int],
+    rate: float | None,
     *,
     creating: bool,
     storage_root: Path | str | None,
 ) -> None:
-    """Pre-register the authored capacity of each original batch at creation and refuse any later difference."""
+    """Pre-register a Dataset plan's minimum success rate for each original batch at creation and refuse any later difference."""
     for batch in plan["batches"]:
-        material = str(batch["material_family"])
-        wanted = int(capacity.get(material, 0))
         amendments = _batch_amendments(batch, storage_root=storage_root)
-        recorded = int(amendments[0]["high_water"]) if amendments and amendments[0]["registered_by"] == "plan" else 0
-        if recorded == wanted:
+        recorded = amendments[0]["minimum_success_rate"] if amendments and amendments[0]["registered_by"] == "plan" else None
+        if recorded == rate:
             continue
-        if not creating or amendments:
+        if rate is None or not creating or amendments:
             msg = (
-                f"Replacement capacity of {material!r} ({batch['sampling_regime']}) is pre-registered per Source: "
-                f"{plan['source_name']!r} records {recorded} from its authored plan, but the plan now requests {wanted}. "
-                "Restore the recorded value, add capacity explicitly with amend-replacements, or create a new Source."
+                f"The minimum success rate of {batch['material_family']!r} ({batch['sampling_regime']}) is pre-registered per Source: "
+                f"{plan['source_name']!r} records {recorded} from its authored plan, but the plan now requests {rate}. "
+                "Restore the recorded value, lower it explicitly with amend-replacements, or create a new Source."
             )
             raise ValueError(msg)
         _append_amendment(
-            root,
-            plan,
-            batch,
-            high_water=wanted,
-            reason="authored plan generation.replacement_capacity",
-            registered_by="plan",
-            storage_root=storage_root,
+            root, plan, batch, rate=rate, reason="authored plan generation.minimum_success_rate", registered_by="plan", storage_root=storage_root
         )
 
 
@@ -1042,7 +1050,11 @@ def replacement_batch_from_reservation(
     from src.generation.cases import generation_cases_sampling as sampling  # noqa: PLC0415 -- validate frozen scientific sample
 
     design = reservation.get("design_evidence")
-    if reservation.get("origin") != "replacement" or not isinstance(design, dict) or design.get("schema_version") != _CAMPAIGN_PLAN_SCHEMA_VERSION:
+    if (
+        reservation.get("origin") != "replacement"
+        or not isinstance(design, dict)
+        or not common.serialization.is_schema_version(design.get("schema_version"), sampling.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION)
+    ):
         msg = "Reservation is not one canonical replacement design."
         raise ValueError(msg)
     ordinal = design.get("candidate_ordinal")
@@ -1087,10 +1099,20 @@ def materialize_replacement_batch(
     *,
     storage_root: Path | str | None = None,
 ) -> config_service.GenerationConfig:
-    """Derive the next one-case Sobol design inside the original campaign."""
+    """Derive the next one-case Sobol design inside the original campaign.
+
+    Raises
+    ------
+    NoReplacementError
+        If the batch's records, read here, leave no success deficit or its minimum success rate stops it; a decision
+        recorded after the caller's own check leads here, so the caller ends planning for this batch.
+    RuntimeError
+        If a primary is undecided or unreserved, or no failed target slot is free.
+
+    """
     from src.generation.cases import generation_cases_sampling as sampling  # noqa: PLC0415 -- runtime-only scientific sampling
 
-    if campaign.schema_version != _CAMPAIGN_PLAN_SCHEMA_VERSION or campaign.sampling_mode not in {"lhs", "sobol"}:
+    if campaign.sampling_mode not in {"lhs", "sobol"}:
         msg = "Generated replacements require one canonical sampled campaign."
         raise ValueError(msg)
     plan = load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
@@ -1116,8 +1138,12 @@ def materialize_replacement_batch(
         msg = "All material primary slots must be reserved before allocating a replacement case ID."
         raise RuntimeError(msg)
     if selection_service.replacement_deficit(batch_records, target=target) < 1:
-        msg = "No terminal-failure success deficit remains after active replacement work."
-        raise RuntimeError(msg)
+        msg = "The batch needs no replacement: its success deficit is closed after active replacement work."
+        raise NoReplacementError(msg)
+    rate = _current_rate(_batch_amendments(_frozen_batch(plan, batch_id), storage_root=storage_root))
+    if selection_service.success_rate_stopped(*selection_service.decided_counts(batch_records), minimum_success_rate=rate):
+        msg = "The batch is stopped by its minimum success rate and admits no replacement."
+        raise NoReplacementError(msg)
     failed = sorted((row for row in primaries if row["decision"]["outcome"] == "failed"), key=lambda row: row["reservation"]["case_id"])
     occupied_slots = {
         row["reservation"]["target_slot"]
@@ -1131,13 +1157,6 @@ def materialize_replacement_batch(
     failed_primary = available[0]
     target_slot = int(failed_primary["reservation"]["target_slot"])
     ordinal = sum(row["reservation"]["origin"] == "replacement" for row in batch_records) + 1
-    amendments = _replacement_amendments(
-        common.paths.resolve_generation_replacements_directory(parent.batch_storage_name, storage_root=storage_root), batch_id
-    )
-    high_water = int(amendments[-1]["high_water"]) if amendments else 0
-    if ordinal > high_water:
-        msg = "Replacement candidate exceeds the explicitly amended pool high-water."
-        raise RuntimeError(msg)
     case_index = len(material_records) + 1
     round_index = ordinal
     plan_sha = common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root))
@@ -1153,7 +1172,7 @@ def materialize_replacement_batch(
     block_seeds = {block: seeding.derive_seed(sampling_seed, "supplemental_replacement", block) for block in point}
     design = {
         "schema_kind": "generation_source_supplemental_design",
-        "schema_version": 1,
+        "schema_version": sampling.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION,
         "campaign_plan_sha256": plan_sha,
         "parent_campaign_digest": campaign.campaign_digest,
         "parent_batch_id": batch_id,
@@ -1195,7 +1214,7 @@ def campaign_from_frozen_run(
     require_executable: bool = True,
     storage_root: Path | str | None = None,
 ) -> config_service.CampaignConfig:
-    """Reconstruct one v2 campaign and reserved replacements from frozen science."""
+    """Reconstruct one campaign and reserved replacements from frozen science."""
     from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- reconstruct typed campaign from immutable plan
     from src.generation.contracts import generation_contracts_profiles as profiles  # noqa: PLC0415 -- frozen profile registry
     from src.generation.contracts import generation_contracts_templates as templates  # noqa: PLC0415 -- exact template validation
@@ -1203,7 +1222,7 @@ def campaign_from_frozen_run(
     run_id = str(manifest.get("campaign_run_id"))
     parts = common.paths.campaign_run_parts(run_id)
     if parts is None:
-        msg = "Frozen campaign reconstruction requires a canonical v2 run handle."
+        msg = "Frozen campaign reconstruction requires a canonical source run handle."
         raise ValueError(msg)
     task, name = parts
     storage_value = manifest.get("remote_storage_root")
@@ -1309,7 +1328,6 @@ def campaign_from_frozen_run(
         dataset_packages=(),
         duplicate_case_input_policy=plan["duplicate_case_input_policy"],
         execution_values=copy.deepcopy(plan["execution_values"]),
-        schema_version=_CAMPAIGN_PLAN_SCHEMA_VERSION,
         root_seed=int(plan["root_seed"]),
         sampling_mode=str(plan["sampling_mode"]),
         selected_targets={material: int(count) for material, count in plan["selected_targets"].items()},

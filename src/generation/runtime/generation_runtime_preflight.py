@@ -395,7 +395,6 @@ def run_cpu_preflight(
     disk = shutil.disk_usage(storage)
     return {
         "schema_kind": "generation_cpu_preflight",
-        "schema_version": 1,
         "status": ("environment_ready" if production_blocker is None else "environment_ready_production_blocked"),
         "production_configuration_ready": production_blocker is None,
         "production_configuration_blocker": production_blocker,

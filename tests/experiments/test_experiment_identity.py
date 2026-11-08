@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check scientific identity, layout paths, and authored-source provenance separation
+  - Check that resolution records the producer digests and that saved configs keep that evidence under code drift
   - Check parent-record binding of the matched A0/B/A1 children and of the persisted identity
 
 Design principles:
@@ -18,9 +19,10 @@ import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from support import configs
+from support import configs, run_state
 
-from src import common
+from src import common, learning
+from src.experiments.config import experiments_config_loader as config_loader
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -47,6 +49,45 @@ def _record(
     return identity.build_transient_experiment_record(stage_a0, stage_b, stage_a1=stage_a1, config_path=source)
 
 
+def test_resolution_records_the_running_producer_digests_and_saved_configs_keep_them_under_code_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stamp producer evidence once, refuse authored, missing or tampered evidence, and keep a saved identity when code moves."""
+    checkpoint = learning.training.checkpoint
+    config = configs.resolve(configs.direct_config())
+    assert config["producer"] == {
+        "training_sha256": checkpoint.TRAINING_PROJECTIONS["steady_flow"].sha256(),
+        "model_sha256": checkpoint.MODEL_PROJECTIONS["steady_flow"].sha256(),
+    }
+    authored = configs.direct_config()
+    authored["producer"] = copy.deepcopy(config["producer"])
+    with pytest.raises(config_loader.ConfigError, match="must not supply it"):
+        configs.resolve(authored)
+    missing = copy.deepcopy(config)
+    del missing["producer"]
+    with pytest.raises(config_loader.ConfigError, match=r"Missing: \['producer'\]"):
+        config_loader.validate_resolved_config(missing, verify_layout_identity=False)
+    for key in sorted(config["producer"]):
+        tampered = copy.deepcopy(config)
+        tampered["producer"][key] = "0" * 64
+        with pytest.raises(config_loader.ConfigError, match="Initial run layout identity"):
+            config_loader.validate_resolved_config(tampered)
+        tampered["producer"][key] = "0" * 63
+        with pytest.raises(config_loader.ConfigError, match="lowercase SHA-256 digests"):
+            config_loader.validate_resolved_config(tampered, verify_layout_identity=False)
+
+    with monkeypatch.context() as drift:
+        run_state.drift_training_code(drift, "steady_flow")
+        saved = config_loader.validate_resolved_config(copy.deepcopy(config))
+        fresh = configs.resolve(configs.direct_config())
+    assert saved["producer"] == config["producer"]
+    assert saved["run"]["layout"] == config["run"]["layout"]
+    # New training code is a new experiment; the model digest, and with it the scaling cache, is untouched.
+    assert fresh["producer"]["model_sha256"] == config["producer"]["model_sha256"]
+    assert fresh["producer"]["training_sha256"] != config["producer"]["training_sha256"]
+    assert fresh["run"]["layout"]["a0_id"] != config["run"]["layout"]["a0_id"]
+
+
 def test_parent_record_uses_content_layout_and_relative_children(tmp_path: Path) -> None:
     """Persist parent metadata in the pair directory and point to the shared A0 and the pair's leaves."""
     authored = configs.write_yaml(tmp_path / "synthetic_plan.yaml", configs.transient_matched_config())
@@ -66,7 +107,7 @@ def test_parent_record_uses_content_layout_and_relative_children(tmp_path: Path)
         identity.admit_fresh_transient_experiment_record(record, output_root=tmp_path)
 
 
-def test_readonly_child_navigation_binds_saved_identity_after_training_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_readonly_child_navigation_binds_saved_identity_and_admits_training_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     stages = _plan(tmp_path)
     stage_a = stages[0]
     authored = configs.write_yaml(tmp_path / "plan.yaml", configs.transient_matched_config())
@@ -76,15 +117,18 @@ def test_readonly_child_navigation_binds_saved_identity_after_training_drift(tmp
     run_dir = common.paths.resolve_config_run_dir(stage_a)
     config_path = configs.write_yaml(run_dir / "config.yaml", stage_a)
     summary = {
-        "schema_version": run_service.RUN_SUMMARY_SCHEMA_VERSION,
+        "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
         "status": "completed",
         "config_sha256": common.serialization.file_sha256(config_path),
         "checkpoint_identity": {"resume_contract_digest": child["semantic_config_sha256"]},
     }
     common.serialization.atomic_write_json(run_dir / "summary.json", summary)
-    monkeypatch.setattr(identity.training_checkpoint, "scientific_implementation_digest", lambda _task: "0" * 64)
     monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", lambda _config: pytest.fail("Navigation must use saved identity"))
     assert identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path) == run_dir
+    with monkeypatch.context() as drift:
+        # Navigation is a historical read: it binds the recorded producer evidence, never the running code.
+        run_state.drift_training_code(drift, "transient_drying")
+        assert identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path) == run_dir
 
     changed = copy.deepcopy(summary)
     changed["checkpoint_identity"]["resume_contract_digest"] = "0" * 64
@@ -97,7 +141,7 @@ def test_readonly_child_navigation_binds_saved_identity_after_training_drift(tmp
         identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
     common.serialization.atomic_write_json(run_dir / "summary.json", summary)
     raw = copy.deepcopy(stage_a)
-    raw["data"]["batch_size"] += 1
+    raw["tracking"]["wandb"]["mode"] = "offline"
     configs.write_yaml(config_path, raw)
     with pytest.raises(ValueError, match="config bytes"):
         identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
@@ -114,7 +158,7 @@ def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path:
     common.serialization.atomic_write_json(
         run_dir / "summary.json",
         {
-            "schema_version": run_service.RUN_SUMMARY_SCHEMA_VERSION,
+            "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "status": "budget_unmet",
             "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(stage_b)},
         },

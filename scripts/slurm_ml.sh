@@ -4,10 +4,10 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/slurm_ml.sh --mode cpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS train CONFIG [--epochs N] [--train-dataset ID] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--max-epochs N] [--continue-with-current-code]
+  scripts/slurm_ml.sh --mode cpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--max-epochs N] [--continue-with-current-code]
   scripts/slurm_ml.sh --mode cpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS train --resume STAGE [--max-epochs N] [--continue-with-current-code]
   scripts/slurm_ml.sh --mode gpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS --gres gpu:TYPE:1 train --resume STAGE [--max-epochs N] [--continue-with-current-code]
-  scripts/slurm_ml.sh --mode gpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS --gres gpu:TYPE:1 train CONFIG [--epochs N] [--train-dataset ID] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--artifacts selected|none] [--continue-with-current-code]
+  scripts/slurm_ml.sh --mode gpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS --gres gpu:TYPE:1 train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--artifacts selected|none] [--continue-with-current-code]
   scripts/slurm_ml.sh [same resource options] optuna CONFIG [--epochs N] [--train-dataset ID] [--revision LABEL] [Optuna CLI options] [--continue-with-current-code]
   scripts/slurm_ml.sh [same resource options] artifacts [artifact CLI options]
   scripts/slurm_ml.sh [same resource options] probe
@@ -176,6 +176,7 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
   train_seconds_seen=false
   lr_scale_seen=false
   rollout_length_seen=false
+  seed_seen=false
   while (( $# > 0 )); do
     if [[ "${operation}" == optuna ]]; then
       case "$1" in
@@ -305,6 +306,16 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
         semantic_args+=("$1" "$2")
         preflight_override_args+=("--lr-scale" "$2")
         lr_scale_seen=true
+        shift 2
+        ;;
+      --seed)
+        [[ "${operation}" == train ]] || fail 2 "--seed is training-only."
+        (( $# >= 2 )) || fail 2 "--seed requires a non-negative integer."
+        [[ "$2" =~ ^(0|[1-9][0-9]*)$ ]] || fail 2 "--seed requires a non-negative integer."
+        [[ "${seed_seen}" == false ]] || fail 2 "Duplicate --seed."
+        semantic_args+=("$1" "$2")
+        preflight_override_args+=("--seed" "$2")
+        seed_seen=true
         shift 2
         ;;
       *) fail 2 "Unsupported ${operation} argument: $1" ;;

@@ -44,6 +44,8 @@ def direct_config(
             "n_modes": [4, 5],
             "hidden_channels": 8,
             "n_layers": 2,
+            "positional_embedding": None,
+            "domain_padding": 0.1,
         }
     elif model_kind == "uno":
         model_params = {
@@ -52,6 +54,8 @@ def direct_config(
             "hidden_channels": 8,
             "n_layers": 5,
             "mode_ratio": 0.5,
+            "positional_embedding": None,
+            "domain_padding": 0.1,
         }
     else:
         message = f"Unsupported synthetic model kind: {model_kind!r}"
@@ -61,7 +65,7 @@ def direct_config(
     if physics_enabled:
         physics = {
             "enabled": True,
-            "derivatives": {"kind": "physical", "extension": "none"},
+            "derivatives": {"kind": "physical"},
             "interior_crop": 1,
             "momentum_weight": {
                 "target": 2.0e-3,
@@ -89,6 +93,7 @@ def direct_config(
             "additional_evaluation_datasets": ["synthetic_ood"],
             "batch_size": 2,
             "num_workers": 0,
+            "persistent_workers": False,
         },
         "model": {"kind": model_kind, "params": model_params},
         "loss": {
@@ -97,12 +102,11 @@ def direct_config(
         },
         "evaluation": {"objective": {"id": "normalized_group_macro_rmse"}},
         "optimizer": {"kind": "adamw", "lr": 1.0e-3, "weight_decay": 0.0},
-        "scheduler": {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 2},
+        "scheduler": {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 2, "min_lr": 1.0e-6},
         "training": {
             "epochs": 3,
             "evaluation_interval": 1,
             "additional_evaluation_interval": 1,
-            "mixed_precision": False,
         },
         "tracking": {
             "wandb": {
@@ -128,12 +132,14 @@ def _transient_model_params(model_kind: str) -> dict[str, Any]:
             "channel_mlp_skip": "soft-gating",
             "implementation": "factorized",
             "positional_embedding": None,
+            "domain_padding": 0.1,
         }
     if model_kind == "rno":
         return {
             "n_modes": [4, 5],
             "hidden_channels": 8,
             "n_layers": 2,
+            "candidate_activation": "tanh",
             "rno_skip": False,
             "lifting_channel_ratio": 2,
             "projection_channel_ratio": 2,
@@ -141,6 +147,7 @@ def _transient_model_params(model_kind: str) -> dict[str, Any]:
             "fno_skip": "linear",
             "return_sequences": False,
             "positional_embedding": None,
+            "domain_padding": 0.1,
         }
     if model_kind == "uno":
         return {
@@ -149,6 +156,8 @@ def _transient_model_params(model_kind: str) -> dict[str, Any]:
             "hidden_channels": 8,
             "n_layers": 5,
             "mode_ratio": 0.5,
+            "positional_embedding": None,
+            "domain_padding": 0.1,
         }
     message = f"Unsupported synthetic transient model kind: {model_kind!r}"
     raise ValueError(message)
@@ -170,9 +179,7 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
             "num_workers": 0,
             "pin_memory": False,
             "persistent_workers": False,
-            "transient_backend_preference": "pt_shards",
-            "transient_backend_required": True,
-            "hdf5_cache_size": 0,
+            "spatial_stride": 1,
         },
         "input_profile": "canonical_physics_complete_v1",
         "temporal": temporal,
@@ -214,16 +221,16 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
     }
 
 
-def _teacher_forced_stage(*, model_kind: str, seed: int) -> dict[str, Any]:
+def _teacher_forced_stage(*, model_kind: str) -> dict[str, Any]:
     """Return the A0 sampling and curriculum that A1 inherits."""
     if model_kind == "rno":
         return {
             "sampling": {"mode": "trajectory", "rollout_length": 4},
-            "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5], "seed": seed},
+            "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
         }
     return {
         "sampling": {"mode": "one_step_transition"},
-        "curriculum": {"lengths": [1], "milestone_fractions": [0.0], "seed": seed},
+        "curriculum": {"lengths": [1], "milestone_fractions": [0.0]},
     }
 
 
@@ -238,7 +245,7 @@ def transient_matched_config(
         "evaluation_interval": 1,
         "additional_evaluation_interval": 1,
         "gradient_accumulation_steps": 1,
-        **_teacher_forced_stage(model_kind=model_kind, seed=seed),
+        **_teacher_forced_stage(model_kind=model_kind),
     }
     b_sampling: dict[str, Any] = {"mode": "rollout_window", "rollout_length": 4, "window_stride": 4, "window_offset": 0}
     if model_kind == "rno":
@@ -251,12 +258,11 @@ def transient_matched_config(
         "additional_evaluation_interval": 1,
         "gradient_accumulation_steps": 1,
         "sampling": b_sampling,
-        "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5], "seed": seed},
+        "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
     }
     config = _transient_base(model_kind=model_kind, seed=seed, temporal={"temporal_conditioning": {"kind": "none"}})
     config["training"] = {
         "mode": "matched_a1_b",
-        "mixed_precision": False,
         "continuation_evaluations": 4,
         "a0": a0,
         "b": b,
@@ -271,7 +277,7 @@ def transient_stage_a_only_config(
     seed: int = 17,
 ) -> dict[str, Any]:
     """Return a compact artificial single-stage A0 request, as an Optuna study base owns it."""
-    a0 = _teacher_forced_stage(model_kind=model_kind, seed=seed)
+    a0 = _teacher_forced_stage(model_kind=model_kind)
     epochs = 4
     config = _transient_base(
         model_kind=model_kind,
@@ -283,7 +289,6 @@ def transient_stage_a_only_config(
         "stage_schedule": {"mode": "stage_a_only", "budget_unit": "epochs", "total_epochs": epochs},
         "evaluation_interval": 1,
         "additional_evaluation_interval": 1,
-        "mixed_precision": False,
         "stage": "a",
         "comparison_arm": "a0",
         "gradient_accumulation_steps": 1,

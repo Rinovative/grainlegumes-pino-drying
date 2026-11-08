@@ -2,9 +2,11 @@
 
 Responsibilities:
   - Check steady maps, metrics, timing bindings, exact grids, and shared controls
+  - Check that compared frames record one valid analysis producer within and across roles
 
 Design principles:
   - Matched-case grid identity is checked independently of lazy view admission
+  - The producer check reads recorded provenance only, never the running analysis code
 
 This module does NOT:
   - Train steady models or provide transient evaluation behavior
@@ -25,13 +27,16 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import analysis, common, domain
+from src import analysis, domain, experiments
 from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader
 from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_panel as panel
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
     from matplotlib.patches import Rectangle
 
 _CASE_COUNT = 2
@@ -46,8 +51,6 @@ def _numeric_array(values: Any) -> np.ndarray:
 def _runtime_payload(frame: pd.DataFrame) -> dict[str, Any]:
     """Build exact two-case steady runtime evidence for the fixture."""
     provenance = frame.attrs["artifact_provenance"]
-    dataset = provenance["dataset"]
-    selection = provenance["selection"]
     run = provenance["run"]
     manifest_digest = "d" * 64
     simulation = {
@@ -70,13 +73,7 @@ def _runtime_payload(frame: pd.DataFrame) -> dict[str, Any]:
     }
     return analysis.artifacts.timing.build_runtime_comparison(
         split_role="eval",
-        dataset_identity={
-            "name": dataset["name"],
-            "fingerprint": dataset["fingerprint"],
-            "data_contract_digest": dataset["data_contract_digest"],
-            "saved_membership_digest": dataset["saved_membership_digest"],
-            "effective_ordered_source_indices_sha256": selection["effective_ordered_source_indices_sha256"],
-        },
+        dataset_identity=analysis.artifacts.timing.runtime_dataset_identity(provenance),
         model_identity={
             "run_name": run["name"],
             "effective_config_digest": run["effective_config_digest"],
@@ -182,6 +179,7 @@ def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
             "case_index": position + 1,
             "source_index": position,
             "split_local_index": position,
+            "source_dataset_id": "steady-fixture-dataset",
             "npz_path": str(path),
             "rel_l2": 0.1 * (position + 1),
             "rel_h1": 0.2 * (position + 1),
@@ -191,6 +189,7 @@ def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
             "flux_balance_mse": (0.1 * scale) ** 2,
             "pressure_boundary_mse": scale**2,
             "parameters_bed.structure.coarse_len_rel": 0.1 * (position + 1),
+            "prediction_validity": json.dumps(validity_contract.build_field_prediction_validity(prediction, channels=task.output_names)),
         }
         for field_index, field in enumerate(task.output_names):
             values = prediction[field_index] - reference[field_index]
@@ -217,26 +216,31 @@ def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
     provenance = {
         "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
+        "producer": {"analysis_sha256": "d" * 64},
         "run": {
             "name": "steady-fixture",
             "task": task.id,
             "task_contract_digest": task.contract_digest,
             "effective_config_digest": "a" * 64,
             "best_checkpoint_sha256": "b" * 64,
+            "best_checkpoint_epoch": 7,
             "normalizer_sha256": "c" * 64,
         },
         "dataset": {
             "name": "steady-fixture-dataset",
-            "fingerprint": "e" * 64,
-            "data_contract_digest": task.data_contract_digest,
-            "saved_membership_digest": membership_digest,
+            "role": "id",
+            "source_dataset_ids": ["steady-fixture-dataset"],
+            "source_identities": [{"dataset_id": "steady-fixture-dataset", "case_ids": ["case-a", "case-b"]}],
+            "case_ids_by_source": [["case-a", "case-b"]],
+            "membership_digests": [membership_digest],
+            "evaluation_assignments": [],
         },
         "selection": {
             "effective_case_count": 2,
             "effective_ordered_source_indices_sha256": membership_digest,
         },
         "split_role": "eval",
-        "runtime": {"batch_size": 2},
+        "runtime": {"inference_batch_size": 2},
         "model": {
             "kind": "fno",
             "physics_enabled": False,
@@ -270,6 +274,7 @@ def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
             "residual_evaluation_region": {},
         },
         "aggregate": aggregate,
+        "evaluation": {"prediction_validity": validity_contract.table_role_prediction_validity(frame)},
         "outputs": {},
     }
     frame.attrs.update(
@@ -291,8 +296,75 @@ def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
             dataframe.PRIMARY_OBJECTIVE_ID: aggregate,
         }
     )
-    frame.attrs[dataframe.RUNTIME_COMPARISON_ATTR] = _runtime_payload(frame)
+    provenance["timing"] = {"report": _runtime_payload(frame)}
     return frame, x_grid
+
+
+def test_steady_wandb_summary_uses_the_shared_bounded_vocabulary_and_omits_unavailable_values(tmp_path: Path) -> None:
+    """The steady upload reduces each role to the tracked vocabulary; an unavailable objective logs its counts, never a value."""
+    frame, _grid = _steady_frame(tmp_path)
+    aggregate = frame.attrs["artifact_provenance"]["aggregate"]
+    summary = analysis.artifacts.service._steady_wandb_summary({"id": frame})
+    assert all(experiments.tracking._validate_evaluation_summary_entry(key, value) == key for key, value in summary.items())
+    assert summary["evaluation/id/normalized_group_macro_rmse"] == aggregate["value"]
+    assert summary["evaluation/id/physical_rmse_u"] == aggregate["field_statistics"]["u"]["physical_rmse"]
+    assert (summary["evaluation/id/valid_case_count"], summary["evaluation/id/nonfinite_value_count"]) == (2, 0)
+    assert summary["evaluation/identity/checkpoint_epoch"] == 7
+    assert summary["evaluation/timing/component/batch_amortized_neural_operator_forward_seconds/available_count"] == 2
+
+    unavailable = frame.copy()
+    unavailable.attrs["artifact_provenance"] = copy.deepcopy(frame.attrs["artifact_provenance"])
+    unavailable.attrs["artifact_provenance"]["aggregate"].update(
+        available=False,
+        value=None,
+        field_statistics=None,
+        group_statistics=None,
+        finite_value_count=aggregate["required_value_count"] - 1,
+        nonfinite_value_count=1,
+    )
+    reduced = analysis.artifacts.service._steady_wandb_summary({"id": unavailable})
+    assert reduced["evaluation/id/nonfinite_value_count"] == 1
+    assert not any(key.endswith(("macro_rmse", "_rmse_p", "_rmse_u", "_rmse_v")) for key in reduced)
+
+
+def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_counts(tmp_path: Path) -> None:
+    """Table cells, scoreboard ticks and the Pareto notice carry the counts; per-case statistics leave a non-finite case out."""
+    frame, _grid = _steady_frame(tmp_path)
+    peer = _steady_peer(frame)
+    aggregate = peer.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
+    aggregate.update(available=False, value=None, field_statistics=None, group_statistics=None, finite_value_count=0)
+    aggregate["nonfinite_value_count"] = aggregate["required_value_count"]
+    text = validity_contract.unavailable_text(aggregate)
+    datasets = {"Model A": frame, "Model B": peer}
+    plots = analysis.evaluation.plots.run_summary
+
+    table = plots.build_run_summary_table(datasets)
+    assert (table.loc["Model B", "normalized_group_macro_rmse"], table.loc["Model B", "normalized_rmse_u"]) == (text, text)
+    assert table.loc["Model A", "normalized_group_macro_rmse"] == pytest.approx(frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"])
+    assert text in plots.plot_run_summary_table(datasets=datasets).children[1].value
+
+    scoreboard = plots.plot_relative_comparison_scoreboard(datasets=datasets)
+    bars = cast("list[Rectangle]", scoreboard.axes[0].patches)
+    assert {bar.get_x() + bar.get_width() / 2.0 < 0.5 for bar in bars} == {True}
+    assert text in scoreboard.axes[0].get_xticklabels()[1].get_text()
+    plt.close(scoreboard)
+
+    pareto = plots.plot_accuracy_physics_pareto(datasets=datasets)
+    assert [len(axis.collections) for axis in pareto.axes[:3]] == [1, 1, 1]
+    assert any(text in item.get_text() for item in pareto.axes[3].texts)
+    plt.close(pareto)
+
+    peer.loc[peer.index[0], "flux_balance_mse"] = np.nan
+    physics = analysis.evaluation.plots.physical_consistency.build_physical_consistency_summary_table(datasets)
+    assert physics.loc["Model B", "flux_balance_mse median"] == pytest.approx(frame["flux_balance_mse"].iloc[1])
+
+    peer.loc[peer.index[0], "normalized_rmse_p"] = np.nan
+    sensitivity = analysis.evaluation.plots.sensitivity_capacity
+    heatmap = sensitivity.plot_metadata_error_heatmap(datasets=datasets, max_cases=_CASE_COUNT)
+    np.testing.assert_allclose(_numeric_array(heatmap.axes[0].images[0].get_array()), 1.0)
+    assert np.isnan(_numeric_array(heatmap.axes[1].images[0].get_array())[:, 0]).all()
+    plt.close(heatmap)
+    plt.close(sensitivity.plot_metadata_error_trends(datasets=datasets, max_cases=_CASE_COUNT, channels=("p",)))
 
 
 def test_steady_comparison_checks_every_matched_case_grid_after_lazy_panel_admission(tmp_path: Path) -> None:
@@ -311,6 +383,52 @@ def test_steady_comparison_checks_every_matched_case_grid_after_lazy_panel_admis
     dataframe.validate_comparison(datasets, verify_grid=False)
     with pytest.raises(dataframe.ComparisonCompatibilityError, match=r"case.*coordinate_digest"):
         dataframe.validate_comparison(datasets)
+
+
+def test_steady_comparison_refuses_runs_with_different_role_membership(tmp_path: Path) -> None:
+    """Steady comparisons refuse disagreeing membership instead of intersecting it, as transient ones do."""
+    frame, _grid = _steady_frame(tmp_path)
+    narrowed = frame.iloc[:-1].copy()
+    narrowed.attrs = copy.deepcopy(frame.attrs)
+    narrowed.attrs["artifact_provenance"]["dataset"]["case_ids_by_source"] = [["case-a"]]
+
+    def loaded(table: pd.DataFrame) -> Any:
+        return SimpleNamespace(id_artifact=SimpleNamespace(frame=table), additional_artifact=None, run_dir=tmp_path)
+
+    workflow = analysis.evaluation.workflow
+    workflow._validate_shared_membership((loaded(frame), loaded(frame.copy())), roles=("id",))
+    with pytest.raises(ValueError, match="dataset membership"):
+        workflow._validate_shared_membership((loaded(frame), loaded(narrowed)), roles=("id",))
+
+
+@pytest.mark.parametrize("peer_role", ["eval", "additional_evaluation"])
+@pytest.mark.parametrize(
+    ("producer", "message"),
+    [
+        ({"analysis_sha256": "0" * 64}, "different analysis implementations"),
+        (None, "cannot be compared: Artifact producer must be exactly"),
+        ({"analysis_sha256": "D" * 64}, "cannot be compared: Artifact producer must be exactly"),
+    ],
+    ids=["different", "missing", "malformed"],
+)
+def test_steady_comparison_requires_one_recorded_analysis_producer(
+    tmp_path: Path,
+    peer_role: str,
+    producer: dict[str, str] | None,
+    message: str,
+) -> None:
+    """Frames of one comparison, within one role or across ID and OOD, must record the same valid analysis producer."""
+    frame, _grid = _steady_frame(tmp_path)
+    peer = _steady_peer(frame)
+    peer.attrs["artifact_provenance"]["split_role"] = peer_role
+    dataframe.validate_comparison({"A": frame, "B": peer}, verify_grid=False)
+
+    if producer is None:
+        del peer.attrs["artifact_provenance"]["producer"]
+    else:
+        peer.attrs["artifact_provenance"]["producer"] = producer
+    with pytest.raises(dataframe.ComparisonCompatibilityError, match=message):
+        dataframe.validate_comparison({"A": frame, "B": peer}, verify_grid=False)
 
 
 def test_exact_grid_cache_rejects_changed_payload_witness(tmp_path: Path) -> None:
@@ -362,7 +480,6 @@ def _steady_peer(frame: pd.DataFrame) -> pd.DataFrame:
             "architecture": {"modes": 8},
         }
     )
-    peer.attrs.pop(dataframe.RUNTIME_COMPARISON_ATTR, None)
     return peer
 
 
@@ -495,7 +612,7 @@ def test_steady_global_decomposition_capacity_and_map_values(tmp_path: Path) -> 
     )
     np.testing.assert_allclose(
         _numeric_array(bias.axes[0].collections[0].get_offsets()),
-        ((0.5, 1.0), (1.0, 2.0)),
+        np.asarray(((0.5, 1.0), (1.0, 2.0))),
     )
     plt.close(bias)
 
@@ -529,7 +646,7 @@ def test_steady_global_decomposition_capacity_and_map_values(tmp_path: Path) -> 
     )
     np.testing.assert_allclose(
         _numeric_array(capacity.axes[0].collections[0].get_offsets()),
-        ((8.0, frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"]),),
+        np.asarray(((8.0, frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]["value"]),), dtype=float),
     )
     plt.close(capacity)
 
@@ -646,6 +763,78 @@ def test_steady_physical_spectral_and_sensitivity_values(tmp_path: Path) -> None
     plt.close(trend)
 
 
+def _nonfinite_frame(tmp_path: Path, positions: Sequence[int]) -> pd.DataFrame:
+    """Return the two-case steady fixture with the given rows rewritten as NONFINITE predictions."""
+    tmp_path.mkdir()
+    frame, _grid = _steady_frame(tmp_path)
+    channels = domain.tasks.steady_flow.STEADY_FLOW.output_names
+    for position in positions:
+        path = Path(str(frame.loc[position, "npz_path"]))
+        with np.load(path) as payload:
+            arrays = dict(payload)
+        arrays["pred"][0, 2, 3] = np.nan
+        arrays["err"][0, 2, 3] = np.nan
+        np.savez_compressed(path, **arrays)
+        validity = validity_contract.build_field_prediction_validity(arrays["pred"][: len(channels)], channels=channels)
+        frame.loc[position, "prediction_validity"] = json.dumps(validity)
+        frame.loc[position, ["rel_l2", "rel_h1"]] = np.nan
+    frame.attrs["artifact_provenance"]["evaluation"]["prediction_validity"] = validity_contract.table_role_prediction_validity(frame)
+    return frame
+
+
+def test_prefix_summary_leaves_nonfinite_cases_out_whole_and_counts_them(tmp_path: Path) -> None:
+    """A NONFINITE case never reaches a reduction: the rest reduces as if it were alone, and a prefix without finite case is explicit."""
+    finite = _nonfinite_frame(tmp_path / "finite", ())
+    mixed = _nonfinite_frame(tmp_path / "mixed", (1,))
+    none = _nonfinite_frame(tmp_path / "none", (0, 1))
+    with analysis.evaluation.session.EvaluationSession({"finite": finite}) as session:
+        alone = session.prefix_summary(finite, 1)
+    with analysis.evaluation.session.EvaluationSession({"mixed": mixed}) as session:
+        partial = session.prefix_summary(mixed, _CASE_COUNT)
+    with analysis.evaluation.session.EvaluationSession({"none": none}) as session:
+        empty = session.prefix_summary(none, _CASE_COUNT)
+
+    assert (partial.case_count, partial.left_out_count, partial.used_count) == (_CASE_COUNT, 1, 1)
+    for field in partial.fields:
+        np.testing.assert_array_equal(partial.local_relative_error[field].quantiles, alone.local_relative_error[field].quantiles)
+        np.testing.assert_array_equal(partial.target_magnitude_error[field].medians, alone.target_magnitude_error[field].medians)
+        np.testing.assert_array_equal(partial.spectra[field].error, alone.spectra[field].error)
+    assert partial.spectra["p"].error.shape[0] == 1
+    assert (empty.case_count, empty.left_out_count, empty.used_count) == (_CASE_COUNT, _CASE_COUNT, 0)
+    assert empty.fields == alone.fields
+    reductions = (empty.local_relative_error, empty.target_magnitude_error, empty.boundary_distance_error, empty.spectra, empty.magnitudes)
+    assert not any(reductions)
+
+
+def test_prefix_plots_show_an_empty_prefix_instead_of_failing(tmp_path: Path) -> None:
+    """Every prefix consumer states `unavailable` when no prefix case is finite, and the curated spectral entry still renders the rest."""
+    plots = analysis.evaluation.plots
+    none = {"No finite case": _nonfinite_frame(tmp_path / "none", (0, 1))}
+    mixed = {"One finite case": _nonfinite_frame(tmp_path / "mixed", (1,))}
+    renderers = (
+        plots.spectral_fidelity.plot_spectral_fidelity,
+        plots.spectral_fidelity.plot_spectral_transfer_ratio,
+        plots.error_behavior.plot_predictive_error_distributions,
+        plots.error_behavior.plot_error_vs_target_magnitude,
+        plots.error_behavior.plot_boundary_error_decomposition,
+    )
+    for render in renderers:
+        figure = render(datasets=none)
+        legend_texts = [text.get_text() for axis in figure.axes if (legend := axis.get_legend()) for text in legend.get_texts()]
+        texts = [text.get_text() for axis in figure.axes for text in axis.texts] + legend_texts
+        assert any(f"unavailable (0 finite of {_CASE_COUNT} prefix cases)" in text for text in texts), render.__name__
+        plt.close(figure)
+    figure = plots.spectral_fidelity.plot_spectral_fidelity(datasets=mixed)
+    assert figure.axes[0].lines
+    plt.close(figure)
+    for render in (plots.error_behavior.plot_predictive_error_distributions, plots.error_behavior.plot_global_error_metrics):
+        plt.close(render(datasets=mixed))
+    figure = plots.error_behavior.plot_global_error_metrics(datasets=none)
+    legend_texts = [text.get_text() for axis in figure.axes if (legend := axis.get_legend()) for text in legend.get_texts()]
+    assert any(f"unavailable (0 finite of {_CASE_COUNT} cases)" in text for text in legend_texts)
+    plt.close(figure)
+
+
 def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> None:
     """Protect exact selected cases, Kappa evidence, rankings, and paired fields."""
     frame, x_grid = _steady_frame(tmp_path)
@@ -707,72 +896,58 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
     plt.close(pareto)
 
 
-def test_steady_runtime_binding_rejects_identity_drift_without_invalidating_core(tmp_path: Path) -> None:
-    """Reject optional timing drift while retaining the admitted scientific frame."""
+def test_steady_timing_binding_rejects_identity_drift(tmp_path: Path) -> None:
+    """The required timing report must name the artifact's exact Dataset and checkpoint."""
     frame, _x_grid = _steady_frame(tmp_path)
-    payload = frame.attrs[dataframe.RUNTIME_COMPARISON_ATTR]
     provenance = frame.attrs["artifact_provenance"]
-    role = artifact_loader._SavedRole(
-        split_role="eval",
-        dataset_name=provenance["dataset"]["name"],
-        dataset_identity={
-            **provenance["dataset"],
-            "sample_ids": ("case-a", "case-b"),
-        },
-        source_indices=(0, 1),
-        saved_membership_digest=provenance["dataset"]["saved_membership_digest"],
-        root=tmp_path,
-    )
+    payload = provenance["timing"]["report"]
+    dataset = provenance["dataset"]
+    role = _saved_role("eval", dataset["name"], dict(zip(dataset["source_dataset_ids"], dataset["case_ids_by_source"], strict=True)), tmp_path)
     assert artifact_loader._validate_runtime_comparison_binding(payload, frame=frame, role=role) == payload
 
-    for section, key in (("model_identity", "best_checkpoint_sha256"), ("dataset_identity", "fingerprint")):
+    for section, key in (("model_identity", "best_checkpoint_sha256"), ("dataset_identity", "dataset_provenance_sha256")):
         mismatched = copy.deepcopy(payload)
         mismatched[section][key] = "mismatch"
         with pytest.raises(ValueError, match="Dataset or checkpoint identity"):
             artifact_loader._validate_runtime_comparison_binding(mismatched, frame=frame, role=role)
 
-    scientific_only = frame.copy()
-    scientific_only.attrs.pop(dataframe.RUNTIME_COMPARISON_ATTR, None)
-    invalid = copy.deepcopy(payload)
-    invalid["dataset_identity"]["fingerprint"] = "mismatch"
-    common.serialization.atomic_write_json(
-        analysis.artifacts.timing.runtime_comparison_path(tmp_path),
-        invalid,
+
+def _saved_role(split: Any, name: str, case_ids_by_source: Mapping[str, Sequence[str]], root: Path) -> Any:
+    """Return one saved artifact role over the given sources, each holding exactly its listed cases."""
+    plan = analysis.artifacts.plan.ArtifactRolePlan(
+        split=split,
+        dataset_role="id" if split == "eval" else "additional_evaluation",
+        dataset_name=name,
+        source_dataset_ids=tuple(case_ids_by_source),
+        source_identities=tuple({"dataset_id": source, "case_ids": list(ids)} for source, ids in case_ids_by_source.items()),
+        case_ids_by_source=tuple(tuple(ids) for ids in case_ids_by_source.values()),
+        membership_digests=tuple("a" * 64 for _ in case_ids_by_source),
     )
-    artifact_loader._attach_optional_runtime_comparison(scientific_only, role=role)
-    assert dataframe.RUNTIME_COMPARISON_ATTR not in scientific_only.attrs
-    assert "Dataset or checkpoint identity" in scientific_only.attrs[dataframe.RUNTIME_COMPARISON_ERROR_ATTR]
-    dataframe.validate_comparison({"Steady fixture": scientific_only})
+    return artifact_loader._SavedRole(plan=plan, root=root)
 
 
 def test_steady_payload_membership_binds_file_names_to_saved_dataset_case_ids(tmp_path: Path) -> None:
-    """Admit NPZ files named by the saved Dataset case IDs and reject any other name in table or manifest."""
-    sample_ids = ("lentil__case_0003__fe83e052fbf2", "ood_a::field_pea__case_0001__0123456789ab")
-    names = ("lentil__case_0003__fe83e052fbf2.npz", "field_pea__case_0001__0123456789ab.npz")
+    """Admit NPZ files named by the saved Dataset case IDs of every source and reject any other name, order or source."""
+    sample_ids = ("lentil__case_0003__fe83e052fbf2", "field_pea__case_0001__0123456789ab")
+    names = tuple(f"{case_id}.npz" for case_id in sample_ids)
     (tmp_path / "npz").mkdir()
     for name in names:
         (tmp_path / "npz" / name).write_bytes(b"payload")
 
     def role(ids: tuple[str, ...]) -> Any:
-        return artifact_loader._SavedRole(
-            split_role="additional_evaluation",
-            dataset_name="ood_a",
-            dataset_identity={"sample_ids": ids},
-            source_indices=(0, 1),
-            saved_membership_digest="digest",
-            root=tmp_path,
-        )
+        return _saved_role("additional_evaluation", "ood", {"ood_a": ids[:1], "ood_b": ids[1:]}, tmp_path)
 
-    def membership(table_names: tuple[str, ...], manifest_names: tuple[str, ...]) -> dict[str, Any]:
+    def membership(table_names: tuple[str, ...], manifest_names: tuple[str, ...], sources: tuple[str, ...] = ("ood_a", "ood_b")) -> dict[str, Any]:
         frame = pd.DataFrame(
             {
                 "source_index": [0, 1],
                 "split_local_index": [0, 1],
                 "case_index": [1, 2],
+                "source_dataset_id": list(sources),
                 "npz_path": [str(tmp_path / "npz" / name) for name in table_names],
             }
         )
-        outputs = {"parquet": {"path": "ood_a.parquet"}, "npz": [{"path": f"npz/{name}"} for name in sorted(manifest_names)]}
+        outputs = {"parquet": {"path": "ood.parquet"}, "npz": [{"path": f"npz/{name}"} for name in sorted(manifest_names)]}
         return {"frame": frame, "provenance": {"outputs": outputs}, "effective_indices": (0, 1)}
 
     artifact_loader._validate_payload_membership(role=role(sample_ids), **membership(names, names))
@@ -780,6 +955,8 @@ def test_steady_payload_membership_binds_file_names_to_saved_dataset_case_ids(tm
         artifact_loader._validate_payload_membership(role=role(sample_ids), **membership(names[::-1], names))
     with pytest.raises(ValueError, match="manifest NPZ membership"):
         artifact_loader._validate_payload_membership(role=role(sample_ids), **membership(names, ("case_0001.npz", "case_0002.npz")))
+    with pytest.raises(ValueError, match="source_dataset_id"):
+        artifact_loader._validate_payload_membership(role=role(sample_ids), **membership(names, names, ("ood_a", "ood_a")))
     with pytest.raises(ValueError, match="package case ID"):
         artifact_loader._validate_payload_membership(role=role(("case-a", "case-b")), **membership(names, names))
 

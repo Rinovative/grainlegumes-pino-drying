@@ -2,12 +2,14 @@
 
 Responsibilities:
   - Define the current checkpoint schema and run-identity binding
-  - Capture model, optimizer, scheduler, scaler, loss, RNG, loader, and optional adapter state
+  - Capture model, optimizer, scheduler, loss, RNG, loader, and optional adapter state
   - Decide from the admitted config whether a run's best keeps the full training state
   - Validate matched-comparison batch progress and its exact sampler continuation
   - Validate checkpoint identity before mutating runtime objects
-  - Publish best and last checkpoints through atomic replacement
-  - Declare the per-task training code projections behind the scientific implementation digest
+  - Carry the committed training-work counts across resume
+  - Publish best and last checkpoints through atomic replacement, a new best together with its last
+  - Declare the per-task model projection and the training projection that includes it
+  - Bind run identity to the producer digests a resolved config records, never to the running code
 
 Design principles:
   - ``last_checkpoint.pt`` is the only continuation source and always carries the full state
@@ -18,7 +20,7 @@ Design principles:
 
 This module does NOT:
   - Allocate run directories, choose resume policy, or validate mutable run status
-  - Construct models, optimizers, schedulers, scalers, losses, or dataloaders
+  - Construct models, optimizers, schedulers, losses, or dataloaders
   - Repair or reinterpret malformed checkpoints
 """
 
@@ -32,6 +34,7 @@ import os
 import random
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -48,7 +51,7 @@ if TYPE_CHECKING:
 
 CheckpointRole = Literal["best", "last"]
 CheckpointPayloadKind = Literal["full", "evaluation"]
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_SCHEMA_KIND = "experiment_training_checkpoint"
 _SHA256_LENGTH: Final = 64
 _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
@@ -81,6 +84,7 @@ _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
     {
         "task",
         "task_contract",
+        "producer",
         "run",
         "data",
         "model",
@@ -96,33 +100,69 @@ _RUN_SEMANTIC_KEYS: Final = frozenset({"seed", "deterministic"})
 _RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "revision", "layout", "naming_schema_version"})
 _DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "additional_evaluation_datasets", "batch_size"})
 _DATA_EXECUTION_KEYS: Final = frozenset({"num_workers", "pin_memory", "persistent_workers"})
-_TRAINING_DIRECTORIES: Final = (
-    "datasets/contracts",
-    "datasets/preprocessing",
-    "datasets/runtime",
-    "learning/losses",
-    "learning/metrics",
-    "learning/models",
-    "learning/training",
-)
-_TRAINING_FILES: Final = (
+PRODUCER_KEYS: Final = frozenset({"training_sha256", "model_sha256"})
+_MODEL_DIRECTORIES: Final = ("datasets/contracts", "datasets/preprocessing", "datasets/runtime")
+_MODEL_FILES: Final = (
     "common/common_code_identity.py",
-    "common/common_random.py",
     "common/common_serialization.py",
     "datasets/packages/dataset_packages_manifest.py",
-    "datasets/packages/dataset_packages_reproduction.py",
     "domain/domain_field_sets.py",
     "domain/domain_fields.py",
     "domain/tasks/domain_task_registry.py",
     "domain/tasks/domain_task_spec.py",
-    "experiments/config/experiments_config_loader.py",
-    "experiments/experiments_run.py",
     "generation/contracts/generation_contracts_descriptors.py",
     "generation/contracts/generation_contracts_materials.py",
     "generation/contracts/generation_contracts_porosity.py",
     "generation/contracts/generation_contracts_profiles.py",
     "generation/contracts/generation_contracts_registry.py",
     "generation/contracts/generation_contracts_vocabulary.py",
+    "learning/models/learning_models_factory.py",
+)
+_MODEL_EXEMPTIONS: Final = {
+    "datasets/packages/dataset_packages_builder.py": "Dataset publication is bound by the Dataset content identity",
+    "datasets/packages/dataset_packages_reproduction.py": "Dataset producer evidence is validated as evidence, not used for prediction",
+    "datasets/packages/dataset_packages_selection.py": "Dataset membership is bound by the Dataset content identity",
+    "generation/cases/generation_cases_config.py": "Generation config reaches a model only through Dataset content",
+    "generation/contracts/generation_contracts_source.py": "producer provenance capture, not prediction",
+    "learning/learning_device.py": "device choice; the numerical environment is bound separately",
+    "learning/learning_device_policy.py": "device choice; the numerical environment is bound separately",
+}
+MODEL_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
+    "steady_flow": common.code_identity.CodeProjection(
+        name="model_steady_flow",
+        directories=_MODEL_DIRECTORIES,
+        files=(*_MODEL_FILES, "domain/physics/domain_physics_contracts.py", "domain/tasks/domain_task_steady_flow.py"),
+        excluded_markers=("transient",),
+        exemptions={
+            **_MODEL_EXEMPTIONS,
+            "learning/models/learning_models_rno_cell.py": "transient-only RNO cell, reached through the model factory's kind dispatch",
+        },
+    ),
+    "transient_drying": common.code_identity.CodeProjection(
+        name="model_transient_drying",
+        directories=_MODEL_DIRECTORIES,
+        files=(
+            *_MODEL_FILES,
+            "datasets/packages/dataset_packages_trajectory.py",
+            "datasets/packages/dataset_packages_transient_shards.py",
+            "domain/tasks/domain_task_transient_drying.py",
+            "learning/learning_temporal.py",
+            "learning/models/learning_models_rno_cell.py",
+            "learning/transient/learning_transient_contracts.py",
+            "learning/transient/learning_transient_rollout.py",
+            "learning/transient/learning_transient_scaling.py",
+            "learning/transient/learning_transient_tensorizer.py",
+        ),
+        excluded_markers=("steady", "_pino"),
+        exemptions=_MODEL_EXEMPTIONS,
+    ),
+}
+_TRAINING_DIRECTORIES: Final = ("learning/losses", "learning/metrics", "learning/models", "learning/training")
+_TRAINING_FILES: Final = (
+    "common/common_random.py",
+    "datasets/packages/dataset_packages_reproduction.py",
+    "experiments/config/experiments_config_loader.py",
+    "experiments/experiments_run.py",
 )
 _TRAINING_EXEMPTIONS: Final = {
     "datasets/packages/dataset_packages_builder.py": "Dataset publication is bound by the Dataset content identity",
@@ -135,35 +175,29 @@ _TRAINING_EXEMPTIONS: Final = {
     "learning/learning_device.py": "device choice; the numerical environment is bound separately",
     "learning/learning_device_policy.py": "device choice; the numerical environment is bound separately",
 }
-TRAINING_PROJECTIONS: Final = {
+TRAINING_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
     "steady_flow": common.code_identity.CodeProjection(
         name="training_steady_flow",
         directories=(*_TRAINING_DIRECTORIES, "domain/physics"),
-        files=(*_TRAINING_FILES, "domain/tasks/domain_task_steady_flow.py"),
+        files=_TRAINING_FILES,
         excluded_markers=("transient",),
         exemptions={
             **_TRAINING_EXEMPTIONS,
             "experiments/experiments_matched_budget.py": "transient matched-budget protocol, reached through the run module dispatch",
             "learning/learning_temporal.py": "transient time-conditioning contract, reached through the loader's transient config validation",
         },
+        includes=(MODEL_PROJECTIONS["steady_flow"],),
     ),
     "transient_drying": common.code_identity.CodeProjection(
         name="training_transient_drying",
         directories=(*_TRAINING_DIRECTORIES, "learning/transient"),
-        files=(
-            *_TRAINING_FILES,
-            "datasets/packages/dataset_packages_trajectory.py",
-            "datasets/packages/dataset_packages_transient_shards.py",
-            "domain/physics/domain_physics_contracts.py",
-            "domain/tasks/domain_task_transient_drying.py",
-            "experiments/experiments_matched_budget.py",
-            "learning/learning_temporal.py",
-        ),
+        files=(*_TRAINING_FILES, "domain/physics/domain_physics_contracts.py", "experiments/experiments_matched_budget.py"),
         excluded_markers=("steady", "_pino"),
         exemptions={
             **_TRAINING_EXEMPTIONS,
             "domain/physics/domain_physics_derivatives.py": "steady PINO derivative operators, reached through the loss factory dispatch",
         },
+        includes=(MODEL_PROJECTIONS["transient_drying"],),
     ),
 }
 _NEURALOPERATOR_PROJECTION: Final = common.code_identity.CodeProjection(name="neuraloperator", directories=(".",))
@@ -180,8 +214,6 @@ _CHECKPOINT_KEYS = frozenset(
         "model_state_dict",
         "optimizer_state_dict",
         "scheduler_state_dict",
-        "amp_enabled",
-        "scaler_state_dict",
         "loss_state_dict",
         "best_metric",
         "best_epoch",
@@ -192,8 +224,10 @@ _CHECKPOINT_KEYS = frozenset(
         "torch_cuda_rng_states",
         "train_loader_generator_state",
         "train_sampler_state_dict",
+        "training_work",
     }
 )
+TRAINING_WORK_KEYS: Final = frozenset({"optimizer_steps", "gradient_predictions"})
 # Only a full payload continues optimization. An evaluation payload keeps the remaining keys:
 # completed_epoch and global_step are then the epoch (possibly a budget-ended partial one) and
 # the optimizer step at which its best was evaluated, never a continuation boundary.
@@ -202,7 +236,6 @@ _CONTINUATION_KEYS: Final = frozenset(
         "next_epoch",
         "optimizer_state_dict",
         "scheduler_state_dict",
-        "scaler_state_dict",
         "python_rng_state",
         "numpy_rng_state",
         "torch_cpu_rng_state",
@@ -233,12 +266,12 @@ def _selected_config_mapping(
 
 
 def scientific_implementation_digest(task_id: str) -> str:
-    """Bind the declared task-owned scientific implementation, excluding presentation.
+    """Bind the declared task-owned training implementation, excluding presentation.
 
-    The task's training projection names its declaration modules, shared model,
-    loss, metric, training, preprocessing and runtime packages, and the task-specific
-    files of that task; files owned by the other task do not participate. A changed
-    digest detects changed implementation, without proving mathematical
+    The task's training projection is its model projection plus the loss, metric,
+    model-naming and training packages, the task's other training machinery and the
+    shared run and loader modules; files owned by the other task do not participate.
+    A changed digest detects changed implementation, without proving mathematical
     nonequivalence or completeness; the projection tests classify every static
     import of a member. The shared run and loader modules execute scientific choices
     and are hashed conservatively in full, so unrelated edits within those two
@@ -258,12 +291,37 @@ def scientific_implementation_digest(task_id: str) -> str:
     return projection.sha256()
 
 
+def model_implementation_digest(task_id: str) -> str:
+    """Bind the code that turns persisted weights and fitted scaling into predictions of one task.
+
+    The task's model projection names the Dataset contracts, preprocessing and runtime
+    readers with their scaling fit callers, the Generation interpretation contracts,
+    the model factory and the task's tensorizer and rollout files; losses, metrics and
+    the training lifecycle do not participate. The training projection includes it.
+
+    Raises
+    ------
+    ValueError
+        If ``task_id`` has no declared model projection.
+
+    """
+    projection = MODEL_PROJECTIONS.get(task_id)
+    if projection is None:
+        message = f"No model implementation projection is declared for task {task_id!r}."
+        raise ValueError(message)
+    return projection.sha256()
+
+
 def effective_config_identity_payload(
     config: Mapping[str, Any],
     *,
     include_epochs: bool = True,
 ) -> dict[str, Any]:
-    """Return positive model-training dependencies without paths or reporting."""
+    """Return positive model-training dependencies without paths or reporting.
+
+    The implementation identity is the config's recorded ``producer`` evidence, never
+    the running code, so a persisted config keeps its identity under later code changes.
+    """
     keys = set(config)
     if keys == {"task", "temporal"}:
         temporal = _required_mapping(config["temporal"], label="config temporal")
@@ -294,33 +352,16 @@ def effective_config_identity_payload(
                 {
                     "train_dataset",
                     "additional_evaluation_datasets",
-                    "additional_evaluation_fraction",
                     "batch_size",
+                    "spatial_stride",
                 }
             )
             if is_transient
             else _DATA_SEMANTIC_KEYS
         ),
-        ignored_keys=(
-            frozenset(
-                {
-                    "num_workers",
-                    "pin_memory",
-                    "persistent_workers",
-                    "spatial_stride",
-                    "transient_backend_preference",
-                    "transient_backend_required",
-                    "hdf5_cache_size",
-                }
-            )
-            if is_transient
-            else _DATA_EXECUTION_KEYS
-        ),
+        ignored_keys=(frozenset({"num_workers", "pin_memory", "persistent_workers"}) if is_transient else _DATA_EXECUTION_KEYS),
         label="data",
     )
-    configured_spatial_stride = config["data"].get("spatial_stride", 1) if is_transient else 1
-    if is_transient and configured_spatial_stride != 1:
-        data["spatial_stride"] = configured_spatial_stride
     task_contract = _required_mapping(config["task_contract"], label="config task_contract")
     required_task_contract = {"schema_version", "task", "digest", "data_contract_digest"}
     missing_contract = sorted(required_task_contract.difference(task_contract))
@@ -342,7 +383,7 @@ def effective_config_identity_payload(
     payload = {
         "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
         "task": copy.deepcopy(config["task"]),
-        "implementation_sha256": scientific_implementation_digest(str(config["task"])),
+        "producer": _selected_config_mapping(config["producer"], semantic_keys=PRODUCER_KEYS, ignored_keys=frozenset(), label="producer"),
         "task_contract": {key: copy.deepcopy(task_contract[key]) for key in sorted(required_task_contract)},
         "run": run,
         "data": data,
@@ -384,6 +425,18 @@ def _required_sha256(value: Any, *, label: str) -> str:
         message = f"Checkpoint {label} must be one lowercase SHA-256 digest."
         raise ValueError(message)
     return value
+
+
+def _validate_training_work(value: Any) -> dict[str, int]:
+    """Return an isolated copy of the two non-negative committed training-work counts."""
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != TRAINING_WORK_KEYS
+        or any(type(value[key]) is not int or value[key] < 0 for key in TRAINING_WORK_KEYS)
+    ):
+        message = f"Checkpoint training_work must hold exactly the non-negative integers {sorted(TRAINING_WORK_KEYS)}."
+        raise ValueError(message)
+    return {key: int(value[key]) for key in sorted(TRAINING_WORK_KEYS)}
 
 
 _OBJECTIVE_KEYS = frozenset({"id", "kind", "space", "fields", "reduction", "direction"})
@@ -450,18 +503,9 @@ def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
         raise ValueError(message)
     objective = _validate_objective(identity["objective"], label=f"{label}.objective")
     normalized_roles: dict[str, dict[str, Any]] = {}
-    is_transient = identity["task"] == "transient_drying"
-    # Steady additional evaluation is optional but must appear in every role mapping together.
-    has_additional = is_transient or "additional_evaluation" in _required_mapping(
-        identity["dataset_fingerprints"], label=f"{label}.dataset_fingerprints"
-    )
-    additional_roles = {"additional_evaluation"} if has_additional else set()
-    membership_roles = (
-        {"train", "scaling_train_one_step", "validation", "id_test", "additional_evaluation"}
-        if is_transient
-        else {"train", "validation", "id_test", *additional_roles}
-    )
-    dataset_roles = {"train", *additional_roles}
+    # Both tasks bind the ordered additional Evaluation sources as one digest, an empty list included.
+    membership_roles = {"train", "validation", "id_test", "additional_evaluation"}
+    dataset_roles = {"train", "additional_evaluation"}
     for key, roles in (
         ("dataset_fingerprints", dataset_roles),
         ("split_membership_digests", membership_roles),
@@ -541,104 +585,16 @@ def build_checkpoint_identity(
         raise TypeError(message)
     task_digest = _required_sha256(task_digest, label="config task_contract.digest")
     normalizer_digest = _required_sha256(normalizer_sha256, label="normalizer_sha256")
-    if task == "transient_drying":
-        base_required = {
-            "schema_kind",
-            "schema_version",
-            "task",
-            "task_contract_digest",
-            "data_contract_digest",
-            "tensorizer",
-            "sampling",
-            "evaluation_sampling",
-            "dataset_identity",
-            "additional_evaluation_fraction",
-            "case_partition",
-            "case_partition_digest",
-            "evaluation_assignments",
-            "split_seed",
-            "source_case_ids",
-            "source_case_materials",
-            "spatial_view",
-            "roles",
-            "runtime_provenance",
-        }
-        split_version = split_indices.get("schema_version")
-        configured_stride = config["data"].get("spatial_stride", 1)
-        if (
-            split_indices.get("schema_kind") != datasets.runtime.transient_training.SPLIT_SCHEMA_KIND
-            or type(split_version) is not int
-            or split_version != datasets.runtime.transient_training.SPLIT_SCHEMA_VERSION
-        ):
-            message = "Historical or malformed transient checkpoint split schema is unsupported."
-            raise ValueError(message)
-        required = base_required
-        spatial_view = _required_mapping(split_indices.get("spatial_view"), label="transient spatial_view")
-        if spatial_view.get("spatial_stride") != configured_stride:
-            message = "Transient checkpoint split spatial stride does not match the config."
-            raise ValueError(message)
-        if set(split_indices) != required:
-            message = "Transient checkpoint split does not match the maintained training-split schema."
-            raise ValueError(message)
-        if split_indices["task"] != task or split_indices["task_contract_digest"] != task_digest:
-            message = "Transient checkpoint split task identity does not match the config contract."
-            raise ValueError(message)
-        identities = _required_mapping(split_indices["dataset_identity"], label="transient dataset_identity")
-        roles = _required_mapping(split_indices["roles"], label="transient roles")
-        train_identity = _required_mapping(identities.get("train"), label="transient train identity")
-        additional_identity = identities.get("additional_evaluation")
-        if not isinstance(additional_identity, list):
-            message = "Transient checkpoint additional evaluation Dataset identities must be a list."
-            raise ValueError(message)
-
-        def membership(role: str) -> str:
-            if role == "additional_evaluation":
-                added_roles = _required_mapping(roles.get(role), label="transient additional evaluation roles").get("parts")
-                if not isinstance(added_roles, list):
-                    message = "Transient checkpoint additional evaluation membership evidence is invalid."
-                    raise ValueError(message)
-                return common.serialization.canonical_json_sha256(added_roles)
-            evidence = _required_mapping(roles.get(role), label=f"transient {role} role")
-            return _required_sha256(evidence.get("membership_digest"), label=f"transient {role} membership_digest")
-
-        membership_values = {role: membership(role) for role in ("train", "scaling_train_one_step", "validation", "id_test", "additional_evaluation")}
-        dataset_ids = {
-            "train": str(train_identity.get("dataset_id", "")),
-            "additional_evaluation": common.serialization.canonical_json_sha256(additional_identity),
-        }
-        fingerprints = {
-            "train": _required_sha256(train_identity.get("index_digest"), label="transient train index_digest"),
-            "additional_evaluation": common.serialization.canonical_json_sha256(additional_identity),
-        }
-        scientific_split = dict(split_indices)
-        scientific_split.pop("runtime_provenance")
-        persisted = dict(persisted_config or config)
-        return _validate_checkpoint_identity(
-            {
-                "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
-                "task": task,
-                "task_contract_digest": task_digest,
-                "effective_config_digest": config_digest(persisted),
-                "resume_contract_digest": resume_contract_digest(persisted),
-                "dataset_ids": dataset_ids,
-                "dataset_fingerprints": fingerprints,
-                "split_contract_digest": common.serialization.canonical_json_sha256(scientific_split),
-                "split_membership_digests": membership_values,
-                "normalizer_sha256": normalizer_digest,
-                "numerical_environment": numerical_environment_identity(),
-                "objective": objective,
-            },
-            label="built identity",
-        )
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    if split_contract.task != task or split_contract.task_contract_digest != task_digest:
+    split = datasets.preprocessing.splits.admit_split(split_indices)
+    if split.task != task or split.task_contract_digest != task_digest:
         message = "Split task identity must match the checkpoint config contract."
         raise ValueError(message)
-    sources = split_contract.sources()
-    dataset_ids = {role: source.dataset_id for role, source in sources.items()}
-    fingerprints = {role: source.fingerprint for role, source in sources.items()}
-    split_payload = split_contract.scientific_payload()
-    membership_values = split_payload["membership_digests"]
+    if split.extension is not None and split.extension["spatial_view"]["spatial_stride"] != config["data"]["spatial_stride"]:
+        message = "Transient checkpoint split spatial stride does not match the config."
+        raise ValueError(message)
+    digest = common.serialization.canonical_json_sha256
+    memberships = split.membership_digests()
+    additional = split.additional_evaluation
     persisted = dict(persisted_config or config)
     return _validate_checkpoint_identity(
         {
@@ -647,10 +603,13 @@ def build_checkpoint_identity(
             "task_contract_digest": task_digest,
             "effective_config_digest": config_digest(persisted),
             "resume_contract_digest": resume_contract_digest(persisted),
-            "dataset_ids": dataset_ids,
-            "dataset_fingerprints": fingerprints,
-            "split_contract_digest": common.serialization.canonical_json_sha256(split_payload),
-            "split_membership_digests": membership_values,
+            "dataset_ids": {"train": split.train.dataset_id, "additional_evaluation": digest([part.dataset_id for part in additional])},
+            "dataset_fingerprints": {
+                "train": digest(dict(split.train.dataset)),
+                "additional_evaluation": digest([dict(part.dataset) for part in additional]),
+            },
+            "split_contract_digest": digest(split.as_payload()),
+            "split_membership_digests": {**memberships, "additional_evaluation": digest(memberships["additional_evaluation"])},
             "normalizer_sha256": normalizer_digest,
             "numerical_environment": numerical_environment_identity(),
             "objective": objective,
@@ -784,14 +743,13 @@ def make_checkpoint(
     model: nn.Module,
     optimizer: Optimizer,
     scheduler: Any | None,
-    scaler: Any | None,
-    amp_enabled: bool,
     loss: nn.Module,
     best_metric: float | None,
     best_epoch: int | None,
     objective_history: list[dict[str, Any]],
     train_loader: DataLoader[Any],
     runtime_device: torch.device,
+    training_work: Mapping[str, int],
     adapter: Any | None = None,
     batch_progress: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -805,17 +763,15 @@ def make_checkpoint(
     payload_kind : {"full", "evaluation"}
         ``"full"`` for every last checkpoint and the best of
         :func:`is_teacher_handoff_source` runs; ``"evaluation"`` omits optimizer,
-        scheduler, scaler, RNG, loader, ``next_epoch``, and batch progress.
+        scheduler, RNG, loader, ``next_epoch``, and batch progress.
     identity : Mapping[str, Any]
         Immutable run identity from :func:`build_checkpoint_identity`.
     completed_epoch : int
         Positive one-based epoch that completed fully.
     global_step : int
         Number of completed optimizer steps.
-    model, optimizer, scheduler, scaler, loss : Any
+    model, optimizer, scheduler, loss : Any
         Stateful runtime objects.
-    amp_enabled : bool
-        Whether mixed-precision scaling is active.
     best_metric : float | None
         Best finite objective so far, if any.
     best_epoch : int | None
@@ -827,6 +783,8 @@ def make_checkpoint(
     runtime_device : torch.device
         Active concrete execution device. CUDA RNG is captured only for this device and
         any CUDA devices that actually own model parameters or buffers.
+    training_work : Mapping[str, int]
+        Committed ``optimizer_steps`` and ``gradient_predictions`` of this run so far.
 
     adapter : Any | None, optional
         Task-owned batch and continuation-state adapter; mutually exclusive with data_processor where accepted.
@@ -867,12 +825,6 @@ def make_checkpoint(
     if not isinstance(runtime_device, torch.device) or runtime_device.type not in {"cpu", "cuda"}:
         msg = f"Checkpoint capture requires one concrete CPU or CUDA torch.device, got {runtime_device!r}."
         raise TypeError(msg)
-    if amp_enabled and scaler is None:
-        msg = "AMP-enabled checkpoints require a scaler."
-        raise ValueError(msg)
-    if amp_enabled and runtime_device.type != "cuda":
-        msg = "AMP-enabled checkpoints require a concrete CUDA runtime device."
-        raise ValueError(msg)
 
     validated_identity = _validate_checkpoint_identity(identity, label="identity")
     adapter_state: dict[str, Any] | None = None
@@ -891,11 +843,11 @@ def make_checkpoint(
         "completed_epoch": completed_epoch,
         "global_step": global_step,
         "model_state_dict": model.state_dict(),
-        "amp_enabled": bool(amp_enabled),
         "loss_state_dict": loss.state_dict(),
         "best_metric": None if best_metric is None else float(best_metric),
         "best_epoch": best_epoch,
         "objective_history": copy.deepcopy(objective_history),
+        "training_work": _validate_training_work(training_work),
     }
     if payload_kind == "full":
         generator = _train_loader_generator(train_loader)
@@ -904,7 +856,6 @@ def make_checkpoint(
             "next_epoch": completed_epoch + (1 if batch_progress is None or batch_progress["complete"] else 0),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),  # noqa: NPY002 -- exact process-global RNG state
             "torch_cpu_rng_state": torch.get_rng_state(),
@@ -952,7 +903,6 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     expected_role: CheckpointRole,
     payload_kind: CheckpointPayloadKind,
     scheduler_expected: bool,
-    amp_expected: bool,
     require_best: bool,
     adapter_expected: bool = False,
 ) -> dict[str, Any]:
@@ -972,8 +922,6 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         every last checkpoint, :func:`best_payload_kind` for a best checkpoint.
     scheduler_expected : bool
         Whether scheduler state must be present.
-    amp_expected : bool
-        Whether AMP and scaler state must be present.
     require_best : bool
         Whether finite best-objective state is mandatory.
 
@@ -1002,9 +950,9 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
 
     """
     schema_version = payload.get("schema_version")
-    if payload.get("schema_kind") != CHECKPOINT_SCHEMA_KIND or type(schema_version) is not int or schema_version != CHECKPOINT_SCHEMA_VERSION:
+    if payload.get("schema_kind") != CHECKPOINT_SCHEMA_KIND or not common.serialization.is_schema_version(schema_version, CHECKPOINT_SCHEMA_VERSION):
         msg = (
-            "Historical or malformed checkpoint schema_kind/schema_version is unsupported: "
+            "Malformed or unsupported checkpoint schema_kind/schema_version: "
             f"got {payload.get('schema_kind')!r}/{schema_version!r}, admitted {CHECKPOINT_SCHEMA_KIND!r}/{CHECKPOINT_SCHEMA_VERSION}. "
             "Regenerate the run."
         )
@@ -1055,6 +1003,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             msg = f"Checkpoint {label} must be an integer >= {minimum}."
             raise TypeError(msg)
+    _validate_training_work(payload["training_work"])
     progress = payload.get("batch_progress")
     if has_batch_progress:
         if not isinstance(progress, Mapping) or set(progress) != {"epoch", "cursor", "size", "complete"}:
@@ -1081,13 +1030,6 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         _required_mapping(payload[key], label=key)
     if full and scheduler_expected != isinstance(payload["scheduler_state_dict"], Mapping):
         msg = "Checkpoint scheduler state is absent or present inconsistently with the resolved config."
-        raise ValueError(msg)
-    amp_enabled = payload["amp_enabled"]
-    if not isinstance(amp_enabled, bool) or amp_enabled != amp_expected:
-        msg = f"Checkpoint AMP mode mismatch: expected {amp_expected}, got {amp_enabled!r}."
-        raise ValueError(msg)
-    if full and amp_expected != isinstance(payload["scaler_state_dict"], Mapping):
-        msg = "Checkpoint scaler state is absent or present inconsistently with active AMP."
         raise ValueError(msg)
 
     best_metric = payload["best_metric"]
@@ -1193,24 +1135,63 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     return dict(payload)
 
 
-def save_checkpoint(payload: Mapping[str, Any], path: Path | str) -> Path:
+def _staged_path(path: Path) -> Path:
+    """Return the fixed hidden sibling a checkpoint is staged at before its rename."""
+    return path.with_name(f".{path.name}.staged")
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Best-effort flush of renamed directory entries; content atomicity holds without it."""
+    with suppress(OSError):
+        descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def save_checkpoints(*publications: tuple[Mapping[str, Any], Path | str]) -> None:
     """
-    Atomically publish one already validated checkpoint payload.
+    Atomically publish already validated checkpoint payloads as one ordered group.
 
     Parameters
     ----------
-    payload : Mapping[str, Any]
-        Complete best- or last-checkpoint mapping.
-    path : Path | str
-        Exact role-qualified checkpoint path.
+    *publications : tuple[Mapping[str, Any], Path | str]
+        Complete best- or last-checkpoint mappings with their exact role-qualified
+        paths, in rename order.
 
-    Returns
-    -------
-    Path
-        Atomically published checkpoint path.
+    Notes
+    -----
+    Every payload is first published atomically to its fixed staged sibling
+    (``.<name>.staged``); only then are the staged files renamed back to back, so
+    a failure before the renames leaves every destination unchanged. A handled
+    failure removes all staged files; a crash leaves at most one staged file per
+    destination, which ``discard_staged_checkpoints`` removes before the next run.
 
     """
-    return common.serialization.atomic_torch_save(dict(payload), path)
+    staged = [(_staged_path(Path(path)), Path(path)) for _payload, path in publications]
+    try:
+        for (payload, _path), (temporary, _final) in zip(publications, staged, strict=True):
+            common.serialization.atomic_torch_save(dict(payload), temporary)
+        for temporary, final in staged:
+            temporary.replace(final)
+    except BaseException:
+        with suppress(OSError):  # a failed cleanup must not replace the publication error
+            discard_staged_checkpoints(*(final for _temporary, final in staged))
+        raise
+    if staged:
+        _fsync_directory(staged[-1][1].parent)
+
+
+def discard_staged_checkpoints(*paths: Path) -> None:
+    """Remove staged siblings, and the atomic writer's temporaries of them, left by a failure or crash."""
+    for path in paths:
+        staged = _staged_path(path)
+        staged.unlink(missing_ok=True)
+        # A kill inside atomic_torch_save leaves its randomly named temporary of the staged file.
+        for candidate in staged.parent.glob(f".{staged.name}.*"):
+            if common.serialization.atomic_write_temporary_destination(candidate) == staged:
+                candidate.unlink(missing_ok=True)
 
 
 def load_checkpoint(
@@ -1220,7 +1201,6 @@ def load_checkpoint(
     expected_role: CheckpointRole,
     payload_kind: CheckpointPayloadKind,
     scheduler_expected: bool,
-    amp_expected: bool,
     require_best: bool,
     adapter_expected: bool = False,
 ) -> dict[str, Any]:
@@ -1239,8 +1219,6 @@ def load_checkpoint(
         Required payload kind; see :func:`validate_checkpoint`.
     scheduler_expected : bool
         Whether scheduler state is required.
-    amp_expected : bool
-        Whether scaler state is required.
     require_best : bool
         Whether finite selected-best state must already exist.
 
@@ -1267,7 +1245,6 @@ def load_checkpoint(
         expected_role=expected_role,
         payload_kind=payload_kind,
         scheduler_expected=scheduler_expected,
-        amp_expected=amp_expected,
         require_best=require_best,
         adapter_expected=adapter_expected,
     )
@@ -1280,8 +1257,6 @@ def restore_checkpoint(
     model: nn.Module,
     optimizer: Optimizer,
     scheduler: Any | None,
-    scaler: Any | None,
-    amp_enabled: bool,
     loss: nn.Module,
     train_loader: DataLoader[Any],
     adapter: Any | None = None,
@@ -1301,10 +1276,8 @@ def restore_checkpoint(
         Candidate strict ``last`` checkpoint.
     expected_identity : Mapping[str, Any]
         Immutable identity required by the current resumed run.
-    model, optimizer, scheduler, scaler, loss : Any
+    model, optimizer, scheduler, loss : Any
         Current runtime components whose state may be replaced.
-    amp_enabled : bool
-        Whether scaler state is required by the resumed runtime.
     train_loader : DataLoader
         Loader owning the explicit shuffle generator and optional sampler state.
 
@@ -1337,7 +1310,6 @@ def restore_checkpoint(
         expected_role="last",
         payload_kind="full",
         scheduler_expected=scheduler is not None,
-        amp_expected=amp_enabled,
         require_best=False,
         adapter_expected=adapter_expected,
     )
@@ -1372,7 +1344,6 @@ def restore_checkpoint(
         "model_state_dict": copy.deepcopy(model.state_dict()),
         "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
         "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()) if scheduler is not None else None,
-        "scaler_state_dict": copy.deepcopy(scaler.state_dict()) if scaler is not None else None,
         "loss_state_dict": copy.deepcopy(loss.state_dict()),
         "adapter_state_dict": copy.deepcopy(adapter.state_dict()) if adapter is not None else None,
         "train_loader_generator_state": generator.get_state().clone(),
@@ -1388,8 +1359,6 @@ def restore_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if scheduler is not None:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        if scaler is not None:
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
         loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         if adapter_expected and adapter is not None:
             adapter.load_state_dict(dict(checkpoint["adapter_state_dict"]))
@@ -1421,12 +1390,6 @@ def restore_checkpoint(
             _attempt_rollback(
                 "scheduler",
                 lambda: scheduler.load_state_dict(snapshot["scheduler_state_dict"]),
-                rollback_errors,
-            )
-        if scaler is not None:
-            _attempt_rollback(
-                "scaler",
-                lambda: scaler.load_state_dict(snapshot["scaler_state_dict"]),
                 rollback_errors,
             )
         _attempt_rollback(
@@ -1487,6 +1450,7 @@ def restore_checkpoint(
         "best_epoch": checkpoint["best_epoch"],
         "objective_history": copy.deepcopy(checkpoint["objective_history"]),
         "batch_progress": copy.deepcopy(checkpoint.get("batch_progress")),
+        "training_work": _validate_training_work(checkpoint["training_work"]),
     }
 
 
@@ -1497,8 +1461,6 @@ def restore_handoff_checkpoint(
     model: nn.Module,
     optimizer: Optimizer,
     scheduler: Any | None,
-    scaler: Any | None,
-    amp_enabled: bool,
     loss: nn.Module,
     train_loader: DataLoader[Any],
 ) -> dict[str, Any]:
@@ -1517,7 +1479,6 @@ def restore_handoff_checkpoint(
         expected_role="best",
         payload_kind="full",
         scheduler_expected=scheduler is not None,
-        amp_expected=amp_enabled,
         require_best=True,
         adapter_expected=True,
     )
@@ -1531,8 +1492,6 @@ def restore_handoff_checkpoint(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        scaler=scaler,
-        amp_enabled=amp_enabled,
         loss=loss,
         train_loader=train_loader,
         adapter=None,

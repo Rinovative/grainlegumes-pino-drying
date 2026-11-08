@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Bind steady per-case reductions and the term decomposition to the domain residual
-  - Check the 2/3 trace variant and the pointwise-divergence scaling on manufactured fields
+  - Check the 2/3 trace part and the pointwise-divergence scaling on manufactured fields
   - Check float64 coordinate rebuilding, boundary bands, edge profiles, and perturbations
   - Check transient field integrals, global and sorption closures, and validity counts
   - Check the physics-setting inventory of authored steady configurations
@@ -29,7 +29,7 @@ import pytest
 import torch
 import yaml
 
-from src import domain, generation
+from src import common, domain, experiments, generation
 from src.analysis.physics_diagnostics import physics_diagnostics_plots as plots
 from src.analysis.physics_diagnostics import physics_diagnostics_sources as sources
 from src.analysis.physics_diagnostics import physics_diagnostics_steady as steady
@@ -109,8 +109,7 @@ def test_uniform_darcy_flow_has_zero_terms_and_reductions_bind_the_domain_loss()
     """
     reference = _reference()
     exact = steady.residual_rows(_fields(reference), crop=1)
-    for name in ("momentum", "momentum_with_trace"):
-        assert np.allclose(exact[name], 0.0, atol=1e-10)
+    assert np.allclose(exact["momentum"], 0.0, atol=1e-10)
     for name in ("trace_rms", "pointwise_divergence", "porous_divergence", "flux_balance", "boundary"):
         assert np.allclose(exact[name], 0.0, atol=1e-20)
 
@@ -137,22 +136,23 @@ def test_uniform_darcy_flow_has_zero_terms_and_reductions_bind_the_domain_loss()
     assert torch.allclose(fields.pressure[:, 1], torch.ones_like(fields.pressure[:, 1]), rtol=1e-5)
 
 
-def test_trace_variant_reduces_the_viscous_term_of_a_divergent_field_by_one_third() -> None:
+def test_trace_part_is_contained_in_the_viscous_term_of_a_divergent_field() -> None:
     """
-    For u = x**2 the incompressible stress gives div(tau)_x = 4 mu / eps.
+    For u = v = x y the symmetric stress part gives div(tau) = mu / eps in both components.
 
-    The 2/3 trace term must add -(4/3) mu / eps, so viscous plus trace equals two
-    thirds of the viscous term two cells inside the one-sided edge stencils.
+    The 2/3 trace part adds -(2/3) mu / eps per component, so the viscous term, which
+    contains it, is mu / (3 eps).
     """
     reference = _reference()
     x_grid = reference.inputs[:, reference.input_fields.index("x")]
-    fields = _fields(_with_outputs(reference, p=torch.zeros_like(x_grid), v=torch.zeros_like(x_grid), u=x_grid.square()))
-    interior = (slice(None), 0, slice(2, -2), slice(2, -2))
-    gradient = fields.scales.pressure_gradient[:, None, None]
-    expected_viscous = 4.0 * _VISCOSITY / 0.5 / gradient
-    assert torch.allclose(fields.viscous[interior], expected_viscous.expand_as(fields.viscous[interior]), rtol=1e-4)
-    assert torch.allclose(fields.trace[interior], -expected_viscous.expand_as(fields.trace[interior]) / 3.0, rtol=1e-4)
-    assert torch.allclose(fields.residual_with_trace, fields.residual + fields.trace)
+    y_grid = reference.inputs[:, reference.input_fields.index("y")]
+    velocity = x_grid * y_grid
+    fields = _fields(_with_outputs(reference, p=torch.zeros_like(x_grid), u=velocity, v=velocity))
+    interior = (slice(None), slice(None), slice(2, -2), slice(2, -2))
+    gradient = fields.scales.pressure_gradient[:, None, None, None]
+    symmetric = _VISCOSITY / 0.5 / gradient
+    assert torch.allclose(fields.viscous[interior], (symmetric / 3.0).expand_as(fields.viscous[interior]), rtol=1e-4)
+    assert torch.allclose(fields.trace[interior], (-2.0 * symmetric / 3.0).expand_as(fields.trace[interior]), rtol=1e-4)
 
 
 def test_pointwise_divergence_is_scaled_by_the_darcy_velocity_over_the_bed_height() -> None:
@@ -351,13 +351,13 @@ def test_balance_availability_reads_generation_and_dataset_contracts() -> None:
 
 
 def test_physics_setting_inventory_reads_authored_experiments_and_studies(tmp_path: Path) -> None:
-    """Enabled physics blocks of experiments and studies are listed with their derivative and crop; disabled ones are skipped."""
+    """Enabled physics blocks are listed with their derivative and crop, omitted keys take the loader defaults; disabled ones are skipped."""
     root = tmp_path / "steady_flow"
     (root / "experiments").mkdir(parents=True)
     (root / "optuna").mkdir()
     physics = {
         "enabled": True,
-        "derivatives": {"kind": "physical", "extension": "none"},
+        "derivatives": {"kind": "physical"},
         "interior_crop": 3,
         "momentum_weight": {"target": 2.0},
         "continuity_weight": {"target": 5.0},
@@ -368,14 +368,21 @@ def test_physics_setting_inventory_reads_authored_experiments_and_studies(tmp_pa
         yaml.safe_dump({"task": "steady_flow", "base": "../base.yaml", "loss": {"physics": physics}}), encoding="utf-8"
     )
     (root / "experiments" / "plain.yaml").write_text(yaml.safe_dump({"task": "steady_flow", "base": "../base.yaml"}), encoding="utf-8")
+    (root / "experiments" / "minimal.yaml").write_text(
+        yaml.safe_dump({"task": "steady_flow", "loss": {"physics": {"enabled": True}}}), encoding="utf-8"
+    )
     study = {
         "experiment": {"task": "steady_flow", "base": "../base.yaml", "loss": {"physics": {**physics, "interior_crop": 1}}},
         "search_space": {"loss.physics.momentum_weight.target": {"kind": "float"}, "optimizer.lr": {"kind": "float"}},
     }
     (root / "optuna" / "study.yaml").write_text(yaml.safe_dump(study), encoding="utf-8")
     table = steady.maintained_physics_settings(root).set_index("config")
-    assert sorted(table.index) == ["experiments/pi.yaml", "optuna/study.yaml"]
+    assert sorted(table.index) == ["experiments/minimal.yaml", "experiments/pi.yaml", "optuna/study.yaml"]
     assert table.loc["experiments/pi.yaml", "interior_crop"] == 3
+    defaults = experiments.config.defaults.get_task_defaults("steady_flow")["loss"]["physics"]
+    assert table.loc["experiments/minimal.yaml", "derivative"] == defaults["derivatives"]["kind"]
+    assert table.loc["experiments/minimal.yaml", "interior_crop"] == defaults["interior_crop"]
+    assert table.loc["experiments/minimal.yaml", "momentum_weight"] == pytest.approx(defaults["momentum_weight"]["target"])
     assert table.loc["optuna/study.yaml", "searched_physics_keys"] == "loss.physics.momentum_weight.target"
 
 
@@ -447,3 +454,13 @@ def test_transient_plots_accept_more_cases_than_categorical_colours() -> None:
     figure = plots.plot_transient_balances({f"case {index}": balance for index in range(count)})
     assert "cases" in figure.axes[0].get_title()
     plt.close(figure)
+
+
+def test_changed_source_is_refused_with_the_dataset_admission_message(tmp_path: Path) -> None:
+    """A source whose bytes changed after Dataset admission fails with the one message the Dataset owner defines."""
+    path = tmp_path / "source.h5"
+    path.write_bytes(b"admitted")
+    admitted_stat, expected_sha256 = sources._file_stat(path), common.serialization.file_sha256(path)
+    path.write_bytes(b"changed after admission")
+    with pytest.raises(ValueError, match=r"^Source HDF5 changed after Dataset admission: "):
+        sources._read_source_balances(path, expected_sha256=expected_sha256, admitted_stat=admitted_stat)

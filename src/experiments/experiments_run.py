@@ -5,12 +5,15 @@ Responsibilities:
   - Derive stable labeled seeds and configure deterministic execution early
   - Persist immutable run inputs and mutable lifecycle outputs atomically
   - Enforce allowed resume config changes and exact last-checkpoint continuation
+  - Refuse continuing, extending or reusing a run, and handing an A0 to B or A1, when its recorded training code is not current
   - Continue or extend an existing run when a start names it, its saved science matches and its source binding admits the job
   - Validate the completed/loadable contract consumed by inference and artifacts
   - Free a finished Optuna trial's checkpoints with its terminal summary and validate such a trial without them
+  - Merge caller-owned terminal status and evidence into the one terminal summary of every run and trial
 
 Design principles:
   - A start that names an existing run continues it only when its saved science matches; anything else is refused
+  - KeyboardInterrupt and SystemExit end as interrupted; a failure to record a failure never replaces the primary error
   - A run last executed by a Slurm job in one source tree is continued only in that tree unless the job switched explicitly
   - Config, split, and normalizer artifacts are immutable after fresh creation
   - Best and last checkpoints have distinct enforced lifecycle roles and config-derived payload kinds
@@ -31,6 +34,7 @@ import os
 import random
 import re
 import shutil
+import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -41,11 +45,11 @@ from typing import Any, Literal, cast
 
 import numpy as np
 import torch
-from torch.amp.grad_scaler import GradScaler
 
-from src import common, datasets, learning
+from src import common, datasets, domain, learning
 from src.common.common_random import derive_subseed
 from src.learning.transient import learning_transient_adapter as transient_adapter
+from src.learning.transient import learning_transient_curriculum as transient_curriculum
 from src.learning.transient import learning_transient_handoff as transient_handoff
 from src.learning.transient import learning_transient_history as transient_adapter_history
 from src.learning.transient import learning_transient_scaling as transient_scaling
@@ -60,7 +64,6 @@ from .config import experiments_config_loader as config_loader
 from .config import experiments_config_naming as config_naming
 from .config import experiments_config_transient_plan as transient_plan
 
-RUN_SUMMARY_SCHEMA_VERSION = 1
 RUN_DURATION_CONTRACT: dict[str, Any] = {
     "clock": "cumulative_wall_seconds",
     "cumulative_across_resume": True,
@@ -94,9 +97,12 @@ RUN_STATUSES = frozenset(
     }
 )
 _TERMINAL_RUN_STATUSES = RUN_STATUSES.difference({"initializing", "running"})
+# A failure may end a run before or after it starts running; only training reaches completed or budget_unmet.
+_FAILURE_RUN_STATUSES = _TERMINAL_RUN_STATUSES.difference({"completed", "budget_unmet"})
+_PRUNED_RUN_STATUSES = frozenset({"pruned", "nonfinite_pruned", "oom_pruned"})
 _TRANSITIONS: dict[str | None, frozenset[str]] = {
     None: frozenset({"initializing"}),
-    "initializing": frozenset({"running", "failed", "interrupted"}),
+    "initializing": frozenset({"running", *_FAILURE_RUN_STATUSES}),
     "running": frozenset({"running", *_TERMINAL_RUN_STATUSES}),
     "interrupted": frozenset({"running", "failed"}),
     "completed": frozenset({"running"}),
@@ -107,11 +113,15 @@ _TRANSITIONS: dict[str | None, frozenset[str]] = {
     "oom_pruned": frozenset(),
     "recoverable_failed": frozenset(),
 }
-_SEED_LABELS = ("process", "model_init", "split", "loader", "worker", "tuner")
+_SEED_LABELS = ("process", "model_init", "loader", "worker", "curriculum_a0", "curriculum_b")
 # "explicit" marks a session that deliberately continues a unit with newer code than its bound source tree.
 _SOURCE_TRANSITIONS = frozenset({"explicit", "none"})
 _MISSING = object()
 _MAX_CONFIG_DIFFERENCES = 12
+_TRAINING_CONTINUATION_REMEDY = "finish it in its bound source tree or start a new run with --revision <label>"
+# Caller facts merged into a terminal summary: called with the result before the completed transition (a raise
+# fails the run) and with the error on the guarded failure path, always before a trial's best checkpoint goes.
+TerminalEvidence = Callable[[str, Mapping[str, Any] | BaseException], Mapping[str, Any]]
 _A0_EPOCH_BUDGET_MESSAGE = (
     "A0's epoch count is its scientific budget (its curriculum and controller identity depend on it) and names its seed group; "
     "set it with --epochs before A0 trains. --max-epochs extends only B, A1 or steady runs."
@@ -229,8 +239,9 @@ def build_seed_plan(seed: int) -> dict[str, int]:
     Return the complete stable labeled seed plan for one run seed.
 
     Derivation is order-independent and covers process, model initialization,
-    splitting, loader order, workers, and tuning. A cryptographic-prefix
-    collision among the maintained labels raises ``RuntimeError``.
+    loader order, workers, and the A0 (shared with A1) and B rollout
+    curricula. A cryptographic-prefix collision among the maintained labels
+    raises ``RuntimeError``.
     """
     plan = {label: derive_subseed(seed, label) for label in _SEED_LABELS}
     if len(set(plan.values())) != len(plan):
@@ -285,7 +296,7 @@ def configure_reproducibility(
 
     The resolved ``run`` section produces a stable labeled seed plan, then
     process-global deterministic controls and the ``process`` stream are applied.
-    The full plan is returned for model, split, loader, worker, and tuner owners.
+    The full plan is returned for model, loader, worker, and curriculum owners.
     """
     run = config.get("run")
     if not isinstance(run, Mapping):
@@ -358,11 +369,10 @@ def _validated_runtime_device(
     resolution: learning.device.DeviceResolution,
 ) -> torch.device:
     """
-    Admit one service resolution against the requested config and AMP policy.
+    Admit one service resolution against the requested config device policy.
 
-    Requested policy equality is checked without re-resolving availability.
-    Mixed precision is then validated against the same concrete decision, which
-    is returned as a ``torch.device`` for downstream factories.
+    Requested policy equality is checked without re-resolving availability. The
+    concrete decision is returned as a ``torch.device`` for downstream factories.
     """
     run = config.get("run")
     if not isinstance(run, Mapping):
@@ -372,11 +382,40 @@ def _validated_runtime_device(
     if resolution.requested_policy != requested:
         msg = f"Runtime device resolution does not match the requested config policy: {resolution.requested_policy!r} != {requested!r}."
         raise ValueError(msg)
-    learning.device.validate_mixed_precision_device(
-        config.get("training", {}).get("mixed_precision"),
-        resolution,
-    )
     return resolution.device
+
+
+def _steady_grid_spacing(config: Mapping[str, Any], train_loader: Any, additional_loader: Any | None) -> tuple[float, float]:
+    """
+    Return the physical steady-grid spacing ``(spacing_y, spacing_x)`` in metres, rows then columns.
+
+    The Dataset stores physical coordinate channels before the data processor
+    normalizes them; one grid serves every sample of a Dataset, so the first
+    training sample defines it. Loss and metric differentiate on this grid, and
+    the same metric objects evaluate the additional Evaluation cases, so every
+    one of them must share the training spacing.
+    """
+    task = domain.tasks.registry.get_task(str(config["task"]))
+
+    def spacing(sample_inputs: torch.Tensor) -> tuple[float, float]:
+        spacing_x, spacing_y = domain.physics.derivatives.infer_uniform_spacing(
+            sample_inputs[task.input_names.index("x")],
+            sample_inputs[task.input_names.index("y")],
+        )
+        return float(spacing_y), float(spacing_x)
+
+    reference = spacing(train_loader.dataset[0]["x"])
+    evaluation_set = [] if additional_loader is None else additional_loader.dataset
+    for index in range(len(evaluation_set)):
+        case_spacing = spacing(evaluation_set[index]["x"])
+        # Float32 coordinates of one generated grid agree far inside this tolerance.
+        if not all(math.isclose(value, expected, rel_tol=1e-6) for value, expected in zip(case_spacing, reference, strict=True)):
+            msg = (
+                f"Additional Evaluation case {index} has grid spacing {case_spacing} m, but the training grid has {reference} m; "
+                "relative H1 loss and metrics differentiate on the training spacing."
+            )
+            raise ValueError(msg)
+    return reference
 
 
 def runtime_session_updates(
@@ -706,8 +745,7 @@ def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         msg = f"Run summary must contain a JSON object: {path}"
         raise RunLifecycleError(msg)
-    schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != RUN_SUMMARY_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(payload.get("schema_version"), common.paths.RUN_SUMMARY_SCHEMA_VERSION):
         msg = f"Unsupported or missing run summary schema: {path}"
         raise RunLifecycleError(msg)
     return payload
@@ -730,6 +768,7 @@ def _transition_run_status_locked(
     status: str,
     *,
     updates: Mapping[str, Any] | None = None,
+    keep_trial_best: bool = False,
 ) -> dict[str, Any]:
     """
     Atomically transition summary.json through the explicit run state machine.
@@ -742,6 +781,8 @@ def _transition_run_status_locked(
         Target lifecycle status.
     updates : Mapping[str, Any] | None, optional
         Additional JSON-safe summary fields.
+    keep_trial_best : bool, optional
+        Keep a trial's best checkpoint at its terminal status, because its evidence was not recorded.
 
     Returns
     -------
@@ -770,17 +811,16 @@ def _transition_run_status_locked(
     payload = {
         **current,
         **dict(updates or {}),
-        "schema_version": RUN_SUMMARY_SCHEMA_VERSION,
+        "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
         "status": status,
         "status_history": history,
         "updated_at": now,
     }
     payload.setdefault("created_at", now)
     common.serialization.atomic_write_json(summary_path, payload)
-    if status in _TERMINAL_RUN_STATUSES and _is_trial_run(run_dir):
-        # Trials are never resumed; the summary keeps the checkpoint digests.
-        for checkpoint in (common.paths.resolve_best_checkpoint_file(run_dir), common.paths.resolve_last_checkpoint_file(run_dir)):
-            checkpoint.unlink(missing_ok=True)
+    if status in _TERMINAL_RUN_STATUSES and not keep_trial_best and _is_trial_run(run_dir):
+        # Trials are never resumed and write no last; the summary keeps the best checkpoint's digest.
+        common.paths.resolve_best_checkpoint_file(run_dir).unlink(missing_ok=True)
     return payload
 
 
@@ -789,77 +829,83 @@ def transition_run_status(
     status: str,
     *,
     updates: Mapping[str, Any] | None = None,
+    keep_trial_best: bool = False,
 ) -> dict[str, Any]:
     """
     Publish one allowed summary-state transition under the writer lease.
 
     ``updates`` are merged with versioned status history and timestamps through
     atomic JSON replacement. Unknown or forbidden transitions raise
-    ``RunLifecycleError`` without changing the summary.
+    ``RunLifecycleError`` without changing the summary. A trial's terminal
+    status deletes its best checkpoint unless ``keep_trial_best`` is set.
     """
     with run_writer_lease(run_dir):
-        return _transition_run_status_locked(run_dir, status, updates=updates)
+        return _transition_run_status_locked(run_dir, status, updates=updates, keep_trial_best=keep_trial_best)
 
 
-def _load_mapping_artifact(path: Path, *, label: str) -> dict[str, Any]:
-    """Load one local Torch mapping artifact."""
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping):
-        msg = f"Saved {label} must contain a mapping: {path}"
-        raise TypeError(msg)
-    return dict(payload)
+def _read_saved_data_artifacts(run_dir: Path | str) -> tuple[datasets.preprocessing.splits.SplitContract, dict[str, Any]]:
+    """Read a run's saved split and scaling artifact through their one reader each; an unreadable or inadmissible one is a lifecycle error."""
+    try:
+        split = datasets.preprocessing.splits.read_saved_split(run_dir)
+    except (TypeError, ValueError) as error:
+        message = f"Saved split is invalid: {error}"
+        raise RunLifecycleError(message) from error
+    try:
+        artifact = datasets.preprocessing.scaling.read_scaling_artifact(common.paths.resolve_normalizer_path(run_dir))
+    except (TypeError, ValueError) as error:
+        message = f"Saved scaling artifact is invalid: {error}"
+        raise RunLifecycleError(message) from error
+    return split, artifact
 
 
 def _validate_saved_data_contract(
     config: Mapping[str, Any],
-    split_indices: Mapping[str, Any],
+    split: datasets.preprocessing.splits.SplitContract,
     normalizer_artifact: Mapping[str, Any],
-) -> dict[str, torch.Tensor]:
+) -> dict[str, torch.Tensor] | transient_scaling.TransientScalingArtifact:
     """
-    Admit saved split and normalizer artifacts against the resolved task config.
+    Admit a saved split and scaling artifact against the resolved task config, the same way for both tasks.
 
-    Task/digest identity, split ratios, stable split subseed, dataset membership,
-    tensor layout, and input/output normalizer channel counts are validated on
-    CPU before resume, inference, or artifact consumers may use the state.
+    The admitted split must belong to the configured task, Datasets and item expansion: its Train Dataset is
+    ``data.train_dataset`` and its additional Evaluation parts are the configured Datasets in order, followed by the
+    training Dataset when that holds fixed OOD cases. The scaling artifact must carry the scaling identity derived from
+    that split and the configured preprocessing. The decoded task state is returned for resume, inference, or artifact
+    consumers.
     """
     task = config_loader.validate_resolved_task_contract(config)
-    if task.id == "transient_drying":
-        try:
-            artifact = transient_scaling.TransientScalingArtifact.from_state_dict(normalizer_artifact)
-            tensorizer = TransientTensorizerSpec.from_mapping(
-                {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
-            )
-            admitted = datasets.runtime.transient_training.admit_transient_training_split(
-                split_indices,
-                tensorizer=tensorizer,
-                sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
-                additional_evaluation_fraction=float(config["data"]["additional_evaluation_fraction"]),
-                spatial_stride=int(config["data"].get("spatial_stride", 1)),
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            message = f"Saved transient data contract is invalid: {error}"
-            raise RunLifecycleError(message) from error
-        if artifact.tensorizer != tensorizer or artifact.scale_mode != config["scaling"]["mode"]:
-            message = "Saved transient scaling conflicts with the resolved tensorizer or scaling mode."
-            raise RunLifecycleError(message)
-        if artifact.train_membership_digest != admitted["roles"]["scaling_train_one_step"]["membership_digest"]:
-            message = "Saved transient scaling Train membership disagrees with split evidence."
-            raise RunLifecycleError(message)
-        return artifact  # type: ignore[return-value]
-    data_config = config.get("data")
-    run_config = config.get("run")
-    if not isinstance(data_config, Mapping) or not isinstance(run_config, Mapping):
-        msg = "Completed run config must contain data and run mappings."
-        raise RunLifecycleError(msg)
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    if split_contract.task != task.id or split_contract.task_contract_digest != task.contract_digest:
+    if split.task != task.id:
         msg = "Saved split task identity does not match the resolved config task contract."
         raise RunLifecycleError(msg)
-    normalizer_state = datasets.preprocessing.normalization.validate_normalizer_artifact(
-        normalizer_artifact,
-        task=task,
-        split_contract=split_contract,
-    )
+    data = config["data"]
+    expected_additional = (*data["additional_evaluation_datasets"], *((split.train.dataset_id,) if split.case_partition["ood"] else ()))
+    if split.train.dataset_id != data["train_dataset"] or tuple(part.dataset_id for part in split.additional_evaluation) != expected_additional:
+        msg = "Saved split Datasets do not match the configured training and additional Evaluation Datasets."
+        raise RunLifecycleError(msg)
+    preprocessing = datasets.preprocessing.normalization.preprocessing_spec(task)
+    if task.id == "transient_drying":
+        tensorizer = TransientTensorizerSpec.from_mapping(
+            {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
+        )
+        extension = cast("Mapping[str, Any]", split.extension)
+        if (
+            extension["tensorizer"] != tensorizer.selection_dict()
+            or extension["sampling"] != datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]).as_dict()
+            or extension["spatial_view"]["spatial_stride"] != config["data"]["spatial_stride"]
+        ):
+            msg = "Saved transient split item expansion conflicts with the resolved tensorizer, sampling or spatial stride."
+            raise RunLifecycleError(msg)
+        preprocessing = transient_scaling.preprocessing_spec(
+            tensorizer=tensorizer, scale_mode=config["scaling"]["mode"], spatial_view=extension["spatial_view"]
+        )
+    try:
+        identity = datasets.preprocessing.scaling.scaling_identity(split, preprocessing)
+        state = datasets.preprocessing.scaling.admit_scaling_artifact(normalizer_artifact, identity=identity)
+        if task.id == "transient_drying":
+            return transient_scaling.admit_transient_scaling_state(state, identity=identity)
+        normalizer_state = datasets.preprocessing.normalization.processor_state(datasets.preprocessing.normalization.data_processor_from_state(state))
+    except (KeyError, TypeError, ValueError) as error:
+        message = f"Saved scaling artifact is invalid: {error}"
+        raise RunLifecycleError(message) from error
     channel_axis = task.tensor_layout.index("channel")
     for prefix, expected_channels in (("in_normalizer", task.in_channels), ("out_normalizer", task.out_channels)):
         mean = normalizer_state[f"{prefix}.mean"]
@@ -901,6 +947,16 @@ def _epoch_cap_admits_resume(last: Mapping[str, Any], target_epochs: int, *, sta
     progress = last.get("batch_progress")
     unfinished_epoch = progress is not None and not progress["complete"]
     return unfinished_epoch or status in {"running", "interrupted"}
+
+
+def _require_current_training(saved_config: Mapping[str, Any], *, unit: str) -> None:
+    """Refuse to continue, extend or reuse a run whose recorded training implementation differs from the running code."""
+    common.code_identity.require_current_implementation(
+        learning.training.checkpoint.TRAINING_PROJECTIONS[saved_config["task"]],
+        saved_config["producer"]["training_sha256"],
+        unit=unit,
+        remedy=_TRAINING_CONTINUATION_REMEDY,
+    )
 
 
 def validate_resume_config(
@@ -1004,6 +1060,7 @@ def inspect_existing_run_admission(
                 config_loader.load_yaml(config_file),
             )
             existing_config_digest = run_identity.resolved_config_digest(saved_config)
+            _require_current_training(saved_config, unit=f"Run {path}")
             validate_resume_config(requested_config, saved_config)
         except (OSError, KeyError, TypeError, ValueError) as error:
             issues.append(str(error))
@@ -1095,6 +1152,7 @@ def _prepare_fresh_run_locked(
     *,
     run_dir: Path | str | None = None,
     summary_extra: Mapping[str, Any] | None = None,
+    terminal_status_resolver: Callable[[BaseException], str] | None = None,
 ) -> Path:
     """
     Allocate a fresh leaf and publish its initial summary/config under a lease.
@@ -1118,13 +1176,8 @@ def _prepare_fresh_run_locked(
         transition_run_status(allocated, "initializing", updates=initial)
         config_loader.save_yaml(dict(config), common.paths.resolve_run_config_path(allocated))
     except BaseException as error:
-        with suppress(Exception):
-            if common.paths.resolve_run_summary_path(allocated).is_file():
-                transition_run_status(
-                    allocated,
-                    "failed",
-                    updates={"error_type": type(error).__name__, "error": str(error)},
-                )
+        if common.paths.resolve_run_summary_path(allocated).is_file():
+            _mark_failure(allocated, error, status=_failure_status(error, terminal_status_resolver))
         raise
     return allocated
 
@@ -1134,6 +1187,7 @@ def prepare_fresh_run(
     *,
     run_dir: Path | str | None = None,
     summary_extra: Mapping[str, Any] | None = None,
+    terminal_status_resolver: Callable[[BaseException], str] | None = None,
 ) -> Path:
     """
     Allocate and initialize a fresh run while holding its writer lease.
@@ -1147,6 +1201,8 @@ def prepare_fresh_run(
         output root.
     summary_extra : Mapping[str, Any] | None, optional
         Additional caller-owned lifecycle facts for the initial summary.
+    terminal_status_resolver : Callable[[BaseException], str] | None, optional
+        Caller-owned failure classifier, as for :func:`execute_prepared_run`.
 
     Returns
     -------
@@ -1178,6 +1234,7 @@ def prepare_fresh_run(
             config,
             run_dir=destination,
             summary_extra=summary_extra,
+            terminal_status_resolver=terminal_status_resolver,
         )
 
 
@@ -1187,7 +1244,7 @@ def _attempt_duration_updates(
     started: float,
     resumed: bool,
 ) -> dict[str, Any]:
-    """Accumulate measured attempts without fabricating missing historical coverage."""
+    """Accumulate measured attempts without fabricating the coverage of an attempt that ended without publishing its duration."""
     attempt_seconds = time.monotonic() - started
     duration_contract = {**copy.deepcopy(RUN_DURATION_CONTRACT), "clock_source": "time.monotonic"}
     previous_measured = previous_summary.get("measured_elapsed_seconds") if resumed else 0.0
@@ -1224,7 +1281,6 @@ _TERMINAL_CONTROLLER_KEYS: tuple[str, ...] = (
     "completed_stage_epochs",
     "post_handoff_optimizer_device_seconds",
     "post_handoff_optimizer_steps",
-    "successful_optimizer_steps",
     "processed_target_transitions",
     "forward_transitions",
     "wall_seconds",
@@ -1240,6 +1296,7 @@ _TERMINAL_CONTROLLER_KEYS: tuple[str, ...] = (
     "matched_receipt_sha256",
     "batch_cursor",
 )
+_TERMINAL_CURRICULUM_KEYS = ("active_stage", "max_horizon", "draw_index")
 
 
 def _terminal_budget_aliases(controller: Mapping[str, Any]) -> dict[str, Any]:
@@ -1247,62 +1304,53 @@ def _terminal_budget_aliases(controller: Mapping[str, Any]) -> dict[str, Any]:
     return {"train_seconds": controller.get("train_seconds"), "target_train_seconds": controller.get("planned_train_seconds")}
 
 
+def _failure_status(error: BaseException, resolver: Callable[[BaseException], str] | None) -> str:
+    """Return ``interrupted`` for an interrupt, otherwise the caller's admitted failure status or ``failed``."""
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return "interrupted"
+    if resolver is None:
+        return "failed"
+    try:
+        status = resolver(error)
+    except BaseException as secondary:  # noqa: BLE001 -- a broken classifier, even an interrupt in it, must not replace the run's own failure
+        error.add_note(f"Terminal status resolution failed: {type(secondary).__name__}: {secondary}")
+        return "failed"
+    if status not in _FAILURE_RUN_STATUSES:
+        error.add_note(f"Terminal status resolver returned unsupported status {status!r}.")
+        return "failed"
+    return status
+
+
 def _mark_failure(
     run_dir: Path,
     error: BaseException,
     *,
-    interrupted: bool,
-    timing_updates: Mapping[str, Any] | None = None,
-    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
+    status: str,
+    updates: Mapping[str, Any] | None = None,
+    terminal_evidence: TerminalEvidence | None = None,
 ) -> None:
     """
-    Best-effort publish failed or interrupted status without masking the cause.
+    Publish a terminal failure status on the one guarded path that never replaces the primary error.
 
-    Transition and serialization errors are deliberately suppressed because
-    this helper runs while propagating a primary lifecycle exception.
+    Caller evidence is merged before the transition, so it is bound before a
+    trial's best checkpoint is deleted. When collecting it fails, the status is
+    still published, the best checkpoint is kept and ``terminal_evidence_error``
+    names the failure. A failure, including an interrupt, to collect the
+    evidence or to publish the status is attached to ``error`` as a note.
     """
-    status = "interrupted" if interrupted else "failed"
-    if not interrupted and terminal_status_resolver is not None:
-        with suppress(Exception):
-            resolved_status = terminal_status_resolver(error)
-            if resolved_status is not None:
-                if resolved_status not in _TERMINAL_RUN_STATUSES:
-                    message = f"Terminal status resolver returned unsupported status: {resolved_status!r}."
-                    raise ValueError(message)
-                status = resolved_status
-    with suppress(Exception):
-        transition_run_status(
-            run_dir,
-            status,
-            updates={"error_type": type(error).__name__, "error": str(error), "ended_at": _utc_now(), **dict(timing_updates or {})},
-        )
-
-
-def _validate_reused_data_state(
-    *,
-    data_processor: Any,
-    restored_data_processor: Any,
-    saved_split_indices: Mapping[str, Any] | None,
-    rebuilt_split_indices: Mapping[str, Any],
-) -> None:
-    """
-    Verify object-identical processor and tensor-identical split reuse on resume.
-
-    Dataloader reconstruction must retain the admitted saved processor instance
-    and exact train/eval/OOD membership. Replacement or drift raises before model
-    training or checkpoint restoration.
-    """
-    if data_processor is not restored_data_processor:
-        msg = "Resume dataloader construction replaced the saved normalizer state."
-        raise RuntimeError(msg)
-    if saved_split_indices is None:
-        msg = "Resume dataloader construction requires admitted saved split evidence."
-        raise RuntimeError(msg)
-    saved_contract = datasets.preprocessing.splits.admit_split_contract(saved_split_indices)
-    rebuilt_contract = datasets.preprocessing.splits.admit_split_contract(rebuilt_split_indices)
-    if saved_contract != rebuilt_contract:
-        msg = "Resume dataloader construction changed saved split membership."
-        raise RuntimeError(msg)
+    payload = {"error_type": type(error).__name__, "error": str(error), "ended_at": _utc_now(), **dict(updates or {})}
+    evidence_lost = False
+    if terminal_evidence is not None:
+        try:
+            payload.update(terminal_evidence(status, error))
+        except BaseException as secondary:  # noqa: BLE001 -- see docstring
+            evidence_lost = True
+            reason = payload["terminal_evidence_error"] = f"{type(secondary).__name__}: {console.sanitized_exception_message(secondary)}"
+            error.add_note(f"Terminal evidence for status {status!r} was not recorded, so the best checkpoint is kept: {reason}")
+    try:
+        transition_run_status(run_dir, status, updates=payload, keep_trial_best=evidence_lost)
+    except BaseException as secondary:  # noqa: BLE001 -- see docstring
+        error.add_note(f"Terminal status {status!r} was not published: {type(secondary).__name__}: {secondary}")
 
 
 def _validate_training_result_objective(
@@ -1321,12 +1369,13 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     run_dir: Path,
     persisted_config: Mapping[str, Any] | None = None,
     saved_split_indices: dict[str, Any] | None = None,
-    restored_data_processor: Any | None = None,
+    restored_scaling_artifact: Mapping[str, Any] | None = None,
     resume_from: Path | None = None,
     epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
     summary_extra: Mapping[str, Any] | None = None,
     device_resolution: learning.device.DeviceResolution,
-    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
+    terminal_status_resolver: Callable[[BaseException], str] | None = None,
+    terminal_evidence: TerminalEvidence | None = None,
     matched_receipt: Mapping[str, Any] | None = None,
     max_steps: int | None = None,
     max_train_seconds: float | None = None,
@@ -1341,13 +1390,15 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
     Fresh execution atomically publishes fitted normalizer and split artifacts.
     Resume requires object-identical processor reuse and unchanged membership.
     The helper owns status transitions, factories, checkpoint execution, terminal
-    digests, observer finalization, and best-effort failure publication while its
+    digests, observer finalization, and the guarded failure publication while its
     caller retains the exclusive writer lease.
     """
     attempt_started = time.monotonic()
     start_time = datetime.now(UTC)
     previous_summary: Mapping[str, Any] = {}
     operational_timing: dict[str, Any] = {"scope": "current_attempt"}
+    # Filled by the training loop at every epoch boundary, so an exceptional end still publishes the committed work.
+    training_work: dict[str, int] = {}
     runtime_session_id = uuid.uuid4().hex
     tracker: tracking.WandbSession | None = None
     tracking_status = "failed"
@@ -1369,7 +1420,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         previous_summary = read_run_summary(run_dir)
         validate_deterministic_model_device_policy(config, device_resolution)
         device = _validated_runtime_device(config, device_resolution)
-        amp_enabled = bool(config["training"]["mixed_precision"])
         seed_plan = build_seed_plan(int(config["run"]["seed"]))
         transition_run_status(
             run_dir,
@@ -1383,7 +1433,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 "target_epochs": int(config["training"]["epochs"]),
                 "seed_plan": seed_plan,
                 "deterministic": bool(config["run"]["deterministic"]),
-                "amp_enabled": amp_enabled,
                 **dict(summary_extra or {}),
                 **runtime_session_updates(
                     run_dir,
@@ -1396,18 +1445,11 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         )
         configure_reproducibility(config, device=device)
         is_transient = config["task"] == "transient_drying"
-        if is_transient:
-            console_reporter.startup(resolved_device=str(device))
-            console_reporter.startup_phase(
-                "data_setup_start",
-                {
-                    "backend_preference": config["data"]["transient_backend_preference"],
-                    "spatial_stride": config["data"]["spatial_stride"],
-                },
-            )
+        console_reporter.startup(resolved_device=str(device))
+        console_reporter.startup_phase("data_setup_start", {"spatial_stride": config["data"]["spatial_stride"]} if is_transient else None)
         handoff_manifest: dict[str, Any] | None = None
         handoff_directory: Path | None = None
-        handoff_scaling = restored_data_processor
+        handoff_scaling = restored_scaling_artifact
         if is_transient and config["training"]["teacher_handoff"] is not None:
             if resume_from is None:
                 source_name = str(config["training"]["teacher_handoff"]["source_run_name"])
@@ -1419,9 +1461,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 handoff_manifest = transient_handoff.validate_stage_a_handoff(
                     handoff_directory, target_config=config, device=device_resolution.as_dict(), expected_source_run_name=source_name
                 )
-                handoff_scaling = transient_scaling.TransientScalingArtifact.from_state_dict(
-                    _load_mapping_artifact(handoff_directory / "normalizer.pt", label="teacher scaling")
-                )
+                handoff_scaling = datasets.preprocessing.scaling.read_scaling_artifact(handoff_directory / "normalizer.pt")
                 if handoff_manifest["checkpoint_identity"] != source_completed["checkpoint_identity"]:
                     message = "Teacher handoff checkpoint identity disagrees with its completed source run."
                     raise RunLifecycleError(message)  # noqa: TRY301
@@ -1433,9 +1473,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                     target_config=config,
                     device=device_resolution.as_dict(),
                 )
-                handoff_scaling = transient_scaling.TransientScalingArtifact.from_state_dict(
-                    _load_mapping_artifact(local_normalizer, label="local teacher scaling")
-                )
+                handoff_scaling = datasets.preprocessing.scaling.read_scaling_artifact(local_normalizer)
 
         def persist_split(resolved: Mapping[str, Any]) -> None:
             """Save exact Experiment membership before any scaler is fitted."""
@@ -1444,67 +1482,38 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         dataloaders = config_loader.create_dataloaders_from_config(
             config,
             split_indices=saved_split_indices,
-            data_processor=handoff_scaling,
+            scaling_artifact=handoff_scaling,
             seed_plan=seed_plan,
-            startup_callback=console_reporter.startup_phase if is_transient else None,
+            startup_callback=console_reporter.startup_phase,
             split_persist_callback=persist_split if resume_from is None else None,
         )
         data_processor = dataloaders["data_processor"]
         split_indices = dataloaders["split_indices"]
 
-        if resume_from is None:
-            if is_transient:
-                if handoff_directory is not None:
-                    if handoff_manifest is None:
-                        message = "Teacher handoff directory requires one validated manifest."
-                        raise RunLifecycleError(message)  # noqa: TRY301
-                    normalizer_path = common.paths.resolve_normalizer_path(run_dir)
-                    temporary_normalizer = normalizer_path.with_name(f".{normalizer_path.name}.{uuid.uuid4().hex}.tmp")
-                    try:
-                        shutil.copyfile(handoff_directory / "normalizer.pt", temporary_normalizer)
-                        temporary_normalizer.replace(normalizer_path)
-                    finally:
-                        temporary_normalizer.unlink(missing_ok=True)
-                    common.serialization.atomic_write_json(run_dir / "teacher_handoff_manifest.json", handoff_manifest)
-                else:
-                    common.serialization.atomic_torch_save(data_processor.state_dict(), common.paths.resolve_normalizer_path(run_dir))
-            else:
-                split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-                normalizer_artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
-                    data_processor,
-                    task=config_loader.validate_resolved_task_contract(config),
-                    split_contract=split_contract,
-                )
-                common.serialization.atomic_torch_save(normalizer_artifact, common.paths.resolve_normalizer_path(run_dir))
-        elif not is_transient:
-            _validate_reused_data_state(
-                data_processor=data_processor,
-                restored_data_processor=restored_data_processor,
-                saved_split_indices=saved_split_indices,
-                rebuilt_split_indices=split_indices,
-            )
+        if resume_from is None and handoff_directory is not None:
+            if handoff_manifest is None:
+                message = "Teacher handoff directory requires one validated manifest."
+                raise RunLifecycleError(message)  # noqa: TRY301
+            normalizer_path = common.paths.resolve_normalizer_path(run_dir)
+            temporary_normalizer = normalizer_path.with_name(f".{normalizer_path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                shutil.copyfile(handoff_directory / "normalizer.pt", temporary_normalizer)
+                temporary_normalizer.replace(normalizer_path)
+            finally:
+                temporary_normalizer.unlink(missing_ok=True)
+            common.serialization.atomic_write_json(run_dir / "teacher_handoff_manifest.json", handoff_manifest)
+        elif resume_from is None:
+            common.serialization.atomic_torch_save(dataloaders["scaling_artifact"], common.paths.resolve_normalizer_path(run_dir))
 
         seed_process(seed_plan["model_init"], device=device)
         model_started = time.perf_counter()
+        console_reporter.startup_phase("model_build_start", {"model_kind": config["model"]["kind"]})
         if is_transient:
-            console_reporter.startup_phase(
-                "model_build_start",
-                {"model_kind": config["model"]["kind"]},
-            )
-            learning.models.factory.validate_transient_model_spatial_shape(
-                config,
-                data_processor.spatial_shape,
-            )
+            learning.models.factory.validate_transient_model_spatial_shape(config, data_processor.spatial_shape)
         model = learning.models.factory.build_model(config, device=device)
-        if is_transient:
-            console_reporter.startup_phase(
-                "model_cuda_ready",
-                {
-                    "device": str(device),
-                    "seconds": time.perf_counter() - model_started,
-                },
-            )
-        train_loss = learning.losses.factory.build_training_loss(config, device=device)
+        console_reporter.startup_phase("model_cuda_ready", {"device": str(device), "seconds": time.perf_counter() - model_started})
+        grid_spacing = None if is_transient else _steady_grid_spacing(config, dataloaders["train"], dataloaders["additional_evaluation"])
+        train_loss = learning.losses.factory.build_training_loss(config, device=device, grid_spacing=grid_spacing)
         set_normalizers = getattr(train_loss, "set_normalizers", None)
         if callable(set_normalizers):
             set_normalizers(
@@ -1529,6 +1538,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 config,
                 scaling=data_processor,
                 device=device,
+                curriculum_seed=seed_plan["curriculum_b" if config["training"]["comparison_arm"] == "b" else "curriculum_a0"],
                 teacher_handoff=teacher_identity,
                 matched_train_seconds=(float(matched_receipt["train_seconds"]) if matched_receipt is not None else None),
                 matched_receipt_sha256=(str(matched_receipt["receipt_sha256"]) if matched_receipt is not None else None),
@@ -1543,6 +1553,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             config,
             device=device,
             output_standard_deviations=output_standard_deviations,
+            grid_spacing=grid_spacing,
         )
         optimizer = learning.training.optim.build_optimizer(model, config)
         scheduler = learning.training.optim.build_scheduler(optimizer, config)
@@ -1563,7 +1574,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                     expected_role="last",
                     payload_kind="full",
                     scheduler_expected=scheduler is not None,
-                    amp_expected=amp_enabled,
                     require_best=False,
                     adapter_expected=True,
                 )
@@ -1638,14 +1648,11 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 model=model,
                 device_metadata=device_resolution.as_dict(),
                 duration_contract=RUN_DURATION_CONTRACT,
-                runtime_provenance=(dataloaders.get("runtime_provenance") if is_transient else None),
                 transient_scaling=transient_scaling_payload,
                 transient_handoff=handoff_manifest,
                 tuning_context=(dict(summary_extra) if summary_extra and "study_name" in summary_extra else None),
             )
 
-        if not is_transient:
-            console_reporter.startup(resolved_device=str(device))
         tracking_initialization_attempted = True
         tracker = tracking.initialize_wandb(
             config,
@@ -1657,7 +1664,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             state_updater=state_updater,
         )
 
-        handoff_scaler = GradScaler("cuda") if amp_enabled else None
         if handoff_manifest is not None and handoff_directory is not None:
             # Only an is_teacher_handoff_source A0 publishes a handoff, so its linked best is full.
             teacher_payload = learning.training.checkpoint.load_checkpoint(
@@ -1666,7 +1672,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 expected_role="best",
                 payload_kind="full",
                 scheduler_expected=scheduler is not None,
-                amp_expected=amp_enabled,
                 require_best=True,
                 adapter_expected=True,
             )
@@ -1676,8 +1681,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                scaler=handoff_scaler,
-                amp_enabled=amp_enabled,
                 loss=train_loss,
                 train_loader=dataloaders["train"],
             )
@@ -1688,11 +1691,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 scale=float(config["training"]["matched_a1_b"]["lr_scale"]),
             )
 
-        if is_transient:
-            console_reporter.startup_phase(
-                "training_start",
-                {"batches_per_epoch": len(dataloaders["train"])},
-            )
+        console_reporter.startup_phase("training_start", {"batches_per_epoch": len(dataloaders["train"])})
         result = learning.training.loop.train_loop(
             config=config,
             device=device,
@@ -1706,7 +1705,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             data_processor=loop_data_processor,
             scheduler=scheduler,
             save_dir=run_dir,
-            use_amp=config["training"].get("mixed_precision", False),
             resume_from=resume_from,
             epoch_end_callback=tracking.combine_epoch_callbacks(
                 console_reporter.epoch,
@@ -1716,10 +1714,10 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             checkpoint_identity=identity,
             adapter=adapter,
             epoch_state_callback=transient_history_callback,
-            scaler=handoff_scaler,
             max_steps=max_steps,
             max_train_seconds=max_train_seconds,
             operational_timing=operational_timing,
+            training_work=training_work,
         )
         result["operational_timing"] = operational_timing
         if result["status"] == "budget_unmet":
@@ -1729,6 +1727,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             terminal_updates = {
                 "completed_epoch": result["completed_epoch"],
                 "global_step": result["global_step"],
+                "training_work": dict(result["training_work"]),
                 "best_epoch": result["best_epoch"],
                 "best_metric": result["best_metric"],
                 "terminal_controller": terminal,
@@ -1763,7 +1762,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 checkpoint_identity=identity,
                 best_checkpoint_path=result["best_checkpoint_path"],
                 scheduler_expected=scheduler is not None,
-                amp_expected=amp_enabled,
                 max_physics_cases=int(config["tracking"]["wandb"]["monitor"]["max_cases"]),
                 adapter=adapter,
             )
@@ -1772,6 +1770,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 torch.cuda.synchronize(device)
             operational_timing["selected_checkpoint_evaluation_seconds"] = time.monotonic() - selected_started
         result.update(selected)
+        caller_evidence = dict(terminal_evidence("completed", result)) if terminal_evidence is not None else {}
         published_handoff: dict[str, Any] | None = None
         # Only a matched-plan A0 is ever continued by B/A1; stage-A-only trials never branch.
         if learning.training.checkpoint.is_teacher_handoff_source(config):
@@ -1791,7 +1790,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 config=config,
             )
         end_time = datetime.now(UTC)
-        console_reporter.final(result, total_wall_seconds=time.monotonic() - attempt_started)
+        result["phase_seconds"] = console_reporter.final(result, total_wall_seconds=time.monotonic() - attempt_started)
         transient_completion_evidence: dict[str, Any] = {}
         if is_transient:
             if adapter is None or transient_scaling_payload is None:
@@ -1802,15 +1801,19 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             transient_completion_evidence = {
                 "checkpoint_identity": copy.deepcopy(identity),
                 "transient_scaling": copy.deepcopy(dict(transient_scaling_payload)),
-                "runtime_backend_provenance": copy.deepcopy(dict(dataloaders["runtime_provenance"])),
                 "spatial_view": copy.deepcopy(dict(dataloaders["spatial_view"])),
                 "terminal_controller": {key: controller[key] for key in _TERMINAL_CONTROLLER_KEYS},
-                "terminal_curriculum": {
-                    "active_stage": adapter.curriculum_state.active_stage,
-                    "max_horizon": adapter.curriculum_state.max_horizon,
-                    "draw_index": adapter.curriculum_state.draw_index,
-                },
+                "terminal_curriculum": {key: getattr(adapter.curriculum_state, key) for key in _TERMINAL_CURRICULUM_KEYS},
             }
+        # A trial writes no last checkpoint, so its summary names none.
+        last_checkpoint_evidence = (
+            {}
+            if is_trial_config(config)
+            else {
+                "last_checkpoint": common.paths.RUN_LAST_CHECKPOINT_FILENAME,
+                "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
+            }
+        )
         completed_updates = {
             "task": config["task"],
             "run_name": config["run"]["name"],
@@ -1825,13 +1828,13 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             "terminal_metrics": copy.deepcopy(result["terminal_metrics"]),
             "completed_epoch": result["completed_epoch"],
             "global_step": result["global_step"],
+            "training_work": dict(result["training_work"]),
             "best_checkpoint": "best_checkpoint.pt",
-            "last_checkpoint": "last_checkpoint.pt",
             "config_sha256": common.serialization.file_sha256(common.paths.resolve_run_config_path(run_dir)),
             "split_indices_sha256": common.serialization.file_sha256(common.paths.resolve_split_indices_path(run_dir)),
             "normalizer_sha256": common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             "best_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(run_dir)),
-            "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
+            **last_checkpoint_evidence,
             "effective_config_digest": identity["effective_config_digest"],
             "operational_timing": copy.deepcopy(operational_timing),
             "ended_at": end_time.isoformat(),
@@ -1846,6 +1849,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             "stage_a_handoff": published_handoff,
             **transient_completion_evidence,
             **dict(summary_extra or {}),
+            **caller_evidence,
             **(_terminal_budget_aliases(controller) if is_transient else {}),
             **_attempt_duration_updates(previous_summary, started=attempt_started, resumed=resume_from is not None),
         }
@@ -1858,41 +1862,28 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
         transition_run_status(run_dir, "completed", updates=completed_updates)
         tracking_status = "completed"
         tracking_result = result
-    except KeyboardInterrupt as error:
-        tracking_status = "interrupted"
-        tracking_error = error
-        if tracking_enabled and tracker is None and not tracking_initialization_attempted:
-            _record_tracking_never_started(run_dir, runtime_session_id, error, "Local run was interrupted before tracking initialization.")
-        console_reporter.failure(error, status=tracking_status)
-        _mark_failure(
-            run_dir,
-            error,
-            interrupted=True,
-            terminal_status_resolver=terminal_status_resolver,
-            timing_updates={
-                **_attempt_duration_updates(previous_summary, started=attempt_started, resumed=resume_from is not None),
-                "operational_timing": copy.deepcopy(operational_timing),
-            },
-        )
-        raise
     except BaseException as error:
-        tracking_error = error
-        if terminal_status_resolver is not None:
-            with suppress(Exception):
-                resolved_status = terminal_status_resolver(error)
-                if resolved_status in _TERMINAL_RUN_STATUSES:
-                    tracking_status = resolved_status
+        tracking_status, tracking_error = _failure_status(error, terminal_status_resolver), error
         if tracking_enabled and tracker is None and not tracking_initialization_attempted:
-            _record_tracking_never_started(run_dir, runtime_session_id, error, "Local run admission failed before tracking initialization.")
-        console_reporter.failure(error, status=tracking_status)
+            _record_tracking_never_started(
+                run_dir,
+                runtime_session_id,
+                error,
+                f"Local run {'was interrupted' if tracking_status == 'interrupted' else 'admission failed'} before tracking initialization.",
+            )
+        # A pruned trial is a normal outcome that its study reports in one line.
+        if tracking_status not in _PRUNED_RUN_STATUSES:
+            console_reporter.failure(error, status=tracking_status)
         _mark_failure(
             run_dir,
             error,
-            interrupted=False,
-            terminal_status_resolver=terminal_status_resolver,
-            timing_updates={
+            status=tracking_status,
+            terminal_evidence=terminal_evidence,
+            updates={
+                "started_at": start_time.isoformat(),
                 **_attempt_duration_updates(previous_summary, started=attempt_started, resumed=resume_from is not None),
                 "operational_timing": copy.deepcopy(operational_timing),
+                **({"training_work": dict(training_work)} if training_work else {}),
             },
         )
         raise
@@ -1908,9 +1899,16 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                     local_summary=local_summary,
                     error=tracking_error,
                 )
-            except tracking.TrackingError:
+            except tracking.TrackingError as finish_error:
+                # Tracking never decides local validity and finish kept its failed state locally, so the published end
+                # state stands; a failed run keeps its own error.
                 if tracking_error is None:
-                    raise
+                    print(
+                        f"WARNING W&B finish failed after the local run ended {tracking_status}; that end state stands: "
+                        f"{type(finish_error).__name__}: {console.sanitized_exception_message(finish_error)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
     return result
 
 
@@ -1920,12 +1918,13 @@ def execute_prepared_run(
     run_dir: Path,
     persisted_config: Mapping[str, Any] | None = None,
     saved_split_indices: dict[str, Any] | None = None,
-    restored_data_processor: Any | None = None,
+    restored_scaling_artifact: Mapping[str, Any] | None = None,
     resume_from: Path | None = None,
     epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
     summary_extra: Mapping[str, Any] | None = None,
     device_resolution: learning.device.DeviceResolution,
-    terminal_status_resolver: Callable[[BaseException], str | None] | None = None,
+    terminal_status_resolver: Callable[[BaseException], str] | None = None,
+    terminal_evidence: TerminalEvidence | None = None,
 ) -> dict[str, Any]:
     """
     Execute a prepared fresh or resume run under its exclusive writer lease.
@@ -1942,8 +1941,8 @@ def execute_prepared_run(
         ``config`` for fresh execution.
     saved_split_indices : dict[str, Any] | None, optional
         Admitted saved membership reused while a run continues.
-    restored_data_processor : Any | None, optional
-        Processor reconstructed from the saved normalizer while a run continues.
+    restored_scaling_artifact : Mapping[str, Any] | None, optional
+        Admitted saved scaling artifact (``normalizer.pt``) reused while a run continues.
     resume_from : pathlib.Path | None, optional
         Validated ``last_checkpoint.pt`` continuation source. ``None`` starts a
         fresh training state.
@@ -1954,9 +1953,14 @@ def execute_prepared_run(
         Caller-owned facts merged into lifecycle publications.
     device_resolution : learning.device.DeviceResolution
         Concrete service-resolved device and serializable runtime metadata.
-    terminal_status_resolver : Callable[[BaseException], str | None] | None, optional
-        Optional caller-owned classifier for terminal trial outcomes. The returned
-        status must be an admitted run terminal status.
+    terminal_status_resolver : Callable[[BaseException], str] | None, optional
+        Caller-owned classifier for failures that are not interrupts. A raise or
+        a status outside the admitted failure statuses publishes ``failed``.
+    terminal_evidence : TerminalEvidence | None, optional
+        Caller-owned facts merged into the terminal summary. Called with
+        ``("completed", result)`` before the completed transition, where a raise
+        fails the run, and with ``(status, error)`` on the failure path, where a
+        raise becomes a note on the error.
 
     Returns
     -------
@@ -1970,33 +1974,40 @@ def execute_prepared_run(
         or lifecycle transition violates the admitted run contract.
     BaseException
         Runtime construction, training, interruption, and required tracking
-        failures are re-raised after best-effort failed/interrupted publication.
+        failures during the run are re-raised unchanged after the terminal
+        publication; ``KeyboardInterrupt`` and ``SystemExit`` publish ``interrupted``.
 
     Notes
     -----
     Fresh execution atomically publishes split and normalizer state before model
     construction. Resume reuses those immutable artifacts and restores only the
     last checkpoint. The best checkpoint remains the selected inference source.
-    Local summary/checkpoint publication is authoritative. Any failure in an
-    explicitly requested online or offline W&B session follows the tracking
-    contract and propagates.
+    Local summary/checkpoint publication is authoritative. A failure in an
+    explicitly requested online or offline W&B session during the run follows
+    the tracking contract and fails the run. A W&B finish failure after the
+    local run ended without error is a console warning and leaves its published
+    end state unchanged.
 
     This is a lower-level service for callers that already prepared lifecycle
     state. Normal CLI/notebook launches should prefer :func:`run_experiment`.
 
     """
+    if resume_from is not None:
+        # The service boundaries guard their own resumes; this public entry continues persisted computation directly.
+        _require_current_training(config, unit=f"Run {run_dir}")
     with run_writer_lease(run_dir):
         return _execute_prepared_run_locked(
             config,
             run_dir=run_dir,
             persisted_config=persisted_config,
             saved_split_indices=saved_split_indices,
-            restored_data_processor=restored_data_processor,
+            restored_scaling_artifact=restored_scaling_artifact,
             resume_from=resume_from,
             epoch_end_callback=epoch_end_callback,
             summary_extra=summary_extra,
             device_resolution=device_resolution,
             terminal_status_resolver=terminal_status_resolver,
+            terminal_evidence=terminal_evidence,
         )
 
 
@@ -2035,71 +2046,6 @@ def _evaluable_run_result(
     }
 
 
-def _saved_artifact_checkpoint_identity(
-    *,
-    config: Mapping[str, Any],
-    split_indices: Mapping[str, Any],
-    normalizer_sha256: str,
-    checkpoint_path: Path,
-) -> dict[str, Any]:
-    """Bind persisted checkpoint identity to saved data without execution identity.
-
-    Exact bundle-file hashes are checked by the shared run validator. Historical
-    config digests remain persisted evidence: their full implementation preimage
-    is unavailable, so this reader does not regenerate or reinterpret them.
-    Checkpoint schema validation still validates every persisted identity field.
-    """
-    checkpoint = _load_mapping_artifact(checkpoint_path, label="best checkpoint")
-    saved = checkpoint.get("identity")
-    if not isinstance(saved, Mapping):
-        msg = "Saved artifact checkpoint identity must be a mapping."
-        raise RunLifecycleError(msg)
-    layout = config["run"]["layout"]
-    if layout["stage"] in {"single", "a0"}:
-        persisted_key = "effective_config_digest" if config_loader.allocation_includes_epochs(config) else "resume_contract_digest"
-        persisted_digest = saved.get(persisted_key)
-        if not isinstance(persisted_digest, str) or layout["a0_id"] != persisted_digest[:16]:
-            msg = "Saved artifact initial run layout disagrees with persisted checkpoint identity."
-            raise RunLifecycleError(msg)
-    expected = {
-        "task": config["task"],
-        "task_contract_digest": config["task_contract"]["digest"],
-        "objective": config["evaluation"]["objective"],
-        "normalizer_sha256": normalizer_sha256,
-    }
-    if config["task"] == "transient_drying":
-        identities = split_indices["dataset_identity"]
-        added = identities["additional_evaluation"]
-        roles = split_indices["roles"]
-        expected["dataset_ids"] = {
-            "train": identities["train"]["dataset_id"],
-            "additional_evaluation": common.serialization.canonical_json_sha256(added),
-        }
-        expected["dataset_fingerprints"] = {
-            "train": identities["train"]["index_digest"],
-            "additional_evaluation": common.serialization.canonical_json_sha256(added),
-        }
-        expected["split_membership_digests"] = {
-            **{role: roles[role]["membership_digest"] for role in ("train", "scaling_train_one_step", "validation", "id_test")},
-            "additional_evaluation": common.serialization.canonical_json_sha256(roles["additional_evaluation"]["parts"]),
-        }
-        scientific_split = dict(split_indices)
-        scientific_split.pop("runtime_provenance")
-    else:
-        split = datasets.preprocessing.splits.admit_split_contract(split_indices)
-        sources = split.sources()
-        scientific_split = split.scientific_payload()
-        expected["dataset_ids"] = {role: source.dataset_id for role, source in sources.items()}
-        expected["dataset_fingerprints"] = {role: source.fingerprint for role, source in sources.items()}
-        expected["split_membership_digests"] = scientific_split["membership_digests"]
-    expected["split_contract_digest"] = common.serialization.canonical_json_sha256(scientific_split)
-    for label, value in expected.items():
-        if saved.get(label) != value:
-            msg = f"Saved artifact checkpoint identity {label!r} disagrees with saved config/data evidence."
-            raise RunLifecycleError(msg)
-    return dict(saved)
-
-
 def _run_validation_identity(
     *,
     config: Mapping[str, Any],
@@ -2108,21 +2054,21 @@ def _run_validation_identity(
     checkpoint_path: Path,
     purpose: Literal["execution", "saved_artifacts"],
 ) -> dict[str, Any]:
-    """Select execution identity or exact persisted identity for artifact reading."""
-    normalizer_sha256 = common.serialization.file_sha256(normalizer_path)
-    if purpose == "saved_artifacts":
-        return _saved_artifact_checkpoint_identity(
-            config=config,
-            split_indices=split_indices,
-            normalizer_sha256=normalizer_sha256,
-            checkpoint_path=checkpoint_path,
-        )
-    return learning.training.checkpoint.build_checkpoint_identity(
+    """Build the current checkpoint identity; saved-artifact reading takes the numerical environment from the checkpoint."""
+    identity = learning.training.checkpoint.build_checkpoint_identity(
         config,
         split_indices,
-        normalizer_sha256=normalizer_sha256,
+        normalizer_sha256=common.serialization.file_sha256(normalizer_path),
         persisted_config=config,
     )
+    if purpose == "saved_artifacts":
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)  # checkpoints are read under their own module's policy
+        saved = payload.get("identity") if isinstance(payload, Mapping) else None
+        if not isinstance(saved, Mapping):
+            msg = "Saved artifact checkpoint identity must be a mapping."
+            raise RunLifecycleError(msg)
+        identity["numerical_environment"] = saved.get("numerical_environment")
+    return identity
 
 
 def _require_completed_status(path: Path) -> None:
@@ -2190,9 +2136,11 @@ def saved_artifact_run_lease(run_dir: Path | str) -> Iterator[dict[str, Any]]:
 
     Only completed runs are admitted. This lease establishes no resume, inference,
     or artifact-generation authority.
-    It preserves persisted implementation/environment identity without comparing
-    it to the current execution environment; payload readers retain their own
-    schema, provenance, membership, hash, and containment admission.
+    The run is validated like an execution run against its own recorded producer
+    evidence, never the running code, except that the numerical environment is
+    also the checkpoint's own, so a run copied to another machine stays readable;
+    payload readers retain their own schema, provenance, membership, hash, and
+    containment admission.
     """
     with run_reader_lease(run_dir) as path:
         required = common.paths.resolve_current_run_required_paths(path)
@@ -2214,21 +2162,16 @@ def validate_evaluable_run(run_dir: Path | str) -> dict[str, Any]:
 
 
 def _validate_transient_summary_evidence(
+    run_dir: Path,
     *,
     summary: Mapping[str, Any],
     config: Mapping[str, Any],
-    split_indices: Mapping[str, Any],
     normalizer_state: Any,
     checkpoint_identity: Mapping[str, Any],
+    completed_epoch: int,
 ) -> None:
-    """Cross-check the transient completion evidence a summary records against saved state; no checkpoint bytes are read."""
-    required = {
-        "checkpoint_identity",
-        "transient_scaling",
-        "runtime_backend_provenance",
-        "terminal_controller",
-        "terminal_curriculum",
-    }
+    """Cross-check the summary's transient completion evidence and the epoch history against saved state."""
+    required = {"checkpoint_identity", "transient_scaling", "terminal_controller", "terminal_curriculum"}
     if not required.issubset(summary):
         message = "Completed transient run summary lacks required completion evidence."
         raise RunLifecycleError(message)
@@ -2242,50 +2185,53 @@ def _validate_transient_summary_evidence(
     if scaling.get("task_contract_digest") != config["task_contract"]["digest"]:
         message = "Completed transient summary task contract digest mismatch."
         raise RunLifecycleError(message)
-    provenance = summary["runtime_backend_provenance"]
-    expected_provenance = split_indices.get("runtime_provenance")
-    if not isinstance(provenance, Mapping) or provenance != expected_provenance:
-        message = "Completed transient summary runtime backend provenance disagrees with saved split evidence."
+    terminal = summary["terminal_controller"]
+    if not isinstance(terminal, Mapping) or set(terminal) != set(_TERMINAL_CONTROLLER_KEYS):
+        message = "Completed transient summary terminal controller mismatch."
         raise RunLifecycleError(message)
+    for alias, expected_value in _terminal_budget_aliases(terminal).items():
+        if alias in summary and summary[alias] != expected_value:
+            message = f"Completed transient summary {alias} contradicts its terminal controller."
+            raise RunLifecycleError(message)
+    terminal_curriculum = summary["terminal_curriculum"]
+    if not isinstance(terminal_curriculum, Mapping) or set(terminal_curriculum) != set(_TERMINAL_CURRICULUM_KEYS):
+        message = "Completed transient summary terminal curriculum mismatch."
+        raise RunLifecycleError(message)
+    try:
+        history = transient_adapter_history.validate_completed_history(
+            run_dir,
+            task=str(config["task"]),
+            run_name=str(config["run"]["name"]),
+            checkpoint_identity=checkpoint_identity,
+            completed_epoch=completed_epoch,
+        )
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        message = f"Completed transient history admission failed: {error}"
+        raise RunLifecycleError(message) from error
+    # A trial keeps no last checkpoint to compare, so the values are admitted by their owner against the final epoch record.
+    try:
+        records = history["epochs"]
+        transient_curriculum.validate_terminal_evidence(terminal, terminal_curriculum, final_record=records[-1] if records else {})
+    except (TypeError, ValueError) as error:
+        message = f"Completed transient summary terminal evidence is invalid: {error}"
+        raise RunLifecycleError(message) from error
 
 
-def _validate_transient_completed_summary(
-    *,
-    summary: Mapping[str, Any],
-    config: Mapping[str, Any],
-    split_indices: Mapping[str, Any],
-    normalizer_state: Any,
-    checkpoint_identity: Mapping[str, Any],
-    last_checkpoint: Mapping[str, Any],
-) -> None:
-    """Cross-check bounded transient completion evidence against durable state."""
-    _validate_transient_summary_evidence(
-        summary=summary,
-        config=config,
-        split_indices=split_indices,
-        normalizer_state=normalizer_state,
-        checkpoint_identity=checkpoint_identity,
-    )
+def _validate_transient_terminal_state(summary: Mapping[str, Any], last_checkpoint: Mapping[str, Any]) -> None:
+    """Require the summary's terminal controller and curriculum to equal the last checkpoint's adapter state."""
     adapter_state = last_checkpoint.get("adapter_state_dict")
     if not isinstance(adapter_state, Mapping) or not isinstance(adapter_state.get("controller"), Mapping):
         message = "Completed transient last checkpoint lacks controller evidence."
         raise RunLifecycleError(message)
     controller = adapter_state["controller"]
-    terminal = summary["terminal_controller"]
-    terminal_keys = set(_TERMINAL_CONTROLLER_KEYS)
-    if not isinstance(terminal, Mapping) or set(terminal) != terminal_keys or any(terminal[key] != controller.get(key) for key in terminal_keys):
+    if any(summary["terminal_controller"][key] != controller.get(key) for key in _TERMINAL_CONTROLLER_KEYS):
         message = "Completed transient summary terminal controller mismatch."
         raise RunLifecycleError(message)
-    for alias, expected_value in _terminal_budget_aliases(controller).items():
-        if alias in summary and summary[alias] != expected_value:
-            message = f"Completed transient summary {alias} contradicts its terminal controller."
-            raise RunLifecycleError(message)
     curriculum = adapter_state.get("curriculum")
-    terminal_curriculum = summary["terminal_curriculum"]
-    if not isinstance(curriculum, Mapping) or not isinstance(terminal_curriculum, Mapping):
+    if not isinstance(curriculum, Mapping):
         message = "Completed transient curriculum evidence is invalid."
         raise RunLifecycleError(message)
-    if terminal_curriculum != {key: curriculum.get(key) for key in ("active_stage", "max_horizon", "draw_index")}:
+    if summary["terminal_curriculum"] != {key: curriculum.get(key) for key in _TERMINAL_CURRICULUM_KEYS}:
         message = "Completed transient summary terminal curriculum mismatch."
         raise RunLifecycleError(message)
 
@@ -2334,14 +2280,13 @@ def _validate_trial_summary_evidence(summary: Mapping[str, Any], config: Mapping
         "run_name": config["run"]["name"],
         "objective": config["evaluation"]["objective"],
         "best_checkpoint": common.paths.RUN_BEST_CHECKPOINT_FILENAME,
-        "last_checkpoint": common.paths.RUN_LAST_CHECKPOINT_FILENAME,
     }
-    digests = (summary.get("best_checkpoint_sha256"), summary.get("last_checkpoint_sha256"))
+    digest = summary.get("best_checkpoint_sha256")
     completed_epoch, best_epoch, global_step = summary.get("completed_epoch"), summary.get("best_epoch"), summary.get("global_step")
     metric = summary.get("best_metric")
     if (
         any(summary.get(label) != value for label, value in expected.items())
-        or not all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests)
+        or not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest))
         or type(completed_epoch) is not int
         or completed_epoch < 1
         or type(best_epoch) is not int
@@ -2351,7 +2296,7 @@ def _validate_trial_summary_evidence(summary: Mapping[str, Any], config: Mapping
         or not (isinstance(metric, (int, float)) and not isinstance(metric, bool) and math.isfinite(metric))
     ):
         msg = (
-            "Completed trial summary must record its task, run name, objective, both checkpoint digests, "
+            "Completed trial summary must record its task, run name, objective, its best checkpoint digest, "
             "completed progress with a best epoch inside it, and a finite best metric."
         )
         raise RunLifecycleError(msg)
@@ -2366,9 +2311,10 @@ def _validate_completed_run(
     path = Path(run_dir)
     _require_completed_status(path)
     checkpoints = (common.paths.resolve_best_checkpoint_file(path), common.paths.resolve_last_checkpoint_file(path))
-    # A finished Optuna trial has no checkpoint files; its summary keeps their digests. Any other run still requires both.
-    checkpointless = _is_trial_run(path) and not any(item.exists() for item in checkpoints)
-    missing = tuple(item for item in common.paths.missing_current_run_files(path) if not (checkpointless and item in checkpoints))
+    # A finished Optuna trial writes no last and deletes its best; its summary keeps the best digest. Any other run, and a
+    # trial bundle that holds a last checkpoint, requires both and is validated in full.
+    trial = _is_trial_run(path) and not checkpoints[1].exists()
+    missing = tuple(item for item in common.paths.missing_current_run_files(path) if not (trial and item in checkpoints))
     if missing:
         names = ", ".join(item.name for item in missing)
         msg = f"Run is incomplete and not loadable: {path}. Missing: {names}."
@@ -2377,15 +2323,10 @@ def _validate_completed_run(
     config_path = common.paths.resolve_run_config_path(path)
     split_path = common.paths.resolve_split_indices_path(path)
     normalizer_path = common.paths.resolve_normalizer_path(path)
-    saved_config = config_loader.load_yaml(config_path)
-    config = (
-        config_loader.validate_saved_artifact_config(saved_config)
-        if purpose == "saved_artifacts"
-        else config_loader.validate_resolved_config(saved_config)
-    )
-    split_indices = _load_mapping_artifact(split_path, label="split indices")
-    normalizer_artifact = _load_mapping_artifact(normalizer_path, label="normalizer")
-    normalizer_state = _validate_saved_data_contract(config, split_indices, normalizer_artifact)
+    config = config_loader.validate_resolved_config(config_loader.load_yaml(config_path))
+    split, normalizer_artifact = _read_saved_data_artifacts(path)
+    split_indices = split.as_payload()
+    normalizer_state = _validate_saved_data_contract(config, split, normalizer_artifact)
     identity = _run_validation_identity(
         config=config,
         split_indices=split_indices,
@@ -2402,19 +2343,20 @@ def _validate_completed_run(
         if summary.get(label) != expected_digest:
             msg = f"Completed run {label} mismatch."
             raise RunLifecycleError(msg)
-    amp_enabled = summary.get("amp_enabled")
-    if not isinstance(amp_enabled, bool):
-        msg = "Completed run summary must record amp_enabled."
-        raise RunLifecycleError(msg)
-    if checkpointless:
+    if trial:
         _validate_trial_summary_evidence(summary, config)
+        # A kill between the completed summary and the best deletion leaves the best behind; it must be the recorded one.
+        if checkpoints[0].exists() and summary.get("best_checkpoint_sha256") != common.serialization.file_sha256(checkpoints[0]):
+            msg = "Completed trial best checkpoint digest mismatch."
+            raise RunLifecycleError(msg)
         if config["task"] == "transient_drying":
             _validate_transient_summary_evidence(
+                path,
                 summary=summary,
                 config=config,
-                split_indices=split_indices,
                 normalizer_state=normalizer_state,
                 checkpoint_identity=identity,
+                completed_epoch=int(summary["completed_epoch"]),
             )
         if summary.get("effective_config_digest") != identity["effective_config_digest"]:
             msg = "Completed trial summary/config identity mismatch."
@@ -2435,7 +2377,6 @@ def _validate_completed_run(
         expected_role="best",
         payload_kind=learning.training.checkpoint.best_payload_kind(config),
         scheduler_expected=scheduler_expected,
-        amp_expected=amp_enabled,
         require_best=True,
         adapter_expected=config["task"] == "transient_drying",
     )
@@ -2445,7 +2386,6 @@ def _validate_completed_run(
         expected_role="last",
         payload_kind="full",
         scheduler_expected=scheduler_expected,
-        amp_expected=amp_enabled,
         require_best=True,
         adapter_expected=config["task"] == "transient_drying",
     )
@@ -2466,25 +2406,15 @@ def _validate_completed_run(
         msg = "Completed run best and last checkpoints disagree."
         raise RunLifecycleError(msg)
     if config["task"] == "transient_drying":
-        _validate_transient_completed_summary(
+        _validate_transient_summary_evidence(
+            path,
             summary=summary,
             config=config,
-            split_indices=split_indices,
             normalizer_state=normalizer_state,
             checkpoint_identity=best["identity"],
-            last_checkpoint=last,
+            completed_epoch=int(last["completed_epoch"]),
         )
-        try:
-            transient_adapter_history.validate_completed_history(
-                path,
-                task=str(config["task"]),
-                run_name=str(config["run"]["name"]),
-                checkpoint_identity=last["identity"],
-                completed_epoch=int(last["completed_epoch"]),
-            )
-        except (FileNotFoundError, TypeError, ValueError) as error:
-            message = f"Completed transient history admission failed: {error}"
-            raise RunLifecycleError(message) from error
+        _validate_transient_terminal_state(summary, last)
     expected_summary_values = {
         "task": config.get("task"),
         "run_name": config.get("run", {}).get("name") if isinstance(config.get("run"), Mapping) else None,
@@ -2526,7 +2456,7 @@ def _run_resolved_experiment(
     """
     Resolve and execute a fresh, continued or extended experiment.
 
-    Config, requested device, concrete device, and mixed-precision requirements
+    Config, requested device, and concrete device requirements
     are validated before fresh output allocation. Resume acquires the run writer
     lease before reading mutable lifecycle artifacts and restores only the
     identity-validated last checkpoint.
@@ -2568,8 +2498,7 @@ def _run_resolved_experiment(
     config_loader.ConfigError
         If YAML or an override violates the semantic experiment schema.
     learning.device.DeviceResolutionError
-        If runtime policy is invalid, strict CUDA is unusable, or mixed precision
-        is incompatible with the resolved device.
+        If runtime policy is invalid or strict CUDA is unusable.
     RunLifecycleError
         If a writer lease is active or saved status, data, checkpoint identity,
         best/last roles, or lifecycle history is not resumable.
@@ -2612,10 +2541,6 @@ def _run_resolved_experiment(
             requested["run"]["device"],
             path="run.device",
         )
-    learning.device.validate_mixed_precision_device(
-        requested["training"]["mixed_precision"],
-        device_resolution,
-    )
     validate_deterministic_model_device_policy(requested, device_resolution)
     if finished is not None:
         return {**finished, "device_resolution": device_resolution}
@@ -2661,6 +2586,7 @@ def _run_resolved_experiment(
             msg = f"Run status {summary.get('status')!r} is not resumable: {run_dir}"
             raise RunLifecycleError(msg)
         saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
+        _require_current_training(saved_config, unit=f"Run {run_dir}")
         target_epochs = validate_resume_config(requested, saved_config)
         _validate_resume_output_root(run_dir, saved_config, output_root)
         runtime_config = copy.deepcopy(saved_config)
@@ -2672,28 +2598,21 @@ def _run_resolved_experiment(
             runtime_config["training"]["stage_schedule"] = copy.deepcopy(requested["training"]["stage_schedule"])
         runtime_config["run"]["device"] = requested["run"]["device"]
 
-        split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
-        normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
-        normalizer_state = _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
-        data_processor = (
-            normalizer_state
-            if saved_config["task"] == "transient_drying"
-            else datasets.preprocessing.normalization.data_processor_from_state(normalizer_state, device="cpu")
-        )
+        split, normalizer_artifact = _read_saved_data_artifacts(run_dir)
+        split_indices = split.as_payload()
+        _validate_saved_data_contract(saved_config, split, normalizer_artifact)
         identity = learning.training.checkpoint.build_checkpoint_identity(
             runtime_config,
             split_indices,
             normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=saved_config,
         )
-        amp_enabled = bool(runtime_config["training"]["mixed_precision"])
         last = learning.training.checkpoint.load_checkpoint(
             common.paths.resolve_last_checkpoint_file(run_dir),
             expected_identity=identity,
             expected_role="last",
             payload_kind="full",
             scheduler_expected=runtime_config.get("scheduler") is not None,
-            amp_expected=amp_enabled,
             require_best=False,
             adapter_expected=runtime_config["task"] == "transient_drying",
         )
@@ -2709,7 +2628,6 @@ def _run_resolved_experiment(
                 expected_role="best",
                 payload_kind=learning.training.checkpoint.best_payload_kind(runtime_config),
                 scheduler_expected=runtime_config.get("scheduler") is not None,
-                amp_expected=amp_enabled,
                 require_best=True,
                 adapter_expected=runtime_config["task"] == "transient_drying",
             )
@@ -2728,7 +2646,7 @@ def _run_resolved_experiment(
             run_dir=run_dir,
             persisted_config=saved_config,
             saved_split_indices=split_indices,
-            restored_data_processor=data_processor,
+            restored_scaling_artifact=normalizer_artifact,
             resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
             device_resolution=device_resolution,
             matched_receipt=matched_receipt,
@@ -2817,9 +2735,10 @@ def _validate_reusable_stage_a(
     requested_b: Mapping[str, Any],
     device_resolution: learning.device.DeviceResolution,
 ) -> None:
-    """Admit a completed A leaf only when config and immutable handoff match the plan."""
+    """Admit a completed A leaf only when its training code is current and config and immutable handoff match the plan."""
     completed = validate_completed_run(run_dir)
     saved = config_loader.validate_resolved_config(completed["config"])
+    _require_current_training(saved, unit=f"A0 {run_dir}")
     validate_resume_config(requested_a, saved)
     transient_handoff.validate_stage_a_handoff(
         run_dir / transient_handoff.HANDOFF_DIRECTORY,
@@ -2843,12 +2762,11 @@ def _matched_failed_stage_recovery(
         if report["resume_compatibility"] != "compatible":
             return False, str(report["reason"])
         saved_config = config_loader.validate_resolved_config(config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir)))
-        split_indices = _load_mapping_artifact(common.paths.resolve_split_indices_path(run_dir), label="split indices")
-        normalizer_artifact = _load_mapping_artifact(common.paths.resolve_normalizer_path(run_dir), label="normalizer")
-        _validate_saved_data_contract(saved_config, split_indices, normalizer_artifact)
+        split, normalizer_artifact = _read_saved_data_artifacts(run_dir)
+        _validate_saved_data_contract(saved_config, split, normalizer_artifact)
         identity = learning.training.checkpoint.build_checkpoint_identity(
             requested,
-            split_indices,
+            split.as_payload(),
             normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
             persisted_config=saved_config,
         )
@@ -2859,7 +2777,6 @@ def _matched_failed_stage_recovery(
             expected_role="last",
             payload_kind="full",
             scheduler_expected=requested.get("scheduler") is not None,
-            amp_expected=bool(requested["training"]["mixed_precision"]),
             require_best=False,
             adapter_expected=True,
         )
@@ -2874,7 +2791,6 @@ def _matched_failed_stage_recovery(
                 expected_role="best",
                 payload_kind=checkpoint.best_payload_kind(requested),
                 scheduler_expected=requested.get("scheduler") is not None,
-                amp_expected=bool(requested["training"]["mixed_precision"]),
                 require_best=True,
                 adapter_expected=True,
             )
@@ -2909,7 +2825,6 @@ def _run_transient_matched_plan(  # noqa: C901, PLR0912
         msg = "--train-stages must select one or more distinct a0,b,a1 stages."
         raise ValueError(msg)
     device_resolution = learning.device.resolve_device(configs["a0"]["run"]["device"], path="run.device")
-    learning.device.validate_mixed_precision_device(configs["a0"]["training"]["mixed_precision"], device_resolution)
     for config in configs.values():
         validate_deterministic_model_device_policy(config, device_resolution)
     record = run_identity.build_transient_experiment_record(configs["a0"], configs["b"], stage_a1=configs["a1"], config_path=config_path)
@@ -2923,6 +2838,7 @@ def _run_transient_matched_plan(  # noqa: C901, PLR0912
                 msg = f"Matched stage {name} has an unsafe or incomplete config: {run_dir}"
                 raise RunLifecycleError(msg)
             saved = config_loader.validate_resolved_config(config_loader.load_yaml(saved_path))
+            _require_current_training(saved, unit=f"Matched stage {name} {run_dir}")
             if name == "a0" and saved["run"]["layout"]["a0_id"] != configs["a0"]["run"]["layout"]["a0_id"]:
                 msg = (
                     f"The existing A0 at {run_dir} has another scientific identity than the requested plan. "
@@ -3191,6 +3107,7 @@ def run_experiment(
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
+    seed: int | None = None,
     max_epochs: int | None = None,
     max_steps: int | None = None,
     max_train_seconds: float | None = None,
@@ -3222,10 +3139,12 @@ def run_experiment(
         Continuation learning-rate factor applied to both B and A1 for a paired sweep.
     revision : str | None, optional
         Label of a deliberately separate output location (``run.revision``) for otherwise identical science.
+    seed : int | None, optional
+        Replicate seed replacing ``run.seed`` before the layout and seed plan are derived.
     max_epochs : int | None, optional
         Operational cap override for one selected matched stage.
     max_steps : int | None, optional
-        Total successful optimizer-step cap for one selected matched B/A1 stage.
+        Total optimizer-step cap for one selected matched B/A1 stage.
     max_train_seconds : float | None, optional
         Cumulative committed optimization-region seconds cap for one selected matched B/A1 stage.
 
@@ -3238,7 +3157,7 @@ def run_experiment(
     if resume is not None and Path(config_path).expanduser().resolve(strict=False) == common.paths.resolve_run_config_path(
         Path(resume).expanduser()
     ).resolve(strict=False):
-        if any(value is not None for value in (epochs, train_dataset, train_seconds, rollout_length, lr_scale, revision)):
+        if any(value is not None for value in (epochs, train_dataset, train_seconds, rollout_length, lr_scale, revision, seed)):
             msg = "Saved-effective resume cannot override scientific settings; use its saved config and operational caps."
             raise ValueError(msg)
         return _run_saved_effective_resume(
@@ -3265,6 +3184,7 @@ def run_experiment(
         rollout_length=rollout_length,
         lr_scale=lr_scale,
         revision=revision,
+        seed=seed,
     )
     _apply_device_override(raw_requested, device)
     if transient_plan.is_matched_a1_b_config(raw_requested):

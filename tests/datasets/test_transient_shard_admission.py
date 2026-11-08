@@ -163,7 +163,7 @@ def receipt_fixture(tmp_path: Path) -> dict[str, Any]:
     torch.save({"fixture": torch.tensor([1])}, shard)
     canonical_size, canonical_stat = owner._file_stat_identity(canonical)
     shard_size, shard_stat = owner._file_stat_identity(shard)
-    publication = owner._publication_identity_from_dataset(manifest, index, "4" * 64)
+    publication = owner._publication_identity_from_dataset(manifest, index)
     record = {
         "filename": shard.name,
         "shard_index": 0,
@@ -186,7 +186,6 @@ def receipt_fixture(tmp_path: Path) -> dict[str, Any]:
         "dataset_digest": manifest["dataset_digest"],
         "index_digest": index["index_digest"],
         "transient_contract_digest": index["contract_digest"],
-        "package_manifest_sha256": "4" * 64,
         "canonical_payload_sha256": manifest["payload_sha256"],
         "canonical_payload_size_bytes": canonical_size,
         "canonical_payload_stat_identity": canonical_stat,
@@ -221,7 +220,6 @@ def _admit(fixture: dict[str, Any]) -> dict[str, Any]:
         fixture["receipt"],
         manifest=fixture["manifest"],
         index=fixture["index"],
-        manifest_sha256="4" * 64,
         canonical_payload_size_bytes=size,
         canonical_payload_stat_identity=stat,
         canonical_payload_path=fixture["canonical"],
@@ -254,7 +252,7 @@ def test_receipt_stat_change_requires_content(receipt_fixture: dict[str, Any], m
 
 
 def _republish_shard(package: dict[str, Any], mutate: Callable[[dict[str, Any]], None]) -> None:
-    """Rewrite shard 0 with a mutated payload and refresh its size, stat, digest and inventory evidence like the producer."""
+    """Rewrite shard 0 with a mutated payload and refresh its size, stat, digest, inventory and manifest evidence like the producer."""
     dataset_id, root = package["train_dataset"], package["root"]
     receipt_path = owner.transient_shard_directory(dataset_id, storage_root=root) / owner.TRANSIENT_PT_RECEIPT_FILENAME
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -268,6 +266,10 @@ def _republish_shard(package: dict[str, Any], mutate: Callable[[dict[str, Any]],
     receipt["total_size_bytes"] = sum(item["size_bytes"] for item in receipt["shards"])
     receipt["shard_inventory_digest"] = common.serialization.canonical_json_sha256(receipt["shards"])
     common.serialization.atomic_write_json(receipt_path, receipt)
+    manifest_path = receipt_path.parent.parent / common.paths.DATASET_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["derived_payload_sha256"] = common.serialization.file_sha256(receipt_path)
+    common.serialization.atomic_write_json(manifest_path, manifest)
 
 
 def _reorder_dynamic_fields(payload: dict[str, Any]) -> None:

@@ -426,9 +426,7 @@ def test_startup_ramp_configuration_is_strict(
 @pytest.mark.parametrize(
     ("section", "key", "value", "message"),
     [
-        ("runtime", "maximum_failed_cases", -1, "must be an integer >= 0"),
-        ("runtime", "maximum_failed_cases", 1.5, "must be an integer >= 0"),
-        ("runtime", "maximum_failed_cases", True, "must be an integer >= 0"),
+        ("runtime", "maximum_failed_cases", 3, r"execution\.runtime keys are invalid: missing=\[\], unknown=\['maximum_failed_cases'\]"),
         ("cluster", "node_jobs", 0, "must be an integer >= 1"),
         ("cluster", "node_jobs", 1.5, "must be an integer >= 1"),
         ("cluster", "node_jobs", 5, "must be between 1 and 4"),
@@ -441,7 +439,7 @@ def test_execution_count_limits_reject_invalid_domains(
     value: object,
     message: str,
 ) -> None:
-    """Reject invalid failure-threshold and node-job counts."""
+    """Reject invalid node-job counts and a global failure threshold, which the per-batch minimum success rate replaces."""
     config_path, _template = generation_config_factory()
     _edit_layer(config_path, "execution.yaml", lambda execution: execution[section].update({key: value}))
 
@@ -488,13 +486,24 @@ def test_node_job_contract_rejects_what_does_not_fit(
         generation.cases.config.load_campaign_config(config_path)
 
 
-def test_execution_schema_version_one_is_not_read(generation_config_factory: Any) -> None:
-    """A version-1 file is refused with the supported version named, before any field is interpreted."""
+def test_execution_schema_version_other_than_one_is_not_read(generation_config_factory: Any) -> None:
+    """Any other version is refused with the supported version named, before any field is interpreted."""
     config_path, _template = generation_config_factory()
-    _edit_layer(config_path, "execution.yaml", lambda execution: execution.update({"schema_version": 1}))
+    _edit_layer(config_path, "execution.yaml", lambda execution: execution.update({"schema_version": 2}))
 
-    with pytest.raises(generation.cases.config.GenerationConfigError, match=r"schema_version 1 is not supported; schema_version 2 .* is required"):
+    with pytest.raises(generation.cases.config.GenerationConfigError, match=r"schema_version 2 is not supported; schema_version 1 is required"):
         generation.cases.config.load_campaign_config(config_path)
+
+
+def test_campaign_schema_version_is_refused_once_with_its_path_and_the_found_and_expected_version(generation_config_factory: Any) -> None:
+    """The campaign loader owns the one schema check and names the file, the found and the expected version."""
+    config_path, _template = generation_config_factory()
+    config_path.write_text(yaml.safe_dump({**yaml.safe_load(config_path.read_text(encoding="utf-8")), "schema_version": 2}), encoding="utf-8")
+
+    with pytest.raises(generation.cases.config.GenerationConfigError) as refused:
+        generation.cases.config.load_campaign_config(config_path)
+    assert config_path.name in str(refused.value)
+    assert "found 'generation_source_campaign' version 2, expected 'generation_source_campaign' version 1" in str(refused.value)
 
 
 def test_node_job_resources_derive_concurrency_and_memory_from_the_case_step(generation_config_factory: Any) -> None:
@@ -599,7 +608,6 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
         {
             "timeout_seconds": 4200,
             "graceful_stop_reserve_seconds": 300,
-            "maximum_failed_cases": 3,
         }
     )
     execution["cluster"]["node_job_wall_time"] = "02:00:00"
@@ -650,7 +658,6 @@ def test_valid_config_edits_are_resolved_without_source_synchronization(
     assert scientific["scientific_fixed_values"]["p_ref"] == 100000.0
     assert scientific["storage"]["compression_level"] == 6
     assert resolved.execution_values["runtime"]["timeout_seconds"] == 4200.0
-    assert resolved.execution_values["runtime"]["maximum_failed_cases"] == 3
     assert resolved.execution_values["runtime"]["graceful_stop_reserve_seconds"] == 300.0
     cluster = resolved.execution_values["cluster"]
     assert cluster["node_job_wall_time"] == "02:00:00"
@@ -877,7 +884,7 @@ def test_target_reaches_scalar_handoff_and_scientific_identity(
         config_path,
         only_batch=batch_name,
     )
-    material_path = config_path.parents[3] / "physical_model/materials/lentil.yaml"
+    material_path = config_path.parents[2] / "physical_model/materials/lentil.yaml"
     assert tmp_path in material_path.parents
     authored = yaml.safe_load(material_path.read_text(encoding="utf-8"))
     assert set(authored["target_moisture"]) == {
@@ -1052,6 +1059,35 @@ def test_each_sampled_morphology_control_changes_its_owned_field(generation_conf
         observed[name] = difference / max(scale, np.finfo(np.float64).tiny)
     assert set(observed) == set(bed_names) | set(moisture_names)
     assert all(effect > 1e-10 for effect in observed.values()), observed
+
+
+def test_anisotropy_max_ratio_is_the_principal_permeability_ratio_with_preserved_geometric_mean() -> None:
+    """Pin k1/k2 = 1 + strength*(max_ratio - 1)*|b|^exponent and sqrt(k1*k2) = kappa."""
+    rng = np.random.default_rng(7)
+    background = rng.standard_normal((24, 32))
+    values = {
+        "kappa_mean": 1.0e-9,
+        "kappa_cv": 0.3,
+        "permeability.orientation.smooth_len_rel": 0.05,
+        "permeability.orientation.jitter": 0.0,
+        "permeability.anisotropy.strength": 0.7,
+        "permeability.anisotropy.max_ratio": 1.6,
+        "permeability.anisotropy.exponent": 1.5,
+    }
+    kappa, kxx, kxy, kyy, _diagnostics = fields._permeability_fields(
+        rng.standard_normal(background.shape),
+        background,
+        resolution=0.01,
+        length_x=0.32,
+        values=values,
+        random=rng,
+    )
+    tensor = np.stack([np.stack([kxx, kxy], axis=-1), np.stack([kxy, kyy], axis=-1)], axis=-2)
+    eigenvalues = np.linalg.eigvalsh(tensor)
+    magnitude = np.abs(background) / np.max(np.abs(background))
+    expected = 1.0 + 0.7 * (1.6 - 1.0) * magnitude**1.5
+    np.testing.assert_allclose(eigenvalues[..., 1] / eigenvalues[..., 0], expected, rtol=1e-9)
+    np.testing.assert_allclose(np.sqrt(eigenvalues[..., 0] * eigenvalues[..., 1]), kappa, rtol=1e-9)
 
 
 @pytest.mark.parametrize(

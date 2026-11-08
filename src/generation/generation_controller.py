@@ -3,7 +3,7 @@
 Responsibilities:
   - Interpret immutable run plans and configured execution resources
   - Summarize the Slurm footprint of a run (node jobs and driver) for read-only previews
-  - Sequence source campaign and benchmark lifecycles
+  - Sequence source campaign lifecycles
   - Reconcile repeat invocations, monitor work, and gate source publication
   - Report failure stages of a run, from plan resolution and preflight on, with the command that continues, preserving service-owned state
   - Print each stage with its duration and a live campaign board in the driver log
@@ -12,7 +12,7 @@ Responsibilities:
 Design principles:
   - Existing Generation services own identities, manifests, and scientific data
   - Every continuation is reconstructed from persisted service evidence
-  - Finalization follows exact source and benchmark validation gates
+  - Finalization follows exact source validation gates
   - A source failure stops the driver only after it persisted through reconciliations for a settle window
   - Printing reads no extra evidence and never changes a decision, a call, or an exit status
 
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import re
 import shlex
 import sys
 import time
@@ -51,7 +50,6 @@ _NODE_JOB_SETTLE_SECONDS: Final = 1800  # longer than the node worker's 900 s id
 _PYTHON_OPERATION_WALL_TIME: Final = "02:00:00"
 # Printed stages of a run: the plan, then input readiness, submission with monitoring, and the closing stage of a campaign.
 _CAMPAIGN_STAGES: Final = 4
-_BENCHMARK_STAGES: Final = 5
 
 
 class GenerationControllerError(RuntimeError):
@@ -99,7 +97,6 @@ class GenerationCommandPort(Protocol):
         operation: str,
         *arguments: str,
         scheduled: bool | None = None,
-        benchmark_preflight: bool = False,
         partition: str = "standard",
         wall_time: str = _PYTHON_OPERATION_WALL_TIME,
     ) -> str:
@@ -139,16 +136,7 @@ class GenerationCommandPort(Protocol):
         ...
 
 
-_SCHEDULED_OPERATIONS = frozenset(
-    {
-        "prepare-campaign-inputs",
-        "resume-campaign",
-        "finalize-core-benchmark",
-        "validate-core-benchmark",
-    }
-)
-_RUN_ID = re.compile(r"[A-Za-z0-9._-]+__[0-9a-f]{16}\Z")
-_MONITOR_HEADER_FIELDS = 4
+_SCHEDULED_OPERATIONS = frozenset({"prepare-campaign-inputs", "resume-campaign"})
 
 
 def _payload(output: str, operation: str) -> dict[str, Any]:
@@ -165,12 +153,6 @@ def _payload(output: str, operation: str) -> dict[str, Any]:
 def _positive(value: Any, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         _fail(f"{label} must be an integer >= 1", exit_code=2)
-    return value
-
-
-def _identifier(value: Any, pattern: re.Pattern[str], label: str) -> str:
-    if not isinstance(value, str) or pattern.fullmatch(value) is None:
-        _fail(f"Malformed {label}: {value}")
     return value
 
 
@@ -214,7 +196,7 @@ class RunPlan:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionResources:
-    """Validated execution fields from one campaign or benchmark config."""
+    """Validated execution fields from one campaign config."""
 
     partition: str
     scheduler: str
@@ -239,7 +221,6 @@ class ExecutionResources:
         cores_per_case = _positive(cluster["cores_per_case"], "cores_per_case")
         if cores_per_case > cores_per_node:
             _fail("cores_per_case exceeds site cores_per_node", exit_code=2)
-        _positive(submission["max_admission_cases"], "max_admission_cases")
         node_jobs = _positive(cluster["node_jobs"], "node_jobs")
         return cls(
             partition=str(site["partition"]),
@@ -253,22 +234,6 @@ class ExecutionResources:
             cores_per_node=cores_per_node,
             purpose=str(value["campaign_purpose"]),
             parallel_cases=node_jobs * (cores_per_node // cores_per_case),
-        )
-
-    @classmethod
-    def benchmark(cls, value: dict[str, Any]) -> ExecutionResources:
-        """Project a validated benchmark suite onto host execution settings."""
-        site = value["resource_contract"]
-        return cls(
-            partition=str(site["partition"]),
-            scheduler=str(site["scheduler"]),
-            python_module=str(site["python_module"]),
-            comsol_module=str(site["comsol_module"]),
-            python_executable=str(site["python_executable"]),
-            comsol_executable=str(site["comsol_executable"]),
-            poll_seconds=_positive(site["poll_interval_seconds"], "poll_interval_seconds"),
-            wall_time=_PYTHON_OPERATION_WALL_TIME,
-            cores_per_node=_positive(site["cores_per_node"], "cores_per_node"),
         )
 
 
@@ -304,7 +269,7 @@ def scheduler_footprint(
     dict[str, Any] | None
         ``node_jobs``, ``cores_per_node_job``, ``node_job_memory`` (``<int>G``), ``node_job_wall_time``
         (``HH:MM:SS``), ``driver_cpus`` and ``driver_time``; ``None`` when the plan carries no campaign
-        execution values (a benchmark), whose footprint is not defined by this contract.
+        execution values.
 
     Raises
     ------
@@ -333,46 +298,11 @@ def scheduler_footprint(
     }
 
 
-def benchmark_scheduler_footprint(
-    resource_contract: Mapping[str, Any],
-    *,
-    driver_time: str,
-    driver_partition: str = "standard",
-) -> dict[str, Any]:
-    """
-    Return the maximum Slurm footprint of a core benchmark: its sweep node jobs and its driver job.
-
-    Parameters
-    ----------
-    resource_contract : Mapping[str, Any]
-        The suite's resource contract (``inspect-core-benchmark``), which owns the sweep node-job resources.
-    driver_time : str
-        Time limit of the driver job as given to ``--driver-time``.
-    driver_partition : str, optional
-        Partition of the driver job.
-
-    Returns
-    -------
-    dict[str, Any]
-        The same keys as ``scheduler_footprint``.
-
-    """
-    driver = host_service.LauncherJob("generation", "generation", driver_partition, driver_time)
-    return {
-        "node_jobs": int(resource_contract["node_jobs"]),
-        "cores_per_node_job": int(resource_contract["cores_per_node"]),
-        "node_job_memory": str(resource_contract["node_job_memory"]),
-        "node_job_wall_time": str(resource_contract["node_job_wall_time"]),
-        "driver_cpus": driver.cpus_per_task,
-        "driver_time": driver.wall_time,
-    }
-
-
 def _require_continuable_state(run_id: str, state: object) -> None:
     """Stop with an actionable message for every campaign state the controller does not continue by itself."""
     if state == "license_wait_exhausted":
         _fail(f"Canonical campaign stopped: the licence wait budget of at least one case is exhausted; inspect status {run_id}")
-    if state in {"blocked", "submission_unknown", "cancel_requested", "force_cancel_requested", "failure_threshold_reached"}:
+    if state in {"blocked", "submission_unknown", "cancel_requested", "force_cancel_requested"}:
         _fail(f"Canonical campaign requires explicit continuation from state {state!r}; inspect status {run_id}")
 
 
@@ -387,10 +317,13 @@ class LeafResult:
     partial: bool = False
 
     @property
-    def source_name(self) -> str | None:
-        """Return the Source locator for a campaign result."""
+    def source_name(self) -> str:
+        """Return the Source locator for a campaign result; a run id without campaign parts is refused."""
         parts = common.paths.campaign_run_parts(self.run_id)
-        return None if parts is None else parts[1]
+        if parts is None:
+            message = f"Run {self.run_id!r} is not a canonical campaign run and has no Source."
+            raise ValueError(message)
+        return parts[1]
 
 
 def _campaign_override_arguments(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -408,12 +341,15 @@ def _campaign_override_arguments(payload: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(arguments)
 
 
-def _unsettled_failure(run_id: str, cases: Sequence[Mapping[str, Any]], counts: Mapping[str, Any]) -> str | None:
+def _unsettled_failure(run_id: str, status: Mapping[str, Any]) -> str | None:
     """Describe a quiescent source campaign that no recorded decision or replacement settles, else return ``None``.
 
-    A failed case with a recorded terminal decision never stops the campaign: its
-    slot is either covered by a replacement or counted as an unfilled deficit.
+    A failed case with a recorded terminal decision never stops the campaign: its slot is either covered by a
+    replacement or left unfilled by a batch its minimum success rate stopped, which the status names.
     """
+    cases, counts = status.get("cases"), status.get("counts")
+    if not isinstance(cases, list) or not cases or not isinstance(counts, dict):
+        _fail("Canonical campaign status lacks current candidate evidence")
     deficit = counts.get("replacement_deficit")
     if isinstance(deficit, bool) or not isinstance(deficit, int) or any("terminal_decision" not in case for case in cases):
         _fail("Canonical campaign status lacks current candidate evidence")
@@ -426,10 +362,10 @@ def _unsettled_failure(run_id: str, cases: Sequence[Mapping[str, Any]], counts: 
             "then rerun the same command."
         )
     if deficit > 0:
+        stop = status.get("success_rate_stop")
         return (
-            f"Canonical campaign has {deficit} unfilled success slot(s) and no pending or running job: the Source cannot reach its target "
-            f"without more replacement capacity; add it with `./scripts/generation amend-replacements {run_id} --material MATERIAL "
-            "--regime REGIME --capacity N --reason TEXT` or start a new Source."
+            f"Canonical campaign has {deficit} unfilled success slot(s) and no pending or running job. "
+            f"{stop if isinstance(stop, str) else f'Inspect status {run_id}.'}"
         )
     return None
 
@@ -443,7 +379,6 @@ class GenerationController:
         self.execute = execute
         self.stage = "not_started"
         self.run_id = ""
-        self.run_kind = ""
         self.config_argument = ""
         self.scientific_arguments: tuple[str, ...] = ()
         self.restart_arguments: tuple[str, ...] = ()
@@ -467,7 +402,7 @@ class GenerationController:
     def _leave_stage(self) -> None:
         """Print the duration of the running stage, if one runs."""
         if self._stage_started is not None:
-            duration = status_service.format_duration(self.clock() - self._stage_started)
+            duration = common.console.format_duration(self.clock() - self._stage_started)
             print(f"[{self._stage_number}/{self._stage_total}] {self.stage} done in {duration}")
             self._stage_started = None
 
@@ -488,7 +423,6 @@ class GenerationController:
         operation: str,
         *arguments: str,
         scheduled: bool | None = None,
-        benchmark_preflight: bool = False,
     ) -> str:
         """Use the node boundary for configured computational operations."""
         resources = self.resources
@@ -498,7 +432,6 @@ class GenerationController:
             operation,
             *arguments,
             scheduled=scheduled,
-            benchmark_preflight=benchmark_preflight,
             partition=resources.partition if resources else "standard",
             wall_time=resources.wall_time if resources else _PYTHON_OPERATION_WALL_TIME,
         )
@@ -550,10 +483,7 @@ class GenerationController:
                 "execution_overrides": dict(execution_overrides or {}),
             }
         )
-        plan = self.plan(str(plan_path), scientific_arguments=tuple(arguments))
-        if plan.kind != "campaign":
-            _fail("Authored values must resolve to a campaign", exit_code=2)
-        return plan
+        return self.plan(str(plan_path), scientific_arguments=tuple(arguments))
 
     def choose_run_tree(self, plan: RunPlan, *, continue_with_current_code: bool) -> tuple[host_service.SourceAdmission, bool]:
         """
@@ -564,11 +494,9 @@ class GenerationController:
         campaign then records as an explicit source transition. New campaigns and
         other run kinds use the current code.
         """
-        bound = None
-        if plan.kind == "campaign":
-            from . import generation_campaign as campaign_service  # noqa: PLC0415 -- persisted campaign bindings are read only by launchers
+        from . import generation_campaign as campaign_service  # noqa: PLC0415 -- persisted campaign bindings are read only by launchers
 
-            bound = campaign_service.bound_source_snapshot(plan.identity, storage_root=self.port.storage)
+        bound = campaign_service.bound_source_snapshot(plan.identity, storage_root=self.port.storage)
         return self.port.choose_tree(bound_snapshot=bound, continue_with_current_code=continue_with_current_code)
 
     def submit_run_tree(
@@ -591,22 +519,19 @@ class GenerationController:
         *,
         execution_overrides: Mapping[str, Any] | None = None,
         scientific_overrides: Mapping[str, Any] | None = None,
-        max_admission_cases: int | None = None,
     ) -> LeafResult:
         """Run one in-memory campaign through the existing admitted controller.
 
         ``plan_path`` identifies the repository YAML preserved as recovery evidence.
-        The authored mapping contains only Generation campaign values. A ``STAGED``
-        result retains incomplete bounded admission; failures raise the ordinary
+        The authored mapping contains only Generation campaign values; an explicit
+        admission cap is one of the ``execution_overrides``. A ``STAGED`` result
+        retains incomplete bounded admission; failures raise the ordinary
         controller error and preserve the service-owned continuation evidence.
         """
         plan = self.authored_campaign_plan(
             plan_path, authored_value, execution_overrides=execution_overrides, scientific_overrides=scientific_overrides
         )
-        result = self.run(plan, str(plan_path), max_admission_cases=max_admission_cases)
-        if not isinstance(result, LeafResult) or result.kind != "campaign":
-            _fail("Authored campaign resolved to an unsupported run kind", exit_code=2)
-        return result
+        return self.run(plan, str(plan_path))
 
     def campaign_resources(self, config: str, *, executable: bool = True, override_arguments: tuple[str, ...] = ()) -> ExecutionResources:
         """Read the configured campaign resource contract once in Python."""
@@ -619,15 +544,6 @@ class GenerationController:
         self._validate_site(resources)
         self.resources = resources
         return resources
-
-    def benchmark_resources(self, config: str) -> tuple[ExecutionResources, dict[str, Any]]:
-        """Read the benchmark suite's resource and identity contract."""
-        config_path, _ = self.port.config_file(config)
-        inspection = self.json("inspect-core-benchmark", str(config_path), scheduled=False)
-        resources = ExecutionResources.benchmark(inspection)
-        self._validate_site(resources)
-        self.resources = resources
-        return resources, inspection
 
     def _validate_site(self, resources: ExecutionResources) -> None:
         if resources.scheduler != "slurm" or resources.partition not in {"standard", "long"}:
@@ -644,17 +560,12 @@ class GenerationController:
         """Check executable config and native solver without generating data."""
         overrides = _campaign_override_arguments(plan.payload)
         with self._checked_before_run("preflight", plan.config_path, overrides):
-            if plan.kind == "benchmark":
-                resources, _ = self.benchmark_resources(plan.config_path)
-            elif plan.kind == "campaign":
-                resources = self.campaign_resources(plan.config_path, override_arguments=overrides)
-            else:
-                _fail(f"Unsupported plan kind: {plan.kind}", exit_code=2)
+            resources = self.campaign_resources(plan.config_path, override_arguments=overrides)
             self.port.verify_execution()
             version = self.port.comsol_version(resources.comsol_module, resources.comsol_executable)
         return f"PREFLIGHT COMPLETE: plan={plan.identity} kind={plan.kind} host=shared-filesystem COMSOL={version}"
 
-    def run(self, plan: RunPlan, config_argument: str, *, max_admission_cases: int | None = None) -> LeafResult | tuple[LeafResult, ...]:
+    def run(self, plan: RunPlan, config_argument: str, *, max_admission_cases: int | None = None) -> LeafResult:
         """Execute or resume one immutable plan from service-owned evidence."""
         self.execute = True
         self.config_argument = config_argument
@@ -663,28 +574,20 @@ class GenerationController:
             if max_admission_cases is not None and "max_admission_cases" not in plan.payload.get("execution_overrides", {})
             else ()
         )
-        self.run_kind = plan.kind
         self.authored_campaign = plan.payload.get("authored_value") is not None
         self._stage_number = 0
         self._stage_started = None
-        self._stage_total = _CAMPAIGN_STAGES if plan.kind == "campaign" else _BENCHMARK_STAGES
+        self._stage_total = _CAMPAIGN_STAGES
         self._enter_stage("common plan resolution", f"Run plan: kind={plan.kind} identity={plan.identity} config={plan.config_path}")
         try:
-            result: LeafResult | tuple[LeafResult, ...]
-            if plan.kind == "campaign":
-                if common.paths.campaign_run_parts(plan.identity) is None:
-                    _fail("Campaign plan is not a current source campaign", exit_code=2)
-                result = self._canonical_campaign(plan, max_admission_cases=max_admission_cases)
-            elif plan.kind == "benchmark":
-                result = self._benchmark(plan)
-            else:
-                _fail(f"Unsupported Generation run kind: {plan.kind}", exit_code=2)
+            if common.paths.campaign_run_parts(plan.identity) is None:
+                _fail("Campaign plan is not a current source campaign", exit_code=2)
+            result = self._canonical_campaign(plan, max_admission_cases=max_admission_cases)
         except BaseException as error:
             self._record_failure(error, self._continuation())
             raise
         self._leave_stage()
-        staged = any(child.result == "STAGED" for child in result) if isinstance(result, tuple) else result.result == "STAGED"
-        if staged:
+        if result.result == "STAGED":
             print(f"GENERATION STAGED: run_identity={plan.identity}")
         else:
             print(f"GENERATION COMPLETE: run_identity={plan.identity}")
@@ -744,7 +647,7 @@ class GenerationController:
                 time.sleep(resources.poll_seconds)
                 manifest = self._resume_campaign(run_id)
                 continue
-            _require_continuable_state(run_id, state)
+            self._require_continuable(run_id, state)
             if state not in {
                 "ready",
                 "submitting",
@@ -768,11 +671,8 @@ class GenerationController:
                 and not status.get("open_node_jobs")
                 and status.get("submission_unknown") is False
             ):
-                cases = status.get("cases")
-                counts = status.get("counts")
-                if not isinstance(cases, list) or not cases or not isinstance(counts, dict):
-                    _fail("Canonical campaign status lacks current candidate evidence")
-                unsettled = _unsettled_failure(run_id, cases, counts)
+                unsettled = _unsettled_failure(run_id, status)
+                cases, counts = status["cases"], status["counts"]
                 if unsettled is None:
                     successful = sum(case.get("state") == "successful" for case in cases)
                     if (
@@ -795,6 +695,15 @@ class GenerationController:
         self._show_board(board, self._await_settled_node_jobs(run_id, resources))
         self._enter_stage("selected source publication")
         return result
+
+    def _require_continuable(self, run_id: str, state: object) -> None:
+        """Stop on every state the controller does not continue by itself; a blocked campaign names its stopped batches or its cap."""
+        if state == "blocked":
+            status = self.json("campaign-status", run_id, *self._storage())
+            stops = [stop for stop in (status.get("success_rate_stop"), status.get("admission_cap_stop")) if isinstance(stop, str)]
+            if stops:
+                _fail(f"Canonical campaign is blocked. {' '.join(stops)}")
+        _require_continuable_state(run_id, state)
 
     def _cancellation_settling(self, run_id: str, state: object) -> bool:
         """Return whether a persisted cancellation still has node jobs or submissions to end.
@@ -833,84 +742,13 @@ class GenerationController:
             _fail("Canonical campaign continuation identity changed")
         return manifest
 
-    def _benchmark(self, plan: RunPlan) -> LeafResult:
-        """Advance one benchmark through its own source and terminal owner."""
-        path, _ = self._campaign_file(plan.config_path)
-        resources, _ = self.benchmark_resources(plan.config_path)
-        version = self.port.comsol_version(resources.comsol_module, resources.comsol_executable)
-        identity = self.json("resolve-core-benchmark-run", path, "--git-commit", self.port.commit, "--comsol-version-output", version)
-        run_id = _identifier(identity["benchmark_run_id"], _RUN_ID, "benchmark-run ID")
-        self.run_id = run_id
-        result = LeafResult(run_id=run_id, kind="benchmark", purpose=plan.purpose)
-        try:
-            self.call("validate-core-benchmark", run_id, *self._storage())
-        except host_service.GenerationCommandError:
-            pass
-        else:
-            result.result = "REUSED"
-            print(self.call("core-benchmark-summary", run_id, "--format", "markdown", *self._storage()))
-            return result
-        self.port.verify_execution()
-        self._enter_stage("benchmark input readiness")
-        materialized = self._benchmark_plan_command("materialize-core-benchmark-inputs", path, resources)
-        if materialized["benchmark_run_id"] != run_id:
-            _fail("Benchmark input identity changed")
-        self._enter_stage("benchmark work-unit admission")
-        submitted = self._benchmark_plan_command("submit-core-benchmark", path, resources)
-        if submitted["benchmark_run_id"] != run_id:
-            _fail("Benchmark submission identity changed")
-        self._enter_stage("benchmark scheduler reconciliation")
-        self._monitor(result, resources)
-        self._enter_stage("benchmark terminal publication")
-        self.call("finalize-core-benchmark", run_id, *self._storage())
-        self.call("validate-core-benchmark", run_id, *self._storage())
-        print(self.call("core-benchmark-summary", run_id, "--format", "markdown", *self._storage()))
-        return result
-
-    def _benchmark_plan_command(self, operation: str, path: str, resources: ExecutionResources) -> dict[str, Any]:
-        output = self.port.call(
-            operation,
-            path,
-            "--git-commit",
-            self.port.commit,
-            *self._storage(),
-            scheduled=True,
-            benchmark_preflight=True,
-            partition=resources.partition,
-            wall_time=resources.wall_time,
-        )
-        return _payload(output, operation)
-
-    def _monitor(self, result: LeafResult, resources: ExecutionResources) -> None:
-        """Reconcile a benchmark until terminal service evidence exists."""
-        while True:
-            self.call("resume-core-benchmark", result.run_id, *self._storage(), scheduled=True, benchmark_preflight=True)
-            output = self.call("core-benchmark-status", result.run_id, *self._storage(), "--format", "monitor")
-            benchmark_header, _, detail = output.partition("\n")
-            fields = benchmark_header.split("\t")
-            if len(fields) != _MONITOR_HEADER_FIELDS or fields[0] != "campaign-monitor":
-                _fail("Malformed benchmark monitor")
-            state = fields[1]
-            print(detail)
-            if state == "complete":
-                return
-            if state in {"variant_failed", "cancelled"}:
-                _fail(f"Benchmark reached terminal state: {state}")
-            if state not in {"inputs_ready", "running"}:
-                _fail(f"Unsupported benchmark state: {state}")
-            time.sleep(resources.poll_seconds)
-
     def _continuation(self) -> str | None:
-        """Return the command that continues the identified run: rerunning its command (an authored campaign's status), else ``None``.
-
-        A campaign's rerun adopts its persisted node jobs; a benchmark's rerun measures interrupted variants again.
-        """
-        if not self.run_id or self.run_kind not in {"campaign", "benchmark"}:
+        """Return the command that continues the identified run: its status for an authored campaign, else rerunning its command."""
+        if not self.run_id:
             return None
-        if self.run_kind == "campaign" and self.authored_campaign:
+        if self.authored_campaign:
             return shlex.join(["./scripts/generation", "status", self.run_id])
-        restart = (*self.scientific_arguments, *self.restart_arguments) if self.run_kind == "campaign" else ()
-        return shlex.join(["./scripts/generation", "run", self.config_argument, *restart])
+        return shlex.join(["./scripts/generation", "run", self.config_argument, *self.scientific_arguments, *self.restart_arguments])
 
     def _record_failure(self, error: BaseException, continuation: str | None) -> None:
         """Bind the exact failed stage and the continuation to an expected failure, which its CLI reports; source state remains service-owned.
@@ -920,60 +758,28 @@ class GenerationController:
         if isinstance(error, GenerationControllerError):
             error.stage, error.next_command = self.stage, continuation
         elif continuation is not None:
-            identity = [f"{self.run_kind}_run_id: {self.run_id}"] if self.run_id else []
+            identity = [f"campaign_run_id: {self.run_id}"] if self.run_id else []
             print("\n".join((f"FAILED: {self.stage}", *identity, f"Next: {continuation}")), file=sys.stderr)
 
     def status(self, target: str) -> str:
         """Compose read-only service status for a config or persisted run ID."""
         self.execute = False
-        lines: list[str] = []
         candidate = Path(target)
-        is_config = candidate.is_file() if candidate.is_absolute() else (self.port.repository / candidate).is_file()
-        if is_config:
+        if candidate.is_file() if candidate.is_absolute() else (self.port.repository / candidate).is_file():
             # Status only reads: a failure here suggests no dry run of a run.
             plan = self._resolved_plan(target, allow_incomplete=True, scientific_arguments=())
-            lines.extend((f"run_identity={plan.identity}", f"run_kind={plan.kind}", f"config={plan.config_path}"))
-            if plan.kind == "campaign":
-                _campaign_identifier(plan.identity)
-                lines.append(json.dumps(self.json("campaign-status", plan.identity, *self._storage()), sort_keys=True))
-            elif plan.kind == "benchmark":
-                resources, _ = self.benchmark_resources(plan.config_path)
-                version = self.port.comsol_version(resources.comsol_module, resources.comsol_executable)
-                path, _ = self._campaign_file(plan.config_path)
-                identity = self.json("resolve-core-benchmark-run", path, "--git-commit", self.port.commit, "--comsol-version-output", version)
-                run_id = _identifier(identity["benchmark_run_id"], _RUN_ID, "benchmark run ID")
-                lines.extend(self._benchmark_status(run_id))
-            else:
-                _fail(f"Unsupported run kind: {plan.kind}")
-        elif target.startswith("core_scaling_transient__"):
-            run_id = _identifier(target, _RUN_ID, "benchmark run ID")
-            lines.extend(self._benchmark_status(run_id))
-        else:
-            run_id = _campaign_identifier(target)
-            lines.append(json.dumps(self.json("campaign-status", run_id, *self._storage()), sort_keys=True))
-        return "\n".join(lines)
-
-    def _benchmark_status(self, run_id: str) -> list[str]:
-        lines = [
-            "Benchmark status:",
-            self.call("core-benchmark-status", run_id, *self._storage(), "--format", "summary"),
-            "CPU source status:",
-            self.call("core-benchmark-source-status", run_id, *self._storage()),
-        ]
-        try:
-            self.call("validate-core-benchmark", run_id, *self._storage())
-        except host_service.GenerationCommandError:
-            lines.append("Host publication state: absent_or_incomplete")
-        else:
-            lines.append("Host publication state: complete")
-        return lines
+            _campaign_identifier(plan.identity)
+            return "\n".join(
+                (
+                    f"run_identity={plan.identity}",
+                    f"run_kind={plan.kind}",
+                    f"config={plan.config_path}",
+                    json.dumps(self.json("campaign-status", plan.identity, *self._storage()), sort_keys=True),
+                )
+            )
+        return json.dumps(self.json("campaign-status", _campaign_identifier(target), *self._storage()), sort_keys=True)
 
     def cancel(self, run_id: str, *, force: bool = False) -> str:
-        """Delegate cancellation to the campaign or benchmark state owner."""
-        if run_id.startswith("core_scaling_transient__"):
-            _identifier(run_id, _RUN_ID, "benchmark run ID")
-        else:
-            _campaign_identifier(run_id)
-        operation = "cancel-core-benchmark" if run_id.startswith("core_scaling_transient__") else "cancel-campaign"
+        """Delegate cancellation to the campaign state owner."""
         options = ("--force",) if force else ()
-        return self.call(operation, run_id, *self._storage(), *options, scheduled=False)
+        return self.call("cancel-campaign", _campaign_identifier(run_id), *self._storage(), *options, scheduled=False)

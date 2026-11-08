@@ -4,6 +4,7 @@ Responsibilities:
   - Check which budget a matched plan, a stage-A-only A0, and a steady run receive from --epochs
   - Check that B target, B rollout window, and continuation scale reach exactly their stages
   - Check that matched-only overrides are rejected for every other configuration kind
+  - Check that only a non-negative integer is admitted as the replicate seed
 
 Design principles:
   - Overrides copy the authored request and the result must still resolve through its loader
@@ -76,6 +77,12 @@ def test_epochs_override_must_be_a_positive_integer(epochs: object) -> None:
         loader.apply_epoch_budget(configs.transient_matched_config(), epochs)  # type: ignore[arg-type]
 
 
+def test_seed_override_must_be_a_non_negative_integer() -> None:
+    """Reject a negative replicate seed before any layout or seed plan derives from it."""
+    with pytest.raises(loader.ConfigError, match="--seed must be a non-negative integer"):
+        loader.apply_training_overrides(configs.direct_config(), seed=-1)
+
+
 def test_train_seconds_override_supplies_and_replaces_the_b_target() -> None:
     """A plan that leaves B's target open becomes runnable once the target is passed."""
     raw = configs.transient_matched_config()
@@ -145,7 +152,6 @@ def test_rollout_length_override_resizes_the_b_window_and_truncates_its_curricul
     assert b["sampling"] == sampling
     assert b["curriculum"]["lengths"] == lengths
     assert b["curriculum"]["milestone_fractions"] == pytest.approx(fractions)
-    assert b["curriculum"]["seed"] == raw["training"]["b"]["curriculum"]["seed"]
     assert changed["training"]["a0"] == raw["training"]["a0"]
     assert plan.b["temporal"]["sampling"] == sampling
     assert plan.a1["temporal"]["sampling"] == plan.a0["temporal"]["sampling"]

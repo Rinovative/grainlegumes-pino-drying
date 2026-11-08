@@ -3,7 +3,11 @@
 Responsibilities:
   - Check prepared, absent, and invalid supplemental input evidence
   - Preserve sole-feeder cancellation, scheduler reconciliation, and completion
-  - Defer replacement generation and legacy heavy artifact admission
+  - Defer replacement generation and legacy heavy artifact admission; plan no replacement for a stopped batch
+  - Check that the stop set and blocking read one candidate snapshot and a decision recorded mid-planning ends planning
+    for its batch only
+  - Check that a recorded integer cap stays and a recorded null cap follows the current plan rates, only under a plan rate
+  - Check the one-line resume summary with its continuation reason and only its own reclassifications
 
 Design principles:
   - Metadata-only continuation uses the same feeder and never launches input generation
@@ -15,9 +19,13 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
+import copy
+import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -27,7 +35,11 @@ from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.cases import generation_cases_input as inputs
 from src.generation.cases import generation_cases_selection as selection
 from src.generation.cli import cli_generation
+from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_catalog as catalog
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _RUN = "source~steady_flow~lentil-d1__reference-range__lhs-s9910"
 
@@ -44,11 +56,11 @@ def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     original = SimpleNamespace(batch_id="primary", batch_name="primary", case_indices=(1,), scientific_values={})
     replacement = SimpleNamespace(batch_id="replacement", batch_name="replacement", case_indices=(2,), scientific_values={"supplemental_design": {}})
     campaign = SimpleNamespace(
-        schema_version=service.config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION,
         batches=(original,),
         profile=SimpleNamespace(id="steady_flow"),
         campaign_name="fixture",
         source_name="fixture__" + "a" * 16,
+        producer_identity={"source_implementation_sha256": source_service.GENERATION_SOURCE_PROJECTION.sha256()},
     )
     manifest = {
         "campaign_run_id": _RUN,
@@ -74,13 +86,15 @@ def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         fills=[],
         seals=[],
         states=[],
+        policy=[{"batch_id": "primary", "stopped": False, "amendments": []}],
     )
     monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: tmp_path)
     monkeypatch.setattr(service.campaign_evidence, "load_campaign_run", lambda *_a, **_k: manifest)
     monkeypatch.setattr(service.campaign_evidence, "campaign_from_manifest", lambda _m: campaign)
     monkeypatch.setattr(lifecycle, "candidate_records", lambda *_a, **_k: state.records)
+    monkeypatch.setattr(lifecycle, "replacement_policy", lambda *_a, **_k: state.policy)
     monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda _m: campaign)
-    monkeypatch.setattr(service, "_execution_binding", lambda _m: {})
+    monkeypatch.setattr(service, "_execution_binding", lambda _m: {"submission_config": {"max_admission_cases": 4}})
     monkeypatch.setattr(service.cluster_service, "campaign_tasks", lambda _c: ())
     monkeypatch.setattr(service, "_submission_index", lambda _m: {})
     monkeypatch.setattr(service, "_scheduler_evidence", lambda _ids: scheduler_evidence([]))
@@ -144,19 +158,92 @@ def test_supplemental_missing_requests_compute_but_invalid_evidence_fails(
     assert not feeder.fills
 
 
-def test_replacement_deficit_defers_before_candidate_materialization(
+@pytest.mark.parametrize("stopped", [False, True])
+def test_replacement_deficit_defers_before_candidate_materialization_unless_its_batch_is_stopped(
     feeder: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
+    stopped: bool,
 ) -> None:
-    """A sibling deficit requests compute without reserving or generating a replacement."""
+    """A deficit requests compute without reserving a replacement; a stopped batch plans none and, all decided, ends blocked."""
     feeder.records[0]["decision"] = {"outcome": "failed"}
+    feeder.policy = [{"batch_id": "primary", "stopped": stopped, "amendments": []}]
     monkeypatch.setattr(selection, "replacement_deficit", lambda *_a, **_k: 1)
-    monkeypatch.setattr(lifecycle, "replacement_pool_high_water", lambda *_a, **_k: 2)
     monkeypatch.setattr(lifecycle, "materialize_replacement_batch", lambda *a, **_k: feeder.materializations.append(a))
     result = service.resume_campaign(_RUN, metadata_only=True)
-    assert result["continuation_reason"] == "replacement_input_generation"
+    assert result.get("continuation_reason") == (None if stopped else "replacement_input_generation")
+    assert ("blocked" in feeder.states) is stopped
     assert not feeder.materializations
     assert not feeder.generations
+
+
+def test_a_success_recorded_during_the_feed_lifts_its_batch_stop_instead_of_blocking(
+    feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop set and the blocked decision read one snapshot: k/n 0/2 stops at s = 0.8, a success committed mid-feed (1/3) does not."""
+    feeder.campaign.batches = (SimpleNamespace(batch_id="primary", batch_name="primary", case_indices=(1, 2, 3, 4), scientific_values={}),)
+    feeder.records = [
+        {"reservation": {"batch_id": "primary", "case_id": f"case_000{index}", "origin": "primary"}, "decision": None, "attempts": []}
+        for index in (1, 2, 3, 4)
+    ]
+    for row in feeder.records[:2]:
+        row["decision"] = {"outcome": "failed"}
+
+    def policy(*_a: Any, records: Any = None, **_k: Any) -> list[dict[str, Any]]:
+        counts = selection.decided_counts(feeder.records if records is None else records)
+        stopped = selection.success_rate_stopped(*counts, minimum_success_rate=0.8)
+        return [{"batch_id": "primary", "stopped": stopped, "amendments": [], "minimum_success_rate": 0.8}]
+
+    def success_commits(_manifest: Any) -> SimpleNamespace:
+        feeder.records[2]["decision"] = {"outcome": "successful"}  # case_0003 succeeds after the first policy read
+        return feeder.campaign
+
+    monkeypatch.setattr(lifecycle, "replacement_policy", policy)
+    monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", success_commits)
+    service.resume_campaign(_RUN)
+    assert "blocked" not in feeder.states
+    assert feeder.fills[0]["stopped"] == frozenset()
+
+
+def test_a_success_recorded_while_a_replacement_is_planned_ends_planning_for_that_batch_only(
+    feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A success that closes a batch's deficit after the check ends its planning without an error; the other batch gets its replacement."""
+    second = SimpleNamespace(batch_id="second", batch_name="second", case_indices=(1,), scientific_values={})
+    feeder.replacement.scientific_values = {"supplemental_design": {"parent_batch_id": "second", "candidate_id": "replacement__second"}}
+    feeder.campaign.batches += (second,)
+    feeder.records = [
+        {"reservation": {"batch_id": batch_id, "case_id": "case_0001", "origin": "primary"}, "decision": {"outcome": "failed"}, "attempts": []}
+        for batch_id in ("primary", "second")
+    ]
+    feeder.policy = [{"batch_id": batch_id, "stopped": False, "amendments": [], "minimum_success_rate": 0.5} for batch_id in ("primary", "second")]
+
+    def materialize(_campaign: Any, batch_id: str, **_k: Any) -> SimpleNamespace:
+        feeder.materializations.append(batch_id)
+        if batch_id == "primary":  # a candidate of this batch is recorded successful after the deficit check
+            reservation = {"batch_id": "primary", "case_id": "case_0002", "origin": "replacement", "design_key": "replacement__primary"}
+            feeder.records.append({"reservation": reservation, "decision": {"outcome": "successful"}, "attempts": []})
+            raise lifecycle.NoReplacementError(batch_id)
+        reservation = {"batch_id": "second", "case_id": "case_0002", "origin": "replacement", "design_key": "replacement__second"}
+        feeder.records.append({"reservation": reservation, "decision": None, "attempts": []})
+        feeder.campaign.batches += (feeder.replacement,)
+        return feeder.replacement
+
+    monkeypatch.setattr(lifecycle, "materialize_replacement_batch", materialize)
+    service.resume_campaign(_RUN)
+    assert feeder.materializations == ["primary", "second"]
+    assert [call[0] for call in feeder.generations] == [feeder.replacement]
+    assert len(feeder.fills) == 1
+
+
+def test_a_derived_admission_cap_follows_current_rates_and_requires_a_plan_rate_for_every_original_batch() -> None:
+    """A recorded integer is the cap; a recorded null is the plan default over the current rates, refused without a plan rate."""
+    campaign: Any = SimpleNamespace(batches=(SimpleNamespace(batch_id="primary", case_indices=(1, 2)),))
+    plan = {"registered_by": "plan", "minimum_success_rate": 0.8}
+    policy = [{"batch_id": "primary", "minimum_success_rate": 0.6, "amendments": [plan, {"registered_by": "explicit", "minimum_success_rate": 0.6}]}]
+    assert service._admission_cap({"max_admission_cases": 4}, campaign, policy) == 4
+    assert service._admission_cap({"max_admission_cases": None}, campaign, policy) == 2 + selection.maximum_tolerated_failures(2, 0.6)
+    with pytest.raises(RuntimeError, match="plan-registered"):
+        service._admission_cap({"max_admission_cases": None}, campaign, [{**policy[0], "amendments": []}])
 
 
 def test_completed_canonical_pool_seals_without_compute(feeder: SimpleNamespace) -> None:
@@ -171,17 +258,6 @@ def test_completed_canonical_pool_seals_without_compute(feeder: SimpleNamespace)
     assert not feeder.fills
 
 
-def test_legacy_completion_requires_scheduled_artifact_admission(feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Legacy batch HDF5 admission is deferred before the heavyweight owner is called."""
-    feeder.campaign.schema_version = service.config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION + 1
-    feeder.views = [{"state": "successful"}]
-    finalized: list[bool] = []
-    monkeypatch.setattr(service, "_finalize_completed_batches", lambda *_a, **_k: finalized.append(True))
-    result = service.feed_campaign(_RUN, metadata_only=True)
-    assert result["continuation_reason"] == "batch_artifact_admission"
-    assert not finalized
-
-
 @pytest.mark.parametrize("state", ["cancel_requested", "force_cancel_requested"])
 def test_cancelled_campaign_does_not_admit_inputs_or_feed(feeder: SimpleNamespace, state: str) -> None:
     """Cancellation remains ahead of prepared input and retry processing."""
@@ -190,6 +266,18 @@ def test_cancelled_campaign_does_not_admit_inputs_or_feed(feeder: SimpleNamespac
     assert service.resume_campaign(_RUN, metadata_only=True) is feeder.manifest
     assert not feeder.admissions
     assert not feeder.fills
+
+
+def test_changed_source_projection_refuses_continuation_before_supplemental_inputs_or_reconciliation(
+    feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frozen campaign recorded under another Source implementation is not continued with the running code."""
+    feeder.campaign.batches += (feeder.replacement,)
+    recorded = feeder.campaign.producer_identity["source_implementation_sha256"]
+    monkeypatch.setattr(type(source_service.GENERATION_SOURCE_PROJECTION), "sha256", lambda _self, _root=None: "0" * 64)
+    with pytest.raises(ValueError, match=r"generation_source implementation changed \(recorded " + recorded[:12]):
+        service.resume_campaign(_RUN, metadata_only=True)
+    assert [feeder.admissions, feeder.generations, feeder.fills, feeder.states, feeder.seals] == [[], [], [], [], []]
 
 
 def test_scheduler_unknown_preserves_existing_transition(feeder: SimpleNamespace) -> None:
@@ -228,15 +316,80 @@ def test_cli_metadata_only_continuation_is_explicit() -> None:
     assert parser.parse_args(["resume-campaign", _RUN, "--metadata-only"]).metadata_only is True
 
 
-@pytest.mark.parametrize("canonical", [True, False])
-def test_fresh_metadata_submission_requires_explicit_prepared_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, canonical: bool) -> None:
+def test_cli_resume_prints_one_summary_line_with_the_fields_the_controller_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A resume prints the state, the compute request with its reason, the submission counts and the reclassifications of its feed."""
+    case = {"batch_id": "primary", "batch_name": "primary", "case_id": "case_0002", "case_index": 2}
+    manifest = {
+        "campaign_run_id": _RUN,
+        "state": "active",
+        "continuation_requires_compute": True,
+        "continuation_reason": "replacement_input_generation",
+        "node_jobs": [{"job_id": "1"}] * 50,
+        "submissions": [
+            {"status": "not_started", "case": {**case, "case_id": "case_0001"}, "error": "reclassified by an earlier resume"},
+            {"status": "not_started", "case": case, "error": "the node job ended before the ticket was published"},
+        ],
+    }
+
+    def resume(*_a: Any, reclassified: list[Any], **_k: Any) -> dict[str, Any]:
+        reclassified.append(manifest["submissions"][1])
+        return manifest
+
+    monkeypatch.setattr(cli_generation.campaign_runtime, "resume_campaign", resume)
+    assert cli_generation.main(["resume-campaign", _RUN, "--storage-root", str(tmp_path)]) == 0
+    (line,) = capsys.readouterr().out.splitlines()
+    summary = json.loads(line)
+    assert (summary["campaign_run_id"], summary["state"], summary["continuation_requires_compute"]) == (_RUN, "active", True)
+    assert summary["continuation_reason"] == "replacement_input_generation"
+    assert summary["submissions"] == {"not_started": 2}
+    assert summary["reclassified"] == ["case_0002: the node job ended before the ticket was published"]
+    assert datetime.fromisoformat(summary["at"]).utcoffset() is not None
+    assert summary["record"].endswith("_record/execution/run.json")
+    assert "node_jobs" not in summary
+
+
+def test_cli_resume_claims_only_the_reclassifications_of_its_own_feed(
+    feeder: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A resume reports the dispatches its own feed reclassified, by either way, but not one another feed reclassified before."""
+    case = {"batch_id": "primary", "batch_name": "primary", "case_index": 1}
+    feeder.manifest["submissions"] = [
+        {"status": "dispatched", "submission_index": index, "case": {**case, "case_id": f"case_000{index}"}, "error": None} for index in (1, 2, 3)
+    ]
+    persisted = copy.deepcopy(feeder.manifest)
+    lock = common.locking.exclusive_file_lock
+
+    @contextlib.contextmanager
+    def after_another_feed(*args: Any, **kwargs: Any) -> Iterator[Path]:
+        persisted["submissions"][0].update(status="not_started", error="reclassified by another feed")
+        with lock(*args, **kwargs) as path:
+            yield path
+
+    def recover_interrupted_dispatch(manifest: Any, *_a: Any, **_k: Any) -> None:
+        manifest["submissions"][2].update(status="not_started", error="the node job ended before the ticket was published")
+
+    def evidence(manifest: Any, scheduler: Any, **_k: Any) -> dict[str, Any]:
+        unstarted = [record for record in manifest["submissions"] if record["status"] == "dispatched" and record["case"]["case_id"] == "case_0002"]
+        return {**scheduler, "active": {}, "accounted": {}, "not_started": [(record, "the node job ended") for record in unstarted]}
+
+    monkeypatch.setattr(service.campaign_evidence, "load_campaign_run", lambda *_a, **_k: copy.deepcopy(persisted))
+    monkeypatch.setattr(common.locking, "exclusive_file_lock", after_another_feed)
+    monkeypatch.setattr(service, "_maintain_node_jobs", recover_interrupted_dispatch)
+    monkeypatch.setattr(service, "_dispatch_evidence", evidence)
+    monkeypatch.setattr(service, "_persist_manifest", lambda *_a, **_k: None)
+    monkeypatch.setattr(service, "_fill_submission_capacity", lambda manifest, *_a, **_k: manifest)
+    assert cli_generation.main(["resume-campaign", _RUN, "--storage-root", str(tmp_path)]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["submissions"] == {"not_started": 3}
+    assert summary["reclassified"] == ["case_0002: the node job ended", "case_0003: the node job ended before the ticket was published"]
+
+
+def test_fresh_metadata_submission_requires_explicit_prepared_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The public metadata-only contract never enters fresh spatial input preparation."""
     commit = "a" * 40
-    config: Any = SimpleNamespace(
-        schema_version=service.config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION + int(not canonical),
-        total_case_count=1,
-        selected_targets={"lentil": 1},
-    )
+    config: Any = SimpleNamespace(total_case_count=1, selected_targets={"lentil": 1})
     monkeypatch.setattr(service, "_repository_commit", lambda: commit)
     monkeypatch.setattr(service, "campaign_run_id", lambda *_a, **_k: _RUN)
     monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: tmp_path)

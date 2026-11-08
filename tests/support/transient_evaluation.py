@@ -25,6 +25,8 @@ from src.analysis.evaluation import evaluation_transient_timing as timing
 from src.learning.transient.learning_transient_contracts import TemporalConditioningSpec, TransientTensorizerSpec
 from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
 
+ANALYSIS_SHA256 = "9" * 64
+
 
 def scaling_state() -> dict[str, object]:
     """Return one valid synthetic transient scaling state with a two-unit state scale."""
@@ -121,7 +123,7 @@ def sequence_record(
             "material_family": material_family,
             "input_profile": "canonical_physics_complete_v1",
             "model_kind": "fno",
-            "dataset_backend": "canonical_hdf5",
+            "pt_payload_identity": "a" * 64,
             "timing_evidence_identity": "b" * 64,
             "scaling_identity": {"semantic_digest": "c" * 64},
             "evaluation_assignment": None,
@@ -131,11 +133,12 @@ def sequence_record(
 
 
 def sequence_frame(records: tuple[SimpleNamespace, ...]) -> pd.DataFrame:
-    """Return an artifact frame carrying the given in-memory sequence records."""
+    """Return an artifact frame carrying the given in-memory sequence records and their recorded analysis producer."""
     frame = pd.DataFrame()
     frame.attrs.update(
         {
             "artifact_kind": "transient_sequence",
+            "artifact_provenance": {"producer": {"analysis_sha256": ANALYSIS_SHA256}},
             "transient_sequence_records": records,
             "transient_unavailable_horizons": ({"case_id": "case", "requested_horizon": 4, "reason": "short"},),
             "transient_scaling_state": scaling_state(),
@@ -164,7 +167,7 @@ def production_frame(
                 },
                 device="cpu",
                 precision="float32",
-                dataset_backend="canonical_hdf5",
+                pt_payload_identity="a" * 64,
                 warmup_passes=1,
                 cpu="test-cpu",
                 software_versions={"python": "test", "pytorch": "test", "numpy": "test"},
@@ -176,6 +179,7 @@ def production_frame(
         {
             "artifact_root": artifact_root,
             "artifact_provenance": {
+                "producer": {"analysis_sha256": ANALYSIS_SHA256},
                 "run": {
                     "best_checkpoint_sha256": "d" * 64,
                     "best_checkpoint_epoch": 3,
@@ -184,7 +188,10 @@ def production_frame(
                     "name": dataset_name,
                     "role": dataset_role,
                     "source_dataset_ids": [dataset_name],
+                    "source_identities": [{"dataset_id": dataset_name}],
+                    "case_ids_by_source": [[record.case_id for record in records]],
                     "membership_digests": ["e" * 64],
+                    "evaluation_assignments": [],
                 },
                 "evaluation": {
                     "pipeline_analysis": {
@@ -197,10 +204,12 @@ def production_frame(
                         "c_unavailable_reasons": ["compatible_airflow_checkpoint_not_selected"],
                         "fabricated_prediction_count": 0,
                     },
+                },
+                "timing": {
+                    "report": json.loads(json.dumps(asdict(report))),
                     "component_availability": {
                         "case": {"dataset_materialization_seconds": 0.005},
                     },
-                    "timing_report": json.loads(json.dumps(asdict(report))),
                 },
                 "lineage": {
                     "stage_identity": {"stage": "b", "comparison_arm": "b"},

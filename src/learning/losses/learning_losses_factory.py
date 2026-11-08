@@ -3,7 +3,7 @@
 Responsibilities:
   - Resolve semantic supervised data-loss identifiers
   - Build task-dimensional data losses with explicit reduction and weighting
-  - Own the non-periodic relative H1 definition shared by loss and metric
+  - Own the non-periodic relative H1 definition on the physical grid shared by loss and metric
   - Build one named composition interface for supervised and physics training
 
 Design principles:
@@ -19,13 +19,17 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from src import domain
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
     import torch
     from torch import nn
 
@@ -84,9 +88,9 @@ def validate_data_loss_semantics(kind: str, *, space: str) -> DataLossKindSpec:
     return spec
 
 
-def build_relative_h1(operator_dimensionality: int, *, reduction: str) -> Any:
+def build_relative_h1(operator_dimensionality: int, *, reduction: str, grid_spacing: Sequence[float]) -> Callable[..., Any]:
     """
-    Build the relative H1 norm for non-periodic task domains.
+    Build the relative H1 norm for non-periodic task domains on a physical grid.
 
     Parameters
     ----------
@@ -94,28 +98,44 @@ def build_relative_h1(operator_dimensionality: int, *, reduction: str) -> Any:
         Task-owned number of spatial operator axes.
     reduction : str
         NeuralOp batch reduction, ``"mean"`` or ``"sum"``.
+    grid_spacing : Sequence[float]
+        Positive finite grid spacing in metres per spatial axis, ordered like the
+        trailing tensor axes (rows, then columns), matching the evaluation ``rel_h1``.
 
     Returns
     -------
-    neuralop.H1Loss
-        Relative H1 norm with one-sided boundary differences on every axis.
+    Callable[..., Any]
+        ``neuralop.H1Loss`` bound to the physical spacing on every call, with
+        one-sided boundary differences on every axis.
+
+    Raises
+    ------
+    ValueError
+        If its length differs from ``operator_dimensionality`` or an entry is not positive and finite.
 
     Notes
     -----
     NeuralOp's default periodic differences pair opposite boundaries; on a bed
     with inlet pressure at one end and zero gauge at the other that wrap term
-    dominates the pressure gradient norm, so periodicity is disabled.
+    dominates the pressure gradient norm, so periodicity is disabled. The spacing
+    is passed as the finite-difference step, so derivatives are per metre instead
+    of per unit reference length and do not depend on the tensor size.
 
     """
     from neuralop import H1Loss  # noqa: PLC0415
 
-    return H1Loss(
+    spacing = [float(value) for value in grid_spacing]
+    if len(spacing) != operator_dimensionality or not all(math.isfinite(value) and value > 0.0 for value in spacing):
+        msg = f"grid_spacing must hold {operator_dimensionality} positive finite spacings in metres (rows, then columns), got {spacing}."
+        raise ValueError(msg)
+    implementation = H1Loss(
         d=operator_dimensionality,
         reduction=reduction,
         periodic_in_x=False,
         periodic_in_y=False,
         periodic_in_z=False,
     )
+    return partial(implementation, quadrature=spacing)
 
 
 def build_data_loss(
@@ -124,6 +144,7 @@ def build_data_loss(
     space: str,
     operator_dimensionality: int,
     weight: float = 1.0,
+    grid_spacing: Sequence[float] | None = None,
 ) -> nn.Module:
     """
     Build one semantic task-dimensional supervised loss.
@@ -138,6 +159,9 @@ def build_data_loss(
         Task-owned number of spatial operator axes.
     weight : float, optional
         Explicit scalar component weight.
+    grid_spacing : Sequence[float] | None, optional
+        Physical grid spacing in metres, rows then columns. Required for
+        ``"relative_h1"``; ignored by ``"relative_l2"``.
 
     Returns
     -------
@@ -154,7 +178,10 @@ def build_data_loss(
         msg = f"operator_dimensionality must be positive, got {operator_dimensionality}."
         raise ValueError(msg)
     if kind == "relative_h1":
-        implementation: Any = build_relative_h1(operator_dimensionality, reduction="mean")
+        if grid_spacing is None:
+            msg = "Loss 'relative_h1' requires grid_spacing in metres (rows, then columns) from the physical Dataset grid."
+            raise ValueError(msg)
+        implementation: Any = build_relative_h1(operator_dimensionality, reduction="mean", grid_spacing=grid_spacing)
     elif kind == "relative_l2":
         implementation = LpLoss(d=operator_dimensionality, p=2, reduction="mean")
     else:
@@ -190,7 +217,7 @@ def _resolved_weight(config: dict[str, Any], name: str) -> pino.LinearWarmup:
     )
 
 
-def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.Module:
+def build_training_loss(config: dict[str, Any], *, device: torch.device, grid_spacing: Sequence[float] | None = None) -> nn.Module:
     """
     Build the unified semantic training loss from resolved configuration.
 
@@ -206,6 +233,9 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
         Fully resolved task, loss, and physics configuration.
     device : torch.device
         Concrete CPU or indexed CUDA device selected by the service boundary.
+    grid_spacing : Sequence[float] | None, optional
+        Physical steady-grid spacing in metres, rows then columns; required when
+        the steady data loss is ``relative_h1``. The transient branch ignores it.
 
     Returns
     -------
@@ -250,15 +280,10 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
             raise ValueError(msg)
         transient_loss = transient.TransientIncrementLoss(
             kind=cast("transient.TransientDataLossKind", kind),
-            channel_weights=data_config.get(
-                "channel_weights",
-                (1.0, 1.0, 1.0, 1.0),
-            ),
-            data_weight=float(data_config.get("weight", 1.0)),
-            huber_beta=float(data_config.get("beta", 1.0)),
-            state_aux_weight=float(
-                data_config.get("state_aux_weight", 0.0),
-            ),
+            channel_weights=data_config["channel_weights"],
+            data_weight=float(data_config["weight"]),
+            huber_beta=float(data_config["beta"]),
+            state_aux_weight=float(data_config["state_aux_weight"]),
         )
         return transient_loss.to(device)
 
@@ -267,19 +292,13 @@ def build_training_loss(config: dict[str, Any], *, device: torch.device) -> nn.M
     if not isinstance(derivatives_config, dict):
         msg = "loss.physics.derivatives must be a mapping."
         raise TypeError(msg)
-    derivative_kind, extension = domain.physics.contracts.validate_derivative_kind(
-        str(derivatives_config["kind"]),
-        extension=str(derivatives_config["extension"]),
-    )
-    derivatives = domain.physics.derivatives.build_derivative_operator(
-        derivative_kind,
-        extension=extension,
-    )
+    derivatives = domain.physics.derivatives.build_derivative_operator(str(derivatives_config["kind"]))
     data_loss = build_data_loss(
         str(data_config["kind"]),
         space=str(data_config["space"]),
         operator_dimensionality=task.operator_dimensionality,
         weight=1.0,
+        grid_spacing=grid_spacing,
     )
     steady_loss = pino.SemanticComposedLoss(
         data_loss=data_loss,

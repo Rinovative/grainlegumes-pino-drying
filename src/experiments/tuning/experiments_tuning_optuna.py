@@ -5,37 +5,40 @@ Responsibilities:
   - Bind reusable studies to scientific semantic signatures before optimization
   - Admit transient studies only as the single-stage ``stage_a_only`` A0 protocol and reject matched A0/B/A1 plans
   - Run fresh numbered trials with actual-completed-epoch reporting and pruning
-  - Persist local trial inputs, lifecycle summaries, splits, normalizers, and checkpoints
+  - Bind the same manifest identity and payload digests of either task, read by the one manifest reader, before the dry-run
+    description or the study signature
+  - Supply the trial status, reporting progress, failure context and best evidence of every terminal trial summary
   - Record the Slurm source binding of every invocation that creates or reopens a study, before its first trial
-  - Classify non-finite, OOM, recoverable, interrupted, and unexpected outcomes explicitly
+  - Classify non-finite, OOM, recoverable, interrupted, duplicate and unexpected outcomes explicitly
   - Declare the per-task HPO code projections: its own modules plus the training projection of the study's task
 
 Design principles:
   - Reopening preserves history but each invocation allocates only additional fresh trials
+  - Both tasks run their trials through the one driver and the shared prepared-run lifecycle
   - Embedded requests use the generic experiment structure. Wrappers own study/search policy
   - Wrapper objective and direction derive from the embedded resolved experiment objective
-  - Device, output, tracking, and invocation count remain outside scientific identity
+  - Device, output, tracking, invocation count and Dataset locations remain outside scientific identity
   - Local trial state is authoritative. W&B is an optional post-publication observer
   - Optuna imports stay lazy for help and dry-run validation
 
 This module does NOT:
   - Parse search-space schemas. ``experiments.tuning.search_space`` owns admission
-  - Execute training epochs. ``learning.training.loop`` owns model optimization
+  - Execute training epochs or publish run state. ``experiments.run`` owns the run lifecycle
   - Clean repository or run state
 """
 
 from __future__ import annotations
 
 import copy
+import functools
 import gc
 import importlib
 import math
+import sys
 import time
-import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -47,7 +50,7 @@ from src.experiments.config import experiments_config_transient_plan as transien
 
 from . import experiments_tuning_search_space as search_space
 
-STUDY_SIGNATURE_SCHEMA_VERSION = 2
+STUDY_SIGNATURE_SCHEMA_VERSION = 1
 TRIAL_LIFECYCLE_SCHEMA_VERSION = 1
 _STUDY_SIGNATURE_ATTR = "semantic_signature"
 _STUDY_SIGNATURE_PAYLOAD_ATTR = "semantic_signature_payload"
@@ -59,7 +62,7 @@ _STUDY_SUMMARY_FILENAME = "study_summary.json"
 _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS = 20
 _STUDY_ROLES = frozenset({"production"})
 _MODEL_PARAMS_PREFIX = "model.params."
-_TRANSIENT_OOM_PRUNED_MESSAGE = "Trial pruned after allocator out-of-memory failure"
+_OOM_PRUNED_MESSAGE = "Trial pruned after allocator out-of-memory failure"
 OPTUNA_ROOT_KEYS = frozenset({"study", "experiment", "search_space"})
 _TRIAL_OUTCOMES = (
     "completed",
@@ -480,7 +483,6 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
     study["name"] = study_name
     study.setdefault("role", None)
     study.setdefault("mode", "standard")
-    study.setdefault("seed", base_config.get("run", {}).get("seed", 9))
     study.setdefault("n_trials", 30)
     study.setdefault(
         "pruner",
@@ -502,7 +504,7 @@ def _normalise_study(raw_study: Mapping[str, Any], base_config: dict[str, Any], 
     if study["mode"] not in {"standard", "stage_a_only"}:
         msg = "study.mode must be 'standard' or 'stage_a_only'."
         raise ValueError(msg)
-    study["seed"] = _require_exact_int(study["seed"], label="study.seed")
+    study["seed"] = _require_exact_int(study.get("seed"), label="study.seed")
     study["n_trials"] = _require_exact_int(study["n_trials"], label="study.n_trials", minimum=1)
     study["sampler"] = _normalise_sampler_config(study["sampler"])
     study["pruner"] = _normalise_pruner_config(study["pruner"])
@@ -635,11 +637,6 @@ def load_optuna_study_config(
     if workflow != "optuna_trial":
         msg = "experiment.tracking.wandb.workflow must be 'optuna_trial' for an Optuna study."
         raise ValueError(msg)
-    if "study" in wandb_settings:
-        msg = "experiment.tracking.wandb.study is wrapper-owned and must not be supplied."
-        raise ValueError(msg)
-    wandb_settings["workflow"] = "optuna_trial"
-    wandb_settings["study"] = study_name
     tracking["wandb"] = wandb_settings
     effective_experiment["tracking"] = tracking
 
@@ -797,7 +794,8 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
         If an in-memory study component has an invalid exact type.
     ValueError
         If study, objective, reporting cadence, search policy, or resolved base
-        config has drifted outside the admitted semantic contract.
+        config has drifted outside the admitted semantic contract, or the
+        configured Datasets are not bound to validated physical identities.
 
     Notes
     -----
@@ -811,18 +809,10 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
     pruner = _normalise_pruner_config(validated.study["pruner"])
     sampler_seed = _sampler_seed(validated.study)
     reporting_interval = _validate_reporting_contract(validated.base_config)
-    data = _as_mapping(validated.base_config.get("data"), label="experiment.data")
     if validated.dataset_identities is None:
-        dataset_roles: dict[str, Any] = {
-            "binding": "configured_dataset_ids",
-            "train": data.get("train_dataset"),
-            "additional_evaluation": copy.deepcopy(data.get("additional_evaluation_datasets")),
-        }
-    else:
-        dataset_roles = {
-            "binding": "validated_physical_packages",
-            "roles": copy.deepcopy(validated.dataset_identities),
-        }
+        msg = "A study signature binds validated physical Dataset identities; bind the configured Datasets first."
+        raise ValueError(msg)
+    dataset_roles = {"binding": "validated_physical_packages", "roles": copy.deepcopy(validated.dataset_identities)}
     payload = {
         "schema_version": STUDY_SIGNATURE_SCHEMA_VERSION,
         "task": {
@@ -851,7 +841,7 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
         },
         "trial_lifecycle": {
             "schema_version": TRIAL_LIFECYCLE_SCHEMA_VERSION,
-            "run_summary_schema_version": experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+            "run_summary_schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "outcomes": list(_TRIAL_OUTCOMES),
             "resume_policy": "new_trials_only",
             "trial_count_policy": "additional_fresh_trials_per_invocation",
@@ -949,7 +939,6 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate exact configured Dataset selections without assigning package roles."""
     data = _as_mapping(config.get("data"), label="experiment.data")
     train_dataset = _require_nonempty_string(data.get("train_dataset"), label="data.train_dataset")
-    is_transient = config.get("task") == "transient_drying"
     diagnostic_key = "additional_evaluation_datasets"
     raw_diagnostic = data.get(diagnostic_key)
     if not isinstance(raw_diagnostic, list):
@@ -964,61 +953,25 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
 
     task = experiments.config.loader.validate_resolved_task_contract(config)
     paths = _as_mapping(config.get("paths"), label="experiment.paths")
-    if is_transient:
-        storage_root = Path(_require_nonempty_string(paths.get("storage_root"), label="paths.storage_root"))
-
-        def summarize_transient(dataset_id: str) -> dict[str, Any]:
-            manifest = datasets.packages.manifest.load_package_manifest_evidence(
-                task.id,
-                dataset_id,
-                storage_root=storage_root,
-            )
-            index_path = common.paths.resolve_dataset_path(
-                task.id, dataset_id, dataset_root=common.paths.get_datasets_root(storage_root=storage_root)
-            )
-            index = datasets.packages.trajectory.load_transient_index(index_path)
-            if index["dataset_id"] != manifest["dataset_id"] or index["contract_digest"] != manifest["channel_contract_digest"]:
-                message = "Transient package index identity disagrees with its validated package manifest."
-                raise ValueError(message)
-            return {
-                "dataset_id": manifest["dataset_id"],
-                "dataset_view": manifest["dataset_view"],
-                "dataset_digest": manifest["dataset_digest"],
-                "manifest_schema": {"kind": manifest["schema_kind"], "version": manifest["schema_version"]},
-                "manifest_payload_sha256": manifest["payload_sha256"],
-                "index_digest": index["index_digest"],
-                "sample_count": index["sample_count"],
-                "source_case_count": index["source_case_count"],
-                "data_contract_digest": index["contract_digest"],
-                "materials": copy.deepcopy(manifest["materials"]),
-                "source_case_identity_digest": common.serialization.canonical_json_sha256(manifest["source_case_identities"]),
-                "validation": "validated_package_manifest_and_compact_transient_index",
-            }
-
-        return {
-            "train": summarize_transient(train_dataset),
-            "additional_evaluation": [summarize_transient(dataset_id) for dataset_id in diagnostic_datasets],
-        }
+    storage_root = common.paths.storage_root_for_datasets_root(_require_nonempty_string(paths.get("dataset_root"), label="paths.dataset_root"))
 
     def summarize(dataset_id: str) -> dict[str, Any]:
-        summary = datasets.contracts.metadata.load_dataset_metadata_summary(
-            dataset_id,
-            task=task,
-            dataset_root=Path(paths["dataset_root"]),
-            metadata_root=Path(paths["dataset_root"]),
-        )
-        if not summary.dataset_exists:
-            msg = f"Configured training dataset is not a regular file: {summary.dataset_path}"
-            raise FileNotFoundError(msg)
+        # The one manifest reader admits the manifest and rehashes the payload digests it binds, for either task.
+        manifest = datasets.packages.manifest.load_package_manifest(task.id, dataset_id, storage_root=storage_root)
+        # Locations stay outside the signature, as device and output root do: the digests identify the Dataset.
         return {
-            "dataset_id": summary.dataset_id,
-            "dataset_path": str(summary.dataset_path),
-            "metadata_dir": str(summary.metadata_directory),
-            "validation": "selection_manifest_and_payload_hash",
-            "task": summary.task_id,
-            "data_contract_digest": summary.data_contract_digest,
-            "dataset_digest": summary.dataset_digest,
-            "sample_count": summary.sample_count,
+            "dataset_id": manifest["dataset_id"],
+            "dataset_view": manifest["dataset_view"],
+            "dataset_digest": manifest["dataset_digest"],
+            "channel_contract_digest": manifest["channel_contract_digest"],
+            "manifest_schema": {"kind": manifest["schema_kind"], "version": manifest["schema_version"]},
+            "payload_sha256": manifest["payload_sha256"],
+            "derived_payload_sha256": manifest["derived_payload_sha256"],
+            "sample_count": manifest["sample_count"],
+            "source_case_count": manifest["source_case_count"],
+            "materials": copy.deepcopy(manifest["materials"]),
+            "source_case_identity_digest": common.serialization.canonical_json_sha256(manifest["source_case_identities"]),
+            "validation": "validated_package_manifest_and_payload_digests",
         }
 
     return {
@@ -1097,7 +1050,6 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
     sampler_seed = _sampler_seed(study_config.study)
     wandb_settings = config["tracking"]["wandb"]
     wandb_settings["workflow"] = "optuna_trial"
-    wandb_settings["study"] = str(study_config.study["name"])
     wandb_settings.update(experiments.config.loader.derive_wandb_organization(config))
     leaf = config_naming.trial_leaf(trial_number, config, _trial_name_values(study_config.search_space, overrides))
     config = experiments.config.loader.finalize_run_layout(config, trial=leaf)
@@ -1109,7 +1061,7 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         msg = "Sampled trial objective does not match the resolved study objective."
         raise ValueError(msg)
 
-    analysis_parameters = {
+    sampled_parameters = {
         parameter.name: copy.deepcopy(overrides[parameter.path]) for parameter in study_config.search_space if parameter.kind != "fixed"
     }
     context = {
@@ -1120,7 +1072,7 @@ def _prepare_trial_config(study_config: OptunaStudyConfig, trial: TrialProtocol)
         "training_seed": training_seed,
         "sampler_seed": sampler_seed,
         "overrides": overrides,
-        "analysis_parameters": analysis_parameters,
+        "sampled_parameters": sampled_parameters,
         "search_signature": build_study_signature(study_config)["digest"],
     }
     trial.set_user_attr("run_name", config["run"]["name"])
@@ -1227,117 +1179,71 @@ def _checkpoint_progress(
     reporter: OptunaEpochReporter,
 ) -> dict[str, Any]:
     """
-    Bind every reported Optuna epoch to already durable checkpoint metadata.
+    Bind an unfinished trial's progress to its durable best checkpoint.
 
-    A reported epoch requires ``last_checkpoint.pt`` and its digest. A retained
-    finite best epoch additionally requires ``best_checkpoint.pt``. Missing files
-    are lifecycle violations rather than guessed or backfilled progress.
+    Trials never resume and write no ``last_checkpoint.pt``, so no trial summary
+    records one. The loop publishes a best before it reports that epoch, so best
+    epoch, metric and digest come from ``best_checkpoint.pt`` whenever it exists,
+    with its progress when that is later than the last report. A finite reported
+    best without the file is a lifecycle violation rather than guessed or
+    backfilled progress. Every key is returned, ``None`` when nothing was reached.
     """
-    if reporter.last_reported_epoch is None:
-        return {}
-    last_path = common.paths.resolve_last_checkpoint_file(run_dir)
-    if not last_path.is_file():
-        msg = "A reported Optuna epoch must already have a durable last checkpoint."
+    best_path = common.paths.resolve_best_checkpoint_file(run_dir)
+    if reporter.best_epoch is not None and not best_path.is_file():
+        msg = "A finite best Optuna objective must already have a durable best checkpoint."
         raise experiments.run.RunLifecycleError(msg)
-    progress = {
+    progress: dict[str, Any] = {
+        **dict.fromkeys(("best_epoch", "best_metric", "best_checkpoint", "best_checkpoint_sha256")),
         "completed_epoch": reporter.last_reported_epoch,
-        "global_step": reporter.last_global_step,
-        "last_checkpoint": last_path.name,
-        "last_checkpoint_sha256": common.serialization.file_sha256(last_path),
+        "global_step": reporter.last_global_step if reporter.last_reported_epoch is not None else None,
     }
-    if reporter.best_epoch is not None:
-        best_path = common.paths.resolve_best_checkpoint_file(run_dir)
-        if not best_path.is_file():
-            msg = "A finite best Optuna objective must already have a durable best checkpoint."
+    if best_path.is_file():
+        # Memory-mapped, because this runs in failure handlers (host memory exhaustion included) while the
+        # model is still alive; training has stopped, so the digest below reads the same file.
+        payload = torch.load(best_path, map_location="cpu", mmap=True, weights_only=False)
+        if not isinstance(payload, Mapping) or not {"best_epoch", "best_metric", "completed_epoch", "global_step"} <= payload.keys():
+            msg = f"Optuna best checkpoint does not record its best and progress: {best_path}"
             raise experiments.run.RunLifecycleError(msg)
         progress.update(
             {
+                "best_epoch": payload["best_epoch"],
+                "best_metric": payload["best_metric"],
                 "best_checkpoint": best_path.name,
                 "best_checkpoint_sha256": common.serialization.file_sha256(best_path),
             }
         )
+        if reporter.last_reported_epoch is None or payload["completed_epoch"] > reporter.last_reported_epoch:
+            progress.update({"completed_epoch": payload["completed_epoch"], "global_step": payload["global_step"]})
     return progress
 
 
-def _write_summary(
+def _trial_terminal_evidence(
+    status: str,
+    outcome: Mapping[str, Any] | BaseException,
     *,
     run_dir: Path,
-    config: dict[str, Any],
-    context: Mapping[str, Any],
-    status: str,
-    start_time: datetime,
-    result: Mapping[str, Any] | None = None,
-    reporter: OptunaEpochReporter | None = None,
-    error: BaseException | None = None,
-    checkpoint_identity: Mapping[str, Any] | None = None,
-    amp_enabled: bool = False,
-    failure_context: Mapping[str, Any] | None = None,
-) -> None:
+    reporter: OptunaEpochReporter,
+    objective: Mapping[str, Any],
+    device_resolution: learning.device.DeviceResolution,
+) -> dict[str, Any]:
     """
-    Atomically publish one terminal local trial outcome and provenance record.
+    Return the trial facts the shared run lifecycle merges into a terminal summary.
 
-    All statuses share objective, sampled parameters, reporting progress, timing,
-    and bounded failure context. Completed trials additionally require checkpoint
-    identity and all authoritative artifact digests. Non-completed trials publish
-    only checkpoints proven durable by the reporter. The run state machine owns
-    final atomic summary replacement.
+    A completed result must have reported its terminal epoch and carry a finite
+    objective; a raise fails the run. A failure binds its bounded context and the
+    best evidence of :func:`_checkpoint_progress` before the best file goes.
     """
-    if status not in _TRIAL_OUTCOMES:
-        msg = f"Unsupported Optuna trial outcome {status!r}."
-        raise ValueError(msg)
-    end_time = datetime.now(UTC)
-    result = result or {}
-    objective = experiments.config.loader.get_resolved_objective(config)
-    summary: dict[str, Any] = {
-        "task": config["task"],
-        "model_kind": config["model"]["kind"],
-        "study_name": context["study_name"],
-        "study_role": context["study_role"],
-        "trial_number": context["trial_number"],
-        "sampled_parameters": context["overrides"],
-        "search_signature": context["search_signature"],
-        "objective": objective,
-        "best_epoch": result.get("best_epoch", reporter.best_epoch if reporter else None),
-        "best_metric": result.get("best_metric", reporter.best_value if reporter else None),
-        "checkpoint_path": result.get("checkpoint_path"),
-        "last_reported_epoch": reporter.last_reported_epoch if reporter else None,
-        "last_reported_objective": reporter.last_reported_objective if reporter else None,
-        "pruning_epoch": reporter.last_reported_epoch if status == "pruned" and reporter else None,
-        "status": status,
-        "error": str(error) if error is not None else None,
-        "failure_context": dict(failure_context) if failure_context is not None else None,
-        "elapsed_seconds": (end_time - start_time).total_seconds(),
-        "start_time": start_time.isoformat(),
-        "end_time": end_time.isoformat(),
+    evidence: dict[str, Any] = {
+        "last_reported_epoch": reporter.last_reported_epoch,
+        "last_reported_objective": reporter.last_reported_objective,
+        "pruning_epoch": reporter.last_reported_epoch if status == "pruned" else None,
     }
-    if status == "completed":
-        if checkpoint_identity is None:
-            msg = "Completed Optuna summary requires checkpoint identity."
-            raise ValueError(msg)
-        summary.update(
-            {
-                "run_name": config["run"]["name"],
-                "completed_epoch": result.get("completed_epoch"),
-                "global_step": result.get("global_step"),
-                "selected_epoch": result.get("selected_epoch"),
-                "selected_metrics": copy.deepcopy(result.get("selected_metrics", {})),
-                "terminal_epoch": result.get("terminal_epoch"),
-                "terminal_metrics": copy.deepcopy(result.get("terminal_metrics", {})),
-                "duration_contract": copy.deepcopy(experiments.run.RUN_DURATION_CONTRACT),
-                "best_checkpoint": "best_checkpoint.pt",
-                "last_checkpoint": "last_checkpoint.pt",
-                "config_sha256": common.serialization.file_sha256(common.paths.resolve_run_config_path(run_dir)),
-                "split_indices_sha256": common.serialization.file_sha256(common.paths.resolve_split_indices_path(run_dir)),
-                "normalizer_sha256": common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
-                "best_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(run_dir)),
-                "last_checkpoint_sha256": common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(run_dir)),
-                "effective_config_digest": checkpoint_identity["effective_config_digest"],
-                "amp_enabled": amp_enabled,
-            }
-        )
-    elif reporter is not None:
-        summary.update(_checkpoint_progress(run_dir, reporter))
-    experiments.run.transition_run_status(run_dir, status, updates=summary)
+    if isinstance(outcome, BaseException):
+        failure_context = _failure_context(error=outcome, device_resolution=device_resolution, reporter=reporter)
+        return {**evidence, "failure_context": failure_context, **_checkpoint_progress(run_dir, reporter)}
+    _validate_completed_reporting(reporter, outcome)
+    _finite_objective_value(outcome, objective)
+    return {**evidence, "failure_context": None}
 
 
 def _validate_completed_reporting(
@@ -1379,8 +1285,10 @@ def _validate_transient_study_policy(
         raise ValueError(message)
 
 
-def _transient_terminal_status(error: BaseException, trial_pruned: type[BaseException]) -> str | None:
-    """Classify Optuna-local terminal outcomes for shared lifecycle publication."""
+def _trial_terminal_status(error: BaseException, trial_pruned: type[BaseException]) -> str:
+    """Map a trial's exception to its terminal status; explicit classes take precedence over allocator text."""
+    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return "interrupted"
     if isinstance(error, trial_pruned):
         return "pruned"
     if isinstance(error, FloatingPointError):
@@ -1389,25 +1297,19 @@ def _transient_terminal_status(error: BaseException, trial_pruned: type[BaseExce
         return "recoverable_failed"
     if isinstance(error, (torch.cuda.OutOfMemoryError, MemoryError)) or (isinstance(error, RuntimeError) and _runtime_error_is_allocation_oom(error)):
         return "oom_pruned"
-    return None
+    return "failed"
 
 
-def _duplicate_trial_value(config: Mapping[str, Any], trial: TrialProtocol, trial_pruned: type[BaseException]) -> float | None:
-    """Answer a trial whose exact experiment already ran, without training it again.
+def _duplicate_trial_outcome(config: Mapping[str, Any], trial: TrialProtocol) -> tuple[float | None, str] | None:
+    """Return the stored value and owner of a trial whose exact experiment already ran.
 
     A completed trial of the same study (which fixes the epoch budget through its
     directory name) with the same objective supplies its stored value. Any other
     existing owner of the identity (another study of the same epoch budget, an
-    unfinished or pruned trial) prunes the trial. The trial's digest includes its
-    epoch budget, so a trial of another budget and an ordinary steady run (whose
-    digest is epoch-free) own other identities and never prune it; ``None`` means
-    the identity is new.
-
-    Raises
-    ------
-    optuna.TrialPruned
-        If the identity belongs to an existing run whose value cannot be reused.
-
+    unfinished or pruned trial) supplies no value, and the trial is pruned. The
+    trial's digest includes its epoch budget, so a trial of another budget and an
+    ordinary steady run (whose digest is epoch-free) own other identities;
+    ``None`` means the identity is new.
     """
     entry = experiments.registry.lookup(config)
     if entry is None:
@@ -1428,91 +1330,31 @@ def _duplicate_trial_value(config: Mapping[str, Any], trial: TrialProtocol, tria
             and not isinstance(value, bool)
             and math.isfinite(float(value))
         ):
-            trial.set_user_attr("terminal_status", "duplicate")
-            return float(value)
-    trial.set_user_attr("terminal_status", "duplicate_pruned")
-    msg = f"Trial duplicates the existing experiment at {relative}; it was not trained again."
-    raise trial_pruned(msg)
+            return float(value), relative
+    return None, relative
 
 
-def _run_transient_trial(study_config: OptunaStudyConfig, trial: TrialProtocol) -> float:
-    """Execute one transient trial through the authoritative prepared-run lifecycle."""
-    config, context = _prepare_trial_config(study_config, trial)
-    _validate_transient_study_policy(config, study_config.search_space)
-    duplicate = _duplicate_trial_value(config, trial, _trial_pruned_error())
-    if duplicate is not None:
-        return duplicate
-    device_resolution = learning.device.resolve_device(config["run"]["device"], path="run.device")
-    learning.device.validate_mixed_precision_device(config["training"]["mixed_precision"], device_resolution)
-    objective = experiments.config.loader.get_resolved_objective(config)
-    reporter = OptunaEpochReporter(
-        trial=trial,
-        objective_id=str(objective["id"]),
-        direction=str(objective["direction"]),
-        evaluation_interval=int(config["training"]["evaluation_interval"]),
-        target_epoch=int(config["training"]["epochs"]),
-    )
-    trial_pruned = _trial_pruned_error()
-    run_dir = experiments.run.prepare_fresh_run(
-        config,
-        run_dir=_trial_run_dir(config),
-        summary_extra=context,
-    )
-
-    def callback(epoch: int, metrics: dict[str, float]) -> None:
-        """Report only completed ID objective observations to Optuna."""
-        key = f"id/{objective['id']}"
-        if key not in metrics:
-            return
-        guardrail_key = f"id/guardrail/one_step/{objective['id']}"
-        if guardrail_key not in metrics or not math.isfinite(float(metrics[guardrail_key])):
-            message = "Transient one-step guardrail must be finite at each reported evaluation."
-            raise NonFiniteTrialError(message)
-        reporter(epoch, metrics)
-        if reporter.last_reported_objective is not None:
-            metrics["optuna/objective"] = reporter.last_reported_objective
-        if reporter.best_value is not None:
-            metrics["optuna/best_objective_so_far"] = reporter.best_value
-
-    try:
-        result = experiments.run.execute_prepared_run(
-            config,
-            run_dir=run_dir,
-            persisted_config=config,
-            epoch_end_callback=callback,
-            summary_extra=context,
-            device_resolution=device_resolution,
-            terminal_status_resolver=lambda error: _transient_terminal_status(error, trial_pruned),
-        )
-        _validate_completed_reporting(reporter, result)
-        value = _finite_objective_value(result, objective)
-        trial.set_user_attr("terminal_status", "completed")
-    except trial_pruned:
-        trial.set_user_attr("terminal_status", "pruned")
-        raise
-    except FloatingPointError as error:
-        trial.set_user_attr("terminal_status", "nonfinite_pruned")
-        raise trial_pruned(str(error)) from None
-    except RecoverableTrialError:
-        trial.set_user_attr("terminal_status", "recoverable_failed")
-        raise
-    except (torch.cuda.OutOfMemoryError, MemoryError) as error:
-        trial.set_user_attr("terminal_status", "oom_pruned")
-        raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
-    except RuntimeError as error:
-        if _runtime_error_is_allocation_oom(error):
-            trial.set_user_attr("terminal_status", "oom_pruned")
-            raise trial_pruned(_TRANSIENT_OOM_PRUNED_MESSAGE) from error
-        raise
-    return value
+def _settle_close_failures(failures: Sequence[tuple[str, BaseException]], *, propagating: BaseException | None) -> None:
+    """Note closing-step failures on the trial's propagating error, or raise the first one when the trial returned normally."""
+    if not failures:
+        return
+    notes = [f"{label}: {type(error).__name__}: {error}" for label, error in failures]
+    if propagating is not None:
+        for note in notes:
+            propagating.add_note(note)
+        return
+    first = failures[0][1]
+    for note in notes[1:]:
+        first.add_note(note)
+    raise first
 
 
-def run_trial(  # noqa: C901, PLR0912, PLR0915
+def run_trial(
     study_config: OptunaStudyConfig,
     trial: TrialProtocol,
 ) -> float:
     """
-    Execute one exclusively allocated trial through the normal run lifecycle.
+    Execute one trial of either task through the shared prepared-run lifecycle.
 
     Parameters
     ----------
@@ -1529,517 +1371,145 @@ def run_trial(  # noqa: C901, PLR0912, PLR0915
     Raises
     ------
     optuna.TrialPruned
-        For explicit pruning, non-finite science, or narrowly classified OOM.
+        For explicit pruning, non-finite science, narrowly classified OOM, or a
+        duplicate whose stored value cannot be reused.
     RecoverableTrialError
         For an explicitly recoverable trial-local failure.
     BaseException
-        Interrupts and programming/identity errors propagate after local terminal
-        status publication and guarded device-specific cleanup.
+        Interrupts and programming, identity, storage or tracking errors
+        propagate unchanged after the terminal publication.
 
     Notes
     -----
-    The trial gets a fresh study-qualified run leaf and never resumes partial
-    training. Actual completed epochs are reported before optional W&B mirroring.
+    A duplicate is answered from stored evidence before any device is resolved
+    or run directory allocated. Every other trial gets a fresh study-qualified
+    run leaf and never resumes. The shared lifecycle publishes the terminal
+    summary with this driver's status and evidence before the best checkpoint is
+    deleted; this driver sets ``terminal_status`` and prints the one ``trial``
+    line of every outcome. Setting the attribute, printing the line and the
+    cleanup each run even when another of them fails; their failures become
+    notes on the trial's own propagating error, or the first is raised after a
+    normal return.
 
     """
-    study_config, _ = _validate_study_contract(study_config)
-    if study_config.base_config["task"] == "transient_drying":
-        return _run_transient_trial(study_config, trial)
-    device_resolution = learning.device.resolve_device(
-        study_config.base_config["run"]["device"],
-        path="run.device",
-    )
-    learning.device.validate_mixed_precision_device(
-        study_config.base_config["training"]["mixed_precision"],
-        device_resolution,
-    )
-    config, context = _prepare_trial_config(study_config, trial)
-    if config["run"]["device"] != device_resolution.requested_policy:
-        msg = "Prepared trial changed the already resolved runtime device policy."
-        raise ValueError(msg)
-    experiments.run.validate_deterministic_model_device_policy(config, device_resolution)
-    duplicate = _duplicate_trial_value(config, trial, _trial_pruned_error())
-    if duplicate is not None:
-        return duplicate
-    device = device_resolution.device
-    objective = experiments.config.loader.get_resolved_objective(config)
-    reporter = OptunaEpochReporter(
-        trial=trial,
-        objective_id=str(objective["id"]),
-        direction=str(objective["direction"]),
-        evaluation_interval=int(config["training"]["evaluation_interval"]),
-        target_epoch=int(config["training"]["epochs"]),
-    )
+    started = time.monotonic()
     trial_pruned = _trial_pruned_error()
-    requested_run_dir = _trial_run_dir(config)
-    summary_extra = dict(context)
-    run_dir = experiments.run.prepare_fresh_run(
-        config,
-        run_dir=requested_run_dir,
-        summary_extra=summary_extra,
-    )
-    console_reporter = experiments.console.ConsoleReporter(
-        config=config,
-        run_dir=run_dir,
-        study_name=str(context["study_name"]),
-        trial_number=int(context["trial_number"]),
-    )
-    start_time = datetime.now(UTC)
+    returned = False
+    status = "failed"
+    value: float | None = None
+    device: torch.device | None = None
+    # Setup runs inside the guarded attempt, so a refused sample still ends with a status and one trial line.
+    context: Mapping[str, Any] = {"trial_number": trial.number, "sampled_parameters": {}}
+    reporter: OptunaEpochReporter | None = None
 
-    checkpoint_identity: dict[str, Any] | None = None
-    amp_enabled = False
-    run_started = False
-    runtime_session_id = uuid.uuid4().hex
-    tracker: experiments.tracking.WandbSession | None = None
-    tracking_status = "failed"
-    tracking_result: Mapping[str, Any] | None = None
-    tracking_error: BaseException | None = None
-    dataloaders: Any = None
-    data_processor: Any = None
-    model: Any = None
-    train_loss: Any = None
-    eval_metrics: Any = None
-    optimizer: Any = None
-    scheduler: Any = None
-    wandb_epoch_callback: Callable[[int, dict[str, float]], None] | None = None
-    result: Mapping[str, Any] | None = None
+    def attempt() -> float:
+        """Answer a duplicate from stored evidence, or train the trial through the shared run lifecycle."""
+        nonlocal status, device, context, reporter
+        validated_config, _ = _validate_study_contract(study_config)
+        config, context = _prepare_trial_config(validated_config, trial)
+        objective = experiments.config.loader.get_resolved_objective(config)
+        epoch_reporter = reporter = OptunaEpochReporter(
+            trial=trial,
+            objective_id=str(objective["id"]),
+            direction=str(objective["direction"]),
+            evaluation_interval=int(config["training"]["evaluation_interval"]),
+            target_epoch=int(config["training"]["epochs"]),
+        )
+
+        def report(epoch: int, metrics: dict[str, float]) -> None:
+            """Report each evaluated epoch to Optuna, after the transient one-step guardrail, and expose it to W&B."""
+            key = f"id/{objective['id']}"
+            if key not in metrics:
+                return
+            guardrail = metrics.get(f"id/guardrail/one_step/{objective['id']}", math.nan)
+            if config["task"] == "transient_drying" and not math.isfinite(float(guardrail)):
+                message = "Transient one-step guardrail must be finite at each reported evaluation."
+                raise NonFiniteTrialError(message)
+            epoch_reporter(epoch, metrics)
+            if epoch_reporter.best_value is not None:
+                metrics.update({"optuna/objective": float(metrics[key]), "optuna/best_objective": epoch_reporter.best_value})
+
+        _validate_transient_study_policy(config, validated_config.search_space)
+        duplicate = _duplicate_trial_outcome(config, trial)
+        if duplicate is not None:
+            stored, owner = duplicate
+            if stored is None:
+                status = "duplicate_pruned"
+                message = f"Trial duplicates the existing experiment at {owner}; it was not trained again."
+                raise trial_pruned(message)
+            status = "duplicate"
+            return stored
+        device_resolution = learning.device.resolve_device(config["run"]["device"], path="run.device")
+        device = device_resolution.device
+        experiments.run.validate_deterministic_model_device_policy(config, device_resolution)
+        # Preparation and execution classify a failure of the trial's run like the trial itself.
+        resolve_status = functools.partial(_trial_terminal_status, trial_pruned=trial_pruned)
+        run_dir = experiments.run.prepare_fresh_run(
+            config, run_dir=_trial_run_dir(config), summary_extra=context, terminal_status_resolver=resolve_status
+        )
+        result = experiments.run.execute_prepared_run(
+            config,
+            run_dir=run_dir,
+            persisted_config=config,
+            epoch_end_callback=report,
+            summary_extra=context,
+            device_resolution=device_resolution,
+            terminal_status_resolver=resolve_status,
+            terminal_evidence=lambda terminal, outcome: _trial_terminal_evidence(
+                terminal, outcome, run_dir=run_dir, reporter=epoch_reporter, objective=objective, device_resolution=device_resolution
+            ),
+        )
+        status = "completed"
+        # The completed evidence admitted this value as finite before the run was published.
+        return float(result["best_metric"])
 
     try:
-        seed_plan = experiments.run.configure_reproducibility(config, device=device)
-        dataloaders = experiments.config.loader.create_dataloaders_from_config(
-            config,
-            seed_plan=seed_plan,
-        )
-        data_processor = dataloaders["data_processor"]
-        common.serialization.atomic_torch_save(
-            data_processor.state_dict(),
-            common.paths.resolve_normalizer_path(run_dir),
-        )
-        common.serialization.atomic_torch_save(
-            dataloaders["split_indices"],
-            common.paths.resolve_split_indices_path(run_dir),
-        )
-
-        experiments.run.seed_process(seed_plan["model_init"], device=device)
-        model = learning.models.factory.build_model(config, device=device)
-        train_loss = learning.losses.factory.build_training_loss(config, device=device)
-        set_normalizers = getattr(train_loss, "set_normalizers", None)
-        if callable(set_normalizers):
-            set_normalizers(
-                in_normalizer=data_processor.in_normalizer,
-                out_normalizer=data_processor.out_normalizer,
-            )
-        data_processor.to(device)
-        eval_metrics = learning.metrics.metrics.build_evaluation_metrics(
-            config,
-            device=device,
-            output_standard_deviations=data_processor.out_normalizer.std,
-        )
-        optimizer = learning.training.optim.build_optimizer(model, config)
-        scheduler = learning.training.optim.build_scheduler(optimizer, config)
-        checkpoint_identity = learning.training.checkpoint.build_checkpoint_identity(
-            config,
-            dataloaders["split_indices"],
-            normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
-            persisted_config=config,
-        )
-        amp_enabled = bool(config["training"]["mixed_precision"])
-        experiments.run.transition_run_status(
-            run_dir,
-            "running",
-            updates={
-                **summary_extra,
-                "target_epochs": int(config["training"]["epochs"]),
-                "seed_plan": seed_plan,
-                "deterministic": bool(config["run"]["deterministic"]),
-                "amp_enabled": amp_enabled,
-                **experiments.run.runtime_session_updates(
-                    run_dir,
-                    device_resolution,
-                    started_at=start_time,
-                    session_id=runtime_session_id,
-                    tracking_state=experiments.run.initial_tracking_state(config),
-                ),
-            },
-        )
-        run_started = True
-
-        def state_updater(updates: Mapping[str, Any]) -> None:
-            """Persist trial-observer facts in the current run runtime session."""
-            experiments.run.update_runtime_session(run_dir, runtime_session_id, updates)
-
-        monitor_membership = experiments.tracking.build_monitor_membership(
-            config,
-            dataloaders["split_indices"],
-        )
-        if monitor_membership is not None:
-            state_updater({"monitor": monitor_membership})
-        semantic_config: Mapping[str, Any] | None = None
-        monitor_settings = config["tracking"]["wandb"]["monitor"]
-        if config["tracking"]["wandb"]["mode"] != "disabled":
-            semantic_config = experiments.tracking.build_semantic_config(
-                config,
-                split_indices=dataloaders["split_indices"],
-                split_indices_sha256=common.serialization.file_sha256(common.paths.resolve_split_indices_path(run_dir)),
-                normalizer_sha256=common.serialization.file_sha256(common.paths.resolve_normalizer_path(run_dir)),
-                checkpoint_identity=checkpoint_identity,
-                model=model,
-                device_metadata=device_resolution.as_dict(),
-                duration_contract=experiments.run.RUN_DURATION_CONTRACT,
-                tuning_context={
-                    "study_name": context["study_name"],
-                    "study_role": context["study_role"],
-                    "trial_number": context["trial_number"],
-                    "training_seed": context["training_seed"],
-                    "sampler_seed": context["sampler_seed"],
-                    "search_signature": context["search_signature"],
-                    "sampled_parameters": copy.deepcopy(context["analysis_parameters"]),
-                    "objective": copy.deepcopy(objective),
-                },
-            )
-        console_reporter.startup(resolved_device=str(device))
-        tracker = experiments.tracking.initialize_wandb(
-            config,
-            run_dir=run_dir,
-            semantic_config=semantic_config,
-            state_updater=state_updater,
-        )
-        wandb_epoch_callback = experiments.tracking.epoch_callback(tracker)
-
-        def mirror_epoch_to_wandb(epoch: int, metrics: dict[str, float]) -> None:
-            """Mirror trial telemetry only when an optional W&B session is active."""
-            if wandb_epoch_callback is not None:
-                wandb_epoch_callback(epoch, metrics)
-
-        def optuna_tracking_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
-            """Mirror only the exact reported ID value and trial-best scalar under Optuna/."""
-            payload = dict(metrics)
-            if reporter.last_reported_objective is not None:
-                payload["optuna/objective"] = reporter.last_reported_objective
-            if reporter.best_value is not None:
-                payload["optuna/best_objective_so_far"] = reporter.best_value
-            return payload
-
-        def trial_epoch_callback(epoch: int, metrics: dict[str, float]) -> None:
-            """Log every epoch but report/prune only after one genuine ID evaluation."""
-            console_reporter.epoch(epoch, metrics)
-            id_key = f"id/{objective['id']}"
-            if id_key not in metrics:
-                mirror_epoch_to_wandb(epoch, metrics)
-                return
-            reporter(epoch, metrics)
-            mirror_epoch_to_wandb(epoch, optuna_tracking_metrics(metrics))
-
-        result = learning.training.loop.train_loop(
-            config=config,
-            device=device,
-            model=model,
-            optimizer=optimizer,
-            train_loader=dataloaders["train"],
-            eval_loader=dataloaders["eval"],
-            train_loss=train_loss,
-            eval_metrics=eval_metrics,
-            additional_evaluation_loader=dataloaders["additional_evaluation"],
-            data_processor=data_processor,
-            scheduler=scheduler,
-            save_dir=run_dir,
-            use_amp=config["training"].get("mixed_precision", False),
-            epoch_end_callback=trial_epoch_callback,
-            checkpoint_identity=checkpoint_identity,
-        )
-        selected = learning.training.loop.evaluate_selected_checkpoint(
-            config=config,
-            model=model,
-            train_loss=train_loss,
-            eval_loader=dataloaders["eval"],
-            additional_evaluation_loader=dataloaders["additional_evaluation"],
-            eval_metrics=eval_metrics,
-            device=device,
-            data_processor=data_processor,
-            checkpoint_identity=checkpoint_identity,
-            best_checkpoint_path=result["best_checkpoint_path"],
-            scheduler_expected=scheduler is not None,
-            amp_expected=amp_enabled,
-            max_physics_cases=int(monitor_settings["max_cases"]),
-        )
-        result.update(selected)
-        objective_value = _finite_objective_value(result, objective)
-        _validate_completed_reporting(reporter, result)
-        tracking_status = "completed"
-        tracking_result = result
-        console_reporter.final(result, total_wall_seconds=(datetime.now(UTC) - start_time).total_seconds())
-
-    except (KeyboardInterrupt, SystemExit) as error:
-        tracking_status = "interrupted"
-        tracking_error = error
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="interrupted",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        raise
-    except trial_pruned as error:
-        tracking_error = error
-        if not run_started:
-            _write_summary(
-                run_dir=run_dir,
-                config=config,
-                context=context,
-                status="failed",
-                start_time=start_time,
-                reporter=reporter,
-                error=error,
-                failure_context=_failure_context(
-                    error=error,
-                    device_resolution=device_resolution,
-                    reporter=reporter,
-                ),
-            )
-            msg = "Optuna requested pruning before the trial reached training."
-            raise RuntimeError(msg) from error
-        tracking_status = "pruned"
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="pruned",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        pruning_epoch = reporter.last_reported_epoch
-        if wandb_epoch_callback is not None and reporter.last_metrics is not None and pruning_epoch is not None:
-            wandb_epoch_callback(pruning_epoch, optuna_tracking_metrics(reporter.last_metrics))
-        raise
-    except FloatingPointError as error:
-        tracking_error = error
-        if not run_started:
-            _write_summary(
-                run_dir=run_dir,
-                config=config,
-                context=context,
-                status="failed",
-                start_time=start_time,
-                reporter=reporter,
-                error=error,
-                failure_context=_failure_context(
-                    error=error,
-                    device_resolution=device_resolution,
-                    reporter=reporter,
-                ),
-            )
-            raise
-        tracking_status = "nonfinite_pruned"
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="nonfinite_pruned",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        message = f"Trial pruned after non-finite value: {error}"
-        raise trial_pruned(message) from None
-    except (torch.cuda.OutOfMemoryError, MemoryError) as error:
-        tracking_error = error
-        if not run_started:
-            _write_summary(
-                run_dir=run_dir,
-                config=config,
-                context=context,
-                status="failed",
-                start_time=start_time,
-                reporter=reporter,
-                error=error,
-                failure_context=_failure_context(
-                    error=error,
-                    device_resolution=device_resolution,
-                    reporter=reporter,
-                ),
-            )
-            raise
-        tracking_status = "oom_pruned"
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="oom_pruned",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        message = "Trial pruned after allocator out-of-memory failure"
-        raise trial_pruned(message) from None
-    except RecoverableTrialError as error:
-        tracking_error = error
-        if not run_started:
-            _write_summary(
-                run_dir=run_dir,
-                config=config,
-                context=context,
-                status="failed",
-                start_time=start_time,
-                reporter=reporter,
-                error=error,
-                failure_context=_failure_context(
-                    error=error,
-                    device_resolution=device_resolution,
-                    reporter=reporter,
-                ),
-            )
-            msg = "A recoverable trial error occurred before training started."
-            raise RuntimeError(msg) from error
-        tracking_status = "recoverable_failed"
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="recoverable_failed",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        raise
-    except experiments.tracking.TrackingError as error:
-        tracking_error = error
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="failed",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        raise
-    except RuntimeError as error:
-        tracking_error = error
-        if run_started and _runtime_error_is_allocation_oom(error):
-            tracking_status = "oom_pruned"
-            _write_summary(
-                run_dir=run_dir,
-                config=config,
-                context=context,
-                status="oom_pruned",
-                start_time=start_time,
-                reporter=reporter,
-                error=error,
-                failure_context=_failure_context(
-                    error=error,
-                    device_resolution=device_resolution,
-                    reporter=reporter,
-                ),
-            )
-            message = "Trial pruned after allocator out-of-memory failure"
+        value = attempt()
+    except BaseException as error:
+        if status != "duplicate_pruned":
+            status = _trial_terminal_status(error, trial_pruned)
+        if status == "failed":
+            experiments.console.print_sanitized_traceback(error)
+        else:
+            # Pruned outcomes print no traceback; a lifecycle step that failed while recording them left notes.
+            experiments.console.print_error_notes(error)
+        if status == "nonfinite_pruned":
+            message = f"Trial pruned after non-finite value: {error}"
             raise trial_pruned(message) from None
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="failed",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
-        raise
-    except Exception as error:
-        tracking_error = error
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="failed",
-            start_time=start_time,
-            reporter=reporter,
-            error=error,
-            failure_context=_failure_context(error=error, device_resolution=device_resolution, reporter=reporter),
-        )
+        if status == "oom_pruned":
+            raise trial_pruned(_OOM_PRUNED_MESSAGE) from error
         raise
     else:
-        _write_summary(
-            run_dir=run_dir,
-            config=config,
-            context=context,
-            status="completed",
-            start_time=start_time,
-            result=result,
-            reporter=reporter,
-            checkpoint_identity=checkpoint_identity,
-            amp_enabled=amp_enabled,
-        )
-        experiments.console.optuna_trial_event(
-            "completed",
-            trial=int(context["trial_number"]),
-            sampled=context["analysis_parameters"],
-            objective=objective_value,
-            duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
-        )
-        return objective_value
+        returned = True
+        return value
     finally:
-        if tracking_error is not None:
+        # Each closing step runs even when an earlier one fails; their failures are settled after all three.
+        close_failures: list[tuple[str, BaseException]] = []
+        try:
+            trial.set_user_attr("terminal_status", status)
+        except BaseException as error:  # noqa: BLE001 -- settled below, after the trial line and cleanup
+            close_failures.append((f"Optuna attribute terminal_status={status!r} was not recorded", error))
+        try:
             experiments.console.optuna_trial_event(
-                tracking_status,
+                status,
                 trial=int(context["trial_number"]),
-                sampled=context["analysis_parameters"],
-                objective=reporter.last_reported_objective,
-                duration_seconds=(datetime.now(UTC) - start_time).total_seconds(),
-                step=reporter.last_reported_epoch,
+                sampled=context["sampled_parameters"],
+                duration_seconds=time.monotonic() - started,
+                objective=value if value is not None or reporter is None else reporter.last_reported_objective,
+                step=None if reporter is None else reporter.last_reported_epoch,
             )
-            if tracking_status not in {"pruned", "nonfinite_pruned", "oom_pruned"}:
-                console_reporter.failure(tracking_error, status=tracking_status, phase="optuna_trial")
-                if isinstance(tracking_error, Exception):
-                    experiments.console.print_sanitized_traceback(tracking_error)
-        if tracker is not None:
-            local_summary: Mapping[str, Any] | None = None
-            with suppress(Exception):
-                local_summary = experiments.run.read_run_summary(run_dir)
-            terminal_tracking_result = tracking_result
-            if terminal_tracking_result is None and reporter.last_reported_epoch is not None:
-                terminal_tracking_result = {
-                    "best_metric": reporter.best_value,
-                    "best_epoch": reporter.best_epoch,
-                    "completed_epoch": reporter.last_reported_epoch,
-                    "global_step": reporter.last_global_step,
-                    "terminal_epoch": reporter.last_reported_epoch,
-                    "terminal_metrics": {key: value for key, value in (reporter.last_metrics or {}).items() if key.startswith("train/")},
-                }
-            try:
-                tracker.finish(
-                    status=tracking_status,
-                    result=terminal_tracking_result,
-                    local_summary=local_summary,
-                    error=tracking_error,
-                )
-            except experiments.tracking.TrackingError:
-                if tracking_error is None:
-                    raise
-        scheduler = None
-        optimizer = None
-        eval_metrics = None
-        train_loss = None
-        model = None
-        data_processor = None
-        dataloaders = None
-        result = None
-        tracker = None
-        gc.collect()
-        if device.type == "cuda" and torch.cuda.is_initialized():
-            with suppress(RuntimeError):
-                torch.cuda.empty_cache()
-            with suppress(RuntimeError):
-                torch.cuda.reset_peak_memory_stats(device)
+        except BaseException as error:  # noqa: BLE001 -- settled below, after the cleanup
+            close_failures.append(("The trial line was not printed", error))
+        try:
+            gc.collect()
+            if device is not None and device.type == "cuda" and torch.cuda.is_initialized():
+                with suppress(RuntimeError):
+                    torch.cuda.empty_cache()
+                with suppress(RuntimeError):
+                    torch.cuda.reset_peak_memory_stats(device)
+        except BaseException as error:  # noqa: BLE001 -- settled below
+            close_failures.append(("The trial cleanup did not finish", error))
+        _settle_close_failures(close_failures, propagating=None if returned else sys.exception())
 
 
 def create_objective(study_config: OptunaStudyConfig) -> Callable[[TrialProtocol], float]:
@@ -2167,7 +1637,7 @@ def _validate_existing_study(
         raise ValueError(msg)
 
     def require_schema_version(value: Any, expected: int, *, label: str) -> None:
-        if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        if not common.serialization.is_schema_version(value, expected):
             msg = f"Existing Optuna study {label} must be schema version {expected}."
             raise ValueError(msg)
 
@@ -2203,7 +1673,7 @@ def _validate_existing_study(
     )
     require_schema_version(
         actual_lifecycle.get("run_summary_schema_version"),
-        experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+        common.paths.RUN_SUMMARY_SCHEMA_VERSION,
         label="run summary",
     )
 
@@ -2260,6 +1730,17 @@ def _storage_console_location(paths: _OptunaStudyPaths) -> str:
 def _trial_state_name(trial: Any) -> str:
     """Return one stable lowercase Optuna trial state name."""
     return str(getattr(getattr(trial, "state", None), "name", "unknown")).lower()
+
+
+def _fail_running_trials(study: Any, numbers: Sequence[int], error: BaseException) -> None:
+    """Record FAIL for this invocation's trials that an exception outside Optuna's own handling (``SystemExit``) left RUNNING."""
+    states = _optuna_module().trial.TrialState
+    try:
+        for frozen in study.get_trials(deepcopy=False, states=(states.RUNNING,)):
+            if frozen.number in numbers:
+                study.tell(frozen.number, state=states.FAIL)
+    except Exception as cleanup_error:  # noqa: BLE001 -- the error that ended the study stays the one the caller sees
+        error.add_note(f"Unfinished Optuna trials could not be marked failed: {cleanup_error}")
 
 
 def _study_lifecycle_summary(
@@ -2321,7 +1802,6 @@ def _study_lifecycle_summary(
         }
 
     return {
-        "schema_version": 1,
         "status": status,
         "study_name": config.study["name"],
         "study_role": config.study["role"],
@@ -2410,8 +1890,7 @@ def run_optuna_study(
     study_config = load_optuna_study_config(config) if isinstance(config, (str, Path)) else config
     study_config = with_runtime_overrides(study_config, device=device, output_root=output_root)
     study_config, objective = _validate_study_contract(study_config)
-    if study_config.base_config["task"] == "transient_drying":
-        study_config = _bind_configured_dataset_identities(study_config)
+    study_config = _bind_configured_dataset_identities(study_config)
     signature = build_study_signature(study_config)
     numerical_environment = learning.training.checkpoint.numerical_environment_identity()
 
@@ -2480,13 +1959,22 @@ def run_optuna_study(
         maximum_epochs=int(study_config.base_config["training"]["epochs"]),
         continuation="reopened" if reopened else "new",
     )
+    run_objective = create_objective(study_config)
+    started_trials: list[int] = []
+
+    def objective_of_invocation(trial: TrialProtocol) -> float:
+        """Record which trials this invocation started before running one."""
+        started_trials.append(trial.number)
+        return run_objective(trial)
+
     try:
         study.optimize(
-            create_objective(study_config),
+            objective_of_invocation,
             n_trials=trial_count,
             catch=(RecoverableTrialError,),
         )
-    except BaseException:
+    except BaseException as error:
+        _fail_running_trials(study, started_trials, error)
         summary = _study_lifecycle_summary(
             study,
             config=study_config,

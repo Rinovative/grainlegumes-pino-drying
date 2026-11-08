@@ -2,9 +2,11 @@
 
 Responsibilities:
   - Check pooled statistics, target records, lazy case access, panels, and local reports
+  - Check that a session admits only frames recording one valid analysis producer
 
 Design principles:
   - Unequal support, unavailable metrics, and material summaries retain distinct meanings
+  - The producer check reads recorded provenance only, never the running analysis code
 
 This module does NOT:
   - Generate model predictions or refit saved scales
@@ -253,6 +255,7 @@ def test_indexed_session_pools_unequal_statistics_without_loading_payloads(
     frame.attrs.update(
         {
             "artifact_kind": "transient_sequence",
+            "artifact_provenance": {"producer": {"analysis_sha256": "9" * 64}},
             "transient_sequence_index": index,
             "transient_unavailable_horizons": (),
             "transient_scaling_state": scaling_state(),
@@ -285,13 +288,38 @@ def test_session_uses_saved_scale_excludes_origin_and_retains_default_modes() ->
     evaluation = session.TransientEvaluationSession({"id": sequence_frame(values)})
     summaries = evaluation.summaries()
     teacher_cumulative = next(item for item in summaries if item.mode == "teacher_forced_one_step" and item.scope == "cumulative")
-    assert teacher_cumulative.metrics.normalized_drying_group_macro_rmse == pytest.approx(1.0)
-    assert teacher_cumulative.metrics.physical_w_gr_rmse == pytest.approx(2.0)
-    assert teacher_cumulative.metrics.bulk_dry_basis_rmse == pytest.approx(0.02)
-    assert teacher_cumulative.metrics.bulk_wet_basis_rmse == pytest.approx(2.0 / 102.0)
-    assert teacher_cumulative.metrics.bulk_moisture_valid_count == 1
+    teacher_metrics = teacher_cumulative.metrics
+    assert teacher_metrics is not None
+    assert teacher_metrics.normalized_drying_group_macro_rmse == pytest.approx(1.0)
+    assert teacher_metrics.physical_w_gr_rmse == pytest.approx(2.0)
+    assert teacher_metrics.bulk_dry_basis_rmse == pytest.approx(0.02)
+    assert teacher_metrics.bulk_wet_basis_rmse == pytest.approx(2.0 / 102.0)
+    assert teacher_metrics.bulk_moisture_valid_count == 1
     assert teacher_cumulative.contributing_record_count == 1
     assert set(evaluation.case_dataframe()["mode"]) == {"teacher_forced_one_step", "autonomous_full", "rolling_origin"}
+
+
+@pytest.mark.parametrize(
+    ("producer", "message"),
+    [
+        ({"analysis_sha256": "0" * 64}, "different analysis implementations"),
+        (None, "'B' cannot be compared: Artifact producer must be exactly"),
+        ({"analysis_sha256": "9" * 63}, "'B' cannot be compared: Artifact producer must be exactly"),
+    ],
+    ids=["different", "missing", "malformed"],
+)
+def test_session_requires_one_recorded_analysis_producer(producer: dict[str, str] | None, message: str) -> None:
+    """Every session view compares its frames, so all of them must record the same valid analysis producer."""
+    records = (sequence_record("autonomous_full", "full"),)
+    peer = sequence_frame(records)
+    session.TransientEvaluationSession({"A": sequence_frame(records), "B": peer})
+
+    if producer is None:
+        del peer.attrs["artifact_provenance"]["producer"]
+    else:
+        peer.attrs["artifact_provenance"]["producer"] = producer
+    with pytest.raises(ValueError, match=message):
+        session.TransientEvaluationSession({"A": sequence_frame(records), "B": peer})
 
 
 def test_target_records_select_one_full_autonomous_outcome_per_case() -> None:
@@ -367,6 +395,8 @@ def test_session_aggregates_cases_scopes_unavailability_and_target_evidence() ->
     summaries = evaluation.summaries(modes=("rolling_origin",))
     cumulative = next(item for item in summaries if item.scope == "cumulative")
     endpoint = next(item for item in summaries if item.scope == "endpoint")
+    assert cumulative.metrics is not None
+    assert endpoint.metrics is not None
     assert cumulative.metrics.normalized_drying_group_macro_rmse == pytest.approx(np.sqrt((1.0**2 + 2.0**2) / 2.0))
     assert endpoint.metrics.normalized_drying_group_macro_rmse == pytest.approx(cumulative.metrics.normalized_drying_group_macro_rmse)
     assert (cumulative.contributing_case_count, cumulative.unavailable_case_count) == (2, 1)
@@ -378,6 +408,22 @@ def test_session_aggregates_cases_scopes_unavailability_and_target_evidence() ->
     assert cumulative.target_final_gap_error_mean is None
     assert cumulative.target_final_gap_error_mae is None
     assert all(key.startswith("evaluation/") for key in evaluation.wandb_summary(modes=("rolling_origin",)))
+
+
+def test_session_reports_support_counts_instead_of_metrics_over_a_nonfinite_prediction() -> None:
+    """A non-finite case makes the group's error metrics unavailable in rows and W&B; its finite peer is not reduced alone."""
+    records = (sequence_record("rolling_origin", 2, case_id="a", offset=np.nan), sequence_record("rolling_origin", 2, case_id="b"))
+    evaluation = session.TransientEvaluationSession({"id": sequence_frame(records)})
+    cumulative = next(item for item in evaluation.summaries(modes=("rolling_origin",)) if item.scope == "cumulative")
+    assert cumulative.metrics is None
+    assert (cumulative.metric_support["finite_value_count"], cumulative.metric_support["required_value_count"]) == (8, 16)
+
+    row = evaluation.dataset_dataframe(modes=("rolling_origin",)).query("scope == 'cumulative'").iloc[0]
+    assert (row["nonfinite_value_count"], pd.isna(row["normalized_drying_group_macro_rmse"])) == (8, True)
+    values = evaluation.wandb_summary(modes=("rolling_origin",))
+    support = {key: value for key, value in values.items() if key.endswith("/rolling_origin/2/cumulative/nonfinite_value_count")}
+    assert list(support.values()) == [8]
+    assert not any("rmse" in key for key in values)
 
 
 def test_exact_stop_gap_is_not_paired_with_a_regular_prediction_endpoint() -> None:
@@ -445,11 +491,10 @@ def test_tracking_summary_stays_bounded_for_complete_two_role_horizon_inventory(
     assert len(publication) <= _TRANSIENT_PUBLICATION_SUMMARY_LIMIT
     assert all(key.startswith("evaluation/") for key in publication)
     assert all(isinstance(value, (bool, float, int, str)) for value in publication.values())
-    validator = experiments.tracking._validate_transient_evaluation_summary_entry
+    validator = experiments.tracking._validate_evaluation_summary_entry
     assert all(validator(key, value) == key for key, value in publication.items())
     assert publication["evaluation/identity/checkpoint_sha256"] == "d" * 64
     assert publication["evaluation/identity/input_profile"] == "canonical_physics_complete_v1"
-    assert publication["evaluation/identity/backend"] == "canonical_hdf5"
     assert {
         "evaluation/identity/scaling_semantic_digest",
         "evaluation/identity/comparison_arm",

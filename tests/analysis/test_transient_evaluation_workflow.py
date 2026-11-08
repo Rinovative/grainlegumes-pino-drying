@@ -23,8 +23,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from support.synthetic_task import synthetic_split_payload
 
-from src import analysis, common
+from src import analysis, common, datasets
 from src.experiments import experiments_matched_budget as matched_budget
 
 if TYPE_CHECKING:
@@ -33,29 +34,13 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
 
 
-def _split(arm: str) -> dict[str, Any]:
-    """Represent complete saved cases with distinct strategy-owned runtime sampling."""
-    roles = {}
-    for role, cases in {
-        "train": ["train_case"],
-        "validation": ["validation_case"],
-        "id_test": ["case_0001"],
-        "scaling_train_one_step": ["train_case"],
-    }.items():
-        items = [f"{case}__{'window' if arm == 'b' and role != 'scaling_train_one_step' else 'step'}" for case in cases]
-        roles[role] = {
-            "case_ids": cases,
-            "item_ids": items,
-            "membership_digest": common.serialization.canonical_json_sha256({"case_ids": cases, "item_ids": items}),
-        }
-    roles["additional_evaluation"] = {"parts": []}
-    return {
-        "dataset_identity": {
-            "train": {"dataset_id": "transient_dataset", "index_digest": "split", "data_contract_digest": "contract"},
-            "additional_evaluation": [],
-        },
-        "roles": roles,
-    }
+def _split(arm: str, *, additional: tuple[tuple[str, tuple[str, ...]], ...] = ()) -> dict[str, Any]:
+    """Return one admitted transient split; B differs from A0/A1 only in its strategy-owned Train sampling."""
+    split = synthetic_split_payload("transient_drying", train_dataset="transient_dataset", additional=additional)
+    if arm == "b":
+        rollout = {"mode": "trajectory", "rollout_length": 2}
+        split["extension"]["sampling"] = datasets.contracts.transient.TransientSamplingSpec.from_mapping(rollout).as_dict()
+    return split
 
 
 def _matched_receipt() -> dict[str, Any]:
@@ -93,7 +78,6 @@ def _matched_receipt() -> dict[str, Any]:
                 "budget_complete": True,
                 "clock_kind": "train_seconds",
                 "train_seconds": 10.0,
-                "successful_optimizer_steps": 10,
                 "post_handoff_optimizer_steps": 10,
             },
             "terminal_epoch": 3,
@@ -115,7 +99,7 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
         "completed_stage_epochs": 0 if matched else 3,
         "planned_train_seconds": 10.0 if matched else None,
         "train_seconds": 10.0 if matched else 0.0,
-        "successful_optimizer_steps": 10 if matched else 3,
+        "post_handoff_optimizer_steps": 10 if matched else 3,
         "budget_complete": True,
         "best_within_budget_epoch": 2,
     }
@@ -127,21 +111,24 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
         "scaling_identity": {"semantic_digest": "scale"},
     }
     split = _split(arm)
+    id_test = split["roles"]["id_test"]
     frame = pd.DataFrame()
     frame.attrs.update(
         {
             "artifact_kind": "transient_sequence",
-            "transient_sequence_records": (SimpleNamespace(case_id="case_0001", identity=identity),),
+            "transient_sequence_records": (SimpleNamespace(case_id=id_test["case_ids"][0], identity=identity),),
             "transient_unavailable_horizons": (),
             "transient_scaling_state": {"unused_by_fake_session": True},
-            "transient_physical_split": analysis.evaluation.artifact_loader._transient_physical_split(split),
+            "transient_physical_split": analysis.evaluation.artifact_loader._physical_split(split),
             "artifact_provenance": {
                 "dataset": {
                     "name": "transient_dataset",
+                    "role": "id",
                     "source_dataset_ids": ["transient_dataset"],
                     "source_identities": [deepcopy(split["dataset_identity"]["train"])],
-                    "case_ids_by_source": [split["roles"]["id_test"]["case_ids"]],
-                    "membership_digests": [split["roles"]["id_test"]["membership_digest"]],
+                    "case_ids_by_source": [list(id_test["case_ids"])],
+                    "membership_digests": [id_test["membership_digest"]],
+                    "evaluation_assignments": [],
                 },
                 "lineage": {
                     "stage_identity": {"stage": "b" if arm == "b" else "a", "comparison_arm": arm},
@@ -338,7 +325,6 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
                 "budget_complete": True,
                 "clock_kind": "train_seconds",
                 "train_seconds": 12.5,
-                "successful_optimizer_steps": 4,
                 "post_handoff_optimizer_steps": 4,
             },
             "terminal_epoch": 3,
@@ -369,7 +355,8 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
             )
             manifest["b_train_budget_receipt"] = receipt
     loaded = tuple(current.loaded_run for current in prepared)
-    lineage = analysis.evaluation.workflow._transient_lineage(loaded)
+    lineage, reason = analysis.evaluation.workflow._transient_lineage(loaded)
+    assert reason is None
     assert lineage is not None
     assert lineage.a1 is not None
     assert lineage.a1.arm == "A1"
@@ -574,9 +561,8 @@ def test_generic_transient_comparison_rejects_mismatched_role_membership(
         (tmp_path / "first").resolve(): _prepared((tmp_path / "first").resolve(), "a0"),
         (tmp_path / "second").resolve(): _prepared((tmp_path / "second").resolve(), "a1"),
     }
-    prepared[(tmp_path / "second").resolve()].loaded_run.id_artifact.frame.attrs["transient_sequence_records"] = (
-        SimpleNamespace(case_id="different_case", identity=_frame("a1").attrs["transient_sequence_records"][0].identity),
-    )
+    second_dataset = prepared[(tmp_path / "second").resolve()].loaded_run.id_artifact.frame.attrs["artifact_provenance"]["dataset"]
+    second_dataset["case_ids_by_source"] = [["different_case"]]
     closed: list[bool] = []
 
     class FakeSession:
@@ -596,27 +582,22 @@ def test_generic_transient_comparison_rejects_mismatched_role_membership(
     assert closed == [True]
 
 
-def test_physical_projection_preserves_raw_sampling_and_package_associations() -> None:
-    """Different expanded item sampling retains the exact physical split without rewriting evidence."""
-    split = _split("b")
-    split["dataset_identity"]["additional_evaluation"] = [
-        {"dataset_id": "additional", "index_digest": "additional_index", "data_contract_digest": "additional_contract"}
-    ]
-    split["roles"]["additional_evaluation"] = {
-        "parts": [{"case_ids": ["additional_case"], "item_ids": ["window"], "membership_digest": "raw_digest"}]
-    }
+def test_physical_projection_drops_only_the_sampling_extension() -> None:
+    """The physical split keeps every Dataset identity and role membership, without the task's item expansion."""
+    split = _split("b", additional=(("additional", ("chickpea__case_0001__00000000000a",)),))
     before = deepcopy(split)
-    physical = analysis.evaluation.artifact_loader._transient_physical_split(split)
+    physical = analysis.evaluation.artifact_loader._physical_split(split)
     assert split == before
-    assert physical["additional_evaluation"]["source_dataset_ids"] == ["additional"]
-    assert physical["additional_evaluation"]["case_ids_by_source"] == [["additional_case"]]
-    assert all("item_ids" not in part for part in physical.values())
-    physical["train"]["source_identities"][0]["index_digest"] = "changed_copy"
+    assert set(physical) == {"dataset_identity", "roles"}
+    assert physical["dataset_identity"]["additional_evaluation"][0]["dataset_id"] == "additional"
+    assert physical["roles"]["additional_evaluation"]["parts"][0]["case_ids"] == ["chickpea__case_0001__00000000000a"]
+    physical["dataset_identity"]["train"]["index_digest"] = "changed_copy"
     assert split == before
 
 
-def test_strategy_sampling_digests_do_not_change_physical_role_or_lineage() -> None:
-    """A0/A1 one-step and B rollout windows compare the same complete physical cases."""
+def test_strategy_sampling_does_not_change_physical_role_or_lineage() -> None:
+    """A0/A1 one-step and B rollout sampling compare the same complete physical cases."""
+    assert _split("a0")["extension"] != _split("b")["extension"]
     first = _prepared(Path("a0"), "a0").loaded_run
     second = _prepared(Path("b"), "b").loaded_run
     workflow = analysis.evaluation.workflow
@@ -625,49 +606,26 @@ def test_strategy_sampling_digests_do_not_change_physical_role_or_lineage() -> N
     assert first_artifact is not None
     assert second_artifact is not None
     first_raw = deepcopy(first_artifact.frame.attrs["artifact_provenance"])
-    second_raw = deepcopy(second_artifact.frame.attrs["artifact_provenance"])
-    assert first_raw["dataset"]["membership_digests"] != second_raw["dataset"]["membership_digests"]
-    assert workflow._transient_role_membership(first_artifact) == workflow._transient_role_membership(second_artifact)
+    assert workflow._role_membership(first_artifact) == workflow._role_membership(second_artifact)
     assert workflow._transient_arm_evidence(first).split_id == workflow._transient_arm_evidence(second).split_id
     assert first_artifact.frame.attrs["artifact_provenance"] == first_raw
-    assert second_artifact.frame.attrs["artifact_provenance"] == second_raw
 
 
-@pytest.mark.parametrize("role", ["train", "validation", "id_test", "scaling_train_one_step", "additional_evaluation"])
+@pytest.mark.parametrize("role", ["train", "validation", "id_test", "additional_evaluation"])
 def test_lineage_rejects_changes_in_every_physical_role(role: str) -> None:
     """Even unchanged evaluated ID cases cannot conceal a different training/validation split."""
     first = _prepared(Path("a0"), "a0").loaded_run
     second = _prepared(Path("b"), "b").loaded_run
     assert second.id_artifact is not None
-    physical = second.id_artifact.frame.attrs["transient_physical_split"]
-    if role == "additional_evaluation":
-        physical[role] = deepcopy(physical["train"])
-    physical[role]["case_ids_by_source"] = [["different_case"]]
+    roles = second.id_artifact.frame.attrs["transient_physical_split"]["roles"]
+    roles[role] = {"parts": [{"case_ids": ["different_case"]}]} if role == "additional_evaluation" else {"case_ids": ["different_case"]}
     workflow = analysis.evaluation.workflow
     assert workflow._transient_arm_evidence(first).split_id != workflow._transient_arm_evidence(second).split_id
     third = _prepared(Path("a1"), "a1").loaded_run
-    with pytest.raises(ValueError, match="split_id"):
-        workflow._transient_lineage((first, second, third))
-
-
-@pytest.mark.parametrize("field", ["index_digest", "data_contract_digest"])
-def test_shared_role_rejects_different_source_identity(field: str) -> None:
-    """The same package name/case cannot conceal a different immutable Source-backed index."""
-    first = _prepared(Path("a0"), "a0").loaded_run
-    second = _prepared(Path("b"), "b").loaded_run
-    assert second.id_artifact is not None
-    second.id_artifact.frame.attrs["artifact_provenance"]["dataset"]["source_identities"][0][field] = "different"
-    with pytest.raises(ValueError, match="dataset membership"):
-        analysis.evaluation.workflow._validate_transient_shared_membership((first, second), roles=("id",))
-
-
-@pytest.mark.parametrize("field", ["source_identities", "case_ids_by_source"])
-def test_missing_physical_role_evidence_fails_closed(field: str) -> None:
-    artifact = _prepared(Path("a0"), "a0").loaded_run.id_artifact
-    assert artifact is not None
-    del artifact.frame.attrs["artifact_provenance"]["dataset"][field]
-    with pytest.raises(ValueError, match="physical membership"):
-        analysis.evaluation.workflow._transient_role_membership(artifact)
+    lineage, reason = workflow._transient_lineage((first, second, third))
+    assert lineage is None
+    assert reason is not None
+    assert "split_id" in reason
 
 
 def test_missing_all_role_projection_fails_closed() -> None:
@@ -676,30 +634,6 @@ def test_missing_all_role_projection_fails_closed() -> None:
     del loaded.id_artifact.frame.attrs["transient_physical_split"]
     with pytest.raises(TypeError, match="physical split"):
         analysis.evaluation.workflow._transient_arm_evidence(loaded)
-
-
-@pytest.mark.parametrize("mutation", ["wrong_dataset", "wrong_length", "duplicate_case", "empty_case"])
-def test_physical_projection_rejects_malformed_associations(mutation: str) -> None:
-    split = _split("a0")
-    if mutation == "wrong_dataset":
-        split["dataset_identity"]["train"]["dataset_id"] = None
-    elif mutation == "wrong_length":
-        split["dataset_identity"]["additional_evaluation"] = [split["dataset_identity"]["train"]]
-    elif mutation == "duplicate_case":
-        split["roles"]["id_test"]["case_ids"] = ["case_0001", "case_0001"]
-    else:
-        split["roles"]["id_test"]["case_ids"] = []
-    with pytest.raises(ValueError, match="physical membership"):
-        analysis.evaluation.artifact_loader._transient_physical_split(split)
-
-
-@pytest.mark.parametrize("additional", [[], {}, {"parts": [], "unexpected": []}, {"parts": None}])
-def test_additional_projection_requires_saved_parts_mapping(additional: Any) -> None:
-    """Reject alternate list, missing-key and invalid parts shapes instead of guessing."""
-    split = _split("a0")
-    split["roles"]["additional_evaluation"] = additional
-    with pytest.raises((TypeError, ValueError), match="additional physical split"):
-        analysis.evaluation.artifact_loader._transient_physical_split(split)
 
 
 def test_transient_loader_attaches_existing_admitted_all_role_projection(
@@ -722,7 +656,7 @@ def test_transient_loader_attaches_existing_admitted_all_role_projection(
     (root / "artifact_provenance.json").write_text("{}")
     transient = analysis.artifacts.transient
     plan = SimpleNamespace(id_role=SimpleNamespace(dataset_name="transient_dataset"), additional_role=None, run_name="run_b")
-    monkeypatch.setattr(transient, "transient_artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
+    monkeypatch.setattr(analysis.artifacts.plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
     index = SimpleNamespace(frame=pd.DataFrame(), provenance={}, unavailable_horizons=(), identity_sha256="identity")
     monkeypatch.setattr(transient, "validate_transient_role_artifact_index", lambda *_args, **_kwargs: index)
     loaded = analysis.evaluation.artifact_loader._load_admitted_transient_run_artifacts(
@@ -733,11 +667,10 @@ def test_transient_loader_attaches_existing_admitted_all_role_projection(
     )
     assert loaded.id_artifact is not None
     physical = loaded.id_artifact.frame.attrs["transient_physical_split"]
-    assert set(physical) == set(split["roles"])
-    assert physical["id_test"]["case_ids_by_source"] == [["case_0001"]]
-    assert physical["additional_evaluation"]["case_ids_by_source"] == []
-    physical["validation"]["case_ids_by_source"][0][0] = "copy_changed"
-    assert split["roles"]["validation"]["case_ids"] == ["validation_case"]
+    assert physical["roles"] == split["roles"]
+    assert physical["dataset_identity"] == split["dataset_identity"]
+    physical["roles"]["validation"]["case_ids"][0] = "copy_changed"
+    assert physical["roles"] != split["roles"]
 
 
 def test_general_three_model_comparison_discloses_failed_controlled_lineage(

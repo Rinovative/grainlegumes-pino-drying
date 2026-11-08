@@ -28,7 +28,6 @@ from support.source_tree import FrozenProject, build_project, snapshot_manifest,
 
 from src import common
 from src.datasets.packages import dataset_packages_reproduction as reproduction
-from src.generation import generation_benchmark as benchmark_service
 from src.generation import generation_campaign as campaign_service
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
@@ -271,17 +270,12 @@ def test_publication_guard_accepts_an_untouched_tree_and_refuses_every_drift(fro
 
 
 def test_clean_commit_and_campaign_commit_come_from_the_verified_tree(frozen_project: FrozenProject, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A clean tree yields its snapshot commit for direct, campaign and benchmark provenance; a dirty tree refuses only clean provenance.
-
-    The benchmark binds commit plus source fingerprint, so a dirty tree is admitted with its own fingerprint.
-    """
+    """A clean tree yields its snapshot commit for direct and campaign provenance; a dirty tree refuses only clean provenance."""
     receipt = frozen_project.materialize()
     git_log = _use_tree(monkeypatch, frozen_project, receipt)
 
     assert source_service.clean_repository_git_commit() == receipt["git_commit"]
     assert campaign_service._repository_commit() == receipt["git_commit"]
-    clean_commit, clean_fingerprint = benchmark_service._executing_source()
-    assert clean_commit == receipt["git_commit"]
     with pytest.raises(RuntimeError, match="admits only its executing tree"):
         source_service.clean_repository_git_commit(frozen_project.repository)
 
@@ -291,8 +285,6 @@ def test_clean_commit_and_campaign_commit_come_from_the_verified_tree(frozen_pro
     assert campaign_service._repository_commit() == dirty["git_commit"]
     with pytest.raises(RuntimeError, match="requires a clean repository worktree"):
         source_service.clean_repository_git_commit()
-    dirty_commit, dirty_fingerprint = benchmark_service._executing_source()
-    assert (dirty_commit, dirty_fingerprint != clean_fingerprint) == (dirty["git_commit"], True)
     assert not git_log.exists()
 
 

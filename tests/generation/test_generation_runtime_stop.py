@@ -3,6 +3,7 @@
 Responsibilities:
   - Check controlled stop, owned process escalation, status grammar, and capacity cleanup
   - Check that the stall rule's simulated-time minimum is recorded without changing stop control
+  - Check that the stall rule applies only to a profile with a time horizon and that a runtime failure detail names the solver progress of its task
 
 Design principles:
   - Ambiguous or changed status bytes remain preserved within exact workspace bounds
@@ -153,7 +154,6 @@ def test_timeout_requests_stop_at_reserve_then_classifies_clean_controlled_exit(
             "reason": "timeout",
             "requested_at": "2026-08-18T00:00:00+00:00",
             "schema_kind": "generation_runtime_stop",
-            "schema_version": 1,
         },
         "Controlled-stop evidence does not preserve the timeout request.",
     )
@@ -299,13 +299,36 @@ def test_a_failing_observation_reader_changes_no_stop_decision(tmp_path: Path) -
     assert result.minimum_simulated_reached_after_seconds is None
 
 
+_STALL_RULE = {"check_after_seconds": 900.0, "minimum_simulated_seconds": 3600.0}
+_TRANSIENT_HEADER = "Step Time Stepsize Res Jac Sol Order Tfail NLfail LinErr LinRes\n"
+
+
+def _profile_config(profile: str, *, rule: dict[str, float] | None = None) -> Any:
+    """Return a config stub of ``profile``; as in the resolved configuration only the transient profile has a time section, hence a horizon."""
+    scientific = {"time": {"start": 0.0, "stop": 168.0}} if profile == "transient_drying" else {}
+    return cast("Any", SimpleNamespace(scientific_values=scientific, execution_values={"runtime": {} if rule is None else {"stall_stop": rule}}))
+
+
+@pytest.mark.parametrize(("profile", "applies"), [("transient_drying", True), ("steady_flow", False)])
+def test_the_stall_rule_applies_only_to_a_profile_with_a_time_horizon(tmp_path: Path, profile: str, applies: bool) -> None:
+    """A stationary solve never reports simulated time: with a rule configured, a steady case builds none and records no stall_progress."""
+    config = _profile_config(profile, rule=_STALL_RULE)
+    prepared = cast("Any", SimpleNamespace(runtime_directory=tmp_path))
+    result = stop_service.StopResult(0, None, False, False, 412.5)
+
+    rule = batch_runtime._stall_rule(config, prepared)  # pyright: ignore[reportPrivateUsage]
+    progress = batch_runtime._stall_progress(config, result)  # pyright: ignore[reportPrivateUsage]
+
+    assert (rule is not None) is applies
+    assert progress == ({"minimum_simulated_seconds": 3600.0, "reached_after_seconds": 412.5} if applies else None)
+
+
 def test_the_stall_rule_records_the_minimum_with_its_own_uncached_reader(tmp_path: Path) -> None:
     """The decision reader keeps its refresh cache; the observation reader sees appended solver rows at once."""
     stdout = tmp_path / "stdout.log"
-    header = "Step Time Stepsize Res Jac Sol Order Tfail NLfail LinErr LinRes\n"
-    stdout.write_text(header + "1 10 1 2 1 2 1 0 0 1e-3 1e-4\n", encoding="utf-8")
-    config = SimpleNamespace(execution_values={"runtime": {"stall_stop": {"check_after_seconds": 900.0, "minimum_simulated_seconds": 3600.0}}})
-    rule = batch_runtime._stall_rule(cast("Any", config), cast("Any", SimpleNamespace(runtime_directory=tmp_path)))  # pyright: ignore[reportPrivateUsage]
+    stdout.write_text(_TRANSIENT_HEADER + "1 10 1 2 1 2 1 0 0 1e-3 1e-4\n", encoding="utf-8")
+    config = _profile_config("transient_drying", rule=_STALL_RULE)
+    rule = batch_runtime._stall_rule(config, cast("Any", SimpleNamespace(runtime_directory=tmp_path)))  # pyright: ignore[reportPrivateUsage]
     assert rule is not None
     assert rule.observed_simulated_seconds is not None
     assert rule.simulated_seconds() == 10.0
@@ -402,8 +425,8 @@ def test_a_forced_stop_result_carries_the_recorded_minimum_time(tmp_path: Path) 
 
 def test_the_timing_stall_progress_binds_the_rule_minimum_to_the_observed_time() -> None:
     """The persisted record exists only with a stall rule and keeps an unobserved minimum explicit."""
-    without_rule = SimpleNamespace(execution_values={"runtime": {}})
-    with_rule = SimpleNamespace(execution_values={"runtime": {"stall_stop": {"check_after_seconds": 600, "minimum_simulated_seconds": 1800}}})
+    without_rule = _profile_config("transient_drying")
+    with_rule = _profile_config("transient_drying", rule={"check_after_seconds": 600, "minimum_simulated_seconds": 1800})
     reached = stop_service.StopResult(0, None, False, False, 412.5)
 
     def progress(config: object, result: stop_service.StopResult | None) -> dict[str, float | None] | None:
@@ -413,6 +436,50 @@ def test_the_timing_stall_progress_binds_the_rule_minimum_to_the_observed_time()
     assert progress(with_rule, None) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": None}
     assert progress(with_rule, stop_service.StopResult(0, None, False, False)) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": None}
     assert progress(with_rule, reached) == {"minimum_simulated_seconds": 1800.0, "reached_after_seconds": 412.5}
+
+
+def test_only_a_stalled_failure_detail_names_the_stall_threshold(tmp_path: Path) -> None:
+    """The persisted detail of a stalled solve carries its rule; other runtime stops keep the plain detail."""
+    config = _profile_config("transient_drying", rule=_STALL_RULE)
+    prepared = SimpleNamespace(work_directory=tmp_path)
+
+    def detail(reason: batch_runtime.RuntimeFailureReason) -> str:
+        return batch_runtime._runtime_failure_detail(config, cast("Any", prepared), reason, 912.4)  # pyright: ignore[reportPrivateUsage]
+
+    assert detail("stalled").endswith("(threshold: 1 h simulated after 900 s)")
+    assert "threshold" not in detail("timed_out")
+
+
+_STATIONARY_LOG = (
+    "Iter SolEst ResEst Damping Stepsize #Res #Jac #Sol LinErr LinRes\n"
+    "36 1e-3 1e-2 1.0 1e-3 5 3 6 1e-14 1e-16\n"
+    "37 1e-4 1e-3 1.0 1e-4 6 4 8 2e-14 2e-16\n"
+)
+_TRANSIENT_LOG = _TRANSIENT_HEADER + "1 3600 1 2 1 2 1 0 0 1e-3 1e-4\n2 7200 1 2 1 2 1 0 0 1e-3 1e-4\n"
+_EXITED = "COMSOL exited with status 1 at "
+
+
+@pytest.mark.parametrize(
+    ("profile", "solver_log", "progress"),
+    [
+        ("steady_flow", _STATIONARY_LOG, "nonlinear iteration 37"),
+        ("transient_drying", _TRANSIENT_LOG, "2.00 h of 168 h simulated"),
+        ("transient_drying", _STATIONARY_LOG, "nonlinear iteration 37"),
+        ("steady_flow", None, "no progress reported"),
+        ("transient_drying", None, "no progress reported"),
+    ],
+)
+def test_a_failure_detail_names_the_solver_progress_of_its_task(tmp_path: Path, profile: str, solver_log: str | None, progress: str) -> None:
+    """Simulated hours of the horizon for a transient case, the last stationary nonlinear iteration for a steady one, else none reported."""
+    if solver_log is not None:
+        (tmp_path / "runtime").mkdir()
+        (tmp_path / "runtime" / "stdout.log").write_text(solver_log, encoding="utf-8")
+
+    detail = batch_runtime._runtime_failure_detail(  # pyright: ignore[reportPrivateUsage]
+        _profile_config(profile), cast("Any", SimpleNamespace(work_directory=tmp_path)), "solver_error", 120.4, cause=_EXITED
+    )
+
+    assert detail == f"solver_error: {_EXITED}{progress} after 120 s solving"
 
 
 @pytest.mark.parametrize("content", ["1790892938336\nDone", "1790892938336\nRunning extra", "Running"])

@@ -4,7 +4,8 @@ Responsibilities:
   - Validate variable-length sequence records and exact scientific identities
   - Stage deduplicated complete-case payloads with explicit resumable work evidence
   - Bind completed manifests to payload digests and support lazy case loading
-  - Publish validated operational telemetry outside scientific artifact identity
+  - Keep the required non-identity timing block outside scientific artifact identity
+  - Require the recorded analysis producer in scientific identity and expose a partial stage's recorded resume identity
 
 Design principles:
   - Case bundles retain each distinct prediction chain once per origin, without its first state, and explicit horizon prefixes
@@ -12,6 +13,7 @@ Design principles:
   - Increments and invalid masks are rederived from persisted states on load (loaded increments are state differences, not decoded model increments)
   - Prediction IEEE values and validity evidence are preserved without numerical repair
   - Payload paths, manifest inventories and persisted identity fail closed
+  - Reading validates the recorded producer strictly and never compares it with the running analysis code
 
 This module does NOT:
   - Reconstruct models, select Dataset membership or calculate scientific metrics
@@ -34,15 +36,13 @@ import numpy as np
 import pandas as pd
 
 from src import common
-from src.analysis.artifacts import analysis_artifact_performance as artifact_performance
 from src.analysis.artifacts import contracts
-from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "evaluation_transient_sequence"
-TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 5
+TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 1
 TRANSIENT_ARTIFACT_KIND: Final = "transient_sequence"
 _STEP_CONTRACT: Final = transient_contract.TRANSIENT_STEP_CONTRACT
 STATE_ORDER: Final = tuple(field.name for field in _STEP_CONTRACT.dynamic_state)
@@ -96,11 +96,11 @@ _IDENTITY_KEYS: Final = {
     "parent_checkpoint",
     "stage_a_handoff",
     "matched_compute_manifest",
-    "dataset_backend",
     "pt_payload_identity",
     "evaluation_config_identity",
     "timing_evidence_identity",
 }
+_DATASET_IDENTITY_KEYS: Final = {"artifact_dataset_name", "source_dataset_id", "saved_membership_digests", "source_index_digest"}
 _TARGET_KEYS: Final = {
     "criterion",
     "limit",
@@ -323,7 +323,7 @@ def _validate_spatial_representation_identity(
         raise TransientSequenceArtifactError(message) from error
     serialized = representation.as_dict()
     if (
-        result["schema_version"] != serialized["schema_version"]
+        not common.serialization.is_schema_version(result["schema_version"], serialized["schema_version"])
         or evaluation != serialized["represented_shape"]
         or result["axis_indices"] != serialized["axis_indices"]
         or result["index_identity_sha256"] != serialized["index_identity_sha256"]
@@ -461,8 +461,8 @@ def build_transient_spatial_identity(
     )
 
 
-def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: DatasetRole) -> dict[str, Any]:
-    """Admit exact checkpoint, Dataset, tensorizer, lineage, and backend identity."""
+def validate_sequence_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: DatasetRole) -> dict[str, Any]:
+    """Admit exact checkpoint, Dataset, tensorizer, lineage, and PT payload identity."""
     identity = _json_copy(value, label="sequence identity")
     if set(identity) != _IDENTITY_KEYS:
         missing = sorted(_IDENTITY_KEYS.difference(identity))
@@ -473,9 +473,15 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
         message = "Sequence identity contradicts its case or Dataset role."
         raise TransientSequenceArtifactError(message)
     dataset_identity = identity["dataset_identity"]
-    if not isinstance(dataset_identity, dict) or not dataset_identity:
-        message = "Sequence Dataset identity must be a non-empty mapping."
+    if not isinstance(dataset_identity, dict) or set(dataset_identity) != _DATASET_IDENTITY_KEYS:
+        message = f"Sequence Dataset identity must be exactly the mapping {sorted(_DATASET_IDENTITY_KEYS)}."
         raise TransientSequenceArtifactError(message)
+    digests = dataset_identity["saved_membership_digests"]
+    if not isinstance(digests, list) or not digests:
+        message = "Sequence Dataset identity must name a non-empty list of saved membership digests."
+        raise TransientSequenceArtifactError(message)
+    for text in (*digests, *(dataset_identity[key] for key in _DATASET_IDENTITY_KEYS - {"saved_membership_digests"})):
+        _nonempty_text(text, label="sequence Dataset identity entry")
     assignment = identity["evaluation_assignment"]
     if dataset_role == "id":
         if assignment is not None:
@@ -502,9 +508,6 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
     if identity["inference_airflow_source"] not in {"comsol_reference", "external"}:
         message = "Inference airflow source must be 'comsol_reference' or 'external'."
         raise TransientSequenceArtifactError(message)
-    if identity["dataset_backend"] not in {"canonical_hdf5", "pt_shards"}:
-        message = "Dataset backend must be canonical_hdf5 or pt_shards."
-        raise TransientSequenceArtifactError(message)
     required_text = (
         "case_id",
         "material_family",
@@ -512,14 +515,13 @@ def _validate_identity(value: Mapping[str, Any], *, case_id: str, dataset_role: 
         "coordinate_policy",
         "boundary_representation",
         "training_strategy",
-        "dataset_backend",
+        "pt_payload_identity",
         "evaluation_config_identity",
         "timing_evidence_identity",
     )
     for key in required_text:
         _nonempty_text(identity[key], label=f"sequence identity.{key}")
     for key in (
-        "dataset_identity",
         "simulation_identity",
         "model_parameters",
         "checkpoint_identity",
@@ -894,7 +896,7 @@ class TransientSequenceRecord:
             validity_arguments.pop("decoded_physical_increments")
             prediction_validity = transient_validity.validate_persisted_state_prediction_validity(self.prediction_validity, **validity_arguments)
 
-        identity = _validate_identity(self.identity, case_id=case_id, dataset_role=self.dataset_role)
+        identity = validate_sequence_identity(self.identity, case_id=case_id, dataset_role=self.dataset_role)
         _validate_spatial_representation_identity(
             identity["spatial_representation"],
             expected_shape=(height, width),
@@ -990,12 +992,8 @@ class LoadedTransientSequenceArtifact:
 
 
 def _scientific_identity_document(document: Mapping[str, Any]) -> dict[str, Any]:
-    """Return artifact identity evidence without operational performance telemetry."""
-    result = {key: value for key, value in document.items() if key not in {"outputs", "identity_sha256"}}
-    runtime = result.get("runtime")
-    if isinstance(runtime, Mapping) and "operational_performance" in runtime:
-        result["runtime"] = {key: value for key, value in runtime.items() if key != "operational_performance"}
-    return result
+    """Return artifact identity evidence without payload digests, runtime device facts or the operational timing block, as for steady."""
+    return {key: value for key, value in document.items() if key not in {"outputs", "identity_sha256", "runtime", "timing"}}
 
 
 def _chain_id_from_coordinates(*, mode: str, origin_index: int) -> str:
@@ -1036,7 +1034,6 @@ def _record_row(
         "elapsed_physical_time": record.elapsed_physical_time,
         "inference_airflow_source": record.identity["inference_airflow_source"],
         "model_kind": record.identity["model_kind"],
-        "dataset_backend": record.identity["dataset_backend"],
         "prediction_validity_status": record.prediction_validity["status"],
         "reference_reached": target["reference_reached"],
         "predicted_reached": target["predicted_reached"],
@@ -1067,7 +1064,7 @@ def _record_row(
 def _case_payload_path(case_id: str) -> Path:
     """Return the bundle path named by one strict package case ID."""
     try:
-        return Path("npz") / dataframe.case_payload_filename(case_id)
+        return Path("npz") / contracts.case_payload_filename(case_id)
     except ValueError as error:
         raise TransientSequenceArtifactError(str(error)) from error
 
@@ -1351,19 +1348,17 @@ class TransientSequenceArtifactStager:
 
     def _open_or_create_resumable_stage(self) -> None:
         descriptor_path = self._resume_descriptor_path()
+        expected = {
+            "schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
+            "dataset_name": self.dataset_name,
+            "dataset_role": self.dataset_role,
+            "resume_identity": self._resume_identity,
+        }
         if not self.root.exists():
             self.root.mkdir(parents=True)
             (self.root / "npz").mkdir()
             (self.root / self._CASE_MANIFEST_DIRECTORY).mkdir()
-            common.serialization.atomic_write_json(
-                descriptor_path,
-                {
-                    "schema_version": 1,
-                    "dataset_name": self.dataset_name,
-                    "dataset_role": self.dataset_role,
-                    "resume_identity": self._resume_identity,
-                },
-            )
+            common.serialization.atomic_write_json(descriptor_path, expected)
             return
         if contracts.artifact_provenance_path(self.root).exists():
             message = f"Transient resume stage is already finalized: {self.root}"
@@ -1376,13 +1371,7 @@ class TransientSequenceArtifactStager:
         except (OSError, json.JSONDecodeError) as error:
             message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
             raise TransientSequenceArtifactError(message) from error
-        expected = {
-            "schema_version": 1,
-            "dataset_name": self.dataset_name,
-            "dataset_role": self.dataset_role,
-            "resume_identity": self._resume_identity,
-        }
-        if descriptor != expected:
+        if descriptor != expected or not common.serialization.is_schema_version(descriptor["schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION):
             message = f"Transient partial artifact is incompatible; rerun with --rebuild: {self.root}"
             raise TransientSequenceArtifactError(message)
         manifest_directory = self.root / self._CASE_MANIFEST_DIRECTORY
@@ -1606,16 +1595,19 @@ class TransientSequenceArtifactStager:
             label="transient artifact provenance",
         )
         required_provenance = {
+            "producer",
             "run",
             "dataset",
             "evaluation",
             "spatial_representation",
             "runtime",
             "lineage",
+            "timing",
         }
         if set(admitted_provenance) != required_provenance:
             message = "Transient artifact provenance fields do not match the current role-level schema."
             raise ValueError(message)
+        admitted_provenance["producer"] = contracts.validate_analysis_producer(admitted_provenance["producer"])
         spatial_representation = admitted_provenance["spatial_representation"]
         if not isinstance(spatial_representation, dict) or not spatial_representation:
             message = "Transient artifact role spatial representation must be a non-empty mapping."
@@ -1700,6 +1692,19 @@ def cleanup_transient_resume_metadata(root: Path | str) -> None:
         descriptor.unlink()
 
 
+def recorded_resume_identity(root: Path | str) -> Mapping[str, Any] | None:
+    """Return the resume identity a partial stage recorded, or None without a readable regular descriptor, which the stager refuses."""
+    descriptor_path = Path(root).expanduser() / _RESUME_DESCRIPTOR_NAME
+    if descriptor_path.is_symlink() or not descriptor_path.is_file():
+        return None
+    try:
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    identity = descriptor.get("resume_identity") if isinstance(descriptor, dict) else None
+    return identity if isinstance(identity, dict) else None
+
+
 def write_transient_sequence_artifact(
     root: Path | str,
     *,
@@ -1739,37 +1744,6 @@ def write_transient_sequence_artifact(
         message = "Transient unavailable horizons contain cases without staged records."
         raise ValueError(message)
     return stager.finalize(provenance=provenance)
-
-
-def publish_transient_operational_performance(
-    root: Path | str,
-    value: Mapping[str, Any],
-) -> None:
-    """Publish validated non-scientific telemetry without changing artifact identity."""
-    artifact_root = Path(root).expanduser().resolve(strict=True)
-    marker = contracts.artifact_provenance_path(artifact_root)
-    if not marker.is_file() or marker.is_symlink():
-        message = f"Transient artifact completion marker is missing or unsafe: {marker}"
-        raise FileNotFoundError(message)
-    admitted = artifact_performance.validate_operational_performance(value)
-    with marker.open("r", encoding="utf-8") as handle:
-        document = json.load(handle)
-    if not isinstance(document, dict):
-        message = "Transient artifact provenance must be a mapping."
-        raise TypeError(message)
-    identity = document.get("identity_sha256")
-    if identity != common.serialization.canonical_json_sha256(_scientific_identity_document(document)):
-        message = "Transient artifact identity digest is invalid before telemetry publication."
-        raise TransientSequenceArtifactError(message)
-    runtime = document.get("runtime")
-    if not isinstance(runtime, dict):
-        message = "Transient artifact runtime provenance must be a mapping."
-        raise TypeError(message)
-    runtime["operational_performance"] = admitted
-    if identity != common.serialization.canonical_json_sha256(_scientific_identity_document(document)):
-        message = "Operational telemetry changed scientific artifact identity."
-        raise RuntimeError(message)
-    common.serialization.atomic_write_json(marker, document)
 
 
 def _require_relative_payload(root: Path, relative: Any) -> Path:
@@ -2105,7 +2079,6 @@ _SUMMARY_COLUMNS = frozenset(
         "elapsed_physical_time",
         "inference_airflow_source",
         "model_kind",
-        "dataset_backend",
         "prediction_validity_status",
         "reference_reached",
         "predicted_reached",
@@ -2135,7 +2108,7 @@ def _summary_from_row(  # noqa: C901
         raise TransientSequenceArtifactError(message)
     if (
         row["schema_kind"] != TRANSIENT_SEQUENCE_SCHEMA_KIND
-        or row["schema_version"] != TRANSIENT_SEQUENCE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(row["schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION)
         or row["dataset_role"] != dataset_role
     ):
         message = "Transient sequence summary schema or Dataset role is incompatible."
@@ -2166,7 +2139,7 @@ def _summary_from_row(  # noqa: C901
         label="summary payload_sha256",
     )
     try:
-        identity = _validate_identity(json.loads(str(row["identity_json"])), case_id=case_id, dataset_role=dataset_role)
+        identity = validate_sequence_identity(json.loads(str(row["identity_json"])), case_id=case_id, dataset_role=dataset_role)
         target = _validate_target(json.loads(str(row["target_json"])))
         timing = _json_copy(json.loads(str(row["timing_json"])), label="sequence timing")
         exclusion = _validate_exclusion(json.loads(str(row["exclusion_json"])))
@@ -2194,7 +2167,6 @@ def _summary_from_row(  # noqa: C901
     if (
         row["inference_airflow_source"] != identity["inference_airflow_source"]
         or row["model_kind"] != identity["model_kind"]
-        or row["dataset_backend"] != identity["dataset_backend"]
         or row["prediction_validity_status"] != prediction_validity["status"]
         or prediction_validity["mode"] != mode
         or prediction_validity["origin_index"] != origin
@@ -2431,22 +2403,6 @@ def _validate_case_payload_manifest(
             raise TransientSequenceArtifactError(message)
 
 
-def _validate_runtime_performance(provenance: Mapping[str, Any]) -> None:
-    """Admit optional operational telemetry outside scientific identity."""
-    runtime = provenance.get("runtime")
-    if not isinstance(runtime, Mapping):
-        message = "Transient artifact runtime provenance must be a mapping."
-        raise TransientSequenceArtifactError(message)
-    operational_performance = runtime.get("operational_performance")
-    if operational_performance is None:
-        return
-    try:
-        artifact_performance.validate_operational_performance(operational_performance)
-    except (TypeError, ValueError) as error:
-        message = "Transient artifact operational performance is invalid."
-        raise TransientSequenceArtifactError(message) from error
-
-
 def _index_from_admitted_frame(
     artifact_root: Path,
     *,
@@ -2556,12 +2512,14 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
         "artifact_schema_version",
         "artifact_kind",
         "task",
+        "producer",
         "run",
         "dataset",
         "evaluation",
         "spatial_representation",
         "runtime",
         "lineage",
+        "timing",
         "availability",
         "outputs",
         "identity_sha256",
@@ -2569,19 +2527,23 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
     if not isinstance(provenance, dict) or set(provenance) != required:
         message = "Transient artifact provenance fields do not match the schema."
         raise TransientSequenceArtifactError(message)
+    # Recorded evidence only: a historical artifact is never compared with the running analysis code here.
+    contracts.validate_analysis_producer(provenance["producer"])
     expected_static = {
         "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
         "artifact_kind": TRANSIENT_ARTIFACT_KIND,
         "task": "transient_drying",
     }
-    if provenance["artifact_schema_version"] != TRANSIENT_SEQUENCE_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(provenance["artifact_schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION):
         message = (
             f"Transient artifact schema version {provenance['artifact_schema_version']!r} is unsupported; "
             f"expected {TRANSIENT_SEQUENCE_SCHEMA_VERSION}. Regenerate the artifact."
         )
         raise TransientSequenceArtifactError(message)
-    if any(provenance[key] != value for key, value in expected_static.items()):
+    if any(provenance[key] != value for key, value in expected_static.items()) or not common.serialization.is_schema_version(
+        provenance["provenance_schema_version"], contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION
+    ):
         message = "Transient artifact schema or task identity is unsupported."
         raise TransientSequenceArtifactError(message)
     if provenance["outputs"] != contracts.artifact_output_manifest(artifact_root):
@@ -2591,7 +2553,6 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
     if provenance["identity_sha256"] != common.serialization.canonical_json_sha256(identity_document):
         message = "Transient artifact identity digest is invalid."
         raise TransientSequenceArtifactError(message)
-    _validate_runtime_performance(provenance)
     if not isinstance(provenance["spatial_representation"], dict) or not provenance["spatial_representation"]:
         message = "Transient artifact role spatial representation must be a non-empty mapping."
         raise TransientSequenceArtifactError(message)

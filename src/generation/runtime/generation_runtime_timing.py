@@ -27,6 +27,7 @@ from numbers import Real
 from typing import TYPE_CHECKING, Any, Protocol
 
 from src import common
+from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol_timing as comsol_timing
 
@@ -35,7 +36,6 @@ if TYPE_CHECKING:
 
 _TIMING_SCHEMA_KIND = "simulation_case_timing"
 _STATUS_SCHEMA_KIND = "simulation_case_status"
-_SCHEMA_VERSION = 1
 _UNAVAILABLE_NOT_PERSISTED = "unavailable_not_persisted"
 _UNAVAILABLE_NOT_APPLICABLE = "unavailable_not_applicable"
 _UNAVAILABLE_MISSING = "unavailable_missing"
@@ -98,7 +98,7 @@ class CaseTimingEvidence:
     stall_minimum_reached_after_seconds: float | None
     queue_wait_seconds: None
     generation_compute_end_to_end_seconds: None
-    comsol_solver_timing: comsol_timing.ComsolSolverTiming | None
+    comsol_solver_timing: comsol_timing.ComsolSolverTiming
     component_timing_availability: tuple[tuple[str, str], ...]
 
     def as_dict(self) -> dict[str, Any]:
@@ -128,7 +128,7 @@ class CaseTimingEvidence:
             "stall_minimum_reached_after_seconds": self.stall_minimum_reached_after_seconds,
             "queue_wait_seconds": None,
             "generation_compute_end_to_end_seconds": None,
-            "comsol_solver_timing": None if self.comsol_solver_timing is None else self.comsol_solver_timing.as_dict(),
+            "comsol_solver_timing": self.comsol_solver_timing.as_dict(),
             "component_timing_availability": dict(self.component_timing_availability),
         }
 
@@ -276,7 +276,9 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
     _validate_batch_binding(case, batch)
     timing = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/timing.json")
     status = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/status.json")
-    if timing.get("schema_kind") != _TIMING_SCHEMA_KIND or timing.get("schema_version") != _SCHEMA_VERSION:
+    if timing.get("schema_kind") != _TIMING_SCHEMA_KIND or not common.serialization.is_schema_version(
+        timing.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION
+    ):
         msg = "Case timing does not use the current simulation_case_timing schema."
         raise ValueError(msg)
     expected = {
@@ -293,7 +295,9 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
     if timing.get("exit_code") != 0 or timing.get("timed_out") is not False:
         msg = "Case timing does not represent a successful completed COMSOL process."
         raise ValueError(msg)
-    if status.get("schema_kind") != _STATUS_SCHEMA_KIND or status.get("schema_version") != _SCHEMA_VERSION:
+    if status.get("schema_kind") != _STATUS_SCHEMA_KIND or not common.serialization.is_schema_version(
+        status.get("schema_version"), storage_service.STATUS_SCHEMA_VERSION
+    ):
         msg = "Case status does not use the current simulation_case_status schema."
         raise ValueError(msg)
     physical_duration, time_to_target, target_reached, right_censored, final_wet, physical_availability, status_runtime = _physical_status(
@@ -323,31 +327,17 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         timing,
         simulation_profile=batch.simulation_profile,
     )
-    if solver_timing is None:
-        stationary_seconds = None
-        transient_seconds = None
-        scientific_seconds = None
-        solver_components = (
-            ("stationary_airflow_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
-            ("transient_drying_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
-            ("scientific_solver_seconds", _UNAVAILABLE_NOT_PERSISTED),
-        )
-    else:
-        stationary_seconds = solver_timing.stationary_airflow.seconds
-        transient_seconds = solver_timing.transient_drying.seconds
-        scientific_seconds = solver_timing.scientific_solver_seconds
-        scientific_availability = (
-            _AVAILABLE
-            if solver_timing.status == "complete"
-            else _UNAVAILABLE_AMBIGUOUS
-            if solver_timing.status == "ambiguous"
-            else _UNAVAILABLE_MISSING
-        )
-        solver_components = (
-            ("stationary_airflow_solver_seconds", _phase_availability(solver_timing.stationary_airflow.status)),
-            ("transient_drying_solver_seconds", _phase_availability(solver_timing.transient_drying.status)),
-            ("scientific_solver_seconds", scientific_availability),
-        )
+    stationary_seconds = solver_timing.stationary_airflow.seconds
+    transient_seconds = solver_timing.transient_drying.seconds
+    scientific_seconds = solver_timing.scientific_solver_seconds
+    scientific_availability = (
+        _AVAILABLE if solver_timing.status == "complete" else _UNAVAILABLE_AMBIGUOUS if solver_timing.status == "ambiguous" else _UNAVAILABLE_MISSING
+    )
+    solver_components = (
+        ("stationary_airflow_solver_seconds", _phase_availability(solver_timing.stationary_airflow.status)),
+        ("transient_drying_solver_seconds", _phase_availability(solver_timing.transient_drying.status)),
+        ("scientific_solver_seconds", scientific_availability),
+    )
     stall_minimum, stall_reached_after, stall_availability = _stall_progress(timing)
     components = (
         *solver_components,

@@ -3,12 +3,21 @@
 
 run:
   seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
+  deterministic: false  # Request deterministic kernels where supported; false keeps the faster non-deterministic kernels.
   device: auto  # Requested compute device; auto selects an available supported device.
 
 data:
   train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
   additional_evaluation_datasets: []  # Optional built Datasets whose declared OOD cases are evaluated in addition to validation and ID-test.
   batch_size: 32  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
+  num_workers: 8  # Data-loader worker processes; the loader benchmark measured 893 items/s with 8 workers against 763 with 0.
+  pin_memory: true  # Page-locked host memory for faster host-to-GPU copies.
+  persistent_workers: true  # Keep the worker processes alive across epochs.
+
+model:
+  params:
+    positional_embedding: null  # No positional embedding: x and y are explicit input channels, and an embedding grid would give one physical point different coordinates at different strides.
+    domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; the fields are not periodic, and padding keeps the FFT wrap-around away from the boundaries.
 
 loss:
   data:
@@ -29,18 +38,17 @@ optimizer:
 scheduler:
   kind: reduce_on_plateau  # Learning-rate schedule policy.
   factor: 0.5  # Multiplicative learning-rate reduction after a plateau.
-  patience: 20  # Validation checks without improvement before reducing the learning rate; at evaluation_interval 5 this is 100 epochs.
+  patience: 20  # Validation checks without improvement before reducing the learning rate; at evaluation_interval 2 this is 40 epochs.
   min_lr: 1.0e-5  # Lower bound for the scheduled learning rate.
 
 training:
   epochs: 600  # Maximum training epochs for steady-flow runs.
-  evaluation_interval: 5  # Validate every this many epochs; validation selects the checkpoint and drives the scheduler.
-  additional_evaluation_interval: 5  # Evaluate the additional evaluation Datasets every this many epochs.
-  mixed_precision: false  # Enable mixed-precision arithmetic when supported.
+  evaluation_interval: 2  # Validate every this many epochs; validation selects the checkpoint and drives the scheduler.
+  additional_evaluation_interval: 2  # Evaluate the additional evaluation Datasets every this many epochs.
 
 tracking:
   wandb:
     mode: online  # W&B logging mode, such as online or offline.
     workflow: train  # Workflow label attached to tracking metadata.
     monitor:
-      interval: 5  # Monitoring interval in epochs.
+      interval: 2  # Monitoring interval in epochs; Optuna studies require it to equal training.evaluation_interval.

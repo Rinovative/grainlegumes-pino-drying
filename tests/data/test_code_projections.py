@@ -5,6 +5,9 @@ Responsibilities:
   - Check that an unclassified import is reported by file and line, on synthetic trees and on a copy of the real tree
   - Check that package-alias resolution lets a runtime binding win over a TYPE_CHECKING alias and reports contradictory runtime bindings
   - Check member resolution including package initializers, the syntax-only digest, composition, and the task separation of the training projections
+  - Check that the model projection follows fit and application code while loss, metric and lifecycle edits spare it
+  - Check that the analysis projection includes the model projection of its task and follows metric and artifact code
+    while training-only edits and the other task spare it
   - Check that the owners compute their identities from their declared projections
 
 Design principles:
@@ -27,6 +30,7 @@ import pytest
 from support import import_closure
 
 from src import common, datasets, generation, learning
+from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.experiments.tuning import experiments_tuning_optuna as optuna_runtime
 
 if TYPE_CHECKING:
@@ -41,11 +45,13 @@ _PROJECTIONS: dict[str, CodeProjection] = {
         generation.contracts.source.GENERATION_INPUT_PROJECTION,
         generation.contracts.source.GENERATION_SOURCE_PROJECTION,
         *datasets.packages.reproduction.DATASET_CONVERSION_PROJECTIONS.values(),
+        *learning.training.checkpoint.MODEL_PROJECTIONS.values(),
         *learning.training.checkpoint.TRAINING_PROJECTIONS.values(),
         *optuna_runtime.HPO_PROJECTIONS.values(),
+        *artifact_contracts.ANALYSIS_PROJECTIONS.values(),
     )
 }
-_EXPECTED_PROJECTION_COUNT = 8
+_EXPECTED_PROJECTION_COUNT = 12
 _ONE = "value = 1\n"
 
 
@@ -57,7 +63,7 @@ def _write_tree(root: Path, files: Mapping[str, str]) -> None:
 
 
 def test_all_declared_projections_are_covered() -> None:
-    """Cover generation input and source, both Dataset views, both training tasks and both studies."""
+    """Cover generation input and source, both Dataset views, and the model, training, study and analysis projections of both tasks."""
     assert len(_PROJECTIONS) == _EXPECTED_PROJECTION_COUNT
 
 
@@ -373,6 +379,26 @@ def test_digest_ignores_comments_and_docstrings_and_follows_code_and_membership(
     assert widened.sha256(tmp_path) != changed
 
 
+def test_current_implementation_guard_accepts_the_running_digest_and_refuses_drift_or_bad_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pass a matching digest; refuse a changed, malformed or missing one, naming unit, projection and remedy."""
+    _write_tree(tmp_path, {"core.py": _ONE})
+    unrooted_sha256 = CodeProjection.sha256
+    monkeypatch.setattr(CodeProjection, "sha256", lambda self, root=None: unrooted_sha256(self, tmp_path if root is None else root))
+    projection = CodeProjection(name="synthetic", files=("core.py",))
+    recorded = projection.sha256()
+    guard = common.code_identity.require_current_implementation
+
+    guard(projection, recorded, unit="Run x", remedy="start a new run")
+    (tmp_path / "core.py").write_text("value = 2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"^Run x: synthetic implementation changed \(recorded \w{12}, current \w{12}\); start a new run$"):
+        guard(projection, recorded, unit="Run x", remedy="start a new run")
+    for bad in (None, recorded.upper(), recorded[:-1]):
+        with pytest.raises(ValueError, match=r"^Run x: recorded synthetic implementation digest is missing or malformed; start a new run$"):
+            guard(projection, bad, unit="Run x", remedy="start a new run")
+
+
 def test_composition_includes_the_included_members_in_members_and_digest(tmp_path: Path) -> None:
     """Resolve an including projection as its own files plus the included projection, hash included."""
     _write_tree(tmp_path, {"own.py": _ONE, "shared/shared.py": _ONE})
@@ -382,6 +408,16 @@ def test_composition_includes_the_included_members_in_members_and_digest(tmp_pat
     before = including.sha256(tmp_path)
     (tmp_path / "shared/shared.py").write_text("value = 2\n", encoding="utf-8")
     assert including.sha256(tmp_path) != before
+
+
+@pytest.mark.parametrize("task_id", sorted(learning.training.checkpoint.TRAINING_PROJECTIONS))
+def test_training_projection_includes_the_model_projection_of_its_task(task_id: str) -> None:
+    """Make a model change invalidate the training identity of the same task, never the other way round."""
+    checkpoint = learning.training.checkpoint
+    model = checkpoint.MODEL_PROJECTIONS[task_id]
+    training = checkpoint.TRAINING_PROJECTIONS[task_id]
+    assert training.includes == (model,)
+    assert set(model.members()) < set(training.members())
 
 
 @pytest.mark.parametrize("task_id", sorted(learning.training.checkpoint.TRAINING_PROJECTIONS))
@@ -403,7 +439,9 @@ def test_owners_compute_identities_from_their_declared_projections() -> None:
     checkpoint = learning.training.checkpoint
     for task_id, projection in checkpoint.TRAINING_PROJECTIONS.items():
         assert checkpoint.scientific_implementation_digest(task_id) == projection.sha256()
+        assert checkpoint.model_implementation_digest(task_id) == checkpoint.MODEL_PROJECTIONS[task_id].sha256()
         assert optuna_runtime._hpo_implementation_sha256(task_id) == optuna_runtime.HPO_PROJECTIONS[task_id].sha256()
+        assert artifact_contracts.analysis_producer(task_id) == {"analysis_sha256": artifact_contracts.ANALYSIS_PROJECTIONS[task_id].sha256()}
     for view, projection in datasets.packages.reproduction.DATASET_CONVERSION_PROJECTIONS.items():
         assert datasets.packages.reproduction.conversion_implementation_sha256(view) == projection.sha256()
     source = generation.contracts.source
@@ -412,6 +450,8 @@ def test_owners_compute_identities_from_their_declared_projections() -> None:
     assert identity["source_implementation_sha256"] == source.GENERATION_SOURCE_PROJECTION.sha256()
     with pytest.raises(ValueError, match="No training implementation projection"):
         checkpoint.scientific_implementation_digest("unregistered_task")
+    with pytest.raises(ValueError, match="No model implementation projection"):
+        checkpoint.model_implementation_digest("unregistered_task")
     with pytest.raises(ValueError, match="No HPO implementation projection"):
         optuna_runtime._hpo_implementation_sha256("unregistered_task")
     with pytest.raises(ValueError, match="Unsupported Dataset implementation view"):
@@ -462,3 +502,78 @@ def test_training_projection_covers_task_science_without_unrelated_coupling(
     before = projection.sha256(root)
     (root / relative_path).write_text("value = 2\n", encoding="utf-8")
     assert (projection.sha256(root) != before) is changes_identity
+
+
+@pytest.mark.parametrize(
+    ("task_id", "relative_path", "changes_identity"),
+    [
+        ("steady_flow", "datasets/runtime/dataset_runtime_training.py", True),
+        ("steady_flow", "learning/models/learning_models_factory.py", True),
+        ("steady_flow", "learning/losses/learning_losses_pino.py", False),
+        ("steady_flow", "learning/metrics/learning_metrics.py", False),
+        ("transient_drying", "learning/transient/learning_transient_scaling.py", True),
+        ("transient_drying", "learning/losses/learning_losses_transient.py", False),
+        ("transient_drying", "learning/transient/learning_transient_curriculum.py", False),
+    ],
+)
+def test_model_projection_covers_fit_and_application_code_but_not_losses_metrics_or_lifecycle(
+    tmp_path: Path,
+    task_id: str,
+    relative_path: str,
+    changes_identity: bool,
+) -> None:
+    """Refit scaling and refuse stale weights on prediction-code edits while a loss-only edit spares the model."""
+    projection = learning.training.checkpoint.MODEL_PROJECTIONS[task_id]
+    root = tmp_path / "src"
+    _write_tree(root, dict.fromkeys(projection.members(_SOURCE_ROOT), _ONE))
+    _write_tree(root, {relative_path: _ONE})
+    before = projection.sha256(root)
+    (root / relative_path).write_text("value = 2\n", encoding="utf-8")
+    assert (projection.sha256(root) != before) is changes_identity
+
+
+@pytest.mark.parametrize("task_id", sorted(artifact_contracts.ANALYSIS_PROJECTIONS))
+def test_analysis_projection_includes_the_model_projection_of_its_task_only(task_id: str) -> None:
+    """Refuse stale artifacts after prediction-code edits of the same task, never after the other task's artifact code."""
+    model = learning.training.checkpoint.MODEL_PROJECTIONS[task_id]
+    analysis = artifact_contracts.ANALYSIS_PROJECTIONS[task_id]
+    assert analysis.includes == (model,)
+    assert set(model.members()) < set(analysis.members())
+    other = next(other for other in artifact_contracts.ANALYSIS_PROJECTIONS if other != task_id)
+    own_writer = {"steady_flow": "analysis_artifact_generation.py", "transient_drying": "analysis_artifact_transient.py"}
+    members = {Path(member).name for member in analysis.members()}
+    assert own_writer[task_id] in members
+    assert own_writer[other] not in members
+
+
+@pytest.mark.parametrize(
+    ("task_id", "relative_path", "changed"),
+    [
+        ("steady_flow", "learning/models/learning_models_factory.py", {"model", "training", "analysis"}),
+        ("steady_flow", "learning/metrics/learning_metrics.py", {"training", "analysis"}),
+        ("steady_flow", "analysis/artifacts/analysis_artifact_service.py", {"analysis"}),
+        ("steady_flow", "analysis/artifacts/analysis_artifact_transient.py", set()),
+        ("transient_drying", "learning/transient/learning_transient_rollout.py", {"model", "training", "analysis"}),
+        ("transient_drying", "analysis/evaluation/evaluation_transient_metrics.py", {"analysis"}),
+        ("transient_drying", "learning/transient/learning_transient_curriculum.py", {"training"}),
+        ("transient_drying", "analysis/artifacts/analysis_artifact_generation.py", set()),
+    ],
+)
+def test_analysis_projection_composes_with_model_and_training_identities(
+    tmp_path: Path,
+    task_id: str,
+    relative_path: str,
+    changed: set[str],
+) -> None:
+    """A model edit moves model, training and analysis; a metric edit moves training and analysis; artifact edits move analysis only."""
+    projections = {
+        "model": learning.training.checkpoint.MODEL_PROJECTIONS[task_id],
+        "training": learning.training.checkpoint.TRAINING_PROJECTIONS[task_id],
+        "analysis": artifact_contracts.ANALYSIS_PROJECTIONS[task_id],
+    }
+    root = tmp_path / "src"
+    _write_tree(root, dict.fromkeys({member for projection in projections.values() for member in projection.members(_SOURCE_ROOT)}, _ONE))
+    _write_tree(root, {relative_path: _ONE})
+    before = {name: projection.sha256(root) for name, projection in projections.items()}
+    (root / relative_path).write_text("value = 2\n", encoding="utf-8")
+    assert {name for name, projection in projections.items() if projection.sha256(root) != before[name]} == changed

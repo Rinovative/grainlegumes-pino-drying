@@ -6,6 +6,7 @@ Responsibilities:
   - Keep comparable map axes equal-sized with row/column-aware axis labels
   - Size composite line-and-map figures without plot-local magic numbers
   - Center figure titles over data axes when a right-side column is present
+  - Mark panels whose bounded prefix has no finite case as unavailable
 
 Design principles:
   - Layout is presentation-only and never changes scientific values
@@ -115,6 +116,17 @@ def aggregate_title_context(title: str, case_counts: Mapping[str, int]) -> tuple
     if len(unique_counts) == 1:
         return case_title(title, case_count=next(iter(unique_counts))), dict.fromkeys(case_counts, "")
     return title, validated
+
+
+def empty_prefix_text(case_count: int) -> str:
+    """Return how a bounded-prefix view states that no finite case remains, never a number and never zero."""
+    return f"unavailable (0 finite of {case_count} prefix cases)"
+
+
+def mark_empty_prefix(*axes: Axes, case_count: int) -> None:
+    """Show on every given panel that its bounded prefix has no finite case, instead of drawing or failing."""
+    for axis in axes:
+        axis.text(0.5, 0.5, empty_prefix_text(case_count), ha="center", va="center", transform=axis.transAxes)
 
 
 def map_subplots(*, rows: int, columns: int, **kwargs: Any) -> tuple[Figure, Any]:

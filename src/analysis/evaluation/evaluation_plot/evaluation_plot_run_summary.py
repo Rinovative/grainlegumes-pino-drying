@@ -32,6 +32,7 @@ import pandas as pd
 
 from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
 if TYPE_CHECKING:
@@ -53,12 +54,9 @@ def _provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
 
 
 def _finite_quantile(frame: pd.DataFrame, column: str, quantile: float) -> float:
-    """Return one finite per-case metric quantile."""
-    values = np.asarray(pd.to_numeric(frame[column], errors="raise"), dtype=float)
-    if values.size == 0 or not np.isfinite(values).all():
-        msg = f"Metric {column!r} must contain finite values."
-        raise ValueError(msg)
-    return float(np.quantile(values, quantile))
+    """Return one per-case metric quantile over the finite cases, or NaN (never plotted) when no case is finite."""
+    values = validity_contract.finite_case_values(pd.to_numeric(frame[column], errors="raise"))
+    return float(np.quantile(values, quantile)) if values.size else float("nan")
 
 
 def _model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
@@ -126,6 +124,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
         run = provenance["run"]
         dataset = provenance["dataset"]
         aggregate = frame.attrs["normalized_group_macro_rmse"]
+        unavailable = None if aggregate["available"] else validity_contract.unavailable_text(aggregate)
         fields = tuple(frame.attrs["output_fields"])
         units = dataframe.field_units(frame)
         family, trainable, physics_enabled = _model_metadata(frame)
@@ -137,7 +136,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
             "architecture_family": family,
             "trainable_parameters": trainable,
             "physics_enabled": physics_enabled,
-            "normalized_group_macro_rmse": float(aggregate["value"]),
+            "normalized_group_macro_rmse": unavailable or float(aggregate["value"]),
             "relative_l2_median": _finite_quantile(frame, "rel_l2", 0.5),
             "relative_l2_q90": _finite_quantile(frame, "rel_l2", 0.9),
             "relative_h1_median": _finite_quantile(frame, "rel_h1", 0.5),
@@ -147,15 +146,14 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
             "config_digest": str(run["effective_config_digest"]),
             "checkpoint_digest": str(run["best_checkpoint_sha256"]),
         }
-        field_statistics = aggregate["field_statistics"]
         for field in fields:
-            row[f"normalized_rmse_{field}"] = float(field_statistics[field]["normalized_rmse"])
+            row[f"normalized_rmse_{field}"] = unavailable or float(aggregate["field_statistics"][field]["normalized_rmse"])
             physical_column = contracts.physical_statistic_columns(field)[2]
             row[f"physical_rmse_{field}_median [{units[field]}]"] = _finite_quantile(frame, physical_column, 0.5)
             row[f"physical_rmse_{field}_q90 [{units[field]}]"] = _finite_quantile(frame, physical_column, 0.9)
-        for group_id, statistics in aggregate["group_statistics"].items():
-            row[f"normalized_group_rmse_{group_id}"] = float(statistics["normalized_rmse"])
-            row[f"physical_group_rmse_{group_id}"] = float(statistics["physical_rmse"])
+        for group_id, _group_fields in frame.attrs["output_groups"]:
+            for space in ("normalized", "physical"):
+                row[f"{space}_group_rmse_{group_id}"] = unavailable or float(aggregate["group_statistics"][group_id][f"{space}_rmse"])
         if "physical_rmse_speed_magnitude" in frame.columns:
             row["physical_rmse_speed_magnitude_median [m/s]"] = _finite_quantile(
                 frame,
@@ -195,12 +193,16 @@ def _blue_style(table: pd.DataFrame) -> pd.DataFrame:
     return styles
 
 
+def _cell_text(value: object) -> str:
+    """Format a number to four significant digits and keep text, such as an unavailable metric, verbatim."""
+    return f"{value:.4g}" if isinstance(value, Real) and not isinstance(value, bool) else str(value)
+
+
 def _styled_table(table: pd.DataFrame, *, title: str) -> widgets.VBox:
     """Render one automatically displayed blue table."""
     styles = _blue_style(table)
-    formats: dict[Any, Any] = {column: "{:.4g}" for column in table.columns if pd.api.types.is_numeric_dtype(table[column])}
     styler = table.style
-    styler.format(formats)
+    styler.format(_cell_text)
     styler.apply(lambda _table: styles, axis=None)
     return widgets.VBox((widgets.HTML(f"<h2>{title}</h2>"), widgets.HTML(styler.to_html())))
 
@@ -240,38 +242,36 @@ def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame])
         "Comparison-relative normalized error",
         layout.effective_case_counts(datasets),
     )
-    first_groups = datasets[labels[0]].attrs["normalized_group_macro_rmse"].get("group_statistics")
-    if not isinstance(first_groups, Mapping):
-        msg = "Relative comparison scoreboard requires aggregate group statistics."
-        raise TypeError(msg)
-    group_ids = tuple(str(group_id) for group_id in first_groups)
+    group_ids = tuple(str(group_id) for group_id, _fields in datasets[labels[0]].attrs["output_groups"])
     diagnostic_labels = ("Task macro", *(f"Group: {group_id}" for group_id in group_ids))
-    raw = np.empty((len(labels), len(diagnostic_labels)), dtype=float)
+    # An unavailable aggregate stays NaN: it gets no bar and its tick names the support counts instead.
+    raw = np.full((len(labels), len(diagnostic_labels)), np.nan)
+    tick_labels = [count_headings[label] or label for label in labels]
     for row, label in enumerate(labels):
         aggregate = datasets[label].attrs["normalized_group_macro_rmse"]
-        groups = aggregate.get("group_statistics")
-        if not isinstance(groups, Mapping) or tuple(str(group_id) for group_id in groups) != group_ids:
+        if not aggregate["available"]:
+            tick_labels[row] += f"\n{validity_contract.unavailable_text(aggregate)}"
+            continue
+        groups = aggregate["group_statistics"]
+        if tuple(str(group_id) for group_id in groups) != group_ids:
             msg = "Relative comparison scoreboard requires identical ordered task groups."
             raise dataframe.ComparisonCompatibilityError(msg)
-        raw[row, 0] = float(aggregate["value"])
-        for column, group_id in enumerate(group_ids, start=1):
-            statistics = groups[group_id]
-            if not isinstance(statistics, Mapping):
-                msg = f"Aggregate statistics for group {group_id!r} must be a mapping."
-                raise TypeError(msg)
-            raw[row, column] = float(statistics["normalized_rmse"])
-    if not np.isfinite(raw).all() or np.any(raw < 0.0):
-        msg = "Relative comparison scoreboard requires finite non-negative normalized errors."
+        raw[row] = [float(aggregate["value"]), *(float(groups[group_id]["normalized_rmse"]) for group_id in group_ids)]
+    available = np.isfinite(raw)
+    if np.any(raw[available] < 0.0):
+        msg = "Relative comparison scoreboard requires non-negative normalized errors."
         raise ValueError(msg)
 
     relative = np.full_like(raw, np.nan)
     for column in range(raw.shape[1]):
-        best = float(np.min(raw[:, column]))
+        if not available[:, column].any():
+            continue
+        best = float(np.nanmin(raw[:, column]))
         if best == 0.0:
             relative[raw[:, column] == 0.0, column] = 1.0
         else:
             relative[:, column] = raw[:, column] / best
-    tied_diagnostics = bool(np.allclose(relative, 1.0, rtol=1e-6, atol=1e-12, equal_nan=False))
+    tied_diagnostics = bool(available.all() and np.allclose(relative, 1.0, rtol=1e-6, atol=1e-12, equal_nan=False))
 
     figure = plt.figure(figsize=(max(12.5, 3.5 * len(labels) + 2.5), 5.3))
     grid = figure.add_gridspec(1, 2, width_ratios=(1.0, 0.28), wspace=0.18)
@@ -282,10 +282,11 @@ def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame])
     width = min(0.8 / len(diagnostic_labels), 0.24)
     offsets = (np.arange(len(diagnostic_labels)) - (len(diagnostic_labels) - 1) / 2.0) * width
     for offset, diagnostic, values in zip(offsets, diagnostic_labels, relative.T, strict=True):
-        axis.bar(positions + offset, np.nan_to_num(values, nan=0.0), width, label=diagnostic)
+        shown = np.isfinite(values)
+        axis.bar(positions[shown] + offset, values[shown], width, label=diagnostic)
     axis.axhline(1.0, color="black", linestyle="--", linewidth=1.0, alpha=0.65)
     axis.set_xticks(positions)
-    axis.set_xticklabels([count_headings[label] or label for label in labels], rotation=25, ha="right")
+    axis.set_xticklabels(tick_labels, rotation=25, ha="right")
     axis.set_ylabel("Ratio to displayed best per metric (lower is better)")
     subtitle = (
         "Displayed models are tied across all shown normalized diagnostics\nThis is a descriptive comparison, not an overall ranking"
@@ -508,7 +509,6 @@ def _add_physics_configuration(
     row.update(
         {
             "Physics-informed loss · Derivative operator": derivatives.get("kind"),
-            "Physics-informed loss · Derivative extension": derivatives.get("extension"),
             "Physics-informed loss · Interior crop": physics.get("interior_crop"),
         }
     )
@@ -652,10 +652,14 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
     legend_axis = figure.add_subplot(grid[0, 3])
     legend_axis.axis("off")
     colors = plt.get_cmap("tab10")
+    aggregates = {label: frame.attrs["normalized_group_macro_rmse"] for label, frame in datasets.items()}
+    unavailable = [f"{label}: {validity_contract.unavailable_text(item)}" for label, item in aggregates.items() if not item["available"]]
     for axis, metric in zip(axes, dataframe.STEADY_PHYSICS_METRICS, strict=True):
         metric_label, unit = _PHYSICS_LABELS[metric]
         for index, (label, frame) in enumerate(datasets.items()):
-            primary = float(frame.attrs["normalized_group_macro_rmse"]["value"])
+            if not aggregates[label]["available"]:
+                continue
+            primary = float(aggregates[label]["value"])
             physics_value = _finite_quantile(frame, metric, 0.5)
             if primary < 0.0 or physics_value < 0.0:
                 msg = f"Pareto metrics must be non-negative. {label!r} supplied {primary}, {physics_value}."
@@ -688,6 +692,8 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         legend_axis.legend(handles, labels, loc="upper left", title="Model / dataset", frameon=True)
+    if unavailable:
+        legend_axis.text(0.0, 0.0, "Not plotted:\n" + "\n".join(unavailable), transform=legend_axis.transAxes, fontsize=8, va="bottom", wrap=True)
     figure.subplots_adjust(top=0.84, bottom=0.14, left=0.06, right=0.98)
     layout.title_over_axes(figure, figure_title, axes, y=0.96)
     return figure

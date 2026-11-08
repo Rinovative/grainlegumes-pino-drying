@@ -35,7 +35,7 @@ import shutil
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -47,7 +47,6 @@ from src import datasets, learning
 
 from . import experiments_run_identity as run_identity
 from . import experiments_wandb_schema as wandb_schema
-from .config import experiments_config_defaults as config_defaults
 
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
@@ -74,12 +73,23 @@ _TRANSIENT_EVALUATION_METRIC_KEY = re.compile(
     rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|additional_evaluation)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
 )
 _TRANSIENT_EVALUATION_PIPELINE_KEY = re.compile(r"^evaluation/pipeline/(?:0|[1-9][0-9]*)/(?P<metric>[A-Za-z0-9_]+)$")
-_TRANSIENT_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|additional_evaluation)/name$")
+_STEADY_EVALUATION_METRIC_KEY = re.compile(r"^evaluation/(?:id|additional_evaluation)/(?P<metric>[A-Za-z0-9_]+)$")
+_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|additional_evaluation)/name$")
 _TRANSIENT_EVALUATION_SPEEDUP_KEY = re.compile(
     r"^evaluation/timing/speedup/(?P<name>drying_only_solver_speedup|full_pipeline_solver_speedup|hybrid_component_speedup|comsol_process_speedup|generation_compute_end_to_end_speedup)/(?P<metric>available_count|unavailable_count|ratio_of_sums)$"
 )
-_TRANSIENT_EVALUATION_COMPONENT_KEY = re.compile(
-    r"^evaluation/timing/component/(?P<name>comsol_transient_drying_seconds|drying_no_rollout_model_seconds|dataset_materialization_seconds)/(?P<metric>available_count|median_seconds)$"
+_EVALUATION_COMPONENT_KEY = re.compile(
+    r"^evaluation/timing/component/(?P<name>comsol_transient_drying_seconds|drying_no_rollout_model_seconds|dataset_materialization_seconds|batch_amortized_neural_operator_forward_seconds)/(?P<metric>available_count|median_seconds)$"
+)
+_STEADY_EVALUATION_COUNT_METRICS = frozenset(
+    {"valid_case_count", "nonfinite_case_count", "required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count"}
+)
+_STEADY_EVALUATION_SUMMARY_METRICS = frozenset(
+    {
+        *_STEADY_EVALUATION_COUNT_METRICS,
+        "normalized_group_macro_rmse",
+        *(f"{space}_rmse_{field}" for space in ("normalized", "physical") for field in ("p", "u", "v")),
+    }
 )
 _TRANSIENT_EVALUATION_SUMMARY_METRICS = frozenset(
     {
@@ -139,7 +149,7 @@ _TRANSIENT_EVALUATION_PIPELINE_METRICS = frozenset(
         "upstream_airflow_error",
     }
 )
-_TRANSIENT_EVALUATION_HASH_IDENTITIES = frozenset(
+_EVALUATION_HASH_IDENTITIES = frozenset(
     {
         "evaluation/identity/checkpoint_sha256",
         "evaluation/identity/timing_evidence_sha256",
@@ -147,14 +157,14 @@ _TRANSIENT_EVALUATION_HASH_IDENTITIES = frozenset(
         "evaluation/timing/hardware_identity_sha256",
     }
 )
-_TRANSIENT_EVALUATION_EXACT_TEXT_IDENTITIES = {
+_EVALUATION_EXACT_TEXT_IDENTITIES = {
     "evaluation/identity/input_profile": frozenset({"canonical_physics_complete_v1"}),
     "evaluation/identity/model_kind": frozenset({"fno", "uno", "rno"}),
     "evaluation/timing/precision": frozenset({"float32"}),
 }
-_TRANSIENT_EVALUATION_LOGICAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,254}$")
-_TRANSIENT_EVALUATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_TRANSIENT_EVALUATION_DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)(?:\|(?:cpu|cuda(?::[0-9]+)?))*$")
+_EVALUATION_LOGICAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,254}$")
+_EVALUATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_EVALUATION_DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)(?:\|(?:cpu|cuda(?::[0-9]+)?))*$")
 AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
     "Overview",
     "Accuracy",
@@ -178,21 +188,28 @@ def _is_finite_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, Real) and math.isfinite(float(value))
 
 
-def _validate_transient_metric_entry(key: str, value: Any) -> bool:
-    """Validate one mode/horizon or pipeline aggregate key when recognized."""
-    metric_match = _TRANSIENT_EVALUATION_METRIC_KEY.fullmatch(key)
-    if metric_match is not None:
-        metric = metric_match.group("metric")
-        if metric not in _TRANSIENT_EVALUATION_SUMMARY_METRICS:
-            return False
-        if metric in _TRANSIENT_EVALUATION_COUNT_METRICS:
-            if not _is_nonnegative_int(value):
-                msg = f"Transient Evaluation count {key!r} must be a non-negative integer."
-                raise TrackingError(msg)
-        elif not _is_finite_number(value):
-            msg = f"Transient Evaluation aggregate {key!r} must be finite numeric evidence."
-            raise TrackingError(msg)
-        return True
+def _require_summary_number(key: str, value: Any, *, count: bool) -> None:
+    """Require one Evaluation count to be a non-negative integer and one aggregate to be finite."""
+    if count and not _is_nonnegative_int(value):
+        msg = f"Evaluation count {key!r} must be a non-negative integer."
+        raise TrackingError(msg)
+    if not count and not _is_finite_number(value):
+        msg = f"Evaluation aggregate {key!r} must be finite numeric evidence."
+        raise TrackingError(msg)
+
+
+def _validate_metric_entry(key: str, value: Any) -> bool:
+    """Validate one steady role, transient mode/horizon or pipeline aggregate key when recognized."""
+    for pattern, vocabulary, counts in (
+        (_STEADY_EVALUATION_METRIC_KEY, _STEADY_EVALUATION_SUMMARY_METRICS, _STEADY_EVALUATION_COUNT_METRICS),
+        (_TRANSIENT_EVALUATION_METRIC_KEY, _TRANSIENT_EVALUATION_SUMMARY_METRICS, _TRANSIENT_EVALUATION_COUNT_METRICS),
+    ):
+        metric_match = pattern.fullmatch(key)
+        if metric_match is not None:
+            if metric_match.group("metric") not in vocabulary:
+                return False
+            _require_summary_number(key, value, count=metric_match.group("metric") in counts)
+            return True
 
     pipeline_match = _TRANSIENT_EVALUATION_PIPELINE_KEY.fullmatch(key)
     if pipeline_match is None:
@@ -210,51 +227,42 @@ def _validate_transient_metric_entry(key: str, value: Any) -> bool:
     return True
 
 
-def _validate_transient_identity_entry(key: str, value: Any) -> bool:
+def _validate_identity_entry(key: str, value: Any) -> bool:
     """Validate one exact approved Dataset, model, or Training identity key."""
-    if key in _TRANSIENT_EVALUATION_HASH_IDENTITIES:
-        if not isinstance(value, str) or _TRANSIENT_EVALUATION_SHA256.fullmatch(value) is None:
-            msg = f"Transient Evaluation identity {key!r} must be one SHA-256 digest."
+    if key in _EVALUATION_HASH_IDENTITIES:
+        if not isinstance(value, str) or _EVALUATION_SHA256.fullmatch(value) is None:
+            msg = f"Evaluation identity {key!r} must be one SHA-256 digest."
             raise TrackingError(msg)
         return True
-    allowed = _TRANSIENT_EVALUATION_EXACT_TEXT_IDENTITIES.get(key)
+    allowed = _EVALUATION_EXACT_TEXT_IDENTITIES.get(key)
     if allowed is not None:
         if value not in allowed:
-            msg = f"Transient Evaluation identity {key!r} is unsupported."
+            msg = f"Evaluation identity {key!r} is unsupported."
             raise TrackingError(msg)
         return True
     if key == "evaluation/identity/checkpoint_epoch":
         if not _is_nonnegative_int(value):
-            msg = "Transient Evaluation checkpoint epoch must be a non-negative integer."
+            msg = "Evaluation checkpoint epoch must be a non-negative integer."
             raise TrackingError(msg)
         return True
-    if key == "evaluation/identity/backend":
-        if not isinstance(value, str):
-            msg = "Transient Evaluation backend identity must be bounded text."
-            raise TrackingError(msg)
-        backends = value.split("|")
-        if not backends or len(backends) != len(set(backends)) or not set(backends).issubset({"canonical_hdf5", "pt_shards"}):
-            msg = "Transient Evaluation backend identity is unsupported."
-            raise TrackingError(msg)
-        return True
-    if _TRANSIENT_EVALUATION_DATASET_KEY.fullmatch(key) is not None:
-        if not isinstance(value, str) or _TRANSIENT_EVALUATION_LOGICAL_NAME.fullmatch(value) is None:
-            msg = "Transient Evaluation Dataset identity must be one bounded logical name."
+    if _EVALUATION_DATASET_KEY.fullmatch(key) is not None:
+        if not isinstance(value, str) or _EVALUATION_LOGICAL_NAME.fullmatch(value) is None:
+            msg = "Evaluation Dataset identity must be one bounded logical name."
             raise TrackingError(msg)
         return True
     return False
 
 
-def _validate_transient_timing_entry(key: str, value: Any) -> bool:
+def _validate_timing_entry(key: str, value: Any) -> bool:
     """Validate one approved aggregate timing, device, or speedup entry."""
     if key == "evaluation/timing/device":
-        if not isinstance(value, str) or _TRANSIENT_EVALUATION_DEVICE.fullmatch(value) is None:
-            msg = "Transient Evaluation device identity is unsupported."
+        if not isinstance(value, str) or _EVALUATION_DEVICE.fullmatch(value) is None:
+            msg = "Evaluation device identity is unsupported."
             raise TrackingError(msg)
         return True
     if key == "evaluation/timing/warmup_passes":
         if not _is_nonnegative_int(value):
-            msg = "Transient Evaluation warm-up count must be a non-negative integer."
+            msg = "Evaluation warm-up count must be a non-negative integer."
             raise TrackingError(msg)
         return True
     if key == "evaluation/timing/component_composed":
@@ -275,112 +283,29 @@ def _validate_transient_timing_entry(key: str, value: Any) -> bool:
             raise TrackingError(msg)
         return True
 
-    component_match = _TRANSIENT_EVALUATION_COMPONENT_KEY.fullmatch(key)
+    component_match = _EVALUATION_COMPONENT_KEY.fullmatch(key)
     if component_match is None:
         return False
     metric = component_match.group("metric")
     if metric == "available_count":
         if not _is_nonnegative_int(value):
-            msg = f"Transient Evaluation timing count {key!r} must be a non-negative integer."
+            msg = f"Evaluation timing count {key!r} must be a non-negative integer."
             raise TrackingError(msg)
     elif not _is_finite_number(value) or float(value) < 0.0:
-        msg = f"Transient Evaluation timing median {key!r} must be finite and non-negative."
+        msg = f"Evaluation timing median {key!r} must be finite and non-negative."
         raise TrackingError(msg)
     return True
 
 
-def _validate_transient_evaluation_summary_entry(key: Any, value: Any) -> str:
-    """Admit only the declared aggregate and identity publication vocabulary."""
+def _validate_evaluation_summary_entry(key: Any, value: Any) -> str:
+    """Admit only the declared aggregate and identity publication vocabulary of both tasks."""
     if not isinstance(key, str) or not key:
-        msg = "Transient Evaluation summary keys must be non-empty text."
+        msg = "Evaluation summary keys must be non-empty text."
         raise TrackingError(msg)
-    if _validate_transient_metric_entry(key, value) or _validate_transient_identity_entry(key, value) or _validate_transient_timing_entry(key, value):
+    if _validate_metric_entry(key, value) or _validate_identity_entry(key, value) or _validate_timing_entry(key, value):
         return key
-    msg = f"Unsupported transient Evaluation summary key {key!r}."
+    msg = f"Unsupported Evaluation summary key {key!r}."
     raise TrackingError(msg)
-
-
-def _accuracy_history_metric_ids(
-    evaluation_metrics: Sequence[Mapping[str, Any]],
-    *,
-    objective_id: str,
-) -> tuple[str, ...]:
-    """Select ordered predictive diagnostics from resolved metric semantics."""
-    selected: list[str] = []
-    for metric in evaluation_metrics:
-        metric_id = str(metric["id"])
-        if metric_id == objective_id:
-            continue
-        kind = str(metric["kind"])
-        fields = metric["fields"]
-        field_count = len(fields) if isinstance(fields, Sequence) and not isinstance(fields, str) else 0
-        if kind in {"group_rmse", "vector_rmse", "relative_l2", "relative_h1"} or (kind == "rmse" and field_count == 1):
-            selected.append(metric_id)
-    return tuple(selected)
-
-
-_PHYSICS_ID_SOURCE_KEYS = (
-    "physics/id/momentum_residual_mse",
-    "physics/id/flux_balance_mse",
-    "physics/id/pressure_boundary_mse",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class HistoryMetricDefinition:
-    """Document one authoritative source-to-W&B history mapping."""
-
-    source_key: str
-    wandb_key: str
-    owner: str
-    computation_cost: str
-    scientific_question: str
-    multiplier: float = 1.0
-
-
-def _definition(
-    source_key: str,
-    wandb_key: str,
-    *,
-    owner: str,
-    computation_cost: str,
-    scientific_question: str,
-    multiplier: float = 1.0,
-) -> HistoryMetricDefinition:
-    """Build one compact immutable history definition."""
-    return HistoryMetricDefinition(
-        source_key=source_key,
-        wandb_key=wandb_key,
-        owner=owner,
-        computation_cost=computation_cost,
-        scientific_question=scientific_question,
-        multiplier=multiplier,
-    )
-
-
-def _curated_transient_history_metric_definitions(
-    *,
-    objective_id: str,
-    state_aux_enabled: bool,
-    cuda_enabled: bool,
-) -> tuple[HistoryMetricDefinition, ...]:
-    """Project only the current curated transient completed-epoch history."""
-    owner = "src.learning.training.learning_training_loop.train_loop"
-    return tuple(
-        _definition(
-            projection.source_key,
-            projection.wandb_key,
-            owner=owner,
-            computation_cost="existing authoritative value with optional unit projection",
-            scientific_question="What does this curated transient history series report?",
-            multiplier=projection.multiplier,
-        )
-        for projection in wandb_schema.curated_transient_metric_projections(
-            objective_id=objective_id,
-            state_aux_enabled=state_aux_enabled,
-            cuda_enabled=cuda_enabled,
-        )
-    )
 
 
 def automatic_history_metric_definitions(
@@ -393,217 +318,20 @@ def automatic_history_metric_definitions(
     optuna_trial: bool = False,
     task_id: str | None = None,
     state_aux_enabled: bool = False,
-) -> tuple[HistoryMetricDefinition, ...]:
-    """
-    Return the ordered automatic-personal-workspace history contract.
-
-    The source keys are authoritative local training-loop telemetry. Only this
-    observer boundary renames them for W&B. Definitions follow the intended
-    Overview, Accuracy/ID, Accuracy/OOD, Physics/ID, Physics/Training, and
-    Diagnostics registration order. W&B itself does not guarantee that a
-    personal workspace will preserve registration order in its UI.
-    """
-    if task_id == "transient_drying":
-        transient_definitions = _curated_transient_history_metric_definitions(
-            objective_id=objective_id,
-            state_aux_enabled=state_aux_enabled,
-            cuda_enabled=cuda_enabled,
-        )
-        if optuna_trial:
-            transient_definitions = (
-                *transient_definitions,
-                _definition(
-                    "optuna/objective",
-                    "Optuna/objective",
-                    owner="src.experiments.tuning.experiments_tuning_optuna",
-                    computation_cost="existing Optuna report",
-                    scientific_question="What held-out objective was reported to Optuna?",
-                ),
-                _definition(
-                    "optuna/best_objective_so_far",
-                    "Optuna/best_objective_so_far",
-                    owner="src.experiments.tuning.experiments_tuning_optuna",
-                    computation_cost="existing Optuna reporter state",
-                    scientific_question="What is the best reported trial objective so far?",
-                ),
-            )
-        source_keys = [definition.source_key for definition in transient_definitions]
-        wandb_keys = [definition.wandb_key for definition in transient_definitions]
-        if len(source_keys) != len(set(source_keys)) or len(wandb_keys) != len(set(wandb_keys)):
-            message = "Automatic transient W&B history definitions must have unique source and destination keys."
-            raise RuntimeError(message)
-        return transient_definitions
-    metric_ids = frozenset(str(metric["id"]) for metric in evaluation_metrics)
-    accuracy_metric_ids = _accuracy_history_metric_ids(evaluation_metrics, objective_id=objective_id)
-    definitions: list[HistoryMetricDefinition] = []
-    evaluation_owner = "src.learning.training.learning_training_loop.eval_one_epoch"
-    training_owner = "src.learning.training.learning_training_loop.train_one_epoch"
-    loop_owner = "src.learning.training.learning_training_loop.train_loop"
-    monitor_owner = "src.learning.training.learning_training_loop.evaluate_physics_monitor"
-
-    if objective_id in metric_ids:
-        definitions.extend(
-            (
-                _definition(
-                    f"id/{objective_id}",
-                    f"Overview/ID/{objective_id}",
-                    owner=evaluation_owner,
-                    computation_cost="existing ID evaluation pass",
-                    scientific_question="Is authoritative in-distribution validation performance improving?",
-                ),
-                _definition(
-                    f"additional_evaluation/{objective_id}",
-                    f"Overview/additional_evaluation/{objective_id}",
-                    owner=evaluation_owner,
-                    computation_cost="existing additional evaluation pass",
-                    scientific_question="Is performance on the declared evaluation holdouts improving or degrading?",
-                ),
-                _definition(
-                    "additional_evaluation/objective_difference",
-                    "Overview/additional_evaluation_objective_difference",
-                    owner=loop_owner,
-                    computation_cost="one scalar subtraction",
-                    scientific_question="How far does holdout error separate from validation error?",
-                ),
-            )
-        )
-    definitions.extend(
-        (
-            _definition(
-                "train/loss_total",
-                "Overview/train_loss_total",
-                owner=training_owner,
-                computation_cost="existing training reduction",
-                scientific_question="Is the complete optimization objective converging?",
-            ),
-            _definition(
-                "train/loss_data",
-                "Overview/train_loss_data",
-                owner=training_owner,
-                computation_cost="existing training reduction",
-                scientific_question="Is supervised fit improving independently of PI contributions?",
-            ),
-            _definition(
-                "optimization/learning_rate",
-                "Overview/learning_rate",
-                owner=loop_owner,
-                computation_cost="existing optimizer scalar",
-                scientific_question="When and how does the scheduler react?",
-            ),
-        )
+    ood_enabled: bool = True,
+) -> tuple[wandb_schema.MetricProjection, ...]:
+    """Return the ordered curated history contract; the schema module owns sections and key names."""
+    return wandb_schema.curated_metric_projections(
+        task_id,
+        evaluation_metrics,
+        objective_id=objective_id,
+        physics_training_enabled=physics_training_enabled,
+        physics_monitor_enabled=physics_monitor_enabled,
+        state_aux_enabled=state_aux_enabled,
+        ood_enabled=ood_enabled,
+        cuda_enabled=cuda_enabled,
+        optuna_trial=optuna_trial,
     )
-
-    for role in ("ID", "OOD"):
-        source_role = role.lower()
-        pass_cost = "existing ID evaluation pass" if role == "ID" else "existing OOD diagnostic pass"
-        for metric_id in accuracy_metric_ids:
-            if metric_id not in metric_ids:
-                continue
-            definitions.append(
-                _definition(
-                    f"{source_role}/{metric_id}",
-                    f"Accuracy/{role}/{metric_id}",
-                    owner=evaluation_owner,
-                    computation_cost=pass_cost,
-                    scientific_question=f"What does {metric_id} reveal for {role} predictive accuracy?",
-                )
-            )
-
-    if physics_monitor_enabled:
-        for source_key in _PHYSICS_ID_SOURCE_KEYS:
-            suffix = source_key.removeprefix("physics/id/")
-            definitions.append(
-                _definition(
-                    source_key,
-                    f"Physics/ID/{suffix}",
-                    owner=monitor_owner,
-                    computation_cost="existing bounded configured monitor pass",
-                    scientific_question=f"Does the ID prediction satisfy {suffix}?",
-                )
-            )
-
-    if physics_training_enabled:
-        training_physics = (
-            ("loss_momentum", "Does the weighted momentum contribution converge?"),
-            ("loss_continuity", "Does the weighted flux-balance contribution converge?"),
-            ("loss_boundary", "Does the weighted pressure-boundary contribution converge?"),
-            ("momentum_weight", "What momentum weight is actually applied during warmup?"),
-            ("continuity_weight", "What continuity weight is actually applied during warmup?"),
-            ("boundary_weight", "What boundary weight is actually applied during warmup?"),
-        )
-        for suffix, question in training_physics:
-            definitions.append(
-                _definition(
-                    f"physics/train/{suffix}",
-                    f"Physics/Training/{suffix}",
-                    owner=training_owner,
-                    computation_cost="existing PI loss telemetry",
-                    scientific_question=question,
-                )
-            )
-
-    if optuna_trial:
-        definitions.extend(
-            (
-                _definition(
-                    "optuna/objective",
-                    "Optuna/objective",
-                    owner="src.experiments.tuning.experiments_tuning_optuna.OptunaEpochReporter",
-                    computation_cost="exact mirror of the existing ID objective payload",
-                    scientific_question="What exact objective value did Optuna receive at this report step?",
-                ),
-                _definition(
-                    "optuna/best_objective_so_far",
-                    "Optuna/best_objective_so_far",
-                    owner="src.experiments.tuning.experiments_tuning_optuna.OptunaEpochReporter",
-                    computation_cost="one direction-aware scalar comparison",
-                    scientific_question="What is the best reported objective reached by this trial?",
-                ),
-            )
-        )
-
-    definitions.extend(
-        (
-            _definition(
-                "system/epoch_duration_seconds",
-                "Diagnostics/epoch_duration_seconds",
-                owner=loop_owner,
-                computation_cost="one monotonic-clock subtraction",
-                scientific_question="How long does each complete maintained epoch lifecycle take?",
-            ),
-            _definition(
-                "system/train_duration_seconds",
-                "Diagnostics/train_duration_seconds",
-                owner=training_owner,
-                computation_cost="one training-phase clock interval and one CUDA synchronization pair when applicable",
-                scientific_question="How long does optimizer training take without evaluation or epoch finalization?",
-            ),
-            _definition(
-                "system/train_samples_per_second",
-                "Diagnostics/train_samples_per_second",
-                owner=training_owner,
-                computation_cost="one division of actual processed samples by training-phase duration",
-                scientific_question="What actual training throughput is achieved at the visible configured batch size?",
-            ),
-        )
-    )
-    if cuda_enabled:
-        definitions.append(
-            _definition(
-                "system/cuda_peak_memory_allocated_bytes",
-                "Diagnostics/cuda_peak_memory_allocated_bytes",
-                owner=loop_owner,
-                computation_cost="existing CUDA allocator counter",
-                scientific_question="What is the peak allocated CUDA memory per epoch?",
-            )
-        )
-
-    source_keys = [definition.source_key for definition in definitions]
-    wandb_keys = [definition.wandb_key for definition in definitions]
-    if len(source_keys) != len(set(source_keys)) or len(wandb_keys) != len(set(wandb_keys)):
-        msg = "Automatic W&B history definitions must have unique source and destination keys."
-        raise RuntimeError(msg)
-    return tuple(definitions)
 
 
 class TrackingError(RuntimeError):
@@ -753,9 +481,6 @@ def _git_metadata() -> dict[str, Any]:
     return run_identity.source_repository_evidence()
 
 
-TRACKING_INTEGRATION_VERSION = 2
-
-
 def model_parameter_counts(model: Any) -> dict[str, int]:
     """Count the exact instantiated total and trainable model parameters."""
     return {
@@ -779,6 +504,24 @@ def _package_versions() -> dict[str, str | None]:
     return versions
 
 
+def _split_semantics(split_indices: Mapping[str, Any], *, split_indices_sha256: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Project the admitted split of either task into its W&B Dataset identities and split evidence."""
+    split = datasets.preprocessing.splits.admit_split(split_indices)
+    payload = split.as_payload()
+    split_payload = {
+        "schema_kind": payload["schema_kind"],
+        "schema_version": split.schema_version,
+        "artifact": "split_indices.pt",
+        "artifact_sha256": split_indices_sha256,
+        "split_seed": split.split_seed,
+        "case_partition_digest": split.case_partition_digest,
+        "roles": payload["roles"],
+        "evaluation_assignments": payload["evaluation_assignments"],
+        "extension": payload["extension"],
+    }
+    return payload["dataset_identity"], split_payload
+
+
 def _build_transient_semantic_config(
     config: Mapping[str, Any],
     *,
@@ -789,7 +532,6 @@ def _build_transient_semantic_config(
     model: Any,
     device_metadata: Mapping[str, Any],
     duration_contract: Mapping[str, Any],
-    runtime_provenance: Mapping[str, Any] | None,
     transient_scaling: Mapping[str, Any] | None,
     transient_handoff: Mapping[str, Any] | None,
     tuning_context: Mapping[str, Any] | None,
@@ -798,20 +540,7 @@ def _build_transient_semantic_config(
     task_contract = cast("Mapping[str, Any]", config["task_contract"])
     data_config = cast("Mapping[str, Any]", config["data"])
     run_config = cast("Mapping[str, Any]", config["run"])
-    training_config = cast("Mapping[str, Any]", config["training"])
-    matched_checkpoint = training_config.get("matched_a1_b") is not None and training_config.get("comparison_arm") in {"b", "a1"}
-    roles = cast("Mapping[str, Any]", split_indices["roles"])
-    datasets_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", split_indices["dataset_identity"])))
-    split_payload = {
-        "schema_kind": split_indices["schema_kind"],
-        "schema_version": split_indices["schema_version"],
-        "artifact": "split_indices.pt",
-        "artifact_sha256": split_indices_sha256,
-        "sampling": copy.deepcopy(split_indices["sampling"]),
-        "additional_evaluation_fraction": split_indices["additional_evaluation_fraction"],
-        "split_seed": split_indices["split_seed"],
-        "roles": copy.deepcopy(dict(roles)),
-    }
+    datasets_payload, split_payload = _split_semantics(split_indices, split_indices_sha256=split_indices_sha256)
     scaling_payload = copy.deepcopy(dict(transient_scaling or {}))
     scaling_payload["artifact"] = "normalizer.pt"
     scaling_payload["artifact_sha256"] = normalizer_sha256
@@ -822,7 +551,6 @@ def _build_transient_semantic_config(
         "run": {
             "name": run_config["name"],
             "seed": run_config["seed"],
-            "naming_schema_version": run_config.get("naming_schema_version", 1),
             "stage": cast("Mapping[str, Any]", config["training"]).get("stage"),
         },
         "data": {
@@ -838,7 +566,6 @@ def _build_transient_semantic_config(
             "split": split_payload,
             "normalization": scaling_payload,
         },
-        "tensorizer": copy.deepcopy(split_indices["tensorizer"]),
         "model": model_payload,
         "loss": copy.deepcopy(config["loss"]),
         "evaluation": copy.deepcopy(config["evaluation"]),
@@ -852,13 +579,6 @@ def _build_transient_semantic_config(
             "resolved_config_sha256": run_identity.resolved_config_digest(config),
             "checkpoint_config_digest": checkpoint_identity.get("effective_config_digest"),
             "task_contract_digest": task_contract.get("digest"),
-            "runtime_backend": copy.deepcopy(dict(runtime_provenance or {})),
-            "schema_versions": {
-                "run": run_config.get("naming_schema_version", 1),
-                "checkpoint": 2 if matched_checkpoint else 1,
-                "tracking_integration": TRACKING_INTEGRATION_VERSION,
-                "wandb_metrics": config_defaults.WANDB_METRIC_SCHEMA_VERSION,
-            },
         },
         "runtime": {
             "device": copy.deepcopy(dict(device_metadata)),
@@ -882,7 +602,6 @@ def build_semantic_config(
     device_metadata: Mapping[str, Any],
     duration_contract: Mapping[str, Any],
     tuning_context: Mapping[str, Any] | None = None,
-    runtime_provenance: Mapping[str, Any] | None = None,
     transient_scaling: Mapping[str, Any] | None = None,
     transient_handoff: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -897,7 +616,6 @@ def build_semantic_config(
             model=model,
             device_metadata=device_metadata,
             duration_contract=duration_contract,
-            runtime_provenance=runtime_provenance,
             transient_scaling=transient_scaling,
             transient_handoff=transient_handoff,
             tuning_context=tuning_context,
@@ -906,24 +624,7 @@ def build_semantic_config(
     if not isinstance(task_contract, Mapping):
         msg = "Semantic tracking config requires a resolved task contract."
         raise TypeError(msg)
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    dataset_payload: dict[str, Any] = {}
-    tracked_roles = [(split_contract.role("train"), "id")]
-    if split_contract.additional_evaluation is not None:
-        tracked_roles.append((split_contract.additional_evaluation, "additional_evaluation"))
-    for evidence, tracked_role in tracked_roles:
-        raw_identity = evidence.source.as_dict()
-        dataset_payload[tracked_role] = {
-            key: copy.deepcopy(raw_identity[key])
-            for key in (
-                "dataset_id",
-                "fingerprint",
-                "sample_count",
-                "spatial_shape",
-                "data_contract_digest",
-            )
-        }
-
+    dataset_payload, split_payload = _split_semantics(split_indices, split_indices_sha256=split_indices_sha256)
     data_config = cast("Mapping[str, Any]", config["data"])
     loader_keys = ("batch_size", "num_workers", "pin_memory", "persistent_workers")
     preprocessing = task_contract.get("preprocessing")
@@ -960,7 +661,7 @@ def build_semantic_config(
             "boundary": physics_contract.get("boundary"),
             "derivatives": copy.deepcopy(dict(derivative_config)),
             "interior_crop": int(physics_config["interior_crop"]),
-            "metric_ids": [source.removeprefix("physics/id/") for source in _PHYSICS_ID_SOURCE_KEYS],
+            "metric_ids": list(wandb_schema.PHYSICS_VALIDATION_METRICS),
         }
     }
     model_payload["variant"] = learning.models.naming.architecture_label(config)
@@ -987,19 +688,7 @@ def build_semantic_config(
         "data": {
             "datasets": dataset_payload,
             "loader": {key: copy.deepcopy(data_config.get(key)) for key in loader_keys},
-            "split": {
-                "schema_version": split_contract.schema_version,
-                "artifact": "split_indices.pt",
-                "artifact_sha256": split_indices_sha256,
-                "n_train_full": split_contract.train.full_count,
-                "n_train": split_contract.train.count,
-                "n_validation": split_contract.validation.count,
-                "n_id_test": split_contract.id_test.count,
-                "n_additional_evaluation": None if split_contract.additional_evaluation is None else split_contract.additional_evaluation.count,
-                "split_seed": split_contract.split_seed,
-                "case_partition_digest": split_contract.case_partition_digest,
-                "membership_digests": {role: split_contract.role(role).membership_digest for role in split_contract.roles},
-            },
+            "split": split_payload,
             "normalization": {
                 **copy.deepcopy(dict(preprocessing)),
                 "artifact": "normalizer.pt",
@@ -1018,13 +707,6 @@ def build_semantic_config(
             "repository": source,
             "config_digest": checkpoint_identity.get("effective_config_digest"),
             "task_contract_digest": task_contract.get("digest"),
-            "dataset_fingerprints": {role: identity.get("fingerprint") for role, identity in dataset_payload.items()},
-            "schema_versions": {
-                "run": 1,
-                "checkpoint": 1,
-                "split": split_contract.schema_version,
-                "tracking_integration": TRACKING_INTEGRATION_VERSION,
-            },
         },
         "runtime": {
             "device": copy.deepcopy(dict(device_metadata)),
@@ -1066,18 +748,17 @@ def build_monitor_membership(
     monitor = cast("Mapping[str, Any]", settings["monitor"])
     if settings["mode"] == "disabled" or not bool(monitor["enabled"]):
         return None
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    evidence = split_contract.validation
+    evidence = datasets.preprocessing.splits.admit_split(split_indices).validation
     selected = list(evidence.index_values[: int(monitor["max_cases"])])
     digest = datasets.contracts.identity.membership_digest(
         role="wandb_physics_monitor",
-        dataset_fingerprint=evidence.source.fingerprint,
-        sample_ids=evidence.source.sample_ids,
+        dataset_fingerprint=evidence.dataset["dataset_digest"],
+        sample_ids=evidence.dataset["case_ids"],
         indices=selected,
     )
     return {
         "source_indices": selected,
-        "sample_ids": [evidence.source.sample_ids[index] for index in selected],
+        "sample_ids": list(evidence.case_ids[: int(monitor["max_cases"])]),
         "membership_digest": digest,
         "saved_eval_membership_digest": evidence.membership_digest,
         "max_cases": int(monitor["max_cases"]),
@@ -1128,6 +809,12 @@ def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | Non
     return next(iter(identities)), last_epoch
 
 
+def persisted_evaluation_summary_keys(summary: Mapping[str, Any]) -> frozenset[str]:
+    """Return every Evaluation summary key that any recorded runtime session published to W&B."""
+    states = (session.get("tracking") for session in summary.get("runtime_sessions", []) if isinstance(session, Mapping))
+    return frozenset(key for state in states if isinstance(state, Mapping) for key in state.get("evaluation_summary_keys", ()))
+
+
 @dataclass(slots=True)
 class WandbSession:
     """Own one optional, fail-closed W&B mirror of authoritative local state."""
@@ -1144,8 +831,10 @@ class WandbSession:
     task_id: str
     upload_settings: Mapping[str, Any]
     semantic_config: Mapping[str, Any] = field(default_factory=dict)
-    history_metric_definitions: tuple[HistoryMetricDefinition, ...] = ()
+    history_metric_definitions: tuple[wandb_schema.MetricProjection, ...] = ()
     state_updater: TrackingStateUpdater | None = None
+    _resumed_through_epoch: int | None = None
+    _published_summary_keys: frozenset[str] = frozenset()
     _last_logged_epoch: int | None = None
     _finished: bool = False
     _observer_failed: bool = False
@@ -1175,7 +864,7 @@ class WandbSession:
         return value if isinstance(value, str) and value else None
 
     @property
-    def history_definition_by_source(self) -> dict[str, HistoryMetricDefinition]:
+    def history_definition_by_source(self) -> dict[str, wandb_schema.MetricProjection]:
         """Return complete source projections including presentation-only unit scaling."""
         return {definition.source_key: definition for definition in self.history_metric_definitions}
 
@@ -1204,7 +893,13 @@ class WandbSession:
         return True
 
     def log_epoch(self, epoch: int, metrics: Mapping[str, float]) -> None:
-        """Log one strictly increasing completed epoch with only approved keys."""
+        """
+        Log one strictly increasing completed epoch with only approved keys.
+
+        A resume trains the epochs after its restored ``last_checkpoint.pt`` again;
+        an epoch an earlier session already logged keeps its first values and is
+        not sent again, while the in-session order stays strict.
+        """
         if self._run is None or self._finished:
             return
         if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
@@ -1213,6 +908,9 @@ class WandbSession:
         if self._last_logged_epoch is not None and epoch <= self._last_logged_epoch:
             msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}. The last successful epoch is {self._last_logged_epoch}."
             raise TrackingError(msg)
+        if self._resumed_through_epoch is not None and epoch <= self._resumed_through_epoch:
+            self._last_logged_epoch = epoch
+            return
 
         payload: dict[str, float | int] = {"epoch": epoch}
         definition_by_source = self.history_definition_by_source
@@ -1228,8 +926,8 @@ class WandbSession:
             self._last_logged_epoch = epoch
             self._persist({"last_logged_epoch": epoch})
 
-    def log_transient_evaluation_summary(self, evidence: Mapping[str, Any]) -> None:
-        """Log one schema-restricted transient Evaluation summary."""
+    def log_evaluation_summary(self, evidence: Mapping[str, Any]) -> None:
+        """Log one schema-restricted steady or transient Evaluation summary."""
         if self._run is None or self._finished:
             return
         if not isinstance(evidence, Mapping) or not evidence or len(evidence) > _MAX_EVALUATION_SUMMARY_ENTRIES:
@@ -1237,7 +935,7 @@ class WandbSession:
             raise TrackingError(msg)
         payload: dict[str, bool | float | int | str] = {}
         for key, value in evidence.items():
-            admitted_key = _validate_transient_evaluation_summary_entry(key, value)
+            admitted_key = _validate_evaluation_summary_entry(key, value)
             if isinstance(value, (bool, int)):
                 payload[admitted_key] = value
             elif isinstance(value, float):
@@ -1252,15 +950,21 @@ class WandbSession:
                 raise TrackingError(msg)
 
         def update_summary() -> None:
-            """Apply one bounded summary mutation without writing history arrays."""
-            summary = getattr(self._run, "summary", None)
-            update = getattr(summary, "update", None)
-            if not callable(update):
+            """Replace the tracker-published Evaluation summary without writing history arrays."""
+            summary = cast("Any", getattr(self._run, "summary", None))
+            if not callable(getattr(summary, "update", None)):
                 msg_0 = "The active W&B run does not expose summary updates."
                 raise TrackingUploadError(msg_0)
-            update(payload)
+            stale = sorted((self._published_summary_keys - payload.keys()) & set(summary.keys()))
+            if stale and not hasattr(summary, "__delitem__"):
+                msg_1 = "The active W&B run does not expose summary key removal."
+                raise TrackingUploadError(msg_1)
+            for key in stale:
+                del summary[key]
+            summary.update(payload)
 
         if self._run_operation("evaluation_summary", update_summary):
+            self._published_summary_keys = frozenset(payload)
             self._persist(
                 {
                     "evaluation_summary_keys": sorted(payload),
@@ -1448,22 +1152,6 @@ class WandbSession:
             summary["model/parameters_trainable"] = counts.get("trainable")
         data = self.semantic_config.get("data")
         if isinstance(data, Mapping):
-            datasets = data.get("datasets")
-            if isinstance(datasets, Mapping):
-                if isinstance(task, Mapping) and task.get("id") == "transient_drying":
-                    train_identity = datasets.get("train")
-                    if isinstance(train_identity, Mapping):
-                        summary["data/train/dataset_id"] = train_identity.get("dataset_id")
-                        summary["data/train/index_digest"] = train_identity.get("index_digest")
-                    additional = datasets.get("additional_evaluation")
-                    if isinstance(additional, list):
-                        summary["data/additional_evaluation/dataset_count"] = len(additional)
-                else:
-                    for role in ("id", "additional_evaluation"):
-                        identity = datasets.get(role)
-                        if isinstance(identity, Mapping):
-                            summary[f"data/{role}/dataset_id"] = identity.get("dataset_id")
-                            summary[f"data/{role}/fingerprint"] = identity.get("fingerprint")
             split = data.get("split")
             if isinstance(split, Mapping):
                 summary["data/split_sha256"] = split.get("artifact_sha256")
@@ -1497,8 +1185,6 @@ class WandbSession:
             ):
                 if source in result:
                     summary[target] = result[source]
-            if tuning is not None and "best_metric" in result:
-                summary["Optuna/objective"] = result["best_metric"]
             selected_metrics = result.get("selected_metrics")
             if isinstance(selected_metrics, Mapping):
                 summary.update({key: value for key, value in selected_metrics.items() if isinstance(key, str) and key.startswith("selected/")})
@@ -1516,11 +1202,11 @@ class WandbSession:
             ):
                 if source in local_summary:
                     summary[target] = local_summary[source]
-            if isinstance(tuning, Mapping):
-                if "elapsed_seconds" in local_summary:
-                    summary["Optuna/trial_duration_seconds"] = local_summary["elapsed_seconds"]
-                if "best_metric" in local_summary:
-                    summary["Optuna/objective"] = local_summary["best_metric"]
+            if isinstance(local_summary.get("training_work"), Mapping):
+                # The local summary holds the counts in every terminal state; W&B shows them as training_work.<count>.
+                summary["training_work"] = dict(local_summary["training_work"])
+            if isinstance(tuning, Mapping) and "elapsed_seconds" in local_summary:
+                summary["Optuna/trial_duration_seconds"] = local_summary["elapsed_seconds"]
             checkpoint_digest = local_summary.get("best_checkpoint_sha256")
             if isinstance(checkpoint_digest, str):
                 summary["selected/checkpoint_sha256_short"] = checkpoint_digest[:16]
@@ -1574,17 +1260,6 @@ class WandbSession:
         self._persist({"status": terminal_tracking_status, "finished_at": _utc_now()})
 
 
-def _runtime_wandb_tags(settings: Mapping[str, Any], semantic_config: Mapping[str, Any] | None) -> list[str]:
-    """Keep role-less Optuna tags canonical and qualify only explicit study roles."""
-    tags = [str(tag) for tag in cast("Sequence[str]", settings["tags"])]
-    if settings.get("workflow") == "optuna_trial" and isinstance(semantic_config, Mapping):
-        tuning = semantic_config.get("tuning")
-        role = tuning.get("study_role") if isinstance(tuning, Mapping) else None
-        if role == "production":
-            tags = [f"optuna-{role}" if tag == "optuna" else tag for tag in tags]
-    return list(dict.fromkeys(tags))
-
-
 def initialize_wandb(
     config: Mapping[str, Any],
     *,
@@ -1593,6 +1268,7 @@ def initialize_wandb(
     resume: bool = False,
     persisted_run_id: str | None = None,
     previous_last_logged_epoch: int | None = None,
+    previous_evaluation_summary_keys: Collection[str] = (),
     state_updater: TrackingStateUpdater | None = None,
 ) -> WandbSession:
     """Initialize the configured W&B mode with strict identity and metric rules."""
@@ -1616,14 +1292,6 @@ def initialize_wandb(
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
     mode = str(settings["mode"])
     workflow = str(settings["workflow"])
-    group = str(settings["study"]) if workflow == "optuna_trial" else None
-    job_type = workflow
-    if task_id == "transient_drying" and workflow == "train":
-        group, job_type = wandb_schema.transient_run_organization(
-            config,
-            workflow=workflow,
-        )
-    runtime_tags = _runtime_wandb_tags(settings, semantic_config)
 
     if mode == "disabled":
         return WandbSession(
@@ -1641,6 +1309,8 @@ def initialize_wandb(
             semantic_config=copy.deepcopy(dict(semantic_config or {})),
         )
 
+    group, job_type, wandb_name = wandb_schema.run_organization(config, workflow=workflow)
+    runtime_tags = list(cast("Sequence[str]", settings["tags"]))
     run_id = persisted_run_id if resume else uuid.uuid4().hex
     if not isinstance(run_id, str) or not run_id:
         msg = "Exact W&B resume requires the persisted non-empty run ID."
@@ -1689,6 +1359,8 @@ def initialize_wandb(
         "Mapping[str, Any]",
         cast("Mapping[str, Any]", config["loss"])["physics"],
     )
+    data_config = cast("Mapping[str, Any]", config["data"])
+    ood_datasets = list(data_config["additional_evaluation_datasets"])
     runtime_config = semantic_config.get("runtime") if isinstance(semantic_config, Mapping) else None
     runtime_device = runtime_config.get("device") if isinstance(runtime_config, Mapping) else None
     resolved_device = runtime_device.get("resolved_device") if isinstance(runtime_device, Mapping) else None
@@ -1705,6 +1377,7 @@ def initialize_wandb(
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
         state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
+        ood_enabled=bool(ood_datasets),
     )
 
     # Online SDK state lives on the process TMPDIR (node-local, removed at container exit) and is copied into the run folder
@@ -1723,7 +1396,7 @@ def initialize_wandb(
                 group=group,
                 job_type=job_type,
                 mode=mode,
-                name=run_name,
+                name=wandb_name,
                 id=run_id,
                 resume=resume_policy,
                 dir=str(local_root),
@@ -1743,12 +1416,14 @@ def initialize_wandb(
 
         sdk_run.define_metric("epoch", hidden=True, summary="none")
         for definition in history_definitions:
+            # summary=None keeps the SDK default, the last value under the history key; "none" keeps a series out of the summary.
             sdk_run.define_metric(
                 definition.wandb_key,
                 step_metric="epoch",
                 step_sync=False,
-                summary="none",
+                summary=None if definition.in_summary else "none",
             )
+        sdk_run.summary.update({"data/train_dataset": data_config["train_dataset"], "data/ood_datasets": ood_datasets})
     except Exception as error:
         if sdk_run is not None:
             with suppress(Exception):
@@ -1784,7 +1459,8 @@ def initialize_wandb(
         semantic_config=copy.deepcopy(dict(semantic_config or {})),
         history_metric_definitions=history_definitions,
         state_updater=state_updater,
-        _last_logged_epoch=previous_last_logged_epoch,
+        _resumed_through_epoch=previous_last_logged_epoch,
+        _published_summary_keys=frozenset(previous_evaluation_summary_keys),
         _local_root=None if mode == "offline" else local_root,
     )
 

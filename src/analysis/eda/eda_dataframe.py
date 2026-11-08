@@ -19,7 +19,7 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
 import pandas as pd
@@ -27,12 +27,30 @@ import pandas as pd
 from src import domain
 
 _SPATIAL_DIMENSIONS = 2
+_REQUIRED_SOURCE_KEYS: Final = (
+    "total_discovered_case_count",
+    "failed_case_count",
+    "incomplete_case_count",
+    "invalid_case_count",
+    "exclusion_reasons",
+    "case_accounting_scope",
+    "analysis_representation",
+    "dataset_backend",
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from src.analysis.eda.eda_sources import GeneratedOutputEDABatch
     from src.domain.tasks.domain_task_spec import TaskSpec
+
+
+def _require_source_keys(loaded: dict[str, Any], *, batch_name: str) -> None:
+    """Require every source to report its case accounting and labels; a missing count is never read as zero."""
+    missing = [key for key in _REQUIRED_SOURCE_KEYS if key not in loaded]
+    if missing:
+        message = f"EDA source {batch_name!r} does not report {missing}; a source without such cases must state 0 explicitly."
+        raise ValueError(message)
 
 
 def _transient_dataframe(
@@ -44,6 +62,7 @@ def _transient_dataframe(
     """Build one nested completed-case frame without flattening trajectories."""
     from . import eda_transient as transient  # noqa: PLC0415
 
+    _require_source_keys(loaded, batch_name=batch_name)
     sample_ids = loaded["sample_ids"]
     rows = loaded["rows"]
     available = int(loaded["available_case_count"])
@@ -93,12 +112,12 @@ def _transient_dataframe(
             "source_manifest_sha256": loaded["manifest_sha256"],
             "loaded_case_count": len(frame),
             "available_case_count": available,
-            "total_discovered_case_count": int(loaded.get("total_discovered_case_count", available)),
-            "failed_case_count": int(loaded.get("failed_case_count", 0)),
-            "incomplete_case_count": int(loaded.get("incomplete_case_count", 0)),
-            "invalid_case_count": int(loaded.get("invalid_case_count", 0)),
-            "exclusion_reasons": dict(loaded.get("exclusion_reasons", {})) | ({} if excluded == 0 else {"bounded_prefix": excluded}),
-            "case_accounting_scope": str(loaded.get("case_accounting_scope", "admitted_terminal_manifest")),
+            "total_discovered_case_count": int(loaded["total_discovered_case_count"]),
+            "failed_case_count": int(loaded["failed_case_count"]),
+            "incomplete_case_count": int(loaded["incomplete_case_count"]),
+            "invalid_case_count": int(loaded["invalid_case_count"]),
+            "exclusion_reasons": dict(loaded["exclusion_reasons"]) | ({} if excluded == 0 else {"bounded_prefix": excluded}),
+            "case_accounting_scope": str(loaded["case_accounting_scope"]),
             "spatial_shape": tuple(np.asarray(frame.iloc[0]["state_trajectories"][state_names[0]]).shape[1:]),
             "analysis_representation": loaded["analysis_representation"],
             "dataset_backend": loaded["dataset_backend"],
@@ -124,6 +143,7 @@ def _steady_dataframe(
     task: TaskSpec,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Build one steady-flow frame with shared derived-field and accounting semantics."""
+    _require_source_keys(loaded, batch_name=batch_name)
     sample_ids = loaded["sample_ids"]
     rows = loaded["rows"]
     available = int(loaded["available_case_count"])
@@ -153,14 +173,14 @@ def _steady_dataframe(
             "source_manifest_sha256": loaded["manifest_sha256"],
             "loaded_case_count": len(frame),
             "available_case_count": available,
-            "total_discovered_case_count": int(loaded.get("total_discovered_case_count", available)),
-            "failed_case_count": int(loaded.get("failed_case_count", 0)),
-            "incomplete_case_count": int(loaded.get("incomplete_case_count", 0)),
-            "invalid_case_count": int(loaded.get("invalid_case_count", 0)),
-            "exclusion_reasons": dict(loaded.get("exclusion_reasons", {})) | ({} if excluded == 0 else {"bounded_prefix": excluded}),
-            "case_accounting_scope": str(loaded.get("case_accounting_scope", "admitted_terminal_manifest")),
-            "analysis_representation": str(loaded.get("analysis_representation", "steady_field_rows")),
-            "dataset_backend": str(loaded.get("dataset_backend", "canonical_generation_hdf5")),
+            "total_discovered_case_count": int(loaded["total_discovered_case_count"]),
+            "failed_case_count": int(loaded["failed_case_count"]),
+            "incomplete_case_count": int(loaded["incomplete_case_count"]),
+            "invalid_case_count": int(loaded["invalid_case_count"]),
+            "exclusion_reasons": dict(loaded["exclusion_reasons"]) | ({} if excluded == 0 else {"bounded_prefix": excluded}),
+            "case_accounting_scope": str(loaded["case_accounting_scope"]),
+            "analysis_representation": str(loaded["analysis_representation"]),
+            "dataset_backend": str(loaded["dataset_backend"]),
             "spatial_shape": None if frame.empty else tuple(frame.iloc[0][task.input_names[0]].shape),
         }
     )
@@ -208,10 +228,13 @@ def load_published_dataset_frame(
         case_ids=package_ids,
         transient_sampling=sampling,
         storage_root=storage_root,
-        transient_backend_preference="canonical_hdf5",
         spatial_stride=1,
     )
-    runtime = datasets.runtime.factory.create_dataset(request)
+    runtime = (
+        datasets.runtime.factory.create_hdf5_source_dataset(request)
+        if view.id == "transient_drying"
+        else datasets.runtime.factory.create_dataset(request)
+    )
     task = domain.tasks.registry.get_task(view.id)
     if isinstance(runtime, transient_runtime.TransientPhysicalDataset):
         try:
@@ -263,9 +286,16 @@ def load_published_dataset_frame(
             "sample_ids": package_ids,
             "rows": rows,
             "available_case_count": len(identities),
+            "total_discovered_case_count": len(identities),
+            # A published package holds admitted cases only: this path defines no failed, incomplete or invalid ones.
+            "failed_case_count": 0,
+            "incomplete_case_count": 0,
+            "invalid_case_count": 0,
+            "exclusion_reasons": {},
             "generated_batch_identity": None,
             "manifest_sha256": manifest["dataset_digest"],
             "generation_root": storage_root,
+            "analysis_representation": "steady_field_rows",
             "dataset_backend": "published_steady_pt",
             "case_accounting_scope": "published_package_membership",
         }
@@ -346,7 +376,6 @@ def generate_eda_dataframe_from_completed_cases(
         "task": task,
         "generated_batch_identity": {
             "schema_kind": "analysis_generation_campaign_selection",
-            "schema_version": 1,
             "campaign_name": batch.campaign_name,
             "campaign_digest": batch.campaign_digest,
             "material_family": batch.material_family,

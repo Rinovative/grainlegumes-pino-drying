@@ -5,7 +5,7 @@ Responsibilities:
   - Capture immutable source snapshots of clean or dirty trees and restore them for reproduction
   - Materialize and verify read-only source trees restored from snapshots
   - Record job leases on source trees and prune trees that no queued or running job uses
-  - Expose fingerprint, capture, restore, materialize, materialize-snapshot, verify-tree, lease, and prune command-line operations
+  - Expose fingerprint, restore, materialize, materialize-snapshot, verify-tree, lease, and prune command-line operations
 
 Design principles:
   - Preserve the established source fingerprint and bind snapshots to Git HEAD
@@ -53,13 +53,13 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+_SNAPSHOT_SCHEMA_VERSION: Final = 1
 _FINGERPRINT_ARGUMENT_COUNT = 2
-_CAPTURE_ARGUMENT_COUNT = 4
 _RESTORE_ARGUMENT_COUNT = 5
 _MATERIALIZE_ARGUMENT_COUNT = 5
 _VERIFY_TREE_ARGUMENT_COUNT = 4
@@ -221,7 +221,7 @@ def capture_source_snapshot(root: Path, destination_root: Path) -> dict[str, str
             raise RuntimeError(message)
         manifest = {
             "schema_kind": "generation_source_snapshot",
-            "schema_version": 1,
+            "schema_version": _SNAPSHOT_SCHEMA_VERSION,
             "git_commit": head,
             "source_fingerprint_sha256": before,
             "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
@@ -417,7 +417,9 @@ def _load_snapshot(snapshot_path: Path) -> tuple[Path, str, bytes, list[dict[str
         _invalid("Snapshot manifest must be a regular non-symlink file.")
     snapshot_path = snapshot_path.resolve(strict=True)
     manifest = json.loads(snapshot_path.read_bytes())
-    if manifest.get("schema_kind") != "generation_source_snapshot" or manifest.get("schema_version") != 1:
+    version = manifest.get("schema_version")
+    # Strict like common.serialization.is_schema_version, which this stdlib-only script cannot import: JSON true or 1.0 is no version 1.
+    if manifest.get("schema_kind") != "generation_source_snapshot" or type(version) is not int or version != _SNAPSHOT_SCHEMA_VERSION:
         _invalid("Unsupported Generation source snapshot schema.")
     commit = manifest.get("git_commit")
     if not isinstance(commit, str) or len(commit) != _GIT_OBJECT_ID_LENGTH or any(character not in "0123456789abcdef" for character in commit):
@@ -972,8 +974,6 @@ def _active_slurm_job_ids() -> set[str] | None:
 if __name__ == "__main__":
     if len(sys.argv) == _FINGERPRINT_ARGUMENT_COUNT:
         print(source_fingerprint(Path(sys.argv[1])))
-    elif len(sys.argv) == _CAPTURE_ARGUMENT_COUNT and sys.argv[2] == "--capture":
-        print(json.dumps(capture_source_snapshot(Path(sys.argv[1]), Path(sys.argv[3])), sort_keys=True))
     elif len(sys.argv) == _RESTORE_ARGUMENT_COUNT and sys.argv[2] == "--restore":
         print(json.dumps(restore_source_snapshot(Path(sys.argv[1]), Path(sys.argv[3]), Path(sys.argv[4])), sort_keys=True))
     elif len(sys.argv) == _MATERIALIZE_ARGUMENT_COUNT and sys.argv[2] == "--materialize":
@@ -988,7 +988,7 @@ if __name__ == "__main__":
         print(json.dumps(prune_source_trees(Path(sys.argv[2]), _active_slurm_job_ids(), now=time.time()), sort_keys=True))
     else:
         usage = (
-            f"Usage: {sys.argv[0]} REPOSITORY [--capture DESTINATION_ROOT | --restore SNAPSHOT_JSON DESTINATION"
+            f"Usage: {sys.argv[0]} REPOSITORY [--restore SNAPSHOT_JSON DESTINATION"
             " | --materialize SNAPSHOT_ROOT TREES_ROOT | --materialize-snapshot SNAPSHOT_JSON TREES_ROOT]\n"
             f"       {sys.argv[0]} --verify-tree TREE SNAPSHOT_ROOT | --lease TREES_ROOT TREE_ID LEASE_ID | --prune TREES_ROOT"
         )

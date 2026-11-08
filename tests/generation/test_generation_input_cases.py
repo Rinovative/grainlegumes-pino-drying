@@ -158,6 +158,103 @@ def test_git_provenance_changes_case_json_but_not_scientific_case_ids(
     assert first_payload["git_commit"] != second_payload["git_commit"]
 
 
+def _batch_commit(batch: Any) -> str:
+    """Return the source commit recorded by one published input-batch manifest."""
+    return json.loads((batch.metadata_directory / "input_generation_manifest.json").read_text())["git_commit"]
+
+
+def test_commit_only_change_reuses_the_input_batch_and_keeps_its_original_commit(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new commit extends the same input batch; the recorded commit stays the first publication's."""
+    config = _load_config(generation_config_factory, "steady_flow")
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    storage = tmp_path / "storage"
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    inputs = generation.cases.input_generation
+    first = inputs.generate_input_cases(config, 2, case_start=config.case_indices[0], storage_root=storage)
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", _OTHER_GIT_COMMIT)
+
+    prepared = inputs.prepare_campaign_inputs(campaign, git_commit=_OTHER_GIT_COMMIT, storage_root=storage)
+
+    batch = prepared["batches"][0]
+    assert batch["input_generation_id"] == first.input_generation_id
+    assert (batch["reused_case_count"], batch["generated_case_count"]) == (2, len(config.case_indices) - 2)
+    assert batch["source_git_commit"] == _batch_commit(first) == _FAKE_GIT_COMMIT
+    admitted = inputs.admit_configured_input_references(config, storage_root=storage, validation_depth="full")
+    assert set(admitted) == set(config.case_indices)
+    replay = inputs.generate_input_cases(config, len(config.case_indices), case_start=config.case_indices[0], storage_root=storage)
+    assert (replay.generated_case_count, replay.reused_case_count) == (0, len(config.case_indices))
+
+
+@pytest.mark.parametrize("git_commit", ["A" * 40, "a" * 39, 7, None])
+def test_input_manifest_admission_rejects_a_malformed_git_commit(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    git_commit: object,
+) -> None:
+    """A manifest whose git_commit is not a full lowercase Git object identifier is refused although its batch identity still matches."""
+    config = _load_config(generation_config_factory, "steady_flow", natural_count=1)
+    campaign = generation.cases.config.load_campaign_config(config.source_path)
+    storage = tmp_path / "storage"
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    batch = generation.cases.input_generation.generate_input_cases(config, 1, case_start=config.case_indices[0], storage_root=storage)
+    manifest_path = batch.metadata_directory / "input_generation_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["git_commit"] = git_commit
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(ValueError, match="git_commit"):
+        generation.cases.admission.admit_input_batch_source(batch.metadata_directory, raw_directory=batch.raw_directory, validation_depth="evidence")
+
+
+def test_transaction_recovery_after_a_commit_only_change_keeps_the_original_commit(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recover an interrupted publication under a newer commit without rewriting its recorded commit."""
+    config = _load_config(generation_config_factory, "steady_flow")
+    storage = tmp_path / "storage"
+    lifecycle.create_campaign(generation.cases.config.load_campaign_config(config.source_path), storage_root=storage)
+    inputs = generation.cases.input_generation
+    interrupted = RuntimeError("interrupted before promotion")
+    with (
+        patch("src.generation.contracts.generation_contracts_source.validate_admitted_source_before_publication", side_effect=interrupted),
+        pytest.raises(RuntimeError, match="interrupted before promotion"),
+    ):
+        inputs.generate_input_cases(config, len(config.case_indices), storage_root=storage)
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", _OTHER_GIT_COMMIT)
+
+    recovered = inputs.generate_input_cases(config, len(config.case_indices), storage_root=storage)
+
+    assert (recovered.generated_case_count, recovered.reused_case_count) == (0, len(config.case_indices))
+    assert _batch_commit(recovered) == _FAKE_GIT_COMMIT
+    assert set(inputs.admit_configured_input_references(config, storage_root=storage, validation_depth="full")) == set(config.case_indices)
+
+
+def test_scientific_drift_still_refuses_an_existing_input_batch_under_a_new_commit(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the commit is waived: any other source evidence field of the batch still conflicts."""
+    config = _load_config(generation_config_factory, "steady_flow")
+    storage = tmp_path / "storage"
+    lifecycle.create_campaign(generation.cases.config.load_campaign_config(config.source_path), storage_root=storage)
+    inputs = generation.cases.input_generation
+    batch = inputs.generate_input_cases(config, 1, case_start=config.case_indices[0], storage_root=storage)
+    monkeypatch.setenv("GENERATION_GIT_COMMIT", _OTHER_GIT_COMMIT)
+    base, resolved, metadata, raw = inputs._configured_input_locations(config, storage_root=storage)
+    assert metadata == batch.metadata_directory
+    assert inputs._load_existing(metadata, raw, base=base, resolved_config=resolved)[0]
+
+    with pytest.raises(FileExistsError, match="different source evidence"):
+        inputs._load_existing(metadata, raw, base={**base, "scientific_config_digest": "0" * 64}, resolved_config=resolved)
+
+
 def test_clean_repository_source_identity_fails_closed_on_dirty_evidence() -> None:
     """Resolve exact clean HEAD and reject any porcelain worktree evidence."""
     source_service = generation.contracts.source
@@ -341,14 +438,14 @@ def test_generation_cli_renders_context_for_unexpected_key_errors(
 
     monkeypatch.setattr(cli_generation, "_dispatch", fail_dispatch)
 
-    assert cli_generation.main(["list-campaigns"]) == 2
+    assert cli_generation.main(["resolve-generation-run", "plan.yaml", "--git-commit", "a" * 40]) == 2
     error = json.loads(capsys.readouterr().err)
     assert error == {
-        "command": "list-campaigns",
-        "context": {},
+        "command": "resolve-generation-run",
+        "context": {"config": "plan.yaml"},
         "error_type": "KeyError",
         "message": "'T_flow_ref'",
-        "stage": "list-campaigns",
+        "stage": "resolve-generation-run",
         "status": "error",
     }
 

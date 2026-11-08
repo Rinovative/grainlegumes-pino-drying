@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Reconstruct a transient model, tensorizer, and fitted scaling artifact from one completed run
+  - Refuse saved weights whose recorded model digest differs from the running model code before building any state
   - Validate explicit physical one-step and rollout request evidence
   - Apply the admitted airflow-source policy without mutating caller tensors
   - Execute stateless or recurrent model calls and return physical reconstructed states with factual timing
@@ -30,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import torch
 from torch import nn
 
-from src import domain, experiments, learning
+from src import common, domain, experiments, learning
 from src.learning.models import learning_models_factory as model_factory
 from src.learning.transient import learning_transient_rollout as rollout
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
@@ -44,6 +45,7 @@ _COMSOL_REFERENCE_AIRFLOW_SOURCE = "comsol_reference"
 _AIRFLOW_SOURCES = {_COMSOL_REFERENCE_AIRFLOW_SOURCE, "external"}
 _MODEL_KINDS = {"fno", "uno", "rno"}
 _PRECISION = "float32"
+_MODEL_CHANGED_REMEDY = "evaluate it with the model code it was trained with or train a new run with --revision <label>"
 _TIME_ATOL = 1.0e-6
 _PREPARED_REQUEST_TOKEN = object()
 
@@ -295,6 +297,13 @@ def build_transient_inference_context(
     if experiments.run.is_trial_config(config):
         msg = "Transient inference is unavailable for an Optuna trial: trials keep no checkpoints. Train the selected configuration as a normal run."
         raise RuntimeError(msg)
+    # Loading the weights continues the trained computation, so the recorded model code must be the running one.
+    common.code_identity.require_current_implementation(
+        learning.training.checkpoint.MODEL_PROJECTIONS["transient_drying"],
+        config["producer"]["model_sha256"],
+        unit=f"Run {completed['scientific_run_name']}",
+        remedy=_MODEL_CHANGED_REMEDY,
+    )
     normalizer_state = completed.get("normalizer_state")
     if not isinstance(normalizer_state, Mapping):
         msg = "Completed transient run must provide one scaling-artifact mapping."
@@ -316,7 +325,7 @@ def build_transient_inference_context(
         raise TypeError(msg)
     kind = _require_model_kind(model_config.get("kind"))
     decision = architecture_compatibility.get("decision")
-    training_stride = scaling.dataset_identity.get("spatial_stride")
+    training_stride = config.get("data", {}).get("spatial_stride")
     checkpoint_identity = {
         "identity": completed.get("checkpoint_identity"),
         "best_checkpoint_sha256": completed.get("selected_checkpoint_sha256"),
@@ -344,7 +353,7 @@ def build_transient_inference_context(
     best_checkpoint = completed.get("best_checkpoint")
     if (
         not isinstance(best_checkpoint, Mapping)
-        or best_checkpoint.get("schema_version") != learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(best_checkpoint.get("schema_version"), learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION)
         or not isinstance(best_checkpoint.get("model_state_dict"), Mapping)
     ):
         msg = "Completed transient run must provide an admitted best model state dict."
@@ -405,7 +414,7 @@ def load_transient_inference_context(
         Loaded model plus fitted preprocessing and explicit grid compatibility.
 
     """
-    completed = experiments.run.validate_completed_run(run_dir)
+    completed = experiments.run.validate_evaluable_run(run_dir)
     return build_transient_inference_context(
         completed=completed,
         device=device,

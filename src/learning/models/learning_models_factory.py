@@ -3,7 +3,7 @@
 Responsibilities:
   - Build FNO models from channel, mode and layer settings
   - Build UNO models with configured mode schedules
-  - Build official neuraloperator RNO models when the installed dependency exposes it
+  - Build neuraloperator RNO models with the project-owned tanh-candidate cell when the installed dependency exposes the RNO
   - Declare the maintained neuraloperator UNO resampling semantics
   - Resolve semantic model identifiers from strict registries
 
@@ -14,7 +14,7 @@ Design principles:
   - Device placement happens only when requested by the caller
 
 This module does NOT:
-  - Implement FNO, UNO, or RNO architectures. ``neuraloperator`` supplies them
+  - Implement FNO, UNO, or RNO architectures. ``neuraloperator`` supplies them; only the RNO cell variant lives in ``learning_models_rno_cell``
   - Orchestrate training. ``learning.training.loop`` owns execution
   - Derive task channels or axes. Task contracts and config resolution own them
 """
@@ -112,12 +112,13 @@ def build_fno(
     n_modes: list[int] | tuple[int, int],
     hidden_channels: int,
     n_layers: int,
+    positional_embedding: str | None,
+    domain_padding: float | None,
     lifting_channel_ratio: float = 2,
     projection_channel_ratio: float = 2,
     fno_skip: str = "linear",
     channel_mlp_skip: str = "soft-gating",
     implementation: str = "factorized",
-    positional_embedding: str | None = "grid",
     device: torch.device | str | None = None,
 ) -> FNO:
     """
@@ -135,6 +136,10 @@ def build_fno(
         Number of hidden channels
     n_layers : int
         Number of Fourier layers
+    positional_embedding : str | None
+        Neuraloperator positional embedding; ``None`` disables it
+    domain_padding : float | None
+        Symmetric zero padding per side as a fraction of the lifted field; ``None`` disables it
     lifting_channel_ratio : float, optional
         Channel ratio for lifting layer (default: 2)
     projection_channel_ratio : float, optional
@@ -145,8 +150,6 @@ def build_fno(
         Skip connection type for channel MLP (default: "soft-gating")
     implementation : str, optional
         Implementation type (default: "factorized")
-    positional_embedding : str | None, optional
-        Neuraloperator positional embedding (default: "grid")
     device : torch.device | str | None, optional
         Device to place model on (default: None - caller handles)
 
@@ -174,9 +177,9 @@ def build_fno(
         "fno_skip": _validate_skip("fno_skip", fno_skip),
         "channel_mlp_skip": _validate_skip("channel_mlp_skip", channel_mlp_skip),
         "implementation": implementation,
+        "positional_embedding": positional_embedding,
+        "domain_padding": domain_padding,
     }
-    if positional_embedding != "grid":
-        kwargs["positional_embedding"] = positional_embedding
     model = FNO(**kwargs)
 
     if device is not None:
@@ -372,10 +375,13 @@ def build_uno(
     hidden_channels: int,
     modes_x: int,
     modes_y: int,
+    positional_embedding: str | None,
+    domain_padding: float | None,
     mode_ratio: float = 0.5,
     uno_scalings: list[list[float]] | None = None,
+    lifting_channel_ratio: float = 2,
+    projection_channel_ratio: float = 2,
     channel_mlp_skip: str = "linear",
-    positional_embedding: str | None = "grid",
     device: torch.device | str | None = None,
 ) -> UNO:
     """
@@ -395,14 +401,20 @@ def build_uno(
         Base number of Fourier modes in x-direction
     modes_y : int
         Base number of Fourier modes in y-direction
+    positional_embedding : str | None
+        Neuraloperator positional embedding; ``None`` disables it
+    domain_padding : float | None
+        Symmetric zero padding per side as a fraction of the lifted field; ``None`` disables it
     mode_ratio : float, optional
         Ratio for computing intermediate layer modes (default: 0.5)
     uno_scalings : list[list[float]] | None, optional
         Layer-specific spatial scalings (default: None - auto-computed)
+    lifting_channel_ratio : float, optional
+        Lifting width relative to ``hidden_channels`` (default: 2)
+    projection_channel_ratio : float, optional
+        Projection width relative to ``hidden_channels`` (default: 2)
     channel_mlp_skip : str, optional
         Skip connection type for channel MLP (default: "linear")
-    positional_embedding : str | None, optional
-        Neuraloperator positional embedding (default: "grid")
     device : torch.device | str | None, optional
         Device to place model on (default: None - caller handles)
 
@@ -429,9 +441,7 @@ def build_uno(
 
     uno_out_channels = [hidden_channels] * n_layers
 
-    constructor_options: dict[str, Any] = {}
-    if positional_embedding != "grid":
-        constructor_options["positional_embedding"] = positional_embedding
+    constructor_options: dict[str, Any] = {"positional_embedding": positional_embedding, "domain_padding": domain_padding}
     with _filter_uno_constructor_stdout():
         model = UNO(
             in_channels=in_channels,
@@ -441,6 +451,8 @@ def build_uno(
             uno_out_channels=uno_out_channels,
             uno_n_modes=uno_n_modes,
             uno_scalings=uno_scalings,
+            lifting_channels=int(lifting_channel_ratio * hidden_channels),
+            projection_channels=int(projection_channel_ratio * hidden_channels),
             channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
             **constructor_options,
         )
@@ -456,17 +468,22 @@ def build_rno(
     out_channels: int,
     n_modes: list[int] | tuple[int, int],
     hidden_channels: int,
+    candidate_activation: str,
+    positional_embedding: str | None,
+    domain_padding: float | None,
     n_layers: int = 4,
     rno_skip: bool = False,
     lifting_channel_ratio: float = 2,
     projection_channel_ratio: float = 2,
-    positional_embedding: str | None = "grid",
     channel_mlp_skip: str = "soft-gating",
     fno_skip: str = "linear",
     return_sequences: bool = False,
     device: torch.device | str | None = None,
 ) -> torch.nn.Module:
-    """Build the official neuraloperator recurrent neural operator."""
+    """Build the neuraloperator recurrent neural operator with the project-owned tanh-candidate cell."""
+    if candidate_activation != "tanh":
+        message = f"RNO requires candidate_activation='tanh' (bounded hidden state), got: {candidate_activation!r}."
+        raise ValueError(message)
     if return_sequences is not False:
         message = "RNO requires return_sequences=False; transient rollouts carry hidden state explicitly."
         raise ValueError(message)
@@ -477,7 +494,7 @@ def build_rno(
         raise ValueError(message)
     rno_builder = _resolve_rno_builder()
     if rno_builder is None:
-        message = "The installed neuraloperator package does not expose official RNO support."
+        message = "The installed neuraloperator package does not expose RNO support."
         raise RuntimeError(message)
     n_modes_tuple = tuple(int(mode) for mode in n_modes)
     if len(n_modes_tuple) != _FNO_MODE_DIMENSIONS:
@@ -493,17 +510,23 @@ def build_rno(
         lifting_channel_ratio=lifting_channel_ratio,
         projection_channel_ratio=projection_channel_ratio,
         positional_embedding=positional_embedding,
+        domain_padding=domain_padding,
         channel_mlp_skip=_validate_skip("channel_mlp_skip", channel_mlp_skip),
         fno_skip=_validate_skip("fno_skip", fno_skip),
         return_sequences=False,
     )
+    # Imported here because the cell module needs neuralop.layers at import time, and
+    # available_model_kinds() must keep working when the dependency lacks the RNO.
+    from . import learning_models_rno_cell as rno_cell  # noqa: PLC0415
+
+    rno_cell.use_tanh_candidate_cells(model, n_layers=n_layers)
     if device is not None:
         model.to(device)
     return model
 
 
 def _resolve_rno_builder() -> Callable[..., torch.nn.Module] | None:
-    """Return the official neuraloperator RNO constructor when exposed."""
+    """Return the neuraloperator RNO constructor when exposed."""
     try:
         models = importlib.import_module("neuralop.models")
     except ImportError:
@@ -515,7 +538,7 @@ def _resolve_rno_builder() -> Callable[..., torch.nn.Module] | None:
 
 
 def _rno_is_available() -> bool:
-    """Return whether the installed neuraloperator exposes official RNO."""
+    """Return whether the installed neuraloperator exposes the RNO."""
     return _resolve_rno_builder() is not None
 
 
@@ -573,6 +596,7 @@ _MODEL_KINDS = MappingProxyType(
                     "channel_mlp_skip",
                     "implementation",
                     "positional_embedding",
+                    "domain_padding",
                 }
             ),
             required_params=frozenset(
@@ -582,13 +606,21 @@ _MODEL_KINDS = MappingProxyType(
                     "n_modes",
                     "hidden_channels",
                     "n_layers",
+                    "positional_embedding",
+                    "domain_padding",
                 }
             ),
         ),
         "uno": ModelKindSpec(
             kind="uno",
             builder=build_uno,
-            defaults=MappingProxyType({"channel_mlp_skip": "linear"}),
+            defaults=MappingProxyType(
+                {
+                    "lifting_channel_ratio": 2,
+                    "projection_channel_ratio": 2,
+                    "channel_mlp_skip": "linear",
+                }
+            ),
             allowed_params=frozenset(
                 {
                     "in_channels",
@@ -599,8 +631,11 @@ _MODEL_KINDS = MappingProxyType(
                     "modes_y",
                     "mode_ratio",
                     "uno_scalings",
+                    "lifting_channel_ratio",
+                    "projection_channel_ratio",
                     "channel_mlp_skip",
                     "positional_embedding",
+                    "domain_padding",
                 }
             ),
             required_params=frozenset(
@@ -611,6 +646,8 @@ _MODEL_KINDS = MappingProxyType(
                     "hidden_channels",
                     "modes_x",
                     "modes_y",
+                    "positional_embedding",
+                    "domain_padding",
                 }
             ),
         ),
@@ -623,7 +660,6 @@ _MODEL_KINDS = MappingProxyType(
                     "rno_skip": False,
                     "lifting_channel_ratio": 2,
                     "projection_channel_ratio": 2,
-                    "positional_embedding": "grid",
                     "channel_mlp_skip": "soft-gating",
                     "fno_skip": "linear",
                     "return_sequences": False,
@@ -636,16 +672,20 @@ _MODEL_KINDS = MappingProxyType(
                     "n_modes",
                     "hidden_channels",
                     "n_layers",
+                    "candidate_activation",
                     "rno_skip",
                     "lifting_channel_ratio",
                     "projection_channel_ratio",
                     "positional_embedding",
+                    "domain_padding",
                     "channel_mlp_skip",
                     "fno_skip",
                     "return_sequences",
                 }
             ),
-            required_params=frozenset({"in_channels", "out_channels", "n_modes", "hidden_channels"}),
+            required_params=frozenset(
+                {"in_channels", "out_channels", "n_modes", "hidden_channels", "candidate_activation", "positional_embedding", "domain_padding"}
+            ),
         ),
     }
 )
@@ -774,6 +814,10 @@ def validate_model_params(
 
     if kind == "rno" and params.get("rno_skip", False) is not False:
         message = "model.params.rno_skip must be false for RNO."
+        raise ValueError(message)
+
+    if kind == "rno" and params.get("candidate_activation") != "tanh":
+        message = "model.params.candidate_activation must be 'tanh' for RNO; the project cell bounds the hidden state."
         raise ValueError(message)
 
     if kind == "uno":

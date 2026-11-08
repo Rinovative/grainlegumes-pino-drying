@@ -31,7 +31,8 @@ def _architecture_parts(config: Mapping[str, Any]) -> tuple[str, str]:
     modes = (params["modes_x"], params["modes_y"]) if kind == "uno" else params["n_modes"]
     number, text = common.names.number_token, common.names.text_token
     label = f"{kind}_m{number(modes[0])}x{number(modes[1])}_h{number(params['hidden_channels'])}_l{number(params['n_layers'])}"
-    core = {"n_modes", "modes_x", "modes_y", "hidden_channels", "n_layers", "in_channels", "out_channels"}
+    # domain_padding is a required, project-wide fixed value with no default to deviate from, so it names no switch.
+    core = {"n_modes", "modes_x", "modes_y", "hidden_channels", "n_layers", "in_channels", "out_channels", "domain_padding"}
     if kind == "uno":
         scales = factory.resolve_uno_scalings(params["n_layers"], params.get("uno_scalings"))
         tokens = []
@@ -41,6 +42,9 @@ def _architecture_parts(config: Mapping[str, Any]) -> tuple[str, str]:
             tokens.append(a if x == y else f"{a}x{b}")
         label += "_s" + "-".join(tokens) + "_r" + number(params.get("mode_ratio", 0.5), precision=3)
         core.update({"uno_scalings", "mode_ratio"})
+    if kind == "rno":
+        # The RNO accepts only the tanh candidate, so the value names no alternative.
+        core.add("candidate_activation")
     defaults = factory.model_defaults(kind)
     switches = []
     for key, value in sorted(params.items()):

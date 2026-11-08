@@ -16,19 +16,18 @@ import json
 import shlex
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import Any
 
 import pytest
 import torch
 from support import configs
+from support.synthetic_task import admitted_manifest
 
 from src import analysis, common, experiments, learning
 from src.experiments.cli import cli_build_artifacts, cli_config_preflight, cli_optuna, cli_train
 
-if TYPE_CHECKING:
-    from src.domain.tasks.domain_task_spec import TaskSpec
-
 _CLI_USAGE_ERROR = 2
+_NO_ARTIFACTS = SimpleNamespace(id_artifact=None, additional_artifact=None)
 
 
 def test_public_cli_rejects_one_unknown_option() -> None:
@@ -120,7 +119,7 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
         assert selected is run_dir
         post_training_call.update(kwargs)
         events.append("artifacts prepared")
-        return SimpleNamespace(role_actions={"id": "reused", "additional_evaluation": "generated"})
+        return SimpleNamespace(role_actions={"id": "reused", "additional_evaluation": "generated"}, loaded_run=_NO_ARTIFACTS)
 
     def capture_build(**kwargs: object) -> dict[str, object]:
         artifact_cli_call.update(kwargs)
@@ -142,6 +141,8 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
                 "1",
                 "--train-dataset",
                 "synthetic_train",
+                "--seed",
+                "19",
                 "--train-seconds",
                 "25",
                 "--rollout-length",
@@ -158,6 +159,7 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
     assert "output_root" not in training_call
     assert training_call["epochs"] == 1
     assert training_call["train_dataset"] == "synthetic_train"
+    assert training_call["seed"] == 19
     assert training_call["train_seconds"] == 25
     assert training_call["rollout_length"] == 8
     assert training_call["lr_scale"] == pytest.approx(0.5)
@@ -394,6 +396,21 @@ def test_train_cli_rejects_non_positive_budgets_before_dispatch(
     assert cli_train.main(["unused.yaml", *overrides]) == 1
 
 
+def test_train_cli_rejects_a_negative_seed_before_dispatch(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Name the seed contract at the CLI boundary instead of failing later inside the run service."""
+    monkeypatch.setattr(
+        experiments.run,
+        "run_experiment",
+        lambda *_args, **_kwargs: pytest.fail("negative seed reached training"),
+    )
+
+    assert cli_train.main(["unused.yaml", "--seed", "-1"]) == 1
+    assert "--seed must be a non-negative integer." in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("lr_scale", ["0", "-1", "nan"])
 def test_train_cli_rejects_an_invalid_lr_scale_before_any_run_is_allocated(
     tmp_path: Path,
@@ -446,6 +463,63 @@ def test_artifact_failure_is_nonzero_without_relabeling_completed_training(
     assert "--rebuild" not in captured.err
 
 
+def _prepared_with_validity(valid: int, total: int) -> SimpleNamespace:
+    """Return prepared artifacts whose only role carries ``valid`` of ``total`` valid predictions."""
+    evidence = {"status_counts": {"VALID": valid}, "case_count": total}
+    artifact = SimpleNamespace(frame=SimpleNamespace(attrs={"artifact_provenance": {"evaluation": {"prediction_validity": evidence}}}))
+    return SimpleNamespace(role_actions={"id": "generated"}, loaded_run=SimpleNamespace(id_artifact=artifact, additional_artifact=None))
+
+
+@pytest.mark.parametrize(("valid", "status"), [(0, "completed with invalid predictions (valid 0 of 2)"), (2, "generated")])
+def test_post_training_line_reports_invalid_predictions_and_the_duration_parts(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    valid: int,
+    status: str,
+) -> None:
+    """Never call artifacts complete while their predictions are invalid; the exit status stays 0 and the line shows the duration parts."""
+    outcome = {
+        "run_dir": Path("run"),
+        "result": {
+            "status": "completed",
+            "best_epoch": 1,
+            "best_metric": 0.5,
+            "phase_seconds": {"startup": 5.0, "training": 70.0, "validation": 12.0},
+        },
+        "device_resolution": _cuda_zero_resolution(),
+    }
+    monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
+    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
+    monkeypatch.setattr(analysis.artifacts.service, "cleanup_runtime", lambda _device: None)
+    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda *_args, **_kwargs: _prepared_with_validity(valid, 2))
+
+    assert cli_train.main(["experiment.yaml"]) == 0
+
+    final = capsys.readouterr().out.splitlines()[-1]
+    assert final.startswith(f"Post-training artifacts: {status} (cuda:0) | total ")
+    for part in ("startup 5 s", "training 1 min 10 s", "validation 12 s", "artifacts 0 s", "other "):
+        assert part in final
+
+
+def test_budget_unmet_status_names_the_operational_cap(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run that stops before its budget says it hit an operational cap, with the epochs it ran."""
+    run_dir = Path("run")
+    outcome = {"run_dir": run_dir, "result": {"status": "budget_unmet", "completed_epoch": 7}, "device_resolution": _cuda_zero_resolution()}
+    monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
+    monkeypatch.setattr(experiments.config.loader, "load_yaml", lambda _path: {"training": {"epochs": 7}})
+
+    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == 2
+
+    assert "Training status: budget_unmet after 7 epochs (operational cap)" in capsys.readouterr().out
+
+
+def test_run_admission_rejection_reports_saved_and_requested_epochs(capsys: pytest.CaptureFixture[str]) -> None:
+    """Name both epoch counts instead of the ambiguous ``epoch 5 of 4``."""
+    cli_train._print_existing_run_admission({"reason": "different settings", "completed_epoch": 5, "target_epoch": 4, "status": "completed"})
+
+    assert "saved 5 epochs, requested 4" in capsys.readouterr().err
+
+
 def _capture_post_training_rebuild_flags(monkeypatch: pytest.MonkeyPatch, outcome: dict[str, object]) -> dict[Path, object]:
     """Run the train CLI on a fixed outcome and map each prepared run directory to its rebuild flag."""
     flags: dict[Path, object] = {}
@@ -453,7 +527,7 @@ def _capture_post_training_rebuild_flags(monkeypatch: pytest.MonkeyPatch, outcom
     def prepare(selected: Path, **kwargs: object) -> SimpleNamespace:
         flags[selected] = kwargs["rebuild_incompatible"]
         # An authorized rebuild replaces the incompatible artifacts of an extended run, as the artifact service reports it.
-        return SimpleNamespace(role_actions={"id": "rebuilt" if kwargs["rebuild_incompatible"] else "reused"})
+        return SimpleNamespace(role_actions={"id": "rebuilt" if kwargs["rebuild_incompatible"] else "reused"}, loaded_run=_NO_ARTIFACTS)
 
     monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
     monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _path: {})
@@ -529,28 +603,6 @@ def test_incompatible_artifact_failure_recovery_command_requests_rebuild(
     assert recovery[0].endswith("--run-dir completed-run --rebuild")
 
 
-def _describe_artificial_dataset(
-    seen: list[str],
-    dataset_id: str,
-    *,
-    task: TaskSpec,
-    dataset_root: Path,
-    metadata_root: Path,
-) -> SimpleNamespace:
-    """Return a valid bounded summary for a test-owned dataset identifier."""
-    seen.append(dataset_id)
-    return SimpleNamespace(
-        dataset_id=dataset_id,
-        dataset_path=common.paths.resolve_dataset_path(task.id, dataset_id, dataset_root=dataset_root),
-        metadata_directory=common.paths.resolve_dataset_metadata_dir(task.id, dataset_id, metadata_root=metadata_root),
-        dataset_exists=True,
-        task_id=task.id,
-        data_contract_digest=task.data_contract_digest,
-        dataset_digest="a" * 64,
-        sample_count=4,
-    )
-
-
 def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
@@ -562,14 +614,15 @@ def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
     output_root = tmp_path / "storage" / "03_experiments"
     described: list[str] = []
 
-    def describe(dataset_id: str, **kwargs: object) -> SimpleNamespace:
-        return _describe_artificial_dataset(described, dataset_id, **kwargs)  # type: ignore[arg-type]
+    def describe(task: str, dataset_id: str, **_roots: object) -> dict[str, Any]:
+        described.append(dataset_id)
+        return admitted_manifest(task, dataset_id)
 
     def reject_side_effect(*_args: object, **_kwargs: object) -> object:
         pytest.fail("dry-run reached a side-effecting runtime boundary")
 
     runtime = experiments.tuning.optuna
-    monkeypatch.setattr(runtime.datasets.contracts.metadata, "load_dataset_metadata_summary", describe)
+    monkeypatch.setattr(runtime.datasets.packages.manifest, "load_package_manifest", describe)
     monkeypatch.setattr(runtime, "_optuna_module", reject_side_effect)
     monkeypatch.setattr(experiments.run, "prepare_fresh_run", reject_side_effect)
     monkeypatch.setattr(experiments.tracking, "initialize_wandb", reject_side_effect)
@@ -660,15 +713,11 @@ def test_optuna_dry_run_dataset_failure_is_nonzero_without_output(
     )
     output_root = tmp_path / "storage" / "03_experiments"
 
-    def reject_dataset(dataset_id: str, **_kwargs: object) -> None:
+    def reject_dataset(_task: str, dataset_id: str, **_kwargs: object) -> None:
         msg = f"configured dataset missing: {dataset_id}"
         raise FileNotFoundError(msg)
 
-    monkeypatch.setattr(
-        experiments.tuning.optuna.datasets.contracts.metadata,
-        "load_dataset_metadata_summary",
-        reject_dataset,
-    )
+    monkeypatch.setattr(experiments.tuning.optuna.datasets.packages.manifest, "load_package_manifest", reject_dataset)
     assert (
         cli_optuna.main(
             [

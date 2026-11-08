@@ -2,8 +2,11 @@
 
 Responsibilities:
   - Validate the single current task-aware training-dataset schema
+  - Own the schema kind and version of the Dataset manifest and of the steady source-selection identity
   - Compute stable package, case, dataset, and split-membership fingerprints
+  - Project an admitted manifest into the binding every runtime Dataset carries
   - Bind persisted tensors and ordered sample identities to task contracts
+  - Refuse Source HDF5 bytes that changed after admission with one error for both Dataset views
 
 Design principles:
   - Identity is content-addressed, deterministic, and fail-closed
@@ -25,14 +28,19 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
-from src import domain
+from src import common, domain
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from torch import Tensor
 
     from src.domain.tasks.domain_task_spec import TaskSpec
 
-PACKAGE_SELECTION_SCHEMA_VERSION = 3
+DATASET_PACKAGE_SCHEMA_KIND: Final = "dataset_selection_manifest"
+DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
+SOURCE_SELECTION_SCHEMA_KIND: Final = "dataset_source_selection"
+SOURCE_SELECTION_SCHEMA_VERSION: Final = 1
 TRAINING_DATASET_SCHEMA_VERSION = 1
 TRAINING_DATASET_SCHEMA_KIND = "dataset_steady_tensor_payload"
 CASE_FINGERPRINT_VERSION = 1
@@ -43,7 +51,6 @@ _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
 _DATASET_CONVERSION_CONTRACTS: Final = {
     "steady_flow": {
         "schema_kind": "dataset_conversion_contract",
-        "schema_version": 1,
         "source_schema_version": 1,
         "tensor_dtype": TRAINING_TENSOR_DTYPE,
         "case_fingerprint_version": CASE_FINGERPRINT_VERSION,
@@ -56,7 +63,6 @@ _DATASET_CONVERSION_CONTRACTS: Final = {
     },
     "transient_drying": {
         "schema_kind": "dataset_conversion_contract",
-        "schema_version": 1,
         "source_schema_version": 1,
         "index_schema_version": 1,
         "transition_selection": "consecutive_regular_states_excluding_irregular_stop",
@@ -122,6 +128,44 @@ class DatasetIdentity:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ManifestBinding:
+    """Bind one runtime Dataset to its admitted manifest: identity, digest, ordered cases, sources, materials and partition."""
+
+    dataset_id: str
+    dataset_digest: str
+    channel_contract_digest: str
+    case_ids: tuple[str, ...]
+    physical_sources: Mapping[str, tuple[str, str]]
+    materials: Mapping[str, str]
+    case_partition: Mapping[str, Any] | None
+
+    def split_identity(self) -> dict[str, Any]:
+        """Return the manifest part of the persisted split and scaling identity."""
+        return {
+            "dataset_id": self.dataset_id,
+            "dataset_digest": self.dataset_digest,
+            "channel_contract_digest": self.channel_contract_digest,
+            "case_ids": list(self.case_ids),
+        }
+
+
+def manifest_binding(manifest: Mapping[str, Any]) -> ManifestBinding:
+    """Project an admitted Dataset manifest into the binding its runtime carries."""
+    entries = manifest["source_case_identities"]
+    return ManifestBinding(
+        dataset_id=str(manifest["dataset_id"]),
+        dataset_digest=str(manifest["dataset_digest"]),
+        channel_contract_digest=str(manifest["channel_contract_digest"]),
+        case_ids=tuple(str(entry["package_case_id"]) for entry in entries),
+        physical_sources={
+            str(entry["package_case_id"]): (str(entry["source"]["case_input_id"]), str(entry["source"]["simulation_case_id"])) for entry in entries
+        },
+        materials={str(entry["package_case_id"]): str(entry["source"]["material_family"]) for entry in entries},
+        case_partition=copy.deepcopy(manifest["case_partition"]),
+    )
+
+
 def combined_dataset_id(dataset_ids: Sequence[str]) -> str:
     """Return the stable logical identity for one ordered OOD package selection."""
     identifiers = tuple(dataset_ids)
@@ -164,7 +208,6 @@ def dataset_conversion_contract_identity(dataset_view: str) -> dict[str, Any]:
     digest = hashlib.sha256(_canonical_json(contract, label="Dataset conversion contract")).hexdigest()
     return {
         "schema_kind": "dataset_conversion_identity",
-        "schema_version": 1,
         "dataset_view": dataset_view,
         "contract_sha256": digest,
     }
@@ -173,7 +216,9 @@ def dataset_conversion_contract_identity(dataset_view: str) -> dict[str, Any]:
 def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """Select the positive content and interpretation dependencies of a package."""
     value = dict(provenance)
-    if value.get("schema_kind") != "dataset_selection_manifest" or value.get("schema_version") != PACKAGE_SELECTION_SCHEMA_VERSION:
+    if value.get("schema_kind") != DATASET_PACKAGE_SCHEMA_KIND or not common.serialization.is_schema_version(
+        value.get("schema_version"), DATASET_PACKAGE_SCHEMA_VERSION
+    ):
         msg = "Dataset package uses an unsupported selection contract."
         raise ValueError(msg)
     dataset_view = _require_non_empty_string(value.get("dataset_view"), label="Dataset package dataset_view")
@@ -309,6 +354,13 @@ def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str
     digest = hashlib.sha256(_canonical_json(payload, label="Dataset package identity")).hexdigest()
     name = _require_non_empty_string(provenance.get("dataset_name"), label="Dataset package dataset_name")
     return name, digest
+
+
+def require_admitted_source_bytes(path: Path, expected_sha256: str) -> None:
+    """Refuse a Source HDF5 whose bytes changed after Dataset admission, for every Dataset view and payload stage."""
+    if common.serialization.file_sha256(path) != expected_sha256:
+        msg = f"Source HDF5 changed after Dataset admission: {path}."
+        raise ValueError(msg)
 
 
 def _update_hash(hasher: Any, value: bytes) -> None:
@@ -466,8 +518,8 @@ def validate_dataset_data_contract_digest(
 
     Notes
     -----
-    Datasets persist only ``TaskSpec.data_contract_digest``. Complete-task
-    digests and prior data-contract digests are rejected without conversion.
+    Datasets persist only ``TaskSpec.data_contract_digest``; any other digest
+    is rejected.
 
     """
     digest = _require_sha256(value, label=label)
@@ -478,8 +530,7 @@ def validate_dataset_data_contract_digest(
 
 
 def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, label: str) -> None:
-    schema_version = payload.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != TRAINING_DATASET_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(payload.get("schema_version"), TRAINING_DATASET_SCHEMA_VERSION):
         msg = f"{label} schema_version must be integer {TRAINING_DATASET_SCHEMA_VERSION}."
         raise ValueError(msg)
     if payload.get("schema_kind") != TRAINING_DATASET_SCHEMA_KIND:
@@ -576,8 +627,8 @@ def build_training_dataset_payload(
     normalized_selection_identity = _json_mapping_copy(source_selection_identity, label="source_selection_identity")
     if (
         set(normalized_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
-        or normalized_selection_identity["schema_kind"] != "dataset_source_selection"
-        or normalized_selection_identity["schema_version"] != 1
+        or normalized_selection_identity["schema_kind"] != SOURCE_SELECTION_SCHEMA_KIND
+        or not common.serialization.is_schema_version(normalized_selection_identity["schema_version"], SOURCE_SELECTION_SCHEMA_VERSION)
         or not isinstance(normalized_selection_identity["source_cases"], list)
         or len(normalized_selection_identity["source_cases"]) != len(normalized_sample_ids)
     ):
@@ -663,8 +714,8 @@ def validate_training_dataset_payload(
     source_selection_identity = _json_mapping_copy(mapping.get("source_selection_identity"), label="source_selection_identity")
     if (
         set(source_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
-        or source_selection_identity["schema_kind"] != "dataset_source_selection"
-        or source_selection_identity["schema_version"] != 1
+        or source_selection_identity["schema_kind"] != SOURCE_SELECTION_SCHEMA_KIND
+        or not common.serialization.is_schema_version(source_selection_identity["schema_version"], SOURCE_SELECTION_SCHEMA_VERSION)
         or not isinstance(source_selection_identity["source_cases"], list)
         or len(source_selection_identity["source_cases"]) != sample_count
     ):

@@ -4,7 +4,7 @@ Responsibilities:
   - Bind epoch records to one task, run, and checkpoint identity
   - Publish ordered finite metric records through atomic JSON replacement
   - Raise FloatingPointError for non-finite live metrics before admission
-  - Reconcile only a crash-ahead final epoch against restored checkpoints
+  - Truncate records ahead of a restored last checkpoint; reject history behind it
 
 Design principles:
   - History is evidence written before last-checkpoint publication
@@ -74,7 +74,11 @@ def _reject_nonfinite_live_metrics(epoch: int, metrics: Mapping[str, Any]) -> No
 def _admit_history(payload: Any, *, task: str, run_name: str, checkpoint_identity: Mapping[str, Any]) -> dict[str, Any]:
     """Validate history identity and gap-free ordered record sequence."""
     required = {"schema_version", "task", "run_name", "checkpoint_identity_digest", "epochs"}
-    if not isinstance(payload, Mapping) or set(payload) != required or payload["schema_version"] != _HISTORY_SCHEMA_VERSION:
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != required
+        or not common.serialization.is_schema_version(payload["schema_version"], _HISTORY_SCHEMA_VERSION)
+    ):
         msg = "Transient history schema is invalid."
         raise ValueError(msg)
     if payload["task"] != task or payload["run_name"] != run_name:
@@ -133,7 +137,13 @@ def reconcile_history(
     checkpoint_identity: Mapping[str, Any],
     completed_epoch: int,
 ) -> dict[str, Any]:
-    """Read and reconcile durable history against one restored last checkpoint."""
+    """
+    Read and reconcile durable history against one restored last checkpoint.
+
+    History is written every epoch while ``last`` follows a wall-time cadence, so
+    records ahead of the checkpoint are truncated atomically; history behind it
+    is incompatible evidence and raises ``ValueError``.
+    """
     if isinstance(completed_epoch, bool) or not isinstance(completed_epoch, int) or completed_epoch < 0:
         msg = "completed_epoch must be a non-negative integer."
         raise ValueError(msg)
@@ -156,14 +166,14 @@ def reconcile_history(
         raise ValueError(msg) from error
     history = _admit_history(raw, task=task, run_name=run_name, checkpoint_identity=checkpoint_identity)
     count = len(history["epochs"])
-    if count == completed_epoch:
-        return history
-    if count == completed_epoch + 1:
+    if count < completed_epoch:
+        msg = "Transient history is behind the restored last checkpoint."
+        raise ValueError(msg)
+    if count > completed_epoch:
+        # Epochs after the newest last checkpoint are trained again, so their records are replaced.
         history["epochs"] = history["epochs"][:completed_epoch]
         common.serialization.atomic_write_json(path, history)
-        return history
-    msg = "Transient history and last checkpoint disagree by more than one completed epoch."
-    raise ValueError(msg)
+    return history
 
 
 def make_epoch_state_callback(

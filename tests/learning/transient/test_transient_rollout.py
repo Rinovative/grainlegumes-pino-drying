@@ -71,9 +71,10 @@ class _RNO(nn.Module):
         self.weight = nn.Parameter(torch.tensor(1.0))
         self.hidden_inputs: list[object | None] = []
 
-    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool) -> Any:
+    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool, keep_states_padded: bool) -> Any:
         assert value.shape[1] == 1
         assert return_hidden_states is True
+        assert keep_states_padded is True
         self.hidden_inputs.append(init_hidden_states)
         if init_hidden_states is not None and not isinstance(init_hidden_states, int):
             message = "Synthetic RNO hidden state must be an integer or null."
@@ -145,8 +146,9 @@ class _StateRNO(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool) -> Any:
+    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool, keep_states_padded: bool) -> Any:
         assert return_hidden_states is True
+        assert keep_states_padded is True
         step = value[:, 0, :4] * self.weight
         state = step if init_hidden_states is None else cast("list[torch.Tensor]", init_hidden_states)[0] + step
         return state, [state]

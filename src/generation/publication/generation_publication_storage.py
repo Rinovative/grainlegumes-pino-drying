@@ -66,6 +66,7 @@ _FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
 STATUS_SCHEMA_VERSION = 1
+PUBLICATION_SCHEMA_VERSION = 1  # case publication, success, timing and provenance records
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION = 1
 
@@ -1708,7 +1709,7 @@ def _validate_hdf5_provenance(
     }
     if (
         not isinstance(scientific, dict)
-        or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(scientific.get("schema_version"), config_contract.CONFIG_SCHEMA_VERSION)
         or scientific.get("simulation_profile") != profile
         or fixed_ownership != expected_fixed
     ):
@@ -1739,7 +1740,7 @@ def _validate_hdf5_provenance(
         or not required_case_keys.issubset(case_scientific)
         or set(case_scientific).difference(required_case_keys | optional_case_keys)
         or case_scientific.get("schema_kind") != _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND
-        or case_scientific.get("schema_version") != _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(case_scientific.get("schema_version"), _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION)
     ):
         msg = "Canonical HDF5 realized case-scientific provenance schema is invalid."
         raise ValueError(msg)
@@ -2302,9 +2303,11 @@ def validate_case_hdf5(
         msg = f"Canonical case HDF5 is missing or unsafe: {path}"
         raise FileNotFoundError(msg)
     with h5py.File(path, "r") as handle:
+        stored_schema_version = handle.attrs.get("schema_version")
         if (
             handle.attrs.get("schema_kind") != HDF5_SCHEMA_KIND
-            or int(handle.attrs.get("schema_version", -1)) != HDF5_SCHEMA_VERSION
+            or not isinstance(stored_schema_version, np.integer)
+            or not common.serialization.is_schema_version(int(stored_schema_version), HDF5_SCHEMA_VERSION)
             or handle.attrs.get("converter_version") != HDF5_CONVERTER_VERSION
         ):
             msg = f"Unsupported canonical case HDF5 schema or converter identity: {path}"

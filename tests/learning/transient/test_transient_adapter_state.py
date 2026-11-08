@@ -130,13 +130,13 @@ def test_validation_work_is_persisted_but_excluded_from_budget_progress() -> Non
 
 
 def test_adapter_uses_only_current_controller_schema() -> None:
-    """Persist schema version 3 and reject controller state from any other schema."""
+    """Persist schema version 1 and reject controller state from any other schema."""
     adapter = _adapter_with_fake_tensorizer()
     current = copy.deepcopy(adapter.state_dict())
-    assert current["controller"]["schema_version"] == 4
+    assert current["controller"]["schema_version"] == 1
 
     invalid = copy.deepcopy(current)
-    invalid["controller"]["schema_version"] = 1
+    invalid["controller"]["schema_version"] = 2
     with pytest.raises(ValueError, match="strict schema"):
         adapter.load_state_dict(invalid)
 
@@ -209,8 +209,9 @@ class _StateRNO(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool) -> Any:
+    def forward(self, value: torch.Tensor, *, init_hidden_states: object | None, return_hidden_states: bool, keep_states_padded: bool) -> Any:
         assert return_hidden_states is True
+        assert keep_states_padded is True
         step = value[:, 0, :4] * self.weight
         state = step if init_hidden_states is None else init_hidden_states[0] + step  # type: ignore[index]
         return state, [state]

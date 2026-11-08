@@ -10,7 +10,7 @@ material_scope:
   product_form: whole_seed
   coat_or_hull_state: intact
   description: Whole mature dry red or brown lentil seed
-# Mean permeability is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
+# The permeability scale kappa_mean is in m^2. Natural support and transform define sampling; ood_supports are separate synthetic stress intervals.
 permeability:
   nominal: 7.88e-09
   support:

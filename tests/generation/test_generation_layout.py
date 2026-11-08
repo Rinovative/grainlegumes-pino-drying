@@ -305,3 +305,9 @@ def test_campaign_discovery_rejects_the_superseded_layout(tmp_path: Path) -> Non
     (old / "campaign_plan.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="superseded storage layout"):
         catalog.list_campaigns("steady_flow", storage_root=tmp_path)
+
+
+def test_input_generation_locators_require_a_campaign_batch_locator(tmp_path: Path) -> None:
+    """A batch name without a campaign namespace has no input-generation location."""
+    with pytest.raises(ValueError, match="not a campaign locator"):
+        common.paths.resolve_generation_input_metadata_storage_root(tmp_path, "flat_batch_name", "input-" + "a" * 24)

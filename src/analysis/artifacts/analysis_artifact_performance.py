@@ -29,6 +29,7 @@ from typing import Any, Final
 
 import torch
 
+from src import common
 from src.experiments import experiments_console as console
 
 _SCHEMA_KIND: Final = "evaluation_artifact_operational_performance"
@@ -37,6 +38,7 @@ _KIBIBYTE: Final = 1024
 _GIBIBYTE: Final = 1024**3
 _MINIMUM_ETA_CASES: Final = 2
 _HEARTBEAT_SECONDS: Final = 60.0
+_SPLIT_LABELS: Final = {"id": "ID test set", "eval": "ID test set", "additional_evaluation": "additional evaluation set"}
 _PHASES: Final = frozenset(
     {
         "preflight",
@@ -189,6 +191,11 @@ def current_process_rss_bytes() -> int | None:
         return _peak_process_rss_bytes()
 
 
+def split_label(split: str) -> str:
+    """Return the reader-facing name of a saved artifact split role."""
+    return _SPLIT_LABELS[split]
+
+
 @dataclass(slots=True)
 class ArtifactProgressReporter:
     """Emit one line per finished phase, a rate-limited heartbeat, and one completion line."""
@@ -234,7 +241,7 @@ class ArtifactProgressReporter:
         """Print one bounded startup line without exact manifests."""
         self._print(
             f"artifacts {self.run} | {self.task} {self.stage_label} ({self.checkpoint_label}) | {self.device} {self.dtype}"
-            f" | {self.total_cases} cases | split {self.split} | out {console.display_path(self.output_root)}"
+            f" | {self.total_cases} cases | {split_label(self.split)} | out {console.display_path(self.output_root)}"
         )
 
     def _phase_done(self, name: str, elapsed: float, detail: str = "") -> None:
@@ -338,11 +345,11 @@ class ArtifactProgressReporter:
             f"  progress {self._completed_cases}/{self.total_cases} cases ({percent}%)",
             material,
             f"{rate:.2f} cases/min",
-            f"elapsed {console.format_duration(elapsed)}",
+            f"elapsed {common.console.format_duration(elapsed)}",
         ]
         if self._completed_cases >= _MINIMUM_ETA_CASES and rate > 0.0:
             remaining = self.total_cases - self._completed_cases
-            parts.append(f"eta {console.format_duration(60.0 * remaining / rate)}")
+            parts.append(f"eta {common.console.format_duration(60.0 * remaining / rate)}")
         parts.append(self._memory_text())
         self._print(" | ".join(parts))
 
@@ -397,7 +404,7 @@ class ArtifactProgressReporter:
         if gpu_peak is not None:
             peaks.insert(0, f"GPU peak {gpu_peak / _GIBIBYTE:.2f} GiB")
         self._print(
-            f"artifacts done | {self._completed_cases} cases | total {console.format_duration(float(validated['total_seconds']))}"
+            f"artifacts done | {self._completed_cases} cases | total {common.console.format_duration(float(validated['total_seconds']))}"
             f" | {float(measurements.get('cases_per_minute', 0.0)):.2f} cases/min"
             f" | forward avg {float(measurements.get('average_forward_milliseconds', 0.0)):.2f} ms | {' | '.join(peaks)}"
             f" | out {console.display_path(self.output_root)}"
@@ -411,7 +418,7 @@ class ArtifactProgressReporter:
         last_case = "" if self._last_case is None else f" | last case {self._last_case}"
         self._print(
             f"artifacts FAILED in {phase or self._current_phase or 'unknown'} | {self._completed_cases}/{self.total_cases} cases done"
-            f" | elapsed {console.format_duration(self.recorder.elapsed_seconds)}{last_case} | out {console.display_path(self.output_root)}",
+            f" | elapsed {common.console.format_duration(self.recorder.elapsed_seconds)}{last_case} | out {console.display_path(self.output_root)}",
             to_stderr=True,
         )
         self._failed_reported = True
@@ -443,7 +450,7 @@ def validate_operational_performance(value: object) -> dict[str, Any]:
     }:
         message = "Artifact operational performance fields do not match the schema."
         raise ValueError(message)
-    if value["schema_kind"] != _SCHEMA_KIND or value["schema_version"] != _SCHEMA_VERSION:
+    if value["schema_kind"] != _SCHEMA_KIND or not common.serialization.is_schema_version(value["schema_version"], _SCHEMA_VERSION):
         message = "Artifact operational performance schema is unsupported."
         raise ValueError(message)
     total = value["total_seconds"]

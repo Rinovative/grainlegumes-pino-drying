@@ -1,9 +1,11 @@
 """Generate and validate transient sequence artifacts through current project owners.
 
 Responsibilities:
-  - Resolve completed-run roles and exact saved complete-case membership
+  - Reopen the parts of a shared artifact role plan and enforce their saved identity and complete-case membership
   - Generate bounded case inference, metric and timing evidence through maintained owners
   - Delegate sequence staging and validate canonical or explicit selected-case artifacts
+  - Bind role-level prediction-validity evidence to exact role membership
+  - Stamp the running analysis producer and resume a partial stage only under the analysis code that started it
 
 Design principles:
   - Saved membership order and training identity bind every artifact role
@@ -25,12 +27,13 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
 from src import common, datasets, domain, experiments, generation, learning
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_transient_artifact as sequence_artifact
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
 from src.analysis.evaluation import evaluation_transient_rollout as rollout
@@ -42,14 +45,15 @@ from src.experiments import experiments_run_identity as run_identity
 from src.learning.transient import learning_transient_handoff as transient_handoff
 from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
+from . import analysis_artifact_contracts as contracts
 from . import analysis_artifact_performance as artifact_performance
+from . import analysis_artifact_plan as artifact_plan
 from . import analysis_artifact_timing as artifact_timing
 
 if TYPE_CHECKING:
     from src.datasets.runtime.dataset_runtime_transient import TransientPhysicalDataset
     from src.learning.learning_device import DeviceResolution
 
-TransientArtifactSplit = Literal["eval", "additional_evaluation"]
 _SOURCE_SELECTOR_KEYS = (
     "campaign_name",
     "campaign_digest",
@@ -60,10 +64,20 @@ _SOURCE_SELECTOR_KEYS = (
     "case_hdf5_sha256",
 )
 _TIMING_REPETITIONS = 3
-_SPATIAL_AXIS_COUNT = 2
-_MINIMUM_SPATIAL_AXIS_LENGTH = 2
 _RESUME_EVIDENCE_SCHEMA_KIND = "evaluation_transient_resume_case"
 _RESUME_EVIDENCE_SCHEMA_VERSION = 1
+# Per-case component evidence the generator writes next to its timing report; resume and role admission both require exactly these fields.
+_COMPONENT_TEXT_FIELDS = ("model_clock", "wall_clock")
+_COMPONENT_MAPPING_FIELDS = (
+    "generation",
+    "timing_case",
+    "prediction_validity",
+    "diagnostic_benchmark",
+    "airflow_model",
+    "drying_model",
+    "surrogate_pipeline",
+)
+_COMPONENT_EVIDENCE_FIELDS = frozenset({"dataset_materialization_seconds", *_COMPONENT_TEXT_FIELDS, *_COMPONENT_MAPPING_FIELDS})
 _CANONICAL_COMPLETION_CONTEXT_FIELDS = frozenset(
     {
         "final_bulk_moisture_wb",
@@ -94,51 +108,9 @@ def _process_diagnostic_policy() -> dict[str, Any]:
     }
 
 
-@dataclass(frozen=True, slots=True)
-class TransientArtifactRolePlan:
-    """Bind one artifact role to immutable package and complete-case membership."""
-
-    split: TransientArtifactSplit
-    dataset_role: sequence_artifact.DatasetRole
-    dataset_name: str
-    source_dataset_ids: tuple[str, ...]
-    source_identities: tuple[Mapping[str, Any], ...]
-    case_ids_by_source: tuple[tuple[str, ...], ...]
-    membership_digests: tuple[str, ...]
-    evaluation_assignments: tuple[Mapping[str, Any], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class TransientArtifactPlan:
-    """Bind one completed transient run to its ID and additional Evaluation roles."""
-
-    run_dir: Path
-    run_name: str
-    id_role: TransientArtifactRolePlan
-    additional_role: TransientArtifactRolePlan | None
-
-
-def _storage_root_from_dataset_root(dataset_root: Path | str) -> Path:
-    """Resolve and verify the storage root represented by one package-root path."""
-    packages_root = Path(dataset_root).expanduser().resolve()
-    if packages_root.name != common.paths.DATASETS_AREA_NAME:
-        message = "Transient artifact generation requires dataset_root to identify the authoritative <storage>/02_datasets directory."
-        raise ValueError(message)
-    storage_root = packages_root.parent
-    if common.paths.get_datasets_root(storage_root=storage_root).resolve() != packages_root:
-        message = "Transient Dataset package root does not map to one authoritative storage root."
-        raise ValueError(message)
-    return storage_root
-
-
 def _reject_trial(completed: Mapping[str, Any]) -> None:
-    """Refuse Optuna trial evidence early: a trial keeps no checkpoints, so no artifact can bind to it."""
-    config = completed.get("config")
-    if isinstance(config, Mapping) and experiments.run.is_trial_config(config):
-        message = (
-            "Transient artifacts are unavailable for an Optuna trial: trials keep no checkpoints. Train the selected configuration as a normal run."
-        )
-        raise RuntimeError(message)
+    """Refuse Optuna trial evidence through the shared artifact refusal of both tasks."""
+    contracts.refuse_optuna_trial(completed.get("config"), label=f"Run {completed.get('scientific_run_name')}")
 
 
 def _require_completed_transient(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -158,152 +130,16 @@ def _completed_transient(run_dir: Path | str) -> dict[str, Any]:
     return completed
 
 
-def _role_plan(
-    *,
-    split: TransientArtifactSplit,
-    dataset_role: sequence_artifact.DatasetRole,
-    dataset_ids: Sequence[object],
-    identities: Sequence[Mapping[str, Any]],
-    role_evidence: Sequence[Mapping[str, Any]],
-) -> TransientArtifactRolePlan:
-    """Build one strict package-part role plan from admitted transient split evidence."""
-    names = tuple(common.paths.validate_logical_name(value, label=f"{dataset_role} dataset_id") for value in dataset_ids)
-    if not names or len(names) != len(identities) or len(names) != len(role_evidence):
-        message = f"Transient {dataset_role} package identity and membership counts disagree."
-        raise ValueError(message)
-    case_groups: list[tuple[str, ...]] = []
-    digests: list[str] = []
-    copied_identities: list[dict[str, Any]] = []
-    for index, (dataset_id, identity, evidence) in enumerate(zip(names, identities, role_evidence, strict=True)):
-        if not isinstance(identity, Mapping) or identity.get("dataset_id") != dataset_id:
-            message = f"Transient {dataset_role}[{index}] Dataset identity disagrees with its configured package."
-            raise ValueError(message)
-        if not isinstance(evidence, Mapping):
-            message = f"Transient {dataset_role}[{index}] membership evidence must be a mapping."
-            raise TypeError(message)
-        case_ids = evidence.get("case_ids")
-        membership_digest = evidence.get("membership_digest")
-        if (
-            not isinstance(case_ids, list)
-            or not case_ids
-            or not all(isinstance(case_id, str) and case_id for case_id in case_ids)
-            or len(case_ids) != len(set(case_ids))
-            or not isinstance(membership_digest, str)
-        ):
-            message = f"Transient {dataset_role}[{index}] complete-case membership is invalid."
-            raise ValueError(message)
-        case_groups.append(tuple(case_ids))
-        digests.append(membership_digest)
-        copied_identities.append(dict(identity))
-    flattened_case_ids = tuple(case_id for case_ids in case_groups for case_id in case_ids)
-    if len(flattened_case_ids) != len(set(flattened_case_ids)):
-        message = f"Transient {dataset_role} package parts contain duplicate package-case identities."
-        raise ValueError(message)
-    dataset_name = names[0] if len(names) == 1 else datasets.contracts.identity.combined_dataset_id(names)
-    return TransientArtifactRolePlan(
-        split=split,
-        dataset_role=dataset_role,
-        dataset_name=dataset_name,
-        source_dataset_ids=names,
-        source_identities=tuple(copied_identities),
-        case_ids_by_source=tuple(case_groups),
-        membership_digests=tuple(digests),
-    )
-
-
-def transient_artifact_plan_from_completed(
-    completed: Mapping[str, Any],
-    *,
-    run_dir: Path | str,
-) -> TransientArtifactPlan:
-    """Project exact ID-test and declared additional Evaluation membership."""
-    config = completed.get("config")
-    split = completed.get("split_indices")
-    if not isinstance(config, Mapping) or config.get("task") != "transient_drying" or not isinstance(split, Mapping):
-        message = "Transient artifact planning requires admitted completed-run config and split evidence."
-        raise TypeError(message)
-    data = config.get("data")
-    identities = split.get("dataset_identity")
-    roles = split.get("roles")
-    split_contract = datasets.runtime.transient_training
-    if split.get("schema_kind") != split_contract.SPLIT_SCHEMA_KIND or split.get("schema_version") != split_contract.SPLIT_SCHEMA_VERSION:
-        message = "Completed transient split must use the current Experiment case-split schema."
-        raise ValueError(message)
-    if not isinstance(data, Mapping) or not isinstance(identities, Mapping) or not isinstance(roles, Mapping):
-        message = "Completed transient config/split lacks data, Dataset identity, or role evidence."
-        raise TypeError(message)
-    train_dataset = common.paths.validate_logical_name(data.get("train_dataset"), label="data.train_dataset")
-    train_identity = identities.get("train")
-    id_test = roles.get("id_test")
-    id_role = _role_plan(
-        split="eval",
-        dataset_role="id",
-        dataset_ids=(train_dataset,),
-        identities=(cast("Mapping[str, Any]", train_identity),),
-        role_evidence=(cast("Mapping[str, Any]", id_test),),
-    )
-    raw_additional_identities = identities.get("additional_evaluation")
-    raw_additional_ids = (
-        [item.get("dataset_id") for item in raw_additional_identities if isinstance(item, Mapping)]
-        if isinstance(raw_additional_identities, list)
-        else None
-    )
-    raw_additional_role = roles.get("additional_evaluation")
-    raw_assignments = split.get("evaluation_assignments")
-    if not isinstance(raw_additional_ids, list) or not isinstance(raw_additional_identities, list) or not isinstance(raw_assignments, list):
-        message = "Completed transient additional Evaluation identities and assignments must be lists."
-        raise TypeError(message)
-    if not isinstance(raw_additional_role, Mapping) or not isinstance(raw_additional_role.get("parts"), list):
-        message = "Completed transient additional Evaluation role evidence is invalid."
-        raise TypeError(message)
-    if not (len(raw_additional_ids) == len(raw_additional_identities) == len(raw_additional_role["parts"]) == len(raw_assignments)):
-        message = "Completed transient additional Evaluation identities, membership, and assignments disagree."
-        raise ValueError(message)
-    for dataset_id, assignment in zip(raw_additional_ids, raw_assignments, strict=True):
-        if (
-            not isinstance(assignment, Mapping)
-            or set(assignment) != {"dataset_id", "role", "relation", "assumptions"}
-            or assignment["dataset_id"] != dataset_id
-            or assignment["role"] != "ood"
-            or not isinstance(assignment["relation"], str)
-            or not assignment["relation"].strip()
-            or not isinstance(assignment["assumptions"], list)
-            or any(not isinstance(item, str) or not item.strip() for item in assignment["assumptions"])
-        ):
-            message = f"Completed transient Evaluation assignment is invalid for {dataset_id!r}."
-            raise ValueError(message)
-    additional_role: TransientArtifactRolePlan | None = None
-    if raw_additional_ids:
-        additional_role = _role_plan(
-            split="additional_evaluation",
-            dataset_role="additional_evaluation",
-            dataset_ids=tuple(raw_additional_ids),
-            identities=tuple(raw_additional_identities),
-            role_evidence=tuple(raw_additional_role["parts"]),
-        )
-        additional_role = replace(additional_role, evaluation_assignments=tuple(dict(item) for item in raw_assignments))
-    run_config = config.get("run")
-    if not isinstance(run_config, Mapping) or not isinstance(run_config.get("name"), str):
-        message = "Completed transient config lacks scientific run identity."
-        raise TypeError(message)
-    return TransientArtifactPlan(
-        run_dir=Path(run_dir).expanduser().resolve(),
-        run_name=str(run_config["name"]),
-        id_role=id_role,
-        additional_role=additional_role,
-    )
-
-
-def load_transient_artifact_plan(run_dir: Path | str) -> TransientArtifactPlan:
-    """Admit a completed run and return exact transient artifact role plans."""
+def load_transient_artifact_plan(run_dir: Path | str) -> artifact_plan.ArtifactPlan:
+    """Admit a completed transient run and return its artifact role plan."""
     path = Path(run_dir).expanduser().resolve()
-    return transient_artifact_plan_from_completed(_completed_transient(path), run_dir=path)
+    return artifact_plan.artifact_plan_from_completed(_completed_transient(path), run_dir=path)
 
 
 def select_transient_role_cases(
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     case_ids: Sequence[str],
-) -> TransientArtifactRolePlan:
+) -> artifact_plan.ArtifactRolePlan:
     """Return one saved-order role subset for disposable scoped generation."""
     selected = tuple(case_ids)
     if not selected or any(not isinstance(case_id, str) or not case_id for case_id in selected) or len(selected) != len(set(selected)):
@@ -316,93 +152,32 @@ def select_transient_role_cases(
         raise ValueError(message)
     requested = set(selected)
     groups = tuple(tuple(case_id for case_id in source_case_ids if case_id in requested) for source_case_ids in role.case_ids_by_source)
-    return TransientArtifactRolePlan(
-        split=role.split,
-        dataset_role=role.dataset_role,
-        dataset_name=role.dataset_name,
-        source_dataset_ids=role.source_dataset_ids,
-        source_identities=role.source_identities,
-        case_ids_by_source=groups,
-        membership_digests=role.membership_digests,
-        evaluation_assignments=role.evaluation_assignments,
-    )
-
-
-def _dataset_identity(dataset: TransientPhysicalDataset) -> dict[str, Any]:
-    """Project the same published package identity persisted by Training."""
-    payload = dataset.payload
-    return {
-        "dataset_id": str(payload["dataset_id"]),
-        "data_contract_digest": str(payload["contract_digest"]),
-        "index_digest": str(payload["index_digest"]),
-        "configured_regular_horizon": dict(payload["configured_regular_horizon"]),
-    }
-
-
-def _spatial_shape(value: Any, *, label: str) -> tuple[int, int]:
-    """Return one persisted exact two-axis spatial shape."""
-    if (
-        not isinstance(value, (list, tuple))
-        or len(value) != _SPATIAL_AXIS_COUNT
-        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in value)
-    ):
-        message = f"{label} must contain two exact integer axes >= 2."
-        raise ValueError(message)
-    return cast("tuple[int, int]", tuple(value))
+    return replace(role, case_ids_by_source=groups)
 
 
 def _training_spatial_representation(
     completed: Mapping[str, Any],
 ) -> datasets.contracts.transient.TransientSpatialRepresentation:
-    """Reconcile resolved config, split, and scaler Training-grid evidence."""
+    """Reconcile the resolved Training stride, the admitted split's spatial view and the fitted scaling shape."""
     _require_completed_transient(completed)
     config = cast("Mapping[str, Any]", completed["config"])
     data = config.get("data")
-    split = completed.get("split_indices")
     normalizer_state = completed.get("normalizer_state")
-    if not isinstance(data, Mapping) or not isinstance(split, Mapping) or not isinstance(normalizer_state, Mapping):
-        message = "Transient artifact grid preflight requires config, split, and scaling evidence."
+    if not isinstance(data, Mapping) or not isinstance(normalizer_state, Mapping):
+        message = "Transient artifact grid preflight requires config and scaling evidence."
         raise TypeError(message)
-    stride = datasets.contracts.transient.validate_spatial_stride(data.get("spatial_stride", 1))
-    scaling = TransientScalingArtifact.from_state_dict(normalizer_state)
-    scaling_identity = scaling.dataset_identity
-    source_shape = _spatial_shape(
-        scaling_identity.get("canonical_spatial_shape"),
-        label="scaling Dataset canonical_spatial_shape",
-    )
-    represented_shape = _spatial_shape(
-        scaling_identity.get("effective_spatial_shape"),
-        label="scaling Dataset effective_spatial_shape",
-    )
-    if scaling_identity.get("spatial_stride") != stride:
-        message = "Resolved Training stride contradicts the admitted scaling Dataset identity."
+    stride = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
+    split = datasets.preprocessing.splits.admit_split(completed["split_indices"])
+    view = cast("Mapping[str, Any]", split.extension)["spatial_view"]
+    if view["spatial_stride"] != stride:
+        message = "Resolved Training stride contradicts the admitted split spatial view."
         raise ValueError(message)
-    representation = datasets.contracts.transient.resolve_spatial_representation(
-        source_shape,
-        stride,
-    )
-    if representation.represented_shape != represented_shape or scaling.spatial_shape != represented_shape:
-        message = "Training-grid shape contradicts the scaling Dataset identity or fitted artifact shape."
+    representation = datasets.contracts.transient.resolve_spatial_representation((view["canonical_ny"], view["canonical_nx"]), stride)
+    represented_shape = (view["effective_ny"], view["effective_nx"])
+    scaling_shape = TransientScalingArtifact.from_state_dict(normalizer_state).spatial_shape
+    if representation.represented_shape != represented_shape or scaling_shape != represented_shape:
+        message = "Training-grid shape contradicts the split spatial view or the fitted scaling shape."
         raise ValueError(message)
-    split_view = split.get("spatial_view")
-    if split_view is None:
-        if stride != 1:
-            message = "Non-unit Training sampling requires explicit persisted split spatial_view evidence."
-            raise ValueError(message)
-    elif not isinstance(split_view, Mapping):
-        message = "Transient split spatial_view must be a mapping when present."
-        raise TypeError(message)
-    else:
-        observed = {
-            "spatial_stride": stride,
-            "canonical_ny": source_shape[0],
-            "canonical_nx": source_shape[1],
-            "effective_ny": represented_shape[0],
-            "effective_nx": represented_shape[1],
-        }
-        if dict(split_view) != observed:
-            message = "Transient split spatial_view contradicts resolved config and scaling identity."
-            raise ValueError(message)
     return representation
 
 
@@ -424,25 +199,24 @@ def resolve_transient_artifact_spatial_representations(
 
 
 def _load_role_datasets(
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     *,
-    config: Mapping[str, Any],
     storage_root: Path,
     spatial_representation: datasets.contracts.transient.TransientSpatialRepresentation,
+    saved_role: artifact_plan.ArtifactRolePlan | None = None,
 ) -> tuple[TransientPhysicalDataset, ...]:
-    """Recreate one-step physical Datasets and enforce saved case membership."""
-    data = config.get("data")
-    if not isinstance(data, Mapping):
-        message = "Completed transient config.data must be a mapping."
-        raise TypeError(message)
-    backend = data.get("transient_backend_preference", "pt_shards")
-    required = data.get("transient_backend_required", False)
-    cache_size = data.get("hdf5_cache_size", 0)
+    """
+    Recreate one-step physical Datasets, check each full package against its saved split part, then select its cases.
+
+    ``saved_role`` is the complete saved role of a scoped ``role`` subset; each package is checked against its full
+    saved membership, never against the subset.
+    """
     sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
     loaded: list[TransientPhysicalDataset] = []
-    for dataset_id, expected_identity, case_ids in zip(
+    for dataset_id, expected_identity, saved_case_ids, case_ids in zip(
         role.source_dataset_ids,
         role.source_identities,
+        (role if saved_role is None else saved_role).case_ids_by_source,
         role.case_ids_by_source,
         strict=True,
     ):
@@ -451,30 +225,25 @@ def _load_role_datasets(
         request = datasets.runtime.factory.DatasetRequest(
             dataset_id=dataset_id,
             dataset_view="transient_drying",
-            case_ids=case_ids,
             transient_sampling=sampling,
             storage_root=storage_root,
-            transient_backend_preference=cast("Any", backend),
-            transient_backend_required=bool(required),
             spatial_stride=spatial_representation.spatial_stride,
         )
-        candidate = datasets.runtime.factory.create_dataset(
-            request,
-            hdf5_cache_size=int(cache_size),
-        )
+        candidate = datasets.runtime.factory.create_dataset(request)
         if not isinstance(candidate, datasets.runtime.transient.TransientPhysicalDataset):
             message = "Transient artifact Dataset factory returned a non-transient runtime."
             raise TypeError(message)
-        if _dataset_identity(candidate) != dict(expected_identity):
+        # The full package is checked before selection, so a drifted Dataset is refused like a steady one.
+        try:
+            datasets.preprocessing.splits.require_source_identity(candidate, expected_identity, role=role.split_role, case_ids=saved_case_ids)
+            selected = datasets.runtime.transient.select_transient_cases(candidate, case_ids)
+        except BaseException:
             candidate.close()
-            message = f"Current package {dataset_id!r} contradicts saved transient Dataset identity."
-            raise RuntimeError(message)
-        if candidate.spatial_representation() != spatial_representation:
-            candidate.close()
+            raise
+        if selected.spatial_representation() != spatial_representation:
+            selected.close()
             message = f"Current package {dataset_id!r} cannot materialize the requested exact Evaluation grid."
             raise RuntimeError(message)
-        selected = datasets.runtime.transient.select_transient_cases(candidate, case_ids)
-        candidate.close()
         selected_case_ids = tuple(
             dict.fromkeys(
                 str(selected.payload["cases"][int(selected.payload["samples"][position]["case_index"])]["package_case_id"])
@@ -484,10 +253,6 @@ def _load_role_datasets(
         if selected_case_ids != case_ids:
             selected.close()
             message = f"Current package {dataset_id!r} contradicts saved complete-case membership."
-            raise RuntimeError(message)
-        if selected.spatial_representation() != spatial_representation:
-            selected.close()
-            message = f"Selected package {dataset_id!r} changed the requested Evaluation-grid identity."
             raise RuntimeError(message)
         loaded.append(selected)
     return tuple(loaded)
@@ -502,8 +267,7 @@ class _TransientCaseMaterialization:
     case_record: Mapping[str, Any]
     item_positions: tuple[int, ...]
     material_family: str
-    dataset_backend: str
-    pt_identity: Mapping[str, Any] | None
+    pt_identity: str
 
 
 def _case_materialization_specs(
@@ -524,17 +288,13 @@ def _case_materialization_specs(
                 message = f"Runtime item {sample_id!r} does not map to its package case record."
                 raise RuntimeError(message)
             positions[package_case_id].append(item_index)
-        pt_identity: Mapping[str, Any] | None = None
-        if dataset.storage_backend == "pt_shards":
-            receipt = datasets.packages.transient_shards.load_transient_shard_receipt(
+        pt_identity = common.serialization.canonical_json_sha256(
+            datasets.packages.transient_shards.load_transient_shard_receipt(
                 dataset.dataset_id,
                 storage_root=dataset.source_root,
                 validation_depth="evidence",
             )
-            pt_identity = {
-                "receipt_digest": common.serialization.canonical_json_sha256(receipt),
-                "index_digest": receipt["index_digest"],
-            }
+        )
         for package_case_id, item_positions in positions.items():
             case_record = case_records[package_case_id]
             material = case_record.get("material_family")
@@ -548,7 +308,6 @@ def _case_materialization_specs(
                     case_record=case_record,
                     item_positions=tuple(item_positions),
                     material_family=material,
-                    dataset_backend=dataset.storage_backend,
                     pt_identity=pt_identity,
                 )
             )
@@ -562,7 +321,7 @@ def _materialize_case(
     spec: _TransientCaseMaterialization,
     *,
     dataset_role: sequence_artifact.DatasetRole,
-) -> tuple[str, Mapping[str, Any], rollout.TransientEvaluationCase, str, Mapping[str, Any] | None]:
+) -> tuple[str, Mapping[str, Any], rollout.TransientEvaluationCase, str]:
     """Load and assemble one selected complete case from its compact plan."""
     materialization_started = perf_counter()
     items = [spec.dataset[position] for position in spec.item_positions]
@@ -589,13 +348,12 @@ def _materialize_case(
             spatial_mask=assembled.spatial_mask,
             metadata=metadata,
         ),
-        spec.dataset_backend,
         spec.pt_identity,
     )
 
 
 def _generation_case_sources(
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     *,
     storage_root: Path,
 ) -> dict[str, Any]:
@@ -820,7 +578,6 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
         scaling = TransientScalingArtifact.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
         model = cast("Mapping[str, Any]", config["model"])
         parent = {
-            "schema_version": 1,
             "source_run_name": completed["scientific_run_name"],
             "source_checkpoint_sha256": completed["selected_checkpoint_sha256"],
             "source_scaling_sha256": completed["normalizer_sha256"],
@@ -934,14 +691,27 @@ def _qualified_case_membership(
     return actual
 
 
+def _case_dataset_identity(role: artifact_plan.ArtifactRolePlan, case_id: str) -> dict[str, Any]:
+    """Derive one case's persisted Dataset identity from its owning saved split part; the producer and the role admission share it."""
+    for dataset_id, source_identity, case_ids in zip(role.source_dataset_ids, role.source_identities, role.case_ids_by_source, strict=True):
+        if case_id in case_ids:
+            return {
+                "artifact_dataset_name": role.dataset_name,
+                "source_dataset_id": dataset_id,
+                "saved_membership_digests": list(role.membership_digests),
+                "source_index_digest": source_identity["index_digest"],
+            }
+    message = f"Case {case_id!r} is absent from saved {role.dataset_role} membership."
+    raise ValueError(message)
+
+
 def _base_identity(
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     case: rollout.TransientEvaluationCase,
     canonical: Mapping[str, Any],
-    dataset_backend: str,
-    pt_identity: Mapping[str, Any] | None,
+    pt_identity: str,
     runtime_identity: Mapping[str, Any],
     spatial_representation: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -961,19 +731,13 @@ def _base_identity(
     lineage = _lineage(completed)
     source = canonical["source"]
     metadata = canonical["meta"]
+    dataset_identity = _case_dataset_identity(role, case.case_id)
     return {
         "case_id": case.case_id,
-        "dataset_identity": {
-            "artifact_dataset_name": role.dataset_name,
-            "source_dataset_id": case.metadata["dataset_id"],
-            "saved_membership_digests": list(role.membership_digests),
-            "source_index_digest": next(
-                identity["index_digest"] for identity in role.source_identities if identity["dataset_id"] == case.metadata["dataset_id"]
-            ),
-        },
+        "dataset_identity": dataset_identity,
         "dataset_role": role.dataset_role,
         "evaluation_assignment": next(
-            (dict(assignment) for assignment in role.evaluation_assignments if assignment["dataset_id"] == case.metadata["dataset_id"]),
+            (dict(assignment) for assignment in role.evaluation_assignments if assignment["dataset_id"] == dataset_identity["source_dataset_id"]),
             None,
         ),
         "material_family": str(case.metadata["material_family"]),
@@ -1008,8 +772,7 @@ def _base_identity(
         "training_airflow_source": task.training_airflow_source,
         "inference_airflow_source": "comsol_reference",
         **lineage,
-        "dataset_backend": dataset_backend,
-        "pt_payload_identity": None if pt_identity is None else dict(pt_identity),
+        "pt_payload_identity": pt_identity,
         "evaluation_config_identity": sequence_artifact.evaluation_protocol_identity(cast("Mapping[str, Any]", config["evaluation"])),
         "timing_evidence_identity": common.serialization.canonical_json_sha256(runtime_identity),
     }
@@ -1021,8 +784,7 @@ def _timing_case(
     benchmark: rollout.TransientRolloutBenchmark,
     expected_model_calls: int,
     generation_timing: Mapping[str, Any],
-    dataset_backend: str,
-    pt_identity: Mapping[str, Any] | None,
+    pt_identity: str,
     runtime_metadata: Mapping[str, Any],
 ) -> transient_timing.TransientTimingCase:
     """Adapt only complete public rollout clocks plus stable Generation timing."""
@@ -1079,13 +841,12 @@ def _timing_case(
     cpu = str(processor) if isinstance(processor, str) and processor else "unknown"
     gpu_value = runtime_metadata.get("cuda_device_name")
     gpu = str(gpu_value) if isinstance(gpu_value, str) and gpu_value else None
-    pt_digest = None if pt_identity is None else common.serialization.canonical_json_sha256(pt_identity)
     return transient_timing.TransientTimingCase(
         case_id=case_id,
         repetitions=repetitions,
         device=str(runtime_metadata["resolved_device"]),
         precision="float32",
-        dataset_backend=dataset_backend,
+        pt_payload_identity=pt_identity,
         warmup_passes=benchmark.warmup_passes,
         batch_size=1,
         cpu=cpu,
@@ -1097,7 +858,6 @@ def _timing_case(
         },
         cold_timings=cold,
         unavailable_reasons=unavailable,
-        pt_payload_identity=pt_digest,
     )
 
 
@@ -1188,11 +948,9 @@ def _record_metric_statistics(
         required_count = int(prediction.size)
         computed_count = int(available_steps.sum() * prediction.shape[1] * prediction.shape[2] * prediction.shape[3])
         finite_count = int(np.isfinite(prediction[available_steps]).sum())
-        nonfinite_count = computed_count - finite_count
-        metric_available = computed_count == required_count and finite_count == required_count
+        support = validity_contract.support_evidence(required=required_count, computed=computed_count, finite=finite_count)
         statistics: Mapping[str, object] | None = None
-        unavailable_reason: str | None = None
-        if metric_available:
+        if support["available"]:
             if normalized_cumulative_prediction is None or normalized_cumulative_reference is None:
                 message = "Available transient metrics unexpectedly lack normalized full support."
                 raise RuntimeError(message)
@@ -1212,20 +970,7 @@ def _record_metric_statistics(
                 valid_mask=record.spatial_mask[None, None],
             )
             statistics = accumulator.state_dict()
-        elif computed_count < required_count:
-            unavailable_reason = "full_prediction_support_unavailable_after_nonfinite_output"
-        else:
-            unavailable_reason = "full_prediction_support_contains_nonfinite_values"
-        result[scope] = {
-            "classification": "REQUIRES_ALL_FINITE_VALUES",
-            "available": metric_available,
-            "unavailable_reason": unavailable_reason,
-            "required_value_count": required_count,
-            "computed_value_count": computed_count,
-            "finite_value_count": finite_count,
-            "nonfinite_value_count": nonfinite_count,
-            "statistics": statistics,
-        }
+        result[scope] = {**support, "statistics": statistics}
     computed_steps = int(record.prediction_available.sum())
     computed_states = record.predicted_states[: computed_steps + 1]
     result["diagnostics"] = {
@@ -1264,7 +1009,7 @@ def _timing_case_from_resume(
         "repetitions",
         "device",
         "precision",
-        "dataset_backend",
+        "pt_payload_identity",
         "warmup_passes",
         "batch_size",
         "cpu",
@@ -1272,7 +1017,6 @@ def _timing_case_from_resume(
         "software_versions",
         "cold_timings",
         "unavailable_reasons",
-        "pt_payload_identity",
     }
     if not isinstance(value, Mapping) or set(value) != required:
         message = "Resumed transient timing-case fields are invalid."
@@ -1281,12 +1025,15 @@ def _timing_case_from_resume(
     if not isinstance(repetitions, Mapping):
         message = "Resumed transient timing repetitions must be a mapping."
         raise TypeError(message)
+    if any(not isinstance(value[name], str) or not value[name] for name in ("case_id", "device", "precision", "pt_payload_identity", "cpu")):
+        message = "Resumed transient timing-case text fields are invalid."
+        raise TypeError(message)
     restored = transient_timing.TransientTimingCase(
         case_id=str(value["case_id"]),
         repetitions={str(name): tuple(float(item) for item in values) for name, values in repetitions.items()},
         device=str(value["device"]),
         precision=str(value["precision"]),
-        dataset_backend=str(value["dataset_backend"]),
+        pt_payload_identity=str(value["pt_payload_identity"]),
         warmup_passes=int(value["warmup_passes"]),
         batch_size=int(value["batch_size"]),
         cpu=str(value["cpu"]),
@@ -1312,13 +1059,70 @@ def _timing_case_from_resume(
                 value["unavailable_reasons"],
             ).items()
         },
-        pt_payload_identity=(None if value["pt_payload_identity"] is None else str(value["pt_payload_identity"])),
     )
     if restored.case_id != case_id:
         message = "Resumed transient timing evidence contradicts its case."
         raise ValueError(message)
     transient_timing.build_transient_timing_report((restored,))
     return restored
+
+
+def _bind_case_timing_evidence(
+    component: object,
+    *,
+    case_id: str,
+    pt_payload_identities: set[object],
+    timing_case: transient_timing.TransientTimingCase,
+    prediction_validity: Mapping[str, Any],
+) -> None:
+    """Require one case's component evidence to carry the producer's fields and agree with its timing case, sequence identity and validity."""
+    seconds = component.get("dataset_materialization_seconds") if isinstance(component, Mapping) else None
+    if (
+        not isinstance(component, Mapping)
+        or set(component) != _COMPONENT_EVIDENCE_FIELDS
+        or any(not isinstance(component[name], Mapping) for name in _COMPONENT_MAPPING_FIELDS)
+        or any(not isinstance(component[name], str) or not component[name] for name in _COMPONENT_TEXT_FIELDS)
+        or not isinstance(seconds, (int, float))
+        or isinstance(seconds, bool)
+        or not np.isfinite(seconds)
+        or seconds < 0
+    ):
+        message = f"Transient case {case_id!r} component timing evidence lacks the producer's fields or a finite non-negative duration."
+        raise ValueError(message)
+    if (
+        timing_case.case_id != case_id
+        or pt_payload_identities != {timing_case.pt_payload_identity}
+        or component["prediction_validity"] != prediction_validity
+        or common.serialization.canonical_json_sha256(component["timing_case"]) != common.serialization.canonical_json_sha256(asdict(timing_case))
+    ):
+        message = f"Transient case {case_id!r} contradicts its timing evidence: sequence identity, timing case and component evidence must agree."
+        raise ValueError(message)
+
+
+def _validate_role_timing_evidence(
+    timing_block: Mapping[str, Any],
+    *,
+    expected_cases: set[str],
+    pt_identities: Mapping[str, set[object]],
+    expected_validity: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Admit the role's timing report and bind every report case to its component evidence and sequence record identity."""
+    component_evidence = timing_block["component_availability"]
+    if not isinstance(component_evidence, Mapping) or set(component_evidence) != expected_cases:
+        message = "Transient artifact timing-component evidence does not cover exact case membership."
+        raise ValueError(message)
+    report = transient_timing.admit_transient_timing_report(cast("Mapping[str, object]", timing_block["report"]))
+    if {case.case_id for case in report.cases} != expected_cases:
+        message = "Transient timing report does not cover exact saved complete-case membership."
+        raise ValueError(message)
+    for case in report.cases:
+        _bind_case_timing_evidence(
+            component_evidence[case.case_id],
+            case_id=case.case_id,
+            pt_payload_identities=pt_identities[case.case_id],
+            timing_case=case,
+            prediction_validity=expected_validity[case.case_id],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1362,7 +1166,7 @@ def _restore_resumed_case_evidence(
     material = value["material_family"]
     if (
         value["schema_kind"] != _RESUME_EVIDENCE_SCHEMA_KIND
-        or value["schema_version"] != _RESUME_EVIDENCE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(value["schema_version"], _RESUME_EVIDENCE_SCHEMA_VERSION)
         or value["case_id"] != case_id
         or not isinstance(material, str)
         or not material
@@ -1395,9 +1199,7 @@ def _restore_resumed_case_evidence(
         planned=((case_id, material),),
         produced=(identity,),
     )
-    if identity.get("dataset_role") != dataset_role:
-        message = "Resumed transient identity contradicts the artifact role."
-        raise ValueError(message)
+    identity = sequence_artifact.validate_sequence_identity(identity, case_id=case_id, dataset_role=dataset_role)
     rollout_steps = progress["rollout_steps"]
     if isinstance(rollout_steps, bool) or not isinstance(rollout_steps, int) or rollout_steps < 1:
         message = "Resumed transient rollout-step evidence is invalid."
@@ -1416,14 +1218,13 @@ def _restore_resumed_case_evidence(
     if spatial_identity != identity.get("spatial_representation"):
         message = "Resumed transient spatial identity contradicts its case identity."
         raise ValueError(message)
-    component_timing = component.get("timing_case")
-    if (
-        component.get("prediction_validity") != prediction_validity
-        or not isinstance(component_timing, Mapping)
-        or common.serialization.canonical_json_sha256(component_timing) != common.serialization.canonical_json_sha256(asdict(timing_case))
-    ):
-        message = "Resumed transient component evidence contradicts its case diagnostics."
-        raise ValueError(message)
+    _bind_case_timing_evidence(
+        component,
+        case_id=case_id,
+        pt_payload_identities={identity["pt_payload_identity"]},
+        timing_case=timing_case,
+        prediction_validity=prediction_validity,
+    )
     return _ResumedCaseEvidence(
         identity=dict(identity),
         spatial_identity=dict(spatial_identity),
@@ -1445,13 +1246,7 @@ def _role_prediction_validity_evidence(
     if set(cases) != expected_case_ids:
         message = "Transient prediction-validity cases contradict role membership."
         raise ValueError(message)
-    counts = {status: sum(case.get("status") == status for case in cases.values()) for status in transient_validity.PREDICTION_VALIDITY_STATUSES}
-    return {
-        "schema_version": (transient_validity.PREDICTION_VALIDITY_SCHEMA_VERSION),
-        "case_count": len(cases),
-        "status_counts": counts,
-        "cases": {case_id: dict(cases[case_id]) for case_id in sorted(cases)},
-    }
+    return validity_contract.role_prediction_validity(cases)
 
 
 def _role_spatial_representation_evidence(
@@ -1506,13 +1301,13 @@ def _role_spatial_representation_evidence(
 def _role_provenance(
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     device_resolution: DeviceResolution,
     component_availability: Mapping[str, Any],
     timing_report: Mapping[str, Any],
     prediction_validity: Mapping[str, Any],
     spatial_representation: Mapping[str, Any],
-    saved_role: TransientArtifactRolePlan | None = None,
+    saved_role: artifact_plan.ArtifactRolePlan | None = None,
 ) -> dict[str, Any]:
     """Build role-level run, Dataset, Evaluation, runtime, and lineage provenance."""
     config = cast("Mapping[str, Any]", completed["config"])
@@ -1526,6 +1321,7 @@ def _role_provenance(
             "canonical_publication_eligible": False,
         }
     result = {
+        "producer": contracts.analysis_producer("transient_drying"),
         "run": {
             "name": completed["scientific_run_name"],
             "effective_config_digest": completed["effective_config_digest"],
@@ -1535,15 +1331,7 @@ def _role_provenance(
             "normalizer_sha256": completed["normalizer_sha256"],
             "parent_experiment": _parent_experiment_evidence(completed),
         },
-        "dataset": {
-            "name": role.dataset_name,
-            "role": role.dataset_role,
-            "source_dataset_ids": list(role.source_dataset_ids),
-            "source_identities": [dict(value) for value in role.source_identities],
-            "case_ids_by_source": [list(values) for values in role.case_ids_by_source],
-            "membership_digests": list(role.membership_digests),
-            "evaluation_assignments": [dict(value) for value in role.evaluation_assignments],
-        },
+        "dataset": role.dataset_provenance(),
         "evaluation": {
             "config_identity": sequence_artifact.evaluation_protocol_identity(cast("Mapping[str, Any]", config["evaluation"])),
             "metrics": config["evaluation"]["metrics"],
@@ -1564,16 +1352,11 @@ def _role_provenance(
                 ],
                 "fabricated_prediction_count": 0,
             },
-            "component_availability": dict(component_availability),
-            "timing_report": dict(timing_report),
         },
         "spatial_representation": dict(spatial_representation),
-        "runtime": {
-            **device_resolution.as_dict(),
-            "precision": "float32",
-            "inference_batch_size": 1,
-        },
+        "runtime": contracts.runtime_provenance(device_resolution.as_dict(), inference_batch_size=1),
         "lineage": _lineage(completed),
+        "timing": {"report": dict(timing_report), "component_availability": dict(component_availability)},
     }
     if scope is not None:
         result["evaluation"]["scope"] = scope
@@ -1583,13 +1366,13 @@ def _role_provenance(
 def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
     *,
     run_dir: Path | str,
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     device_resolution: DeviceResolution,
     dataset_root: Path | str,
     staging_root: Path | str,
     completed: Mapping[str, Any] | None = None,
     evaluation_spatial_stride: int = 1,
-    saved_role: TransientArtifactRolePlan | None = None,
+    saved_role: artifact_plan.ArtifactRolePlan | None = None,
     progress_reporter: artifact_performance.ArtifactProgressReporter | None = None,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Generate one role through bounded case inference, metrics, and staging."""
@@ -1605,7 +1388,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
             f"artifact grid {evaluation_representation.source_shape} -> {evaluation_representation.represented_shape}"
             f" (stride {evaluation_representation.spatial_stride})"
         )
-        storage_root = _storage_root_from_dataset_root(dataset_root)
+        storage_root = common.paths.storage_root_for_datasets_root(dataset_root)
     datasets_for_role: tuple[TransientPhysicalDataset, ...] = ()
     context: Any | None = None
     generation_sources: Mapping[str, Any] | None = None
@@ -1655,7 +1438,18 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 )
             ),
             "evaluation_spatial_representation": (evaluation_representation.as_dict()),
+            # Kept cases carry their timing, so a resumed stage must run on the same hardware and PyTorch build.
+            "timing_hardware": {
+                "device_type": device_resolution.metadata.device_type,
+                "cuda_device_name": device_resolution.metadata.cuda_device_name,
+                "pytorch_version": device_resolution.metadata.pytorch_version,
+            },
+            # Kept cases were computed by one analysis implementation; a stage started by other analysis code is not resumed.
+            "producer": contracts.analysis_producer("transient_drying"),
         }
+        recorded_identity = sequence_artifact.recorded_resume_identity(staging_root)
+        if recorded_identity is not None:
+            contracts.require_current_analysis(recorded_identity, task_id="transient_drying", unit=f"Partial transient artifact stage {staging_root}")
         stager = sequence_artifact.TransientSequenceArtifactStager(
             staging_root,
             dataset_name=role.dataset_name,
@@ -1692,9 +1486,9 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 generation_sources = _generation_case_sources(role, storage_root=storage_root)
                 datasets_for_role = _load_role_datasets(
                     role,
-                    config=config,
                     storage_root=storage_root,
                     spatial_representation=evaluation_representation,
+                    saved_role=saved_role,
                 )
                 runtime_metadata = artifact_timing.neural_runtime_metadata(
                     device_metadata=device_resolution.as_dict(),
@@ -1773,7 +1567,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     package_case_id,
                     case_record,
                     case,
-                    backend,
                     pt_identity,
                 ) = _materialize_case(
                     spec,
@@ -1808,7 +1601,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     role=role,
                     case=case,
                     canonical=canonical,
-                    dataset_backend=backend,
                     pt_identity=pt_identity,
                     runtime_identity=runtime_identity,
                     spatial_representation=case_spatial_identity,
@@ -1849,7 +1641,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     benchmark=benchmark,
                     expected_model_calls=case.transition_count,
                     generation_timing=runtime_identity,
-                    dataset_backend=backend,
                     pt_identity=pt_identity,
                     runtime_metadata=runtime_metadata,
                 )
@@ -1964,45 +1755,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 case_prediction_validity,
                 expected_case_ids=expected_case_ids,
             )
-            validity_counts = prediction_validity["status_counts"]
-            if validity_counts[transient_validity.FINITE_BUT_PHYSICALLY_INVALID] or validity_counts[transient_validity.NONFINITE]:
-                print(
-                    "[WARNING] artifact completed with invalid predictions | "
-                    f"valid={validity_counts[transient_validity.VALID]} | "
-                    "finite_but_physically_invalid="
-                    f"{validity_counts[transient_validity.FINITE_BUT_PHYSICALLY_INVALID]} | "
-                    f"nonfinite={validity_counts[transient_validity.NONFINITE]}",
-                    flush=True,
-                )
-                validity_cases = cast(
-                    "Mapping[str, Mapping[str, Any]]",
-                    prediction_validity["cases"],
-                )
-                for case_id in sorted(validity_cases):
-                    case_validity = validity_cases[case_id]
-                    if case_validity["status"] == transient_validity.VALID:
-                        continue
-                    channels = cast(
-                        "Mapping[str, Mapping[str, int]]",
-                        case_validity["channels"],
-                    )
-                    affected_channels = [
-                        channel
-                        for channel in sequence_artifact.STATE_ORDER
-                        if channels[channel]["nonfinite_value_count"] or channels[channel]["physically_invalid_finite_count"]
-                    ]
-                    first_invalid = cast(
-                        "Mapping[str, Any]",
-                        case_validity["first_invalid"],
-                    )
-                    print(
-                        "[WARNING] invalid prediction case | "
-                        f"case={case_id} | status={case_validity['status']} | "
-                        f"channels={','.join(affected_channels)} | "
-                        f"first_step={first_invalid['rollout_step']} | "
-                        f"first_time={first_invalid['physical_time']}",
-                        flush=True,
-                    )
             if spatial_compatibility is None:
                 message = "Transient role has no spatial compatibility evidence."
                 raise RuntimeError(message)
@@ -2197,11 +1949,19 @@ def _validate_role_spatial_representation(
         "interpolation": "forbidden",
     }
     if (
-        evidence["schema_version"] != datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION
+        not common.serialization.is_schema_version(
+            evidence["schema_version"], datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION
+        )
         or evidence["inference_contract"] != "transient_physical_rollout_evaluation_grid_v1"
         or evidence["source_grid"] != {"shape": list(training.source_shape), "owner": "canonical_generation_dataset_package"}
         or evidence["training_grid"] != training.as_dict()
         or evidence["evaluation_grid"] != evaluation.as_dict()
+        or not all(
+            common.serialization.is_schema_version(
+                evidence[grid]["schema_version"], datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION
+            )
+            for grid in ("training_grid", "evaluation_grid")
+        )
         or evidence["checkpoint_identity"] != expected_checkpoint
         or evidence["field_alignment"] != expected_fields
     ):
@@ -2275,24 +2035,17 @@ def _validate_role_spatial_representation(
             raise ValueError(message)
 
 
-def _validate_transient_role_evidence(  # noqa: C901, PLR0912
+def _validate_transient_role_evidence(
     loaded: (sequence_artifact.LoadedTransientSequenceArtifact | sequence_artifact.TransientSequenceArtifactIndex),
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
 ) -> None:
     """Bind eager or indexed sequence evidence to one exact completed run role."""
     _reject_trial(completed)
-    if (
-        loaded.dataset_name != role.dataset_name
-        or loaded.dataset_role != role.dataset_role
-        or loaded.provenance["dataset"]["source_dataset_ids"] != list(role.source_dataset_ids)
-        or loaded.provenance["dataset"]["source_identities"] != [dict(value) for value in role.source_identities]
-        or loaded.provenance["dataset"]["case_ids_by_source"] != [list(values) for values in role.case_ids_by_source]
-        or loaded.provenance["dataset"]["membership_digests"] != list(role.membership_digests)
-        or loaded.provenance["dataset"]["evaluation_assignments"] != [dict(value) for value in role.evaluation_assignments]
-    ):
+    loaded_role = (loaded.dataset_name, loaded.dataset_role)
+    if loaded.provenance["dataset"] != role.dataset_provenance() or loaded_role != (role.dataset_name, role.dataset_role):
         message = "Transient artifact Dataset provenance contradicts saved complete-case membership."
         raise ValueError(message)
     run = loaded.provenance["run"]
@@ -2326,6 +2079,7 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         dataset_role=role.dataset_role,
     )
     simulation_records: set[str] = set()
+    pt_identities: defaultdict[str, set[object]] = defaultdict(set)
     for record in records:
         record_case_id = str(_sequence_value(record, "case_id"))
         identity = cast("Mapping[str, Any]", _sequence_value(record, "identity"))
@@ -2334,7 +2088,11 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         if package_case_id != record_case_id:
             message = "Transient artifact sequence record lost its qualified Dataset package identity."
             raise ValueError(message)
+        if identity.get("dataset_identity") != _case_dataset_identity(role, record_case_id):
+            message = "Transient artifact sequence record names a Dataset source that contradicts its saved split part."
+            raise ValueError(message)
         simulation_records.add(record_case_id)
+        pt_identities[record_case_id].add(identity.get("pt_payload_identity"))
     if simulation_records != expected_cases:
         message = "Transient artifact sequence records do not cover exact saved complete-case membership."
         raise ValueError(message)
@@ -2403,29 +2161,23 @@ def _validate_transient_role_evidence(  # noqa: C901, PLR0912
         ):
             message = "Unavailable pipeline C requires exact reasons and no fabricated metric evidence."
             raise ValueError(message)
-    component_evidence = evaluation.get("component_availability")
-    if not isinstance(component_evidence, Mapping) or set(component_evidence) != expected_cases:
-        message = "Transient artifact timing-component evidence does not cover exact case membership."
+    if contracts.validate_runtime_provenance(loaded.provenance.get("runtime")) != 1:
+        message = "Transient artifacts are generated one rollout case at a time (inference_batch_size 1)."
         raise ValueError(message)
-    expected_case_validity = expected_prediction_validity["cases"]
-    if any(
-        not isinstance(component_evidence[case_id], Mapping)
-        or component_evidence[case_id].get("prediction_validity") != expected_case_validity[case_id]
-        for case_id in expected_cases
-    ):
-        message = "Transient case component validity contradicts persisted sequence evidence."
-        raise ValueError(message)
-    report = transient_timing.admit_transient_timing_report(cast("Mapping[str, object]", evaluation.get("timing_report")))
-    if {case.case_id for case in report.cases} != expected_cases:
-        message = "Transient timing report does not cover exact saved complete-case membership."
-        raise ValueError(message)
+    timing_block = artifact_timing.timing_block(loaded.provenance, records=frozenset({"report", "component_availability"}))
+    _validate_role_timing_evidence(
+        timing_block,
+        expected_cases=expected_cases,
+        pt_identities=pt_identities,
+        expected_validity=expected_prediction_validity["cases"],
+    )
 
 
 def validate_transient_role_artifact(
     root: Path | str,
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.LoadedTransientSequenceArtifact:
     """Admit every payload and bind it to exact completed-run role evidence."""
@@ -2443,7 +2195,7 @@ def validate_staged_transient_role_artifact(
     index: sequence_artifact.TransientSequenceArtifactIndex,
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Bind writer-admitted private staging evidence without rereading payload bytes."""
@@ -2467,7 +2219,7 @@ def validate_scoped_transient_role_artifact_index(
     root: Path | str,
     *,
     completed: Mapping[str, Any],
-    saved_role: TransientArtifactRolePlan,
+    saved_role: artifact_plan.ArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Admit one exact selected-case subset without treating it as canonical coverage."""
@@ -2513,7 +2265,7 @@ def validate_transient_role_artifact_index(
     root: Path | str,
     *,
     completed: Mapping[str, Any],
-    role: TransientArtifactRolePlan,
+    role: artifact_plan.ArtifactRolePlan,
     evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Admit manifest evidence without opening numerical arrays until selected."""

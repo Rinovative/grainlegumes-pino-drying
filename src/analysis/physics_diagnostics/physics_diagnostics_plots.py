@@ -37,7 +37,6 @@ if TYPE_CHECKING:
 _LOSS_TERMS: Final = ("momentum", "flux_balance", "boundary")
 _TERM_LABELS: Final = {
     "momentum": "momentum (loss)",
-    "momentum_with_trace": "momentum + 2/3 trace",
     "pointwise_divergence": "pointwise div u",
     "porous_divergence": "pointwise div(eps u)",
     "flux_balance": "flux balance (loss)",
@@ -97,24 +96,21 @@ def plot_crop_sweep(residuals: pd.DataFrame, *, dtype: str = "float32") -> Figur
     Returns
     -------
     matplotlib.figure.Figure
-        Median over cases with the case range as a band; solid lines are the
-        loss term, dashed lines include the 2/3 trace term.
+        Median over cases with the case range as a band.
 
     """
     colors = backend_colors()
     selected = residuals[residuals["dtype"] == dtype]
     figure, axis = plt.subplots(figsize=(7.0, 4.2), layout="constrained")
     for backend, group in selected.groupby("backend", sort=False):
-        for column, style in (("momentum", "-"), ("momentum_with_trace", "--")):
-            stats = group.groupby("crop")[column].agg(["median", "min", "max"])
-            label = f"{_description(str(backend))}" if style == "-" else None
-            axis.plot(stats.index, stats["median"], style, color=colors[str(backend)], linewidth=2.0, marker="o", markersize=5, label=label)
-            if style == "-":
-                axis.fill_between(stats.index, stats["min"], stats["max"], color=colors[str(backend)], alpha=0.15, linewidth=0)
+        stats = group.groupby("crop")["momentum"].agg(["median", "min", "max"])
+        color = colors[str(backend)]
+        axis.plot(stats.index, stats["median"], "-", color=color, linewidth=2.0, marker="o", markersize=5, label=_description(str(backend)))
+        axis.fill_between(stats.index, stats["min"], stats["max"], color=color, alpha=0.15, linewidth=0)
     axis.set_yscale("log")
     axis.set_xlabel("interior crop [cells per edge]")
     axis.set_ylabel("mean (Rx² + Ry²) / G²")
-    axis.set_title(f"Reference momentum residual vs crop ({dtype}; dashed: with 2/3 trace term)")
+    axis.set_title(f"Reference momentum residual vs crop ({dtype})")
     axis.grid(visible=True, which="major", color="0.9")
     axis.legend(frameon=False)
     return figure
@@ -239,7 +235,7 @@ def plot_term_decomposition(terms: pd.DataFrame) -> Figure:
 
     """
     colors = backend_colors()
-    columns = ("pressure", "drag", "viscous", "trace", "residual", "residual_with_trace")
+    columns = ("pressure", "drag", "viscous", "trace", "residual")
     backends = list(dict.fromkeys(terms["backend"]))
     figure, axis = plt.subplots(figsize=(8.0, 4.4), layout="constrained")
     height = 0.8 / max(len(backends), 1)

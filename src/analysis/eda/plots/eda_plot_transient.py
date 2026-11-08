@@ -766,7 +766,7 @@ def _configure_split_time_axes(
                 np.concatenate(
                     (
                         hour_ticks[(hour_ticks >= main_display.minimum_hours) & (hour_ticks <= main_display.maximum_hours)],
-                        (main_display.minimum_hours, main_display.maximum_hours),
+                        np.asarray((main_display.minimum_hours, main_display.maximum_hours), dtype=float),
                     )
                 )
             )

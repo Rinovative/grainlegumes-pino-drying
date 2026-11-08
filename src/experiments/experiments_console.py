@@ -1,7 +1,7 @@
 """Render bounded line-oriented reporting for experiment lifecycles.
 
 Responsibilities:
-  - Report the run start block, one startup line, one line per epoch, and one end line
+  - Report the run start block, one startup line, one line per epoch, and one end line with epochs run, stop reason and duration parts
   - Report one line per finished Optuna trial plus the study start and end
   - Redact secrets from messages and complete traceback chains
 
@@ -46,8 +46,6 @@ _STARTUP_PHASE_EVENTS = frozenset(
         "training_start",
     }
 )
-_SECONDS_PER_MINUTE = 60
-_MINUTES_PER_HOUR = 60
 
 
 def _redact_secrets(value: object) -> str:
@@ -73,13 +71,11 @@ def display_path(value: object) -> str:
     return text
 
 
-def format_duration(seconds: float) -> str:
-    """Format one non-negative wall duration as ``12s``, ``3m05s`` or ``1h02m05s``."""
-    minutes, remainder = divmod(max(0, round(seconds)), _SECONDS_PER_MINUTE)
-    hours, minutes = divmod(minutes, _MINUTES_PER_HOUR)
-    if hours:
-        return f"{hours}h{minutes:02d}m{remainder:02d}s"
-    return f"{minutes}m{remainder:02d}s" if minutes else f"{remainder}s"
+def duration_summary(total_seconds: float, parts: Mapping[str, float]) -> str:
+    """Return ``total <t> (<name> <d>, ..., other <rest>)``, where ``other`` is the part of the total no named part covers."""
+    named = {**parts, "other": max(0.0, total_seconds - sum(parts.values()))}
+    inner = ", ".join(f"{name} {common.console.format_duration(seconds)}" for name, seconds in named.items())
+    return f"total {common.console.format_duration(total_seconds)} ({inner})"
 
 
 def _num(value: object, *, digits: int = 3) -> str:
@@ -126,7 +122,7 @@ def _loss_components(metrics: Mapping[str, float]) -> str:
         for key, value in metrics.items()
         if key.startswith(("train/", "physics/train/")) and key != "train/loss_total"
     }
-    if components.get("data") == total:
+    if "data" in components and components["data"] == total:
         del components["data"]
     if len(components) < 2:  # noqa: PLR2004 -- a single remaining component repeats the total
         return ""
@@ -144,6 +140,8 @@ class ConsoleReporter:
     trial_number: int | None = None
     _started: float = field(default_factory=time.perf_counter)
     _phases: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False)
+    _training_seconds: float = field(default=0.0, init=False)
+    _validation_seconds: float = field(default=0.0, init=False)
 
     @property
     def objective_id(self) -> str:
@@ -165,13 +163,13 @@ class ConsoleReporter:
         data = self._phases.get("dataset_resolved", {})
         scaler = self._phases.get("scaler_cache", {})
         fit = self._phases.get("scaler_fit_complete")
-        parts = [f"startup {self._phases['training_start']['elapsed_seconds']:.1f} s"]
+        parts = [f"startup {common.console.format_duration(self._phases['training_start']['elapsed_seconds'])}"]
         if data:
-            parts.append(f"data {data.get('backend')} {data.get('transitions')} transitions grid {data.get('effective_grid')}")
+            parts.append(f"data {data.get('cases')} Train cases {data.get('items')} items grid {data.get('grid')}")
         if scaler:
-            parts.append(f"scaler {scaler.get('state')}" + (f" (fit {fit['seconds']:.1f} s)" if fit else ""))
+            parts.append(f"scaler {scaler.get('state')}" + (f" (fit {common.console.format_duration(fit['seconds'])})" if fit else ""))
         if "model_cuda_ready" in self._phases:
-            parts.append(f"model {self._phases['model_cuda_ready'].get('seconds', 0.0):.1f} s")
+            parts.append(f"model {common.console.format_duration(self._phases['model_cuda_ready'].get('seconds', 0.0))}")
         parts.append(f"{self._phases['training_start'].get('batches_per_epoch')} batches/epoch")
         return "  ".join(parts)
 
@@ -187,13 +185,11 @@ class ConsoleReporter:
         model = f"{self.config['model']['kind']} {config_loader.resolved_model_variant(self.config)}"
         _line(
             f"run {_text(run['name'])} | {self.config['task']} | {run['layout']['family']} | {resolved_device} | seed {run['seed']}"
-            f" | {'resume' if self.resume else 'fresh'}{origin}"
+            f" | {'resumed run' if self.resume else 'new run'}{origin}"
         )
-        _line(f"data {_text(data['train_dataset'])} | batch {data['batch_size']} | workers {data['num_workers']}")
-        _line(
-            f"model {model} | {optimizer['kind']} lr {_num(optimizer['lr'], digits=2)} {scheduler}"
-            f" | {training['epochs']} epochs | amp {'on' if training['mixed_precision'] else 'off'}"
-        )
+        workers = config_loader.effective_num_workers(int(data["num_workers"]))
+        _line(f"data {_text(data['train_dataset'])} | batch {data['batch_size']} | workers {workers}")
+        _line(f"model {model} | {optimizer['kind']} lr {_num(optimizer['lr'], digits=2)} {scheduler} | {training['epochs']} epochs")
         _line(
             f"loss {_loss_composition(self.config)} | select {self.objective_id} ({objective['direction']})"
             f" | val every {training['evaluation_interval']}"
@@ -217,24 +213,37 @@ class ConsoleReporter:
             learning_rate += f"->{_num(metrics['optimization/scheduler_new_learning_rate'], digits=2)}"
         parts.append(learning_rate)
         if "system/epoch_duration_seconds" in metrics:
-            parts.append(f"{metrics['system/epoch_duration_seconds']:.1f} s")
+            parts.append(common.console.format_duration(metrics["system/epoch_duration_seconds"]))
         if "system/train_samples_per_second" in metrics:
             parts.append(f"{metrics['system/train_samples_per_second']:.1f} samples/s")
+        self._training_seconds += metrics.get("system/train_duration_seconds", 0.0)
+        self._validation_seconds += sum(
+            value
+            for key, value in metrics.items()
+            if key.endswith("_evaluation_duration_seconds") or key == "system/physics_monitor_duration_seconds"
+        )
         _line("  ".join(parts))
 
-    def final(self, result: Mapping[str, Any], *, total_wall_seconds: float) -> None:
-        """Print the end line from the reloaded selected best checkpoint."""
+    def final(self, result: Mapping[str, Any], *, total_wall_seconds: float) -> dict[str, float]:
+        """Print the end line with the epochs run, why training stopped and the duration parts; return the parts."""
+        target = result.get("target_train_seconds")
+        reason = "epoch budget" if target is None else f"train_seconds budget {common.console.format_duration(target)}"
+        parts = {"training": self._training_seconds, "validation": self._validation_seconds}
+        if "training_start" in self._phases:
+            parts = {"startup": self._phases["training_start"]["elapsed_seconds"], **parts}
         _line(
-            f"{result.get('status', 'completed')}  best epoch {result['best_epoch']} of {result['completed_epoch']}"
-            f"  {self.objective_id} {_num(result['best_metric'])}  {format_duration(total_wall_seconds)}  run {display_path(self.run_dir)}"
+            f"{result.get('status', 'completed')} after {result['completed_epoch']} of {self.config['training']['epochs']} epochs ({reason})"
+            f"  best epoch {result['best_epoch']}  {self.objective_id} {_num(result['best_metric'])}"
+            f"  {duration_summary(total_wall_seconds, parts)}  run {display_path(self.run_dir)}"
         )
+        return parts
 
     def failure(self, error: BaseException, *, status: str, phase: str | None = None) -> None:
         """Print the sanitized failure, the last reached startup phase, and how to continue; the caller owns any traceback."""
         epoch = getattr(error, "completed_epoch", None)
         checkpoint = common.paths.resolve_last_checkpoint_file(self.run_dir).is_file()
         _line(
-            f"{'interrupted' if isinstance(error, KeyboardInterrupt) else 'FAILED'} {_text(self.config['run']['name'])}"
+            f"{'interrupted' if status == 'interrupted' else 'FAILED'} {_text(self.config['run']['name'])}"
             f" in {phase or getattr(error, 'training_phase', 'run_lifecycle')}"
             f"{'' if epoch is None else f' after epoch {epoch}'}: {type(error).__name__}: {_clean(error)}",
             to_stderr=True,
@@ -261,6 +270,13 @@ def print_sanitized_traceback(error: BaseException) -> None:
     sys.stderr.flush()
 
 
+def print_error_notes(error: BaseException) -> None:
+    """Print the notes attached to an error whose outcome prints no traceback, with secrets redacted."""
+    for note in getattr(error, "__notes__", ()):
+        sys.stderr.write(_redact_secrets(f"note: {note}\n"))
+    sys.stderr.flush()
+
+
 def run_admission_event(status: str, **fields: object) -> None:
     """Print one stable line about how a start that names an existing run proceeds."""
     _line(f"run {status}: " + "  ".join(f"{key} {_text(value)}" for key, value in fields.items() if value is not None))
@@ -278,8 +294,8 @@ def optuna_study_event(status: str, **fields: Any) -> None:
     best = "no completed trial" if fields["best_trial"] is None else f"best trial {fields['best_trial']} {_num(fields['best_objective'])}"
     _line(
         f"study {_text(fields['study'])} {status} | {fields['attempted_trials']} trials ({fields['completed_trials']} completed,"
-        f" {fields['pruned_trials']} pruned, {fields['failed_trials']} failed) | {best} | {format_duration(fields['duration_seconds'])}"
-        f" | {_text(fields['best_parameters'])} | storage {_text(fields['storage'])}"
+        f" {fields['pruned_trials']} pruned, {fields['failed_trials']} failed) | {best}"
+        f" | {common.console.format_duration(fields['duration_seconds'])} | {_text(fields['best_parameters'])} | storage {_text(fields['storage'])}"
         + ("" if fields.get("summary_file") is None else f" | summary {fields['summary_file']}"),
         to_stderr=status == "failed",
     )
@@ -294,9 +310,9 @@ def optuna_trial_event(
     objective: float | None = None,
     step: int | None = None,
 ) -> None:
-    """Print one line for a finished Optuna trial; pruning is a normal outcome, any other non-completed state goes to stderr."""
+    """Print one line for a finished Optuna trial; pruning and duplicates are normal outcomes, any other state goes to stderr."""
     state = status if step is None or status == "completed" else f"{status}@{step}"
     _line(
-        f"trial {trial:>3}  {state}  val {_num(objective)}  {format_duration(duration_seconds)}  {_text(sampled)}",
-        to_stderr=status != "completed" and not status.endswith("pruned"),
+        f"trial {trial:>3}  {state}  val {_num(objective)}  {common.console.format_duration(duration_seconds)}  {_text(sampled)}",
+        to_stderr=status not in {"completed", "duplicate"} and not status.endswith("pruned"),
     )

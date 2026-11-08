@@ -281,7 +281,7 @@ def _validate_wait_record(
         not isinstance(payload, dict)
         or set(payload) != _WAIT_KEYS
         or payload.get("schema_kind") != _WAIT_SCHEMA_KIND
-        or payload.get("schema_version") != _WAIT_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), _WAIT_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != campaign_run_id
         or payload.get("batch_id") != config.batch_id
         or payload.get("case_id") != case_id
@@ -962,7 +962,7 @@ def load_in_allocation_license_window(
         raise ValueError(message)
     if (
         payload["schema_kind"] != _WINDOW_SCHEMA_KIND
-        or payload["schema_version"] != _WINDOW_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload["schema_version"], _WINDOW_SCHEMA_VERSION)
         or payload["campaign_run_id"] != campaign_run_id
         or payload["batch_id"] != config.batch_id
         or payload["case_id"] != case_id
@@ -1241,7 +1241,7 @@ def _validate_status_recovery_payload(
     )
     if (
         payload.get("schema_kind") != _STATUS_RECOVERY_SCHEMA_KIND
-        or payload.get("schema_version") != _STATUS_RECOVERY_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), _STATUS_RECOVERY_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != campaign_run_id
         or payload.get("batch_id") != config.batch_id
         or payload.get("case_id") != case_id

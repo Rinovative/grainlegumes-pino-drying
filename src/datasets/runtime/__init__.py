@@ -3,7 +3,6 @@ Unified steady and transient Dataset loading and DataLoader orchestration.
 
 Provides:
 - factory: package request, Dataset, and DataLoader construction
-- package_validation: published-package tensor inspection
 - steady: materialized steady-flow Dataset runtime
 - training: split and training DataLoader orchestration
 - transient_training: transient split, scaling, and DataLoader orchestration
@@ -17,7 +16,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import dataset_runtime_factory as factory
-    from . import dataset_runtime_package_validation as package_validation
     from . import dataset_runtime_steady as steady
     from . import dataset_runtime_training as training
     from . import dataset_runtime_transient as transient
@@ -25,13 +23,12 @@ if TYPE_CHECKING:
 
 _MODULES = {
     "factory": "dataset_runtime_factory",
-    "package_validation": "dataset_runtime_package_validation",
     "steady": "dataset_runtime_steady",
     "training": "dataset_runtime_training",
     "transient_training": "dataset_runtime_transient_training",
     "transient": "dataset_runtime_transient",
 }
-__all__ = ["factory", "package_validation", "steady", "training", "transient", "transient_training"]
+__all__ = ["factory", "steady", "training", "transient", "transient_training"]
 
 
 def __getattr__(name: str) -> object:

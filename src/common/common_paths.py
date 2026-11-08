@@ -79,9 +79,12 @@ import os
 import re
 import sys
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from . import common_serialization as serialization
 
 RUN_CONFIG_FILENAME = "config.yaml"
 RUN_NORMALIZER_FILENAME = "normalizer.pt"
@@ -89,6 +92,7 @@ RUN_BEST_CHECKPOINT_FILENAME = "best_checkpoint.pt"
 RUN_LAST_CHECKPOINT_FILENAME = "last_checkpoint.pt"
 RUN_SPLIT_INDICES_FILENAME = "split_indices.pt"
 RUN_SUMMARY_FILENAME = "summary.json"
+RUN_SUMMARY_SCHEMA_VERSION = 1
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 DATASET_PAYLOAD_FILENAME = "dataset.pt"
 DATASET_INDEX_FILENAME = "dataset.json"
@@ -179,6 +183,11 @@ RESUME_RUN_REQUIRED_FILES = (
 )
 
 
+def is_source_tree_id(value: object) -> bool:
+    """Return whether ``value`` is a ``<commit12>-<fingerprint12>`` source-tree name in lowercase hexadecimal."""
+    return isinstance(value, str) and _SOURCE_TREE_ID_PATTERN.fullmatch(value) is not None
+
+
 def source_tree_id(environment: Mapping[str, str] | None = None) -> str | None:
     """
     Return the frozen source-tree ID of this process, or ``None`` outside tree mode.
@@ -203,7 +212,7 @@ def source_tree_id(environment: Mapping[str, str] | None = None) -> str | None:
     value = values.get(SOURCE_TREE_ID_ENVIRONMENT_VARIABLE)
     if value is None:
         return None
-    if _SOURCE_TREE_ID_PATTERN.fullmatch(value) is None:
+    if not is_source_tree_id(value):
         message = f"{SOURCE_TREE_ID_ENVIRONMENT_VARIABLE} must be <commit12>-<fingerprint12> in lowercase hexadecimal, got {value!r}."
         raise ValueError(message)
     return value
@@ -366,7 +375,7 @@ def campaign_batch_parts(batch_storage_name: str) -> tuple[str, str, str, str] |
 
 
 def campaign_run_parts(run_id: str) -> tuple[str, str] | None:
-    """Decode a schema-v2 internal controller handle without changing its campaign name."""
+    """Decode an internal controller handle without changing its campaign name."""
     run_id = validate_logical_name(run_id, label="campaign_run_id")
     if not run_id.startswith("source~"):
         return None
@@ -483,7 +492,8 @@ def record_job_log_owner(owner: Path | str) -> None:
         with Path(record_path).open("a", encoding="utf-8") as record:
             record.write(f"{Path(owner).resolve()}\n")
     except (OSError, ValueError) as error:  # ValueError: a path UTF-8 cannot encode
-        print(f"Warning: could not record the job log owner {owner}: {error}", file=sys.stderr, flush=True)
+        with suppress(OSError, ValueError):  # a broken stderr must not turn the warning into a job failure
+            print(f"Warning: could not record the job log owner {owner}: {error}", file=sys.stderr, flush=True)
 
 
 def resolve_generation_execution_directory(campaign_directory: Path | str) -> Path:
@@ -624,7 +634,7 @@ def resolve_generation_replacements_directory(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve the append-only replacement-capacity amendments of one original batch."""
+    """Resolve the append-only minimum-success-rate amendments of one original batch."""
     return resolve_generation_batch_metadata_directory(batch_storage_name, storage_root=storage_root) / GENERATION_REPLACEMENTS_DIRNAME
 
 
@@ -826,7 +836,12 @@ def resolve_generation_input_metadata_storage_root(directory: Path | str, batch_
     """Invert the exact canonical or staged-transaction design location of an input generation to its storage root."""
     generation_id = validate_logical_name(input_generation_id, label="input_generation_id")
     batch = validate_logical_name(batch_storage_name, label="batch_storage_name")
-    suffixes = [
+    parts = _campaign_batch_parts(batch)
+    if parts is None:
+        message = f"Input-generation batch locator is not a campaign locator: {batch!r}"
+        raise ValueError(message)
+    task, campaign, material, regime = parts
+    transaction_suffix = (
         Path(GENERATION_AREA_NAME)
         / GENERATION_STATE_DIRNAME
         / "raw-inputs"
@@ -836,12 +851,8 @@ def resolve_generation_input_metadata_storage_root(directory: Path | str, batch_
         / batch
         / "input_generations"
         / generation_id
-    ]
-    parts = _campaign_batch_parts(batch)
-    if parts is not None:
-        task, campaign, material, regime = parts
-        suffixes.append(Path(GENERATION_AREA_NAME) / task / campaign / material / GENERATION_RECORD_DIRNAME / regime)
-    for suffix in suffixes:
+    )
+    for suffix in (transaction_suffix, Path(GENERATION_AREA_NAME) / task / campaign / material / GENERATION_RECORD_DIRNAME / regime):
         try:
             return _physical_layout_root(directory, suffix)
         except ValueError:
@@ -895,14 +906,6 @@ def get_generation_input_transactions_root(*, storage_root: Path | str | None = 
     return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "transactions"
 
 
-def get_generation_performance_benchmark_root(
-    *,
-    storage_root: Path | str | None = None,
-) -> Path:
-    """Return the dedicated Generation performance evidence directory."""
-    return get_generation_root(storage_root=storage_root) / "performance_benchmarks"
-
-
 def get_dataset_state_root(*, storage_root: Path | str | None = None) -> Path:
     """Return the hidden root for dataset-publication coordination state."""
     return get_datasets_root(storage_root=storage_root) / ".state"
@@ -923,9 +926,9 @@ def get_run_locks_root(*, storage_root: Path | str | None = None) -> Path:
     return get_experiment_state_root(storage_root=storage_root) / "runs" / "locks"
 
 
-def get_transient_scaler_cache_root(*, storage_root: Path | str | None = None) -> Path:
-    """Return the integrity-bound transient Train-scaler cache root."""
-    return get_experiment_state_root(storage_root=storage_root) / "transient_scalers"
+def get_scaling_cache_root(*, storage_root: Path | str | None = None) -> Path:
+    """Return the identity-bound Train-scaling cache root shared by both tasks."""
+    return get_experiment_state_root(storage_root=storage_root) / "scaling_cache"
 
 
 def resolve_identity_registry_entry(namespace_root: Path | str, digest: str) -> Path:
@@ -1590,9 +1593,7 @@ def is_evaluable_run_dir(run_dir: Path | str) -> bool:
         return False
     if not isinstance(summary, dict):
         return False
-    schema_version = summary.get("schema_version")
-    status = summary.get("status")
-    return isinstance(schema_version, int) and not isinstance(schema_version, bool) and schema_version == 1 and status == "completed"
+    return serialization.is_schema_version(summary.get("schema_version"), RUN_SUMMARY_SCHEMA_VERSION) and summary.get("status") == "completed"
 
 
 def resolve_analysis_root(run_dir: Path | str) -> Path:

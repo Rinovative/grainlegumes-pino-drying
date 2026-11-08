@@ -6,10 +6,10 @@ Responsibilities:
   - Resolve the storage, runtime, and native Python paths of a live checkout or of a frozen source tree
   - Invoke Generation service commands and submit native Slurm work from the admitted tree
   - Submit a launcher command to run from its chosen tree as its own Slurm job with an unbuffered live log and lease the tree for the returned job
-  - Hard-link a job's own Slurm logs and its helper logs into the logs/ of their existing campaign or published Dataset
+  - Hard-link a job's own Slurm logs and its helper logs into the logs/ of their existing campaign
 
 Design principles:
-  - A log link never creates its campaign or Dataset folder and never fails a job: every problem is one warning on stderr
+  - A log link never creates its campaign folder and never fails a job: every problem is one warning on stderr
   - A job finds its own logs from the sbatch templates that submitted it and keeps a link only to the file it checked
   - Keep source identity checks ahead of scheduled worker execution
   - A scheduled operation's runtime log summarizes a JSON result the driver receives whole; other output and failures stay raw
@@ -562,7 +562,7 @@ def submit_source_tree(
             f"--mem={job.memory}",
             f"--time={job.wall_time}",
             f"--output={launcher_log_template(layout.runtime, job.log_area, job.name)}",
-            # A requeue must never truncate a log that is hard-linked into its campaign or Dataset.
+            # A requeue must never truncate a log that is hard-linked into its campaign.
             "--open-mode=append",
             f"--chdir={plan.tree}",
             "--export=ALL",
@@ -612,7 +612,7 @@ def link_job_logs(owner_directory: Path, files: Sequence[Path]) -> None:
     """
     Hard-link job log files into ``<owner>/logs/`` under their own names.
 
-    The owner, a campaign or a published Dataset folder, must already exist and is
+    The owner, a campaign folder, must already exist and is
     never created here. A link to the same file is kept, a different existing file is
     left alone with a warning, a new link whose inode differs from the file checked
     before linking is removed again, and any failure is one warning on stderr, never an error.
@@ -847,7 +847,6 @@ class GenerationHost:
         *arguments: str,
         scheduled: bool | None = None,
         partition: str = "standard",
-        benchmark_preflight: bool = False,
         wall_time: str = "02:00:00",
     ) -> str:
         """Invoke one existing Generation CLI command on the host or through Slurm."""
@@ -864,8 +863,8 @@ class GenerationHost:
             if not worker.is_file() or worker.is_symlink() or not os.access(worker, os.X_OK):
                 message = f"Native Generation Python worker is missing or unsafe: {worker}"
                 raise RuntimeError(message)
-            mode = "benchmark-preflight" if benchmark_preflight else "cli"
-            worker_command = (str(worker), str(self.execution_root), mode, operation, *arguments)
+
+            worker_command = (str(worker), str(self.execution_root), "cli", operation, *arguments)
             on_allocated_node = (
                 re.fullmatch(r"[0-9]+", environment.get("SLURM_JOB_ID", "")) is not None
                 and re.fullmatch(r"[1-9][0-9]*", environment.get("SLURM_CPUS_PER_TASK", "")) is not None

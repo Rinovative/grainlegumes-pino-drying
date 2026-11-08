@@ -73,14 +73,11 @@ class FieldSpec:
         Physical unit before train-fitted normalization.
     representation : str
         Stored/model representation distinct from the physical unit.
-    source_name : str | None
-        Exact producer column name when it differs from the canonical field.
 
     Raises
     ------
     ValueError
-        If names, units, or representations are empty, the role is unsupported,
-        or ``source_name`` is neither ``None`` nor a non-empty string.
+        If names, units, or representations are empty or the role is unsupported.
 
     """
 
@@ -88,7 +85,6 @@ class FieldSpec:
     role: FieldRole
     unit: str
     representation: str
-    source_name: str | None = None
 
     def __post_init__(self) -> None:
         """Reject empty names/units/representations and unsupported runtime roles."""
@@ -99,18 +95,15 @@ class FieldSpec:
         if self.role not in _FIELD_ROLES:
             msg = f"Field {self.name!r} has unsupported role {self.role!r}."
             raise ValueError(msg)
-        if self.source_name is not None and (not isinstance(self.source_name, str) or not self.source_name):
-            msg = f"Field {self.name!r} source_name must be None or a non-empty string."
-            raise ValueError(msg)
 
-    def as_dict(self) -> dict[str, str | None]:
+    def as_dict(self) -> dict[str, str]:
         """
         Return a JSON-serializable field contract.
 
         Returns
         -------
-        dict[str, str | None]
-            Field name, role, unit, representation, and optional source name.
+        dict[str, str]
+            Field name, role, unit, and representation.
 
         """
         return {
@@ -118,7 +111,6 @@ class FieldSpec:
             "role": self.role,
             "unit": self.unit,
             "representation": self.representation,
-            "source_name": self.source_name,
         }
 
 

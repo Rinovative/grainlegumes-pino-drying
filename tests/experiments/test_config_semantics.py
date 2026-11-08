@@ -68,24 +68,49 @@ def test_steady_membership_keys_are_dataset_owned(key: str, value: object) -> No
         configs.resolve(raw)
 
 
+@pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
+def test_persistent_workers_need_worker_processes_in_both_tasks(build: Callable[[], dict[str, Any]]) -> None:
+    """Refuse keeping worker processes alive when the request starts none, with one message for both tasks."""
+    raw = build()
+    raw["data"].update(num_workers=0, persistent_workers=True)
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"^data\.persistent_workers requires data\.num_workers > 0\.$"):
+        configs.resolve(raw)
+
+
 def test_minimal_physics_config_preserves_explicit_semantics() -> None:
     """Propagate explicitly supplied formulation and weight values unchanged."""
     raw = configs.direct_config(physics_enabled=True)
     physics = raw["loss"]["physics"]
-    physics["derivatives"] = {"kind": "spectral", "extension": "fourier_continuation"}
+    physics["derivatives"] = {"kind": "spectral"}
     physics["momentum_weight"]["target"] = 4.0e-3
     physics["continuity_weight"]["target"] = 5.0e-3
     physics["boundary_weight"]["target"] = 6.0e-3
 
     resolved = configs.resolve(raw)
 
-    assert resolved["loss"]["physics"]["derivatives"] == {
-        "kind": "spectral",
-        "extension": "fourier_continuation",
-    }
+    assert resolved["loss"]["physics"]["derivatives"] == {"kind": "spectral"}
     assert resolved["loss"]["physics"]["momentum_weight"]["target"] == pytest.approx(4.0e-3)
     assert resolved["loss"]["physics"]["continuity_weight"]["target"] == pytest.approx(5.0e-3)
     assert resolved["loss"]["physics"]["boundary_weight"]["target"] == pytest.approx(6.0e-3)
+
+
+def test_derivatives_reject_an_extension_key() -> None:
+    """Refuse the removed derivative `extension` key; spectral derivatives always use Fourier continuation."""
+    raw = configs.direct_config(physics_enabled=True)
+    raw["loss"]["physics"]["derivatives"] = {"kind": "spectral", "extension": "none"}
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"loss\.physics\.derivatives.*extension"):
+        configs.resolve(raw)
+
+
+def test_saved_config_rejects_a_derivative_extension_key() -> None:
+    """Refuse the removed derivative `extension` key when a saved resolved config is validated."""
+    saved = configs.resolve(configs.direct_config(physics_enabled=True))
+    saved["loss"]["physics"]["derivatives"]["extension"] = "none"
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"loss\.physics\.derivatives.*extension"):
+        experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
 
 
 def test_scientific_change_updates_name_and_resume_identity() -> None:
@@ -163,6 +188,54 @@ def test_objective_change_is_resume_incompatible() -> None:
         experiments.run.validate_resume_config(second, first)
 
 
+def test_transient_training_states_its_cadence_without_code_defaults() -> None:
+    """Refuse a transient request that omits a training value its base config owns."""
+    raw = configs.transient_stage_a_only_config()
+    raw["training"].pop("evaluation_interval")
+
+    with pytest.raises((TypeError, ValueError), match="Transient training keys"):
+        configs.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    ("build", "path", "match"),
+    [
+        (configs.direct_config, ("run", "deterministic"), r"run\.deterministic must be boolean"),
+        (configs.direct_config, ("scheduler", "factor"), r"scheduler must state scheduler\.factor"),
+        (configs.direct_config, ("scheduler", "patience"), r"scheduler must state scheduler\.patience"),
+        (configs.direct_config, ("scheduler", "min_lr"), r"scheduler must state scheduler\.min_lr"),
+        (configs.direct_config, ("model", "params", "positional_embedding"), r"model\.params is missing required key.*positional_embedding"),
+        (configs.direct_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
+        (configs.transient_stage_a_only_config, ("data", "spatial_stride"), r"data\.spatial_stride is required"),
+        (configs.transient_stage_a_only_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
+    ],
+)
+def test_values_without_a_code_default_are_required_and_named_by_path(
+    build: Callable[[], dict[str, Any]],
+    path: tuple[str, ...],
+    match: str,
+) -> None:
+    """Refuse a request that leaves a training-relevant value to a code default, naming its config path."""
+    raw = build()
+    node = raw
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=match):
+        configs.resolve(raw)
+
+
+@pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
+def test_mixed_precision_is_an_unknown_training_key(build: Callable[[], dict[str, Any]]) -> None:
+    """Refuse the removed mixed-precision switch instead of ignoring it."""
+    raw = build()
+    raw["training"]["mixed_precision"] = False
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"training contains unknown key.*mixed_precision"):
+        configs.resolve(raw)
+
+
 @pytest.mark.parametrize(
     ("mutation", "match"),
     [
@@ -178,6 +251,10 @@ def test_objective_change_is_resume_incompatible() -> None:
         (
             lambda config: config["run"].update({"seed": True}),
             "integer",
+        ),
+        (
+            lambda config: config["training"].pop("evaluation_interval"),
+            r"training must state training\.evaluation_interval",
         ),
         (
             lambda config: config["data"].update({"train_dataset": "01_generation/raw/batch/case.h5"}),

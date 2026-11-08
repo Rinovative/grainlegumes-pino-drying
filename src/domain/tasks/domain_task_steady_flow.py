@@ -55,8 +55,8 @@ STEADY_FLOW = TaskSpec(
             "m^2",
             "dimensionless_log10_ratio_to_1_m2",
         ),
-        FieldSpec("eps_bed", "porosity", "1", "identity", source_name="int4(x,y)"),
-        FieldSpec("p_in_bc", "boundary", "Pa", "identity", source_name="int5(x,y)"),
+        FieldSpec("eps_bed", "porosity", "1", "identity"),
+        FieldSpec("p_in_bc", "boundary", "Pa", "identity"),
     ),
     outputs=(
         FieldSpec("p", "state", "Pa", "identity_before_train_normalization"),

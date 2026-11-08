@@ -2,7 +2,8 @@
 
 Responsibilities:
   - Parse explicit NPZ paths already validated by the artifact service
-  - Enforce TaskSpec field order, units, case identity, and finite arrays
+  - Enforce TaskSpec field order, units, case identity, and finite reference, input and geometry arrays
+  - Keep the non-finite prediction values of a NONFINITE case as gaps instead of failing presentation
   - Expose coordinates, learned outputs, inputs, and steady residuals uniformly
   - Reject every undeclared array and duplicate parsing convention
 
@@ -211,19 +212,21 @@ def _finite_array(
     *,
     label: str,
     rank: int,
+    prediction_derived: bool = False,
 ) -> np.ndarray:
     """
-    Normalize one NPZ array to real finite float values at an exact rank.
+    Normalize one NPZ array to real float values at an exact rank.
 
-    Non-numeric, complex, rank-mismatched, NaN, or infinite payloads fail before
-    shape relationships are checked by the calling case parser.
+    Non-numeric, complex or rank-mismatched payloads fail before shape relationships are checked by the
+    calling case parser. Reference, input and geometry arrays must be finite. A prediction-derived array
+    keeps the non-finite values of a NONFINITE case unchanged, so its maps show them as gaps instead of failing.
     """
     array = np.asarray(value)
     if array.ndim != rank or not np.issubdtype(array.dtype, np.number) or np.iscomplexobj(array):
         msg = f"{label} must be a real numeric rank-{rank} array."
         raise TypeError(msg)
     result = np.asarray(array, dtype=float)
-    if not np.isfinite(result).all():
+    if not prediction_derived and not np.isfinite(result).all():
         msg = f"{label} contains non-finite values."
         raise ValueError(msg)
     return result
@@ -432,16 +435,16 @@ def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCas
         msg = "Artifact derived field order does not begin with the learned TaskSpec outputs."
         raise ValueError(msg)
 
-    prediction_all = _finite_array(payload["pred"], label="pred", rank=3)
+    prediction_all = _finite_array(payload["pred"], label="pred", rank=3, prediction_derived=True)
     reference_all = _finite_array(payload["gt"], label="gt", rank=3)
-    error_all = _finite_array(payload["err"], label="err", rank=3)
+    error_all = _finite_array(payload["err"], label="err", rank=3, prediction_derived=True)
     if prediction_all.shape != reference_all.shape or prediction_all.shape != error_all.shape:
         msg = "Artifact pred, gt, and err arrays must have identical shapes."
         raise ValueError(msg)
     if prediction_all.shape[0] != len(artifact_fields):
         msg = "Artifact field names do not match pred/gt/err channel count."
         raise ValueError(msg)
-    if not np.allclose(error_all, prediction_all - reference_all, rtol=1e-6, atol=1e-9):
+    if not np.allclose(error_all, prediction_all - reference_all, rtol=1e-6, atol=1e-9, equal_nan=True):
         msg = "Artifact err array does not equal pred minus gt."
         raise ValueError(msg)
 
@@ -471,12 +474,14 @@ def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCas
     if any(residual_presence) and not all(residual_presence):
         msg = "Steady residual arrays must contain Rx, Ry, and flux_balance together."
         raise ValueError(msg)
-    residuals = {name: _finite_array(payload[name], label=name, rank=2) for name in _STEADY_MAP_RESIDUAL_NAMES if name in payload}
+    residuals = {
+        name: _finite_array(payload[name], label=name, rank=2, prediction_derived=True) for name in _STEADY_MAP_RESIDUAL_NAMES if name in payload
+    }
     if any(array.shape != prediction.shape[-2:] for array in residuals.values()):
         msg = "Steady residual maps must use the full learned-output grid."
         raise ValueError(msg)
     if "flux_balance" in payload:
-        residuals["flux_balance"] = _finite_array(payload["flux_balance"], label="flux_balance", rank=1)
+        residuals["flux_balance"] = _finite_array(payload["flux_balance"], label="flux_balance", rank=1, prediction_derived=True)
         if residuals["flux_balance"].shape != prediction.shape[-2:-1]:
             msg = "Steady flux_balance must hold one value per learned-output grid row."
             raise ValueError(msg)

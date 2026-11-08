@@ -6,6 +6,7 @@ Responsibilities:
   - Check the continuation guard against implicit switches to another source tree
   - Check the preflight summary line the launcher consumes
   - Check that a Slurm ML job derives commit and dirty state from its source snapshot without Git
+  - Check that artifacts name the executing tree inside a container job and in tree mode
 
 Design principles:
   - Units are test-owned summaries at the exact layout paths the production resolvers name
@@ -28,7 +29,7 @@ import pytest
 import yaml
 from support import configs, run_state
 
-from src import common, experiments
+from src import analysis, common, experiments
 from src.experiments import experiments_run_identity as run_identity
 from src.experiments import experiments_run_source_binding as source_binding
 from src.experiments.cli import cli_config_preflight
@@ -61,7 +62,7 @@ def _write_leaf(run_dir: Path, *sessions: Mapping[str, Any], status: str = "comp
     run_dir.mkdir(parents=True, exist_ok=True)
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": experiments.run.RUN_SUMMARY_SCHEMA_VERSION, "status": status, "runtime_sessions": list(sessions)},
+        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "status": status, "runtime_sessions": list(sessions)},
     )
     return run_dir
 
@@ -114,7 +115,7 @@ def test_malformed_recorded_sessions_fail_closed(tmp_path: Path, sessions: objec
     run_dir.mkdir()
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": experiments.run.RUN_SUMMARY_SCHEMA_VERSION, "runtime_sessions": sessions},
+        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "runtime_sessions": sessions},
     )
 
     with pytest.raises(error):
@@ -355,7 +356,7 @@ def test_outside_a_slurm_job_the_checkout_still_answers(monkeypatch: pytest.Monk
     assert run_identity.source_repository_evidence() == {"commit": None, "dirty": None}
 
 
-def _job_environment(monkeypatch: pytest.MonkeyPatch, tree: str, *, transition: str = "none") -> None:
+def _job_environment(monkeypatch: pytest.MonkeyPatch, tree: str, *, transition: str = "none", config_sha256: str = "c" * 64) -> None:
     """Run the test as the Slurm ML job that the worker script would start in ``tree``."""
     provenance = {
         "job_id": "12345",
@@ -369,11 +370,25 @@ def _job_environment(monkeypatch: pytest.MonkeyPatch, tree: str, *, transition: 
         "source_commit": _COMMITS[tree],
         "source_worktree_sha256": _FINGERPRINTS[tree],
         "source_transition": transition,
-        "config_sha256": "c" * 64,
+        "config_sha256": config_sha256,
         "sif_path": "/workspace/runtime/containers/grainlegumes-pino-drying.sif",
         "sif_sha256": "d" * 64,
     }
     monkeypatch.setenv("ML_SLURM_PROVENANCE", json.dumps(provenance))
+
+
+@pytest.mark.parametrize("config_sha256", ["c" * 64, "none"], ids=["train-job", "artifacts-job"])
+def test_artifacts_record_the_tree_a_container_job_runs_in(monkeypatch: pytest.MonkeyPatch, config_sha256: str) -> None:
+    """The container never sees ``SOURCE_TREE_ID``, so a job's artifacts name its tree from the provenance; elsewhere tree mode names it."""
+    device = {"requested_policy": "cpu", "resolved_device": "cpu", "device_type": "cpu", "pytorch_version": "test"}
+    monkeypatch.delenv("SOURCE_TREE_ID", raising=False)
+    _job_environment(monkeypatch, "b", config_sha256=config_sha256)
+
+    assert analysis.artifacts.contracts.runtime_provenance(device, inference_batch_size=1)["source_tree_id"] == _TREES["b"]
+    monkeypatch.delenv("ML_SLURM_PROVENANCE")
+    assert run_identity.executing_source_tree_id() is None
+    monkeypatch.setenv("SOURCE_TREE_ID", _TREES["c"])
+    assert run_identity.executing_source_tree_id() == _TREES["c"]
 
 
 def test_continuing_a_leaf_in_its_bound_tree_or_a_fresh_leaf_is_admitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

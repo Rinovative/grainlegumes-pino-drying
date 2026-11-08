@@ -1,12 +1,13 @@
 """Bind a Dataset to the complete candidate outcomes of its Source.
 
 Responsibilities:
-  - Check that a Dataset manifest records the replacement policy, every candidate outcome and the original-candidate failure counts
+  - Check that a Dataset manifest records the minimum success rate with its decided counts, every candidate outcome and the original
+    failure counts
   - Check that the manifest validator rejects counts or selected cases that disagree with the recorded table
   - Check the readable failure-rate summary of the Dataset inspection
 
 Design principles:
-  - A fake-solver Source with one failed original and one pre-registered replacement exercises the real publication chain
+  - A fake-solver Source with one failed original and one replacement under a plan rate exercises the real publication chain
   - Selected successes alone never describe the population they were drawn from
 
 This module does NOT:
@@ -26,6 +27,7 @@ from support.generation_fixtures import successful_source_case
 from src import common, datasets, generation
 from src.datasets import dataset_packages as facade
 from src.datasets.packages import dataset_packages_manifest as manifests
+from src.datasets.packages import dataset_packages_selection as selection
 from src.generation import generation_campaign_lifecycle as lifecycle
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.publication import generation_publication_catalog as catalog
@@ -52,9 +54,9 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
     fake_comsol: Path,
     tmp_path: Path,
 ) -> None:
-    """One failed original, one pre-registered replacement: the Dataset states the failure count and the linkage."""
+    """One failed original and one replacement under s = 0.9: the Dataset states the rate, k/n, the failure count and the linkage."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow", executable=fake_comsol, natural_count=2)
-    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "replacement_capacity": {"lentil": 1}}
+    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.9}
     campaign = generation.cases.config.load_campaign_config(config_path, authored_value=authored)
     storage = tmp_path / "scientific-storage"
     lifecycle.create_campaign(campaign, storage_root=storage)
@@ -104,8 +106,8 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
 
     rows = catalog.list_campaign_cases("steady_flow", campaign.source_name, storage_root=storage)
     request = {
-        "schema_kind": "dataset_selection_request",
-        "schema_version": 2,
+        "schema_kind": selection.SELECTION_SCHEMA_KIND,
+        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "steady_flow",
         "dataset_name": "outcomes",
         "dataset_view": "steady_flow",
@@ -129,8 +131,9 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
         }
     }
     (policy,) = outcome["replacement_policy"]
-    assert (policy["material_family"], policy["planned_capacity"], policy["high_water"]) == ("lentil", 1, 1)
-    assert [(item["registered_by"], item["high_water"]) for item in policy["amendments"]] == [("plan", 1)]
+    assert (policy["material_family"], policy["minimum_success_rate"]) == ("lentil", 0.9)
+    assert (policy["successful"], policy["decided"], policy["stopped"]) == (2, 3, False)
+    assert [(item["registered_by"], item["minimum_success_rate"]) for item in policy["amendments"]] == [("plan", 0.9)]
     table = {row["case_id"]: row for row in outcome["candidates"]}
     assert list(table) == ["case_0001", "case_0002", "case_0003"]
     assert (table["case_0001"]["origin"], table["case_0001"]["outcome"], table["case_0001"]["reason_code"]) == (
@@ -148,7 +151,10 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
 
     summary = "\n".join(facade._source_outcome_lines(manifest["source_outcomes"]))
     assert f"Source outcomes of {campaign.source_name}" in summary
-    assert "lentil: original candidates failed 1/2 (50.0%); replacements used 1 (failed 0) of capacity 1 (pre-registered 1); successful 2" in summary
+    assert (
+        "lentil: original candidates failed 1/2 (50.0%); replacements used 1 (failed 0); successful 2; 2/3 decided successful against minimum 0.9"
+        in summary
+    )
 
     payload = common.paths.resolve_dataset_path(
         "steady_flow", published["dataset_id"], dataset_root=common.paths.get_datasets_root(storage_root=storage)
@@ -157,6 +163,17 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
         (lambda value: value["source_outcomes"][0]["materials"]["lentil"].update(original_failed=0), "counts of 'lentil' disagree"),
         (lambda value: value["source_outcomes"][0]["candidates"][1].update(outcome="failed"), r"every selected case as a successful candidate"),
         (lambda value: value["source_outcomes"][0].update(source_name="another-source"), "exactly the contributing Sources"),
+        (lambda value: value.update(selection={"kind": "seed_ranked", "root_seed": 42}), "selection method must be exact or design_order"),
+        (
+            lambda value: value.update(
+                selection={
+                    "kind": "design_order",
+                    "source_names": [value["source_outcomes"][0]["source_name"] + "__rev-fix"],
+                    "target_counts": {"lentil": 2},
+                }
+            ),
+            "must name exactly the Source its cases come from",
+        ),
     ):
         tampered = copy.deepcopy(manifest)
         mutate(tampered)

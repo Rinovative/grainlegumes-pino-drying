@@ -24,7 +24,7 @@ def _steady_provenance(scale: float = 2.0, dataset: str = "train-dataset", fit_s
             "output_normalization": "train_fitted_per_channel_standardization",
             "sha256": "a" * 64,
         },
-        "dataset": {"fingerprint": dataset},
+        "dataset": {"name": dataset},
     }
 
 

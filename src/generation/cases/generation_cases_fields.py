@@ -16,7 +16,7 @@ This module does NOT:
 
 Notes:
   Permeability and porosity:
-    - Scalar permeability uses a lognormal transform parameterized by its configured mean and coefficient of variation; tensor orientation follows a
+    - Scalar permeability uses a lognormal transform parameterized by its configured scale and coefficient of variation; tensor orientation follows a
       smoothed director derived from bed-background gradients.
     - Local porosity texture is centered on a case-level Kozeny-Carman trend with bounded packing scatter, clipped to global guards, then checked
       against natural or active permeability-OOD mean support.
@@ -298,7 +298,12 @@ def _permeability_fields(
     values: Mapping[str, Any],
     random: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    """Map bed structure to scalar and symmetric positive-definite permeability."""
+    """Map bed structure to scalar and symmetric positive-definite permeability.
+
+    The local principal-permeability ratio is ``r = 1 + strength * (max_ratio - 1) * |b|**exponent``;
+    the principal permeabilities are ``kappa * sqrt(r)`` and ``kappa / sqrt(r)``, so ``k1 / k2 = r``
+    and the geometric mean stays ``kappa``.
+    """
     relative_variation = _finite(values, "kappa_cv")
     mean = _finite(values, "kappa_mean")
     if relative_variation < 0 or mean <= 0:
@@ -309,11 +314,11 @@ def _permeability_fields(
     sigma_theta = max(_finite(values, "permeability.orientation.smooth_len_rel") * length_x / resolution, 1.0)
     orientation_kernel = _gaussian_kernel(sigma_theta, sigma_theta)
     normalized_absolute = np.abs(background) / max(float(np.max(np.abs(background))), np.finfo(np.float64).eps)
-    ratio = 1.0 + _finite(values, "permeability.anisotropy.strength") * (
+    principal_ratio = 1.0 + _finite(values, "permeability.anisotropy.strength") * (
         (_finite(values, "permeability.anisotropy.max_ratio") - 1.0) * normalized_absolute ** _finite(values, "permeability.anisotropy.exponent")
     )
-    if np.any(ratio <= 0):
-        msg = "Permeability anisotropy ratio must remain positive."
+    if np.any(principal_ratio <= 0):
+        msg = "Principal-permeability ratio must remain positive."
         raise ValueError(msg)
     gradient_y, gradient_x = np.gradient(background, resolution, resolution)
     theta_raw = np.arctan2(gradient_y, gradient_x)
@@ -333,8 +338,8 @@ def _permeability_fields(
         director_x /= np.maximum(norm, np.finfo(np.float64).eps)
         director_y /= np.maximum(norm, np.finfo(np.float64).eps)
     theta = 0.5 * np.arctan2(director_y, director_x)
-    k1 = kappa * ratio
-    k2 = kappa / ratio
+    k1 = kappa * np.sqrt(principal_ratio)
+    k2 = kappa / np.sqrt(principal_ratio)
     cosine = np.cos(theta)
     sine = np.sin(theta)
     kxx = k1 * cosine**2 + k2 * sine**2

@@ -15,7 +15,8 @@ model:
     implementation: factorized  # FNO spectral implementation choice; factorized uses factorized spectral weights.
 
 optimizer:
-  lr: 0.0003883614530748613  # Initial learning rate; controls the optimizer update scale.
+  # Placeholder until the fno_a0_search study selects it.
+  lr: 0.0003883614530748613 # Initial learning rate; controls the optimizer update scale.
 
 training:
   a0:

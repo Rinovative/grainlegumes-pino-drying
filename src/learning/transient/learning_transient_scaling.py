@@ -5,6 +5,8 @@ Responsibilities:
   - Persist task, Dataset, membership, profile, and channel identities
   - Encode state, spatial, scalar, and boundary values and encode or decode increments
   - Produce device-independent serialized evidence and identity digests
+  - State the transient preprocessing specification that the shared scaling identity binds
+  - Admit a saved state only when its repeated identity fields equal that expected identity
 
 Design principles:
   - Statistics consume Train items only and preserve state provenance
@@ -38,7 +40,7 @@ from typing import Any, Final, Literal
 
 import torch
 
-from src import datasets, domain
+from src import common, datasets, domain
 
 from .learning_transient_contracts import TransientTensorizerSpec
 
@@ -676,7 +678,7 @@ class TransientScalingArtifact:
         if set(state) != required:
             message = "Transient scaling state keys do not match the current schema."
             raise ValueError(message)
-        if state["schema_kind"] != SCALING_SCHEMA_KIND or state["schema_version"] != SCALING_SCHEMA_VERSION:
+        if state["schema_kind"] != SCALING_SCHEMA_KIND or not common.serialization.is_schema_version(state["schema_version"], SCALING_SCHEMA_VERSION):
             message = "Transient scaling state has an unsupported schema."
             raise ValueError(message)
         raw_tensorizer = state["tensorizer"]
@@ -951,6 +953,63 @@ def _positive_horizon(value: Any) -> float:
         message = "horizon must be one positive finite number."
         raise ValueError(message)
     return float(value)
+
+
+def preprocessing_spec(*, tensorizer: TransientTensorizerSpec, scale_mode: TransientScaleMode, spatial_view: Mapping[str, int]) -> dict[str, Any]:
+    """Return the transient preprocessing specification bound into the shared scaling identity."""
+    return {
+        "kind": "transient_one_step_train_scaling",
+        "tensorizer": tensorizer.as_dict(),
+        "scale_mode": scale_mode,
+        "spatial_view": dict(spatial_view),
+    }
+
+
+def admit_transient_scaling_state(state: Mapping[str, Any], *, identity: Mapping[str, Any]) -> TransientScalingArtifact:
+    """
+    Rebuild one saved scaling state and require it to repeat the expected envelope identity.
+
+    Parameters
+    ----------
+    state : Mapping[str, Any]
+        Scaling state of an identity-admitted envelope.
+    identity : Mapping[str, Any]
+        Expected scaling identity (``datasets.preprocessing.scaling.scaling_identity``).
+
+    Returns
+    -------
+    TransientScalingArtifact
+        The strictly rebuilt artifact.
+
+    Raises
+    ------
+    ValueError
+        If the state's Dataset identity, Train membership digest, tensorizer, scale mode or spatial shape
+        differs from the identity, naming the field.
+
+    """
+    artifact = TransientScalingArtifact.from_state_dict(state)
+    preprocessing = identity["preprocessing"]
+    view = preprocessing["spatial_view"]
+    expected = {
+        "dataset_identity": _canonical_mapping(identity["dataset"], label="dataset_identity"),
+        "train_membership_digest": identity["train_membership_digest"],
+        "tensorizer": preprocessing["tensorizer"],
+        "scale_mode": preprocessing["scale_mode"],
+        "spatial_shape": (view["effective_ny"], view["effective_nx"]),
+    }
+    observed = {
+        "dataset_identity": artifact.dataset_identity,
+        "train_membership_digest": artifact.train_membership_digest,
+        "tensorizer": artifact.tensorizer.as_dict(),
+        "scale_mode": artifact.scale_mode,
+        "spatial_shape": artifact.spatial_shape,
+    }
+    for field, value in expected.items():
+        if observed[field] != value:
+            message = f"Transient scaling state {field} does not match the expected scaling identity."
+            raise ValueError(message)
+    return artifact
 
 
 def fit_transient_scaling(

@@ -1,16 +1,19 @@
-"""Build and admit Dataset-bound derived PT shards for transient trajectories.
+"""Write and admit Dataset-bound derived PT shards for transient trajectories.
 
 Responsibilities:
-  - Pack complete canonical cases into soft-target immutable PyTorch shards
-  - Bind derived payloads to exact Dataset manifest and index identity
-  - Atomically publish and strictly validate shard receipts and tensor contents
+  - Pack complete canonical cases into soft-target immutable PyTorch shards inside a staged Dataset folder
+  - Bind derived payloads to the Dataset identity and index the manifest states, and return the receipt digest the manifest binds
+  - Strictly validate shard receipts and tensor contents before and after publication
 
 Design principles:
   - Canonical HDF5 remains authoritative and sufficient for exact reconstruction
   - One case belongs to exactly one shard and exact-stop data remains diagnostic
   - Scientific Dataset identity is independent of derived packing policy
+  - Shards are written before the manifest, so the manifest binds the shard set and never the reverse
+  - Shards become visible only with their Dataset, in the publisher's one atomic step
 
 This module does NOT:
+  - Lock, stage or publish Dataset folders; the Dataset publisher owns that step
   - Change package manifests, Dataset IDs, split membership, or Training semantics
   - Delete, rewrite, or recover canonical Generation HDF5 artifacts
 
@@ -29,10 +32,7 @@ from __future__ import annotations
 import json
 import math
 import re
-import shutil
-import tempfile
-import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +42,7 @@ import h5py
 import torch
 
 from src import common
+from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 from . import DEFAULT_TRANSIENT_PT_SHARD_BYTES
@@ -62,9 +63,8 @@ _MINIMUM_STATE_COUNT: Final = 2
 _TRANSIENT_TENSOR_RANK: Final = 4
 _STATIC_TENSOR_RANK: Final = 3
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
-_DATASET_PUBLICATION_IDENTITY_KEYS: Final = {"dataset_id", "dataset_digest", "manifest_sha256", "index_digest"}
+_DATASET_PUBLICATION_IDENTITY_KEYS: Final = {"dataset_id", "dataset_digest", "index_digest"}
 _CONTENT_STAT_CACHE_SIZE: Final = 128
-ProgressCallback = Callable[[Mapping[str, Any]], None]
 ValidationDepth = Literal["evidence", "full"]
 
 
@@ -108,14 +108,12 @@ def _validate_publication_identity(value: Any) -> dict[str, str]:
 def _publication_identity_from_dataset(
     manifest: Mapping[str, Any],
     index: Mapping[str, Any],
-    manifest_sha256: str,
 ) -> dict[str, str]:
-    """Derive shard provenance from the already admitted Dataset bytes."""
+    """Derive shard provenance from the Dataset identity and index the manifest states; the manifest binds the shards."""
     return _validate_publication_identity(
         {
             "dataset_id": manifest["dataset_id"],
             "dataset_digest": manifest["dataset_digest"],
-            "manifest_sha256": manifest_sha256,
             "index_digest": index["index_digest"],
         }
     )
@@ -126,8 +124,8 @@ def _package_context(
     *,
     storage_root: Path | str | None,
     validation_depth: ValidationDepth = "full",
-) -> tuple[Path, dict[str, Any], dict[str, Any], str]:
-    """Return an admitted transient manifest, index, and manifest digest."""
+) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    """Return an admitted transient manifest and index."""
     if validation_depth not in {"evidence", "full"}:
         message = f"Unsupported transient shard validation depth: {validation_depth!r}."
         raise ValueError(message)
@@ -135,20 +133,9 @@ def _package_context(
     manifest_loader = package_manifest.load_package_manifest if validation_depth == "full" else package_manifest.load_package_manifest_evidence
     manifest = manifest_loader(_TASK, dataset_id, storage_root=storage)
     datasets_root = common.paths.get_datasets_root(storage_root=storage)
-    manifest_path = common.paths.resolve_dataset_manifest_path(_TASK, dataset_id, dataset_root=datasets_root)
-    index_path = common.paths.resolve_dataset_path(_TASK, dataset_id, dataset_root=datasets_root)
-    index = trajectory.load_transient_index(index_path)
-    if (
-        index["dataset_id"] != manifest["dataset_id"]
-        or index["dataset_name"] != manifest["dataset_name"]
-        or index["index_digest"] == ""
-        or index["sample_count"] != manifest["sample_count"]
-        or index["source_case_count"] != manifest["source_case_count"]
-        or index["contract_digest"] != manifest["channel_contract_digest"]
-    ):
-        message = f"Transient package index does not bind its manifest: {index_path}."
-        raise TransientShardContractError(message)
-    return storage, manifest, index, common.serialization.file_sha256(manifest_path)
+    index = trajectory.load_transient_index(common.paths.resolve_dataset_path(_TASK, dataset_id, dataset_root=datasets_root))
+    package_manifest.validate_transient_payload_identity(manifest, index)
+    return storage, manifest, index
 
 
 def _canonical_payload_path(storage: Path, manifest: Mapping[str, Any]) -> Path:
@@ -189,9 +176,7 @@ def _resolve_source(
     if not path.is_relative_to(storage) or not path.is_file() or path.is_symlink():
         message = f"Canonical transient Source is missing or unsafe: {path}."
         raise FileNotFoundError(message)
-    if common.serialization.file_sha256(path) != case.get("source_hdf5_sha256"):
-        message = f"Canonical transient Source changed after Dataset publication: {path}."
-        raise TransientShardContractError(message)
+    identity.require_admitted_source_bytes(path, str(case.get("source_hdf5_sha256")))
     return path
 
 
@@ -395,15 +380,6 @@ def _derived_payload_id(
     return common.serialization.canonical_json_sha256(payload)
 
 
-def _emit(
-    callback: ProgressCallback | None,
-    **values: Any,
-) -> None:
-    """Emit one bounded progress event when a caller owns presentation."""
-    if callback is not None:
-        callback(values)
-
-
 def _save_shards(
     *,
     directory: Path,
@@ -415,7 +391,6 @@ def _save_shards(
     case_sizes: Sequence[int],
     source_paths: Sequence[Path],
     grouped_samples: Sequence[Sequence[Mapping[str, Any]]],
-    callback: ProgressCallback | None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, dict[str, int]], int]:
     """Materialize and serialize one bounded whole-case shard at a time."""
     case_id_groups = [[str(index["cases"][case_index]["package_case_id"]) for case_index in group] for group in case_groups]
@@ -429,8 +404,6 @@ def _save_shards(
     shards: list[dict[str, Any]] = []
     locator: dict[str, dict[str, int]] = {}
     total_size = 0
-    source_bytes_read = 0
-    cases_packed = 0
     for shard_index, group in enumerate(case_groups):
         packed_cases: list[dict[str, Any]] = []
         for case_index in group:
@@ -448,16 +421,6 @@ def _save_shards(
                 message = f"Transient shard tensor-byte plan changed for case {case_index}."
                 raise RuntimeError(message)
             packed_cases.append(payload)
-            cases_packed += 1
-            source_bytes_read += source_paths[case_index].stat().st_size
-            _emit(
-                callback,
-                operation="shard_case_materialization",
-                cases_packed=cases_packed,
-                cases_total=len(index["cases"]),
-                source_bytes_read=source_bytes_read,
-                eta="unavailable",
-            )
         filename = f"shard_{shard_index:05d}.pt"
         case_ids = case_id_groups[shard_index]
         shard_payload = {
@@ -502,14 +465,6 @@ def _save_shards(
                 "shard_index": shard_index,
                 "case_position": case_position,
             }
-        _emit(
-            callback,
-            operation="shard_building",
-            shards_completed=shard_index + 1,
-            shards_total=len(case_groups),
-            bytes_written=total_size,
-            eta="unavailable",
-        )
         del shard_payload, packed_cases
     return derived_id, shards, locator, total_size
 
@@ -708,7 +663,7 @@ def _validate_loaded_shard(
     if (
         set(payload) != required
         or payload["schema_kind"] != TRANSIENT_PT_SHARD_SCHEMA_KIND
-        or payload["schema_version"] != TRANSIENT_PT_SHARD_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload["schema_version"], TRANSIENT_PT_SHARD_SCHEMA_VERSION)
         or payload["dataset_id"] != manifest["dataset_id"]
         or payload["dataset_digest"] != manifest["dataset_digest"]
         or payload["index_digest"] != index["index_digest"]
@@ -764,7 +719,6 @@ def _validate_receipt_directory(
     *,
     manifest: Mapping[str, Any],
     index: Mapping[str, Any],
-    manifest_sha256: str,
     canonical_payload_size_bytes: int,
     canonical_payload_stat_identity: Mapping[str, int],
     canonical_payload_path: Path,
@@ -782,7 +736,6 @@ def _validate_receipt_directory(
         "dataset_digest",
         "index_digest",
         "transient_contract_digest",
-        "package_manifest_sha256",
         "canonical_payload_sha256",
         "canonical_payload_size_bytes",
         "canonical_payload_stat_identity",
@@ -830,7 +783,7 @@ def _validate_receipt_directory(
     )
     if (
         receipt["schema_kind"] != TRANSIENT_PT_RECEIPT_SCHEMA_KIND
-        or receipt["schema_version"] != TRANSIENT_PT_RECEIPT_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(receipt["schema_version"], TRANSIENT_PT_RECEIPT_SCHEMA_VERSION)
         or receipt["status"] != "complete"
         or not isinstance(receipt["created_at"], str)
         or not receipt["created_at"]
@@ -838,7 +791,6 @@ def _validate_receipt_directory(
         or receipt["dataset_digest"] != manifest["dataset_digest"]
         or receipt["index_digest"] != index["index_digest"]
         or receipt["transient_contract_digest"] != index["contract_digest"]
-        or receipt["package_manifest_sha256"] != manifest_sha256
         or receipt["canonical_payload_sha256"] != manifest["payload_sha256"]
         or isinstance(receipt["canonical_payload_size_bytes"], bool)
         or not isinstance(receipt["canonical_payload_size_bytes"], int)
@@ -956,7 +908,6 @@ def _load_transient_shard_receipt_directory(
     *,
     manifest: Mapping[str, Any],
     index: Mapping[str, Any],
-    manifest_sha256: str,
     canonical_payload_size_bytes: int,
     canonical_payload_stat_identity: Mapping[str, int],
     publication_identity: Mapping[str, str] | None,
@@ -977,7 +928,6 @@ def _load_transient_shard_receipt_directory(
         receipt,
         manifest=manifest,
         index=index,
-        manifest_sha256=manifest_sha256,
         canonical_payload_size_bytes=canonical_payload_size_bytes,
         canonical_payload_stat_identity=canonical_payload_stat_identity,
         canonical_payload_path=directory.parent / common.paths.get_dataset_payload_filename(_TASK),
@@ -996,7 +946,7 @@ def load_transient_shard_receipt(
     if validation_depth not in {"evidence", "full"}:
         message = f"Unsupported transient shard validation depth: {validation_depth!r}."
         raise ValueError(message)
-    storage, manifest, index, manifest_sha256 = _package_context(
+    storage, manifest, index = _package_context(
         dataset_id,
         storage_root=storage_root,
         validation_depth=validation_depth,
@@ -1005,12 +955,11 @@ def load_transient_shard_receipt(
         storage,
         manifest,
     )
-    expected_publication = _publication_identity_from_dataset(manifest, index, manifest_sha256)
+    expected_publication = _publication_identity_from_dataset(manifest, index)
     return _load_transient_shard_receipt_directory(
         transient_shard_directory(dataset_id, storage_root=storage),
         manifest=manifest,
         index=index,
-        manifest_sha256=manifest_sha256,
         canonical_payload_size_bytes=canonical_size,
         canonical_payload_stat_identity=canonical_stat,
         publication_identity=expected_publication,
@@ -1033,7 +982,7 @@ def load_transient_shard_payload(
     if type(validate_values) is not bool:
         message = "validate_values must be boolean."
         raise TypeError(message)
-    storage, manifest, index, manifest_sha256 = _package_context(
+    storage, manifest, index = _package_context(
         dataset_id,
         storage_root=storage_root,
         validation_depth="evidence",
@@ -1047,10 +996,9 @@ def load_transient_shard_payload(
             transient_shard_directory(dataset_id, storage_root=storage),
             manifest=manifest,
             index=index,
-            manifest_sha256=manifest_sha256,
             canonical_payload_size_bytes=canonical_size,
             canonical_payload_stat_identity=canonical_stat,
-            publication_identity=_publication_identity_from_dataset(manifest, index, manifest_sha256),
+            publication_identity=_publication_identity_from_dataset(manifest, index),
             validation_depth="evidence",
         )
     else:
@@ -1059,7 +1007,7 @@ def load_transient_shard_payload(
     if admitted.get("dataset_id") != dataset_id or not isinstance(shards, list) or shard_index >= len(shards):
         message = f"Transient PT shard index {shard_index} is outside the admitted receipt."
         raise TransientShardContractError(message)
-    if admitted.get("publication_identity") != _publication_identity_from_dataset(manifest, index, manifest_sha256):
+    if admitted.get("publication_identity") != _publication_identity_from_dataset(manifest, index):
         message = "Transient PT shard receipt does not bind the current Dataset identity."
         raise TransientShardContractError(message)
     record = shards[shard_index]
@@ -1099,320 +1047,99 @@ def load_transient_shard_payload(
     )
 
 
-def _raw_shard_destination_conflicts(
-    destination: Path,
-    *,
-    dataset_id: str,
-    publication_identity: Mapping[str, str],
-    target_shard_bytes: int,
-) -> bool:
-    """Return whether invalid shard evidence claims another immutable owner."""
-    receipt_path = destination / TRANSIENT_PT_RECEIPT_FILENAME
-    if receipt_path.is_symlink() or (receipt_path.exists() and not receipt_path.is_file()):
-        return True
-    if not receipt_path.is_file():
-        return False
-    try:
-        raw_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw_receipt, dict):
-        return False
-    if raw_receipt.get("dataset_id") not in {None, dataset_id}:
-        return True
-    if raw_receipt.get("target_shard_bytes") not in {None, target_shard_bytes}:
-        return True
-    raw_publication = raw_receipt.get("publication_identity")
-    if not isinstance(raw_publication, dict):
-        return False
-    observed_keys = set(raw_publication)
-    expected_keys = set(publication_identity)
-    if observed_keys != expected_keys:
-        return True
-    return any(key in raw_publication and raw_publication[key] != value for key, value in publication_identity.items())
-
-
-def _admit_existing_shard_destination(
-    dataset_id: str,
-    *,
-    destination: Path,
+def write_transient_shards(
+    directory: Path,
     manifest: Mapping[str, Any],
-    index: Mapping[str, Any],
-    manifest_sha256: str,
-    canonical_payload_size_bytes: int,
-    canonical_payload_stat_identity: Mapping[str, int],
-    publication_identity: Mapping[str, str],
-    target_shard_bytes: int,
-    validation_depth: ValidationDepth,
-    rebuild_invalid: bool,
-    case_count: int,
-    progress: ProgressCallback | None,
-) -> tuple[dict[str, Any] | None, bool]:
-    """Return reusable evidence or authorize one atomic replacement."""
-    if not destination.exists():
-        return None, False
-    if destination.is_symlink() or not destination.is_dir():
-        message = f"Transient PT shard destination is unsafe: {destination}."
-        raise TransientShardContractError(message)
-    try:
-        receipt = _load_transient_shard_receipt_directory(
-            destination,
-            manifest=manifest,
-            index=index,
-            manifest_sha256=manifest_sha256,
-            canonical_payload_size_bytes=canonical_payload_size_bytes,
-            canonical_payload_stat_identity=canonical_payload_stat_identity,
-            publication_identity=None,
-            validation_depth=validation_depth,
-        )
-    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
-        if _raw_shard_destination_conflicts(
-            destination,
-            dataset_id=dataset_id,
-            publication_identity=publication_identity,
-            target_shard_bytes=target_shard_bytes,
-        ):
-            message = f"Invalid transient PT shard evidence claims a different immutable owner for {dataset_id!r}."
-            raise FileExistsError(message) from error
-        if not rebuild_invalid:
-            raise
-        _emit(
-            progress,
-            operation="shard_rebuild",
-            cases_packed=0,
-            cases_total=case_count,
-            shards_completed=0,
-            bytes_written=0,
-            eta="unavailable",
-        )
-        return None, True
-    if receipt["publication_identity"] != dict(publication_identity):
-        message = f"Existing transient PT shard publication identity conflicts for {dataset_id!r}."
-        raise FileExistsError(message)
-    if receipt["target_shard_bytes"] != target_shard_bytes:
-        message = f"Existing transient PT shard packing identity conflicts for {dataset_id!r}."
-        raise FileExistsError(message)
-    _emit(
-        progress,
-        operation="shard_reuse",
-        cases_packed=receipt["case_count"],
-        cases_total=receipt["case_count"],
-        shards_completed=receipt["shard_count"],
-        shards_total=receipt["shard_count"],
-        bytes_written=0,
-        eta="unavailable",
-    )
-    return receipt, False
-
-
-def _remove_stale_shard_attempts(state_root: Path, dataset_id: str) -> None:
-    """Remove only inactive shard staging and backup paths for one locked Dataset."""
-    if not state_root.exists():
-        return
-    prefix = f".{dataset_id}.transient-pt."
-    for path in state_root.iterdir():
-        staging = path.name.startswith(prefix) and path.name.endswith(".tmp")
-        backup = path.name.startswith(f"{prefix}invalid-") and path.name.endswith(".backup")
-        if not staging and not backup:
-            continue
-        if path.is_symlink() or not path.is_dir():
-            path.unlink()
-        else:
-            shutil.rmtree(path)
-
-
-def build_transient_shards(
-    dataset_id: str,
     *,
     storage_root: Path | str | None = None,
     target_shard_bytes: int = DEFAULT_TRANSIENT_PT_SHARD_BYTES,
-    existing_validation_depth: ValidationDepth = "evidence",
-    rebuild_invalid: bool = False,
-    progress: ProgressCallback | None = None,
-) -> dict[str, Any]:
-    """Build, validate, and atomically publish one derived PT payload."""
+) -> str:
+    """Pack and fully validate the PT shards of one staged transient Dataset folder before its manifest is written.
+
+    Parameters
+    ----------
+    directory : Path
+        Staged Dataset folder that already holds the transition index.
+    manifest : Mapping[str, Any]
+        The staged manifest without its derived payload digest; it states the Dataset identity and the index digest.
+    storage_root : Path | str | None, optional
+        Storage root of the canonical Source HDF5 files that the index locates.
+    target_shard_bytes : int, optional
+        Soft byte target for whole-case packing.
+
+    Returns
+    -------
+    str
+        SHA-256 of the validated shard receipt, which the manifest binds as its derived payload digest.
+
+    Notes
+    -----
+    The Dataset publisher holds the build lock and moves the folder, shards and manifest included, into place in one
+    atomic step, so shards are never visible without their Dataset and never replaced afterwards.
+
+    """
     if isinstance(target_shard_bytes, bool) or not isinstance(target_shard_bytes, int) or target_shard_bytes < 1:
         message = "target_shard_bytes must be a positive integer."
         raise ValueError(message)
-    if existing_validation_depth not in {"evidence", "full"}:
-        message = f"Unsupported transient shard validation depth: {existing_validation_depth!r}."
-        raise ValueError(message)
-    if not isinstance(rebuild_invalid, bool):
-        message = "rebuild_invalid must be boolean."
-        raise TypeError(message)
     storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-    destination = transient_shard_directory(dataset_id, storage_root=storage)
-    context_depth: ValidationDepth = existing_validation_depth if destination.exists() else "full"
-    storage, manifest, index, manifest_sha256 = _package_context(
-        dataset_id,
-        storage_root=storage,
-        validation_depth=context_depth,
+    index_path = directory / common.paths.get_dataset_payload_filename(_TASK)
+    index = trajectory.load_transient_index(index_path)
+    package_manifest.validate_transient_payload_identity(manifest, index)
+    publication_identity = _publication_identity_from_dataset(manifest, index)
+    canonical_size, canonical_stat = _file_stat_identity(index_path)
+    grouped_samples = _case_samples(index)
+    source_paths = [_resolve_source(storage, case) for case in index["cases"]]
+    case_sizes = [
+        _planned_case_tensor_bytes(path, case, samples) for path, case, samples in zip(source_paths, index["cases"], grouped_samples, strict=True)
+    ]
+    shard_directory = directory / TRANSIENT_PT_SHARD_DIRECTORY
+    shard_directory.mkdir()
+    derived_id, shards, locator, total_size = _save_shards(
+        directory=shard_directory,
+        manifest=manifest,
+        index=index,
+        publication_identity=publication_identity,
+        target_shard_bytes=target_shard_bytes,
+        case_groups=_plan_case_groups(case_sizes, target_shard_bytes=target_shard_bytes),
+        case_sizes=case_sizes,
+        source_paths=source_paths,
+        grouped_samples=grouped_samples,
     )
-    stable_publication = _publication_identity_from_dataset(manifest, index, manifest_sha256)
-    canonical_size, canonical_stat = _canonical_payload_stat_identity(
-        storage,
-        manifest,
-    )
-    lock_path = common.paths.resolve_dataset_build_lock_path(
-        _TASK,
-        dataset_id,
-        storage_root=storage,
-    )
-    with common.locking.exclusive_file_lock(lock_path, blocking=False):
-        state_root = common.paths.get_dataset_state_root(storage_root=storage)
-        existing, replace_invalid = _admit_existing_shard_destination(
-            dataset_id,
-            destination=destination,
-            manifest=manifest,
-            index=index,
-            manifest_sha256=manifest_sha256,
-            canonical_payload_size_bytes=canonical_size,
-            canonical_payload_stat_identity=canonical_stat,
-            publication_identity=stable_publication,
-            target_shard_bytes=target_shard_bytes,
-            validation_depth=context_depth,
-            rebuild_invalid=rebuild_invalid,
-            case_count=len(index["cases"]),
-            progress=progress,
-        )
-        if existing is not None:
-            _remove_stale_shard_attempts(state_root, dataset_id)
-            return {
-                "status": "reused",
-                "receipt_path": destination / TRANSIENT_PT_RECEIPT_FILENAME,
-                "receipt": existing,
-            }
-        if context_depth != "full":
-            storage, manifest, index, manifest_sha256 = _package_context(
-                dataset_id,
-                storage_root=storage,
-                validation_depth="full",
-            )
-            canonical_size, canonical_stat = _canonical_payload_stat_identity(
-                storage,
-                manifest,
-            )
-        state_root.mkdir(parents=True, exist_ok=True)
-        staging = Path(
-            tempfile.mkdtemp(
-                prefix=f".{dataset_id}.transient-pt.",
-                suffix=".tmp",
-                dir=state_root,
-            )
-        )
-        try:
-            grouped_samples = _case_samples(index)
-            source_paths: list[Path] = []
-            case_sizes: list[int] = []
-            source_bytes_validated = 0
-            for case_index, (case, samples) in enumerate(
-                zip(index["cases"], grouped_samples, strict=True),
-            ):
-                source_path = _resolve_source(storage, case)
-                source_paths.append(source_path)
-                case_sizes.append(
-                    _planned_case_tensor_bytes(
-                        source_path,
-                        case,
-                        samples,
-                    )
-                )
-                source_bytes_validated += source_path.stat().st_size
-                _emit(
-                    progress,
-                    operation="shard_source_validation",
-                    cases_completed=case_index + 1,
-                    cases_total=len(index["cases"]),
-                    source_bytes_validated=source_bytes_validated,
-                    eta="unavailable",
-                )
-            case_groups = _plan_case_groups(
-                case_sizes,
-                target_shard_bytes=target_shard_bytes,
-            )
-            derived_id, shards, locator, total_size = _save_shards(
-                directory=staging,
-                manifest=manifest,
-                index=index,
-                publication_identity=stable_publication,
-                target_shard_bytes=target_shard_bytes,
-                case_groups=case_groups,
-                case_sizes=case_sizes,
-                source_paths=source_paths,
-                grouped_samples=grouped_samples,
-                callback=progress,
-            )
-            receipt = {
-                "schema_kind": TRANSIENT_PT_RECEIPT_SCHEMA_KIND,
-                "schema_version": TRANSIENT_PT_RECEIPT_SCHEMA_VERSION,
-                "status": "complete",
-                "created_at": _utc_now(),
-                "dataset_id": manifest["dataset_id"],
-                "dataset_digest": manifest["dataset_digest"],
-                "index_digest": index["index_digest"],
-                "transient_contract_digest": index["contract_digest"],
-                "package_manifest_sha256": manifest_sha256,
-                "canonical_payload_sha256": manifest["payload_sha256"],
-                "canonical_payload_size_bytes": canonical_size,
-                "canonical_payload_stat_identity": canonical_stat,
-                "publication_identity": stable_publication,
-                "target_shard_bytes": target_shard_bytes,
-                "derived_payload_id": derived_id,
-                "shard_count": len(shards),
-                "case_count": len(index["cases"]),
-                "transition_count": len(index["samples"]),
-                "total_size_bytes": total_size,
-                "case_locator": locator,
-                "shards": shards,
-                "shard_inventory_digest": common.serialization.canonical_json_sha256(shards),
-            }
-            common.serialization.atomic_write_json(
-                staging / TRANSIENT_PT_RECEIPT_FILENAME,
-                receipt,
-            )
-            _validate_receipt_directory(
-                staging,
-                receipt,
-                manifest=manifest,
-                index=index,
-                manifest_sha256=manifest_sha256,
-                canonical_payload_size_bytes=canonical_size,
-                canonical_payload_stat_identity=canonical_stat,
-                canonical_payload_path=_canonical_payload_path(storage, manifest),
-                publication_identity=stable_publication,
-                validation_depth="full",
-                content_hash_verified=True,
-            )
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if replace_invalid:
-                backup = state_root / (f".{dataset_id}.transient-pt.invalid-{uuid.uuid4().hex}.backup")
-                destination.replace(backup)
-                try:
-                    staging.replace(destination)
-                except BaseException:
-                    if not destination.exists() and backup.exists():
-                        backup.replace(destination)
-                    raise
-                else:
-                    shutil.rmtree(backup)
-            else:
-                staging.replace(destination)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
-        validated = _load_transient_shard_receipt_directory(
-            destination,
-            manifest=manifest,
-            index=index,
-            manifest_sha256=manifest_sha256,
-            canonical_payload_size_bytes=canonical_size,
-            canonical_payload_stat_identity=canonical_stat,
-            publication_identity=stable_publication,
-            validation_depth="evidence",
-        )
-        _remove_stale_shard_attempts(state_root, dataset_id)
-    return {
-        "status": "rebuilt" if replace_invalid else "complete",
-        "receipt_path": destination / TRANSIENT_PT_RECEIPT_FILENAME,
-        "receipt": validated,
+    receipt = {
+        "schema_kind": TRANSIENT_PT_RECEIPT_SCHEMA_KIND,
+        "schema_version": TRANSIENT_PT_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        "created_at": _utc_now(),
+        "dataset_id": manifest["dataset_id"],
+        "dataset_digest": manifest["dataset_digest"],
+        "index_digest": index["index_digest"],
+        "transient_contract_digest": index["contract_digest"],
+        "canonical_payload_sha256": manifest["payload_sha256"],
+        "canonical_payload_size_bytes": canonical_size,
+        "canonical_payload_stat_identity": canonical_stat,
+        "publication_identity": publication_identity,
+        "target_shard_bytes": target_shard_bytes,
+        "derived_payload_id": derived_id,
+        "shard_count": len(shards),
+        "case_count": len(index["cases"]),
+        "transition_count": len(index["samples"]),
+        "total_size_bytes": total_size,
+        "case_locator": locator,
+        "shards": shards,
+        "shard_inventory_digest": common.serialization.canonical_json_sha256(shards),
     }
+    receipt_path = shard_directory / TRANSIENT_PT_RECEIPT_FILENAME
+    common.serialization.atomic_write_json(receipt_path, receipt)
+    _validate_receipt_directory(
+        shard_directory,
+        receipt,
+        manifest=manifest,
+        index=index,
+        canonical_payload_size_bytes=canonical_size,
+        canonical_payload_stat_identity=canonical_stat,
+        canonical_payload_path=index_path,
+        publication_identity=publication_identity,
+        validation_depth="full",
+        content_hash_verified=True,
+    )
+    return common.serialization.file_sha256(receipt_path)

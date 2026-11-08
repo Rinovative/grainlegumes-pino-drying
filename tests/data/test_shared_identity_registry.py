@@ -164,7 +164,7 @@ def test_targets_outside_the_root_and_unknown_kinds_are_refused(tmp_path: Path) 
         lambda entry: entry.update(target="../escape"),
         lambda entry: entry.update(target="/absolute"),
         lambda entry: entry.update(kind="dataset"),
-        lambda entry: entry.update(schema_version=1),
+        lambda entry: entry.update(schema_version=2),
         lambda entry: entry.update(extra="field"),
     ],
     ids=["digest", "parent-target", "absolute-target", "kind", "schema", "extra-key"],

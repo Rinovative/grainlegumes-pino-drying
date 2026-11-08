@@ -8,13 +8,13 @@ Provides:
 - reproduction: producing source capture and researcher-facing reconstruction evidence
 - planning: deterministic exact source-case admission
 - trajectory: transient source admission and compact trajectory indexes
-- transient_shards: Dataset-bound derived PT shard publication and admission
+- transient_shards: Dataset-bound derived PT shards, written inside the Dataset publication, and their admission
 - DATASET_PACKAGE_SCHEMA_KIND: canonical package-manifest schema kind
 - DATASET_PACKAGE_SCHEMA_VERSION: canonical package-manifest schema version
 - DEFAULT_TRANSIENT_PT_SHARD_BYTES: default soft PT-shard packing target
 - build_dataset_selection: publish one independent immutable ordered Dataset
 - discover_source_collections: inspect successful and failed source outcomes
-- select_exact_cases and select_ranked_cases: author exact case references
+- select_exact_cases and select_ordered_cases: author exact case references
 - load_package_manifest: load one canonical package manifest
 - load_package_manifest_evidence: admit manifest metadata without payload rehashing
 - declared_evaluation_assignments: project declared Dataset OOD membership
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
         load_package_manifest,
         load_package_manifest_evidence,
     )
-    from .dataset_packages_selection import discover_source_collections, select_exact_cases, select_ranked_cases
+    from .dataset_packages_selection import discover_source_collections, select_exact_cases, select_ordered_cases
 
 _MODULES = {
     "builder": "dataset_packages_builder",
@@ -64,7 +64,7 @@ _EXPORTS = {
     "load_package_manifest_evidence": "dataset_packages_manifest",
     "discover_source_collections": "dataset_packages_selection",
     "select_exact_cases": "dataset_packages_selection",
-    "select_ranked_cases": "dataset_packages_selection",
+    "select_ordered_cases": "dataset_packages_selection",
 }
 __all__ = [
     "DATASET_PACKAGE_SCHEMA_KIND",
@@ -82,7 +82,7 @@ __all__ = [
     "planning",
     "reproduction",
     "select_exact_cases",
-    "select_ranked_cases",
+    "select_ordered_cases",
     "trajectory",
     "transient_shards",
 ]

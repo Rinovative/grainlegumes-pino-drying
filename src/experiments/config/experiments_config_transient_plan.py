@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 MatchedStageName = Literal["a0", "b", "a1"]
 _TEMPORAL_KEYS = frozenset({"temporal_conditioning"})
-_MATCHED_PLAN_KEYS = frozenset({"mode", "mixed_precision", "continuation_evaluations", "a0", "b", "a1"})
+_MATCHED_PLAN_KEYS = frozenset({"mode", "continuation_evaluations", "a0", "b", "a1"})
 _MATCHED_A0_KEYS = frozenset(
     {
         "max_epochs",
@@ -201,7 +201,6 @@ def resolve_matched_a1_b_plan(
             "stage_schedule": copy.deepcopy(schedule),
             "evaluation_interval": stage["evaluation_interval"],
             "additional_evaluation_interval": stage["additional_evaluation_interval"],
-            "mixed_precision": training["mixed_precision"],
             "stage": "b" if name == "b" else "a",
             "comparison_arm": name,
             "gradient_accumulation_steps": stage["gradient_accumulation_steps"],

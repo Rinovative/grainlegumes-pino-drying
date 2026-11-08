@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check table schema, metadata identity, contained rebuilds, and run discovery admission
+  - Check that a recorded analysis producer is identity evidence, validated strictly and never compared with the running code
 
 Design principles:
   - Scientific cache identity excludes runtime location; unsafe paths fail before mutation
@@ -15,15 +16,19 @@ from __future__ import annotations
 import copy
 import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from src import analysis, common, experiments
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_TREE_ID = "a" * 12 + "-" + "b" * 12
 
 
 def _current_generic_frame(*, metadata: object, index: int = 0, source_index: int = 2) -> pd.DataFrame:
@@ -43,6 +48,7 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
                 "case_index": source_index + 1,
                 "source_index": source_index,
                 "split_local_index": 0,
+                "source_dataset_id": "dataset",
                 "npz_path": "case_0003.npz",
                 "meta": metadata,
                 "inference_time_ms": None,
@@ -54,6 +60,7 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
                 "normalized_sse_target": 0.0,
                 "normalized_count_target": 1,
                 "normalized_rmse_target": 0.0,
+                "prediction_validity": json.dumps(validity_contract.build_field_prediction_validity(np.zeros((1, 1, 1)), channels=("target",))),
             }
         ],
         index=[index],
@@ -87,8 +94,8 @@ def test_dataframe_reader_rejects_every_unexpected_column() -> None:
 
 @pytest.mark.parametrize(
     "schema_version",
-    [2.0, 1],
-    ids=("floating-current", "previous-version"),
+    [float(analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION), analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION + 1],
+    ids=("floating-current", "other-version"),
 )
 def test_dataframe_reader_requires_the_current_integer_artifact_version(schema_version: float) -> None:
     """Reject alternate representations and unsupported Parquet schema versions."""
@@ -183,16 +190,12 @@ def test_artifact_metadata_requires_a_json_object(
         analysis.evaluation.dataframe.build_eval_df(_current_generic_frame(metadata=metadata))
 
 
-def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
-    """
-    Separate scientific cache identity from operational runtime facts.
-
-    Representative task, training, data, checkpoint, evaluation, and physics
-    changes alter identity. Runtime device and locator facts do not.
-    """
-    provenance = {
+def _identity_provenance() -> dict[str, Any]:
+    """Return one complete steady provenance document carrying every identity section."""
+    return {
         "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
         "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
+        "producer": {"analysis_sha256": "e" * 64},
         "run": {
             "name": "run-a",
             "task": "synthetic",
@@ -210,10 +213,12 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
         "split_role": "eval",
         "dataset": {
             "name": "dataset-a",
-            "full_case_count": 2,
-            "fingerprint": "dataset-a",
-            "data_contract_digest": "data-a",
-            "saved_membership_digest": "membership-a",
+            "role": "id",
+            "source_dataset_ids": ["dataset-a"],
+            "source_identities": [{"dataset_id": "dataset-a", "dataset_digest": "data-a"}],
+            "case_ids_by_source": [["case-a", "case-b"]],
+            "membership_digests": ["membership-a"],
+            "evaluation_assignments": [],
         },
         "selection": {
             "full_selected_case_count": 2,
@@ -256,7 +261,7 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
             "continuity_kind": "cross_section_flux_balance",
             "boundary_condition_kind": "pressure_drop",
             "scales": {"pressure": {"formula": "mean_inlet(p_in_bc)", "unit": "Pa"}},
-            "derivatives": {"kind": "physical", "extension": "none"},
+            "derivatives": {"kind": "physical"},
             "interior_crop": 2,
             "residual_evaluation_region": {"kind": "interior"},
             "constants": {"dynamic_viscosity_pa_s": 1.8139e-5},
@@ -269,14 +274,26 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
             "inference_batch_size": 1,
             "compression": "numpy savez_compressed",
         },
-        "runtime": {"requested_policy": "cpu", "resolved_device": "cpu", "batch_size": 1},
+        "runtime": {"requested_policy": "cpu", "resolved_device": "cpu", "inference_batch_size": 1, "source_tree_id": None},
+        "timing": {"report": {"measured": False}, "operational_performance": {"total_seconds": 1.0}},
     }
+
+
+def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
+    """
+    Separate scientific cache identity from operational runtime facts.
+
+    Representative producer, task, training, data, checkpoint, evaluation, and physics
+    changes alter identity. Runtime device and locator facts do not.
+    """
+    provenance = _identity_provenance()
     baseline = analysis.artifacts.contracts.artifact_identity_digest(provenance)
     mutations = [
         (("artifact_schema_version",), 999),
+        (("producer", "analysis_sha256"), "f" * 64),
         (("run", "effective_config_digest"), "config-b"),
         (("run", "best_checkpoint_sha256"), "checkpoint-b"),
-        (("dataset", "fingerprint"), "dataset-b"),
+        (("dataset", "source_identities", 0, "dataset_digest"), "data-b"),
         (("selection", "effective_ordered_source_indices_sha256"), "membership-b"),
         (("evaluator", "objective", "reduction"), "wrong-reduction"),
         (("physics", "continuity_kind"), "pointwise_divergence"),
@@ -297,11 +314,48 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
     operational["runtime"] = {
         "requested_policy": "auto",
         "resolved_device": "cuda:7",
-        "batch_size": 19,
+        "inference_batch_size": 19,
+        "source_tree_id": _TREE_ID,
     }
+    operational["timing"] = {"report": {"measured": True}, "operational_performance": {"total_seconds": 3.0}}
     operational["run"]["name"] = "renamed-run"
     operational["dataset"]["source_path"] = "/relocated/dataset.pt"
     assert analysis.artifacts.contracts.artifact_identity_digest(operational) == baseline
+
+
+def test_recorded_analysis_producer_is_admitted_as_evidence_and_never_compared_with_the_running_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A read after an analysis-code change keeps the identity; a missing, malformed or extended producer section is refused."""
+    contracts = analysis.artifacts.contracts
+    provenance = _identity_provenance()
+    baseline = contracts.artifact_identity_digest(provenance)
+    for task_id in contracts.ANALYSIS_PROJECTIONS:
+        changed = SimpleNamespace(name=f"analysis_{task_id}", sha256=lambda: "0" * 64)
+        monkeypatch.setitem(contracts.ANALYSIS_PROJECTIONS, task_id, changed)
+    assert contracts.artifact_identity_digest(provenance) == baseline
+    for producer in (None, {}, {"analysis_sha256": "E" * 64}, {"analysis_sha256": "e" * 63}, {"analysis_sha256": "e" * 64, "extra": 1}):
+        malformed = {**copy.deepcopy(provenance), "producer": producer}
+        with pytest.raises(ValueError, match="producer must be exactly"):
+            contracts.artifact_identity_digest(malformed)
+    with pytest.raises(ValueError, match=r"missing semantic sections \['producer'\]"):
+        contracts.artifact_identity_digest({key: value for key, value in provenance.items() if key != "producer"})
+
+
+@pytest.mark.parametrize("tree_id", [None, _TREE_ID])
+def test_runtime_provenance_records_the_executing_source_tree(tree_id: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both tasks persist the executing frozen tree as a required runtime fact; the validator admits exactly null or a tree name."""
+    contracts = analysis.artifacts.contracts
+    monkeypatch.setattr(common.paths, "source_tree_id", lambda *_args, **_kwargs: tree_id)
+    device = {"requested_policy": "cpu", "resolved_device": "cpu", "device_type": "cpu", "pytorch_version": "test"}
+    runtime = contracts.runtime_provenance(device, inference_batch_size=2)
+
+    assert runtime["source_tree_id"] == tree_id
+    assert contracts.validate_runtime_provenance(runtime) == 2
+    without = {key: value for key, value in runtime.items() if key != "source_tree_id"}
+    with pytest.raises(ValueError, match=r"missing=\['source_tree_id'\]"):
+        contracts.validate_runtime_provenance(without)
+    for malformed in ("", _TREE_ID.upper(), _TREE_ID[:-1], 7):
+        with pytest.raises(ValueError, match="source_tree_id must be null or"):
+            contracts.validate_runtime_provenance({**runtime, "source_tree_id": malformed})
 
 
 def test_artifact_target_rejects_broad_and_out_of_run_paths(tmp_path: Path) -> None:
@@ -316,88 +370,39 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Admit only an explicit, complete, current artifact for upload.
+    """The upload gate returns what the shared role validator admits and refuses what it refuses."""
+    from src.analysis.evaluation import evaluation_artifact_loader as loader  # noqa: PLC0415
 
-    The valid fixture must pass without changing its bytes. After the manifest
-    is made stale, validation must fail before any tracking-side effect.
-    """
     run_dir = tmp_path / "run"
     artifact_root = common.paths.resolve_id_analysis_dir(run_dir)
     artifact_root.mkdir(parents=True)
-    marker = artifact_root / "aggregate.parquet"
-    marker.write_bytes(b"complete-local-artifact")
-    provenance_path = analysis.artifacts.contracts.artifact_provenance_path(artifact_root)
-    provenance_path.write_text("{}\n", encoding="utf-8")
-    outputs = {"aggregate.parquet": {"sha256": "a" * 64, "size_bytes": 23}}
-    provenance = {
-        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
-        "outputs": outputs,
-        "run": {
-            "name": "run-name",
-            "task": "steady_flow",
-            "task_contract_digest": "t" * 64,
-            "effective_config_digest": "c" * 64,
-            "best_checkpoint_sha256": "b" * 64,
-            "normalizer_sha256": "n" * 64,
-        },
-    }
-    completed = {
-        "summary": {
-            "effective_config_digest": "c" * 64,
-            "best_checkpoint_sha256": "b" * 64,
-            "normalizer_sha256": "n" * 64,
-        },
-        "config": {"run": {"name": "run-name"}},
-    }
+    service = analysis.artifacts.service
+    monkeypatch.setattr(service.experiments.run, "validate_completed_run", lambda _run_dir: {"config": {}})
+    monkeypatch.setattr(service.experiments.config.loader, "validate_resolved_task_contract", lambda _config: SimpleNamespace(id="steady_flow"))
     monkeypatch.setattr(
-        analysis.artifacts.service,
-        "_read_artifact_provenance",
-        lambda _path: provenance,
+        analysis.artifacts.plan,
+        "artifact_plan_from_completed",
+        lambda *_args, **_kwargs: SimpleNamespace(id_role=SimpleNamespace(split="eval", dataset_name="dataset"), additional_role=None),
     )
-    monkeypatch.setattr(
-        analysis.artifacts.service,
-        "_require_current_provenance_schema",
-        lambda _provenance: None,
-    )
-    monkeypatch.setattr(
-        analysis.artifacts.service.contracts,
-        "artifact_output_manifest",
-        lambda _root: outputs,
-    )
-    monkeypatch.setattr(
-        analysis.artifacts.service.experiments.run,
-        "validate_completed_run",
-        lambda _run_dir: completed,
-    )
-    monkeypatch.setattr(
-        analysis.artifacts.service.experiments.config.loader,
-        "validate_resolved_task_contract",
-        lambda _config: SimpleNamespace(
-            id="steady_flow",
-            contract_digest="t" * 64,
-        ),
-    )
+    frame = pd.DataFrame()
+    frame.attrs["artifact_provenance"] = {"artifact_kind": "steady_field"}
+    calls: list[dict[str, Any]] = []
 
-    validated = analysis.artifacts.service.validate_artifact_upload_source(
-        run_dir=run_dir,
-        artifact_root=artifact_root,
-    )
+    def admit(_run_dir: Path, _completed: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(frame=frame)
 
-    assert validated == provenance
-    assert marker.read_bytes() == b"complete-local-artifact"
-    monkeypatch.setattr(
-        analysis.artifacts.service.contracts,
-        "artifact_output_manifest",
-        lambda _root: {"aggregate.parquet": {"sha256": "stale"}},
-    )
-    with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match="manifest mismatch"):
-        analysis.artifacts.service.validate_artifact_upload_source(
-            run_dir=run_dir,
-            artifact_root=artifact_root,
-        )
-    assert marker.read_bytes() == b"complete-local-artifact"
+    monkeypatch.setattr(loader, "admit_role_artifact", admit)
+    assert service.validate_artifact_upload_source(run_dir=run_dir, artifact_root=artifact_root) == {"artifact_kind": "steady_field"}
+    assert calls == [{"selection_role": "id", "root": artifact_root.resolve(), "evaluation_spatial_stride": 1}]
+
+    def refuse(*_args: Any, **_kwargs: Any) -> Any:
+        msg = "Artifact output manifest does not match the current payload files."
+        raise ValueError(msg)
+
+    monkeypatch.setattr(loader, "admit_role_artifact", refuse)
+    with pytest.raises(service.ArtifactCacheError, match="output manifest"):
+        service.validate_artifact_upload_source(run_dir=run_dir, artifact_root=artifact_root)
 
 
 def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
@@ -503,28 +508,30 @@ def test_discovery_skips_unselected_non_completed_runs_and_refuses_a_selected_on
         list(service.iter_run_dirs(tmp_path, run_names=["unfinished"]))
 
 
+_TRIAL_LAYOUT = {
+    "task": "transient_drying",
+    "dataset": "dataset-id",
+    "family": "optuna",
+    "config_name": "fno_study",
+    "model_label": "fno_m2x2_h4_l1",
+    "seed": 17,
+    "revision": None,
+    "budget_epochs": 3,
+    "stage": "single",
+    "pair": None,
+    "trial": "0001__fno_m2x2_h4_l1__lr-0p001",
+    "a0_id": "a" * 16,
+    "branch_id": None,
+}
+
+
 def test_discovery_skips_valid_optuna_trials_but_rejects_malformed_layouts_and_normal_runs_without_checkpoints(tmp_path: Path) -> None:
     """Skip a finished trial (config and summary only) by its valid recorded layout; keep failing closed otherwise."""
-    trial_layout = {
-        "task": "transient_drying",
-        "dataset": "dataset-id",
-        "family": "optuna",
-        "config_name": "fno_study",
-        "model_label": "fno_m2x2_h4_l1",
-        "seed": 17,
-        "revision": None,
-        "budget_epochs": 3,
-        "stage": "single",
-        "pair": None,
-        "trial": "0001__fno_m2x2_h4_l1__lr-0p001",
-        "a0_id": "a" * 16,
-        "branch_id": None,
-    }
 
     def leaf(root: Path, **changes: object) -> Path:
         directory = root / "run"
         directory.mkdir(parents=True)
-        (directory / "config.yaml").write_text(json.dumps({"run": {"layout": {**trial_layout, **changes}}}), encoding="utf-8")
+        (directory / "config.yaml").write_text(json.dumps({"run": {"layout": {**_TRIAL_LAYOUT, **changes}}}), encoding="utf-8")
         (directory / "summary.json").write_text(json.dumps({"schema_version": 1, "status": "completed"}), encoding="utf-8")
         return root
 
@@ -534,3 +541,20 @@ def test_discovery_skips_valid_optuna_trials_but_rejects_malformed_layouts_and_n
     normal = leaf(tmp_path / "normal", family="base", budget_epochs=None, trial=None)
     with pytest.raises(experiments.run.RunLifecycleError, match=r"evaluation evidence|best checkpoint"):
         list(analysis.artifacts.service.iter_run_dirs(normal))
+
+
+def test_artifacts_refuse_an_explicitly_selected_optuna_trial_before_reading_any_checkpoint(tmp_path: Path) -> None:
+    """A trial leaf chosen as the target gets one clear refusal naming the supported targets, on the discovery and the scoped path."""
+    trial = tmp_path / "trial"
+    trial.mkdir()
+    (trial / "config.yaml").write_text(json.dumps({"run": {"layout": _TRIAL_LAYOUT}}), encoding="utf-8")
+    (trial / "summary.json").write_text(json.dumps({"schema_version": 1, "status": "completed"}), encoding="utf-8")
+    refusal = r"Optuna trial.*no artifacts.*parent study.*training run"
+
+    with pytest.raises(ValueError, match=refusal):
+        list(analysis.artifacts.service.iter_run_dirs(trial))
+    with pytest.raises(ValueError, match=refusal):
+        analysis.artifacts.service.build_scoped_transient_artifact(
+            run_dir=trial, dataset_root=tmp_path, output_root=tmp_path / "scoped", split="id", one_case=True
+        )
+    assert list(analysis.artifacts.service.iter_run_dirs(tmp_path)) == []

@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from support import configs
+from support.synthetic_task import synthetic_split_payload
 
 from src import common, datasets, experiments
 
@@ -155,11 +156,14 @@ def test_matched_plan_preview_requires_no_additional_evaluation_dataset(
     assert not context.run_dir.exists()
 
 
+@pytest.mark.parametrize("split_state", ["absent", "ood", "corrupt"])
 def test_saved_transient_run_inspection_uses_its_own_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    split_state: str,
 ) -> None:
-    """Inspect a persisted transient leaf with no invented OOD or model loading."""
+    """Inspect a persisted transient leaf; the additional row follows the saved split and an inadmissible split is reported, not raised."""
+    saved_ood = split_state == "ood"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "storage"))
     raw = configs.transient_matched_config()
     raw["data"]["additional_evaluation_datasets"] = []
@@ -175,13 +179,22 @@ def test_saved_transient_run_inspection_uses_its_own_config(
         "completed_epoch": 1,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary))
+    if saved_ood:
+        split = synthetic_split_payload("transient_drying", additional=(("synthetic_ood", ("chickpea__case_0001__00000000000a",)),))
+        common.serialization.atomic_torch_save(split, common.paths.resolve_split_indices_path(run_dir))
+    if split_state == "corrupt":
+        common.paths.resolve_split_indices_path(run_dir).write_bytes(b"not a torch archive")
     inspection = support.prepare_run_inspection(run_dir)
     assert dict(inspection.summary_rows)["Status"] == "failed"
     assert dict(inspection.summary_rows)["Objective"] == "normalized_drying_group_macro_rmse"
+    saved_split = str(dict(inspection.summary_rows)["Saved split"])
+    expected_state = {"absent": "not saved", "ood": "admitted"}.get(split_state)
+    assert saved_split.startswith("unavailable: ValueError") if expected_state is None else saved_split == expected_state
     paths = dict(inspection.existence_rows)
     assert "history.json" in paths
     assert paths["history.json"] is False
-    assert not any("ood" in label or "additional_evaluation" in label for label in paths)
+    additional_labels = [label for label in paths if "additional_evaluation" in label]
+    assert additional_labels == (["analysis/additional_evaluation/synthetic_ood/"] if saved_ood else [])
     summary["run_name"] = "mismatched"
     (run_dir / "summary.json").write_text(json.dumps(summary))
     with pytest.raises(ValueError, match="identity disagree"):
@@ -244,6 +257,7 @@ def test_metadata_preview_admits_manifest_without_reading_tensor_payload(
         "source_case_count": 2,
         "transition_count": 0,
         "payload_sha256": "a" * 64,
+        "derived_payload_sha256": None,
     }
     manifest_path = payload.parent / "dataset_manifest.json"
     manifest_path.write_text(json.dumps(manifest))

@@ -1,6 +1,6 @@
 # Documentation
 
-The guides follow the order in which the project is used: set up, understand the physical model, build a Dataset, train, evaluate. Guides 06 and 07 are references for Generation details, reproduction and checks. Each guide puts the normal path first and details in collapsible sections.
+The guides follow the order in which the project is used: set up, understand the physical model, build a Dataset, train, evaluate. Guides 06 and 07 are references for Generation details, reproduction and checks. For an overview of what the project decided and why, start with the [register of scientific decisions](08_scientific_decisions.md) (08): it collects every scientific choice on one page and links to the guide and config that own it. Each guide puts the normal path first and details in collapsible sections.
 
 | Step | Guide | Use it for |
 | --- | --- | --- |
@@ -11,7 +11,8 @@ The guides follow the order in which the project is used: set up, understand the
 | 5 | [Evaluation](05_evaluation.md) | Artifacts, EDA and evaluation notebooks, metrics, comparisons, timing, inference |
 | 6 | [Generation reference](06_generation_reference.md) | Source-only campaigns, input preparation, failures and continuation, storage layout |
 | 7 | [Reproducibility and validation](07_reproducibility_and_validation.md) | Identities, Dataset rebuild, choice of checks |
+| 8 | [Scientific decisions](08_scientific_decisions.md) | Every scientific and methodological choice with its reason, its owning guide and config, and the open choices |
 
 Maintained YAML under `configs/` owns the scientific values; [the config map](../configs/README.md) says which file you edit for what, and the guides explain their meaning. Computation runs in Slurm allocations.
 
-The [VP1 report](Albertin_2026_PINO_Airflow_PorousMedia.pdf) and the figures describe the steady airflow foundation; the [project overview](../README.md) summarizes the project.
+The [VP1 report](Albertin_2026_PINO_Airflow_PorousMedia.pdf) and the figures describe the steady airflow foundation; its [corrigendum](Albertin_2026_PINO_Airflow_PorousMedia_corrigendum.md) lists what is wrong in it and what VP2 does instead. The [project overview](../README.md) summarizes the project.

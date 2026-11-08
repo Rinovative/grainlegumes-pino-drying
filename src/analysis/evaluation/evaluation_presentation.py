@@ -120,9 +120,9 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_bed.perturbations.granularity", "Perturbation granularity", "Structures and texture", 120),
     ParameterPresentation("parameters_bed.perturbations.sign_bias", "Perturbation sign bias", "Structures and texture", 130),
     # Permeability mapping/tensor construction precedes porosity construction.
-    ParameterPresentation("parameters_kappa_mean", "Mean permeability", "Material and properties", 210, "m²"),
+    ParameterPresentation("parameters_kappa_mean", "Permeability scale", "Material and properties", 210, "m²"),
     ParameterPresentation("parameters_kappa_cv", "Relative permeability variation", "Material and properties", 220),
-    ParameterPresentation("parameters_permeability.anisotropy.max_ratio", "Maximum anisotropy ratio", "Material and properties", 230),
+    ParameterPresentation("parameters_permeability.anisotropy.max_ratio", "Anisotropy ratio cap", "Material and properties", 230),
     ParameterPresentation("parameters_permeability.anisotropy.exponent", "Anisotropy exponent", "Material and properties", 240),
     ParameterPresentation("parameters_permeability.anisotropy.strength", "Tensor strength", "Material and properties", 250),
     ParameterPresentation("parameters_permeability.orientation.smooth_len_rel", "Orientation smoothing length", "Material and properties", 260),
@@ -138,7 +138,7 @@ _PARAMETER_PRESENTATION = (
     ParameterPresentation("parameters_pressure_bc.gauss_width", "Inlet Gaussian width", "Boundary conditions", 460),
     ParameterPresentation("parameters_pressure_bc.gauss_jitter", "Inlet Gaussian jitter", "Boundary conditions", 470),
     ParameterPresentation("parameters_pressure_bc.linear_amp", "Inlet linear-gradient amplitude", "Boundary conditions", 480),
-    ParameterPresentation("parameters_pressure_bc.mean", "Mean inlet pressure", "Boundary conditions", 490, "Pa"),
+    ParameterPresentation("parameters_pressure_bc.mean", "Base inlet pressure", "Boundary conditions", 490, "Pa"),
 )
 _PARAMETER_BY_COLUMN = {spec.column: spec for spec in _PARAMETER_PRESENTATION}
 _STRUCTURAL_METADATA_LEAVES = frozenset({"dx", "dy", "lx", "ly", "nx", "ny", "res"})

@@ -208,6 +208,9 @@ def test_adapter_accumulation_weights_transitions_and_keeps_components() -> None
     assert values["train/loss_custom"] == 6.5
     assert values["transient/train/processed_target_transitions"] == 4.0
     assert values["transient/train/optimizer_groups"] == 1.0
+    # Training work counts the gradient-carrying target transitions, never the no-gradient warm-up forwards.
+    assert values["transient/train/forward_transitions"] == 14.0
+    assert (values["committed_optimizer_groups"], values["gradient_predictions"]) == (1.0, 4.0)
     assert adapter.work[0].processed_target_transitions == 4
     assert adapter.work[0].optimizer_device_seconds is None
 

@@ -21,6 +21,7 @@ import pytest
 import yaml
 
 from src import common
+from src.analysis.artifacts import analysis_artifact_plan as artifact_plan
 from src.analysis.artifacts import analysis_artifact_transient as artifact
 from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_run_identity as run_identity
@@ -91,7 +92,6 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
 
     configs = {arm: config(arm) for arm in runs}
     monkeypatch.setattr(run_identity.config_loader, "validate_resolved_config", lambda config: config)
-    monkeypatch.setattr(run_identity.config_loader, "validate_saved_artifact_config", lambda config: config)
     payload: dict[str, Any] = {
         "schema_kind": run_identity.EXPERIMENT_RECORD_SCHEMA_KIND,
         "schema_version": run_identity.EXPERIMENT_RECORD_SCHEMA_VERSION,
@@ -130,7 +130,6 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
             "budget_complete": True,
             "clock_kind": "train_seconds",
             "train_seconds": 12.5,
-            "successful_optimizer_steps": 4,
             "post_handoff_optimizer_steps": 4,
         },
         "terminal_epoch": 2,
@@ -231,7 +230,7 @@ def test_cached_a1_lineage_rechecks_live_immutable_receipt(tmp_path: Path, monke
     """Revalidate receipt-backed lineage before admitting a cached artifact."""
     completed, _receipt = _matched_context(tmp_path, monkeypatch)
     a1 = completed["a1"]
-    role = artifact.TransientArtifactRolePlan(
+    role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
         dataset_name="dataset",
@@ -244,13 +243,7 @@ def test_cached_a1_lineage_rechecks_live_immutable_receipt(tmp_path: Path, monke
         dataset_name="dataset",
         dataset_role="id",
         provenance={
-            "dataset": {
-                "source_dataset_ids": ["dataset"],
-                "source_identities": [{"dataset_id": "dataset"}],
-                "case_ids_by_source": [["case"]],
-                "membership_digests": ["a" * 64],
-                "evaluation_assignments": [],
-            },
+            "dataset": role.dataset_provenance(),
             "run": {
                 "name": "a1",
                 "effective_config_digest": "f" * 64,
@@ -304,7 +297,7 @@ def _portable_matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         common.serialization.atomic_write_json(
             run / "summary.json",
             {
-                "schema_version": artifact.experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+                "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
                 "status": "completed",
                 "config_sha256": common.serialization.file_sha256(run / "config.yaml"),
                 "checkpoint_identity": {"resume_contract_digest": artifact.learning.training.checkpoint.resume_contract_digest(config)},

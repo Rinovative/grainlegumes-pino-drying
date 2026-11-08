@@ -8,7 +8,7 @@ This guide describes what each Generation case simulates, where its values come 
 
 Each case is a two-dimensional porous bed of 1.2 m × 0.75 m without resolved grains. Fields are exported on a boundary-inclusive 401 × 251 (X × Y) grid. The transient horizon is 168 physical hours with hourly output; the solver uses adaptive internal steps.
 
-Grid and horizon are physical model inputs from `configs/01_generation/physical_model/common.yaml`. A Dataset plan or Source campaign can select a shorter physical horizon (`--duration-hours`); the choice becomes part of the case identity. Solver timeouts and Slurm walltimes are execution limits and leave the physical horizon unchanged.
+Grid and horizon are physical model inputs from `configs/01_generation/physical_model/common.yaml`. The transient COMSOL call receives grid, domain size and horizon as run parameters; the steady call passes none, so the steady template must produce the configured grid itself, and conversion admits only an export that covers the configured axes exactly. A Dataset plan or Source campaign can select a shorter physical horizon (`--duration-hours`); the choice becomes part of the case identity. Solver timeouts and Slurm walltimes are execution limits and leave the physical horizon unchanged.
 
 ## Model
 
@@ -17,9 +17,9 @@ The two profiles share one physical description and are solved in sequence.
 <details>
 <summary><strong>Airflow</strong></summary>
 
-The steady profile solves Darcy–Brinkman airflow with heterogeneous permeability `kappa(x)`, porosity `epsilon(x)` and inlet pressure `p_in_bc(y)`. The result `(p, u, v)` is the steady-flow learning target and the fixed airflow of the transient profile.
+The steady profile solves Darcy–Brinkman airflow with heterogeneous permeability `kappa(x)`, porosity `epsilon(x)` and an inlet pressure that varies along x on the inlet edge y = 0 (`p_in_bc`; outlet gauge zero at y = L_y). The result `(p, u, v)` is the steady-flow learning target and the fixed airflow of the transient profile.
 
-Mean permeability is coupled to packing porosity through a material-calibrated Kozeny–Carman reference trend:
+The sampled permeability scale `kappa_mean` is coupled to packing porosity through a material-calibrated Kozeny–Carman reference trend:
 
 ```text
 g(epsilon) = epsilon^3 / (1 - epsilon)^2
@@ -27,7 +27,7 @@ A_KC_reference = kappa_nominal / g(eps_bed_ref)
 eps_kc_trend = g^-1(kappa_mean / A_KC_reference)
 ```
 
-`kappa_mean` is the sampled coordinate and `eps_bed_ref` the material reference porosity. A small bounded case-level packing scatter represents unresolved morphology. The relation is a global material trend; `kappa(x)` and `epsilon(x)` are not tied pointwise.
+`kappa_mean` is the sampled coordinate and `eps_bed_ref` the material reference porosity. Each case shifts the trend by one packing scatter `sigma z` for unresolved morphology: `z` is standard normal truncated to (−3, 3) and `sigma` is one third of the distance from `eps_kc_trend` to the nearer bound of the active packing support, so the case level stays inside that support. A zero-mean texture with RMS amplitude `porosity.texture_amp`, built from the background of the bed structure field (optionally smoothed by `porosity.smooth_len_rel`), is added and clipped pointwise to `eps_min_global` and `eps_max_global` (0.2 and 0.8 in `common.yaml`); the scalar permeability uses that background plus local perturbations, the anisotropy magnitude the background alone. The case records the clipped fraction (`eps_bed_clipped_fraction`), and a realization is redrawn when its mean porosity leaves the natural support (natural cases) or crosses back over the natural bound it lies beyond (`kappa_mean`-OOD cases; [Generation reference](06_generation_reference.md)). The Kozeny–Carman relation is a global material trend: `kappa(x)` and `epsilon(x)` are spatially correlated through the shared background but not tied pointwise.
 
 </details>
 
@@ -87,7 +87,7 @@ The startup phase begins at `T_init`. Its inlet humidity target is the strictest
 ```text
 phi_in_start = min(
     min(phi_eq_init) - initial_equilibrium_rh_dry_margin,
-    startup_max_relative_humidity
+    max_relative_humidity
 )
 ```
 

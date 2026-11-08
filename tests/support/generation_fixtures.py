@@ -214,7 +214,6 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
         parameter_ood_count: int = 0,
         startup_ramp_enabled: bool = True,
         startup_ramp_duration_h: float = 0.25,
-        maximum_failed_cases: int = 2,
         max_admission_cases: int = 1,
         poll_interval_seconds: int = 1,
         node_jobs: int = 2,
@@ -231,7 +230,7 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
         grid_overrides: Mapping[str, int | float] | None = None,
         campaign_purpose: str = "source_generation",
     ) -> tuple[Path, Path]:
-        tests_root = project_root / "configs/01_generation/standalone/test_support"
+        tests_root = project_root / "configs/01_generation/test_support"
         campaign_number = len(list(tests_root.glob("campaign_*"))) if tests_root.exists() else 0
         directory = tests_root / f"campaign_{campaign_number}"
         directory.mkdir(parents=True)
@@ -267,7 +266,6 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             {
                 "timeout_seconds": timeout,
                 "graceful_stop_reserve_seconds": float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0,
-                "maximum_failed_cases": maximum_failed_cases,
                 "extra_arguments": list(extra_arguments),
                 "license_wait": {
                     "enabled": license_retry_enabled,

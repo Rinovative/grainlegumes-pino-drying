@@ -74,9 +74,9 @@ _PARAMETER_ROWS: Final = (
         AIRFLOW_SECTION,
         "Permeability",
         (
-            ("kappa_mean", "Mean"),
+            ("kappa_mean", "Scale"),
             ("kappa_cv", "Coefficient of variation"),
-            ("permeability.anisotropy.max_ratio", "Max. anisotropy ratio"),
+            ("permeability.anisotropy.max_ratio", "Anisotropy ratio cap"),
             ("permeability.anisotropy.exponent", "Anisotropy exponent"),
             ("permeability.anisotropy.strength", "Anisotropy strength"),
             ("permeability.orientation.jitter", "Orientation jitter"),
@@ -98,7 +98,7 @@ _PARAMETER_ROWS: Final = (
         AIRFLOW_SECTION,
         "Inlet pressure",
         (
-            ("pressure_bc.mean", "Mean"),
+            ("pressure_bc.mean", "Base level"),
             ("pressure_bc.sin_amp", "Sine amplitude"),
             ("pressure_bc.sin_freq", "Sine frequency"),
             ("pressure_bc.sin_phase", "Sine phase"),

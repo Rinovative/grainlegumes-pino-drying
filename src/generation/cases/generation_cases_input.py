@@ -49,6 +49,7 @@ from . import generation_cases_case as case_service
 from . import generation_cases_config as config_service
 
 INPUT_TRANSACTION_SCHEMA_VERSION = 1
+INPUT_REFERENCE_SCHEMA_VERSION: Final = 1
 INPUT_GENERATION_ACTIONS: Final = ("dry_run", "execute")
 
 
@@ -73,6 +74,7 @@ class GeneratedInputBatch:
     """Reference one canonical raw-input batch after a bounded request."""
 
     input_generation_id: str
+    source_git_commit: str
     metadata_directory: Path
     raw_directory: Path
     requested_case_indices: tuple[int, ...]
@@ -151,7 +153,7 @@ def configured_input_generation_id(
     Returns
     -------
     str
-        Logical identity of the sole current schema-v1 input generation.
+        Logical identity of the sole current input generation.
 
     """
     return str(_manifest_base(config, _resolved_config(config))["input_generation_id"])
@@ -336,6 +338,11 @@ def _initialize_input_generation_metadata(
     )
 
 
+def _differs_from_source(manifest: Mapping[str, Any], base: Mapping[str, Any]) -> bool:
+    """Compare a manifest with the requested source evidence; the commit is provenance and never conflicts."""
+    return any(manifest.get(key) != value for key, value in base.items() if key != "git_commit")
+
+
 def _load_existing(
     metadata_directory: Path,
     raw_directory: Path,
@@ -356,43 +363,11 @@ def _load_existing(
     except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError) as error:
         message = f"Canonical input-generation evidence is incomplete or invalid: {metadata_directory}: {error}"
         raise FileExistsError(message) from error
-    if not source.resolved_config_matches(resolved_config) or any(manifest.get(key) != value for key, value in base.items()):
+    if not source.resolved_config_matches(resolved_config) or _differs_from_source(manifest, base):
         message = "Canonical input batch belongs to different source evidence."
         raise FileExistsError(message)
     records = {int(record["case_index"]): record for record in manifest["cases"]}
     return records, source
-
-
-def _compatible_source(
-    config: config_service.GenerationConfig,
-    base: Mapping[str, Any],
-    resolved_config: Mapping[str, Any],
-    *,
-    storage_root: Path | str | None,
-) -> admission_service.InputSource | None:
-    """Select one exact compatible immutable source when current evidence is absent."""
-    discovery = admission_service.discover_input_batches(storage_root=storage_root)
-    batch_metadata_directory = common.paths.resolve_generation_batch_metadata_directory(config.batch_storage_name, storage_root=storage_root)
-    relevant_issues = [issue for issue in discovery.issues if issue.directory.resolve() == batch_metadata_directory.resolve()]
-    if relevant_issues:
-        message = f"Compatible input-source discovery found corrupt evidence for {config.batch_storage_name}: {relevant_issues[0].directory}"
-        raise FileExistsError(message)
-    expected_indices = tuple(config.case_indices)
-    candidates = [
-        source
-        for source in discovery.sources
-        if source.batch_storage_name == config.batch_storage_name
-        and source.batch_id == config.batch_id
-        and source.resolved_config_matches(resolved_config)
-        and all(source.manifest_payload().get(field) == base[field] for field in admission_service.INPUT_GENERATION_COMPATIBILITY_FIELDS)
-        and tuple(reference.case_index for reference in source.cases) == expected_indices
-    ]
-    if not candidates:
-        return None
-    if len(candidates) != 1:
-        message = f"Compatible input-source selection is ambiguous for {config.batch_name!r}."
-        raise FileExistsError(message)
-    return candidates[0]
 
 
 def _admit_selected_input_references(
@@ -422,7 +397,7 @@ def _admit_selected_input_references(
         raise RuntimeError(message)
     if (
         not source.resolved_config_matches(resolved)
-        or any(manifest.get(field) != base[field] for field in admission_service.INPUT_GENERATION_COMPATIBILITY_FIELDS)
+        or any(manifest.get(field) != base[field] for field in admission_service.INPUT_GENERATION_IDENTITY_FIELDS)
         or tuple(reference.case_index for reference in source.cases) != tuple(config.case_indices)
     ):
         message = "Selected input source disagrees with active scientific configuration or ordered membership."
@@ -469,7 +444,7 @@ def _write_input_reference(
         inputs_directory / common.paths.GENERATION_INPUT_REFERENCE_FILENAME,
         {
             "schema_kind": "generation_campaign_input_reference",
-            "schema_version": 1,
+            "schema_version": INPUT_REFERENCE_SCHEMA_VERSION,
             "batch_storage_name": batch_storage_name,
             "input_generation_id": input_generation_id,
             "case_id": case_id,
@@ -671,7 +646,7 @@ def _recover_input_transaction(
             "new_case_ids",
         }
         or journal.get("schema_kind") != "generation_input_transaction"
-        or journal.get("schema_version") != INPUT_TRANSACTION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(journal.get("schema_version"), INPUT_TRANSACTION_SCHEMA_VERSION)
         or journal.get("batch_id") != batch_id
         or journal.get("batch_storage_name") != batch_storage_name
         or journal.get("input_generation_id") != base["input_generation_id"]
@@ -679,7 +654,7 @@ def _recover_input_transaction(
         or not isinstance(new_case_ids, list)
         or any(not isinstance(case_id, str) for case_id in new_case_ids)
         or not isinstance(manifest, dict)
-        or any(manifest.get(key) != value for key, value in base.items())
+        or _differs_from_source(manifest, base)
         or json.loads((staged_metadata / "resolved_generation_config.json").read_text(encoding="utf-8")) != resolved_config
     ):
         message = f"Input-generation transaction evidence is invalid: {transaction}"
@@ -764,9 +739,9 @@ def _emit_case_progress(
 def _canonical_replacement_design(config: config_service.GenerationConfig, regime: str, case_index: int) -> dict[str, Any] | None:
     """Require one exact supplemental locator before reserving its case ID."""
     design = config.scientific_values.get("supplemental_design")
-    if not isinstance(design, dict) or design.get("schema_version") != config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
+    if design is None:
         return None
-    if design.get("batch_locator_regime") != regime or design.get("material_case_index") != case_index:
+    if not isinstance(design, dict) or design.get("batch_locator_regime") != regime or design.get("material_case_index") != case_index:
         message = "Replacement input disagrees with its canonical material-local locator."
         raise ValueError(message)
     return design
@@ -795,6 +770,10 @@ def generate_input_cases(
     lock_path = common.paths.resolve_generation_input_lock_path(config.batch_storage_name, storage_root=storage_root)
     transaction = common.paths.resolve_generation_input_transaction_directory(input_generation_id, storage_root=storage_root)
     campaign_parts = common.paths.campaign_batch_parts(config.batch_storage_name)
+    if campaign_parts is None:
+        message = f"Input generation requires a campaign batch locator, got {config.batch_storage_name!r}."
+        raise ValueError(message)
+    task, campaign_name, material, regime = campaign_parts
     with common.locking.exclusive_file_lock(lock_path, blocking=True):
         _initialize_input_generation_metadata(
             config,
@@ -814,10 +793,7 @@ def generate_input_cases(
             )
         manifest_exists = (metadata_directory / "input_generation_manifest.json").is_file()
         raw_exists = raw_directory.is_dir()
-        if not campaign_parts and manifest_exists != raw_exists:
-            message = "Canonical input manifest and raw batch must exist together; found incomplete evidence."
-            raise FileExistsError(message)
-        if campaign_parts and manifest_exists and not raw_exists:
+        if manifest_exists and not raw_exists:
             message = "Canonical campaign input manifest lacks its material-local case namespace."
             raise FileExistsError(message)
         records: dict[int, Mapping[str, Any]] = {}
@@ -830,16 +806,14 @@ def generate_input_cases(
                 generated_cases=0,
                 reused_cases=0,
             )
-            records, _source = _load_existing(
+            records, source = _load_existing(
                 metadata_directory,
                 raw_directory,
                 base=base,
                 resolved_config=resolved_config,
                 validation_depth=existing_validation_depth,
             )
-        elif raw_directory.exists() and campaign_parts is None:
-            message = f"Unmanifested canonical raw batch blocks publication: {raw_directory}"
-            raise FileExistsError(message)
+            base = {**base, "git_commit": source.manifest_payload()["git_commit"]}
         generated_indices = [index for index in requested if index not in records]
         reused_count = len(requested) - len(generated_indices)
         _emit_case_progress(
@@ -872,37 +846,35 @@ def generate_input_cases(
                         case_index,
                         staged_case,
                     )
-                    if campaign_parts is not None:
-                        from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- campaign input publication boundary
+                    from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- campaign input publication boundary
 
-                        task, campaign_name, material, regime = campaign_parts
-                        case_payload = json.loads((staged_case / "case.json").read_text(encoding="utf-8"))
-                        seed_evidence = case_payload["seed_evidence"]
-                        supplemental = _canonical_replacement_design(config, regime, case_index)
-                        replacement = supplemental is not None
-                        replacement_design = supplemental if supplemental is not None else {}
-                        lifecycle.reserve_candidate(
-                            task,
-                            campaign_name,
-                            material,
-                            origin="replacement" if replacement else "primary",
-                            design_key=str(replacement_design["candidate_id"]) if replacement else f"{regime}:{case_index}",
-                            candidate_position=case_index,
-                            target_slot=int(replacement_design["target_slot"]) if replacement else case_index,
-                            sample={
-                                "sampled_values": case_payload["sampled_values"],
-                                "sampled_units": case_payload["sampled_units"],
-                                "ood": case_payload["ood"],
-                                "spatial_diagnostics": case_payload["spatial_diagnostics"],
-                                "schedule_diagnostics": case_payload.get("schedule_diagnostics"),
-                                "input_files": case_payload["input_files"],
-                            },
-                            derived_seeds={"batch": seed_evidence["batch_seed"], "case": seed_evidence["case_seed"], **seed_evidence["subseeds"]},
-                            batch_id=str(replacement_design["parent_batch_id"]) if replacement else config.batch_id,
-                            design_evidence=supplemental if replacement else None,
-                            expected_case_id=case_id,
-                            storage_root=storage_root,
-                        )
+                    case_payload = json.loads((staged_case / "case.json").read_text(encoding="utf-8"))
+                    seed_evidence = case_payload["seed_evidence"]
+                    supplemental = _canonical_replacement_design(config, regime, case_index)
+                    replacement = supplemental is not None
+                    replacement_design = supplemental if supplemental is not None else {}
+                    lifecycle.reserve_candidate(
+                        task,
+                        campaign_name,
+                        material,
+                        origin="replacement" if replacement else "primary",
+                        design_key=str(replacement_design["candidate_id"]) if replacement else f"{regime}:{case_index}",
+                        candidate_position=case_index,
+                        target_slot=int(replacement_design["target_slot"]) if replacement else case_index,
+                        sample={
+                            "sampled_values": case_payload["sampled_values"],
+                            "sampled_units": case_payload["sampled_units"],
+                            "ood": case_payload["ood"],
+                            "spatial_diagnostics": case_payload["spatial_diagnostics"],
+                            "schedule_diagnostics": case_payload.get("schedule_diagnostics"),
+                            "input_files": case_payload["input_files"],
+                        },
+                        derived_seeds={"batch": seed_evidence["batch_seed"], "case": seed_evidence["case_seed"], **seed_evidence["subseeds"]},
+                        batch_id=str(replacement_design["parent_batch_id"]) if replacement else config.batch_id,
+                        design_evidence=supplemental if replacement else None,
+                        expected_case_id=case_id,
+                        storage_root=storage_root,
+                    )
                     records[case_index] = _case_record(staged_case)
                     _write_input_reference(staged_case, config.batch_storage_name, input_generation_id, records[case_index])
                     _emit_case_progress(
@@ -951,6 +923,7 @@ def generate_input_cases(
                 shutil.rmtree(transaction, ignore_errors=True)
     return GeneratedInputBatch(
         input_generation_id=input_generation_id,
+        source_git_commit=str(base["git_commit"]),
         metadata_directory=metadata_directory,
         raw_directory=raw_directory,
         requested_case_indices=requested,
@@ -1081,9 +1054,7 @@ def _ensure_campaign_plan_for_inputs(
     *,
     storage_root: Path | str | None,
 ) -> None:
-    """Freeze a complete v2 plan before reserving its first input case."""
-    if campaign.schema_version != config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION:
-        return
+    """Freeze a complete plan before reserving its first input case."""
     from src.generation import generation_campaign_lifecycle as lifecycle  # noqa: PLC0415 -- canonical reservation owner
 
     target_count = sum(campaign.selected_targets.values())
@@ -1133,7 +1104,7 @@ def prepare_campaign_inputs(
     campaign : CampaignConfig
         Exact campaign selection whose configured case membership is required.
     git_commit : str
-        Lowercase source commit used in every input-generation identity.
+        Lowercase source commit recorded by newly published input batches; an existing batch keeps its first commit.
     storage_root : Path | str | None, optional
         Canonical storage root, or the configured default when omitted.
     progress : Callable[[Mapping[str, Any]], None] | None, optional
@@ -1195,7 +1166,7 @@ def prepare_campaign_inputs(
                     "batch_id": batch.batch_id,
                     "batch_storage_name": batch.batch_storage_name,
                     "input_generation_id": generated.input_generation_id,
-                    "source_git_commit": commit,
+                    "source_git_commit": generated.source_git_commit,
                     "case_indices": list(batch.case_indices),
                     "generated_case_count": generated.generated_case_count,
                     "reused_case_count": generated.reused_case_count,
@@ -1238,12 +1209,8 @@ def admit_campaign_inputs_with_references(
             except FileExistsError as error:
                 if metadata.exists() or raw.exists():
                     raise
-                compatible_source = _compatible_source(batch, base, resolved, storage_root=storage)
-                if compatible_source is None:
-                    message = f"Prepared canonical input batch {batch.batch_name!r} is unavailable."
-                    raise FileNotFoundError(message) from error
-                source = compatible_source
-                record_indices = {reference.case_index for reference in source.cases}
+                message = f"Prepared canonical input batch {batch.batch_name!r} is unavailable."
+                raise FileNotFoundError(message) from error
             expected_indices = set(batch.case_indices)
             missing = tuple(case_index for case_index in batch.case_indices if case_index not in record_indices)
             if missing:

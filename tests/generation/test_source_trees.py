@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from src.generation.contracts import generation_contracts_source as source_contracts
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -139,6 +141,7 @@ def test_materialize_creates_verified_read_only_tree_with_recorded_modes(tree_fi
     assert verified["git_commit"] == receipt["git_commit"]
     assert verified["source_fingerprint_sha256"] == receipt["source_fingerprint_sha256"]
     assert verified["full_modes_verified"] is True
+    assert module["_SNAPSHOT_SCHEMA_VERSION"] == source_contracts.SOURCE_SNAPSHOT_SCHEMA_VERSION  # the host script cannot import src
 
 
 def test_second_materialize_reuses_the_existing_tree(tree_fixture: tuple) -> None:

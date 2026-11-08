@@ -20,13 +20,11 @@ from __future__ import annotations
 from typing import Final, Literal, cast
 
 DerivativeKind = Literal["physical", "spectral"]
-SpectralExtension = Literal["none", "fourier_continuation"]
 STEADY_BRINKMAN_KIND: Final = "steady_2d_brinkman"
 STEADY_BRINKMAN_EQUATION_SET: Final = "steady_two_dimensional_brinkman"
 CONTINUITY_KIND: Final = "cross_section_flux_balance"
 PRESSURE_BOUNDARY_KIND: Final = "pressure_inlet_zero_pressure_outlet"
 _DERIVATIVE_KINDS: Final = ("physical", "spectral")
-_DERIVATIVE_EXTENSIONS: Final = ("none", "fourier_continuation")
 
 __all__ = [
     "CONTINUITY_KIND",
@@ -34,22 +32,14 @@ __all__ = [
     "STEADY_BRINKMAN_EQUATION_SET",
     "STEADY_BRINKMAN_KIND",
     "DerivativeKind",
-    "SpectralExtension",
     "validate_derivative_kind",
 ]
 
 
-def validate_derivative_kind(kind: str, *, extension: str) -> tuple[DerivativeKind, SpectralExtension]:
-    """Validate and return one exact derivative kind and extension pair."""
+def validate_derivative_kind(kind: str) -> DerivativeKind:
+    """Validate and return one exact derivative kind."""
     if kind not in _DERIVATIVE_KINDS:
         available = ", ".join(_DERIVATIVE_KINDS)
         msg = f"Unknown derivative identifier {kind!r}. Available derivatives: {available}."
         raise ValueError(msg)
-    if extension not in _DERIVATIVE_EXTENSIONS:
-        available = ", ".join(_DERIVATIVE_EXTENSIONS)
-        msg = f"Unknown derivative extension {extension!r}. Available extensions: {available}."
-        raise ValueError(msg)
-    if kind == "physical" and extension != "none":
-        msg = "Physical derivatives require extension 'none'."
-        raise ValueError(msg)
-    return cast("DerivativeKind", kind), cast("SpectralExtension", extension)
+    return cast("DerivativeKind", kind)

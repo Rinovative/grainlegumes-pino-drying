@@ -4,6 +4,7 @@ Artifact generation, validation, and runtime evidence.
 Provides:
 - contracts: artifact schemas, identities, and provenance validation
 - generation: deterministic Parquet and NPZ artifact production
+- plan: artifact roles of an evaluable run, shared by both tasks
 - service: artifact lifecycle, cache, rebuilding, and publication
 - timing: COMSOL and neural runtime evidence
 - transient: sequence-aware transient artifact planning and generation
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import analysis_artifact_contracts as contracts
     from . import analysis_artifact_generation as generation
+    from . import analysis_artifact_plan as plan
     from . import analysis_artifact_service as service
     from . import analysis_artifact_timing as timing
     from . import analysis_artifact_transient as transient
@@ -24,11 +26,12 @@ if TYPE_CHECKING:
 _MODULES = {
     "contracts": "analysis_artifact_contracts",
     "generation": "analysis_artifact_generation",
+    "plan": "analysis_artifact_plan",
     "service": "analysis_artifact_service",
     "timing": "analysis_artifact_timing",
     "transient": "analysis_artifact_transient",
 }
-__all__ = ["contracts", "generation", "service", "timing", "transient"]
+__all__ = ["contracts", "generation", "plan", "service", "timing", "transient"]
 
 
 def __getattr__(name: str) -> object:

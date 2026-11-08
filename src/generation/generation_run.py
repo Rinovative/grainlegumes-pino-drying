@@ -1,17 +1,17 @@
 """Resolve immutable Generation run plans.
 
 Responsibilities:
-  - Dispatch validated run configuration schemas to their authoritative loaders
-  - Describe campaign and benchmark execution units
+  - Dispatch the validated campaign configuration schema to its authoritative loader
+  - Describe campaign execution units
 
 Design principles:
-  - Scientific campaign and benchmark identities remain owned by their existing loaders
+  - Scientific campaign identities remain owned by their existing loader
   - Workflow orchestration identity never changes a child scientific identity
   - Run plans are deterministic, serializable, and side-effect free
 
 This module does NOT:
   - Submit jobs, materialize inputs, transfer artifacts, or execute solvers
-  - Replace campaign, benchmark, or publication persistence authorities
+  - Replace campaign or publication persistence authorities
 """
 
 from __future__ import annotations
@@ -29,12 +29,9 @@ from src import common
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.contracts import generation_contracts_source as source_service
 
-from . import generation_benchmark_config as benchmark_config
 from . import generation_campaign as campaign_service
 
 CAMPAIGN_SCHEMA_KIND: Final = "generation_source_campaign"
-BENCHMARK_SCHEMA_KIND: Final = "generation_core_scaling_benchmark_suite"
-CORE_BENCHMARK_SUMMARY_FINALIZER: Final = "core_benchmark_summary"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +44,7 @@ class GenerationRunUnit:
     unit_id : str
         Stable identifier within the containing run plan.
     unit_kind : str
-        Declared unit category: ``campaign_case`` or ``benchmark_case``.
+        Declared unit category: ``campaign_case``.
     input_identity : str
         Existing immutable input identity for the work unit.
     metadata : tuple[tuple[str, Any], ...]
@@ -75,31 +72,6 @@ class GenerationRunUnit:
 
 
 @dataclass(frozen=True, slots=True)
-class GenerationRunFinalizer:
-    """
-    One declared continuation required after all child runs complete.
-
-    Parameters
-    ----------
-    finalizer_kind : str
-        Stable finalizer discriminator.
-    required_child_identities : tuple[str, ...]
-        Ordered child identities that must be terminal before finalization.
-
-    """
-
-    finalizer_kind: str
-    required_child_identities: tuple[str, ...]
-
-    def to_payload(self) -> dict[str, Any]:
-        """Return a deterministic JSON-serializable finalizer payload."""
-        return {
-            "finalizer_kind": self.finalizer_kind,
-            "required_child_identities": list(self.required_child_identities),
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class GenerationRunPlan:
     """
     One resolved immutable run or workflow plan.
@@ -107,7 +79,7 @@ class GenerationRunPlan:
     Parameters
     ----------
     run_kind : str
-        ``campaign`` or ``benchmark``.
+        ``campaign``.
     identity : str
         Run-level immutable identity, distinct from display names and paths.
     source_commit : str
@@ -126,8 +98,6 @@ class GenerationRunPlan:
         Declared source-attempt retention policy.
     collection_policy : str
         Declared collection continuation policy.
-    finalizers : tuple[GenerationRunFinalizer, ...]
-        Continuations that follow workflow child completion.
     lifecycle_stages : tuple[str, ...]
         Ordered subset of the common lifecycle vocabulary.
 
@@ -143,7 +113,6 @@ class GenerationRunPlan:
     units: tuple[GenerationRunUnit, ...]
     retention_policy: str
     collection_policy: str
-    finalizers: tuple[GenerationRunFinalizer, ...]
     lifecycle_stages: tuple[str, ...]
     scientific_overrides: tuple[tuple[str, Any], ...] = ()
     execution_overrides: tuple[tuple[str, Any], ...] = ()
@@ -154,7 +123,6 @@ class GenerationRunPlan:
         """Return a deterministic JSON-serializable plan payload."""
         return {
             "schema_kind": "generation_run_plan",
-            "schema_version": 1,
             "run_kind": self.run_kind,
             "identity": self.identity,
             "source_commit": self.source_commit,
@@ -169,7 +137,6 @@ class GenerationRunPlan:
             "units": [unit.to_payload() for unit in self.units],
             "retention_policy": self.retention_policy,
             "collection_policy": self.collection_policy,
-            "finalizers": [item.to_payload() for item in self.finalizers],
             "lifecycle_stages": list(self.lifecycle_stages),
         }
 
@@ -190,13 +157,13 @@ def resolve_generation_run(
     Parameters
     ----------
     path : Path | str
-        Repository-contained campaign, benchmark-suite, or workflow YAML file.
+        Repository-contained campaign YAML file.
     source_commit : str
         Exact lowercase Git commit bound to execution provenance.
     repository_root : Path | str | None, optional
-        Repository root used for containment validation and relative workflow children.
+        Repository root used for containment validation.
     require_executable : bool, optional
-        Forwarded to the authoritative campaign and benchmark loaders.
+        Forwarded to the authoritative campaign loader.
 
     scientific_overrides : Mapping[str, Any] | None, optional
         Explicit campaign material, design-size, physical-duration and Source-revision overrides.
@@ -213,9 +180,9 @@ def resolve_generation_run(
     Raises
     ------
     FileNotFoundError
-        If the configuration or a declared workflow child is unavailable.
+        If the configuration is unavailable.
     ValueError
-        If schemas, references, identities, or supported workflow contracts are invalid.
+        If schemas, references, or identities are invalid.
 
     """
     root = _repository_root(repository_root)
@@ -224,45 +191,19 @@ def resolve_generation_run(
     raw, config_identity = _load_top_level(source_path)
     if authored_value is not None:
         raw = MappingProxyType(dict(authored_value))
-    schema_kind = raw.get("schema_kind")
-    if schema_kind == CAMPAIGN_SCHEMA_KIND:
-        _validate_schema_version(
-            raw,
-            schema_kind=CAMPAIGN_SCHEMA_KIND,
-            version=config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
-            if raw.get("schema_version") == config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION
-            else 1,
-        )
-        return _campaign_plan(
-            source_path,
-            config_identity=config_identity,
-            source_commit=commit,
-            root=root,
-            require_executable=require_executable,
-            scientific_overrides=scientific_overrides,
-            execution_overrides=execution_overrides,
-            authored_value=authored_value,
-        )
-    if schema_kind == BENCHMARK_SCHEMA_KIND:
-        if authored_value is not None or scientific_overrides or execution_overrides:
-            message = "Scientific run overrides apply to source campaigns only."
-            raise ValueError(message)
-        _validate_schema_version(
-            raw,
-            schema_kind=BENCHMARK_SCHEMA_KIND,
-            version=benchmark_config.BENCHMARK_SCHEMA_VERSION,
-        )
-        return _benchmark_plan(
-            source_path,
-            config_identity=config_identity,
-            source_commit=commit,
-            root=root,
-            require_executable=require_executable,
-        )
-    message = (
-        f"Unsupported Generation run schema_kind {schema_kind!r} in {source_path}; expected {CAMPAIGN_SCHEMA_KIND!r} or {BENCHMARK_SCHEMA_KIND!r}."
+    if raw.get("schema_kind") != CAMPAIGN_SCHEMA_KIND:
+        message = f"Unsupported Generation run schema_kind {raw.get('schema_kind')!r} in {source_path}; expected {CAMPAIGN_SCHEMA_KIND!r}."
+        raise ValueError(message)
+    return _campaign_plan(
+        source_path,
+        config_identity=config_identity,
+        source_commit=commit,
+        root=root,
+        require_executable=require_executable,
+        scientific_overrides=scientific_overrides,
+        execution_overrides=execution_overrides,
+        authored_value=authored_value,
     )
-    raise ValueError(message)
 
 
 def _campaign_plan(
@@ -305,10 +246,6 @@ def _campaign_plan(
                     ),
                 )
             )
-    retention = str(campaign.execution_values["retention_policy"])
-    collection = "deferred_allowed"
-    finalizers: tuple[GenerationRunFinalizer, ...] = ()
-    lifecycle = _campaign_lifecycle()
     return GenerationRunPlan(
         run_kind="campaign",
         identity=campaign_service.campaign_run_id(campaign, git_commit=source_commit),
@@ -318,90 +255,13 @@ def _campaign_plan(
         config_path=source_path.relative_to(root).as_posix(),
         children=(),
         units=tuple(units),
-        retention_policy=retention,
-        collection_policy=collection,
-        finalizers=finalizers,
-        lifecycle_stages=lifecycle,
+        retention_policy=str(campaign.execution_values["retention_policy"]),
+        collection_policy="deferred_allowed",
+        lifecycle_stages=_campaign_lifecycle(),
         scientific_overrides=tuple((campaign.scientific_overrides or {}).items()),
         execution_overrides=tuple((campaign.execution_overrides or {}).items()),
         execution_values=campaign.execution_values,
         authored_value=campaign.authored_value,
-    )
-
-
-def _benchmark_plan(
-    source_path: Path,
-    *,
-    config_identity: str,
-    source_commit: str,
-    root: Path,
-    require_executable: bool,
-) -> GenerationRunPlan:
-    """Build first-attempt work units per sweep: one group per variant in sweep order, each group after the previous one."""
-    suite = benchmark_config.load_core_benchmark_suite(
-        source_path,
-        require_executable=require_executable,
-    )
-    units: list[GenerationRunUnit] = []
-    for sweep in suite.sweeps:
-        previous_group: tuple[str, ...] = ()
-        for group, variant in enumerate(suite.sweep_variants(sweep)):
-            current_group: list[str] = []
-            for case_position in range(1, suite.representative_case_count + 1):
-                representative = suite.representative_case(case_position)
-                case_index = representative.case_index
-                unit_id = suite.work_unit_id(sweep, variant, 1, case_position)
-                current_group.append(unit_id)
-                units.append(
-                    GenerationRunUnit(
-                        unit_id=unit_id,
-                        unit_kind="benchmark_case",
-                        input_identity=_case_input_identity(
-                            suite.case_config,
-                            case_index,
-                        ),
-                        metadata=(
-                            ("sweep_id", sweep.sweep_id),
-                            ("variant_id", variant.variant_id),
-                            ("cores_per_case", variant.cores_per_case),
-                            ("concurrent_cases", suite.resources(variant).concurrent_cases),
-                            ("group", group),
-                            ("case_position", case_position),
-                            ("case_role", representative.case_role),
-                            ("case_index", case_index),
-                            ("case_id", suite.case_config.case_id(case_index)),
-                            ("success_target", suite.target_successful_cases),
-                        ),
-                        depends_on=previous_group,
-                    )
-                )
-            previous_group = tuple(current_group)
-    return GenerationRunPlan(
-        run_kind="benchmark",
-        identity=(
-            "benchmark_plan__"
-            + common.serialization.canonical_json_sha256(
-                {
-                    "suite_digest": suite.suite_digest,
-                    "source_commit": source_commit,
-                }
-            )[:16]
-        ),
-        source_commit=source_commit,
-        input_identity=suite.suite_digest,
-        config_identity=config_identity,
-        config_path=source_path.relative_to(root).as_posix(),
-        children=(),
-        units=tuple(units),
-        retention_policy="compact",
-        collection_policy="deferred_allowed",
-        finalizers=(
-            GenerationRunFinalizer(
-                finalizer_kind=CORE_BENCHMARK_SUMMARY_FINALIZER,
-                required_child_identities=(),
-            ),
-        ),
-        lifecycle_stages=_benchmark_lifecycle(),
     )
 
 
@@ -416,30 +276,6 @@ def _campaign_lifecycle() -> tuple[str, ...]:
         "monitor_scheduler",
         "terminalize",
         "validate_terminal",
-        "complete",
-    )
-
-
-def _benchmark_lifecycle() -> tuple[str, ...]:
-    """Return benchmark stages without a separate prepare worker unit."""
-    return (
-        "resolve_config",
-        "preflight",
-        "prepare_inputs",
-        "plan",
-        "submit",
-        "feed_scheduler",
-        "monitor_scheduler",
-        "terminalize",
-        "validate_terminal",
-        "transfer",
-        "publish",
-        "finalize",
-        "record_workflow",
-        "authorize_cleanup",
-        "cleanup_source",
-        "record_cleanup",
-        "validate",
         "complete",
     )
 
@@ -495,10 +331,3 @@ def _repository_file(value: Path | str, *, root: Path, label: str) -> Path:
         message = f"{label} is missing or unsafe: {resolved}"
         raise FileNotFoundError(message)
     return resolved
-
-
-def _validate_schema_version(raw: Mapping[str, Any], *, schema_kind: str, version: int) -> None:
-    """Require the supported version before dispatching to an authoritative loader."""
-    if raw.get("schema_version") != version:
-        message = f"Unsupported {schema_kind} schema version {raw.get('schema_version')!r}."
-        raise ValueError(message)

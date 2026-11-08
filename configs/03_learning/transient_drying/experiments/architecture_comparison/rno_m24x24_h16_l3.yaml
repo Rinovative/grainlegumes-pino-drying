@@ -9,6 +9,7 @@ model:
     hidden_channels: 16  # Width of the model’s hidden feature representation.
     n_layers: 3  # Number of architecture layers/blocks; affects capacity and compute.
     rno_skip: false  # Recurrent residual skip path; must be false because skip-added hidden states break step-wise carry.
+    candidate_activation: tanh  # Recurrent candidate activation; tanh bounds the hidden state (project deviation from neuraloperator's SELU, docs/04_training.md).
     lifting_channel_ratio: 2  # FNO lifting width relative to hidden_channels.
     projection_channel_ratio: 2  # FNO projection width relative to hidden_channels.
     channel_mlp_skip: soft-gating  # Channel-MLP skip connection type.
@@ -16,7 +17,8 @@ model:
     return_sequences: false  # Whether the recurrent model returns every time step; this task contract requires false.
 
 optimizer:
-  lr: 0.0003883614530748613  # Initial learning rate; controls the optimizer update scale.
+  # Placeholder until the rno_a0_search study selects it.
+  lr: 0.0003883614530748613 # Initial learning rate; controls the optimizer update scale.
 
 training:
   a0:

@@ -135,16 +135,12 @@ def build_scheduler(
             msg = f"evaluation.objective.direction must be 'minimize' or 'maximize', got: {direction!r}"
             raise ValueError(msg)
         mode_value = cast('Literal["min", "max"]', mode_by_direction[direction])
-        factor = sched_config.get("factor", 0.5)
-        patience = sched_config.get("patience", 20)
-        min_lr = sched_config.get("min_lr", 1e-8)
-
         return ReduceLROnPlateau(
             optimizer,
             mode=mode_value,
-            factor=float(factor),
-            patience=int(patience),
-            min_lr=float(min_lr),
+            factor=float(sched_config["factor"]),
+            patience=int(sched_config["patience"]),
+            min_lr=float(sched_config["min_lr"]),
         )
     msg = f"Only 'reduce_on_plateau' scheduler is supported, got: {sched_type}"
     raise ValueError(msg)

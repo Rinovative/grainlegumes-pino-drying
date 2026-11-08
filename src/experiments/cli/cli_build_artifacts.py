@@ -60,7 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         type=Path,
         default=None,
-        help="Exact current direct-run or Optuna-trial directory. May be repeated.",
+        help="Exact current training-run directory (an Optuna trial has no artifacts and is refused). May be repeated.",
     )
     parser.add_argument(
         "--dataset-root",

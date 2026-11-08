@@ -4,7 +4,6 @@ Responsibilities:
   - Resolve canonical campaign, execution-record, and node-job directory paths, invert a node directory to its campaign, and validate run manifests
   - Reconstruct the exact resolved campaign bound to a launched run
   - Admit exact node-job and case-dispatch ownership without loading scientific payloads
-  - Refuse run manifests that predate node mode
 
 Design principles:
   - Campaign state is independent of purpose-specific terminal evidence
@@ -16,7 +15,7 @@ This module does NOT:
   - Publish Dataset membership or execute solver work
 
 Notes:
-  Persisted contract (run.json schema version 2):
+  Persisted contract (run.json schema version 1):
     - ``node_jobs`` records one Slurm node job each; ``slurm_job_ids`` lists their allocation ids in record order.
     - ``submissions`` records one dispatch (one ticket for one case step) each and references a node job by token.
     - ``node_job_intent`` names the single unresolved ``submitting`` node job; ``submission_intent`` the single ``dispatching`` record.
@@ -38,7 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
-RUN_MANIFEST_SCHEMA_VERSION: Final = 2
+RUN_MANIFEST_SCHEMA_VERSION: Final = 1
 NODE_JOBS_DIRNAME: Final = "node_jobs"
 NODE_JOB_TOKEN_PATTERN: Final = re.compile(r"[a-z0-9]{16}")
 _NODE_SEATS: Final = tuple(range(1, config_service.MAXIMUM_NODE_JOBS + 1))
@@ -154,7 +153,7 @@ def node_job_relative_directory(token: str) -> str:
 
 
 def node_job_campaign_directory(node_directory: Path | str) -> Path | None:
-    """Invert one campaign node directory to its campaign directory, or return ``None`` for any other node directory (a benchmark's)."""
+    """Invert one campaign node directory to its campaign directory, or return ``None`` for any other node directory."""
     directory = Path(node_directory)
     if NODE_JOB_TOKEN_PATTERN.fullmatch(directory.name) is None:
         return None
@@ -213,7 +212,7 @@ def resolve_campaign_config_path(value: Any) -> Path:
 
 
 def resolve_frozen_campaign_config_locator(value: Any) -> Path:
-    """Validate a v2 authored locator while reading its durable frozen plan."""
+    """Validate an authored locator while reading its durable frozen plan."""
     if not isinstance(value, str) or not value:
         message = "Canonical campaign configuration locator must be non-empty text."
         raise TypeError(message)
@@ -245,29 +244,17 @@ def _validate_campaign_scheduler_job_ids(
     return value
 
 
-def _require_node_mode_manifest(manifest: Mapping[str, Any], *, run_id: str) -> None:
-    """Refuse a run manifest written before node mode: it is neither executed, resumed, nor admitted."""
-    version = manifest.get("schema_version")
-    if manifest.get("schema_kind") == "generation_campaign_run" and type(version) is int and version < RUN_MANIFEST_SCHEMA_VERSION:
-        message = (
-            f"Campaign run {run_id} predates node mode (run.json schema version {version}); "
-            f"only schema version {RUN_MANIFEST_SCHEMA_VERSION} is executed, resumed, or admitted. Start a new campaign."
-        )
-        raise ValueError(message)
-
-
 def _validate_campaign_run_header(
     manifest: Mapping[str, Any],
     *,
     run_id: str,
 ) -> list[str]:
     """Validate top-level campaign, source, and scheduler identity."""
-    _require_node_mode_manifest(manifest, run_id=run_id)
     if (
         not set(manifest) >= _RUN_MANIFEST_KEYS
         or bool(set(manifest).difference(_RUN_MANIFEST_KEYS | _RUN_MANIFEST_OPTIONAL_KEYS))
         or manifest.get("schema_kind") != "generation_campaign_run"
-        or manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(manifest.get("schema_version"), RUN_MANIFEST_SCHEMA_VERSION)
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
@@ -294,7 +281,6 @@ def _validate_campaign_run_header(
         "submission_failed",
         "submission_unknown",
         "scheduler_unknown",
-        "failure_threshold_reached",
         "license_blocked",
         "completed_with_failures",
         "staged",
@@ -337,7 +323,6 @@ def _validate_submission_configuration(
         "memory_per_case",
         "node_job_memory",
         "node_job_wall_time",
-        "maximum_failed_cases",
         "license_wait",
         "partition",
         "scheduler_options",
@@ -346,7 +331,8 @@ def _validate_submission_configuration(
         raise ValueError(message)
     for key in ("max_admission_cases", "poll_interval_seconds", "cores_per_case", "node_jobs", "concurrent_cases_per_node"):
         value = submission[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        # A null cap is derived from the plan rates; the campaign's effective cap refuses it without a plan rate.
+        if (value is not None or key != "max_admission_cases") and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             message = f"Campaign-run submission configuration {key!r} is malformed: {run_id}."
             raise ValueError(message)
     try:
@@ -356,10 +342,6 @@ def _validate_submission_configuration(
     except config_service.GenerationConfigError as error:
         message = f"Campaign-run submission configuration node-job resources are malformed: {run_id}."
         raise ValueError(message) from error
-    maximum_failed_cases = submission["maximum_failed_cases"]
-    if isinstance(maximum_failed_cases, bool) or not isinstance(maximum_failed_cases, int) or maximum_failed_cases < 0:
-        message = f"Campaign-run submission configuration 'maximum_failed_cases' is malformed: {run_id}."
-        raise ValueError(message)
     wait = submission["license_wait"]
     in_allocation = wait.get("in_allocation_retry") if isinstance(wait, dict) else None
     if (
@@ -642,34 +624,27 @@ def load_campaign_run(
     _validate_admission_reservations(manifest, run_id=run_id)
     node_jobs = _validate_node_job_records(manifest, run_id=run_id, job_ids=job_ids)
     _validate_submission_records(manifest, run_id=run_id, node_jobs=node_jobs)
-    parts = common.paths.campaign_run_parts(run_id)
-    if parts is None:
-        if "source_snapshot" in manifest:
-            message = "Historical campaign run cannot claim a canonical dirty-source snapshot."
+    resolve_frozen_campaign_config_locator(manifest.get("campaign_config"))
+    if "source_snapshot" in manifest:
+        snapshot = manifest["source_snapshot"]
+        storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
+        root = common.paths.get_source_snapshots_root(storage_root=storage)
+        if not isinstance(snapshot, dict) or set(snapshot) != {"path", "sha256", "source_fingerprint_sha256"}:
+            message = "Canonical campaign source snapshot binding is malformed."
             raise ValueError(message)
-        resolve_campaign_config_path(manifest.get("campaign_config"))
-    else:
-        resolve_frozen_campaign_config_locator(manifest.get("campaign_config"))
-        if "source_snapshot" in manifest:
-            snapshot = manifest["source_snapshot"]
-            storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
-            root = common.paths.get_source_snapshots_root(storage_root=storage)
-            if not isinstance(snapshot, dict) or set(snapshot) != {"path", "sha256", "source_fingerprint_sha256"}:
-                message = "Canonical campaign source snapshot binding is malformed."
-                raise ValueError(message)
-            path = _snapshot_path_for_storage(snapshot, manifest, storage=storage)
-            if (
-                not path.is_absolute()
-                or not path.is_relative_to(root)
-                or not path.resolve(strict=False).is_relative_to(root)
-                or path.is_symlink()
-                or not path.is_file()
-                or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["sha256"])) is None
-                or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["source_fingerprint_sha256"])) is None
-                or common.serialization.file_sha256(path) != snapshot["sha256"]
-            ):
-                message = "Canonical campaign source snapshot is missing, unsafe, or changed."
-                raise ValueError(message)
+        path = _snapshot_path_for_storage(snapshot, manifest, storage=storage)
+        if (
+            not path.is_absolute()
+            or not path.is_relative_to(root)
+            or not path.resolve(strict=False).is_relative_to(root)
+            or path.is_symlink()
+            or not path.is_file()
+            or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["sha256"])) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(snapshot["source_fingerprint_sha256"])) is None
+            or common.serialization.file_sha256(path) != snapshot["sha256"]
+        ):
+            message = "Canonical campaign source snapshot is missing, unsafe, or changed."
+            raise ValueError(message)
     return manifest
 
 
@@ -686,7 +661,7 @@ def load_campaign_scheduler_job_ids(
     RuntimeError
         If a node-job submission is unresolved: its allocation may exist without being recorded.
     ValueError
-        If the manifest is malformed, inconsistent, or predates node mode.
+        If the manifest is malformed or inconsistent.
 
     """
     path = campaign_run_manifest_path(run_id, storage_root=storage_root)
@@ -694,10 +669,9 @@ def load_campaign_scheduler_job_ids(
         message = f"Campaign-run manifest is missing or unsafe: {path}"
         raise FileNotFoundError(message)
     manifest = load_json_object(path, label="campaign-run manifest")
-    _require_node_mode_manifest(manifest, run_id=run_id)
     if (
         manifest.get("schema_kind") != "generation_campaign_run"
-        or manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(manifest.get("schema_version"), RUN_MANIFEST_SCHEMA_VERSION)
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."

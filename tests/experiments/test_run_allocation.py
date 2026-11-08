@@ -2,7 +2,9 @@
 
 Responsibilities:
   - Check collision refusal, writer leases, atomic status, runtime sessions, and resume admission
+  - Check that steady and transient inference refuse a run while a writer holds its lease
   - Check admission of a start that names an existing run: continue, report complete, or reject
+  - Check that a run recorded by other training code is neither reported complete, extended nor resumed
   - Check that a started run, but no Optuna trial, records its folder as a job log owner
 
 Design principles:
@@ -23,12 +25,13 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 import pytest
 from support import configs, run_state
 
-from src import common, experiments
+from src import common, experiments, learning
 from src.experiments.config import experiments_config_loader as config_loader
 from src.experiments.config import experiments_config_naming as config_naming
 
@@ -355,6 +358,63 @@ def test_existing_target_that_cannot_continue_rejects_before_runtime_setup(
     assert after == before
 
 
+def test_training_code_drift_refuses_reuse_extension_and_resume_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run recorded by older training code is neither reported complete, extended nor resumed; nothing is written."""
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config_path = _synthetic_config_path(tmp_path)
+    with monkeypatch.context() as drift:
+        run_state.drift_training_code(drift, "steady_flow")
+        stale = _resolved_admission_config(output_root)
+    epochs = int(stale["training"]["epochs"])
+    run_dir = common.paths.resolve_config_run_dir(stale, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, stale, status="completed", completed_epoch=epochs)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("stale code must not train"))
+    saved_config = common.paths.resolve_run_config_path(run_dir)
+    changed = r"training_steady_flow implementation changed \(recorded [0-9a-f]{12}, current [0-9a-f]{12}\); finish it in its bound source tree"
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+
+    with pytest.raises(experiments.run.ExistingRunAdmissionError, match=changed):
+        experiments.run.run_experiment(config_path, output_root=output_root)
+    with pytest.raises(ValueError, match=changed):
+        experiments.run.run_experiment(saved_config, resume=run_dir, max_epochs=epochs + 1)
+    run_state_summary = common.paths.resolve_run_summary_path(run_dir)
+    common.serialization.atomic_write_json(
+        run_state_summary, {**json.loads(run_state_summary.read_text(encoding="utf-8")), "status": "interrupted", "completed_epoch": 1}
+    )
+    before[run_state_summary.relative_to(run_dir)] = run_state_summary.read_bytes()
+    with pytest.raises(ValueError, match=changed):
+        experiments.run.run_experiment(saved_config, resume=run_dir)
+
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+
+
+def test_prepared_resume_refuses_training_code_drift_before_any_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The public prepared-run executor resumes only a run recorded by the running training code; nothing is written."""
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    with monkeypatch.context() as drift:
+        run_state.drift_training_code(drift, "steady_flow")
+        stale = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(stale, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, stale, status="interrupted", completed_epoch=1)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("stale code must not train"))
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+
+    with pytest.raises(ValueError, match=r"training_steady_flow implementation changed"):
+        experiments.run.execute_prepared_run(
+            stale,
+            run_dir=run_dir,
+            resume_from=common.paths.resolve_last_checkpoint_file(run_dir),
+            device_resolution=experiments.run.learning.device.resolve_device("cpu"),
+        )
+
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
+
+
 def test_rerunning_a_completed_run_returns_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -370,7 +430,7 @@ def test_rerunning_a_completed_run_returns_without_training(
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
         {
-            "schema_version": experiments.run.RUN_SUMMARY_SCHEMA_VERSION,
+            "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "status": "completed",
             "completed_epoch": config["training"]["epochs"],
             "best_epoch": 1,
@@ -829,6 +889,32 @@ def test_shared_file_lock_admits_readers_and_refuses_an_active_writer(tmp_path: 
     assert [outcomes.get_nowait(), outcomes.get_nowait()] == ["read", "blocked"]
 
 
+@pytest.mark.parametrize(
+    "load_inference",
+    [
+        pytest.param(lambda run_dir: learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu"), id="steady"),
+        pytest.param(lambda run_dir: learning.inference.transient.load_transient_inference_context(run_dir=run_dir), id="transient"),
+    ],
+)
+def test_inference_of_both_tasks_refuses_a_run_while_a_writer_holds_it(load_inference: Callable[[Path], object], tmp_path: Path) -> None:
+    """Steady and transient inference admit a run through the same reader lease, so neither reads a run being written."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    acquired, release = threading.Event(), threading.Event()
+    outcomes: queue.Queue[str] = queue.Queue()
+    holder = threading.Thread(target=_hold_run_writer_lease, args=(run_dir, acquired, release, outcomes))
+    holder.start()
+    try:
+        assert acquired.wait(timeout=5)
+        with pytest.raises(experiments.run.RunLifecycleError, match="active writer lease"):
+            load_inference(run_dir)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+    assert outcomes.get(timeout=5) == "released"
+
+
 @pytest.mark.integration
 def test_start_and_saved_resume_reject_a_second_process_writer(
     tmp_path: Path,
@@ -915,8 +1001,31 @@ def test_saved_effective_resume_service_preserves_exact_science_and_only_extends
     assert source.read_bytes() == original
     with pytest.raises(ValueError, match="cannot override scientific"):
         experiments.run.run_experiment(source, resume=run_dir, train_dataset="different")
+    with pytest.raises(ValueError, match="cannot override scientific"):
+        experiments.run.run_experiment(source, resume=run_dir, seed=19)
     with pytest.raises(ValueError, match="retain or increase"):
         experiments.run.run_experiment(source, resume=run_dir, max_epochs=1)
+
+
+def test_seed_override_selects_the_seed_leaf_and_seed_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replicate seed replaces run.seed before the layout and seed plan derive, so it needs no further config file."""
+    request = configs.write_config(tmp_path, configs.direct_config())
+    authored_seed = configs.direct_config()["run"]["seed"]
+    calls: list[dict[str, Any]] = []
+
+    def execute(requested: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        calls.append(requested)
+        return {"result": {"status": "completed"}, "run_dir": tmp_path}
+
+    monkeypatch.setattr(experiments.run, "_run_resolved_experiment", execute)
+
+    experiments.run.run_experiment(request, device="cpu", output_root=tmp_path, seed=19)
+
+    (requested,) = calls
+    assert requested["run"]["seed"] == requested["run"]["layout"]["seed"] == 19 != authored_seed
+    assert common.paths.resolve_config_run_dir(requested).name == "seed-19"
+    assert experiments.run.build_seed_plan(requested["run"]["seed"]) == experiments.run.build_seed_plan(19)
+    assert experiments.run.build_seed_plan(19) != experiments.run.build_seed_plan(authored_seed)
 
 
 def test_a0_epoch_budget_cannot_be_moved_by_an_operational_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -984,6 +1093,16 @@ def test_job_log_owner_is_recorded_only_inside_a_job_and_a_failed_write_only_war
     monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(tmp_path / "missing" / "owners"))
     common.paths.record_job_log_owner(owner)
     assert capfd.readouterr().err.count("Warning:") == 2
+
+    class _ClosedStream:
+        def write(self, _text: str) -> int:
+            raise OSError(9, "Bad file descriptor")
+
+        def flush(self) -> None:
+            raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr("sys.stderr", _ClosedStream())
+    common.paths.record_job_log_owner(owner)  # neither the failed write nor its failed warning may reach the job
 
 
 @pytest.mark.parametrize(("start", "recorded"), [("resume", 2), ("trial", 0)])

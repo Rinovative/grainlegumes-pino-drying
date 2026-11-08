@@ -4,12 +4,13 @@ Responsibilities:
   - Resolve and revalidate immutable source HDF5 and temporal evidence
   - Materialize explicit one-step transitions, deterministic rollout windows, or complete trajectories
   - Apply one validated boundary-preserving spatial view to every spatial field
-  - Own process-local read-only handles, shard admissions, and bounded caches
+  - Own process-local shard mappings and shard admissions
 
 Design principles:
   - One admitted trajectory index drives every runtime sampling mode
   - Delta targets are derived from canonical absolute endpoint states
-  - Worker serialization never carries open HDF5 resources
+  - Source HDF5 files are opened and closed per read; opened shards stay mapped for the process lifetime
+  - Worker serialization never carries open shard mappings
 
 This module does NOT:
   - Build or publish transient indexes
@@ -20,7 +21,6 @@ from __future__ import annotations
 
 import math
 import os
-from collections import OrderedDict
 from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
@@ -40,7 +40,8 @@ from src.datasets.packages import dataset_packages_transient_shards as transient
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
-_SHA256_LENGTH = 64
+    from src.datasets.contracts import dataset_contracts_identity as identity
+
 _TRANSIENT_FIELD_RANK = 4
 
 
@@ -108,7 +109,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         *,
         sampling: transient_contract.TransientSamplingSpec,
         source_root: Path | str | None = None,
-        hdf5_cache_size: int = 0,
         spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
     ) -> None:
@@ -117,12 +117,10 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             index_path,
             sampling=sampling,
             source_root=source_root,
-            hdf5_cache_size=hdf5_cache_size,
             spatial_stride=spatial_stride,
             sample_indices=sample_indices,
             storage_backend="canonical_hdf5",
         )
-        self._handles: OrderedDict[Path, h5py.File] = OrderedDict()
         selected_cases = {int(self.payload["samples"][position]["case_index"]) for position in self.sample_indices}
         source_paths: list[Path | None] = []
         source_stats: list[tuple[int, int] | None] = []
@@ -144,7 +142,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         *,
         sampling: transient_contract.TransientSamplingSpec,
         source_root: Path | str | None,
-        hdf5_cache_size: int,
         spatial_stride: int,
         sample_indices: Sequence[int] | None,
         storage_backend: str,
@@ -153,18 +150,13 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         if not isinstance(sampling, transient_contract.TransientSamplingSpec):
             message = "sampling must be one validated TransientSamplingSpec."
             raise TypeError(message)
-        if isinstance(hdf5_cache_size, bool) or not isinstance(hdf5_cache_size, int) or hdf5_cache_size < 0:
-            message = "hdf5_cache_size must be a non-negative integer."
-            raise ValueError(message)
         self.index_path = Path(index_path).expanduser().resolve()
         self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
         self.payload = trajectory.load_transient_index(self.index_path)
         self.sampling = sampling
-        self.hdf5_cache_size = hdf5_cache_size
         self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
         self.storage_backend = storage_backend
-        self.dataset_manifest_digest: str | None = None
-        self.dataset_case_partition: dict[str, Any] | None = None
+        self.manifest_binding: identity.ManifestBinding | None = None
         self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
         if sample_indices is None:
@@ -181,7 +173,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 raise ValueError(message)
         self.sample_indices = selected
         self._item_references = self._build_item_references()
-        self._process_id: int | None = None
 
     @property
     def dataset_id(self) -> str:
@@ -193,12 +184,10 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         """Return the Generation-configured temporal normalization horizon."""
         return float(self.payload["configured_regular_horizon"]["value"])
 
-    def bind_dataset_manifest_digest(self, digest: str) -> None:
-        """Bind the factory-admitted immutable package-manifest digest."""
-        if not isinstance(digest, str) or len(digest) != _SHA256_LENGTH or any(character not in "0123456789abcdef" for character in digest):
-            message = "dataset manifest digest must be lowercase SHA-256."
-            raise ValueError(message)
-        self.dataset_manifest_digest = digest
+    @property
+    def payload_identity(self) -> dict[str, Any]:
+        """Return the identity the trajectory index states about itself, as bound into splits."""
+        return {"index_digest": str(self.payload["index_digest"]), "configured_regular_horizon": dict(self.payload["configured_regular_horizon"])}
 
     def spatial_view(self) -> tuple[tuple[int, int], tuple[int, int]]:
         """Return canonical and effective ``(Y, X)`` shapes without reading fields."""
@@ -356,40 +345,8 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             self._source_stats = tuple(observed_stat if index == case_index else value for index, value in enumerate(self._source_stats))
         return path
 
-    def _close_handles(self) -> None:
-        """Close every process-local cached HDF5 handle."""
-        for handle in self._handles.values():
-            with suppress(OSError, RuntimeError):
-                handle.close()
-        self._handles.clear()
-
     def close(self) -> None:
-        """Close bounded runtime resources owned by the current process."""
-        self._close_handles()
-        self._process_id = None
-
-    def _ensure_process(self) -> None:
-        """Discard inherited runtime state before opening a handle in this PID."""
-        process_id = os.getpid()
-        if self._process_id != process_id:
-            self._close_handles()
-            self._process_id = process_id
-
-    def _open_handle(self, path: Path) -> tuple[h5py.File, bool]:
-        """Return one lazy read-only handle and whether the caller must close it."""
-        self._ensure_process()
-        if self.hdf5_cache_size == 0:
-            return h5py.File(path, "r"), True
-        cached = self._handles.pop(path, None)
-        if cached is not None:
-            self._handles[path] = cached
-            return cached, False
-        handle = h5py.File(path, "r")
-        self._handles[path] = handle
-        while len(self._handles) > self.hdf5_cache_size:
-            _evicted_path, evicted = self._handles.popitem(last=False)
-            evicted.close()
-        return handle, False
+        """Release process-local runtime resources; the HDF5 runtime holds none between reads."""
 
     @staticmethod
     def _finite_tensor(
@@ -423,8 +380,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         case_index = reference.case_index
         case = self.payload["cases"][case_index]
         path = self._validate_runtime_source(case_index)
-        handle, close_after = self._open_handle(path)
-        try:
+        with h5py.File(path, "r") as handle:
             arrays = trajectory.read_transient_case_arrays(
                 handle,
                 path,
@@ -433,9 +389,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 expected_regular_horizon=self.configured_regular_horizon,
                 spatial_stride=self.spatial_stride,
             )
-        finally:
-            if close_after:
-                handle.close()
         return self._materialize_item(
             case=case,
             samples=samples,
@@ -468,8 +421,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         case = self.payload["cases"][case_index]
         samples = [self.payload["samples"][position] for position in all_positions]
         path = self._validate_runtime_source(case_index)
-        handle, close_after = self._open_handle(path)
-        try:
+        with h5py.File(path, "r") as handle:
             return trajectory.read_transient_case_arrays(
                 handle,
                 path,
@@ -478,9 +430,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 expected_regular_horizon=self.configured_regular_horizon,
                 spatial_stride=self.spatial_stride,
             )
-        finally:
-            if close_after:
-                handle.close()
 
     def _materialize_item(
         self,
@@ -495,7 +444,11 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         source_label: Path,
         validate_values: bool = True,
     ) -> TransientItem:
-        """Build one backend-independent TransientItem from physical arrays."""
+        """Build one backend-independent TransientItem from physical arrays.
+
+        The ``static`` and ``scalars`` tensors may share memory with the process-local shard cache
+        (copying would slow loading); consumers must treat them as read-only and never modify them in place.
+        """
         times = np.asarray(time_values, dtype=np.float64)
         dt_values = np.diff(times)
         states = self._finite_tensor(
@@ -590,24 +543,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         }
         return item
 
-    def __getstate__(self) -> dict[str, Any]:
-        """Exclude open HDF5 handles from worker serialization."""
-        state = dict(self.__dict__)
-        state["_process_id"] = None
-        state["_handles"] = OrderedDict()
-        return state
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        """Restore a worker-local dataset without runtime HDF5 resources."""
-        self.__dict__.update(state)
-        self._process_id = None
-        self._handles = OrderedDict()
-
-    def __del__(self) -> None:
-        """Best-effort close of process-local read-only HDF5 handles."""
-        with suppress(AttributeError, OSError, RuntimeError):
-            self._close_handles()
-
 
 class TransientPTShardDataset(TransientPhysicalDataset):
     """Expose the same physical samples from validated Dataset-bound PT shards."""
@@ -618,7 +553,6 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         *,
         sampling: transient_contract.TransientSamplingSpec,
         source_root: Path | str | None = None,
-        hdf5_cache_size: int = 0,
         spatial_stride: int = 1,
         sample_indices: Sequence[int] | None = None,
     ) -> None:
@@ -627,12 +561,12 @@ class TransientPTShardDataset(TransientPhysicalDataset):
             index_path,
             sampling=sampling,
             source_root=source_root,
-            hdf5_cache_size=hdf5_cache_size,
             spatial_stride=spatial_stride,
             sample_indices=sample_indices,
             storage_backend="pt_shards",
         )
-        self._shard_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._process_id: int | None = None
+        self._shard_cache: dict[int, dict[str, Any]] = {}
         self._validated_shards: set[int] = set()
         self._shard_receipt = transient_shards.load_transient_shard_receipt(
             self.dataset_id,
@@ -656,7 +590,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         self._shard_cache.clear()
 
     def close(self) -> None:
-        """Release bounded process-local shard cache and admission evidence."""
+        """Release process-local shard mappings and admission evidence."""
         self._clear_shard_cache()
         self._validated_shards.clear()
         self._process_id = None
@@ -670,11 +604,10 @@ class TransientPTShardDataset(TransientPhysicalDataset):
             self._process_id = process_id
 
     def _load_shard(self, shard_index: int) -> dict[str, Any]:
-        """Return one fully validated shard through a bounded process-local LRU."""
+        """Return one fully validated shard, keeping it mapped for the life of the process."""
         self._ensure_process()
-        cached = self._shard_cache.pop(shard_index, None)
+        cached = self._shard_cache.get(shard_index)
         if cached is not None:
-            self._shard_cache[shard_index] = cached
             return cached
         payload = transient_shards.load_transient_shard_payload(
             self.dataset_id,
@@ -684,10 +617,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
             validate_values=shard_index not in self._validated_shards,
         )
         self._validated_shards.add(shard_index)
-        shard_cache_size = max(1, self.hdf5_cache_size)
         self._shard_cache[shard_index] = payload
-        while len(self._shard_cache) > shard_cache_size:
-            self._shard_cache.popitem(last=False)
         return payload
 
     @property
@@ -770,7 +700,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         *,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> Iterator[TransientItem]:
-        """Yield one-step Train items while retaining only one shard mapping."""
+        """Yield one-step Train items shard by shard in canonical order, reusing opened shard mappings."""
         if self.sampling.mode != "one_step_transition":
             message = "Shard-aware scaling iteration requires one-step sampling."
             raise ValueError(message)
@@ -839,7 +769,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         """Exclude mmap-backed shard payloads from worker serialization."""
         state = dict(self.__dict__)
         state["_process_id"] = None
-        state["_shard_cache"] = OrderedDict()
+        state["_shard_cache"] = {}
         state["_validated_shards"] = set()
         return state
 
@@ -847,7 +777,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
         """Restore one worker-local dataset without inherited shard mappings."""
         self.__dict__.update(state)
         self._process_id = None
-        self._shard_cache = OrderedDict()
+        self._shard_cache = {}
         self._validated_shards = set()
 
     def __del__(self) -> None:
@@ -865,7 +795,7 @@ def select_transient_cases(
 
     The original runtime remains usable when replacement admission fails. The
     selected runtime preserves its storage backend, sampling contract, source
-    root, and cache policy without opening storage outside that backend's
+    root, and spatial stride without opening storage outside that backend's
     constructor.
     """
     if not isinstance(dataset, TransientPhysicalDataset):
@@ -896,7 +826,6 @@ def select_transient_cases(
         dataset.index_path,
         sampling=dataset.sampling,
         source_root=dataset.source_root,
-        hdf5_cache_size=dataset.hdf5_cache_size,
         spatial_stride=dataset.spatial_stride,
         sample_indices=positions,
     )
@@ -904,8 +833,6 @@ def select_transient_cases(
         replacement.close()
         message = "Transient runtime reconstruction changed storage backend."
         raise RuntimeError(message)
-    manifest_digest = getattr(dataset, "dataset_manifest_digest", None)
-    if manifest_digest is not None:
-        replacement.bind_dataset_manifest_digest(manifest_digest)
+    replacement.manifest_binding = dataset.manifest_binding
     dataset.close()
     return replacement

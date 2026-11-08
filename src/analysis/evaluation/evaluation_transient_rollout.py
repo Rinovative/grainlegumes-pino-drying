@@ -22,7 +22,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ import torch
 from src import domain
 from src.learning.inference import learning_inference_transient as inference
 
+from . import evaluation_prediction_validity as validity_contract
 from . import evaluation_transient_metrics as transient_metrics
 from . import evaluation_transient_validity as transient_validity
 from .evaluation_transient_artifact import (
@@ -151,8 +152,8 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
     if not items or isinstance(items, (str, bytes)):
         message = "Transient Evaluation case assembly requires ordered one-step items."
         raise ValueError(message)
-    if dataset_role not in {"id", "ood"}:
-        message = "Transient Evaluation dataset_role must be 'id' or 'ood'."
+    if dataset_role not in get_args(DatasetRole):
+        message = "Transient Evaluation dataset_role must be 'id' or 'additional_evaluation'."
         raise ValueError(message)
     states: list[np.ndarray] = []
     boundaries: list[np.ndarray] = []
@@ -640,7 +641,7 @@ def _target_evidence(
     target_wet_basis: float,
     target_fraction_limit: float,
     reference_completion: CanonicalTargetCompletion | None,
-    prediction_status: transient_validity.PredictionValidityStatus,
+    prediction_status: validity_contract.PredictionValidityStatus,
 ) -> dict[str, Any]:
     """Build distinct canonical-reference and regular-grid prediction target evidence."""
     if not 0.0 < target_fraction_limit < 1.0:
@@ -656,7 +657,7 @@ def _target_evidence(
 
     def classify(values: np.ndarray) -> tuple[bool, bool, str | None, float | None, float | None, float | None]:
         """Classify one prediction on its exact regular sequence grid."""
-        if prediction_status == transient_validity.NONFINITE:
+        if prediction_status == validity_contract.NONFINITE:
             return False, False, "prediction_contains_nonfinite_model_output", None, None, None
         if not bool(np.isfinite(values).all()):
             return False, False, "target_fraction_unavailable_for_nonphysical_state", None, None, None
@@ -754,7 +755,7 @@ def _record(
         target_fraction_limit=target_fraction_limit,
         reference_completion=reference_completion,
         prediction_status=cast(
-            "transient_validity.PredictionValidityStatus",
+            "validity_contract.PredictionValidityStatus",
             prediction_validity["status"],
         ),
     )

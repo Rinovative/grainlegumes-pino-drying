@@ -109,7 +109,7 @@ def prepare_dataset_selection(
             msg = f"Source case does not provide Dataset view {dataset_view!r}."
             raise ValueError(msg)
         if payload.get("material_role") is not None or payload.get("evaluation_regime") is not None:
-            msg = "Historical role-bearing source case is unsupported by the current Dataset contract."
+            msg = "Source case carries a material role or evaluation regime; physical Sources are role-free."
             raise ValueError(msg)
         if dataset_view == "steady_flow":
             conditioning = payload.get("steady_flow_conditioning")

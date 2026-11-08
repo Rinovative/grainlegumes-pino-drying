@@ -102,12 +102,12 @@ def validate_shared_role_membership(
     role: str,
     memberships: tuple[SharedRoleMembership, ...],
 ) -> SharedRoleMembership:
-    """Require every transient comparison run to evaluate identical role membership."""
+    """Require every comparison run of either task to evaluate identical role membership."""
     if not isinstance(role, str) or not role:
-        msg = "Transient comparison role must be non-empty text."
+        msg = "Comparison role must be non-empty text."
         raise ValueError(msg)
     if len(memberships) < _MINIMUM_SHARED_MEMBERSHIP_RUNS:
-        msg = "Transient shared-membership validation requires at least two runs."
+        msg = "Shared-membership validation requires at least two runs."
         raise ValueError(msg)
     reference = memberships[0]
     for membership in memberships:
@@ -122,24 +122,23 @@ def validate_shared_role_membership(
             or not all(isinstance(value, str) and value for value in membership.case_ids)
             or membership.case_ids != tuple(sorted(set(membership.case_ids)))
         ):
-            msg = f"Transient {role!r} membership evidence is malformed."
+            msg = f"Comparison {role!r} membership evidence is malformed."
             raise ValueError(msg)
         if membership != reference:
-            msg = f"Transient comparison runs disagree on exact {role!r} dataset membership."
+            msg = f"Comparison runs disagree on exact {role!r} dataset membership; select runs evaluated on the same cases."
             raise ValueError(msg)
     return reference
 
 
-def validate_matched_a1_b_lineage_comparison(
+def matched_lineage_mismatch(
     *,
     a0: TrainingArmEvidence,
     a1: TrainingArmEvidence,
     b: TrainingArmEvidence,
-) -> LineageComparison:
-    """Admit the real A0/B/A1 branch and B-receipt-matched training time."""
+) -> str | None:
+    """Return why three valid arms are not one matched A0/A1/B set, or ``None`` when they are."""
     if (a0.arm, a1.arm, b.arm) != ("A0", "A1", "B"):
-        msg = "Matched lineage comparison requires distinct A0, A1, and B arms."
-        raise ValueError(msg)
+        return "Matched lineage comparison requires distinct A0, A1, and B arms."
     for name in (
         "parent_id",
         "architecture_id",
@@ -151,11 +150,22 @@ def validate_matched_a1_b_lineage_comparison(
     ):
         values = {getattr(item, name) for item in (a0, a1, b)}
         if len(values) != 1 or not next(iter(values)):
-            msg = f"Matched A0/B/A1 immutable lineage evidence disagrees for {name}."
-            raise ValueError(msg)
+            return f"Matched A0/B/A1 immutable lineage evidence disagrees for {name}."
     if not b.parent_experiment_sha256 or b.parent_experiment_sha256 != a1.parent_experiment_sha256:
-        msg = "Matched B/A1 must share their exact branch parent identity."
-        raise ValueError(msg)
+        return "Matched B/A1 must share their exact branch parent identity."
+    return None
+
+
+def validate_matched_a1_b_lineage_comparison(
+    *,
+    a0: TrainingArmEvidence,
+    a1: TrainingArmEvidence,
+    b: TrainingArmEvidence,
+) -> LineageComparison:
+    """Admit the real A0/B/A1 branch and B-receipt-matched training time."""
+    mismatch = matched_lineage_mismatch(a0=a0, a1=a1, b=b)
+    if mismatch is not None:
+        raise ValueError(mismatch)
     if a0.parent_experiment_sha256 is not None:
         msg = "Shared A0 identity must remain independent of a B/A1 branch."
         raise ValueError(msg)

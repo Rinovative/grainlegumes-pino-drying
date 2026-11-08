@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 if (( $# < 2 )); then
-  printf 'Usage: %s SOURCE_TREE cli|benchmark-preflight|campaign-case|benchmark-case|node-worker [ARGS...]\n' "$0" >&2
+  printf 'Usage: %s SOURCE_TREE cli|campaign-case|node-worker [ARGS...]\n' "$0" >&2
   exit 2
 fi
 
@@ -19,12 +19,12 @@ fi
 
 # A case step repeats the checks that the node worker reported once at node start: its passing checks stay silent,
 # a failing check is still reported on stderr and ends the step.
-if [[ "${MODE}" == campaign-case || "${MODE}" == benchmark-case ]]; then
+if [[ "${MODE}" == campaign-case ]]; then
   export GENERATION_PREFLIGHT_QUIET=1
 fi
 
 # Admit the frozen source tree, its roots, and the native venv before importing any project Python.
-if [[ "${MODE}" == cli || "${MODE}" == benchmark-preflight ]]; then
+if [[ "${MODE}" == cli ]]; then
   /bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
     "${REPOSITORY_ROOT}" "${GENERATION_GIT_COMMIT:-}" "${BASH_SOURCE[0]}" >&2
 else
@@ -46,17 +46,6 @@ run_python() {
   "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" "$@"
 }
 
-cleanup_benchmark_preflight() {
-  local status="$?"
-  trap - EXIT
-  if [[ "${SCRATCH}" != "${SCRATCH_PARENT%/}/generation-benchmark-preflight."* ]]; then
-    printf 'Refusing to remove an unexpected benchmark scratch directory.\n' >&2
-    exit 1
-  fi
-  rm -rf -- "${SCRATCH}" || exit 1
-  exit "${status}"
-}
-
 validate_source_after_python() {
   local status="$1"
   if ! GENERATION_PREFLIGHT_QUIET=1 /bin/bash "${PREREQUISITE_HELPER}" validate-worker-repository \
@@ -74,42 +63,7 @@ run_python_mode() {
     printf 'Generation Python mode requires a CLI command.\n' >&2
     return 2
   fi
-  if [[ "${MODE}" == benchmark-preflight ]]; then
-    case "$1" in
-      materialize-core-benchmark-inputs|submit-core-benchmark|resume-core-benchmark) ;;
-      *) printf 'Unsupported native benchmark preparation operation: %s\n' "$1" >&2; return 2 ;;
-    esac
-    if ! module load Comsol/v6.4 >&2; then
-      printf 'Generation node could not load Comsol/v6.4.\n' >&2
-      return 1
-    fi
-    local comsol_executable comsol_version
-    comsol_executable="$(command -v comsol)" || {
-      printf 'Native COMSOL executable is unavailable.\n' >&2
-      return 1
-    }
-    comsol_executable="$(readlink -f -- "${comsol_executable}")"
-    comsol_version="$(generation_comsol_version "${comsol_executable}")" || {
-      printf 'Native COMSOL version query failed.\n' >&2
-      return 1
-    }
-    SCRATCH_PARENT="${TMPDIR:-/tmp}"
-    if [[ "${SCRATCH_PARENT}" != /* || ! -d "${SCRATCH_PARENT}" || ! -w "${SCRATCH_PARENT}" ]]; then
-      printf 'Native benchmark scratch parent is unavailable: %s\n' "${SCRATCH_PARENT}" >&2
-      return 1
-    fi
-    SCRATCH="$(mktemp -d "${SCRATCH_PARENT%/}/generation-benchmark-preflight.XXXXXXXX")"
-    trap cleanup_benchmark_preflight EXIT
-    if [[ "$1" != resume-core-benchmark ]]; then
-      run_python "$@" --scratch-root "${SCRATCH}" \
-        --comsol-version-output "${comsol_version}" \
-        --comsol-executable-path "${comsol_executable}" || status=$?
-    else
-      run_python "$@" --scratch-root "${SCRATCH}" || status=$?
-    fi
-  else
-    run_python "$@" || status=$?
-  fi
+  run_python "$@" || status=$?
   validate_source_after_python "${status}"
 }
 
@@ -154,16 +108,16 @@ sweep_stale_worker_scratch() {
     return 0
   fi
   active_jobs=$'\n'"${active_jobs// /}"$'\n'
-  for entry in "${scratch_parent%/}"/vp2-generation-*.* "${scratch_parent%/}"/vp2-benchmark-*.*; do
+  for entry in "${scratch_parent%/}"/vp2-generation-*.*; do
     if [[ ! -d "${entry}" || -L "${entry}" || ! -O "${entry}" \
       || ! -f "${entry}/${WORKER_WORKSPACE_MARKER}" || -L "${entry}/${WORKER_WORKSPACE_MARKER}" ]]; then
       continue
     fi
     name="${entry##*/}"
-    if [[ ! "${name}" =~ ^vp2-(generation|benchmark)-([0-9]+)[.-] ]]; then
+    if [[ ! "${name}" =~ ^vp2-generation-([0-9]+)[.-] ]]; then
       continue
     fi
-    job_id="${BASH_REMATCH[2]}"
+    job_id="${BASH_REMATCH[1]}"
     if [[ "${active_jobs}" == *$'\n'"${job_id}"$'\n'* ]]; then
       continue
     fi
@@ -212,7 +166,7 @@ on_case_exit() {
   local status="$?" cleanup_status=0
   trap - EXIT INT TERM
   set +e
-  if [[ "${MODE}" == campaign-case && -n "${INTERRUPTION_SIGNAL}" ]]; then
+  if [[ -n "${INTERRUPTION_SIGNAL}" ]]; then
     run_python record-worker-interruption "${CASE_RUN_ID}" \
       --signal "${INTERRUPTION_SIGNAL}" --exit-code "${status}" \
       --storage-root "${STORAGE_ROOT}" \
@@ -239,14 +193,10 @@ run_case_worker() {
       "CPU compute-node" "writable scratch parent: ${scratch_parent}" "compute"
   fi
   sweep_stale_worker_scratch "${scratch_parent}"
-  if [[ "${MODE}" == campaign-case ]]; then
-    # A case step inside a node job shares its job ID with every other step; the step ID keeps the scratch root attributable.
-    prefix="vp2-generation-${SLURM_JOB_ID}"
-    if [[ "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ ]]; then
-      prefix+="-${SLURM_STEP_ID}"
-    fi
-  else
-    prefix="vp2-benchmark-${SLURM_JOB_ID}-${SLURM_STEP_ID}-${CASE_ROLE}"
+  # A case step inside a node job shares its job ID with every other step; the step ID keeps the scratch root attributable.
+  prefix="vp2-generation-${SLURM_JOB_ID}"
+  if [[ "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ ]]; then
+    prefix+="-${SLURM_STEP_ID}"
   fi
   WORK_ROOT="$(mktemp -d "${scratch_parent%/}/${prefix}.XXXXXX")"
   # Held until this worker and every child inheriting the descriptor exit; the sweep never removes a locked scratch.
@@ -263,13 +213,8 @@ run_case_worker() {
 
   # Python starts directly in the background (not through run_python): a backgrounded shell function is a subshell,
   # and the trap's TERM would stop that subshell while the case worker kept running without its orderly stop.
-  if [[ "${MODE}" == campaign-case ]]; then
-    "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}" \
-      --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
-  else
-    "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-core-benchmark-case "${CASE_RUN_ID}" "${SWEEP_ID}" "${VARIANT_ID}" "${VARIANT_ATTEMPT}" "${CASE_ROLE}" \
-      --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
-  fi
+  "${GENERATION_NATIVE_VENV}/bin/python" -m "${PYTHON_MODULE}" run-campaign-case "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_INDEX}" \
+    --storage-root "${STORAGE_ROOT}" --work-root "${WORK_ROOT}" &
   CHILD_PID="$!"
   set +e
   wait "${CHILD_PID}"
@@ -324,7 +269,7 @@ run_node_worker_mode() {
 }
 
 case "${MODE}" in
-  cli|benchmark-preflight)
+  cli)
     run_python_mode "$@"
     ;;
   campaign-case)
@@ -352,33 +297,10 @@ case "${MODE}" in
     fi
     printf -v CASE_ID 'case_%04d' "${CASE_INDEX}"
     CASE_NODE="${SLURMD_NODENAME:-${HOSTNAME:-unavailable}}"
-    CASE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf unavailable)"
+    CASE_STARTED_AT="$(date +%Y-%m-%dT%H:%M:%S%:z 2>/dev/null || printf unavailable)"
     printf 'CASE START campaign_run_id=%s batch=%s case=%s case_index=%s job=%s step=%s dispatch=%s node=%s cores=%s started_at=%s\n' \
       "${CASE_RUN_ID}" "${BATCH_NAME}" "${CASE_ID}" "${CASE_INDEX}" \
       "${SLURM_JOB_ID}" "${SLURM_STEP_ID:-unavailable}" "${GENERATION_DISPATCH_KEY:-unavailable}" "${CASE_NODE}" "${CORES_PER_CASE}" "${CASE_STARTED_AT}"
-    run_case_worker
-    ;;
-  benchmark-case)
-    if (( $# != 5 )); then
-      printf 'Usage: %s SOURCE_TREE benchmark-case BENCHMARK_RUN_ID SWEEP_ID VARIANT_ID VARIANT_ATTEMPT CASE_ROLE\n' "$0" >&2
-      exit 2
-    fi
-    CASE_RUN_ID="$1"
-    SWEEP_ID="$2"
-    VARIANT_ID="$3"
-    VARIANT_ATTEMPT="$4"
-    CASE_ROLE="$5"
-    if [[ ! "${CASE_RUN_ID}" =~ ^core_scaling_transient__[0-9a-f]{16}$ \
-      || "${GENERATION_BENCHMARK_RUN_ID:-}" != "${CASE_RUN_ID}" \
-      || ! "${SWEEP_ID}" =~ ^[a-z0-9]+(_[a-z0-9]+)*$ \
-      || ! "${VARIANT_ID}" =~ ^[A-Za-z0-9._-]+$ \
-      || ! "${VARIANT_ATTEMPT}" =~ ^[1-9][0-9]*$ \
-      || ! "${CASE_ROLE}" =~ ^[A-Za-z0-9._-]+$ \
-      || ! "${SLURM_STEP_ID:-}" =~ ^[0-9]+$ \
-      || -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-      printf 'Benchmark case identity or Slurm allocation is inconsistent.\n' >&2
-      exit 2
-    fi
     run_case_worker
     ;;
   node-worker)

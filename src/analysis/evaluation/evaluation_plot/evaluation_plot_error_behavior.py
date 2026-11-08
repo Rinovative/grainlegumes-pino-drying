@@ -29,6 +29,7 @@ from matplotlib.lines import Line2D
 from scipy.stats import gaussian_kde
 
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
@@ -50,11 +51,11 @@ _BAND_LABELS = ("0-5 %", "5-10 %", "10-20 %", "20-40 %", ">40 %")
 
 
 def _finite(frame: pd.DataFrame, column: str, *, limit: int | None = None) -> np.ndarray:
-    """Return finite non-negative current metric values in saved order."""
+    """Return the non-negative metric values of the finite cases in saved order; non-finite cases are left out, so it may be empty."""
     selected = frame if limit is None else frame.iloc[:limit]
-    values = np.asarray(pd.to_numeric(selected[column], errors="raise"), dtype=float)
-    if values.size == 0 or not np.isfinite(values).all() or np.any(values < 0.0):
-        msg = f"{column} must contain finite non-negative values."
+    values = validity_contract.finite_case_values(pd.to_numeric(selected[column], errors="raise"))
+    if np.any(values < 0.0):
+        msg = f"{column} must not contain a negative value."
         raise ValueError(msg)
     return values
 
@@ -118,6 +119,13 @@ def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure
         raise ValueError(msg)
     metrics = (("Relative L2", "rel_l2"), ("Relative H1", "rel_h1"))
     populations = {column: [_finite(datasets[name], column) for name in names] for _label, column in metrics}
+    # A dataset without one finite case stays in the comparison, is drawn nowhere and says so in the legend.
+    display_names = tuple(
+        f"{display_name}: unavailable (0 finite of {len(datasets[name])} cases)"
+        if all(populations[column][index].size == 0 for _label, column in metrics)
+        else display_name
+        for index, (name, display_name) in enumerate(zip(names, display_names, strict=True))
+    )
     palette = [plt.get_cmap("tab10")(index % 10) for index in range(len(names))]
     figure = plt.figure(figsize=(21, 10))
     grid = figure.add_gridspec(3, 3, width_ratios=(1.0, 1.0, 0.35), hspace=0.35, wspace=0.25)
@@ -141,6 +149,8 @@ def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure
         box_axis.set_title(f"{display_name} - Boxplot")
         box_axis.set_ylabel(f"{display_name} (dimensionless)")
         for values, name, color in zip(values_by_dataset, names, palette, strict=True):
+            if values.size == 0:
+                continue
             if values.size >= _MINIMUM_KDE_SAMPLES and not np.allclose(values, values[0]):
                 coordinates = np.linspace(float(np.min(values)), float(np.max(values)), 400)
                 density_axis.plot(coordinates, gaussian_kde(values)(coordinates), color=color, label=name)
@@ -210,8 +220,11 @@ def plot_predictive_error_distributions(
         summary = summaries[id(frame)]
         global_axis = axes[0, column]
         local_axis = axes[1, column]
-        _plot_ecdf(global_axis, _finite(frame, "rel_l2", limit=count), color="black")
-        for field in fields:
+        if not summary.used_count:
+            layout.mark_empty_prefix(global_axis, local_axis, case_count=summary.case_count)
+        else:
+            _plot_ecdf(global_axis, _finite(frame, "rel_l2", limit=count), color="black")
+        for field in fields if summary.used_count else ():
             local = _prefix_field(summary, field, "local_relative_error")
             local_axis.plot(
                 local.quantiles,
@@ -484,8 +497,13 @@ def plot_error_vs_target_magnitude(
     for row, field in enumerate(fields):
         axis = axes[row]
         for label, frame in datasets.items():
-            trend = _prefix_field(summaries[id(frame)], field, "target_magnitude_error")
+            summary = summaries[id(frame)]
             display_label = count_headings[label] or label
+            if not summary.used_count:
+                if row == 0:
+                    handles.append(Line2D([], [], linestyle="none", label=f"{display_label}: {layout.empty_prefix_text(summary.case_count)}"))
+                continue
+            trend = _prefix_field(summary, field, "target_magnitude_error")
             (line,) = axis.plot(trend.centers, trend.medians, marker="o", markersize=4, label=display_label, alpha=0.9)
             if row == 0:
                 handles.append(line)
@@ -494,6 +512,7 @@ def plot_error_vs_target_magnitude(
                 np.all(_prefix_field(summaries[id(frame)], field, "target_magnitude_error").centers > 0.0)
                 and np.all(_prefix_field(summaries[id(frame)], field, "target_magnitude_error").medians > 0.0)
                 for frame in datasets.values()
+                if summaries[id(frame)].used_count
             )
             if all_positive:
                 axis.set_xscale("log")
@@ -541,6 +560,10 @@ def plot_boundary_error_decomposition(
     width = 0.8 / len(_BAND_LABELS)
     for axis, (label, frame) in zip(axes, datasets.items(), strict=True):
         summary = summaries[id(frame)]
+        if not summary.used_count:
+            layout.mark_empty_prefix(axis, case_count=summary.case_count)
+            axis.set_title(count_headings[label] or label)
+            continue
         means = np.stack([np.asarray(_prefix_field(summary, by_label[channel], "boundary_region_error").means) for channel in active])
         ratios = np.divide(
             means,
@@ -563,7 +586,8 @@ def plot_boundary_error_decomposition(
         axis.set_xlabel("Channel")
         axis.set_title(count_headings[label] or label)
         axis.grid(True, axis="y", linestyle="--", alpha=0.3)
-    legend_axis.legend(bar_handles, _BAND_LABELS, title="x-distance from left/right boundary", loc="upper left")
+    if bar_handles:
+        legend_axis.legend(bar_handles, _BAND_LABELS, title="x-distance from left/right boundary", loc="upper left")
     figure.subplots_adjust(top=0.87, bottom=0.07, left=0.001, right=0.98, wspace=0.25)
     layout.title_over_axes(figure, figure_title, axes, y=0.97)
     return figure

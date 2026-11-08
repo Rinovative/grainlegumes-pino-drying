@@ -1,10 +1,10 @@
 """Common Generation run planning and lifecycle contracts.
 
 Responsibilities:
-  - Check schema-based run dispatch, benchmark order, and byte-bound workflow children
+  - Check schema-based run dispatch and the authored-campaign plan resolved from a Dataset plan
 
 Design principles:
-  - Planning preserves authored child order and rejects unsafe duplicate membership
+  - Planning rejects unknown schema kinds before any loader runs
 
 This module does NOT:
   - Prepare cases or submit scheduler jobs during planning
@@ -56,36 +56,6 @@ def _campaign(*, profile: str = "steady_flow", purpose: str = "source_generation
     )
 
 
-def _benchmark_suite() -> SimpleNamespace:
-    small = SimpleNamespace(variant_id="small", cores_per_case=2)
-    large = SimpleNamespace(variant_id="large", cores_per_case=8)
-    sweeps = (SimpleNamespace(sweep_id="sweep_1", order="ascending"), SimpleNamespace(sweep_id="sweep_2", order="descending"))
-    representatives = (
-        SimpleNamespace(case_role="case_01", case_index=3),
-        SimpleNamespace(case_role="case_02", case_index=4),
-    )
-    case_config = SimpleNamespace(
-        batch_id="benchmark-batch",
-        case_input_config_digest="benchmark-input-digest",
-        case_id=lambda index: f"case_{index:04d}",
-        case_seed=lambda index: 700 + index,
-    )
-    return SimpleNamespace(
-        suite_digest="suite-digest",
-        variants=(small, large),
-        sweeps=sweeps,
-        sweep_variants=lambda sweep: (small, large) if sweep.order == "ascending" else (large, small),
-        resources=lambda variant: SimpleNamespace(concurrent_cases=32 // variant.cores_per_case),
-        representative_case_count=2,
-        target_successful_cases=1,
-        representative_case=lambda position: representatives[position - 1],
-        case_config=case_config,
-        work_unit_id=lambda sweep, variant, attempt, position: (
-            f"{sweep.sweep_id}-{variant.variant_id}-a{attempt}-{representatives[position - 1].case_role}"
-        ),
-    )
-
-
 def test_dispatches_by_schema_kind_and_builds_campaign_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve campaign schemas into ordered common work units."""
     config = _write_yaml(tmp_path / "mutable-name.yaml", "schema_kind: generation_source_campaign\nschema_version: 1\n")
@@ -112,46 +82,6 @@ def test_rejects_unknown_top_level_schema_without_loader(tmp_path: Path, monkeyp
 
     with pytest.raises(ValueError, match="Unsupported Generation run schema_kind"):
         run_service.resolve_generation_run(config, source_commit=COMMIT, repository_root=tmp_path)
-
-
-def test_benchmark_refuses_a_source_revision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A revision relabels a Source campaign; a benchmark has no Source, so the override is refused before its suite loads."""
-    config = _write_yaml(tmp_path / "suite.yaml", "schema_kind: generation_core_scaling_benchmark_suite\nschema_version: 1\n")
-    monkeypatch.setattr(run_service.benchmark_config, "load_core_benchmark_suite", lambda *_args, **_kwargs: pytest.fail("suite must not load"))
-
-    with pytest.raises(ValueError, match="source campaigns only"):
-        run_service.resolve_generation_run(config, source_commit=COMMIT, repository_root=tmp_path, scientific_overrides={"revision": "fix"})
-
-
-def test_benchmark_units_follow_sweep_groups_and_never_prepare(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Plan each sweep's variant groups in sweep order, each group after the previous one, without a preparation unit."""
-    config = _write_yaml(
-        tmp_path / "suite.yaml",
-        "schema_kind: generation_core_scaling_benchmark_suite\nschema_version: 3\n",
-    )
-    monkeypatch.setattr(run_service.benchmark_config, "load_core_benchmark_suite", lambda *_args, **_kwargs: _benchmark_suite())
-
-    plan = run_service.resolve_generation_run(config, source_commit=COMMIT, repository_root=tmp_path)
-
-    assert plan.run_kind == "benchmark"
-    assert [unit.unit_id for unit in plan.units] == [
-        "sweep_1-small-a1-case_01",
-        "sweep_1-small-a1-case_02",
-        "sweep_1-large-a1-case_01",
-        "sweep_1-large-a1-case_02",
-        "sweep_2-large-a1-case_01",
-        "sweep_2-large-a1-case_02",
-        "sweep_2-small-a1-case_01",
-        "sweep_2-small-a1-case_02",
-    ]
-    assert all(unit.unit_kind == "benchmark_case" for unit in plan.units)
-    assert plan.units[0].depends_on == ()
-    assert plan.units[2].depends_on == ("sweep_1-small-a1-case_01", "sweep_1-small-a1-case_02")
-    assert plan.units[4].depends_on == ()
-    assert plan.units[6].depends_on == ("sweep_2-large-a1-case_01", "sweep_2-large-a1-case_02")
-    assert dict(plan.units[2].metadata)["concurrent_cases"] == 4
-    assert all(dict(unit.metadata)["success_target"] == 1 for unit in plan.units)
-    assert "build_packages" not in plan.lifecycle_stages
 
 
 def test_authored_campaign_plan_dispatches_mapping_and_preserves_plan_bytes(

@@ -326,6 +326,10 @@ def test_target_attainment_censoring_grouping_exclusions_and_runtime_separation(
     assert diagnostic.cases["comsol_process_seconds"].eq(12.0).all()
     assert diagnostic.cases["queue_wait_seconds"].isna().all()
 
+    del frame.attrs["failed_case_count"]
+    with pytest.raises(ValueError, match=r"canonical_generation_hdf5.*failed_case_count"):
+        transient.target_attainment_diagnostic(frame)
+
 
 def test_steady_dataframe_behavior_remains_unchanged() -> None:
     """Retain steady field order, values, speed derivation, and metadata columns."""
@@ -341,6 +345,14 @@ def test_steady_dataframe_behavior_remains_unchanged() -> None:
         "sample_ids": ["case_0001"],
         "rows": [row],
         "available_case_count": 1,
+        "total_discovered_case_count": 1,
+        "failed_case_count": 0,
+        "incomplete_case_count": 0,
+        "invalid_case_count": 0,
+        "exclusion_reasons": {},
+        "case_accounting_scope": "test_owned_discovery",
+        "analysis_representation": "steady_field_rows",
+        "dataset_backend": "test_owned_backend",
         "generated_batch_identity": {"batch_manifest_identity_sha256": "f" * 64},
         "manifest_sha256": "d" * 64,
         "generation_root": Path("/synthetic"),
@@ -350,6 +362,11 @@ def test_steady_dataframe_behavior_remains_unchanged() -> None:
     np.testing.assert_allclose(frame.iloc[0]["U"], np.hypot(frame.iloc[0]["u"], frame.iloc[0]["v"]))
     assert frame.attrs["field_names"] == (*task.input_names, *task.output_names, "U")
     assert frame.attrs["spatial_shape"] == shape
+    assert frame.attrs["failed_case_count"] == 0
+
+    del loaded["failed_case_count"]
+    with pytest.raises(ValueError, match=r"'synthetic_steady'.*failed_case_count"):
+        eda_dataframe._steady_dataframe(loaded, batch_name="synthetic_steady", task=task)
 
 
 def test_hdf5_and_pt_items_match_after_selected_source_cleanup(

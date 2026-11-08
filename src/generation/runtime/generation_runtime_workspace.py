@@ -133,11 +133,8 @@ def resolve_work_root(
 
 
 def workspace_run_id(config: GenerationConfig) -> str:
-    """Return the campaign, benchmark, or local batch identity for work."""
-    run_id = os.environ.get(
-        "GENERATION_BENCHMARK_RUN_ID",
-        os.environ.get("GENERATION_CAMPAIGN_RUN_ID", config.batch_id),
-    )
+    """Return the campaign or local batch identity for work."""
+    run_id = os.environ.get("GENERATION_CAMPAIGN_RUN_ID", config.batch_id)
     return common.paths.validate_logical_name(run_id, label="workspace run_id")
 
 
@@ -279,7 +276,7 @@ def _guard_cleanup_target(
     )
     if (
         marker.get("schema_kind") != marker_kind
-        or marker.get("schema_version") != WORKSPACE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(marker.get("schema_version"), WORKSPACE_SCHEMA_VERSION)
         or marker.get("run_id") != expected_run_id
         or marker.get("work_directory") != str(resolved_target)
     ):

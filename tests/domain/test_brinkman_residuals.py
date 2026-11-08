@@ -274,22 +274,26 @@ def test_flux_balance_accepts_heterogeneous_divergence_free_flow() -> None:
     assert torch.allclose(balance, torch.zeros_like(balance), atol=1e-14)
 
 
-def test_viscous_stress_matches_incompressible_stokes_brinkman() -> None:
+def test_viscous_stress_matches_the_comsol_brinkman_stress() -> None:
     """
-    Evaluate a divergent quadratic velocity where a compressible trace term would differ.
+    Evaluate a divergent velocity whose trace term varies in both directions, with heterogeneous porosity.
 
-    For ``u = x**2`` the incompressible stress ``(mu/eps)(grad u + grad u^T)`` gives
-    ``div(tau)_x = 4 mu / eps``; the compressible ``2/3 div(u)`` form would give a third less.
+    With ``u = v = x y`` and ``mu/eps = mu (a + b x)`` the COMSOL stress
+    ``(mu/eps)(grad u + grad u^T - (2/3) div(u) I)`` gives
+    ``div(tau)_x = mu (b (4y - 2x)/3 + (a + b x)/3)`` and ``div(tau)_y = mu (b (x + y) + (a + b x)/3)``.
+    Dropping the trace from either normal stress, a wrong trace factor or sign, or mu/eps
+    outside the divergence changes at least one component.
     """
-    x_grid, _ = _grid()
+    x_grid, y_grid = _grid()
     zeros = torch.zeros_like(x_grid)
     ones = torch.ones_like(x_grid)
-    porosity = 0.5
+    inverse_porosity = 2.0 + 0.5 * x_grid
+    velocity = x_grid * y_grid
     momentum = domain.physics.brinkman.brinkman_momentum_residuals(
         zeros,
-        x_grid.square(),
-        zeros,
-        torch.full_like(x_grid, porosity),
+        velocity,
+        velocity,
+        1.0 / inverse_porosity,
         ones,
         zeros,
         ones,
@@ -298,12 +302,13 @@ def test_viscous_stress_matches_incompressible_stokes_brinkman() -> None:
         0.125,
     )
     viscosity = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
-    expected_x = 4.0 * viscosity / porosity - viscosity * x_grid.square()
+    expected_x = viscosity * (0.5 * (4.0 * y_grid - 2.0 * x_grid) / 3.0 + inverse_porosity / 3.0 - velocity)
+    expected_y = viscosity * (0.5 * (x_grid + y_grid) + inverse_porosity / 3.0 - velocity)
     # One-sided edge stencils are inexact for quadratics; two cells inward only central ones remain.
     interior = (slice(None), slice(2, -2), slice(2, -2))
 
-    assert torch.allclose(momentum.x[interior], expected_x[interior], rtol=1e-9, atol=0.0)
-    assert torch.allclose(momentum.y[interior], zeros[interior], atol=1e-18)
+    assert torch.allclose(momentum.x[interior], expected_x[interior], rtol=0.0, atol=1e-12 * viscosity)
+    assert torch.allclose(momentum.y[interior], expected_y[interior], rtol=0.0, atol=1e-12 * viscosity)
 
 
 def test_viscosity_matches_comsol_air_at_flow_reference_temperature() -> None:

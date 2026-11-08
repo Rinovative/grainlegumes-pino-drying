@@ -50,15 +50,10 @@ class DatasetViewSpec:
     """Describe one buildable Dataset view and its source relevance contract."""
 
     id: DatasetViewId
-    registered_task_id: str | None
+    registered_task_id: str
     source_profiles: tuple[str, ...]
     parameter_ood_blocks: tuple[str, ...]
     contract_digest: str
-
-    @property
-    def trainable(self) -> bool:
-        """Return whether the view is backed by a registered learning task."""
-        return self.registered_task_id is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +64,6 @@ class DatasetFieldInspection:
     unit: str
     role: str
     representation: str | None
-    source_name: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,7 +159,6 @@ def _steady_field(field: domain.tasks.spec.FieldSpec) -> DatasetFieldInspection:
         unit=field.unit,
         role=field.role,
         representation=field.representation,
-        source_name=field.source_name,
     )
 
 
@@ -181,7 +174,6 @@ def _transient_fields(
             unit=field.unit,
             role=role,
             representation=None,
-            source_name=None,
         )
         for field in fields
     )
@@ -301,7 +293,7 @@ _VIEWS: Final = MappingProxyType(
         ),
         "transient_drying": DatasetViewSpec(
             id="transient_drying",
-            registered_task_id=None,
+            registered_task_id="transient_drying",
             source_profiles=_source_profiles("transient_drying"),
             parameter_ood_blocks=(),
             contract_digest=transient_contract.transient_contract_digest(),
@@ -347,7 +339,7 @@ def inspect_contract(view_id: str) -> DatasetContractInspection:
 
     """
     view = get_view(view_id)
-    if view.registered_task_id is not None:
+    if view.id == "steady_flow":
         return _steady_inspection(view, domain.tasks.registry.get_task(view.registered_task_id))
     return _transient_inspection(view, transient_contract.TRANSIENT_STEP_CONTRACT)
 

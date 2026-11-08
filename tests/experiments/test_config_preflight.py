@@ -130,7 +130,7 @@ def test_matched_overrides_are_rejected_for_optuna_workflow(
     """Keep the matched-plan overrides out of the Optuna interface."""
     path = configs.write_yaml(tmp_path / "study.yaml", configs.optuna_config())
 
-    with pytest.raises(ValueError, match="apply only to matched transient training"):
+    with pytest.raises(ValueError, match="require a transient matched_a1_b plan"):
         preflight.validate_workflow(path, requested_workflow="optuna", **override)
 
 

@@ -1,7 +1,7 @@
 """Publish immutable Dataset selections from exact admitted source cases.
 
 Responsibilities:
-  - Build steady tensor payloads or transient trajectory indexes from prepared plans
+  - Build steady tensor payloads or transient trajectory indexes and PT shards from prepared plans
   - Bind content-derived Dataset identities to complete source provenance
   - Publish or reuse exact immutable payload and manifest pairs under writer locks
   - Keep identical content from being published under a second name
@@ -10,6 +10,7 @@ Design principles:
   - Source admission and compatibility remain owned by package planning
   - Immutable publication rejects conflicting content instead of overwriting it
   - Publication completes only after payload and manifest evidence agree
+  - One staged folder holds manifest and complete payload; one rename publishes it, a failure publishes nothing
   - The shared identity registry binds a content digest to its one Dataset directory
 
 This module does NOT:
@@ -40,12 +41,11 @@ from . import dataset_packages_planning as planning
 from . import dataset_packages_reproduction as reproduction
 from . import dataset_packages_selection as selection
 from . import dataset_packages_trajectory as trajectory
+from . import dataset_packages_transient_shards as transient_shards
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-DATASET_PACKAGE_SCHEMA_KIND: Final = package_manifest.DATASET_PACKAGE_SCHEMA_KIND
-DATASET_PACKAGE_SCHEMA_VERSION: Final = package_manifest.DATASET_PACKAGE_SCHEMA_VERSION
 _REGISTRY_KIND: Final = "dataset"
 
 
@@ -84,8 +84,8 @@ def _provenance(
     if case_partition is not None:
         case_partition = partition_contract.validate_fixed_partition(case_partition, case_ids=case_ids, material_by_case=material_by_case)
     return {
-        "schema_kind": DATASET_PACKAGE_SCHEMA_KIND,
-        "schema_version": DATASET_PACKAGE_SCHEMA_VERSION,
+        "schema_kind": identity.DATASET_PACKAGE_SCHEMA_KIND,
+        "schema_version": identity.DATASET_PACKAGE_SCHEMA_VERSION,
         "dataset_name": request["dataset_name"],
         "dataset_view": view.id,
         "registered_task_id": view.registered_task_id,
@@ -124,9 +124,7 @@ def _build_steady_payload(
     fingerprints: list[str] = []
     sample_ids: list[str] = []
     for admitted, entry in zip(prepared.cases, prepared.source_case_identities, strict=True):
-        if common.serialization.file_sha256(admitted.hdf5_path) != entry["source"]["case_hdf5_sha256"]:
-            msg = "Source HDF5 changed after Dataset admission."
-            raise ValueError(msg)
+        identity.require_admitted_source_bytes(admitted.hdf5_path, entry["source"]["case_hdf5_sha256"])
         package_case_id = entry["package_case_id"]
         _shape, case_inputs, case_outputs, case_metadata, source, fingerprint = generated.interpret_admitted_source_case(
             admitted,
@@ -140,8 +138,8 @@ def _build_steady_payload(
         sources.append(source)
         fingerprints.append(fingerprint)
     selection_identity = {
-        "schema_kind": "dataset_source_selection",
-        "schema_version": 1,
+        "schema_kind": identity.SOURCE_SELECTION_SCHEMA_KIND,
+        "schema_version": identity.SOURCE_SELECTION_SCHEMA_VERSION,
         "source_cases": list(prepared.source_case_identities),
     }
     payload = identity.build_training_dataset_payload(
@@ -197,12 +195,17 @@ def _publish(
     build_payload: Callable[[Path], Mapping[str, int]],
     selection_request: Mapping[str, Any],
     storage_root: Path | str | None,
-    validate_ranked_claim: bool = True,
+    validate_ordered_claim: bool = True,
     verify_producer: Callable[[], None] | None = None,
     expected_payload_sha256: str | None = None,
     output_directory: Path | None = None,
+    build_derived_payload: Callable[[Path, Mapping[str, Any]], str] | None = None,
 ) -> tuple[Path, Path, bool, dict[str, Any]]:
-    """Publish once under a lock; incomplete or conflicting identities fail closed."""
+    """Publish once under a lock; incomplete or conflicting identities fail closed.
+
+    Derived payload parts are built in the same staged folder before the manifest, which binds their digest, so the
+    manifest, the payload and every derived part become visible in one atomic rename or not at all.
+    """
     registry = _dataset_registry(storage_root) if output_directory is None else None
     content_digest = identity.package_content_digest(prefix)
     if output_directory is None:
@@ -239,15 +242,15 @@ def _publish(
             if identity.package_semantic_identity_payload(existing) != identity.package_semantic_identity_payload(prefix):
                 msg = "Dataset name already binds different immutable content; pass --revision <label> for a deliberately separate Dataset."
                 raise FileExistsError(msg)
-            if validate_ranked_claim and selection_request["selection"] != existing["selection"]:
-                selection.validate_ranked_publication_claim(selection_request, storage_root=storage_root)
+            if validate_ordered_claim and selection_request["selection"] != existing["selection"]:
+                selection.validate_ordered_publication_claim(selection_request, storage_root=storage_root)
             if registry is not None:
                 registry.ensure_bound(content_digest, payload_dir, kind=_REGISTRY_KIND, conflict=_identical_content_error(registry))
             return payload_path, manifest_path, True, existing
         if verify_producer is not None:
             verify_producer()
-        if validate_ranked_claim:
-            selection.validate_ranked_publication_claim(selection_request, storage_root=storage_root)
+        if validate_ordered_claim:
+            selection.validate_ordered_publication_claim(selection_request, storage_root=storage_root)
         if registry is not None:
             registry.ensure_available(content_digest, payload_dir, conflict=_identical_content_error(registry))
         state_root.mkdir(parents=True, exist_ok=True)
@@ -260,13 +263,15 @@ def _publish(
             if set(counts) != {"sample_count", "transition_count"}:
                 msg = "Dataset representation returned invalid count metadata."
                 raise RuntimeError(msg)
-            manifest = {**prefix, **counts, "payload_sha256": common.serialization.file_sha256(staged_payload)}
+            manifest = {**prefix, **counts, "payload_sha256": common.serialization.file_sha256(staged_payload), "derived_payload_sha256": None}
             if expected_payload_sha256 is not None and manifest["payload_sha256"] != expected_payload_sha256:
                 failed = staging.with_name(staging.name.removesuffix(".tmp") + ".rebuild-mismatch")
                 common.serialization.atomic_write_json(staged_payload_dir / common.paths.DATASET_MANIFEST_FILENAME, manifest)
                 staging.rename(failed)
                 message = f"Rebuilt payload bytes differ from the producing manifest; unpublished evidence retained at {failed}."
                 raise ValueError(message)
+            if build_derived_payload is not None:
+                manifest["derived_payload_sha256"] = build_derived_payload(staged_payload_dir, manifest)
             package_manifest.validate_manifest_content(manifest, task=task, dataset_id=dataset_id, payload_path=staged_payload)
             common.serialization.atomic_write_json(staged_payload_dir / common.paths.DATASET_MANIFEST_FILENAME, manifest)
             if verify_producer is not None:
@@ -369,10 +374,13 @@ def build_dataset_selection(
         build_payload=build_payload,
         selection_request=prepared.request,
         storage_root=storage_root,
-        validate_ranked_claim=reproduction_manifest is None,
+        validate_ordered_claim=reproduction_manifest is None,
         verify_producer=lambda: reproduction.verify_current_producer(provenance["producer_evidence"], storage_root=storage_root),
         expected_payload_sha256=reproduction_manifest["payload_sha256"] if reproduction_manifest is not None else None,
         output_directory=output_directory,
+        build_derived_payload=(lambda directory, manifest: transient_shards.write_transient_shards(directory, manifest, storage_root=storage_root))
+        if dataset_view == "transient_drying"
+        else None,
     )
     return {
         "dataset_name": prepared.request["dataset_name"],

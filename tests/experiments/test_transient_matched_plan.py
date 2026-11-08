@@ -195,10 +195,13 @@ def test_test_owned_matched_configs_preflight(tmp_path: Path, model_kind: str) -
     assert result.physics_enabled is False
 
 
-def test_spatial_stride_defaults_to_one_and_changes_run_identity_only_when_explicit() -> None:
-    """Resolve omission at full resolution and distinguish stride-two runs."""
+def test_spatial_stride_is_required_authored_and_resolved_and_distinguishes_runs() -> None:
+    """Refuse an authored or resolved config without the stride, and distinguish stride-two runs."""
     stride_one_raw = configs.transient_matched_config()
-    assert "spatial_stride" not in stride_one_raw["data"]
+    missing_raw = copy.deepcopy(stride_one_raw)
+    del missing_raw["data"]["spatial_stride"]
+    with pytest.raises(loader.ConfigError, match=r"data\.spatial_stride is required"):
+        _resolve(missing_raw)
     stride_one = _resolve(stride_one_raw)
 
     stride_two_raw = copy.deepcopy(stride_one_raw)
@@ -209,8 +212,8 @@ def test_spatial_stride_defaults_to_one_and_changes_run_identity_only_when_expli
     persisted_without_stride["data"].pop("spatial_stride")
     checkpoint = learning.training.checkpoint
 
-    assert stride_one.a0["data"]["spatial_stride"] == stride_one.b["data"]["spatial_stride"] == 1
-    assert loader.validate_resolved_config(persisted_without_stride)["data"]["spatial_stride"] == 1
+    with pytest.raises(loader.ConfigError, match=r"data\.spatial_stride is required"):
+        loader.validate_resolved_config(persisted_without_stride)
     assert stride_two.a0["data"]["spatial_stride"] == _STRIDE_TWO
     assert stride_two.a0["run"]["layout"]["a0_id"] != stride_one.a0["run"]["layout"]["a0_id"]
     assert checkpoint.config_digest(stride_one.a0) != checkpoint.config_digest(stride_two.a0)
@@ -224,6 +227,25 @@ def test_spatial_stride_rejects_non_integer_or_non_positive_values(value: object
     raw["data"]["spatial_stride"] = value
 
     with pytest.raises((TypeError, ValueError), match="spatial_stride"):
+        _resolve(raw)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda raw: raw["training"]["b"]["curriculum"].update(seed=9),
+        lambda raw: raw["data"].update(hdf5_cache_size=0),
+        lambda raw: raw["tracking"]["wandb"].update(metric_schema_version=2),
+        lambda raw: raw["training"].update(mixed_precision=False),
+    ],
+    ids=["curriculum-seed", "hdf5-cache-size", "metric-schema-version", "mixed-precision"],
+)
+def test_removed_keys_and_other_schema_versions_are_rejected(mutate: Callable[[dict[str, Any]], object]) -> None:
+    """Reject the retired curriculum seed, HDF5 cache and mixed-precision keys and any metric schema version other than 1."""
+    raw = configs.transient_matched_config()
+    mutate(raw)
+
+    with pytest.raises(loader.ConfigError):
         _resolve(raw)
 
 

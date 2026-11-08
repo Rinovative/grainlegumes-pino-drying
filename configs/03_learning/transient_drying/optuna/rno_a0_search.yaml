@@ -5,15 +5,15 @@ study:
   mode: stage_a_only  # Transient protocol searched by this study: A0 alone.
   role: production  # Study role used by the experiment workflow.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
-  n_trials: 30  # Maximum number of trials requested for the study.
+  n_trials: 24  # Maximum number of trials requested for the study.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.
     multivariate: true  # Allow the TPE sampler to model parameter interactions.
   pruner:
     kind: median  # Optuna pruning rule for stopping unpromising trials.
     n_startup_trials: 5  # Trials completed before pruning decisions begin.
-    n_warmup_steps: 5  # Reported objective steps required before pruning can occur.
-    interval_steps: 1  # Objective-step interval between pruning checks.
+    n_warmup_steps: 8  # Reported objective steps (epochs) required before pruning can occur.
+    interval_steps: 1  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
 
 experiment:
   task: transient_drying  # Selects the task contract and its compatible data/model/loss validation.
@@ -25,10 +25,9 @@ experiment:
     train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
     additional_evaluation_datasets: []  # Optional built datasets evaluated in addition to the primary validation/test assignments.
     batch_size: 2  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
-    transient_backend_preference: pt_shards  # Preferred transient storage backend: pt_shards or canonical_hdf5.
-    transient_backend_required: true  # Fail if the preferred backend is unavailable instead of falling back.
-    hdf5_cache_size: 0  # Maximum open HDF5 handles retained; zero disables this handle cache.
     spatial_stride: 2  # Spatial subsampling step; larger strides reduce the effective grid resolution.
+    num_workers: 0  # Equal to base.yaml; the matched B/A1 stages require main-process loading, and the benchmark measured 905 items/s with 0 workers against 33-37 with 2-4.
+    persistent_workers: false  # No worker processes exist to keep alive.
   input_profile: canonical_physics_complete_v1  # Selects the versioned transient input/state profile expected by the dataset and model.
   temporal:
     sampling:
@@ -45,12 +44,14 @@ experiment:
       hidden_channels: 16  # Width of the model’s hidden feature representation.
       n_layers: 3  # Number of architecture layers/blocks; affects capacity and compute.
       rno_skip: false  # Recurrent residual skip path; must be false because skip-added hidden states break step-wise carry.
+      candidate_activation: tanh  # Recurrent candidate activation; tanh bounds the hidden state (project deviation from neuraloperator's SELU, docs/04_training.md).
       lifting_channel_ratio: 2  # FNO lifting width relative to hidden_channels.
       projection_channel_ratio: 2  # FNO projection width relative to hidden_channels.
       channel_mlp_skip: soft-gating  # Channel-MLP skip connection type.
       fno_skip: linear  # FNO spectral-block skip connection type.
       return_sequences: false  # Whether the recurrent model returns every time step; this task contract requires false.
-      positional_embedding: null  # Optional positional embedding configuration; null disables it.
+      positional_embedding: null  # No positional embedding: x and y are explicit input channels.
+      domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; equal to ../base.yaml.
   loss:
     data:
       kind: huber  # Select the supervised error formulation; valid choices depend on the task contract.
@@ -74,21 +75,19 @@ experiment:
     patience: 10  # Validation checks without improvement before reducing the learning rate; one check per epoch at evaluation_interval 1.
     min_lr: 1.0e-06  # Lower bound for the scheduled learning rate.
   training:
-    epochs: 100  # A0 epoch budget of this single-stage run; equals stage_schedule.total_epochs and the matched a0.max_epochs.
+    epochs: 40  # Trial epoch budget of this single-stage run, shorter than the matched a0.max_epochs to rank configurations cheaply; equals stage_schedule.total_epochs.
     stage_schedule:
       mode: stage_a_only  # A0 alone; the only transient protocol Optuna searches.
       budget_unit: epochs  # Unit used to express the training budget.
-      total_epochs: 100  # A0 epoch budget; must equal training.epochs.
+      total_epochs: 40  # Trial epoch budget; must equal training.epochs.
     evaluation_interval: 1  # Roll out the whole validation trajectories every this many stage epochs; this selects the stage checkpoint.
     additional_evaluation_interval: 1  # Evaluate additional configured datasets at this stage interval.
-    mixed_precision: false  # Enable mixed-precision arithmetic when supported.
     stage: a  # Stage selector for a single-stage protocol.
     comparison_arm: a0  # Comparison-arm identifier recorded with the training result.
     gradient_accumulation_steps: 1  # Number of batches accumulated before each optimizer update; increases effective batch size.
     curriculum:
       lengths: [2, 4, 8, 16, 32]  # Self-fed rollout lengths of this stage's curriculum; they must fit the sampling rollout length.
       milestone_fractions: [0.0, 0.2, 0.4, 0.6, 0.8]  # Fractions of the stage budget at which curriculum lengths advance.
-      seed: 9  # Seed controlling curriculum length/order sampling.
     teacher_handoff: null  # Optional teacher-state handoff configuration; null disables handoff.
   tracking:
     wandb:
@@ -125,4 +124,4 @@ search_space:
   data.batch_size:
     name: batch  # Readable Optuna parameter name for this configuration path.
     kind: categorical  # Distribution type used to sample this parameter.
-    values: [1, 2, 4]  # Allowed categorical choices; batch 4 with the largest model needs 34-39 GB in B's rollouts, so run on 48 GB GPUs.
+    values: [2, 4]  # Allowed categorical choices; batch 4 with the largest model needs 34-39 GB in B's rollouts, so run on 48 GB GPUs.

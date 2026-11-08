@@ -4,6 +4,8 @@ Responsibilities:
   - Check exact candidate publication, reader admission, and pilot selection
   - Check the exact published tree of one successful and one failed case and the campaign root entries
   - Check staged continuation and replacement feeding as tickets of fake node jobs
+  - Check that only a derived admission cap follows a lowered rate, an explicit cap that holds back a replacement blocks,
+    and a rerun compares effective caps
   - Check that the feeder decides runtime-stopped solves with their typed reason, only after their step ended, and writes cases.csv
 
 Design principles:
@@ -30,6 +32,7 @@ from support.generation_fixtures import successful_source_case
 from src import common, generation
 from src.generation import generation_campaign as campaign_runtime
 from src.generation import generation_campaign_lifecycle as lifecycle
+from src.generation import generation_campaign_status as status_formatting
 from src.generation import generation_controller as controller_service
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
@@ -125,8 +128,9 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
     )
     common.serialization.atomic_write_json(campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage), manifest)
 
-    lifecycle.amend_replacement_pool(
-        "steady_flow", campaign.source_name, primary.batch_id, high_water=1, reason="Synthetic replacement capacity", storage_root=storage
+    # Without a plan s is 1, so the first failure stops the batch; one failure in two decisions keeps the bound above 0.9.
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.9, reason="Synthetic tolerated failure", storage_root=storage
     )
     replacement = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
     assert replacement.case_indices == (3,)
@@ -207,7 +211,7 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
     inputs_tree = {"inputs", "inputs/case.json", "inputs/fields.csv", "inputs/input_reference.json"}
     records = {"_record", "_record/reservation.json", "_record/decision.json"}
     bundle = "_record/attempts/run_0001"
-    failed_runtime = ("execution_provenance.json", "solver.log", "solver_steps.csv", "stderr.log", "stdout.log", "timing.json")
+    failed_runtime = ("execution_provenance.json", "solver_steps.csv", "stderr.log", "stdout.log", "timing.json")
     assert _tree(root / "lentil/case_0001") == {
         *inputs_tree,
         *records,
@@ -324,7 +328,6 @@ def test_staged_admission_resumes_same_full_design_after_first_success(
         max_admission_cases=1,
         node_jobs=1,
         cores_per_node=2,
-        maximum_failed_cases=0,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     original_digest = campaign.campaign_digest
@@ -486,8 +489,9 @@ def test_failed_replacement_is_terminalized_and_the_next_replacement_completes_s
     common.serialization.atomic_write_json(campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage), manifest)
     successful_source_case(campaign.source_name, primary, 2, storage, tmp_path / "work")
     assert _fail_candidate(run_id, "lentil", "case_0001", storage=storage).is_file()
-    lifecycle.amend_replacement_pool(
-        "steady_flow", campaign.source_name, primary.batch_id, high_water=2, reason="Synthetic replacement capacity", storage_root=storage
+    # One success in three decisions keeps the bound (0.865) at or above 0.8, so the second replacement is still admitted.
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.8, reason="Synthetic tolerated failures", storage_root=storage
     )
 
     first = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
@@ -522,7 +526,7 @@ def test_failed_replacement_is_terminalized_and_the_next_replacement_completes_s
         "failed",
         "successful",
     ]
-    with pytest.raises(RuntimeError, match="No terminal-failure success deficit"):
+    with pytest.raises(lifecycle.NoReplacementError, match="success deficit is closed"):
         lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
 
 
@@ -557,8 +561,8 @@ def test_replacement_batch_passes_terminal_validation_under_its_canonical_identi
         storage_root=storage,
     )
     successful_source_case(campaign.source_name, primary, 2, storage, tmp_path / "work")
-    lifecycle.amend_replacement_pool(
-        "steady_flow", campaign.source_name, primary.batch_id, high_water=1, reason="Synthetic replacement capacity", storage_root=storage
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.9, reason="Synthetic tolerated failure", storage_root=storage
     )
     replacement = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
     generation.cases.input_generation.generate_input_cases(replacement, 1, storage_root=storage)
@@ -578,7 +582,7 @@ def test_replacement_batch_passes_terminal_validation_under_its_canonical_identi
 
 @dataclass
 class _FeederCampaign:
-    """One two-original steady Source with an authored capacity of two, fed through a fake scheduler."""
+    """One two-original steady Source with an authored minimum success rate of 0.8, fed through a fake scheduler."""
 
     campaign: Any
     storage: Path
@@ -636,22 +640,29 @@ _STALLED = "stalled: 0.00 h of 1 h simulated after 900 s solving"
 
 
 @pytest.fixture
-def feeder_campaign(generation_config_factory: Any, fake_comsol: Path, world: FakeSlurm, tmp_path: Path) -> _FeederCampaign:
-    """Submit both originals of a capacity-two Source as tickets of one node job; the first failed, the second succeeded."""
+def feeder_campaign(
+    generation_config_factory: Any, fake_comsol: Path, world: FakeSlurm, tmp_path: Path, request: pytest.FixtureRequest
+) -> _FeederCampaign:
+    """Submit both originals of an s = 0.8 Source as tickets of one node job; the first failed, the second succeeded.
+
+    With one success the bound stays at or above 0.8 after three decisions (0.865) and falls below it after four (0.751).
+    Without an explicit cap (a test's ``param``) the cap is derived: the plan default 4 (two originals plus two tolerated failures).
+    """
+    explicit = getattr(request, "param", None)
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
         scheduler_kind="slurm",
         natural_count=2,
-        max_admission_cases=4,
         node_jobs=1,
         cores_per_node=2,
-        maximum_failed_cases=5,
         timeout=1.0,  # fake COMSOL's timeout mode outlasts it, so the runtime times the solve out
         in_allocation_retry_enabled=False,  # its silent startup would otherwise read as license capacity
     )
-    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "replacement_capacity": {"lentil": 2}}
-    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=authored)
+    authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.8}
+    campaign = generation.cases.config.load_campaign_config(
+        config_path, authored_value=authored, execution_overrides=None if explicit is None else {"max_admission_cases": explicit}
+    )
     first = submit(campaign, world)
     assert [(item["job_id"], item["ticket_seq"]) for item in first["submissions"]] == [("7001", 1), ("7001", 2)]
     successful_source_case(campaign.source_name, campaign.batches[0], 2, world.storage, tmp_path / "work")
@@ -661,7 +672,7 @@ def feeder_campaign(generation_config_factory: Any, fake_comsol: Path, world: Fa
     return fed
 
 
-def test_feeder_replaces_failed_original_and_failed_replacement_within_the_authored_capacity(feeder_campaign: _FeederCampaign) -> None:
+def test_feeder_replaces_failed_original_and_failed_replacement_while_the_bound_reaches_s(feeder_campaign: _FeederCampaign) -> None:
     """Replenishment survives a failed replacement: fail-case frees its slot, the feeder dispatches the next Sobol point, selection seals."""
     fed = feeder_campaign
     after_first = fed.fail("case_0001")
@@ -689,6 +700,55 @@ def test_feeder_replaces_failed_original_and_failed_replacement_within_the_autho
     assert [row["case_id"] for row in pool["selected"]] == ["case_0002", "case_0004"]
     assert [(item["job_id"], item["ticket_seq"]) for item in done["submissions"]] == [("7001", 1), ("7001", 2), ("7001", 3), ("7001", 4)]
     assert len(fed.world.sbatch_arguments()) == 1  # every replacement is a ticket of the same node job
+
+
+@pytest.mark.parametrize(("feeder_campaign", "derived"), [(None, True), (4, False)], indirect=["feeder_campaign"])
+def test_a_lowered_rate_raises_only_a_derived_admission_cap(feeder_campaign: _FeederCampaign, derived: bool) -> None:
+    """A derived cap (null) grows from 4 = 2 + 2 to 2 + 4 at s = 0.6 and admits case 5; an explicit cap equal to 4 holds it back."""
+    fed = feeder_campaign
+    recorded = campaign_evidence.load_campaign_run(fed.run_id, storage_root=fed.storage)["submission_config"]["max_admission_cases"]
+    assert recorded == (None if derived else 4)
+    fed.fail("case_0001")
+    fed.end_step("case_0003", "FAILED", "1:0")
+    fed.fail("case_0003")
+    batch_id = fed.campaign.batches[0].batch_id
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow", fed.campaign.source_name, batch_id, minimum_success_rate=0.6, reason="Synthetic", storage_root=fed.storage
+    )
+    fed.end_step("case_0004", "FAILED", "1:0")
+    after = fed.fail("case_0004")  # k/n 1/4 keeps the bound 0.751 at or above 0.6
+    assert ([item["case"]["case_id"] for item in after["submissions"]][-1] == "case_0005") is derived
+    assert after["state"] == ("active" if derived else "blocked")
+    rendered = status_formatting.format_campaign_status_summary(campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage))
+    assert ("max_admission_cases=6 (plan rates)" if derived else "max_admission_cases=4") in rendered
+    assert ("Admission: 5/6" if derived else "Admission: 4/4") in rendered
+
+
+def test_a_rerun_compares_effective_admission_caps(feeder_campaign: _FeederCampaign) -> None:
+    """A rerun below the derived cap 4 is refused; switching to an explicit cap that keeps the effective cap is accepted."""
+    fed = feeder_campaign
+    fed.world.set_state("7001", "COMPLETED")
+    with pytest.raises(ValueError, match="cannot decrease"):
+        submit(fed.campaign, fed.world, max_admission_cases=3)
+    continued = submit(fed.campaign, fed.world, max_admission_cases=4)
+    assert [epoch["submission_config"]["max_admission_cases"] for epoch in lifecycle.execution_epochs(continued)] == [None, 4]
+
+
+@pytest.mark.parametrize("feeder_campaign", [3], indirect=True)
+def test_an_explicit_admission_cap_that_holds_back_a_needed_replacement_ends_blocked_and_names_the_cap(
+    feeder_campaign: _FeederCampaign,
+) -> None:
+    """An explicit cap stays as given: once it holds back the replacement a slot needs, the campaign ends blocked with its way out."""
+    fed = feeder_campaign
+    fed.fail("case_0001")
+    fed.end_step("case_0003", "FAILED", "1:0")
+    blocked = fed.fail("case_0003")  # k/n 1/3 keeps the batch open, the cap 3 holds case_0004 back
+    assert blocked["state"] == "blocked"
+    assert [item["case"]["case_id"] for item in blocked["submissions"]] == ["case_0001", "case_0002", "case_0003"]
+    status = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)
+    assert status["success_rate_stop"] is None
+    assert "max_admission_cases 3" in status["admission_cap_stop"]
+    assert "--max-admission-cases" in status["admission_cap_stop"]
 
 
 def test_operational_error_of_a_replacement_stops_feeding_by_its_own_task_view(feeder_campaign: _FeederCampaign) -> None:
@@ -742,7 +802,7 @@ def test_the_feeder_decides_stalled_and_timed_out_solves_itself_and_writes_the_c
 
     campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
     status = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)
-    assert controller_service._unsettled_failure(fed.run_id, status["cases"], status["counts"]) is None  # the driver needs no fail-case
+    assert controller_service._unsettled_failure(fed.run_id, status) is None  # the driver needs no fail-case
     successful_source_case(fed.campaign.source_name, fed.batch(4), 4, fed.storage, fed.work)
     fed.end_step("case_0004", "COMPLETED", "0:0")
     assert campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)["state"] == "complete"
@@ -757,7 +817,7 @@ def test_the_feeder_decides_stalled_and_timed_out_solves_itself_and_writes_the_c
     ]
     sampled = json.loads((view.parent / "lentil/case_0003/inputs/case.json").read_text(encoding="utf-8"))["sampled_values"]
     assert {name: float(rows[2][name]) for name in sampled} == pytest.approx(sampled)
-    assert rows[2]["solver_log"] == "lentil/case_0003/_record/attempts/run_0001/payload/runtime/solver.log"
+    assert rows[2]["solver_log"] == "lentil/case_0003/_record/attempts/run_0001/payload/runtime/stdout.log"
     assert (view.parent / rows[2]["solver_log"]).is_file()
     assert rows[0]["solver_log"] == ""  # the stand-in for the stalled solve left no failure bundle
     assert float(rows[3]["duration_s"]) >= 0
@@ -776,15 +836,15 @@ def test_a_validation_failure_is_never_decided_by_the_feeder_and_stops_the_drive
     campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
     assert fed.decision("case_0001") is None
     status = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)
-    message = controller_service._unsettled_failure(fed.run_id, status["cases"], status["counts"])
+    message = controller_service._unsettled_failure(fed.run_id, status)
     assert message is not None
     assert "./scripts/generation fail-case" in message
 
 
-def test_an_automatic_decision_beyond_the_replacement_capacity_ends_blocked(
+def test_an_automatic_decision_that_stops_the_batch_ends_blocked_and_names_the_ways_out(
     feeder_campaign: _FeederCampaign, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The automatic decision changes neither capacity nor the blocked outcome; the idle node job is drained, not left to its timeout."""
+    """The fourth decision stops the batch; the campaign ends blocked, its idle node job is drained, and status names both ways out."""
     fed = feeder_campaign
     fed.fail("case_0001")
     fed.end_step("case_0003", "FAILED", "1:0")
@@ -798,3 +858,7 @@ def test_an_automatic_decision_beyond_the_replacement_capacity_ends_blocked(
     assert blocked["state"] == "blocked"
     assert [(job["draining"], job["stop_ticket_seq"]) for job in blocked["node_jobs"]] == [(True, 5)]
     assert len(blocked["submissions"]) == 4  # nothing was dispatched on the way to blocked
+    stop = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)["success_rate_stop"]
+    assert "lentil (natural): k/n 1/4" in stop
+    assert "--revision LABEL" in stop
+    assert f"amend-replacements {fed.run_id} --material MATERIAL --regime REGIME --minimum-success-rate S --reason TEXT" in stop

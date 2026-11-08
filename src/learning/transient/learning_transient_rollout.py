@@ -167,7 +167,8 @@ def predict_step(
     def invoke_model() -> object:
         """Dispatch exactly one semantic model call without output validation."""
         if kind == "rno":
-            return model(step_input.unsqueeze(1), init_hidden_states=hidden, return_hidden_states=True)
+            # Padded states keep the padding region's recurrence; unpadding and re-zeroing it each step would break the carry.
+            return model(step_input.unsqueeze(1), init_hidden_states=hidden, return_hidden_states=True, keep_states_padded=True)
         return model(step_input)
 
     result = invoke_model() if model_call is None else model_call(invoke_model)

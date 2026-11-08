@@ -19,7 +19,6 @@ import json
 import shlex
 import subprocess
 from copy import deepcopy
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,7 +27,6 @@ import pytest
 import yaml
 from support.fake_slurm import (
     COMMIT,
-    NODE_ID,
     Crash,
     FakeSlurm,
     bind_worker,
@@ -571,8 +569,7 @@ def test_archived_owned_job_uses_exact_accounting_without_claiming_unrelated_liv
     assert evidence["allocations"]["accounted"]["845436"][1:3] == ["FAILED", "2:0"]
     assert evidence["steps"][("845436", "sf-lentil-c0001-s1")]["state"] == "FAILED"
     assert evidence["active"] == evidence["accounted"] == {}  # per-dispatch rows come from the dispatch records, not from the allocation
-    assert generation.campaign.query_active_scheduler_job_ids(("845436",)) == ()
-    assert [command[0] for command in commands] == ["squeue", "sacct", "sacct", "squeue"]
+    assert [command[0] for command in commands] == ["squeue", "sacct", "sacct"]
 
 
 @pytest.mark.parametrize(
@@ -695,7 +692,6 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
             "max_admission_cases": 1,
             "node_jobs": 2,
             "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": 0,
             "license_wait": _synthetic_retry_policy(),
         },
         "state": "active",
@@ -721,6 +717,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
         for task in tasks
     ]
     monkeypatch.setattr(lifecycle, "candidate_records", lambda *_args, **_kwargs: records)
+    monkeypatch.setattr(lifecycle, "replacement_policy", lambda *_args, **_kwargs: [])  # no batch is stopped by its success rate
     # The stubbed records have no campaign tree behind them, so the derived cases view of a completion is stubbed too.
     monkeypatch.setattr(generation.publication.catalog, "campaign_cases_csv", lambda *_args, **_kwargs: "material,case_id\n")
 
@@ -824,52 +821,6 @@ def test_malformed_persisted_job_id_fails_before_scheduler_query(
         feed(campaign, world)
 
 
-@pytest.mark.parametrize(
-    ("failure_count", "maximum_failed_cases", "expected_tripped"),
-    [
-        (0, 5, False),
-        (1, 5, False),
-        (3, 5, False),
-        (5, 5, False),
-        (6, 5, True),
-    ],
-)
-def test_solver_failure_threshold_has_an_exact_exceeds_boundary(
-    failure_count: int,
-    maximum_failed_cases: int,
-    expected_tripped: bool,
-) -> None:
-    """Count only solver failures and trip strictly above the configured limit."""
-    views: list[dict[str, Any]] = [
-        {
-            "state": "failed",
-            "failure_stage": "solver",
-            "temporary_license_retry": None,
-        }
-        for _index in range(failure_count)
-    ]
-    views.extend(
-        (
-            {"state": "conversion_failed"},
-            {"state": "publication_failed"},
-            {
-                "state": "failed",
-                "failure_stage": "solver",
-                "temporary_license_retry": {"classification": "temporary_license_capacity"},
-            },
-            {"state": "case_reconciliation_failed", "failure_stage": "reconciliation"},
-        )
-    )
-
-    assert (
-        generation.campaign._solver_failure_threshold_exceeded(
-            views,
-            maximum_failed_cases=maximum_failed_cases,
-        )
-        is expected_tripped
-    )
-
-
 def test_conversion_failures_do_not_starve_normal_admission(
     generation_config_factory: Any,
     tmp_path: Path,
@@ -880,7 +831,6 @@ def test_conversion_failures_do_not_starve_normal_admission(
         scheduler_kind="slurm",
         natural_count=12,
         max_admission_cases=2,
-        maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
@@ -901,7 +851,6 @@ def test_conversion_failures_do_not_starve_normal_admission(
             "max_admission_cases": 2,
             "node_jobs": 2,
             "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": 5,
             "license_wait": _synthetic_retry_policy(),
         },
         "submissions": [],
@@ -922,6 +871,7 @@ def test_conversion_failures_do_not_starve_normal_admission(
     ]
     monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda *_args, **_kwargs: campaign)
     monkeypatch.setattr(lifecycle, "candidate_records", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(lifecycle, "replacement_policy", lambda *_args, **_kwargs: [])
 
     monkeypatch.setattr(campaign_evidence, "load_campaign_run", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(campaign_evidence, "campaign_from_manifest", lambda _manifest: campaign)
@@ -1044,32 +994,28 @@ def test_logical_admission_membership_is_lifecycle_owned(
 
 
 @pytest.mark.parametrize(
-    ("states", "canonical", "expected"),
+    ("states", "expected"),
     [
-        (("successful", "never_started", "never_started", "never_started"), True, "staged"),
-        (("successful", "never_started", "never_started", "never_started"), False, "completed_with_failures"),
-        (("failed", "never_started", "never_started", "never_started"), True, "completed_with_failures"),
-        (("successful", "publication_failed", "never_started", "never_started"), True, "completed_with_failures"),
-        (("successful", "license_blocked", "never_started", "never_started"), True, "license_blocked"),
-        (("successful", "scheduler_unknown", "never_started", "never_started"), True, "active"),
+        (("successful", "never_started", "never_started", "never_started"), "staged"),
+        (("failed", "never_started", "never_started", "never_started"), "completed_with_failures"),
+        (("successful", "publication_failed", "never_started", "never_started"), "completed_with_failures"),
+        (("successful", "license_blocked", "never_started", "never_started"), "license_blocked"),
+        (("successful", "scheduler_unknown", "never_started", "never_started"), "active"),
     ],
 )
-def test_settled_admission_cap_persists_staged_only_for_failure_free_canonical_subset(
+def test_settled_admission_cap_persists_staged_only_for_a_failure_free_subset(
     generation_config_factory: Any,
     tmp_path: Path,
     states: tuple[str, ...],
-    canonical: bool,
     expected: str,
 ) -> None:
     """Persist an honest capped success state without relabeling failure or uncertainty; a settled state drains the node job."""
     admitted = sum(state != "never_started" for state in states)
     config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=len(states), max_admission_cases=admitted, maximum_failed_cases=5
+        simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=len(states), max_admission_cases=admitted
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
-    if not canonical:
-        campaign = replace(campaign, schema_version=campaign.schema_version + 1)
     storage = tmp_path / "storage"
     run_id = generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
     run_directory = campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
@@ -1089,7 +1035,15 @@ def test_settled_admission_cap_persists_staged_only_for_failure_free_canonical_s
         if state != "never_started":
             dispatch_record(manifest, campaign, task, node_job)
     result = generation.campaign._fill_submission_capacity(
-        manifest, campaign, views, pending_jobs=0, running_jobs=0, scheduler=_scheduler(), storage_root=storage, tasks=tasks
+        manifest,
+        campaign,
+        views,
+        pending_jobs=0,
+        running_jobs=0,
+        scheduler=_scheduler(),
+        storage_root=storage,
+        tasks=tasks,
+        max_admission_cases=admitted,
     )
     persisted = json.loads(campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage).read_text())
     assert result["state"] == persisted["state"] == expected
@@ -1100,19 +1054,19 @@ def test_settled_admission_cap_persists_staged_only_for_failure_free_canonical_s
     assert (persisted["node_jobs"][0]["stop_ticket_seq"] is not None) is settled
 
 
-@pytest.mark.parametrize("failure_count", [1, 3])
-def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
+@pytest.mark.parametrize("stopped", ["own", "other"])
+def test_only_a_stopped_batch_loses_fresh_admission_while_its_running_case_continues(
     generation_config_factory: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failure_count: int,
+    stopped: str,
 ) -> None:
-    """Keep monitoring one active case and admit fresh cases below the budget."""
+    """A stopped batch admits no fresh case while its running case keeps the node job; another batch's stop leaves it admitting."""
+    failure_count = 2
     config_path, _template = generation_config_factory(
         scheduler_kind="slurm",
         natural_count=failure_count + 3,
         max_admission_cases=failure_count + 3,
-        maximum_failed_cases=5,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
@@ -1145,7 +1099,6 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
             "max_admission_cases": failure_count + 3,
             "node_jobs": 2,
             "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": 5,
             "license_wait": _synthetic_retry_policy(),
         },
         "submission_intent": None,
@@ -1170,177 +1123,14 @@ def test_terminal_failures_below_budget_do_not_stop_unrelated_work(
         running_jobs=1,
         scheduler=scheduler,
         storage_root=tmp_path,
+        stopped={tasks[0].batch_id if stopped == "own" else "another-original-batch"},
+        max_admission_cases=failure_count + 3,
     )
 
     assert advanced["state"] == "active"
-    assert dispatched == [(view["case_id"], "initial") for view in fresh]
+    assert dispatched == ([] if stopped == "own" else [(view["case_id"], "initial") for view in fresh])
     assert [job["draining"] for job in advanced["node_jobs"]] == [False]
     assert scheduler["allocations"]["active"] == {"811": ["811", "RUNNING"]}
-    assert (
-        generation.campaign._solver_failure_threshold_exceeded(
-            views,
-            maximum_failed_cases=5,
-        )
-        is False
-    )
-
-
-@pytest.mark.parametrize(
-    (
-        "failure_count",
-        "capacity_occupied",
-        "maximum_failed_cases",
-        "expected_blocked",
-        "expected_reason",
-        "expected_circuit_breaker",
-    ),
-    [
-        (0, True, 5, True, "max_admission_cases_reached", False),
-        (1, False, 5, True, "max_admission_cases_reached", False),
-        (1, True, 5, True, "max_admission_cases_exceeded", False),
-        (2, False, 1, True, "solver_failure_threshold_exceeded", True),
-    ],
-)
-def test_admission_block_reason_is_independent_of_displayed_failure_count(
-    generation_config_factory: Any,
-    failure_count: int,
-    capacity_occupied: bool,
-    maximum_failed_cases: int,
-    expected_blocked: bool,
-    expected_reason: str | None,
-    expected_circuit_breaker: bool,
-) -> None:
-    """Attribute capacity and failure-budget blocks to their actual owner."""
-    admission_limit = 4 if maximum_failed_cases == 1 else 1
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=4,
-        max_admission_cases=admission_limit,
-        maximum_failed_cases=maximum_failed_cases,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [
-        {
-            **_admission_view(task, "failed"),
-            "failure_stage": "solver",
-            "temporary_license_retry": None,
-        }
-        for task in tasks[:failure_count]
-    ]
-    if capacity_occupied:
-        views.append(_admission_view(tasks[failure_count], "pending"))
-    fresh_index = failure_count + int(capacity_occupied)
-    views.extend(_admission_view(task, "never_started") for task in tasks[fresh_index:])
-    manifest = {
-        "campaign_run_id": "synthetic-admission__0123456789abcdef",
-        "git_commit": "a" * 40,
-        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
-        "submission_config": {
-            "max_admission_cases": admission_limit,
-            "node_jobs": 2,
-            "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": maximum_failed_cases,
-        },
-        "submission_intent": None,
-        "submissions": [
-            {"case": {"batch_id": view["batch_id"], "case_index": view["case_index"]}, "mode": "initial"}
-            for view in views
-            if view["state"] != "never_started"
-        ],
-        "admission_reservations": [],
-    }
-
-    blocked, reason = generation.campaign._normal_admission_status(manifest, views)
-
-    assert blocked is expected_blocked
-    assert reason == expected_reason
-    assert (
-        generation.campaign._solver_failure_threshold_exceeded(
-            views,
-            maximum_failed_cases=maximum_failed_cases,
-        )
-        is expected_circuit_breaker
-    )
-
-
-def test_excess_stable_admission_blocks_monitoring_without_submission(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep monitoring an over-limit historical pool without admitting fresh work or submitting a node job."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        natural_count=6,
-        max_admission_cases=4,
-    )
-    campaign = generation.cases.config.load_campaign_config(config_path)
-    tasks = cluster.campaign_tasks(campaign)
-    views = [*(_admission_view(task, "pending") for task in tasks[:5]), _admission_view(tasks[5], "never_started")]
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "over-limit__0123456789abcdef",
-        "execution_config_digest": generation.campaign._execution_config_digest(campaign),
-        "git_commit": "a" * 40,
-        "slurm_job_ids": [],
-        "node_jobs": [],
-        "node_job_intent": None,
-        "submission_config": {
-            "max_admission_cases": 4,
-            "node_jobs": 2,
-            "concurrent_cases_per_node": 4,
-            "maximum_failed_cases": 5,
-            "license_wait": _synthetic_retry_policy(),
-        },
-        "submission_intent": None,
-        "submissions": [],
-        "admission_reservations": [],
-        "state": "active",
-    }
-    monkeypatch.setattr(generation.campaign, "_repository_commit", lambda: "a" * 40)
-    monkeypatch.setattr(generation.campaign.common.serialization, "atomic_write_json", lambda *_args, **_kwargs: None)
-    for forbidden in ("_dispatch_case", "_submit_node_job"):
-        monkeypatch.setattr(
-            generation.campaign, forbidden, lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("over-limit admission submitted work"))
-        )
-
-    assert generation.campaign._normal_admission_status(manifest, views) == (
-        True,
-        "max_admission_cases_exceeded",
-    )
-    generation.campaign._fill_submission_capacity(
-        manifest,
-        campaign,
-        views,
-        pending_jobs=5,
-        running_jobs=0,
-        scheduler=_scheduler(),
-        storage_root=tmp_path,
-    )
-    assert manifest["state"] == "active"
-
-
-def test_node_capacity_and_unresolved_intents_block_fresh_admission() -> None:
-    """Fresh work waits while the node jobs hold their ticket capacity of unresolved cases or an intent is unresolved."""
-    unstarted = {"batch_id": "batch", "case_index": 3, "state": "never_started", "runtime_progress": {"availability": "unavailable"}}
-    views = [
-        {"batch_id": "batch", "case_index": index, "state": "pending", "runtime_progress": {"availability": "unavailable"}} for index in (1, 2)
-    ] + [unstarted]
-    manifest: dict[str, Any] = {
-        "campaign_run_id": "synthetic-capacity__0123456789abcdef",
-        "git_commit": "a" * 40,
-        "execution_config_digest": "b" * 64,
-        "submission_config": {"max_admission_cases": 8, "node_jobs": 1, "concurrent_cases_per_node": 1, "maximum_failed_cases": 5},
-        "submission_intent": None,
-        "node_job_intent": None,
-        "submissions": [],
-        "admission_reservations": [],
-    }
-    assert generation.campaign._normal_admission_status(manifest, views) == (True, "node_capacity_reached")  # one node job holds 2 x 1 cases
-    manifest["submission_config"]["concurrent_cases_per_node"] = 2
-    assert generation.campaign._normal_admission_status(manifest, views) == (False, None)
-    manifest["node_job_intent"] = NODE_ID
-    assert generation.campaign._normal_admission_status(manifest, views) == (True, "submission_intent_unresolved")
 
 
 def test_durable_submission_intent_counts_one_logical_case() -> None:
@@ -1397,12 +1187,6 @@ def test_admission_reservations_are_exact_unsent_plan_members(
 def test_license_retry_activity_ends_at_common_solver_progress() -> None:
     """Keep pending and starting retries in admission until solver work."""
     retry = {"mode": "license_retry"}
-    starting = {
-        "availability": "available",
-        "phase": "starting_solver",
-        "parser_state": "unavailable",
-    }
-
     solver_receipt = {
         "solver_progress_started": True,
         "outcome": "solver_progress_started",
@@ -1411,35 +1195,6 @@ def test_license_retry_activity_ends_at_common_solver_progress() -> None:
     assert generation.campaign._license_retry_is_active("pending", retry, None)
     assert generation.campaign._license_retry_is_active("active", retry, None)
     assert not generation.campaign._license_retry_is_active("active", retry, solver_receipt)
-
-    retrying_view = {
-        "batch_id": "batch",
-        "case_index": 1,
-        "state": "active",
-        "runtime_progress": starting,
-        "in_allocation_license_window": None,
-        "license_retry_active": True,
-    }
-    waiting_view = {
-        "batch_id": "batch",
-        "case_index": 2,
-        "state": "license_blocked",
-        "runtime_progress": {"availability": "unavailable", "reason": "not_reported"},
-        "license_retry_active": False,
-    }
-    manifest = {
-        "campaign_run_id": "synthetic-admission__0123456789abcdef",
-        "git_commit": "a" * 40,
-        "execution_config_digest": "b" * 64,
-        "submission_config": {"max_admission_cases": 2},
-        "submission_intent": None,
-    }
-    assert generation.campaign._admission_summary(manifest, [retrying_view, waiting_view])["components"] == {
-        "pending": 0,
-        "starting": 0,
-        "license_waiting": 1,
-        "acquiring_license": 1,
-    }
 
 
 def test_graceful_then_force_cancel_share_campaign_owner_and_stay_nonterminal(
@@ -1646,25 +1401,6 @@ def test_submission_policy_changes_execution_but_not_scientific_case_identity(
         original,
         git_commit=commit,
     )
-
-
-def test_campaign_discovery_uses_schema_kind_and_deterministic_paths(
-    generation_config_factory: Any,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Protect filename-independent discovery while ignoring unrelated YAML."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    (tmp_path / "unrelated.yaml").write_text("schema_kind: unrelated\n", encoding="utf-8")
-
-    discovered = generation.cases.config.discover_campaign_configs(tmp_path)
-
-    assert tuple(campaign.source_path for campaign in discovered) == (config_path.resolve(),)
-    status = cli_generation.main(["list-campaigns"])
-    assert status == 0
-    output = json.loads(capsys.readouterr().out)
-    assert [record["source_path"] for record in output["campaigns"]] == [str(config_path.resolve())]
-    assert output["campaigns"][0]["campaign_purpose"] == discovered[0].campaign_purpose
 
 
 def test_validate_config_exposes_resolved_campaign_ownership(

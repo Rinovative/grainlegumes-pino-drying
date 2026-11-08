@@ -11,6 +11,7 @@ Design principles:
   - Scientific configuration and execution provenance are physically separate
   - Successful CSV and solved-model retention is explicit and off by default
   - Failed scratch is removed only after policy-bound durable evidence is complete
+  - The stall rule applies only to a profile with a time horizon: a stationary solve reports no simulated time, so only the timeout bounds it
 
 This module does NOT:
   - Modify COMSOL templates or infer internal tags, expressions, or signs
@@ -72,8 +73,9 @@ from .generation_runtime_preparation import PreparedCase, prepare_case_work_dire
 if TYPE_CHECKING:
     from src.generation.validation.generation_validation_policy import DiagnosticRecord
 
-PUBLICATION_SCHEMA_VERSION = 1
 BATCH_MANIFEST_SCHEMA_VERSION = 1
+_EXECUTION_PROVENANCE_SCHEMA_VERSION: Final = 1
+_PROCESSING_PROVENANCE_SCHEMA_VERSION: Final = 1
 # The stall rule needs minutes-scale freshness; rereading the solver stdout every poll would only cost I/O.
 _STALL_PROBE_REFRESH_SECONDS: Final = 15.0
 _BATCH_MANIFEST_SCHEMA_KIND: Final = "simulation_batch_manifest"
@@ -167,7 +169,6 @@ _CASE_SUCCESS_KEYS: Final = frozenset(
     }
 )
 CASE_FAILURE_SCHEMA_KIND = "simulation_case_failure"
-CASE_FAILURE_SCHEMA_VERSION = 1
 _FAILURE_STAGES = frozenset({"input", "solver", "exports", "conversion", "publication"})
 # How the runtime itself classified a solve it ended: its stall rule, its timeout, or a non-zero COMSOL exit.
 RuntimeFailureReason = Literal["stalled", "timed_out", "solver_error"]
@@ -944,8 +945,8 @@ def _bounded_log_text(path: Path, *, maximum_bytes: int) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
-def _write_solver_log(prepared: PreparedCase) -> Path:
-    """Combine bounded head-and-tail evidence from case-owned solver logs."""
+def _solver_log_text(prepared: PreparedCase) -> str:
+    """Combine bounded head-and-tail evidence from case-owned solver logs; licence detection reads it, a success retains it."""
     stdout_path = prepared.runtime_directory / "stdout.log"
     stderr_path = prepared.runtime_directory / "stderr.log"
     per_stream = _MAX_RETAINED_SOLVER_LOG_BYTES // 2
@@ -955,9 +956,7 @@ def _write_solver_log(prepared: PreparedCase) -> Path:
     payload += "===== stderr =====\n" + _bounded_log_text(stderr_path, maximum_bytes=per_stream)
     if not payload.endswith("\n"):
         payload += "\n"
-    path = prepared.runtime_directory / "solver.log"
-    common.serialization.atomic_write_text(path, payload)
-    return path
+    return payload
 
 
 class _SimulatedTimeProbe:
@@ -994,9 +993,20 @@ class _SimulatedTimeProbe:
         return self._latest
 
 
+def _horizon_hours(config: config_contract.GenerationConfig) -> float | None:
+    """Return the physical horizon in hours of a profile that integrates over time, or ``None`` for a stationary profile (it has no time section)."""
+    time_section = config.scientific_values.get("time")
+    return None if time_section is None else config_contract.physical_horizon_hours(time_section)
+
+
+def _stall_stop(config: config_contract.GenerationConfig) -> dict[str, Any] | None:
+    """Return the execution's stall rule for a profile with a time horizon; a stationary solve never reports simulated time, so none applies to it."""
+    return None if _horizon_hours(config) is None else config.execution_values["runtime"].get("stall_stop")
+
+
 def _stall_rule(config: config_contract.GenerationConfig, prepared: PreparedCase) -> stop_service.StallRule | None:
-    """Build the execution's stall rule over the solver stdout of one prepared case, or ``None`` when it sets none."""
-    rule = config.execution_values["runtime"].get("stall_stop")
+    """Build the stall rule over the solver stdout of one prepared case, or ``None`` when the profile or the execution sets none."""
+    rule = _stall_stop(config)
     if rule is None:
         return None
     return stop_service.StallRule(
@@ -1009,8 +1019,8 @@ def _stall_rule(config: config_contract.GenerationConfig, prepared: PreparedCase
 
 
 def _stall_progress(config: config_contract.GenerationConfig, stop_result: stop_service.StopResult | None) -> dict[str, float | None] | None:
-    """Return the timing record of when the case first reached the stall rule's minimum, or ``None`` when the execution sets no rule."""
-    rule = config.execution_values["runtime"].get("stall_stop")
+    """Return the timing record of when the case first reached the stall rule's minimum, or ``None`` when no rule applies to the case."""
+    rule = _stall_stop(config)
     if rule is None:
         return None
     return {
@@ -1111,7 +1121,7 @@ def _execution_provenance(
     execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
     payload = {
         "schema_kind": "simulation_execution_provenance",
-        "schema_version": 1,
+        "schema_version": _EXECUTION_PROVENANCE_SCHEMA_VERSION,
         "case_id": prepared.bundle.case_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "execution_config_digest": execution_digest,
@@ -1191,7 +1201,7 @@ def _write_processing_provenance(
     processing_commit = source_service.required_git_commit()
     payload = {
         "schema_kind": "generation_processing_provenance",
-        "schema_version": 1,
+        "schema_version": _PROCESSING_PROVENANCE_SCHEMA_VERSION,
         "case_id": prepared.bundle.case_id,
         "case_input_id": prepared.bundle.case_input_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
@@ -1226,12 +1236,25 @@ def _final_solver_metrics(prepared: PreparedCase) -> dict[str, Any]:
 def _runtime_failure_detail(
     config: config_contract.GenerationConfig, prepared: PreparedCase, reason: RuntimeFailureReason | None, solving_seconds: float, *, cause: str = ""
 ) -> str:
-    """Return the human detail of a solve the runtime ended: its reason (none when unclassified), how far it simulated, and after how long."""
-    simulated = _final_solver_metrics(prepared).get("simulated_time_seconds")
-    time_section = config.scientific_values.get("time")
-    horizon = "" if time_section is None else f" of {config_contract.physical_horizon_hours(time_section):g} h"
-    reached = f"{simulated / 3600:.2f} h{horizon} simulated" if isinstance(simulated, (int, float)) else "no simulated time reported"
-    return f"{'' if reason is None else f'{reason}: '}{cause}{reached} after {solving_seconds:.0f} s solving"
+    """Return the human detail of a solve the runtime ended: its reason (none when unclassified), the solver progress it reported, and after how long.
+
+    The progress is the simulated time of the horizon for a case that integrates over time, else the last stationary nonlinear iteration.
+    """
+    metrics = _final_solver_metrics(prepared)
+    simulated = metrics.get("simulated_time_seconds")
+    iteration = metrics.get("nonlinear_iteration")
+    horizon = _horizon_hours(config)
+    if isinstance(simulated, (int, float)):
+        reached = f"{simulated / 3600:.2f} h{'' if horizon is None else f' of {horizon:g} h'} simulated"
+    elif isinstance(iteration, int):
+        reached = f"nonlinear iteration {iteration}"
+    else:
+        reached = "no progress reported"
+    detail = f"{'' if reason is None else f'{reason}: '}{cause}{reached} after {solving_seconds:.0f} s solving"
+    if reason != "stalled":
+        return detail
+    rule = config.execution_values["runtime"]["stall_stop"]
+    return f"{detail} (threshold: {float(rule['minimum_simulated_seconds']) / 3600:.3g} h simulated after {float(rule['check_after_seconds']):g} s)"
 
 
 def _solver_environment(prepared: PreparedCase) -> dict[str, str]:
@@ -1718,8 +1741,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                 raise
             finally:
                 _unregister_solver(process)
-        solver_log = _write_solver_log(prepared)
-        captured_solver_text = solver_log.read_text(encoding="utf-8", errors="replace")
+        captured_solver_text = _solver_log_text(prepared)
         license_evidence = license_service.classify_temporary_license_capacity(captured_solver_text)
         solver_started = license_service.solver_progress_started(captured_solver_text)
         expected_exports_exist = _expected_exports_exist(config, prepared.work_directory)
@@ -1841,7 +1863,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         )
     timing = {
         "schema_kind": "simulation_case_timing",
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "batch_id": config.batch_id,
         "case_id": prepared.bundle.case_id,
         "case_input_id": prepared.bundle.case_input_id,
@@ -1886,7 +1908,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         ended_at=timing["ended_at"],
         runtime_seconds=elapsed,
     )
-    solver_log = _write_solver_log(prepared)
+    captured_solver_text = _solver_log_text(prepared)
     _write_solver_step_history(prepared)
     if cancelled:
         message = "Campaign cancellation terminated the COMSOL process."
@@ -1913,7 +1935,6 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
             exit_code=exit_code,
             runtime_reason="stalled",
         )
-    captured_solver_text = solver_log.read_text(encoding="utf-8", errors="replace")
     license_evidence = license_service.classify_temporary_license_capacity(
         captured_solver_text,
     )
@@ -2034,6 +2055,8 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         prepared.runtime_directory / "timing.json",
         timing,
     )
+    solver_log = prepared.runtime_directory / "solver.log"
+    common.serialization.atomic_write_text(solver_log, captured_solver_text)
     return ExecutionResult(
         prepared=prepared,
         command=tuple(command),
@@ -2094,7 +2117,7 @@ def _complete_stage(
     )
     provenance = {
         "schema_kind": "simulation_case_publication",
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "stage": stage,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
@@ -2116,7 +2139,7 @@ def _complete_stage(
     provenance_path = common.serialization.atomic_write_json(directory / "provenance.json", provenance)
     success = {
         "schema_kind": "simulation_case_success",
-        "schema_version": PUBLICATION_SCHEMA_VERSION,
+        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "stage": stage,
         "batch_id": config.batch_id,
         "case_id": case_payload["case_id"],
@@ -2770,7 +2793,7 @@ def _admit_processed_raw_publication(
     if (
         set(provenance) != _CASE_PUBLICATION_KEYS
         or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
-        or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(provenance.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
     ):
         message = f"Case publication schema is not current: {directory}"
         raise RuntimeError(message)
@@ -2841,7 +2864,7 @@ def _admit_processed_case_payload(
         if (
             set(provenance) != _CASE_PUBLICATION_KEYS
             or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
-            or provenance.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+            or not common.serialization.is_schema_version(provenance.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
         ):
             message = f"Case publication schema is not current: {directory}"
             raise RuntimeError(message)
@@ -2872,7 +2895,7 @@ def _require_processed_success_evidence(
     successful_stages = ("solver", "exports", "conversion", "publication")
     if (
         status.get("schema_kind") != "simulation_case_status"
-        or status.get("schema_version") != storage_service.STATUS_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(status.get("schema_version"), storage_service.STATUS_SCHEMA_VERSION)
         or status.get("case_state") != "successful"
         or status.get("solver_success") is not True
         or status.get("contains_nan_or_inf") is not False
@@ -2880,7 +2903,7 @@ def _require_processed_success_evidence(
         or not isinstance(stages, dict)
         or any(stages.get(name) != "succeeded" for name in successful_stages)
         or execution.get("schema_kind") != "simulation_execution_provenance"
-        or execution.get("schema_version") != 1
+        or not common.serialization.is_schema_version(execution.get("schema_version"), _EXECUTION_PROVENANCE_SCHEMA_VERSION)
         or execution.get("case_id") != case_id
         or execution.get("simulation_case_id") != simulation_case_id
         or not isinstance(result, dict)
@@ -2928,9 +2951,9 @@ def _admit_publication_directory(
     if (
         set(success) != _CASE_SUCCESS_KEYS
         or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
-        or success.get("schema_version") != PUBLICATION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(success.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
         or case_payload.get("schema_kind") != case_service.CASE_SCHEMA_KIND
-        or case_payload.get("schema_version") != case_service.CASE_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(case_payload.get("schema_version"), case_service.CASE_SCHEMA_VERSION)
     ):
         msg = f"Case publication schema is not current: {directory}"
         raise RuntimeError(msg)
@@ -3088,7 +3111,7 @@ def _admit_publication_directory(
         or execution.get("git_commit") != processing.get("solver_git_commit")
         or set(processing) != processing_keys
         or processing.get("schema_kind") != "generation_processing_provenance"
-        or processing.get("schema_version") != 1
+        or not common.serialization.is_schema_version(processing.get("schema_version"), _PROCESSING_PROVENANCE_SCHEMA_VERSION)
         or processing.get("case_id") != case_id
         or processing.get("case_input_id") != case_input_id
         or processing.get("simulation_case_id") != simulation_case_id
@@ -3472,7 +3495,6 @@ def _record_case_cleanup_failure(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_kind": "simulation_case_cleanup_failure",
-        "schema_version": 1,
         "publication_complete": completed_case_is_valid(
             config,
             case_index,
@@ -3910,7 +3932,7 @@ def _validate_terminal_scientific_config(
     if (
         not reference_template_matches
         or scientific.get("schema_kind") != "resolved_generation_batch"
-        or scientific.get("schema_version") != config_contract.CONFIG_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(scientific.get("schema_version"), config_contract.CONFIG_SCHEMA_VERSION)
         or scientific.get("simulation_profile") != manifest["simulation_profile"]
         or scientific.get("campaign_purpose") != manifest["campaign_purpose"]
         or scientific.get("sampling_regime") != manifest["sampling_regime"]
@@ -4063,18 +4085,9 @@ def _terminal_identity_is_valid(
     """Bind a terminal batch's name, storage locator, and immutable identifier to its persisted science."""
     expected_name, locator_regime = config_contract.resolve_batch_locators(profile_id, material_family, sampling_regime, scientific)
     storage_parts = common.paths.campaign_batch_parts(storage_name)
-    if storage_parts is not None:
-        expected_storage_name = f"source~{profile_id}~{storage_parts[1]}~{material_family}~{locator_regime}"
-    elif locator_regime == sampling_regime:
-        expected_storage_name = config_contract.build_batch_storage_name(
-            profile_id,
-            material_family,
-            sampling_regime,
-            campaign_purpose,
-            scientific_digest,
-        )
-    else:
+    if storage_parts is None:
         return False
+    expected_storage_name = f"source~{profile_id}~{storage_parts[1]}~{material_family}~{locator_regime}"
     return (
         batch_name == expected_name
         and batch_id == config_contract.build_batch_id(expected_name, scientific_digest)
@@ -4153,7 +4166,7 @@ def admit_terminal_batch(
     if (
         set(manifest) != _BATCH_MANIFEST_KEYS
         or manifest.get("schema_kind") != _BATCH_MANIFEST_SCHEMA_KIND
-        or manifest.get("schema_version") != BATCH_MANIFEST_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(manifest.get("schema_version"), BATCH_MANIFEST_SCHEMA_VERSION)
         or manifest.get("status") != "complete"
         or manifest.get("batch_storage_name") != safe_storage_name
     ):
@@ -4222,14 +4235,19 @@ def admit_terminal_batch(
         manifest.get("input_generation_id"),
         label="input_generation_id",
     )
-    if set(success) != _BATCH_SUCCESS_KEYS or success != {
+    expected_success = {
         "schema_kind": _BATCH_SUCCESS_SCHEMA_KIND,
         "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "simulation_profile": profile.id,
         "batch_id": safe_batch_id,
         "batch_identity": batch_identity,
         "manifest_sha256": manifest_sha256,
-    }:
+    }
+    if (
+        set(success) != _BATCH_SUCCESS_KEYS
+        or not common.serialization.is_schema_version(success["schema_version"], BATCH_MANIFEST_SCHEMA_VERSION)
+        or success != expected_success
+    ):
         msg = f"Terminal success marker does not bind the manifest: {success_path}"
         raise RuntimeError(msg)
     indices = manifest.get("intended_case_indices")

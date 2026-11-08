@@ -3,6 +3,7 @@
 Responsibilities:
   - Preserve the existing seeded material partition algorithm and rounding
   - Bind ordered Dataset ID/OOD case membership to explicit roles and seeds
+  - Refuse training on a Dataset without a fixed partition or without Train cases, for every Dataset view
 
 Design principles:
   - Physical Sources remain role-free; Dataset membership is immutable
@@ -151,6 +152,26 @@ def build_fixed_partition(
     return result
 
 
+def require_disjoint_roles(value: Mapping[str, Any]) -> None:
+    """Require every case in at most one of Train, validation, ID-test and OOD, and at most once within it.
+
+    Raises
+    ------
+    ValueError
+        If a role is not a list of case IDs or a case is repeated within or across roles.
+
+    """
+    for key in (*_ROLES, "ood"):
+        items = value[key]
+        if not isinstance(items, list) or any(not isinstance(item, str) or not item for item in items):
+            msg = f"Fixed partition {key} cases must be a list of case IDs."
+            raise ValueError(msg)
+    combined = [item for key in (*_ROLES, "ood") for item in value[key]]
+    if len(combined) != len(set(combined)):
+        msg = "Fixed partition roles must be disjoint and hold each case once."
+        raise ValueError(msg)
+
+
 def validate_fixed_partition(
     value: Mapping[str, Any],
     *,
@@ -186,13 +207,8 @@ def validate_fixed_partition(
     if set(roles) != set(materials) or any(not isinstance(role, str) or role not in {"id", "ood"} for role in roles.values()):
         msg = "Partition material roles must map each material to id or ood."
         raise ValueError(msg)
-    for key in (*_ROLES, "ood"):
-        items = value[key]
-        if not isinstance(items, list) or any(not isinstance(item, str) or not item for item in items):
-            msg = f"Fixed partition {key} cases must be a list of case IDs."
-            raise ValueError(msg)
-    combined = tuple(item for key in (*_ROLES, "ood") for item in value[key])
-    if len(combined) != len(set(combined)) or set(combined) != set(source):
+    require_disjoint_roles(value)
+    if {item for key in (*_ROLES, "ood") for item in value[key]} != set(source):
         msg = "Fixed partition must cover source cases once without overlap."
         raise ValueError(msg)
     expected_ood = [case_id for case_id in source if roles[material_by_case[case_id]] == "ood"]
@@ -214,6 +230,25 @@ def validate_fixed_partition(
         msg = "Fixed partition ID case membership does not match its recipe and seed."
         raise ValueError(msg)
     return dict(value)
+
+
+def validate_training_partition(
+    value: Mapping[str, Any] | None,
+    *,
+    dataset_id: str,
+    case_ids: Sequence[str],
+    material_by_case: Mapping[str, str],
+) -> dict[str, Any]:
+    """Require the fixed partition of a training Dataset to exist and hold Train cases, then validate it.
+
+    Evaluation-only Datasets may hold every case as OOD; training on one is refused for every Dataset view.
+    """
+    if value is not None:
+        fixed = validate_fixed_partition(value, case_ids=case_ids, material_by_case=material_by_case)
+        if fixed["train"]:
+            return fixed
+    msg = f"Training Dataset {dataset_id!r} has no fixed case partition with Train cases; build it from a Dataset plan."
+    raise ValueError(msg)
 
 
 def partition_digest(value: Mapping[str, Any]) -> str:

@@ -1,7 +1,7 @@
 """Protect transient continuous curriculum and stage-budget contracts.
 
 Responsibilities:
-  - Check horizon draws, exact resumed RNG, clock semantics, overflow, and budget completion
+  - Check horizon draws, exact resumed RNG, clock semantics, and budget completion
   - Check that origin strata reach the late part of a window for every batch size
 
 Design principles:
@@ -66,7 +66,6 @@ def test_curriculum_retains_shorter_horizons_and_resumes_exact_draws() -> None:
 def _work(**overrides: Any) -> dict[str, Any]:
     """Return one completed optimizer group with test-owned defaults."""
     work: dict[str, Any] = {
-        "successful": True,
         "optimizer_device_seconds": None,
         "microbatches": 1,
         "processed_target_transitions": 2,
@@ -142,9 +141,9 @@ def test_controller_state_rejects_semantic_drift_and_superseded_schemas() -> Non
     drifted = dict(saved, config_digest=_digest("other"))
     with pytest.raises(ValueError, match="conflicts"):
         controller.load_state_dict(drifted)
-    superseded = dict(saved, schema_version=2)
-    with pytest.raises(ValueError, match="strict schema"):
-        controller.load_state_dict(superseded)
+    for version in (2, True, 1.0):  # Superseded, JSON true and 1.0 must not pass as version 1.
+        with pytest.raises(ValueError, match="strict schema"):
+            controller.load_state_dict(dict(saved, schema_version=version))
 
 
 def test_controller_rejects_mismatched_budget_and_clock() -> None:
@@ -167,32 +166,6 @@ def test_active_horizon_shortage_fails_without_sampling_shorter_windows() -> Non
     with pytest.raises(ValueError, match="active curriculum maximum"):
         state.select(progress=0.85, available_length=16, batch_size=2)
     assert state.draw_index == 0
-
-
-def test_overflow_keeps_completed_compute_evidence_but_not_step_counters() -> None:
-    """Preserve measured CUDA work for AMP overflow without claiming an update."""
-    controller = MatchedComputeController(
-        arm="A0",
-        stage="stage_a_teacher_forcing",
-        clock_kind="cuda_device_seconds",
-        config_digest=_digest("overflow"),
-        planned_stage_epochs=1,
-    )
-    overflow = _work(
-        successful=False,
-        optimizer_device_seconds=2.5,
-        microbatches=2,
-        processed_target_transitions=8,
-        forward_transitions=8,
-        wall_seconds=3.0,
-    )
-    controller.record_completed_work(**overflow, peak_cuda_memory_bytes=32)
-    assert controller.post_handoff_optimizer_device_seconds == pytest.approx(2.5)
-    assert controller.microbatches == 2
-    assert controller.processed_target_transitions == 8
-    assert controller.forward_transitions == 8
-    assert controller.successful_optimizer_steps == 0
-    assert controller.post_handoff_optimizer_steps == 1
 
 
 def test_train_seconds_crossing_group_is_selectable_and_no_later_work_is_admitted() -> None:
@@ -272,7 +245,6 @@ def test_stage_epoch_budget_completes_only_after_the_terminal_evaluation() -> No
         teacher_handoff=_handoff(),
     )
     work = {
-        "successful": True,
         "optimizer_device_seconds": None,
         "microbatches": 1,
         "processed_target_transitions": 2,

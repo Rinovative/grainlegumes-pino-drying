@@ -132,7 +132,10 @@ link_job_logs() (
         [[ "${target}" -ef "${log}" ]] || printf 'Warning: %s is a different file; %s was not linked.\n' "${target}" "${log}" >&2
         continue
       fi
-      identity="$(stat -c '%d:%i' -- "${log}")"
+      if ! identity="$(stat -c '%d:%i' -- "${log}" 2>&1)"; then
+        printf 'Warning: could not read the identity of %s; it was not linked: %s\n' "${log}" "${identity}" >&2
+        continue
+      fi
       if ! error="$(ln -- "${log}" "${target}" 2>&1)"; then
         printf 'Warning: could not link %s: %s\n' "${log}" "${error}" >&2
       elif [[ "$(stat -c '%d:%i' -- "${target}")" != "${identity}" ]]; then
@@ -143,7 +146,17 @@ link_job_logs() (
   done < <(sort -u -- "${record}")
   return 0
 )
-trap 'link_job_logs; rm -rf -- "${TEMP_DIRECTORY}" || printf "Warning: could not remove %s\n" "${TEMP_DIRECTORY}" >&2' EXIT
+# The EXIT trap keeps the container's exit status: errexit is off inside it, a further TERM or INT cannot cut it short, and
+# it ends with that status explicitly, even when a warning cannot be written.
+finish_job() {
+  local status=$?
+  trap '' TERM INT
+  set +e
+  link_job_logs
+  rm -rf -- "${TEMP_DIRECTORY}" || printf 'Warning: could not remove %s\n' "${TEMP_DIRECTORY}" >&2
+  exit "${status}"
+}
+trap finish_job EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 

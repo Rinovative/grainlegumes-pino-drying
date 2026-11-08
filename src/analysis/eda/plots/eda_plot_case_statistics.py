@@ -263,37 +263,16 @@ def _flatten_dict_raw(dct: Mapping[str, Any]) -> dict[str, float]:
 
 def _case_parameter_values(meta: Mapping[str, Any]) -> dict[str, float]:
     """Return every numeric generated-case parameter leaf without fitting."""
-    values: dict[str, float] = {}
-    generator = meta.get("generator")
-    if isinstance(generator, Mapping):
-        for block in generator.values():
-            if not isinstance(block, Mapping):
-                continue
-            parameters = block.get("parameters")
-            if isinstance(parameters, Mapping):
-                values.update(_flatten_dict_raw(parameters))
     parameters = meta.get("parameters")
-    if isinstance(parameters, Mapping):
-        values.update(_flatten_dict_raw(parameters))
-    return values
+    return _flatten_dict_raw(parameters) if isinstance(parameters, Mapping) else {}
 
 
 def _case_parameter_units(meta: Mapping[str, Any]) -> dict[str, str]:
     """Return authoritative generated-case parameter units when retained."""
-    units: dict[str, str] = {}
-    generator = meta.get("generator")
-    if isinstance(generator, Mapping):
-        for block in generator.values():
-            if not isinstance(block, Mapping):
-                continue
-            for unit_key in ("parameter_units", "sampled_units", "units"):
-                block_units = block.get(unit_key)
-                if isinstance(block_units, Mapping):
-                    units.update({str(key): str(unit) for key, unit in block_units.items() if isinstance(unit, str) and unit})
     parameter_units = meta.get("parameter_units")
-    if isinstance(parameter_units, Mapping):
-        units.update({str(key): str(unit) for key, unit in parameter_units.items() if isinstance(unit, str) and unit})
-    return units
+    if not isinstance(parameter_units, Mapping):
+        return {}
+    return {str(key): str(unit) for key, unit in parameter_units.items() if isinstance(unit, str) and unit}
 
 
 def _dataset_colors(dataset_names: Sequence[str]) -> dict[str, str]:

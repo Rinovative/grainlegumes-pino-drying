@@ -149,6 +149,7 @@ def inspect_config(
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
+    seed: int | None = None,
     resume: Path | str | None = None,
     train_stages: tuple[str, ...] | None = None,
 ) -> ConfigPreflight:
@@ -169,7 +170,7 @@ def inspect_config(
         saved_resume_config = _saved_resume_config_path(source, resume) if resume is not None else None
         resolved: Mapping[str, Any]
         if saved_resume_config is not None and resume is not None:
-            if any(value is not None for value in (epochs, train_dataset, train_seconds, rollout_length, lr_scale, revision)):
+            if any(value is not None for value in (epochs, train_dataset, train_seconds, rollout_length, lr_scale, revision, seed)):
                 msg = "Saved-effective resume config does not accept semantic overrides; resume the saved config unchanged."
                 raise loader.ConfigError(msg)
             raw = loader.validate_resolved_config(raw, verify_layout_identity=False)
@@ -190,6 +191,7 @@ def inspect_config(
                 rollout_length=rollout_length,
                 lr_scale=lr_scale,
                 revision=revision,
+                seed=seed,
             )
             config_source = config_naming.config_source_from_path(source)
             if transient_plan.is_matched_a1_b_config(raw):
@@ -207,9 +209,11 @@ def inspect_config(
         if resume is not None:
             msg = "--resume applies only to the train workflow."
             raise loader.ConfigError(msg)
-        if any(value is not None for value in (train_seconds, rollout_length, lr_scale)):
-            msg = "--train-seconds, --rollout-length and --lr-scale apply only to matched transient training."
+        if seed is not None:
+            msg = "--seed applies only to the train workflow."
             raise loader.ConfigError(msg)
+        if any(value is not None for value in (train_seconds, rollout_length, lr_scale)):
+            raise loader.ConfigError(loader.MATCHED_TRAINING_FLAGS_MESSAGE)
         if train_stages is not None:
             msg = "--train-stages applies only to the train workflow."
             raise loader.ConfigError(msg)
@@ -321,6 +325,7 @@ def validate_workflow(
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
+    seed: int | None = None,
     resume: Path | str | None = None,
     train_stages: tuple[str, ...] | None = None,
 ) -> ConfigPreflight:
@@ -347,6 +352,7 @@ def validate_workflow(
         rollout_length=rollout_length,
         lr_scale=lr_scale,
         revision=revision,
+        seed=seed,
         resume=resume,
         train_stages=train_stages,
     )

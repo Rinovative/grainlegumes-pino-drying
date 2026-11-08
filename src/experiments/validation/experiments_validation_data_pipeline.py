@@ -1,7 +1,8 @@
-"""Validate the complete production data pipeline before an experiment is run.
+"""Validate the complete production data pipeline of a steady-flow experiment before it is run.
 
 Responsibilities:
-  - Admit complete task-bound ID and OOD datasets and metadata artifacts
+  - Refuse a transient-drying request, whose group scaling the transient loaders admit
+  - Admit complete task-bound ID and OOD datasets, whose manifests the production loaders already bound
   - Verify deterministic split membership, leakage, and loader coverage
   - Independently check train-fitted and normalized per-channel statistics
   - Verify finite transforms, inverse transforms, and sampler-state restoration
@@ -25,7 +26,6 @@ import resource
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -38,6 +38,8 @@ from src.experiments import experiments_run as run_service
 from src.experiments.config import experiments_config_loader as config_loader
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 _FULL_VALIDATION_RTOL = 3e-4
@@ -212,10 +214,9 @@ def _components(source: Any) -> tuple[Any, ...]:
     return tuple(getattr(source, "sources", (source,)))
 
 
-def _role_sample_ids(evidence: Any) -> tuple[str, ...]:
-    """Return ordered sample IDs of one admitted split role."""
-    sample_ids = evidence.source.sample_ids
-    return tuple(sample_ids[index] for index in evidence.index_values)
+def _role_sample_ids(parts: Sequence[Any]) -> tuple[str, ...]:
+    """Return the ordered case IDs a loader over admitted split parts yields in its batch metadata."""
+    return tuple(case_id for part in parts for case_id in part.case_ids)
 
 
 def _validate_tensor_contract(
@@ -393,10 +394,24 @@ def _membership_record(
 
 
 def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidationResult:
-    """Execute complete read-only production data admission and validation."""
+    """
+    Execute complete read-only production data admission and validation of a steady-flow experiment.
+
+    The independent checks recompute per-sample ``(x, y)`` per-channel
+    standardization and input-field identity. Transient drying scales
+    deduplicated states, transitions and increments of trajectory items instead,
+    so a transient request is refused before any data is loaded; its partition
+    and scaling membership are admitted when the transient loaders are built.
+    """
     started = time.perf_counter()
     peak_before_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024**2)
     effective = config_loader.validate_resolved_config(config)
+    if effective["task"] == "transient_drying":
+        message = (
+            "The full data-pipeline validator checks per-sample steady_flow standardization; "
+            "transient_drying admits its group scaling when its loaders are built."
+        )
+        raise ValueError(message)
     task = config_loader.validate_resolved_task_contract(effective)
     _require(
         task.tensor_layout == ("batch", "channel", "y", "x"),
@@ -439,28 +454,16 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
             for index, component in enumerate(_components(_full_source_dataset(additional_loader)))
         )
     )
-    metadata_root = Path(effective["paths"]["dataset_root"])
-    for contract in (id_contract, *additional_contracts):
-        datasets.contracts.metadata.load_dataset_metadata(
-            contract.identity.dataset_id,
-            dataset_identity=contract.identity,
-            metadata_root=metadata_root,
-            dataset_path=contract.source.path,
-        )
-
-    split_contract = datasets.preprocessing.splits.admit_split_contract(
-        split,
-        train_identity=id_contract.identity,
-        additional_evaluation_identity=None if additional_loader is None else _full_source_dataset(additional_loader).identity,
-    )
-    role_loaders: dict[str, datasets.preprocessing.splits.SplitRole] = {
-        "ID validation": "validation",
-        "ID test": "id_test",
-        "Additional evaluation": "additional_evaluation",
+    split_contract = datasets.preprocessing.splits.admit_split(split)
+    _require(split_contract.train.dataset["fingerprint"] == id_contract.identity.fingerprint, "split Train identity differs from the ID Dataset")
+    role_parts = {
+        "ID train": (split_contract.train,),
+        "ID validation": (split_contract.validation,),
+        "ID test": (split_contract.id_test,),
+        "Additional evaluation": split_contract.additional_evaluation,
     }
-    expected = {"ID train": _role_sample_ids(split_contract.train)}
-    expected.update({label: _role_sample_ids(split_contract.role(role_loaders[label])) for label in evaluation_loaders})
-    id_sets = [set(split_contract.role(role).index_values) for role in datasets.preprocessing.splits.ID_SPLIT_ROLES]
+    expected = {label: _role_sample_ids(role_parts[label]) for label in ("ID train", *evaluation_loaders)}
+    id_sets = [set(split_contract.role(role).case_ids) for role in datasets.preprocessing.splits.ID_SPLIT_ROLES]
     _require(
         not any(left & right for index, left in enumerate(id_sets) for right in id_sets[index + 1 :]),
         "ID train/validation/test overlap",
@@ -653,7 +656,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         seed_plan=seed_plan,
     )
     _require(
-        datasets.preprocessing.splits.admit_split_contract(repeated["split_indices"]) == first_split,
+        datasets.preprocessing.splits.admit_split(repeated["split_indices"]) == first_split,
         "repeated production split changed membership",
     )
     del repeated

@@ -101,7 +101,6 @@ from src.datasets import preprocessing as dataset_preprocessing
 from src.datasets import runtime as dataset_runtime
 from src.datasets.contracts import (
     dataset_contracts_identity,
-    dataset_contracts_metadata,
     dataset_contracts_transient,
     dataset_contracts_views,
 )
@@ -115,11 +114,11 @@ from src.datasets.packages import (
 )
 from src.datasets.preprocessing import (
     dataset_preprocessing_normalization,
+    dataset_preprocessing_scaling,
     dataset_preprocessing_splits,
 )
 from src.datasets.runtime import (
     dataset_runtime_factory,
-    dataset_runtime_package_validation,
     dataset_runtime_steady,
     dataset_runtime_training,
     dataset_runtime_transient,
@@ -140,7 +139,6 @@ modules = (
     dataset_preprocessing,
     dataset_runtime,
     dataset_contracts_identity,
-    dataset_contracts_metadata,
     dataset_contracts_transient,
     dataset_contracts_views,
     dataset_packages,
@@ -151,9 +149,9 @@ modules = (
     dataset_packages_selection,
     dataset_packages_transient_shards,
     dataset_preprocessing_normalization,
+    dataset_preprocessing_scaling,
     dataset_preprocessing_splits,
     dataset_runtime_factory,
-    dataset_runtime_package_validation,
     dataset_runtime_steady,
     dataset_runtime_training,
     dataset_runtime_transient,
@@ -173,13 +171,13 @@ assert (
     is dataset_packages_generated_batch.interpret_admitted_transient_source_case
 )
 assert datasets.contracts.identity.DatasetIdentity is dataset_contracts_identity.DatasetIdentity
-assert datasets.contracts.metadata.load_dataset_metadata is dataset_contracts_metadata.load_dataset_metadata
-assert datasets.preprocessing.normalization.build_normalizer_artifact is dataset_preprocessing_normalization.build_normalizer_artifact
+assert datasets.preprocessing.normalization.data_processor_from_state is dataset_preprocessing_normalization.data_processor_from_state
+assert datasets.preprocessing.scaling.fit_or_load_scaling is dataset_preprocessing_scaling.fit_or_load_scaling
 assert datasets.packages.build_dataset_selection is dataset_packages.build_dataset_selection
 assert datasets.packages.discover_source_collections is dataset_packages_selection.discover_source_collections
 assert datasets.packages.select_exact_cases is dataset_packages_selection.select_exact_cases
-assert datasets.packages.select_ranked_cases is dataset_packages_selection.select_ranked_cases
-assert datasets.preprocessing.splits.admit_split_contract is dataset_preprocessing_splits.admit_split_contract
+assert datasets.packages.select_ordered_cases is dataset_packages_selection.select_ordered_cases
+assert datasets.preprocessing.splits.admit_split is dataset_preprocessing_splits.admit_split
 assert datasets.runtime.steady.SteadyFlowDataset is dataset_runtime_steady.SteadyFlowDataset
 assert datasets.runtime.training.create_dataloaders is dataset_runtime_training.create_dataloaders
 assert datasets.runtime.transient.TransientPhysicalDataset is dataset_runtime_transient.TransientPhysicalDataset
@@ -189,9 +187,7 @@ assert dataset_package_services.builder.build_dataset_selection is dataset_packa
 assert dataset_package_services.manifest.load_package_manifest is dataset_packages_manifest.load_package_manifest
 assert dataset_package_services.planning.prepare_dataset_selection is dataset_packages_planning.prepare_dataset_selection
 assert dataset_package_services.transient_shards is dataset_packages_transient_shards
-assert dataset_package_services.transient_shards.build_transient_shards is dataset_packages_transient_shards.build_transient_shards
 assert dataset_package_services.inspect_dataset_package is dataset_packages.inspect_dataset_package
-assert dataset_runtime.package_validation.inspect_dataset_package is dataset_runtime_package_validation.inspect_dataset_package
 assert dataset_packages.DATASET_PACKAGE_SCHEMA_KIND == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_KIND
 assert dataset_packages.DATASET_PACKAGE_SCHEMA_VERSION == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_VERSION
 assert dataset_packages.build_dataset_selection.__module__ == "src.datasets.dataset_packages"

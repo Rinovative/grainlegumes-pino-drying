@@ -67,7 +67,6 @@ _FAILURE_STAGES: Final = frozenset({"input", "solver", "exports", "conversion", 
 _RUN_PREFIX: Final = "run_"
 _RUN_DIRECTORY: Final = re.compile(r"run_([0-9]{4,})\Z")
 _SMALL_RUNTIME_PATHS: Final = (
-    Path("runtime/solver.log"),
     Path("runtime/stdout.log"),
     Path("runtime/stderr.log"),
     Path("runtime/timing.json"),
@@ -80,7 +79,6 @@ _SMALL_RUNTIME_PATHS: Final = (
 _MAX_RETAINED_RUNTIME_LOG_BYTES: Final = 1024 * 1024
 _BOUNDED_RUNTIME_LOG_PATHS: Final = frozenset(
     {
-        Path("runtime/solver.log"),
         Path("runtime/stdout.log"),
         Path("runtime/stderr.log"),
     }
@@ -822,7 +820,7 @@ def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
     if (
         set(payload) != _ATTEMPT_RECEIPT_KEYS
         or payload.get("schema_kind") != ATTEMPT_SCHEMA_KIND
-        or payload.get("schema_version") != ATTEMPT_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), ATTEMPT_SCHEMA_VERSION)
         or case_state not in _CASE_STATES
         or failure_stage not in _FAILURE_STAGES
     ):
@@ -956,7 +954,7 @@ def _validate_cleanup_audit(
     if (
         set(payload) != _CLEANUP_RECEIPT_KEYS
         or payload.get("schema_kind") != CLEANUP_SCHEMA_KIND
-        or payload.get("schema_version") != CLEANUP_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), CLEANUP_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
         or payload.get("case_id") != attempt_payload["case_id"]
         or payload.get("attempt_index") != attempt_payload["attempt_index"]
@@ -986,7 +984,7 @@ def _license_compaction_audit(
     if (
         set(payload) != _LICENSE_COMPACTION_KEYS
         or payload.get("schema_kind") != LICENSE_COMPACTION_SCHEMA_KIND
-        or payload.get("schema_version") != LICENSE_COMPACTION_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload.get("schema_version"), LICENSE_COMPACTION_SCHEMA_VERSION)
         or payload.get("status") not in {"pending", "complete"}
         or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
         or payload.get("batch_id") != attempt_payload["batch_id"]
@@ -1184,7 +1182,6 @@ def compact_license_only_attempt_payload(
     if not isinstance(raw_excerpt, str) or not raw_excerpt:
         evidence_parts: list[str] = []
         for relative in (
-            "payload/runtime/solver.log",
             "payload/runtime/stdout.log",
             "payload/runtime/stderr.log",
         ):

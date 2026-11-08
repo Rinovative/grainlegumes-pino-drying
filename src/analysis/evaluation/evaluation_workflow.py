@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import pandas as pd
 
 from src import analysis, common
-from src.analysis.evaluation.evaluation_artifact_loader import _transient_physical_membership
 from src.analysis.presentation import analysis_compute as compute
 from src.experiments import experiments_matched_budget as matched_budget
 
@@ -361,7 +360,9 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
                 "source_dataset_ids": dataset.get("source_dataset_ids"),
             }
         ),
-        split_id=common.serialization.canonical_json_sha256(_transient_physical_split_identity(artifact)),
+        split_id=common.serialization.canonical_json_sha256(
+            _required_mapping(artifact.frame.attrs.get("transient_physical_split"), label="transient physical split")
+        ),
         input_profile_id=_required_text(identity.get("input_profile"), label="transient input profile"),
         scaling_id=_required_text(scaling.get("semantic_digest"), label="transient scaling digest"),
         boundary_representation_id=_required_text(
@@ -385,109 +386,56 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
     )
 
 
-def _transient_physical_split_identity(artifact: LoadedEvaluationArtifact) -> dict[str, Any]:
-    """Require the loader's admitted complete physical split, including unevaluated roles."""
-    split = _required_mapping(artifact.frame.attrs.get("transient_physical_split"), label="transient physical split")
-    roles = {"train", "validation", "id_test", "scaling_train_one_step", "additional_evaluation"}
-    if set(split) != roles:
-        message = "Transient physical split lacks exact saved roles."
-        raise ValueError(message)
-    result: dict[str, Any] = {}
-    for role in sorted(roles):
-        evidence = _required_mapping(split[role], label=f"transient physical {role}")
-        if set(evidence) != {"source_dataset_ids", "source_identities", "case_ids_by_source"}:
-            message = "Transient physical split has malformed role evidence."
-            raise ValueError(message)
-        result[role] = _transient_physical_membership(
-            evidence.get("source_dataset_ids"),
-            evidence.get("source_identities"),
-            evidence.get("case_ids_by_source"),
-            allow_empty=role == "additional_evaluation",
-        )
-    return result
-
-
-def _transient_role_membership(artifact: LoadedEvaluationArtifact) -> Any:
-    """Extract exact transient dataset and case membership from one admitted artifact."""
-    provenance = _required_mapping(artifact.frame.attrs.get("artifact_provenance"), label="transient artifact provenance")
-    dataset = _required_mapping(provenance.get("dataset"), label="transient Dataset provenance")
-    source_dataset_ids = dataset.get("source_dataset_ids")
-    membership_digests = dataset.get("membership_digests")
-    records = artifact.frame.attrs.get("transient_sequence_records")
-    index = artifact.frame.attrs.get("transient_sequence_index")
-    if (
-        not isinstance(source_dataset_ids, list)
-        or not all(isinstance(value, str) and value for value in source_dataset_ids)
-        or not isinstance(membership_digests, list)
-        or not all(isinstance(value, str) and value for value in membership_digests)
-    ):
-        msg = "Transient artifact has malformed shared-membership evidence."
-        raise ValueError(msg)
-    if isinstance(records, tuple) and records:
-        case_ids = tuple(
-            sorted(
-                {
-                    _required_text(
-                        getattr(record, "case_id", None),
-                        label="transient sequence case ID",
-                    )
-                    for record in records
-                }
-            )
-        )
-    elif isinstance(
-        index,
-        analysis.evaluation.transient_artifact.TransientSequenceArtifactIndex,
-    ):
-        case_ids = tuple(sorted(index.case_ids))
-    else:
-        msg = "Transient artifact has no admitted sequence inventory."
-        raise ValueError(msg)
-    physical = _transient_physical_membership(
-        source_dataset_ids,
-        dataset.get("source_identities"),
-        dataset.get("case_ids_by_source"),
-    )
-    if case_ids != tuple(sorted(case for group in physical["case_ids_by_source"] for case in group)):
-        message = "Transient physical dataset membership contradicts admitted sequence cases."
-        raise ValueError(message)
-    physical_digests = tuple(
-        common.serialization.canonical_json_sha256({"source_identity": identity, "case_ids": group})
-        for identity, group in zip(physical["source_identities"], physical["case_ids_by_source"], strict=True)
-    )
+def _role_membership(artifact: LoadedEvaluationArtifact) -> Any:
+    """Extract the exact source Datasets and case membership both tasks persist in one admitted artifact's provenance."""
+    provenance = _required_mapping(artifact.frame.attrs.get("artifact_provenance"), label="artifact provenance")
+    dataset = _required_mapping(provenance.get("dataset"), label="artifact Dataset provenance")
     return analysis.evaluation.transient_comparison.SharedRoleMembership(
-        dataset_name=_required_text(dataset.get("name"), label="transient dataset name"),
-        source_dataset_ids=tuple(source_dataset_ids),
-        membership_digests=physical_digests,
-        case_ids=case_ids,
+        dataset_name=_required_text(dataset.get("name"), label="artifact Dataset name"),
+        source_dataset_ids=tuple(dataset["source_dataset_ids"]),
+        membership_digests=tuple(dataset["membership_digests"]),
+        case_ids=tuple(sorted(case for group in dataset["case_ids_by_source"] for case in group)),
     )
 
 
-def _validate_transient_shared_membership(
+def _validate_shared_membership(
     loaded_runs: Sequence[LoadedRunArtifacts],
     *,
     roles: Sequence[ArtifactSelectionRole],
 ) -> None:
-    """Require exact role membership before any transient multi-run comparison panel."""
+    """Refuse a multi-run comparison whose runs disagree on any role's exact membership."""
     if len(loaded_runs) < _MINIMUM_COMPARISON_RUNS:
         return
-    comparison = analysis.evaluation.transient_comparison
     for role in roles:
-        comparison.validate_shared_role_membership(
+        analysis.evaluation.transient_comparison.validate_shared_role_membership(
             role=role,
-            memberships=tuple(_transient_role_membership(_selected_artifact(loaded, role)) for loaded in loaded_runs),
+            memberships=tuple(_role_membership(_selected_artifact(loaded, role)) for loaded in loaded_runs),
         )
 
 
-def _transient_lineage(loaded_runs: Sequence[LoadedRunArtifacts]) -> Any | None:
-    """Validate an exact selected A0/A1/B set while leaving other comparisons generic."""
+def _transient_lineage(loaded_runs: Sequence[LoadedRunArtifacts]) -> tuple[Any | None, str | None]:
+    """
+    Return an admitted A0/A1/B lineage comparison or the reason none applies.
+
+    A selection that is not one A0/A1/B set of shared immutable lineage has no
+    matched stage (reason string). Malformed arm evidence, and contradictory
+    evidence of a set that does share its lineage, fail closed.
+    """
     if len(loaded_runs) != _TRAINING_COMPARISON_ARM_COUNT:
-        return None
-    arms = tuple(_transient_arm_evidence(loaded) for loaded in loaded_runs)
-    by_name = {arm.arm: arm for arm in arms}
-    if set(by_name) == {"A0", "A1", "B"}:
-        return analysis.evaluation.transient_comparison.validate_matched_a1_b_lineage_comparison(a0=by_name["A0"], a1=by_name["A1"], b=by_name["B"])
-    return None
+        return None, "a matched training-stage comparison needs exactly the three runs A0, A1 and B"
+    arm_ids = set()
+    for loaded in loaded_runs:
+        provenance = _required_mapping(_selected_artifact(loaded, "id").frame.attrs.get("artifact_provenance"), label="transient artifact provenance")
+        lineage = _required_mapping(provenance.get("lineage"), label="transient lineage")
+        arm_ids.add(_required_mapping(lineage.get("stage_identity"), label="transient stage identity").get("comparison_arm"))
+    if arm_ids != {"a0", "a1", "b"}:
+        return None, "the selected runs are not one A0, A1 and B training-stage set"
+    by_name = {arm.arm: arm for arm in (_transient_arm_evidence(loaded) for loaded in loaded_runs)}
+    comparison = analysis.evaluation.transient_comparison
+    mismatch = comparison.matched_lineage_mismatch(a0=by_name["A0"], a1=by_name["A1"], b=by_name["B"])
+    if mismatch is not None:
+        return None, mismatch
+    return comparison.validate_matched_a1_b_lineage_comparison(a0=by_name["A0"], a1=by_name["A1"], b=by_name["B"]), None
 
 
 def _transient_performance_frame(
@@ -702,9 +650,9 @@ def prepare_evaluation_workflow(
         for spec in specs
     )
 
-    lineage = None
-    matched_stage_unavailable_reason = None
     transient_performance_loader: Callable[[], pd.DataFrame | None] | None = None
+    lineage: LineageComparison | None = None
+    matched_stage_unavailable_reason: str | None = None
     session: EvaluationSession | TransientEvaluationSession
     if task == "transient_drying":
         session = analysis.evaluation.transient_session.TransientEvaluationSession(
@@ -719,13 +667,10 @@ def prepare_evaluation_workflow(
             {f"{loaded.run_dir}:{role}": artifacts[(loaded.run_dir, role)].frame for loaded in loaded_runs for role in roles}
         )
     try:
+        _validate_shared_membership(loaded_runs, roles=roles)
         if task == "transient_drying":
             transient_session = cast("TransientEvaluationSession", session)
-            _validate_transient_shared_membership(loaded_runs, roles=roles)
-            try:
-                lineage = _transient_lineage(loaded_runs)
-            except (ValueError, TypeError, KeyError) as error:
-                matched_stage_unavailable_reason = str(error)
+            lineage, matched_stage_unavailable_reason = _transient_lineage(loaded_runs)
             transient_performance_loader = _lazy_transient_performance(
                 transient_session,
                 loaded_runs=loaded_runs,

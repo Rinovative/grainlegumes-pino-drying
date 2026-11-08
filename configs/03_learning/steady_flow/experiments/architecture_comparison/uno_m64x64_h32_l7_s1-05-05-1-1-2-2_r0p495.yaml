@@ -2,9 +2,6 @@
 task: steady_flow  # Selects the task contract and its compatible data/model/loss validation.
 base: ../../base.yaml  # Shared task settings; every value set below overrides them.
 
-run:
-  deterministic: false  # Request deterministic kernels where supported; may reduce performance or reject unsupported operations.
-
 model:
   kind: uno  # Select the architecture family; its params below are interpreted by that family.
   params:
@@ -14,6 +11,8 @@ model:
     n_layers: 7  # Number of architecture layers/blocks; affects capacity and compute.
     mode_ratio: 0.4951318201313778  # UNO fraction controlling intermediate Fourier-mode allocation.
     uno_scalings: [[1.0, 1.0], [0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0], [2.0, 2.0], [2.0, 2.0]]  # Per-layer [y, x] spatial scaling schedule; its length must match n_layers.
+    lifting_channel_ratio: 2  # U-NO lifting width relative to hidden_channels.
+    projection_channel_ratio: 2  # U-NO projection width relative to hidden_channels.
     channel_mlp_skip: linear  # Channel-MLP skip connection type.
 
 loss:
@@ -21,4 +20,5 @@ loss:
     enabled: false  # Enable the physics residual and boundary loss terms.
 
 optimizer:
+  # Placeholder until the uno_search study selects it.
   lr: 5.319714363424885e-4  # Initial learning rate; controls the optimizer update scale.

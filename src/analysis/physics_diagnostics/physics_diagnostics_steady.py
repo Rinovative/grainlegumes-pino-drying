@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Evaluate the training-loss terms of reference fields through the domain evaluator
-  - Decompose momentum into pressure, viscous, and drag parts and add the 2/3 trace variant
+  - Decompose momentum into pressure, viscous, and drag parts and report the 2/3 trace part
   - Evaluate the pointwise divergence variants removed from the loss
   - Reduce residuals per case over interior crops, boundary bands, and edge profiles
   - Compare finite-difference and spectral derivatives of the same reference fields
@@ -23,10 +23,10 @@ This module does NOT:
 
 Notes:
   Momentum terms, each divided by G = dp / L_y:
-    pressure = -grad(p), viscous = div((mu/eps)(grad u + grad u^T)), drag = -mu K^-1 u,
-    residual = pressure + viscous + drag (exactly the domain residual),
-    trace = -(2/3) grad((mu/eps) div u), the compressible stress term COMSOL omits
-    for incompressible flow; residual_with_trace = residual + trace.
+    pressure = -grad(p), viscous = div((mu/eps)(grad u + grad u^T - (2/3) div(u) I)),
+    drag = -mu K^-1 u, residual = pressure + viscous + drag (exactly the domain residual),
+    trace = -(2/3) grad((mu/eps) div u), the part of viscous that COMSOL keeps also
+    for incompressible flow (zero where div u = 0).
   The parts come from the domain residual itself: drag from an evaluation with
   zero derivatives, viscous minus drag from an evaluation with zero pressure,
   and their difference to the full residual must equal -grad(p) to roundoff.
@@ -56,7 +56,6 @@ if TYPE_CHECKING:
 
 PerturbationKind = Literal["smooth", "noise", "velocity_scale", "pressure_offset"]
 
-TRACE_COEFFICIENT: Final = 2.0 / 3.0
 DEFAULT_CROPS: Final = (0, 1, 2, 4, 8)
 BAND_EDGES: Final = (0, 1, 2, 3, 5, 9, 17)
 BAND_LABELS: Final = ("0", "1", "2", "3-4", "5-8", "9-16", ">=17")
@@ -68,7 +67,6 @@ _INTERIOR_BAND = BAND_LABELS[-1]
 _DECOMPOSITION_TOLERANCE_FACTOR = 64.0
 _RESIDUAL_COLUMNS = (
     "momentum",
-    "momentum_with_trace",
     "trace_rms",
     "pointwise_divergence",
     "porous_divergence",
@@ -88,8 +86,8 @@ class DerivativeBackend:
     ----------
     label : str
         Short stable identifier used in tables.
-    kind, extension : str
-        Domain derivative identifiers passed to the operator factory.
+    kind : str
+        Domain derivative identifier passed to the operator factory.
     description : str
         Readable description for figures.
 
@@ -97,18 +95,16 @@ class DerivativeBackend:
 
     label: str
     kind: str
-    extension: str
     description: str
 
     def build(self) -> domain.physics.derivatives.DerivativeOperator:
         """Return the domain operator for this configuration."""
-        return domain.physics.derivatives.build_derivative_operator(self.kind, extension=self.extension)
+        return domain.physics.derivatives.build_derivative_operator(self.kind)
 
 
 DERIVATIVE_BACKENDS: Final = (
-    DerivativeBackend("fd", "physical", "none", "finite differences (torch.gradient)"),
-    DerivativeBackend("fc", "spectral", "fourier_continuation", "spectral, Fourier continuation"),
-    DerivativeBackend("periodic", "spectral", "none", "spectral, periodic (no extension)"),
+    DerivativeBackend("fd", "physical", "finite differences (NeuralOp FiniteDiff)"),
+    DerivativeBackend("fc", "spectral", "spectral, Fourier continuation"),
 )
 
 
@@ -117,7 +113,6 @@ class _ZeroDerivatives:
     """Return zero derivatives so the domain residual reduces to its drag term."""
 
     kind: Literal["physical", "spectral"] = "physical"
-    extension: Literal["none", "fourier_continuation"] = "none"
     axes: tuple[int, int] = (-2, -1)
 
     def gradient(self, field: Tensor, spacing_x: float | Tensor, spacing_y: float | Tensor) -> tuple[Tensor, Tensor]:
@@ -141,7 +136,8 @@ class SteadyResidualFields:
     backend : str
         Derivative backend label.
     pressure, viscous, drag, trace, residual : torch.Tensor
-        Momentum terms ``[case, 2, y, x]`` divided by the per-case ``G``.
+        Momentum terms ``[case, 2, y, x]`` divided by the per-case ``G``;
+        ``trace`` is the 2/3 part contained in ``viscous``.
     divergence, porous_divergence : torch.Tensor
         Pointwise divergence variants ``[case, y, x]``.
     flux_balance : torch.Tensor
@@ -165,11 +161,6 @@ class SteadyResidualFields:
     boundary_inlet: Tensor
     boundary_outlet: Tensor
     scales: domain.physics.brinkman.BrinkmanScales
-
-    @property
-    def residual_with_trace(self) -> Tensor:
-        """Return the momentum residual including the 2/3 trace term."""
-        return self.residual + self.trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,7 +332,7 @@ def evaluate_residual_fields(
         msg = "Momentum decomposition does not reproduce the domain residual: residual minus velocity terms differs from -grad(p)."
         raise ValueError(msg)
     viscous = velocity_terms - drag_terms
-    trace = -TRACE_COEFFICIENT * torch.stack((trace_x, trace_y), dim=1) / gradient
+    trace = -brinkman.STRESS_TRACE_COEFFICIENT * torch.stack((trace_x, trace_y), dim=1) / gradient
     length_y = values["y"].amax(dim=(-2, -1)) - values["y"].amin(dim=(-2, -1))
     divergence_scale = (scales.velocity / length_y)[:, None, None]
     mean_porosity = porosity.mean(dim=(-2, -1))[:, None, None]
@@ -387,14 +378,13 @@ def residual_rows(fields: SteadyResidualFields, crop: int) -> dict[str, np.ndarr
     Returns
     -------
     dict[str, numpy.ndarray]
-        Per-case values keyed by ``momentum``, ``momentum_with_trace``,
-        ``trace_rms``, ``pointwise_divergence``, ``porous_divergence``,
-        ``flux_balance``, ``boundary_inlet``, ``boundary_outlet``, ``boundary``.
+        Per-case values keyed by ``momentum``, ``trace_rms``,
+        ``pointwise_divergence``, ``porous_divergence``, ``flux_balance``,
+        ``boundary_inlet``, ``boundary_outlet``, ``boundary``.
 
     """
     values = {
         "momentum": _case_mean_square(fields.residual, crop),
-        "momentum_with_trace": _case_mean_square(fields.residual_with_trace, crop),
         "trace_rms": _case_mean_square(fields.trace, crop).sqrt(),
         "pointwise_divergence": _crop(fields.divergence, crop).square().mean(dim=(-2, -1)),
         "porous_divergence": _crop(fields.porous_divergence, crop).square().mean(dim=(-2, -1)),
@@ -466,8 +456,8 @@ def summarize_momentum_terms(fields: SteadyResidualFields, *, case_labels: Seque
     Returns
     -------
     pandas.DataFrame
-        One row per case with ``pressure``, ``viscous``, ``drag``, ``trace``,
-        ``residual``, and ``residual_with_trace`` RMS values, all divided by G.
+        One row per case with ``pressure``, ``viscous``, ``drag``, ``trace``
+        (the part of ``viscous``), and ``residual`` RMS values, all divided by G.
 
     """
     terms = {
@@ -476,7 +466,6 @@ def summarize_momentum_terms(fields: SteadyResidualFields, *, case_labels: Seque
         "drag": fields.drag,
         "trace": fields.trace,
         "residual": fields.residual,
-        "residual_with_trace": fields.residual_with_trace,
     }
     reduced = {name: _case_mean_square(value, crop).sqrt().to(torch.float64).cpu().numpy() for name, value in terms.items()}
     return pd.DataFrame(
@@ -515,20 +504,16 @@ def residual_band_profile(fields: SteadyResidualFields, *, case_labels: Sequence
     Returns
     -------
     pandas.DataFrame
-        Rows with ``case``, ``backend``, ``band``, ``residual_rms``, and
-        ``residual_with_trace_rms``.
+        Rows with ``case``, ``backend``, ``band``, and ``residual_rms``.
 
     """
     bands = band_index(tuple(fields.residual.shape[-2:]))
     residual = fields.residual.square().sum(dim=1).to(torch.float64).cpu().numpy()
-    with_trace = fields.residual_with_trace.square().sum(dim=1).to(torch.float64).cpu().numpy()
     rows: list[dict[str, object]] = []
     for index, case in enumerate(case_labels):
-        plain = _band_rms(residual[index], bands)
-        traced = _band_rms(with_trace[index], bands)
+        rms = _band_rms(residual[index], bands)
         rows.extend(
-            {"case": case, "backend": fields.backend, "band": label, "residual_rms": plain[position], "residual_with_trace_rms": traced[position]}
-            for position, label in enumerate(BAND_LABELS)
+            {"case": case, "backend": fields.backend, "band": label, "residual_rms": rms[position]} for position, label in enumerate(BAND_LABELS)
         )
     return pd.DataFrame(rows)
 
@@ -582,7 +567,7 @@ def compare_derivatives(
     *,
     dtype: torch.dtype = torch.float64,
     baseline: str = "fd",
-    others: Sequence[str] = ("fc", "periodic"),
+    others: Sequence[str] = ("fc",),
 ) -> pd.DataFrame:
     """
     Compare backend derivatives of the reference outputs per boundary band.
@@ -860,10 +845,9 @@ def flow_regime(reference: SteadyReference, *, dtype: torch.dtype = torch.float6
     )
 
 
-def residual_magnitude(fields: SteadyResidualFields, *, with_trace: bool = False) -> np.ndarray:
+def residual_magnitude(fields: SteadyResidualFields) -> np.ndarray:
     """Return the per-point dimensionless momentum residual magnitude ``[case, y, x]``."""
-    residual = fields.residual_with_trace if with_trace else fields.residual
-    return residual.square().sum(dim=1).sqrt().to(torch.float64).cpu().numpy()
+    return fields.residual.square().sum(dim=1).sqrt().to(torch.float64).cpu().numpy()
 
 
 def maintained_physics_settings(config_root: Path | str | None = None) -> pd.DataFrame:
@@ -880,14 +864,15 @@ def maintained_physics_settings(config_root: Path | str | None = None) -> pd.Dat
     -------
     pandas.DataFrame
         One row per experiment or Optuna study with enabled physics: source,
-        derivative kind and extension, interior crop, the three target weights,
+        derivative kind, interior crop, the three target weights,
         and whether the study search space varies any physics setting.
 
     Notes
     -----
     Experiments are merged with their task base through the authoritative
-    authored-config loader; run-time values such as Dataset identities are not
-    resolved because the physics block does not depend on them.
+    authored-config loader and then over the task defaults with the loader's
+    merge; run-time values such as Dataset identities are not resolved because
+    the physics block does not depend on them.
 
     """
     root = Path(config_root) if config_root is not None else common.paths.get_project_root() / "configs" / "03_learning" / "steady_flow"
@@ -897,8 +882,9 @@ def maintained_physics_settings(config_root: Path | str | None = None) -> pd.Dat
             continue
         raw = experiments.config.loader.load_yaml(path)
         is_study = "experiment" in raw
-        config = experiments.config.loader.apply_authored_base(raw["experiment"] if is_study else raw, origin=path)
-        physics = config.get("loss", {}).get("physics", {})
+        authored = experiments.config.loader.apply_authored_base(raw["experiment"] if is_study else raw, origin=path)
+        config = experiments.config.loader.deep_merge(experiments.config.defaults.get_task_defaults("steady_flow"), authored)
+        physics = config["loss"]["physics"]
         if not physics.get("enabled"):
             continue
         searched = sorted(key for key in raw.get("search_space", {}) if str(key).startswith("loss.physics"))
@@ -907,7 +893,6 @@ def maintained_physics_settings(config_root: Path | str | None = None) -> pd.Dat
                 "config": str(path.relative_to(root)),
                 "kind": "optuna" if is_study else "experiment",
                 "derivative": physics["derivatives"]["kind"],
-                "extension": physics["derivatives"]["extension"],
                 "interior_crop": int(physics["interior_crop"]),
                 "momentum_weight": float(physics["momentum_weight"]["target"]),
                 "continuity_weight": float(physics["continuity_weight"]["target"]),
@@ -940,7 +925,7 @@ def residual_overview(residuals: pd.DataFrame, *, statistic: str = "median") -> 
 
 def band_overview(bands: pd.DataFrame) -> pd.DataFrame:
     """Return the case-median momentum-residual RMS per boundary band and backend."""
-    table = bands.pivot_table(index="band", columns="backend", values=["residual_rms", "residual_with_trace_rms"], aggfunc="median")
+    table = bands.pivot_table(index="band", columns="backend", values="residual_rms", aggfunc="median")
     return table.reindex(list(BAND_LABELS))
 
 

@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check completed-run admission, required files, checkpoint roles, and exact normalizer reuse
+  - Check that weights recorded by other model code are refused before any inference state is built
   - Check that inference batches steady items with absent metadata exactly as training does
 
 Design principles:
@@ -145,6 +146,25 @@ def test_continuation_requires_last_checkpoint_even_when_other_files_exist(tmp_p
     assert common.paths.resolve_best_checkpoint_file(run_dir).is_file()
 
 
+def _producer(task_id: str, *, model_sha256: str | None = None) -> dict[str, str]:
+    """Return run producer evidence recording the running model code unless another digest is given."""
+    digest = learning.training.checkpoint.model_implementation_digest(task_id) if model_sha256 is None else model_sha256
+    return {"training_sha256": "a" * 64, "model_sha256": digest}
+
+
+def test_inference_refuses_weights_of_other_model_code_before_building_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loading persisted weights continues the trained computation, so a changed model digest is refused before seeding or model setup."""
+    context = learning.inference.context
+    completed_run = {"scientific_run_name": "run", "config": {"task": "steady_flow", "producer": _producer("steady_flow", model_sha256="0" * 64)}}
+    monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed_run)
+    monkeypatch.setattr(context, "_field_contract", lambda _config: (["source"], ["target"]))
+    monkeypatch.setattr(experiments.run, "configure_reproducibility", lambda *_args, **_kwargs: pytest.fail("seeded before the model guard"))
+    monkeypatch.setattr(context, "_build_model_from_config", lambda *_args, **_kwargs: pytest.fail("built a model before the guard"))
+
+    with pytest.raises(ValueError, match=r"^Run run: model_steady_flow implementation changed .*--revision <label>$"):
+        context.load_inference_context(run_dir=tmp_path / "run", device_policy="cpu")
+
+
 def test_inference_uses_exact_normalizer_state_returned_by_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -164,33 +184,19 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         "out_normalizer.std": torch.ones(1, 1, 1, 1),
     }
     completed_run = {
-        "config": {},
+        "scientific_run_name": "run",
+        "config": {"task": "steady_flow", "producer": _producer("steady_flow")},
         "split_indices": {},
         "best_checkpoint": {"model_state_dict": model.state_dict()},
         "normalizer_state": normalizer_state,
     }
-    source_identity = datasets.contracts.identity.DatasetIdentity(
-        dataset_id="synthetic",
-        task="synthetic",
-        data_contract_digest="d" * 64,
-        fingerprint="f" * 64,
-        sample_ids=("sample-0",),
-        sample_count=1,
-        spatial_shape=(1, 1),
-    )
     evidence = datasets.preprocessing.splits.SplitRoleEvidence(
         name="id_test",
-        source=source_identity,
-        index_values=(0,),
-        count=1,
-        full_count=1,
+        dataset={"dataset_id": "synthetic", "case_ids": ["sample-0"]},
+        case_ids=("sample-0",),
         membership_digest="e" * 64,
     )
-    selection = context.SplitSelection(
-        role="id_test",
-        dataset_paths=(tmp_path / "unused.pt",),
-        evidence=evidence,
-    )
+    selection = context.SplitSelection(role="id_test", evidence=(evidence,))
     dataset = _SyntheticDataset()
 
     monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed_run)
@@ -211,15 +217,9 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         assert device == torch.device("cpu")
         return model
 
-    def create_dataset(_path: Path, *, task: object) -> _SyntheticDataset:
-        del task
-        return dataset
-
     monkeypatch.setattr(context, "_build_model_from_config", build_model)
-    monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: object())
-    monkeypatch.setattr(context.datasets.runtime.steady, "create_dataset", create_dataset)
+    monkeypatch.setattr(context, "_open_split_sources", lambda _selection, **_kwargs: [dataset])
     monkeypatch.setattr(context.datasets.preprocessing.splits, "combine_identity_datasets", lambda _sources: dataset)
-    monkeypatch.setattr(context, "_validate_split_indices_for_dataset", lambda **_kwargs: None)
 
     def unexpected_torch_load(*_args: Any, **_kwargs: Any) -> Any:
         msg = "Inference reopened a validated Torch artifact"

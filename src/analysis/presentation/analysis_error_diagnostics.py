@@ -100,7 +100,7 @@ def steady_reference_scale(provenance: Mapping[str, Any], *, field: str, unit: s
     if normalizer.get("output_normalization") != "train_fitted_per_channel_standardization":
         return f"Saved normalization for {field} is not a physical-difference standard deviation."
     fit_split = normalizer.get("fit_split")
-    identity = dataset.get("fingerprint")
+    identity = dataset.get("name")
     scaler_identity = normalizer.get("sha256")
     if fit_split != "train" or not isinstance(identity, str) or not identity:
         return "Train-only scale provenance or Dataset identity is missing."

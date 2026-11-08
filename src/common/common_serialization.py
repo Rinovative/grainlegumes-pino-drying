@@ -5,11 +5,13 @@ Responsibilities:
   - Flush file data and parent-directory metadata where the platform supports it
   - Remove unpublished temporary files after handled failures
   - Provide canonical JSON and file SHA-256 helpers for lifecycle identities
+  - Provide the one strict integer predicate every reader uses for schema versions
 
 Design principles:
   - A failed publication never damages the published destination
   - Same-directory temporary files keep replacement on one filesystem
   - Callers decide whether replacement is permitted by their lifecycle contract
+  - A schema version matches only an exact integer, never ``True`` or ``1.0``
 
 This module does NOT:
   - Enforce checkpoint, experiment, dataset, or artifact schemas
@@ -323,6 +325,11 @@ def canonical_json_sha256(payload: Any) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
+
+
+def is_schema_version(value: object, expected: int) -> bool:
+    """Return whether a decoded document field is exactly the integer ``expected``, never ``True`` or ``1.0``."""
+    return type(value) is int and value == expected
 
 
 def file_sha256(path: Path | str) -> str:

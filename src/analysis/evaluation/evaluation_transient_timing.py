@@ -83,7 +83,7 @@ class TransientTimingCase:
     repetitions: Mapping[str, tuple[float, ...]]
     device: str
     precision: str
-    dataset_backend: str
+    pt_payload_identity: str
     warmup_passes: int
     batch_size: int = 1
     cpu: str = "unknown"
@@ -91,7 +91,6 @@ class TransientTimingCase:
     software_versions: Mapping[str, str] = field(default_factory=dict)
     cold_timings: Mapping[str, float] = field(default_factory=dict)
     unavailable_reasons: Mapping[str, str] = field(default_factory=dict)
-    pt_payload_identity: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,8 +256,8 @@ def build_transient_timing_report(cases: Sequence[TransientTimingCase]) -> Trans
             msg = "Timing cases require unique non-empty identifiers."
             raise ValueError(msg)
         identifiers.add(case.case_id)
-        if not case.device or not case.precision or case.dataset_backend not in {"canonical_hdf5", "pt_shards"}:
-            msg = "Timing cases must disclose device, precision, and a canonical Dataset backend."
+        if not case.device or not case.precision or not isinstance(case.pt_payload_identity, str) or not case.pt_payload_identity:
+            msg = "Timing cases must disclose device, precision, and the PT payload identity."
             raise ValueError(msg)
         if case.precision != "float32":
             msg = "Transient timing currently supports only float32 Evaluation."
@@ -290,12 +289,6 @@ def build_transient_timing_report(cases: Sequence[TransientTimingCase]) -> Trans
             or repeated.intersection(unavailable)
         ):
             msg = "Timing evidence may contain only declared components and cannot be both available and unavailable."
-            raise ValueError(msg)
-        if case.dataset_backend == "pt_shards" and not case.pt_payload_identity:
-            msg = "PT-shard timing requires its payload identity."
-            raise ValueError(msg)
-        if case.dataset_backend == "canonical_hdf5" and case.pt_payload_identity is not None:
-            msg = "Canonical-HDF5 timing must not claim a PT payload identity."
             raise ValueError(msg)
         for name, value in case.cold_timings.items():
             _duration(value, label=f"{case.case_id}.cold.{name}")
@@ -332,7 +325,7 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
         software_versions = item["software_versions"]
         cold_timings = item["cold_timings"]
         unavailable_reasons = item["unavailable_reasons"]
-        text_fields = ("case_id", "device", "precision", "dataset_backend", "cpu")
+        text_fields = ("case_id", "device", "precision", "pt_payload_identity", "cpu")
         if any(not isinstance(item[name], str) or not item[name] for name in text_fields):
             msg = f"Serialized transient timing case {position} text fields are invalid."
             raise TypeError(msg)
@@ -348,14 +341,12 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
         warmup_passes = item["warmup_passes"]
         batch_size = item["batch_size"]
         gpu = item["gpu"]
-        pt_payload_identity = item["pt_payload_identity"]
         if (
             isinstance(warmup_passes, bool)
             or not isinstance(warmup_passes, int)
             or isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
             or (gpu is not None and (not isinstance(gpu, str) or not gpu))
-            or (pt_payload_identity is not None and (not isinstance(pt_payload_identity, str) or not pt_payload_identity))
         ):
             msg = f"Serialized transient timing case {position} scalar fields are invalid."
             raise TypeError(msg)
@@ -365,7 +356,7 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
                 repetitions=cast("Mapping[str, tuple[float, ...]]", {name: tuple(values) for name, values in repetitions.items()}),
                 device=cast("str", item["device"]),
                 precision=cast("str", item["precision"]),
-                dataset_backend=cast("str", item["dataset_backend"]),
+                pt_payload_identity=cast("str", item["pt_payload_identity"]),
                 warmup_passes=warmup_passes,
                 batch_size=batch_size,
                 cpu=cast("str", item["cpu"]),
@@ -373,7 +364,6 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
                 software_versions=cast("Mapping[str, str]", dict(software_versions)),
                 cold_timings=cast("Mapping[str, float]", dict(cold_timings)),
                 unavailable_reasons=cast("Mapping[str, str]", dict(unavailable_reasons)),
-                pt_payload_identity=cast("str | None", pt_payload_identity),
             )
         )
     report = build_transient_timing_report(cases)

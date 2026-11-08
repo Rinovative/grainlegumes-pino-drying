@@ -191,7 +191,7 @@ def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
 
     def train(*_args: Any, **_kwargs: Any) -> dict[str, float]:
         clock[0] += 7.0
-        return {"train/loss": 0.5, "optimizer_steps": 1.0}
+        return {"train/loss": 0.5, "optimizer_steps": 1.0, "committed_optimizer_groups": 1.0, "gradient_predictions": 1.0}
 
     def evaluate(*_args: Any, **_kwargs: Any) -> dict[str, float]:
         clock[0] += 11.0
@@ -208,13 +208,14 @@ def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
             "checkpoint_role": kwargs["role"],
         }
 
-    def publish(payload: dict[str, Any], path: Path) -> None:
-        events.append(f"publish_{payload['checkpoint_role']}")
-        clock[0] += 3.0
-        if publication_fails and payload["checkpoint_role"] == "last":
-            message = "bounded checkpoint publication failure"
-            raise OSError(message)
-        saved[path] = payload
+    def publish(*publications: tuple[dict[str, Any], Path]) -> None:
+        for payload, _path in publications:
+            events.append(f"publish_{payload['checkpoint_role']}")
+            clock[0] += 3.0
+            if publication_fails and payload["checkpoint_role"] == "last":
+                message = "bounded checkpoint publication failure"
+                raise OSError(message)
+        saved.update({path: payload for payload, path in publications})
 
     def observer(_epoch: int, _values: dict[str, float]) -> None:
         events.append("observer")
@@ -223,7 +224,7 @@ def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
     monkeypatch.setattr(loop, "train_one_epoch", train)
     monkeypatch.setattr(loop, "eval_one_epoch", evaluate)
     monkeypatch.setattr(loop.checkpoints, "make_checkpoint", capture)
-    monkeypatch.setattr(loop.checkpoints, "save_checkpoint", publish)
+    monkeypatch.setattr(loop.checkpoints, "save_checkpoints", publish)
     monkeypatch.setattr(loop.checkpoints, "load_checkpoint", lambda path, **_kwargs: saved[Path(path)])
     arguments = {
         "config": config,
@@ -246,7 +247,7 @@ def test_checkpoint_timer_measures_capture_and_publication_outside_observers(
         result = loop.train_loop(**arguments)
         assert result["operational_timing"] == timing
         assert events[-1] == "observer"
-    assert events[:4] == ["capture_best", "publish_best", "capture_last", "publish_last"]
+    assert events[:4] == ["capture_best", "capture_last", "publish_best", "publish_last"]
     assert timing["checkpoint_capture_and_publication_seconds"] == 10.0
     assert timing["checkpoint_capture_and_publication_attempts"] == 2
-    assert timing["epoch_duration_scope"].endswith("excludes_epoch_state_last_checkpoint_and_observers")
+    assert timing["epoch_duration_scope"].endswith("excludes_epoch_state_checkpoint_writes_and_observers")

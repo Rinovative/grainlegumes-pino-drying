@@ -15,9 +15,7 @@ Provides:
 - timing: admitted completed-case runtime and physical-duration timing evidence
 - stop: controlled COMSOL status-file stop and force escalation
 - workspace: bounded scratch and publication staging
-- PUBLICATION_SCHEMA_VERSION: canonical case-publication schema version
 - CASE_FAILURE_SCHEMA_KIND: canonical persisted case-failure schema kind
-- CASE_FAILURE_SCHEMA_VERSION: canonical persisted case-failure schema version
 - CaseCleanupError: post-publication scratch-cleanup failure
 - CaseExecutionError: structured case-execution failure
 - CaseInterruptedError: cooperative case-cancellation failure
@@ -77,8 +75,6 @@ if TYPE_CHECKING:
     from . import generation_runtime_workspace as workspace
     from .generation_runtime_batch import (
         CASE_FAILURE_SCHEMA_KIND,
-        CASE_FAILURE_SCHEMA_VERSION,
-        PUBLICATION_SCHEMA_VERSION,
         ArtifactEvidence,
         CaseCleanupError,
         CaseExecutionError,
@@ -136,8 +132,6 @@ _MODULES = {
 _BATCH_EXPORTS = frozenset(
     {
         "CASE_FAILURE_SCHEMA_KIND",
-        "CASE_FAILURE_SCHEMA_VERSION",
-        "PUBLICATION_SCHEMA_VERSION",
         "ArtifactEvidence",
         "CaseCleanupError",
         "CaseExecutionError",
@@ -181,8 +175,6 @@ _PREPARATION_EXPORTS = frozenset(
 )
 __all__ = [
     "CASE_FAILURE_SCHEMA_KIND",
-    "CASE_FAILURE_SCHEMA_VERSION",
-    "PUBLICATION_SCHEMA_VERSION",
     "ArtifactEvidence",
     "CaseCleanupError",
     "CaseExecutionError",

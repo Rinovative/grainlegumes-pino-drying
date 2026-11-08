@@ -2,13 +2,13 @@
 
 Responsibilities:
   - Validate a readable plan and explicit temporary execution overrides
-  - Resolve the pre-registered replacement capacity per material and size the admission cap for it
+  - Admit the plan's minimum success rate, from which the Generation campaign derives its admission cap unless one is explicit
   - Compute the Dataset name and the physical Source name from the resolved plan, never from authored text
   - Describe the Slurm footprint and Source run identity of a plan run for read-only preview
-  - Reuse Generation admission/continuation, exact selection and task payload publication
+  - Reuse Generation admission/continuation, design-order selection and task payload publication
   - Submit the Dataset driver from the login node to run from its campaign's frozen source tree
   - Freeze Dataset-owned case roles and membership before training
-  - Hard-link the driver's own Slurm log into the published Dataset folder once publication is complete
+  - Own the plan's physical horizon override: validated once at load and read from the plan by every action
 
 Design principles:
   - Preview performs no admission, snapshots, solver work or Dataset writes
@@ -16,12 +16,14 @@ Design principles:
   - A revision labels only the Dataset and reuses the default Source; a new Source is simulated afresh only on explicit request
     (``new_source``), under the same label, and changes neither seeds nor the scientific campaign digest
   - Physical Sources never receive Dataset evaluation roles
-  - The replacement capacity is authored policy: it changes neither the Dataset name nor the Generation seeds
+  - The minimum success rate is authored policy: it changes neither the Dataset name nor the Generation seeds
+  - Membership follows Generation's design order, so only the Generation seed and the split seed shape a Dataset
   - The source is frozen on the login node only; the driver job runs from the tree and never calls Git
   - Existing stage implementations own their atomic evidence and failures
+  - A published Dataset folder is complete at its rename; the driver's still-growing job log stays in its log area
 
 This module does NOT:
-  - Implement sampling, solver retries, replacement allocation or a stage database
+  - Implement sampling, solver retries, replacement allocation, the admission cap or a stage database
   - Repartition a Dataset for a model or training seed
 """
 
@@ -47,9 +49,10 @@ if TYPE_CHECKING:
 
 _CONFIG_KEYS = ("sources_config", "registry_config", "common_config", "operations_config", "profile_config", "execution_config")
 _SPLIT_ROLES = ("train_fraction", "validation_fraction", "id_test_fraction")
-_PLAN_SCHEMA_VERSION = 2
-_PLAN_KEYS = {"schema_kind", "schema_version", "task", "generation", "materials", "selection_seed", "split"}
+_PLAN_SCHEMA_VERSION = 1
+_PLAN_KEYS = {"schema_kind", "schema_version", "task", "generation", "materials", "split"}
 _PLAN_TASKS = ("steady_flow", "transient_drying")
+_HORIZON_TASKS = ("transient_drying",)
 
 
 def load_dataset_plan(
@@ -77,11 +80,8 @@ def load_dataset_plan(
     if not isinstance(value, dict) or value.get("schema_kind") != "dataset_plan":
         msg = "Dataset plan must be a mapping with schema_kind dataset_plan."
         raise ValueError(msg)
-    if value.get("schema_version") != _PLAN_SCHEMA_VERSION:
-        msg = (
-            f"Dataset plan schema_version must be {_PLAN_SCHEMA_VERSION}, got {value.get('schema_version')!r}; "
-            "version 2 removed the authored name because the Dataset name is computed from the resolved plan."
-        )
+    if not common.serialization.is_schema_version(value.get("schema_version"), _PLAN_SCHEMA_VERSION):
+        msg = f"Dataset plan schema_version must be {_PLAN_SCHEMA_VERSION}, got {value.get('schema_version')!r}."
         raise ValueError(msg)
     if set(value) != _PLAN_KEYS:
         msg = f"Dataset plan must use exactly the fields {sorted(_PLAN_KEYS)}."
@@ -93,10 +93,10 @@ def load_dataset_plan(
     generation_plan = plan["generation"]
     if (
         not isinstance(generation_plan, dict)
-        or not {*_CONFIG_KEYS, "domain_profile"}.issubset(generation_plan)
-        or set(generation_plan) - {*_CONFIG_KEYS, "sampling", "domain_profile", "replacement_capacity"}
+        or not {*_CONFIG_KEYS, "domain_profile", "minimum_success_rate"}.issubset(generation_plan)
+        or set(generation_plan) - {*_CONFIG_KEYS, "sampling", "domain_profile", "minimum_success_rate"}
     ):
-        msg = "Generation must reference the six maintained configs, sampling and domain_profile."
+        msg = "Generation must reference the six maintained configs, sampling, domain_profile and minimum_success_rate."
         raise ValueError(msg)
     if any(not isinstance(generation_plan[key], str) or not generation_plan[key] for key in _CONFIG_KEYS):
         msg = "Generation configuration references must be non-empty paths."
@@ -106,10 +106,10 @@ def load_dataset_plan(
     if not isinstance(sampling, dict) or set(sampling) != {"method", "seed_base"} or sampling["method"] != "lhs":
         msg = "Dataset plan preserves the existing lhs sampling method and seed_base."
         raise ValueError(msg)
-    for seed in (sampling["seed_base"], plan["selection_seed"]):
-        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
-            msg = "Generation and selection seeds must be uint32 integers."
-            raise ValueError(msg)
+    seed = sampling["seed_base"]
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
+        msg = "Generation seed_base must be a uint32 integer."
+        raise ValueError(msg)
     materials = plan["materials"]
     if not isinstance(materials, dict) or not materials:
         msg = "Dataset plan requires explicit material counts and roles."
@@ -136,30 +136,17 @@ def load_dataset_plan(
         ):
             msg = "Material counts must be positive integers and roles explicit id/ood."
             raise ValueError(msg)
-    generation_plan["replacement_capacity"] = _replacement_capacity(generation_plan.get("replacement_capacity", 0), materials)
+    generation_plan["minimum_success_rate"] = generation.cases.config.validate_minimum_success_rate(
+        generation_plan["minimum_success_rate"], label="generation.minimum_success_rate"
+    )
     _validate_split(plan["split"], materials, split_fractions)
+    plan["duration_hours"] = duration_hours
     plan["horizon_override_hours"] = _horizon_override_hours(generation_plan, plan["task"], duration_hours)
     plan["name"] = derive_dataset_name(plan, revision=revision)
     if new_source:
         generation_plan["revision"] = generation.contracts.campaign_identity.revision_label(revision)
     plan["_authored_sha256"] = hashlib.sha256(raw_plan).hexdigest()
     return plan
-
-
-def _replacement_capacity(value: Any, materials: Mapping[str, Any]) -> dict[str, int]:
-    """Resolve the replacement count per material from one integer for all or a mapping; unnamed materials get zero."""
-    if isinstance(value, dict):
-        unknown = sorted(set(value) - set(materials))
-        if unknown:
-            msg = f"generation.replacement_capacity names materials outside the plan: {unknown}."
-            raise ValueError(msg)
-        declared: dict[str, Any] = {material: value.get(material, 0) for material in materials}
-    else:
-        declared = dict.fromkeys(materials, value)
-    if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in declared.values()):
-        msg = "generation.replacement_capacity must be a non-negative integer or a mapping of materials to non-negative integers."
-        raise ValueError(msg)
-    return {material: int(count) for material, count in declared.items()}
 
 
 def _id_split_counts(count: int, fractions: Sequence[float]) -> tuple[int, int, int]:
@@ -249,9 +236,18 @@ def derive_source_name(plan: Mapping[str, Any]) -> str:
 
 
 def _horizon_override_hours(generation_plan: Mapping[str, Any], task: str, duration_hours: float | None) -> float | None:
-    """Return the transient horizon that deviates from the configured one and so enters the names, else ``None``."""
-    if task != "transient_drying" or duration_hours is None:
+    """Return the transient horizon that deviates from the configured one and so enters the names, else ``None``.
+
+    A task without a physical time horizon refuses the override at admission, before anything runs.
+    """
+    if duration_hours is None:
         return None
+    if task not in _HORIZON_TASKS:
+        msg = f"--duration-hours sets a physical time horizon, which the Dataset plan task {task!r} does not have."
+        raise ValueError(msg)
+    if isinstance(duration_hours, bool) or not isinstance(duration_hours, (int, float)) or not 0 < duration_hours < float("inf"):
+        msg = "Physical duration override must be finite and positive."
+        raise ValueError(msg)
     common_config = yaml.safe_load((common.paths.get_project_root() / generation_plan["common_config"]).read_text(encoding="utf-8"))
     configured_hours = generation.cases.config.physical_horizon_hours(common_config["time"])
     return generation.contracts.campaign_identity.deviating_horizon_hours(float(duration_hours), configured_hours)
@@ -294,6 +290,11 @@ def _validate_split(split: dict[str, Any], materials: Mapping[str, Any], split_f
             raise ValueError(msg)
 
 
+def _scientific_overrides(plan: Mapping[str, Any]) -> dict[str, float] | None:
+    """Return the Generation overrides of the admitted plan horizon."""
+    return None if plan["duration_hours"] is None else {"duration_hours": plan["duration_hours"]}
+
+
 def _split_recipe(plan: Mapping[str, Any]) -> dict[str, Any]:
     return {"kind": "seeded_material_fraction", **{key: plan["split"][key] for key in _SPLIT_ROLES}}
 
@@ -303,20 +304,23 @@ def authored_campaign(plan: Mapping[str, Any]) -> dict[str, Any]:
     generation_plan = plan["generation"]
     return {
         "schema_kind": "generation_source_campaign",
-        "schema_version": 1,
+        "schema_version": generation.cases.config.CAMPAIGN_SCHEMA_VERSION,
         **{key: generation_plan[key] for key in _CONFIG_KEYS},
         "sampling": {**generation_plan["sampling"], "counts": {"natural": {material: spec["count"] for material, spec in plan["materials"].items()}}},
         "materials": list(plan["materials"]),
-        "replacement_capacity": dict(generation_plan["replacement_capacity"]),
+        "minimum_success_rate": generation_plan["minimum_success_rate"],
         "domain_profile": generation_plan["domain_profile"],
         **({"revision": generation_plan["revision"]} if "revision" in generation_plan else {}),
     }
 
 
-def effective_execution_overrides(plan: Mapping[str, Any], requested: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Admit precisely the plan's original candidates plus its pre-registered replacements unless explicitly staged."""
-    capacity = sum(plan["generation"]["replacement_capacity"].values())
-    result = {"max_admission_cases": sum(spec["count"] for spec in plan["materials"].values()) + capacity, **dict(requested or {})}
+def effective_execution_overrides(requested: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate the explicitly requested execution overrides of one plan run.
+
+    Without an explicit ``max_admission_cases`` the campaign derives its cap from the plan's ``minimum_success_rate``:
+    each material's count plus the failures it tolerates at each original batch's current rate. An explicit cap stays as given.
+    """
+    result = dict(requested or {})
     for key, value in result.items():
         if key == "no_retry":
             if not isinstance(value, bool):
@@ -333,29 +337,24 @@ def effective_execution_overrides(plan: Mapping[str, Any], requested: Mapping[st
     return result
 
 
-def preview_dataset_plan(
-    plan: Mapping[str, Any], *, duration_hours: float | None = None, execution_overrides: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
+def preview_dataset_plan(plan: Mapping[str, Any], *, execution_overrides: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Describe effective intent; do not claim attempted or successful counts."""
-    if duration_hours is not None and (not isinstance(duration_hours, (int, float)) or not 0 < duration_hours < float("inf")):
-        msg = "Physical duration override must be finite and positive."
-        raise ValueError(msg)
     source_name = derive_source_name(plan)
     return {
         "dataset": plan["name"],
         "task": plan["task"],
         "directory": f"02_datasets/{plan['task']}/{plan['name']}",
         "materials": copy.deepcopy(plan["materials"]),
-        "replacement_capacity": dict(plan["generation"]["replacement_capacity"]),
+        "minimum_success_rate": plan["generation"]["minimum_success_rate"],
         "generation_seed_base": plan["generation"]["sampling"]["seed_base"],
-        "selection": {"kind": "seed_ranked", "seed": plan["selection_seed"]},
+        "selection": {"kind": "design_order"},
         "split": {
             "seed_input": plan["split"]["seed"],
             "seed": common.random.derive_subseed(plan["split"]["seed"], "split"),
             "recipe": _split_recipe(plan),
         },
-        "physical_duration_hours_override": duration_hours,
-        "execution_overrides": effective_execution_overrides(plan, execution_overrides),
+        "physical_duration_hours_override": plan["duration_hours"],
+        "execution_overrides": effective_execution_overrides(execution_overrides),
         "source_name": source_name,
         **(
             {"new_source": f"Source {source_name} will be simulated afresh (--new-source); the default Source is left untouched."}
@@ -390,7 +389,7 @@ def preview_scheduler_footprint(
     """
     execution = generation.cases.config.resolve_execution_values(
         common.paths.get_project_root() / plan["generation"]["execution_config"],
-        execution_overrides=effective_execution_overrides(plan, execution_overrides),
+        execution_overrides=effective_execution_overrides(execution_overrides),
     )
     return {
         "identity": f"source~{plan['task']}~{derive_source_name(plan)}",
@@ -412,12 +411,11 @@ def _admitted_execution(
     path: Path | str,
     plan: Mapping[str, Any],
     *,
-    duration_hours: float | None,
     execution_overrides: Mapping[str, Any] | None,
     require_allocation: bool,
 ) -> dict[str, Any]:
     """Check the shared run guards and return the effective execution overrides."""
-    preview_dataset_plan(plan, duration_hours=duration_hours, execution_overrides=execution_overrides)
+    preview_dataset_plan(plan, execution_overrides=execution_overrides)
     if require_allocation and not os.environ.get("SLURM_JOB_ID"):
         msg = (
             "Dataset assembly must run in a CPU Slurm allocation: start `run` on the login node, which submits its own driver job, "
@@ -427,7 +425,7 @@ def _admitted_execution(
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan.get("_authored_sha256"):
         msg = "Authored plan changed since preview; reload and preview the current plan before running."
         raise ValueError(msg)
-    return effective_execution_overrides(plan, execution_overrides)
+    return effective_execution_overrides(execution_overrides)
 
 
 def submit_dataset_plan(
@@ -437,7 +435,6 @@ def submit_dataset_plan(
     invocation: Sequence[str],
     driver_partition: str,
     driver_time: str,
-    duration_hours: float | None = None,
     execution_overrides: Mapping[str, Any] | None = None,
     continue_with_current_code: bool = False,
 ) -> dict[str, Any]:
@@ -458,12 +455,12 @@ def submit_dataset_plan(
         partition=driver_partition,
         wall_time=driver_time,
     )
-    execution = _admitted_execution(path, plan, duration_hours=duration_hours, execution_overrides=execution_overrides, require_allocation=False)
+    execution = _admitted_execution(path, plan, execution_overrides=execution_overrides, require_allocation=False)
     controller = _controller()
     campaign_plan = controller.authored_campaign_plan(
         str(path),
         authored_campaign(plan),
-        scientific_overrides={"duration_hours": duration_hours} if duration_hours is not None else None,
+        scientific_overrides=_scientific_overrides(plan),
         execution_overrides=execution,
     )
     submitted = controller.submit_run_tree(
@@ -481,32 +478,30 @@ def run_dataset_plan(
     plan: Mapping[str, Any],
     *,
     invocation: Sequence[str],
-    duration_hours: float | None = None,
     execution_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run/reuse the existing stages from the frozen source tree inside the driver job; incomplete Sources never publish a Dataset."""
-    execution = _admitted_execution(path, plan, duration_hours=duration_hours, execution_overrides=execution_overrides, require_allocation=True)
+    execution = _admitted_execution(path, plan, execution_overrides=execution_overrides, require_allocation=True)
     controller = _controller()
     result = controller.run_authored_campaign(
         str(path),
         authored_campaign(plan),
-        scientific_overrides={"duration_hours": duration_hours} if duration_hours is not None else None,
+        scientific_overrides=_scientific_overrides(plan),
         execution_overrides=execution,
-        max_admission_cases=execution["max_admission_cases"],
     )
     if result.result != "OK":
         return {"status": result.result, "source_run": result.run_id, "dataset": None, "next": shlex.join(list(invocation))}
     from .packages import dataset_packages_builder as builder  # noqa: PLC0415
+    from .packages import dataset_packages_selection as selection  # noqa: PLC0415
 
     request = {
-        "schema_kind": "dataset_selection_request",
-        "schema_version": 2,
+        "schema_kind": selection.SELECTION_SCHEMA_KIND,
+        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": plan["task"],
         "dataset_view": plan["task"],
         "dataset_name": plan["name"],
         "selection": {
-            "kind": "seed_ranked",
-            "root_seed": plan["selection_seed"],
+            "kind": "design_order",
             "source_names": [result.source_name],
             "target_counts": {material: spec["count"] for material, spec in plan["materials"].items()},
         },
@@ -518,15 +513,7 @@ def run_dataset_plan(
         "recipe": _split_recipe(plan),
         "material_roles": {material: spec["role"] for material, spec in plan["materials"].items()},
     }
+    # One atomic publication holds the manifest and the complete payload of either task (transient: index and PT shards).
+    # The still-running driver keeps writing its job log, so the log stays in its log area and never enters the immutable folder.
     publication = builder.build_dataset_selection(request, partition_spec=fixed_spec, plan_invocation=list(invocation))
-    pt = None
-    # Steady-flow publication already contains its tensor payload.
-    if plan["task"] == "transient_drying":
-        from .packages import dataset_packages_transient_shards as shards  # noqa: PLC0415
-
-        pt = shards.build_transient_shards(publication["dataset_id"])
-    from src.generation.runtime import generation_runtime_host as host  # noqa: PLC0415
-
-    # Only a published Dataset folder receives logs/: the builder reads any existing folder as a publication.
-    host.link_job_logs(Path(publication["manifest_path"]).parent, host.current_job_log_files())
-    return {"status": "OK", "source_run": result.run_id, "dataset": publication, "pt": pt}
+    return {"status": "OK", "source_run": result.run_id, "dataset": publication}

@@ -3,11 +3,14 @@
 Responsibilities:
   - Validate package-view, exact-case, and DataLoader requests
   - Dispatch steady and transient packages to their responsible runtimes
+  - Bind every runtime to its admitted manifest (digest, ordered cases, fixed partition) the same way for both tasks
+  - Open the canonical source HDF5 files of a transient package for whole-case physical reads
   - Construct DataLoaders with safe worker and collation settings
   - Form batches whose items share one key, such as a whole-trajectory length
 
 Design principles:
   - View runtimes own their data contracts and selection behavior
+  - Transient samples always come from the Dataset's PT shards; a missing shard payload is an error
   - Package identity and ordering remain independent of DataLoader behavior
   - Worker-only options are passed only when worker processes exist
 
@@ -21,12 +24,13 @@ from __future__ import annotations
 from collections.abc import Hashable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 
 from src import common
+from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_manifest as package_manifest
@@ -39,9 +43,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-TransientBackendPreference = Literal["pt_shards", "canonical_hdf5"]
-
-
 @dataclass(frozen=True, slots=True)
 class DatasetRequest:
     """Select one immutable package view and optional exact case membership."""
@@ -51,8 +52,6 @@ class DatasetRequest:
     case_ids: tuple[str, ...] | None = None
     transient_sampling: transient_contract.TransientSamplingSpec | None = None
     storage_root: Path | str | None = None
-    transient_backend_preference: TransientBackendPreference = "pt_shards"
-    transient_backend_required: bool = False
     spatial_stride: int = 1
 
     def __post_init__(self) -> None:
@@ -75,34 +74,23 @@ class DatasetRequest:
         ):
             message = "Dataset case_ids must be an ordered unique non-empty tuple."
             raise ValueError(message)
-        if self.transient_backend_preference not in {"pt_shards", "canonical_hdf5"}:
-            message = "transient_backend_preference must be 'pt_shards' or 'canonical_hdf5'."
-            raise ValueError(message)
-        if not isinstance(self.transient_backend_required, bool):
-            message = "transient_backend_required must be boolean."
-            raise TypeError(message)
-        if self.dataset_view != "transient_drying" and self.transient_backend_required:
-            message = "Steady-flow Dataset requests cannot require a transient backend."
-            raise ValueError(message)
 
 
 @dataclass(frozen=True, slots=True)
 class LoaderSettings:
-    """Validate the common DataLoader and bounded HDF5-cache surface."""
+    """Validate the common DataLoader surface."""
 
     batch_size: int = 1
     num_workers: int = 0
     pin_memory: bool = False
     persistent_workers: bool = False
     shuffle: bool = False
-    hdf5_cache_size: int = 0
 
     def __post_init__(self) -> None:
         """Reject invalid or worker-inapplicable runtime settings."""
         for label, value, minimum in (
             ("batch_size", self.batch_size, 1),
             ("num_workers", self.num_workers, 0),
-            ("hdf5_cache_size", self.hdf5_cache_size, 0),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 message = f"{label} must be an integer >= {minimum}."
@@ -148,91 +136,56 @@ def _payload_path(manifest: Mapping[str, Any], *, storage_root: Path | str | Non
     )
 
 
-def _select_transient(
-    dataset: transient.TransientPhysicalDataset,
-    request: DatasetRequest,
-) -> transient.TransientPhysicalDataset:
-    """Return a transient dataset restricted to exact experiment case IDs."""
-    if request.case_ids is None:
-        return dataset
-    return transient.select_transient_cases(dataset, request.case_ids)
-
-
-def _create_dataset_from_manifest(
+def _open_transient(
+    dataset_class: type[transient.TransientPhysicalDataset],
     request: DatasetRequest,
     manifest: Mapping[str, Any],
-    *,
-    hdf5_cache_size: int = 0,
-) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
-    """Construct one runtime from package evidence admitted by its caller."""
-    if manifest["dataset_view"] != request.dataset_view:
-        message = f"Dataset request view {request.dataset_view!r} does not match package {manifest['dataset_view']!r}."
+) -> transient.TransientPhysicalDataset:
+    """Open one transient runtime of ``dataset_class``, bind it to its package manifest, and select the requested cases."""
+    sampling = request.transient_sampling
+    if request.dataset_view != "transient_drying" or sampling is None:
+        message = "A transient runtime requires a transient_drying request with an explicit transient_sampling."
         raise ValueError(message)
     payload_path = _payload_path(manifest, storage_root=request.storage_root)
+    dataset = dataset_class(
+        payload_path,
+        sampling=sampling,
+        source_root=request.storage_root,
+        spatial_stride=request.spatial_stride,
+    )
+    package_manifest.validate_transient_payload_identity(manifest, dataset.payload)
+    dataset.manifest_binding = identity.manifest_binding(manifest)
+    if request.case_ids is None:
+        return dataset
+    try:
+        return transient.select_transient_cases(dataset, request.case_ids)
+    except BaseException:
+        dataset.close()  # a refused selection leaves the full runtime open; success closes it inside the selection
+        raise
+
+
+def create_dataset(request: DatasetRequest) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
+    """Resolve, validate, and select one package-backed runtime dataset.
+
+    A transient Dataset is read from its PT shards only; missing shards raise ``FileNotFoundError``.
+    """
+    manifest = package_manifest.load_package_manifest(request.dataset_view, request.dataset_id, storage_root=request.storage_root)
     if request.dataset_view == "steady_flow":
-        steady_dataset = steady.create_dataset(payload_path)
         return steady.select_dataset(
-            steady_dataset,
+            steady.create_dataset(_payload_path(manifest, storage_root=request.storage_root)),
             manifest,
             case_ids=request.case_ids,
         )
-    sampling = request.transient_sampling
-    if sampling is None:
-        message = "Validated transient Dataset request lost its explicit sampling specification."
-        raise RuntimeError(message)
-    shard_directory = transient_shards.transient_shard_directory(
-        request.dataset_id,
-        storage_root=request.storage_root,
-    )
-    transient_dataset: transient.TransientPhysicalDataset
-    if request.transient_backend_preference == "pt_shards" and shard_directory.exists():
-        transient_dataset = transient.TransientPTShardDataset(
-            payload_path,
-            sampling=sampling,
-            source_root=request.storage_root,
-            hdf5_cache_size=hdf5_cache_size,
-            spatial_stride=request.spatial_stride,
-        )
-    elif request.transient_backend_preference == "pt_shards" and request.transient_backend_required:
-        message = f"Required transient PT shard payload is missing for {request.dataset_id!r}."
+    if not transient_shards.transient_shard_directory(request.dataset_id, storage_root=request.storage_root).exists():
+        message = f"Transient Dataset {request.dataset_id!r} has no PT shards although they are published with it; the folder is damaged."
         raise FileNotFoundError(message)
-    else:
-        transient_dataset = transient.TransientPhysicalDataset(
-            payload_path,
-            sampling=sampling,
-            source_root=request.storage_root,
-            hdf5_cache_size=hdf5_cache_size,
-            spatial_stride=request.spatial_stride,
-        )
-    if (
-        transient_dataset.payload["dataset_id"] != manifest["dataset_id"]
-        or transient_dataset.payload["contract_digest"] != manifest["channel_contract_digest"]
-        or transient_dataset.payload["sample_count"] != manifest["sample_count"]
-    ):
-        message = f"Transient index does not bind its package manifest: {payload_path}."
-        raise ValueError(message)
-    selected = _select_transient(transient_dataset, request)
-    selected.bind_dataset_manifest_digest(str(manifest["dataset_digest"]))
-    selected.dataset_case_partition = manifest["case_partition"]
-    return selected
+    return _open_transient(transient.TransientPTShardDataset, request, manifest)
 
 
-def create_dataset(
-    request: DatasetRequest,
-    *,
-    hdf5_cache_size: int = 0,
-) -> Dataset[steady.SteadyFlowItem] | transient.TransientPhysicalDataset:
-    """Resolve, validate, and select one package-backed runtime dataset."""
-    manifest = package_manifest.load_package_manifest(
-        request.dataset_view,
-        request.dataset_id,
-        storage_root=request.storage_root,
-    )
-    return _create_dataset_from_manifest(
-        request,
-        manifest,
-        hdf5_cache_size=hdf5_cache_size,
-    )
+def create_hdf5_source_dataset(request: DatasetRequest) -> transient.TransientPhysicalDataset:
+    """Open a transient package's canonical source HDF5 files for whole-case physical reads (EDA, physics diagnostics)."""
+    manifest = package_manifest.load_package_manifest(request.dataset_view, request.dataset_id, storage_root=request.storage_root)
+    return _open_transient(transient.TransientPhysicalDataset, request, manifest)
 
 
 def _collate_steady_metadata(values: Sequence[Any]) -> Any:

@@ -104,7 +104,7 @@ def _log_spectral_transfer(
         where=support,
     )
     support_count = np.sum(support, axis=0, dtype=int)
-    support_fraction = support_count.astype(float) / reference_values.shape[0]
+    support_fraction = support_count.astype(float) / max(reference_values.shape[0], 1)
     return transfer, support_fraction, support_count
 
 
@@ -205,7 +205,9 @@ def plot_spectral_demand_prediction_error(
         top_axis = top_axes[dataset_index]
         bottom_axis = bottom_axes[dataset_index]
         summary = summaries[id(frame)]
-        for field in fields:
+        if not summary.used_count:
+            layout.mark_empty_prefix(top_axis, bottom_axis, case_count=summary.case_count)
+        for field in fields if summary.used_count else ():
             spectrum = _spectral(summary, field)
             reference = _normalize(spectrum.reference) if normalize else spectrum.reference
             prediction = _normalize(spectrum.prediction) if normalize else spectrum.prediction
@@ -274,7 +276,9 @@ def plot_spectral_transfer_ratio(
         transfer_axes.append(transfer_axis)
         support_axes.append(support_axis)
         summary = summaries[id(frame)]
-        for field in fields:
+        if not summary.used_count:
+            layout.mark_empty_prefix(transfer_axis, support_axis, case_count=summary.case_count)
+        for field in fields if summary.used_count else ():
             spectrum = _spectral(summary, field)
             transfer, support_fraction, _support_count = _log_spectral_transfer(
                 spectrum.reference,

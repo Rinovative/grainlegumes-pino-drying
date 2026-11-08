@@ -35,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-length", type=int)
     parser.add_argument("--lr-scale", type=float)
     parser.add_argument("--revision", help="Label of a deliberately separate output location")
+    parser.add_argument("--seed", type=int, help="Train only: replicate seed replacing run.seed")
     parser.add_argument("--resume", help="Exact run directory for explicit training resume")
     parser.add_argument("--train-stages", help="Matched mode only: all or a comma-separated subset of a0,b,a1")
     return parser
@@ -55,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             rollout_length=args.rollout_length,
             lr_scale=args.lr_scale,
             revision=args.revision,
+            seed=args.seed,
             resume=args.resume,
             train_stages=None if args.train_stages in {None, "all"} else tuple(args.train_stages.split(",")),
         )

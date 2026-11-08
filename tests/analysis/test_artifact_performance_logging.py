@@ -113,6 +113,15 @@ class _Clock:
         return self.now
 
 
+def test_startup_line_names_the_split_in_words(capsys: pytest.CaptureFixture[str]) -> None:
+    """Show the reader the evaluated set, not the internal split role."""
+    _reporter(total_cases=2).startup()
+
+    startup = capsys.readouterr().out
+    assert "ID test set" in startup
+    assert "split id" not in startup
+
+
 def test_finished_phases_print_one_line_each_and_fast_cases_print_no_progress(capsys: pytest.CaptureFixture[str]) -> None:
     """Print a line only when a phase finishes, with its duration, and no progress line for fast cases."""
     reporter = _reporter(total_cases=2)
@@ -157,4 +166,5 @@ def test_running_phase_prints_a_heartbeat_at_most_once_per_minute(
     heartbeat = complete(3, advance=31.0)
     assert len(heartbeat) == 1
     assert "3/5" in heartbeat[0]
+    assert "elapsed 2 min 02 s" in heartbeat[0]
     assert complete(4, advance=1.0) == []

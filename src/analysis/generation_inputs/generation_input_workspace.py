@@ -33,9 +33,7 @@ if TYPE_CHECKING:
     from src.analysis.presentation import analysis_display_grid as display_grid
 
 _GENERATION_DOCUMENTATION_LINK: Final = "../docs/06_generation_reference.md#input-only-generation-and-status"
-_GENERIC_GENERATION_COMMAND: Final = (
-    './scripts/generation inputs "$CAMPAIGN_CONFIG" --only-batch "$BATCH_NAME" --case-start 1 --case-count "$CASE_COUNT"'
-)
+_GENERIC_GENERATION_COMMAND: Final = "../runtime/venvs/native/bin/python -m src.datasets.dataset_packages run configs/02_datasets/<task>/<plan>.yaml"
 _MAXIMUM_DISPLAYED_ISSUES: Final = 5
 
 
@@ -103,7 +101,7 @@ def _empty_catalog_workspace(
         "Manifested input cases: 0\n"
         f"Skipped invalid input batches: {len(catalog.issues)}\n\n"
         "No manifested canonical input cases were admitted.\n"
-        "Generate canonical input cases through generate-input-cases, then rerun this notebook.\n"
+        "Run a Dataset plan (it prepares the canonical input cases first), then rerun this notebook.\n"
         f"See {_GENERATION_DOCUMENTATION_LINK}.\n\n"
         f"{_GENERIC_GENERATION_COMMAND}"
     )

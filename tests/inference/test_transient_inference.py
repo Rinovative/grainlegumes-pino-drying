@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check saved reconstruction, explicit requests, runtime placement, rollout recurrence, and timing
+  - Check that weights recorded by other model code are refused before any inference state is built
 
 Design principles:
   - Saved scaling is reused without fitting; invalid feedback retains diagnostic evidence
@@ -159,23 +160,40 @@ def _request(length: int = 3) -> _Request:
     }
 
 
+def _producer(*, model_sha256: str | None = None) -> dict[str, str]:
+    """Return run producer evidence recording the running transient model code unless another digest is given."""
+    digest = learning.training.checkpoint.model_implementation_digest("transient_drying") if model_sha256 is None else model_sha256
+    return {"training_sha256": "a" * 64, "model_sha256": digest}
+
+
+def test_context_refuses_weights_of_other_model_code_before_reading_scaling_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loading persisted weights continues the trained computation, so a changed model digest is refused before any state is built."""
+    completed = {"scientific_run_name": "run", "config": {"task": "transient_drying", "producer": _producer(model_sha256="0" * 64)}}
+    monkeypatch.setattr(transient.model_factory, "build_model", lambda *_args, **_kwargs: pytest.fail("built a model before the guard"))
+
+    with pytest.raises(ValueError, match=r"^Run run: model_transient_drying implementation changed .*--revision <label>$"):
+        transient.build_transient_inference_context(completed=completed)
+
+
 def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """Load only admitted transient bundle state and validate its spatial model contract first."""
     scaling = _scaling()
     model = _IncrementModel()
     config: dict[str, Any] = {
         "task": "transient_drying",
+        "producer": _producer(),
         "input_profile": "canonical_physics_complete_v1",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {"kind": "fno", "params": {}},
     }
     completed = {
+        "scientific_run_name": "run",
         "config": config,
         "normalizer_state": scaling.state_dict(),
         "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
     }
     observed: list[tuple[dict[str, Any], tuple[int, int]]] = []
-    monkeypatch.setattr(experiments.run, "validate_completed_run", lambda _run_dir: completed)
+    monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed)
     monkeypatch.setattr(transient.model_factory, "validate_transient_model_spatial_shape", lambda cfg, shape: observed.append((cfg, shape)))
     monkeypatch.setattr(transient.model_factory, "build_model", lambda _cfg, *, device: model.to(device))
 
@@ -228,6 +246,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
     model.register_forward_pre_hook(capture_model_input)
     config: dict[str, Any] = {
         "task": "transient_drying",
+        "producer": _producer(),
         "input_profile": "canonical_physics_complete_v1",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {
@@ -236,6 +255,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
         },
     }
     completed = {
+        "scientific_run_name": "run",
         "config": config,
         "normalizer_state": scaling.state_dict(),
         "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
@@ -276,15 +296,14 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject retained modes that do not fit the requested grid before case inference."""
-    scaling = replace(
-        _scaling(),
-        dataset_identity={"spatial_stride": 2},
-        spatial_shape=(126, 201),
-    )
+    scaling = replace(_scaling(), spatial_shape=(126, 201))
     model = _IncrementModel()
     completed = {
+        "scientific_run_name": "run",
         "config": {
             "task": "transient_drying",
+            "producer": _producer(),
+            "data": {"spatial_stride": 2},
             "input_profile": "canonical_physics_complete_v1",
             "temporal": {"temporal_conditioning": {"kind": "none"}},
             "model": {"kind": "rno", "params": {"in_channels": 20, "n_modes": [64, 64]}},
@@ -301,11 +320,13 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
         lambda *_args, **_kwargs: pytest.fail("incompatible preflight reached model setup"),
     )
 
-    with pytest.raises(ValueError, match=r"checkpoint=.*Training shape=.*Evaluation shape=.*modes"):
+    with pytest.raises(ValueError, match=r"checkpoint=.*Training shape=.*Evaluation shape=.*modes") as error:
         transient.build_transient_inference_context(
             completed=completed,
             evaluation_spatial_shape=(32, 48),
         )
+    # The advice names the resolved Training stride of the run, not a Dataset-identity field.
+    assert "--evaluation-spatial-stride 2" in str(error.value)
 
 
 def test_context_rejects_an_optuna_trial_before_reading_scaling_evidence() -> None:

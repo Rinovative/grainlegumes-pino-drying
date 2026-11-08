@@ -334,6 +334,10 @@ class TransientSamplingSpec:
         return payload
 
 
+# Every loader evaluates whole trajectories; split admission binds persisted evaluation sampling to this one value.
+EVALUATION_SAMPLING: Final = TransientSamplingSpec(mode="trajectory")
+
+
 @dataclass(frozen=True, slots=True)
 class TransientStepContract:
     """Describe the regular-step transient operator sample contract."""

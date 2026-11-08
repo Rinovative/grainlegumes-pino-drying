@@ -13,7 +13,7 @@ Design principles:
 This module does NOT:
   - Query CUDA or construct Torch devices. ``learning_device`` owns resolution
   - Parse CLI arguments or config files. Their boundary modules own parsing
-  - Persist runtime metadata or select mixed-precision behavior
+  - Persist runtime metadata
 """
 
 from __future__ import annotations

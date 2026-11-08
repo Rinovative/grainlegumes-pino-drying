@@ -5,6 +5,7 @@ Responsibilities:
   - Merge an authored experiment's optional shared task base before validation
   - Reject unknown keys, identifiers, fields, and contradictory settings
   - Derive task-fixed channels, defaults, objective, and task-contract digest
+  - Record the running training and model digests as a fresh config's ``producer`` evidence and preserve them on saved configs
   - Construct dataloaders from an already resolved configuration, capping their workers at the CPUs available to the process
   - Atomically save resolved YAML and derive the run layout and observer organization from the config source
 
@@ -93,8 +94,13 @@ _TASK_FIXED_KEYS = frozenset(
         "paths",
     }
 )
+# Resolution records the running training and model digests here; saved configs keep them as producer evidence.
+_PRODUCER_KEY = "producer"
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ADAM_BETA_COUNT = 2
 _STEADY_DATA_KEYS = frozenset({"train_dataset", "additional_evaluation_datasets", "batch_size", "num_workers", "pin_memory", "persistent_workers"})
+_REQUIRED_TRAINING_KEYS = ("epochs", "evaluation_interval", "additional_evaluation_interval")
+_REQUIRED_SCHEDULER_KEYS = frozenset({"factor", "patience", "min_lr"})
 _PHYSICS_WEIGHT_NAMES = ("momentum_weight", "continuity_weight", "boundary_weight")
 _RESOLVED_PATH_KEYS = frozenset(
     {
@@ -110,15 +116,11 @@ _SECTION_KEYS = {
         {
             "train_dataset",
             "additional_evaluation_datasets",
-            "additional_evaluation_fraction",
             "batch_size",
             "num_workers",
             "pin_memory",
             "persistent_workers",
             "spatial_stride",
-            "transient_backend_preference",
-            "transient_backend_required",
-            "hdf5_cache_size",
         }
     ),
     "model": frozenset({"kind", "params"}),
@@ -132,7 +134,6 @@ _SECTION_KEYS = {
             "stage_schedule",
             "evaluation_interval",
             "additional_evaluation_interval",
-            "mixed_precision",
             "stage",
             "comparison_arm",
             "gradient_accumulation_steps",
@@ -195,6 +196,9 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
     if fixed:
         msg = f"Task-fixed config key(s) cannot be overridden: {fixed}. Select a registered task instead."
         raise ConfigError(msg)
+    if _PRODUCER_KEY in user_config:
+        msg = "producer is recorded from the running code when a config is resolved; an executable request must not supply it."
+        raise ConfigError(msg)
     _reject_unknown(user_config, _ROOT_KEYS, path="config")
 
     for section, allowed in _SECTION_KEYS.items():
@@ -241,7 +245,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
                 _reject_unknown(
                     derivatives,
-                    frozenset({"kind", "extension"}),
+                    frozenset({"kind"}),
                     path="loss.physics.derivatives",
                 )
             for weight_name in _PHYSICS_WEIGHT_NAMES:
@@ -473,9 +477,8 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
     """
     Resolve loss semantics against the registered task contract in place.
 
-    The helper validates supervised space/weight, derivative/extension
-    compatibility, crop size, and the three physics-term linear warmup
-    schedules. Canonical numeric values are written back into ``config`` only
+    The helper validates supervised space/weight, the derivative kind, crop
+    size, and the three physics-term linear warmup schedules. Canonical numeric values are written back into ``config`` only
     after their path-qualified constraints have been checked.
     """
     loss = _as_mapping(config["loss"], path="loss")
@@ -500,11 +503,9 @@ def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) 
         msg = f"Task {task.id!r} physics registry entry does not match its task contract."
         raise ConfigError(msg)
     derivatives = _as_mapping(physics["derivatives"], path="loss.physics.derivatives")
+    _reject_unknown(derivatives, frozenset({"kind"}), path="loss.physics.derivatives")
     try:
-        domain.physics.contracts.validate_derivative_kind(
-            str(derivatives["kind"]),
-            extension=str(derivatives["extension"]),
-        )
+        domain.physics.contracts.validate_derivative_kind(str(derivatives["kind"]))
     except ValueError as error:
         msg = f"loss.physics.derivatives: {error}"
         raise ConfigError(msg) from error
@@ -772,7 +773,7 @@ def resolved_model_variant(config: Mapping[str, Any]) -> str:
 
 
 def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Derive the canonical project, optional study, and minimal base tags."""
+    """Derive the canonical project, entity, and minimal base tags."""
     tracking = _as_mapping(config.get("tracking"), path="tracking")
     wandb = _as_mapping(tracking.get("wandb"), path="tracking.wandb")
     workflow = wandb.get("workflow")
@@ -782,29 +783,11 @@ def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
 
     task = common.paths.validate_logical_name(config.get("task"), label="task")
     variant = config_naming.model_family(config)
-    raw_study = wandb.get("study")
-    if raw_study is not None:
-        try:
-            study = common.paths.validate_logical_name(raw_study, label="tracking.wandb.study")
-        except ValueError as error:
-            raise ConfigError(str(error)) from error
-    else:
-        study = None
-
     if workflow == "train":
-        if study is not None:
-            msg = "tracking.wandb.study is valid only for workflow='optuna_trial'."
-            raise ConfigError(msg)
         tags = [variant]
     elif workflow == "optuna_trial":
-        if study is None:
-            msg = "tracking.wandb.study is required for workflow='optuna_trial'."
-            raise ConfigError(msg)
         tags = [variant, "optuna"]
     else:
-        if study is not None:
-            msg = "Acceptance workflows do not accept tracking.wandb.study."
-            raise ConfigError(msg)
         tags = []
 
     if len(tags) > config_defaults.WANDB_MAX_TAGS or len(tags) != len(set(tags)):
@@ -813,7 +796,6 @@ def derive_wandb_organization(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "project": config_defaults.WANDB_TASK_PROJECTS[task],
         "entity": config_defaults.WANDB_ENTITY,
-        "study": study,
         "tags": tags,
     }
 
@@ -829,7 +811,6 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
             {
                 "mode",
                 "workflow",
-                "study",
                 "project",
                 "entity",
                 "tags",
@@ -846,11 +827,7 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
             msg = "Current resolved configs must persist tracking.wandb.metric_schema_version."
             raise ConfigError(msg)
         wandb["metric_schema_version"] = config_defaults.WANDB_METRIC_SCHEMA_VERSION
-    elif (
-        isinstance(metric_schema_version, bool)
-        or not isinstance(metric_schema_version, int)
-        or metric_schema_version != config_defaults.WANDB_METRIC_SCHEMA_VERSION
-    ):
+    elif not common.serialization.is_schema_version(metric_schema_version, config_defaults.WANDB_METRIC_SCHEMA_VERSION):
         msg = "tracking.wandb.metric_schema_version is unsupported."
         raise ConfigError(msg)
 
@@ -892,7 +869,7 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
 
 def _validate_current_run_identity_schema(run: Mapping[str, Any]) -> None:
     """Validate the persisted run-naming schema and its required identity evidence."""
-    if type(run.get("naming_schema_version")) is not int or run["naming_schema_version"] != RUN_NAMING_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(run.get("naming_schema_version"), RUN_NAMING_SCHEMA_VERSION):
         msg = "run.naming_schema_version is unsupported."
         raise ConfigError(msg)
 
@@ -908,8 +885,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     """
     Validate all generic runtime sections after semantic resolution.
 
-    This final pass checks optimizer/scheduler identifiers, positive duration,
-    mixed-precision type, logical dataset names, optional tracking policy, and
+    This final pass checks optimizer/scheduler identifiers, required scheduler
+    keys, positive duration, logical dataset names, optional tracking policy, and
     the exact requested device vocabulary. It validates policy only: concrete
     device resolution remains a top-level execution-service responsibility.
     """
@@ -931,20 +908,21 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         if scheduler_mapping["kind"] != "reduce_on_plateau":
             msg = f"Unknown scheduler identifier {scheduler_mapping['kind']!r}. Available schedulers: reduce_on_plateau."
             raise ConfigError(msg)
+        missing_scheduler = sorted(_REQUIRED_SCHEDULER_KEYS.difference(scheduler_mapping))
+        if missing_scheduler:
+            missing_paths = ", ".join(f"scheduler.{key}" for key in missing_scheduler)
+            msg = f"scheduler must state {missing_paths} for reduce_on_plateau; the task's base config owns these values."
+            raise ConfigError(msg)
 
     training = _as_mapping(config["training"], path="training")
-    if type(training["mixed_precision"]) is not bool:
-        msg = f"training.mixed_precision must be boolean, got {training['mixed_precision']!r}."
+    missing_training = [key for key in _REQUIRED_TRAINING_KEYS if key not in training]
+    if missing_training:
+        msg = f"training must state {', '.join(f'training.{key}' for key in missing_training)}; the task's base config owns these values."
         raise ConfigError(msg)
-    if int(training["epochs"]) <= 0:
-        msg = "training.epochs must be positive."
-        raise ConfigError(msg)
-    if int(training["evaluation_interval"]) <= 0:
-        msg = "training.evaluation_interval must be positive."
-        raise ConfigError(msg)
-    if int(training["additional_evaluation_interval"]) <= 0:
-        msg = "training.additional_evaluation_interval must be positive."
-        raise ConfigError(msg)
+    for key in ("epochs", "evaluation_interval", "additional_evaluation_interval"):
+        if int(training[key]) <= 0:
+            msg = f"training.{key} must be positive."
+            raise ConfigError(msg)
     data = _as_mapping(config["data"], path="data")
     batch_size = data.get("batch_size")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
@@ -957,8 +935,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if type(data.get("pin_memory")) is not bool or type(data.get("persistent_workers")) is not bool:
         msg = "data.pin_memory and data.persistent_workers must be boolean."
         raise ConfigError(msg)
-    if config.get("task") == "transient_drying" and num_workers == 0 and data["persistent_workers"]:
-        msg = "Transient data.persistent_workers requires data.num_workers > 0."
+    if num_workers == 0 and data["persistent_workers"]:
+        msg = "data.persistent_workers requires data.num_workers > 0."
         raise ConfigError(msg)
     try:
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
@@ -991,6 +969,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
 
 
 RUN_NAMING_SCHEMA_VERSION = 1
+# One refusal for the matched-only training flags, whichever workflow or plan received them.
+MATCHED_TRAINING_FLAGS_MESSAGE = "--rollout-length, --train-seconds and --lr-scale require a transient matched_a1_b plan."
 _EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
 
 
@@ -1247,7 +1227,7 @@ def _resolve_temporal_config(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
+def _validate_transient_extensions(  # noqa: C901, PLR0912
     config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
 ) -> None:
     """Resolve strict transient-only temporal, loader, and curriculum semantics."""
@@ -1274,29 +1254,18 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
     config["scaling"] = {"mode": scaling["mode"]}
     data = _as_mapping(config["data"], path="data")
     if "spatial_stride" not in data:
-        data["spatial_stride"] = 1
+        _raise_config_error("data.spatial_stride is required for transient configs; the task's base config owns it.")
     required_data = {
         "train_dataset",
         "additional_evaluation_datasets",
-        "additional_evaluation_fraction",
         "batch_size",
         "num_workers",
         "pin_memory",
         "persistent_workers",
         "spatial_stride",
-        "transient_backend_preference",
-        "transient_backend_required",
-        "hdf5_cache_size",
     }
     if set(data) != required_data:
         _raise_config_error("Transient data keys do not match the loader contract.")
-    fraction = data["additional_evaluation_fraction"]
-    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not math.isfinite(fraction) or fraction != 1.0:
-        _raise_config_error("Transient data.additional_evaluation_fraction must equal 1; Dataset-owned OOD membership is fixed.")
-    if data["transient_backend_preference"] not in {"pt_shards", "canonical_hdf5"} or type(data["transient_backend_required"]) is not bool:
-        _raise_config_error("Transient backend settings are invalid.")
-    if isinstance(data["hdf5_cache_size"], bool) or not isinstance(data["hdf5_cache_size"], int) or data["hdf5_cache_size"] < 0:
-        _raise_config_error("data.hdf5_cache_size must be an integer >= 0.")
     try:
         data["spatial_stride"] = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
     except (TypeError, ValueError) as error:
@@ -1309,7 +1278,6 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         "stage_schedule",
         "evaluation_interval",
         "additional_evaluation_interval",
-        "mixed_precision",
         "stage",
         "comparison_arm",
         "gradient_accumulation_steps",
@@ -1333,7 +1301,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         _raise_config_error("training.gradient_accumulation_steps must be a positive integer.")
     curriculum = _as_mapping(training["curriculum"], path="training.curriculum")
     if (
-        set(curriculum) != {"lengths", "milestone_fractions", "seed"}
+        set(curriculum) != {"lengths", "milestone_fractions"}
         or not isinstance(curriculum["lengths"], list)
         or not curriculum["lengths"]
         or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in curriculum["lengths"])
@@ -1348,8 +1316,6 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         or [float(item) for item in fractions] != sorted(float(item) for item in fractions)
     ):
         _raise_config_error("training.curriculum.milestone_fractions must align with lengths and be ascending in [0, 1].")
-    if isinstance(curriculum["seed"], bool) or not isinstance(curriculum["seed"], int) or curriculum["seed"] < 0:
-        _raise_config_error("training.curriculum.seed must be a non-negative integer.")
     try:
         resolved_curriculum = RolloutCurriculum(
             lengths=tuple(curriculum["lengths"]),
@@ -1410,7 +1376,6 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912, PLR0915
         "curriculum": {
             "lengths": list(curriculum["lengths"]),
             "milestone_fractions": [float(item) for item in fractions],
-            "seed": curriculum["seed"],
         },
         "teacher_handoff": None if handoff is None else {"source_run_name": handoff["source_run_name"]},
     }
@@ -1460,14 +1425,16 @@ def apply_training_overrides(
     rollout_length: int | None = None,
     lr_scale: float | None = None,
     revision: str | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
-    """Copy and bind explicit Dataset, matched-protocol, revision and epoch-budget overrides.
+    """Copy and bind explicit Dataset, matched-protocol, revision, seed and epoch-budget overrides.
 
     ``rollout_length``, ``train_seconds`` and ``lr_scale`` apply only to an authored
     matched plan: the B window and its truncated curriculum, B's measured target,
     and the continuation learning-rate factor shared by B and A1 for a paired sweep.
     ``revision`` names a deliberately separate output location for otherwise identical
-    science and is stored as ``run.revision``.
+    science and is stored as ``run.revision``. ``seed`` replaces ``run.seed`` so a replicate
+    needs no further config file; it derives the layout and every seed-plan entry.
     """
     requested = copy.deepcopy(dict(raw))
     if revision is not None:
@@ -1476,6 +1443,11 @@ def apply_training_overrides(
         except ValueError as error:
             raise ConfigError(str(error)) from error
         requested["run"] = {**_as_mapping(requested.get("run", {}), path="run"), "revision": validated_revision}
+    if seed is not None:
+        if type(seed) is not int or seed < 0:
+            msg = "--seed must be a non-negative integer."
+            raise ConfigError(msg)
+        requested["run"] = {**_as_mapping(requested.get("run", {}), path="run"), "seed": seed}
     if train_dataset is not None:
         requested["data"]["train_dataset"] = common.paths.validate_logical_name(train_dataset, label="--train-dataset")
     matched = (
@@ -1484,8 +1456,7 @@ def apply_training_overrides(
         and (requested["training"].get("mode") == "matched_a1_b")
     )
     if not matched and any(value is not None for value in (rollout_length, train_seconds, lr_scale)):
-        msg = "--rollout-length, --train-seconds and --lr-scale require a transient matched_a1_b plan."
-        raise ConfigError(msg)
+        raise ConfigError(MATCHED_TRAINING_FLAGS_MESSAGE)
     if rollout_length is not None:
         if type(rollout_length) is not int or rollout_length not in {1, 2, 4, 8, 16, 32, 64}:
             msg = "--rollout-length must be an admitted curriculum horizon: 1, 2, 4, 8, 16, 32 or 64."
@@ -1578,7 +1549,7 @@ def resolve_config(
     if missing_dataset_ids:
         msg = f"Experiment data must explicitly select Dataset identities; missing={missing_dataset_ids}."
         raise ConfigError(msg)
-    if type(naming_schema_version) is not int or naming_schema_version != RUN_NAMING_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(naming_schema_version, RUN_NAMING_SCHEMA_VERSION):
         msg = f"Unsupported requested run naming schema version: {naming_schema_version!r}."
         raise ConfigError(msg)
 
@@ -1616,12 +1587,11 @@ def resolve_config(
         raise ConfigError(msg) from error
     if is_transient:
         tensorizer = effective.pop("_transient_tensorizer")
-        if params.get("positional_embedding", None) is not None:
+        if params["positional_embedding"] is not None:
             msg = "Transient models require model.params.positional_embedding: null because x/y are explicit channels."
             raise ConfigError(msg)
         params["in_channels"] = tensorizer.in_channels
         params["out_channels"] = 4
-        params["positional_embedding"] = None
     else:
         params["in_channels"] = task.in_channels
         params["out_channels"] = task.out_channels
@@ -1660,6 +1630,10 @@ def resolve_config(
     }
     if output_root is not None:
         effective["paths"]["output_root"] = str(Path(output_root).expanduser())
+    effective[_PRODUCER_KEY] = {
+        "training_sha256": learning.training.checkpoint.scientific_implementation_digest(task_id),
+        "model_sha256": learning.training.checkpoint.model_implementation_digest(task_id),
+    }
     config_naming.validate_config_name(source, effective)
     effective = _derive_layout(effective, source, a0_id=None, branch_id=None, stage=None, pair=None, trial=None)
     run = effective["run"]
@@ -1703,8 +1677,7 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
         msg = "Resolved config must contain the current task_contract."
         raise ConfigError(msg)
     expected_contract = task.resolved_contract()
-    schema_version = contract.get("schema_version")
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != domain.tasks.spec.TASK_SCHEMA_VERSION:
+    if not common.serialization.is_schema_version(contract.get("schema_version"), domain.tasks.spec.TASK_SCHEMA_VERSION):
         msg = (
             f"Resolved task contract does not exactly match registered task {task_id!r}: "
             f"schema_version must be integer {domain.tasks.spec.TASK_SCHEMA_VERSION}."
@@ -1726,15 +1699,19 @@ def validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identit
         Fully resolved candidate, commonly loaded from a saved ``config.yaml``.
     verify_layout_identity : bool, optional
         Recompute the layout identity (model label, ``a0_id`` against the allocation
-        digest) with the running scientific implementation. ``False`` keeps the
-        structural checks only; use it where the implementation that will execute the
-        config is not yet known, never to admit execution.
+        digest of the config's own recorded ``producer`` evidence) with the running
+        identity functions. ``False`` keeps the structural checks only; use it where the
+        code that will execute the config is not yet known, never to admit execution.
+        Neither mode compares the recorded producer digests with the running code: a
+        saved config stays valid under later code changes, and continuations compare
+        those digests themselves.
 
     Returns
     -------
     dict[str, Any]
         Deep-copied canonical config whose task contract, paths, model, loss,
-        metrics, objective, runtime sections, and tracking policy all agree.
+        metrics, objective, runtime sections, and tracking policy all agree, with
+        its recorded producer digests preserved unchanged.
 
     Raises
     ------
@@ -1750,36 +1727,6 @@ def validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identit
     return _validate_resolved_config(config, verify_layout_identity=verify_layout_identity)
 
 
-def validate_saved_artifact_config(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate a persisted configuration for reading already-published predictions.
-
-    Parameters
-    ----------
-    config : Mapping[str, Any]
-        Saved resolved configuration whose exact bytes are bound by its run bundle.
-
-    Returns
-    -------
-    dict[str, Any]
-        Isolated configuration with admitted task, schema, semantic sections,
-        paths and structural layout. The saved run validator additionally binds
-        the initial layout to the persisted checkpoint identity.
-
-    Raises
-    ------
-    ConfigError
-        If a saved semantic or structural contract is inconsistent.
-
-    Notes
-    -----
-    This entrypoint does not admit model execution. Resume and new inference
-    require the current scientific implementation through validate_resolved_config.
-    No historical implementation digest or run layout is regenerated or rewritten.
-
-    """
-    return _validate_resolved_config(config, verify_layout_identity=False)
-
-
 def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identity: bool) -> dict[str, Any]:
     """Validate shared saved schema/semantics and, on request, the live layout identity."""
     if not isinstance(config, Mapping):
@@ -1789,11 +1736,19 @@ def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identi
     task_id = effective.get("task")
     transient_roots = frozenset({"input_profile", "temporal", "scaling"})
     roots = _ROOT_KEYS if task_id == "transient_drying" else _ROOT_KEYS.difference(transient_roots)
-    allowed = roots.union({"task_contract", "paths"})
+    allowed = roots.union({"task_contract", "paths", _PRODUCER_KEY})
     missing = sorted(allowed.difference(effective))
     unknown = sorted(set(effective).difference(allowed))
     if missing or unknown:
         msg = f"Resolved config keys do not match. Missing: {missing}. Unknown: {unknown}."
+        raise ConfigError(msg)
+    producer = effective[_PRODUCER_KEY]
+    if (
+        not isinstance(producer, Mapping)
+        or set(producer) != learning.training.checkpoint.PRODUCER_KEYS
+        or any(not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None for value in producer.values())
+    ):
+        msg = "Resolved producer must record exactly training_sha256 and model_sha256 as lowercase SHA-256 digests."
         raise ConfigError(msg)
 
     task = validate_resolved_task_contract(effective)
@@ -1877,12 +1832,16 @@ def load_and_resolve_config(yaml_path: Path | str) -> dict[str, Any]:
     return resolve_config(raw, source=config_naming.config_source_from_path(yaml_path))
 
 
+def effective_num_workers(configured: int) -> int:
+    """Return the configured loader workers capped at the CPUs this process may use."""
+    return min(configured, len(os.sched_getaffinity(0)))
+
+
 def _effective_num_workers(configured: int) -> int:
-    """Cap the configured loader workers at the CPUs this process may use and report the cap once when it applies."""
-    available = len(os.sched_getaffinity(0))
-    effective = min(configured, available)
+    """Cap the configured loader workers and report the cap once when it applies."""
+    effective = effective_num_workers(configured)
     if effective < configured:
-        print(f"data workers {effective} of {configured} configured ({available} CPUs)", flush=True)
+        print(f"data workers {effective} of {configured} configured ({len(os.sched_getaffinity(0))} CPUs)", flush=True)
     return effective
 
 
@@ -1890,8 +1849,8 @@ def create_dataloaders_from_config(
     config: dict[str, Any],
     *,
     split_indices: dict[str, Any] | None = None,
-    data_processor: Any | None = None,
-    seed_plan: Mapping[str, int] | None = None,
+    scaling_artifact: Mapping[str, Any] | None = None,
+    seed_plan: Mapping[str, int],
     startup_callback: Callable[[str, Mapping[str, Any]], None] | None = None,
     split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -1904,11 +1863,11 @@ def create_dataloaders_from_config(
         Fully resolved experiment configuration.
     split_indices : dict[str, Any] or None, optional
         Existing split membership to reuse.
-    data_processor : Any or None, optional
-        Existing data processor passed through to the current loader.
-    seed_plan : Mapping[str, int] | None, optional
-        Stable labeled ``split``, ``loader``, and ``worker`` seeds. Defaults to
-        ``run.seed`` for isolated direct loader callers.
+    scaling_artifact : Mapping[str, Any] or None, optional
+        Restored scaling artifact (``normalizer.pt``), admitted under the run's scaling identity.
+    seed_plan : Mapping[str, int]
+        The run's seed plan; its labeled ``loader`` and ``worker`` seeds
+        drive sampling order and worker randomness.
     startup_callback : Callable or None, optional
         Presentation-owned receiver for bounded semantic startup events.
     split_persist_callback : Callable or None, optional
@@ -1917,7 +1876,7 @@ def create_dataloaders_from_config(
     Returns
     -------
     dict[str, Any]
-        Train/evaluation loaders, data processor, and resolved split membership.
+        Train/evaluation loaders, data processor, scaling artifact, and resolved split membership.
 
     Raises
     ------
@@ -1929,41 +1888,39 @@ def create_dataloaders_from_config(
     The shared task dataset factory validates schema and fingerprint before
     splitting. Loader construction may read dataset files, fit preprocessing
     state for a fresh run, or reuse caller-supplied split and processor state.
-    Persistence remains the run lifecycle's responsibility.
+    The scaling cache is keyed by the config's recorded ``producer.model_sha256``
+    in addition to the scaling identity. Persistence remains the run lifecycle's
+    responsibility.
 
     """
     task = validate_resolved_task_contract(config)
     data_cfg = _as_mapping(config.get("data"), path="data")
     num_workers = _effective_num_workers(data_cfg["num_workers"])
+    model_sha256 = config[_PRODUCER_KEY]["model_sha256"]
     if task.id == "transient_drying":
         tensorizer = TransientTensorizerSpec.from_mapping(
             {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
         )
-        seeds = dict(seed_plan or {})
-        run_seed = int(config["run"]["seed"])
         settings = datasets.runtime.factory.LoaderSettings(
             batch_size=data_cfg["batch_size"],
             num_workers=num_workers,
             pin_memory=data_cfg["pin_memory"],
             persistent_workers=data_cfg["persistent_workers"],
-            hdf5_cache_size=data_cfg["hdf5_cache_size"],
         )
         loaders = datasets.runtime.transient_training.create_transient_training_loaders(
             train_dataset_id=data_cfg["train_dataset"],
             additional_evaluation_dataset_ids=data_cfg["additional_evaluation_datasets"],
-            additional_evaluation_fraction=data_cfg["additional_evaluation_fraction"],
             tensorizer=tensorizer,
             train_sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
             loader_settings=settings,
+            model_sha256=model_sha256,
             storage_root=config["paths"]["storage_root"],
-            transient_backend_preference=data_cfg["transient_backend_preference"],
-            transient_backend_required=data_cfg["transient_backend_required"],
             spatial_stride=data_cfg["spatial_stride"],
             scale_mode=config["scaling"]["mode"],
-            loader_seed=seeds.get("loader", run_seed),
-            worker_seed=seeds.get("worker", run_seed),
+            loader_seed=seed_plan["loader"],
+            worker_seed=seed_plan["worker"],
             saved_split=split_indices,
-            restored_scaling_artifact=data_processor,
+            scaling_artifact=scaling_artifact,
             startup_callback=startup_callback,
             split_persist_callback=split_persist_callback,
         )
@@ -1972,29 +1929,28 @@ def create_dataloaders_from_config(
             "eval": loaders.evaluation,
             "additional_evaluation": loaders.additional_evaluation,
             "id_test": loaders.id_test,
-            "data_processor": loaders.scaling_artifact,
+            "data_processor": loaders.data_processor,
+            "scaling_artifact": loaders.scaling_artifact,
             "split_indices": loaders.split,
-            "dataset_identity": loaders.dataset_identity,
             "spatial_view": loaders.spatial_view,
-            "runtime_provenance": loaders.runtime_provenance,
             "tensorizer": tensorizer,
         }
-    seeds = dict(seed_plan or {})
-    run_seed = int(config["run"]["seed"])
-    train_loader, evaluation_loaders, normalizer, split_indices = datasets.runtime.training.create_dataloaders(
+    train_loader, evaluation_loaders, normalizer, split_indices, envelope = datasets.runtime.training.create_dataloaders(
         train_dataset_id=common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset"),
         additional_evaluation_dataset_ids=tuple(data_cfg["additional_evaluation_datasets"]),
         task=task,
+        model_sha256=model_sha256,
         storage_root=common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]),
         batch_size=data_cfg["batch_size"],
         num_workers=num_workers,
         pin_memory=data_cfg["pin_memory"],
         persistent_workers=data_cfg["persistent_workers"],
-        loader_seed=seeds.get("loader", run_seed),
-        worker_seed=seeds.get("worker", run_seed),
+        loader_seed=seed_plan["loader"],
+        worker_seed=seed_plan["worker"],
         split_indices=split_indices,
-        data_processor=data_processor,
+        scaling_artifact=scaling_artifact,
         split_persist_callback=split_persist_callback,
+        startup_callback=startup_callback,
     )
     return {
         "train": train_loader,
@@ -2002,5 +1958,6 @@ def create_dataloaders_from_config(
         "id_test": evaluation_loaders["id_test"],
         "additional_evaluation": evaluation_loaders["additional_evaluation"],
         "data_processor": normalizer,
+        "scaling_artifact": envelope,
         "split_indices": split_indices,
     }

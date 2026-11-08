@@ -101,9 +101,9 @@ def harness(request: pytest.FixtureRequest) -> _Harness:
         '  printf \'%s\\0\' "$@" > "${EXECUTOR_CAPTURE}"\n'
         '  printf \'%s\' "${APPTAINERENV_ML_SLURM_PROVENANCE:-}" > "${PROVENANCE_CAPTURE}"\n'
         '  printf \'%s\' "${JOB_LOG_FILES:-}" > "${JOB_LOG_CAPTURE}"\n'
-        '  if [[ "${1:-}" == python && "${2:-}" == -c ]]; then\n'
+        '  if [[ "${1:-}" == python && "${2:-}" == -m && "${3:-}" == src.experiments.cli.cli_probe ]]; then\n'
         '    CUDA_VISIBLE_DEVICES="" ML_SLURM_PROVENANCE="${APPTAINERENV_ML_SLURM_PROVENANCE}" \\\n'
-        '      PYTHONPATH="${SOURCE_REPO}" "${TEST_PYTHON}" -c "$3" "$4"\n'
+        '      PYTHONPATH="${SOURCE_REPO}" "${TEST_PYTHON}" -m "$3" "$4"\n'
         "  fi\n"
         "fi\n",
         encoding="utf-8",
@@ -260,6 +260,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "8",
         "--train-dataset",
         "synthetic_train",
+        "--seed",
+        "19",
         "--lr-scale",
         "0.5",
         "--train-seconds",
@@ -276,7 +278,7 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
     assert "--gres" not in " ".join(arguments)
     assert f"--output={harness.runtime}/logs/ml/slurm-%j.out" in arguments
     assert f"--error={harness.runtime}/logs/ml/slurm-%j.err" in arguments
-    assert arguments[-17:] == [
+    assert arguments[-19:] == [
         "/workspace/repo/config.yaml",
         "--epochs",
         "5",
@@ -284,6 +286,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "8",
         "--train-dataset",
         "synthetic_train",
+        "--seed",
+        "19",
         "--lr-scale",
         "0.5",
         "--train-seconds",
@@ -307,6 +311,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "8",
         "--train-dataset",
         "synthetic_train",
+        "--seed",
+        "19",
         "--lr-scale",
         "0.5",
         "--train-seconds",
@@ -320,7 +326,7 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
         "python",
         "-m",
         "src.experiments.cli.cli_train",
-        *arguments[-17:],
+        *arguments[-19:],
     ]
     provenance = json.loads(harness.provenance_capture.read_text(encoding="utf-8"))
     assert provenance["mode"] == "cpu"
@@ -592,6 +598,9 @@ def test_invalid_shared_ml_arguments_fail_before_submission(
         [*_resources("cpu"), "train", "config.yaml", "--lr-scale", "0.5", "--lr-scale", "0.25"],
         [*_resources("cpu"), "optuna", "config.yaml", "--lr-scale", "0.5"],
         [*_resources("cpu"), "optuna", "config.yaml", "--rollout-length", "8"],
+        *[[*_resources("cpu"), "train", "config.yaml", "--seed", value] for value in ("-1", "01", "x")],
+        [*_resources("cpu"), "train", "config.yaml", "--seed", "1", "--seed", "2"],
+        [*_resources("cpu"), "optuna", "config.yaml", "--seed", "1"],
     ],
 )
 def test_invalid_resource_or_training_arguments_fail_before_submission(harness: _Harness, arguments: list[str]) -> None:
@@ -669,15 +678,14 @@ def test_probe_uses_same_apptainer_executor_without_dataset_access(harness: _Har
     result = _run_worker(harness, gpu=False)
 
     assert result.returncode == 0, result.stderr
-    assert _args(harness.executor_capture)[:2] == ["python", "-c"]
+    assert _args(harness.executor_capture) == ["python", "-m", "src.experiments.cli.cli_probe", "cpu"]
     header = result.stdout.splitlines()[:3]
     assert header[0].startswith("job 12345 | partition standard | gres none")
     assert "2 CPUs" in header[0]
     assert "4G" in header[0]
     assert "00:10:00" in header[0]
     assert _submitted_tree(harness).name in header[1]
-    assert "transition none" in header[1]
-    assert re.search(r"commit [0-9a-f]{12}\b", header[1])
+    assert re.search(r"commit [0-9a-f]{12}$", header[1])
     assert "grainlegumes-pino-drying.sif" in header[2]
     assert re.search(r"sha256 [0-9a-f]{12}$", header[2])
     assert "/" not in header[2]
@@ -824,7 +832,7 @@ def test_continue_with_current_code_switches_the_tree_and_marks_the_transition(h
     provenance = json.loads(harness.provenance_capture.read_text(encoding="utf-8"))
     assert provenance["source_transition"] == "explicit"
     assert provenance["source_commit"] == _live_state(harness)[0]
-    assert "transition explicit" in worker_result.stdout.splitlines()[1]
+    assert worker_result.stdout.splitlines()[1].endswith("| continued with current code")
     assert _git_calls(harness) == ""
 
 
@@ -1169,6 +1177,7 @@ def _run_executor_after_job(
     owners: list[str] | None,
     job_logs: list[Path] | None,
     locked_scratch: bool = False,
+    closed_stderr: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run the real executor around a fake container that records ``owners`` as job log owners and exits with status 3."""
     storage, runtime, bin_dir = roots
@@ -1201,8 +1210,12 @@ def _run_executor_after_job(
         environment["JOB_LOG_FILES"] = "\n".join(str(path) for path in job_logs)
     if locked_scratch:
         environment["APPTAINER_LOCKED"] = "1"
+    command = [str(Path(__file__).resolve().parents[2] / "scripts" / "apptainer_exec.sh"), "python", "-V"]
+    if closed_stderr:
+        # File descriptor 2 is closed for the executor, so every warning it writes fails.
+        command = ["bash", "-c", 'exec 2>&-; exec "$@"', "bash", *command]
     return subprocess.run(  # noqa: S603 -- test-owned executable and controlled argument vector; no shell interpolation
-        [str(Path(__file__).resolve().parents[2] / "scripts" / "apptainer_exec.sh"), "python", "-V"],
+        command,
         env=environment,
         text=True,
         capture_output=True,
@@ -1326,15 +1339,32 @@ def test_apptainer_executor_cleans_up_and_keeps_the_status_when_logs_cannot_be_w
     assert len(warnings) == len(job_logs)
 
 
+@pytest.mark.parametrize("closed_stderr", [False, True])
 def test_apptainer_executor_keeps_the_container_status_when_its_scratch_cannot_be_removed(
-    tmp_path: Path, executor_roots: tuple[Path, Path, Path]
+    tmp_path: Path, executor_roots: tuple[Path, Path, Path], closed_stderr: bool
 ) -> None:
-    """A scratch the container left undeletable ends the cleanup with a warning, not with a changed exit status."""
-    result = _run_executor_after_job(tmp_path, executor_roots, owners=None, job_logs=None, locked_scratch=True)
+    """A scratch the container left undeletable ends the cleanup with a warning, not with a changed exit status, even unwritable."""
+    result = _run_executor_after_job(tmp_path, executor_roots, owners=None, job_logs=None, locked_scratch=True, closed_stderr=closed_stderr)
     locked = list((tmp_path / "node-scratch").glob("*/locked"))
     for directory in locked:
         directory.chmod(0o755)
     if not locked:
         pytest.skip("directory permissions do not bind this user")
     assert result.returncode == 3, result.stderr
-    assert result.stderr.splitlines()[-1].startswith("Warning: ")
+    if not closed_stderr:
+        assert result.stderr.splitlines()[-1].startswith("Warning: ")
+
+
+def test_apptainer_executor_links_no_log_whose_identity_cannot_be_read(tmp_path: Path, executor_roots: tuple[Path, Path, Path]) -> None:
+    """A failing identity read leaves the log unlinked with one warning instead of keeping an unverified link."""
+    storage, runtime, bin_dir = executor_roots
+    job_logs = list(_make_job_logs(runtime))
+    (storage / "run").mkdir()
+    failing_stat = bin_dir / "stat"
+    failing_stat.write_text("#!/usr/bin/env bash\necho 'stat: unavailable' >&2\nexit 1\n", encoding="utf-8")
+    failing_stat.chmod(0o755)
+
+    result = _run_executor_after_job(tmp_path, executor_roots, owners=["/workspace/storage/run"], job_logs=job_logs)
+
+    assert len(_warnings(result, tmp_path)) == len(job_logs)
+    assert not tuple((storage / "run" / "logs").iterdir())

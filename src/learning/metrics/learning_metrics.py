@@ -29,7 +29,7 @@ from src import domain
 from src.learning import losses
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 
 MetricSpace = Literal["normalized", "physical"]
@@ -897,17 +897,19 @@ class RelativeH1Metric(RelativeL2Metric):
     Accumulate non-periodic relative H1 values per sample.
 
     The loss factory's relative H1 definition uses the TaskSpec operator
-    dimensionality and one-sided boundary differences; it is evaluated
-    independently per sample before sample-mean accumulation, preserving the
-    declared ``sample_mean`` reduction.
+    dimensionality, one-sided boundary differences and the physical grid spacing
+    in metres (rows, then columns, as in the loss); each sample's value is the
+    mean of its per-field relative H1 values, as in the data loss, and samples
+    are averaged under the declared ``sample_mean`` reduction.
     """
 
-    def __init__(self, definition: ResolvedMetric, *, device: torch.device) -> None:
-        """Build the task-dimensional relative H1 implementation."""
+    def __init__(self, definition: ResolvedMetric, *, device: torch.device, grid_spacing: Sequence[float]) -> None:
+        """Build the task-dimensional relative H1 implementation on the physical grid."""
         super().__init__(definition, device=device)
         self._implementation = losses.factory.build_relative_h1(
             definition.operator_dimensionality,
-            reduction="sum",
+            reduction="mean",
+            grid_spacing=grid_spacing,
         )
 
     def update(
@@ -921,8 +923,8 @@ class RelativeH1Metric(RelativeL2Metric):
         """
         Compute and accumulate one task-dimensional relative H1 value per sample.
 
-        Samples are evaluated independently with NeuralOp reduction ``sum`` so
-        final accumulation preserves the declared dataset ``sample_mean`` contract.
+        Samples are evaluated independently; NeuralOp reduction ``mean`` averages
+        the fields of one sample, and accumulation keeps the dataset ``sample_mean``.
         """
         selected_pred, selected_target = self._validate_update(
             pred,
@@ -1030,6 +1032,7 @@ def build_evaluation_metrics(
     *,
     device: torch.device,
     output_standard_deviations: torch.Tensor | None = None,
+    grid_spacing: Sequence[float] | None = None,
 ) -> dict[str, DatasetMetric]:
     """
     Build explicit-space dataset accumulators from semantic config.
@@ -1048,6 +1051,9 @@ def build_evaluation_metrics(
     output_standard_deviations : torch.Tensor | None, optional
         Raw fitted output-normalizer standard-deviation tensor in TaskSpec output
         order. Required when any configured metric uses physical output groups.
+    grid_spacing : Sequence[float] | None, optional
+        Physical grid spacing in metres, rows then columns. Required when any
+        configured metric is ``relative_h1``.
 
     Returns
     -------
@@ -1150,7 +1156,10 @@ def build_evaluation_metrics(
         elif kind == "relative_l2":
             built[metric_id] = RelativeL2Metric(definition, device=device)
         elif kind == "relative_h1":
-            built[metric_id] = RelativeH1Metric(definition, device=device)
+            if grid_spacing is None:
+                msg = f"Metric {metric_id!r} requires grid_spacing in metres (rows, then columns) from the physical Dataset grid."
+                raise ValueError(msg)
+            built[metric_id] = RelativeH1Metric(definition, device=device, grid_spacing=grid_spacing)
         else:
             msg = f"No dataset accumulator exists for metric identifier {kind!r}."
             raise ValueError(msg)

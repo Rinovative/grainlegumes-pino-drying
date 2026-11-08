@@ -31,6 +31,7 @@ import pandas as pd
 
 from src.analysis.artifacts import analysis_artifact_contracts as contracts
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 
@@ -73,8 +74,8 @@ def _model_identity(frame: pd.DataFrame) -> tuple[str, int, Mapping[str, Any]]:
     return family, int(trainable), architecture
 
 
-def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[float, int]:
-    """Finalize the unchanged task objective on one admitted saved prefix."""
+def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[Mapping[str, Any], int]:
+    """Finalize the unchanged task objective evidence, available or not, on one admitted saved prefix."""
     if isinstance(max_cases, bool) or not isinstance(max_cases, int) or max_cases <= 0:
         msg = "max_cases must be a positive integer."
         raise ValueError(msg)
@@ -87,7 +88,7 @@ def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[float, int]:
         train_standard_deviations=frame.attrs["train_standard_deviations"],
         normalization_denominator_floor=float(frame.attrs["normalization_denominator_floor"]),
     )
-    return float(aggregate["value"]), selected_count
+    return aggregate, selected_count
 
 
 def _architecture_sidebar_text(
@@ -126,12 +127,15 @@ def plot_capacity_accuracy(
     details = []
     for index, (label, frame) in enumerate(datasets.items()):
         family, trainable, architecture = _model_identity(frame)
-        primary, _selected_count = _prefix_objective(frame, max_cases)
+        aggregate, _selected_count = _prefix_objective(frame, max_cases)
         role = dataframe.dataset_role(frame)
         point_label = count_headings[label] or label
+        if not aggregate["available"]:
+            # An unavailable objective is named with its support counts and never placed on the accuracy axis.
+            point_label += f": {validity_contract.unavailable_text(aggregate)}"
         handle = axis.scatter(
             trainable,
-            primary,
+            aggregate["value"] if aggregate["available"] else np.nan,
             marker=_ROLE_MARKERS[role],
             s=90,
             color=colors(index % colors.N),
@@ -169,13 +173,16 @@ def plot_capacity_accuracy(
     return figure
 
 
-def _finite_numeric(frame: pd.DataFrame, column: str, *, max_cases: int) -> np.ndarray:
-    """Return one finite numeric saved prefix."""
-    values = np.asarray(pd.to_numeric(frame.iloc[:max_cases][column], errors="raise"), dtype=float)
-    if values.size == 0 or not np.isfinite(values).all():
-        msg = f"Sensitivity column {column!r} must be finite numeric."
+def _case_pairs(frame: pd.DataFrame, parameter: str, metric_column: str, *, max_cases: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return parameter and metric values of the saved prefix without the cases whose metric is non-finite."""
+    prefix = frame.iloc[:max_cases]
+    explanatory = np.asarray(pd.to_numeric(prefix[parameter], errors="raise"), dtype=float)
+    if explanatory.size == 0 or not np.isfinite(explanatory).all():
+        msg = f"Sensitivity parameter {parameter!r} must be finite numeric."
         raise ValueError(msg)
-    return values
+    response = np.asarray(pd.to_numeric(prefix[metric_column], errors="raise"), dtype=float)
+    finite = validity_contract.finite_case_mask(response)
+    return explanatory[finite], response[finite]
 
 
 def _selected_fields(
@@ -223,9 +230,8 @@ def plot_metadata_error_heatmap(
     for frame in datasets.values():
         matrix = np.empty((len(parameters), len(fields)), dtype=float)
         for parameter_index, parameter in enumerate(parameters):
-            x_values = _finite_numeric(frame, parameter, max_cases=max_cases)
             for field_index, field in enumerate(fields):
-                y_values = _finite_numeric(frame, field.metric_column, max_cases=max_cases)
+                x_values, y_values = _case_pairs(frame, parameter, field.metric_column, max_cases=max_cases)
                 matrix[parameter_index, field_index] = _spearman(x_values, y_values)
         correlations.append(matrix)
     figure, axes = plt.subplots(
@@ -305,9 +311,8 @@ def plot_metadata_error_trends(
         plotted_values: list[float] = []
         for field in fields:
             values = []
-            response = _finite_numeric(frame, field.metric_column, max_cases=max_cases)
             for parameter in parameters:
-                explanatory = _finite_numeric(frame, parameter, max_cases=max_cases)
+                explanatory, response = _case_pairs(frame, parameter, field.metric_column, max_cases=max_cases)
                 values.append(_sensitivity(explanatory, response))
             plotted_values.extend(values)
             (line,) = axis.plot(values, y_positions, marker="o", linestyle="-", alpha=0.9, label=field.matplotlib_label)

@@ -65,9 +65,8 @@ class AdapterEvaluationViews:
 
 @dataclass(frozen=True, slots=True)
 class OptimizerWork:
-    """Describe a completed optimizer group; ``successful`` means parameters changed."""
+    """Describe a completed optimizer group."""
 
-    successful: bool
     microbatches: int
     processed_target_transitions: int
     forward_transitions: int

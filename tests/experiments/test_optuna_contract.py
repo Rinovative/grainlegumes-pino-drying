@@ -14,18 +14,19 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import optuna
 import pytest
-from support import configs
+from support import configs, optuna_trials
+from support.synthetic_task import admitted_manifest
 
 from src import common, datasets, experiments
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 optuna_runtime = experiments.tuning.optuna
 search_space = experiments.tuning.search_space
@@ -72,9 +73,9 @@ def test_epoch_override_is_applied_before_optuna_resolution_and_signature(
     """Bind a study's total epoch override to its scientific signature."""
     payload = configs.optuna_config(multivariate=False)
     path = _write_study(tmp_path, payload)
-    default = optuna_runtime.load_optuna_study_config(path)
-    shortened = optuna_runtime.load_optuna_study_config(path, epochs=2, train_dataset="synthetic_ood")
-    dataset_changed = optuna_runtime.load_optuna_study_config(path, train_dataset="synthetic_ood")
+    default = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(path))
+    shortened = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(path, epochs=2, train_dataset="synthetic_ood"))
+    dataset_changed = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(path, train_dataset="synthetic_ood"))
 
     assert shortened.base_config["training"]["epochs"] == 2
     assert shortened.base_experiment["training"]["epochs"] == 2
@@ -220,6 +221,7 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
     monkeypatch.setattr(optuna.samplers, "TPESampler", capture_sampler)
     monkeypatch.setattr(optuna.pruners, "MedianPruner", capture_pruner)
     monkeypatch.setattr(optuna, "create_study", create_study)
+    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest", admitted_manifest)
 
     result = optuna_runtime.run_optuna_study(
         loaded,
@@ -290,83 +292,81 @@ def test_transient_optuna_rejects_matched_plan_experiment(tmp_path: Path) -> Non
         optuna_runtime._validate_study_contract(replace(loaded, base_experiment=payload["experiment"]))
 
 
-def test_transient_identity_uses_storage_derived_package_root(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bind compact transient index evidence through the canonical storage owner."""
-    loaded = _load_a0_study(tmp_path)
-    config = copy.deepcopy(loaded.base_config)
-    config["paths"]["storage_root"] = str(tmp_path / "storage")
-    config["paths"].pop("dataset_packages_root", None)
-    package_root = tmp_path / "canonical-packages"
-    captured: dict[str, list[Path]] = {}
+def _load_task_study(task: str, tmp_path: Path) -> optuna_runtime.OptunaStudyConfig:
+    """Load the test-owned study of one task."""
+    return optuna_runtime.load_optuna_study_config(_write_study(tmp_path)) if task == "steady_flow" else _load_a0_study(tmp_path)
 
-    def load_manifest(task: str, dataset_id: str, *, storage_root: Path) -> dict[str, object]:
-        assert task == "transient_drying"
-        captured.setdefault("storage_roots", []).append(storage_root)
-        return {
-            "dataset_id": dataset_id,
-            "dataset_view": "transient_drying",
-            "dataset_digest": "d" * 64,
-            "schema_kind": "dataset_selection_manifest",
-            "schema_version": 1,
-            "payload_filename": "dataset.json",
-            "payload_sha256": "a" * 64,
-            "channel_contract_digest": "b" * 64,
-            "materials": ["lentil", "chickpea"],
-            "source_case_identities": [{"case_id": "case_a"}, {"case_id": "case_b"}],
-        }
 
-    def load_index(path: Path) -> dict[str, object]:
-        captured.setdefault("index_paths", []).append(path)
-        return {
-            "dataset_id": path.parent.name,
-            "contract_digest": "b" * 64,
-            "index_digest": "c" * 64,
-            "sample_count": 4,
-            "source_case_count": 2,
-        }
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_study_identity_binds_manifest_evidence_through_the_one_reader(task: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the same manifest identity fields and payload digests for both tasks, read under the configured storage root."""
+    config = _load_task_study(task, tmp_path).base_config
+    captured: list[tuple[str, Path]] = []
 
-    monkeypatch.setattr(common.paths, "get_datasets_root", lambda *, storage_root: (storage_root, package_root)[1])
-    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest_evidence", load_manifest)
-    monkeypatch.setattr(datasets.packages.trajectory, "load_transient_index", load_index)
+    def load_manifest(task: str, dataset_id: str, *, storage_root: Path) -> dict[str, Any]:
+        captured.append((task, storage_root))
+        return admitted_manifest(task, dataset_id)
+
+    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest", load_manifest)
 
     identities = optuna_runtime._configured_dataset_identities(config)
 
-    assert captured["storage_roots"] == [Path(config["paths"]["storage_root"])]
-    assert captured["index_paths"] == [package_root / "transient_drying" / config["data"]["train_dataset"] / "dataset.json"]
-    assert identities["train"]["manifest_payload_sha256"] == "a" * 64
-    assert identities["train"]["index_digest"] == "c" * 64
-    assert identities["train"]["materials"] == ["lentil", "chickpea"]
-    assert identities["additional_evaluation"] == []
+    additional = config["data"]["additional_evaluation_datasets"]
+    root = common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"])
+    assert captured == [(task, root)] * (1 + len(additional))
+    assert [item["dataset_id"] for item in identities["additional_evaluation"]] == additional
+    assert identities["train"]["payload_sha256"] == "a" * 64
+    assert identities["train"]["derived_payload_sha256"] == ("c" * 64 if task == "transient_drying" else None)
     assert identities["train"]["source_case_identity_digest"] == common.serialization.canonical_json_sha256(
         [{"case_id": "case_a"}, {"case_id": "case_b"}]
     )
 
 
-def test_transient_run_requires_physical_package_before_database(
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_dry_run_and_real_study_share_one_signature(task: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sign the dry-run description and the real invocation of either task identically, Dataset evidence included."""
+    loaded = _load_task_study(task, tmp_path)
+    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest", admitted_manifest)
+    signatures: list[dict[str, Any]] = []
+    build = optuna_runtime.build_study_signature
+
+    def recording_build(config: optuna_runtime.OptunaStudyConfig) -> dict[str, Any]:
+        signatures.append(build(config))
+        return signatures[-1]
+
+    def stop_after_signature() -> None:
+        message = "stop before study storage"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(optuna_runtime, "build_study_signature", recording_build)
+    monkeypatch.setattr(optuna_runtime.learning.training.checkpoint, "numerical_environment_identity", stop_after_signature)
+    with pytest.raises(RuntimeError, match="stop before study storage"):
+        optuna_runtime.run_optuna_study(loaded, n_trials=1, output_root=tmp_path / "outputs")
+
+    described = optuna_runtime.describe_optuna_study_config(loaded)["semantic_signature"]
+
+    assert signatures[0] == described
+    assert described["payload"]["dataset_roles"]["roles"]["train"]["dataset_digest"] == "d" * 64
+
+
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_study_run_binds_its_physical_dataset_before_database(
+    task: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fail a transient invocation before creating study state when its package is absent."""
-    loaded = _load_a0_study(tmp_path)
-    base = copy.deepcopy(loaded.base_config)
-    base["paths"]["storage_root"] = str(tmp_path / "missing-storage")
+    """Fail an invocation of either task before creating study state when its Dataset package is absent."""
+    loaded = _load_task_study(task, tmp_path)
     output_root = tmp_path / "outputs"
 
-    def missing_package(_task: str, _dataset_id: str, **_kwargs: Any) -> Any:
+    def missing_package(*_args: Any, **_kwargs: Any) -> Any:
         message = "synthetic Dataset package is absent"
         raise FileNotFoundError(message)
 
-    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest_evidence", missing_package)
+    monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest", missing_package)
 
-    with pytest.raises(FileNotFoundError):
-        optuna_runtime.run_optuna_study(
-            replace(loaded, base_config=base),
-            n_trials=1,
-            output_root=output_root,
-        )
+    with pytest.raises(FileNotFoundError, match="synthetic Dataset package is absent"):
+        optuna_runtime.run_optuna_study(loaded, n_trials=1, output_root=output_root)
 
     assert not output_root.exists()
 

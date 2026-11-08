@@ -5,10 +5,15 @@ Responsibilities:
   - Resolve the sorted member list of a projection below one source root, with the package initializers it runs through, and fail on missing paths
   - Hash the syntax trees of a projection's members with a cache keyed on exact file content
   - Own the modules and directories that every projection treats as infrastructure outside scientific identity
+  - Own the one guard that compares a recorded projection digest with the running code
 
 Design principles:
   - Owners declare their projections; no import closure, sys.modules scan or other runtime discovery decides membership
   - A projection hash decides whether a unit's science changed; exact executed bytes are bound separately by source snapshots
+  - A persisted result is evidence of the code that produced it: reading it compares only its own recorded evidence and
+    its inputs, never the running code; only a request for a result already in place and a continuation of persisted
+    computation compare a recorded digest with the running projection, through ``require_current_implementation``
+    or a composite signature that embeds the recorded digest
   - Every exemption and infrastructure entry states its reason, so tests can require that each static import is classified
   - Package initializers decide which module an alias or lazy name dispatches to, so they are hashed with the modules they front
 
@@ -20,6 +25,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +40,7 @@ if TYPE_CHECKING:
 _EXECUTING_SOURCE_ROOT = Path(__file__).resolve().parents[1]
 _CACHE_SIZE = 64
 _PACKAGE_INIT = "__init__.py"
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 _EXECUTION_REASON = "execution, scheduling and publication I/O; solver commands and templates are bound by their own recorded evidence"
 
@@ -228,3 +235,33 @@ class CodeProjection:
         names = self.members(source_root)
         files = tuple((name, serialization.file_sha256(source_root / name)) for name in names)
         return _implementation_from_content(str(source_root), files)
+
+
+def require_current_implementation(projection: CodeProjection, recorded_sha256: object, *, unit: str, remedy: str) -> None:
+    """
+    Refuse to continue or refresh a persisted result whose recorded implementation differs from the running code.
+
+    Parameters
+    ----------
+    projection : CodeProjection
+        Projection of the computation that would be continued.
+    recorded_sha256 : object
+        Digest the persisted result recorded for that projection.
+    unit : str
+        Human-readable name of the persisted result, used as the message prefix.
+    remedy : str
+        Action that resolves the refusal, appended to the message.
+
+    Raises
+    ------
+    ValueError
+        If the recorded digest is not a lowercase hexadecimal SHA-256 digest or differs from the running projection.
+
+    """
+    if not isinstance(recorded_sha256, str) or _SHA256_PATTERN.fullmatch(recorded_sha256) is None:
+        msg = f"{unit}: recorded {projection.name} implementation digest is missing or malformed; {remedy}"
+        raise ValueError(msg)
+    current = projection.sha256()
+    if recorded_sha256 != current:
+        msg = f"{unit}: {projection.name} implementation changed (recorded {recorded_sha256[:12]}, current {current[:12]}); {remedy}"
+        raise ValueError(msg)

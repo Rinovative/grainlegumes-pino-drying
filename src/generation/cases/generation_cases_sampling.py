@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 LHS_MAXIMIN_CANDIDATES = 50
 SOBOL_SKIP = 1000
 SOBOL_LEAP = 200
-CANONICAL_SUPPLEMENTAL_SCHEMA_VERSION = 1
+SUPPLEMENTAL_DESIGN_SCHEMA_VERSION = 1
 _NEAREST_NEIGHBOR_COUNT = 2
 
 
@@ -909,7 +909,7 @@ def _supplemental_design(config: _SamplingConfig) -> dict[str, Any] | None:
         not isinstance(value, dict)
         or value.get("schema_kind") != "generation_source_supplemental_design"
         or value.get("sampling_algorithm") != "sobol"
-        or value.get("schema_version") != CANONICAL_SUPPLEMENTAL_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(value.get("schema_version"), SUPPLEMENTAL_DESIGN_SCHEMA_VERSION)
         or set(value) != canonical_required
     ):
         message = "Supplemental replacement design has an unsupported schema."

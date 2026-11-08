@@ -739,7 +739,7 @@ def prepare_evaluation_workspace(
     compute.resolve_analysis_device(evaluation_compute_device)
     compute_status = compute.selection_status(evaluation_compute_device)
     root = Path(experiments_root) if experiments_root is not None else common.paths.get_experiments_root(storage_root=storage_root)
-    catalog = run_discovery.discover_evaluation_runs(root, storage_root=storage_root)
+    catalog = run_discovery.discover_evaluation_runs(root)
     if not catalog.groups:
         message = "No persisted Evaluation runs were discovered. Complete or inspect Training runs below the canonical experiments root."
         empty_catalog = run_discovery.EvaluationRunCatalog(

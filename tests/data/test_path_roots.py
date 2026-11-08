@@ -102,6 +102,15 @@ def test_source_tree_mode_resolves_only_explicit_roots(tmp_path: Path, monkeypat
     assert common.paths.source_tree_id({"SOURCE_TREE_ID": "c" * 12 + "-" + "d" * 12}) == "c" * 12 + "-" + "d" * 12
 
 
+def test_source_tree_id_form_has_one_owner() -> None:
+    """The persisted-value predicate and the environment reader accept and refuse the same tree-name form."""
+    assert common.paths.is_source_tree_id(_TREE_ID)
+    malformed = ["", "a" * 12, _TREE_ID.upper(), _TREE_ID + "0", "g" * 12 + "-" + "b" * 12, None, 7]
+    assert not any(common.paths.is_source_tree_id(value) for value in malformed)
+    with pytest.raises(ValueError, match="SOURCE_TREE_ID must be"):
+        common.paths.source_tree_id({"SOURCE_TREE_ID": _TREE_ID.upper()})
+
+
 @pytest.mark.parametrize("missing", ["PROJECT_ROOT", "STORAGE_ROOT", "RUNTIME_ROOT"])
 def test_source_tree_mode_refuses_sibling_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
     """Every root getter raises with the missing variable named instead of inferring it beside the tree."""

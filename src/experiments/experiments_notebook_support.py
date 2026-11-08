@@ -4,7 +4,7 @@ Responsibilities:
   - Resolve steady and transient protocol children, TaskSpec, metadata, and pure paths
   - List the built Datasets of a configuration's task and apply explicit training-Dataset and Stage-B-seconds selections
   - Prepare deterministic table specifications from already resolved values
-  - Inspect saved configuration and summary identities with truthful artifact paths
+  - Inspect saved configuration, summary, and split identities with truthful artifact paths
   - Represent optional completed-run inspection and validation displays
 
 Design principles:
@@ -222,7 +222,7 @@ def prepare_notebook_context(
 
 
 def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
-    """Inspect saved configuration and summary without opening tensor artifacts."""
+    """Inspect saved configuration, summary and split without opening model or Dataset tensors; an inadmissible split is reported, not raised."""
     from . import experiments_run as run_service  # noqa: PLC0415 -- optional run inspection stays lazy
 
     selected_run = Path(run_dir).expanduser().resolve()
@@ -237,7 +237,6 @@ def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
         msg = "Saved run summary and configuration identity disagree."
         raise ValueError(msg)
     objective = config_loader.get_resolved_objective(config)
-    data = config["data"]
     summary_rows: tuple[tuple[str, object], ...] = (
         ("Run directory", selected_run),
         ("Saved task", config["task"]),
@@ -258,9 +257,18 @@ def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
     )
     if config["task"] == "transient_drying":
         expected_paths.append(("history.json", selected_run / "history.json"))
-    additional = data["additional_evaluation_datasets"]
-    if additional:
-        identity = datasets.contracts.identity.combined_dataset_id(additional)
+    identity = None
+    if not common.paths.resolve_split_indices_path(selected_run).is_file():
+        split_state = "not saved"  # A run that ended before its split was persisted has no additional role.
+    else:
+        try:
+            identity = datasets.preprocessing.splits.read_saved_split(selected_run).additional_evaluation_name
+        except (TypeError, ValueError) as error:
+            split_state = f"unavailable: {type(error).__name__}: {error}"
+        else:
+            split_state = "admitted"
+    summary_rows = (*summary_rows, ("Saved split", split_state))
+    if identity is not None:
         expected_paths.append(
             (
                 f"analysis/additional_evaluation/{identity}/",
@@ -380,8 +388,6 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Additional Evaluation datasets", data["additional_evaluation_datasets"], "Optional explicitly assigned scientific roles"),
                 ("Input profile", config["input_profile"], "Resolved transient input semantics"),
                 ("Output fields", context.task.output_names, "Ordered physical state channels"),
-                ("Backend", data["transient_backend_preference"], "Requested maintained data backend"),
-                ("Backend required", data["transient_backend_required"], "Fail-closed backend requirement"),
                 ("Spatial stride", data["spatial_stride"], "Declared model spatial support"),
             ),
         ),
@@ -416,7 +422,6 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
                 ("Batch size", data["batch_size"], "Training batch size"),
                 ("Workers", data["num_workers"], "Dataloader worker count"),
-                ("Mixed precision", training["mixed_precision"], "Configured precision policy"),
                 ("Gradient accumulation", training["gradient_accumulation_steps"], "Batches per optimizer step"),
                 ("Optimizer", config["optimizer"], "Production optimization settings"),
                 ("Scheduler", config["scheduler"], "Validation-objective learning-rate policy"),
@@ -493,7 +498,7 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
         ("Physics enabled", physics["enabled"], "Whether PINO contributions affect training"),
         (
             "Derivative mode",
-            f"{physics['derivatives']['kind']} with {physics['derivatives']['extension']} extension",
+            physics["derivatives"]["kind"],
             "Spatial derivative policy used by diagnostics and active PINO loss",
         ),
         (
@@ -568,7 +573,6 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                     training["additional_evaluation_interval"],
                     "Completed-epoch cadence for additional evaluation",
                 ),
-                ("Mixed precision", training["mixed_precision"], "CUDA mixed-precision policy"),
                 ("Seed", config["run"]["seed"], "Root deterministic seed"),
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
             ),

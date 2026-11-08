@@ -54,7 +54,7 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
 def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
     """Admit exact device type and CUDA GPU model evidence."""
     device_type = device.get("device_type")
-    gpu_model = device.get("cuda_device_name", device.get("cuda_gpu_model"))
+    gpu_model = device.get("cuda_device_name")
     if (
         device_type not in {"cpu", "cuda"}
         or (device_type == "cuda" and (not isinstance(gpu_model, str) or not gpu_model))
@@ -62,7 +62,7 @@ def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
     ):
         msg = "Teacher handoff device evidence must be CPU or CUDA with an exact GPU model."
         raise ValueError(msg)
-    return {"device_type": device_type, "cuda_gpu_model": gpu_model}
+    return {"device_type": device_type, "cuda_device_name": gpu_model}
 
 
 def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -90,7 +90,6 @@ def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
         "scaling": copy.deepcopy(config["scaling"]),
         "deterministic": copy.deepcopy(run.get("deterministic")),
         "seed": copy.deepcopy(run.get("seed")),
-        "amp": copy.deepcopy(training.get("mixed_precision")),
         "datasets": {
             "train_dataset": copy.deepcopy(data.get("train_dataset")),
             "additional_evaluation_datasets": copy.deepcopy(data.get("additional_evaluation_datasets")),
@@ -202,7 +201,11 @@ def validate_local_teacher_handoff(
         "compatibility_digest",
         "target_reset_policy",
     }
-    if not isinstance(manifest, Mapping) or set(manifest) != required or manifest["schema_version"] != _SCHEMA_VERSION:
+    if (
+        not isinstance(manifest, Mapping)
+        or set(manifest) != required
+        or not common.serialization.is_schema_version(manifest["schema_version"], _SCHEMA_VERSION)
+    ):
         msg = "Local teacher handoff manifest schema is invalid."
         raise ValueError(msg)
     files = manifest["files"]
@@ -271,7 +274,11 @@ def validate_stage_a_handoff(
         "compatibility_digest",
         "target_reset_policy",
     }
-    if not isinstance(manifest, Mapping) or set(manifest) != required or manifest["schema_version"] != _SCHEMA_VERSION:
+    if (
+        not isinstance(manifest, Mapping)
+        or set(manifest) != required
+        or not common.serialization.is_schema_version(manifest["schema_version"], _SCHEMA_VERSION)
+    ):
         msg = "Transient handoff manifest schema is invalid."
         raise ValueError(msg)
     if expected_source_run_name is not None and manifest["source_run_name"] != expected_source_run_name:

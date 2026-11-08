@@ -1,7 +1,7 @@
 """Protect deterministic, content-bound dataset and saved-membership identity.
 
 Responsibilities:
-  - Check content fingerprints, ordered membership, saved splits, normalizers, and partial batches
+  - Check content fingerprints, ordered membership, saved splits, additional Evaluation parts, normalizer state, and partial batches
 
 Design principles:
   - Operational provenance cannot replace scientific content identity
@@ -13,7 +13,6 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -241,6 +240,7 @@ def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additiona
         train_dataset_id=train,
         additional_evaluation_dataset_ids=additional,
         task=task,
+        model_sha256="a" * 64,
         storage_root=root,
         num_workers=0,
         pin_memory=False,
@@ -249,16 +249,16 @@ def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additiona
     )
 
 
-def test_multiple_additional_evaluation_packages_form_one_ordered_identity_bound_loader(
+def test_two_additional_evaluation_datasets_keep_their_own_identity_membership_and_assignment(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Combine declared OOD cases of independent packages without losing exact ordered identities."""
+    """Record each additional Evaluation Dataset as its own split part and evaluate their declared cases in order."""
     _publish(tmp_path, training_dataset_payload_factory("combined_train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("parameter_ood", material_family="chickpea", material_role="ood"))
     _publish(tmp_path, training_dataset_payload_factory("family_ood", material_family="kidney_bean", material_role="ood"))
-    _train_loader, _test_loaders, _processor, split_info = _loaders(
+    _train_loader, loaders, _processor, split_info, _scaling = _loaders(
         tmp_path,
         steady_task,
         "combined_train",
@@ -266,25 +266,17 @@ def test_multiple_additional_evaluation_packages_form_one_ordered_identity_bound
         batch_size=2,
     )
 
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_info)
-    assert split_contract.validation.source is split_contract.train.source
-    assert split_contract.train.source.dataset_id == "combined_train"
-    assert split_contract.role("additional_evaluation").count == _COMBINED_OOD_SAMPLE_COUNT
-    isolated_indices = split_contract.role("additional_evaluation").indices
-    isolated_indices.fill_(-1)
-    assert min(split_contract.role("additional_evaluation").index_values) >= 0
-    rebuilt = split_contract.as_payload()
-    assert list(rebuilt) == list(split_info)
-    assert rebuilt["metadata"] == split_info["metadata"]
-    for key in ("train_indices", "validation_indices", "id_test_indices", "additional_evaluation_indices"):
-        assert torch.equal(rebuilt[key], split_info[key])
-        assert rebuilt[key].data_ptr() != split_info[key].data_ptr()
-
-    expected_id = datasets.contracts.identity.combined_dataset_id(("parameter_ood", "family_ood"))
-    assert split_info["metadata"]["datasets"]["additional_evaluation"]["dataset_id"] == expected_id
-    assert expected_id != datasets.contracts.identity.combined_dataset_id(("family_ood", "parameter_ood"))
-    assert split_info["additional_evaluation_indices"].numel() == _COMBINED_OOD_SAMPLE_COUNT
-    assert len(set(split_info["metadata"]["datasets"]["additional_evaluation"]["sample_ids"])) == _COMBINED_OOD_SAMPLE_COUNT
+    split = datasets.preprocessing.splits.admit_split(split_info)
+    assert split.train.dataset_id == "combined_train"
+    assert [part.dataset_id for part in split.additional_evaluation] == ["parameter_ood", "family_ood"]
+    assert [assignment["dataset_id"] for assignment in split.evaluation_assignments] == ["parameter_ood", "family_ood"]
+    assert len({part.dataset["dataset_digest"] for part in split.additional_evaluation}) == 2
+    assert len({part.membership_digest for part in split.additional_evaluation}) == 2
+    assert all(part.count == part.full_count for part in split.additional_evaluation)
+    assert split.as_payload() == split_info
+    evaluated = loaders["additional_evaluation"]
+    assert evaluated is not None
+    assert sum(len(batch["y"]) for batch in evaluated) == _COMBINED_OOD_SAMPLE_COUNT
 
 
 def test_family_holdout_must_not_reuse_a_training_material(
@@ -323,14 +315,12 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     """
     train_path = _publish(tmp_path, training_dataset_payload_factory("train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("ood", material_family="chickpea", material_role="ood"))
-    *_, split_info = _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1)
+    *_, split_info, _scaling = _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1)
     assert split_info["task_contract_digest"] == steady_task.contract_digest
-    assert split_info["metadata"]["datasets"]["train"]["data_contract_digest"] == steady_task.data_contract_digest
-    assert split_info["metadata"]["datasets"]["additional_evaluation"]["data_contract_digest"] == steady_task.data_contract_digest
     stale_header = copy.deepcopy(split_info)
     stale_header["task_contract_digest"] = "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a"
     with pytest.raises(ValueError, match="current registered task"):
-        datasets.preprocessing.splits.admit_split_contract(stale_header)
+        datasets.preprocessing.splits.admit_split(stale_header)
 
     replaced = training_dataset_payload_factory(
         "train",
@@ -339,7 +329,7 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     )
     train_path.unlink()
     save_steady_package(tmp_path / "02_datasets", replaced)
-    with pytest.raises(ValueError, match="identity does not match"):
+    with pytest.raises(ValueError, match="Saved split does not match the current Dataset manifests"):
         _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1, split_indices=split_info)
 
 
@@ -410,64 +400,6 @@ def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
     assert torch.isfinite(normalized_outputs).all()
     assert torch.equal(normalized_inputs, torch.zeros_like(normalized_inputs))
     assert torch.equal(normalized_outputs, torch.zeros_like(normalized_outputs))
-
-
-def test_normalizer_artifact_binds_exact_dataset_and_train_membership(
-    tmp_path: Path,
-    steady_task: domain.tasks.spec.TaskSpec,
-    training_dataset_payload_factory: Callable[..., dict[str, Any]],
-) -> None:
-    """Reject raw or stale normalizers whose training data identity changed."""
-    _publish(tmp_path, training_dataset_payload_factory("normalizer_train", material_role="id"))
-    _train_loader, _test_loaders, processor, split_info = _loaders(tmp_path, steady_task, "normalizer_train", (), batch_size=2)
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_info)
-    artifact = datasets.preprocessing.normalization.build_normalizer_artifact(
-        processor,
-        task=steady_task,
-        split_contract=split_contract,
-    )
-    restored = datasets.preprocessing.normalization.validate_normalizer_artifact(
-        artifact,
-        task=steady_task,
-        split_contract=split_contract,
-    )
-
-    assert set(restored) == set(_valid_normalizer_state())
-    assert artifact["dataset_id"] == "normalizer_train"
-    assert artifact["train_sample_count"] == split_info["train_indices"].numel()
-    for key in restored:
-        assert torch.equal(restored[key], artifact["state"][key])
-        assert restored[key].data_ptr() != artifact["state"][key].data_ptr()
-
-    with pytest.raises(ValueError, match="artifact keys"):
-        datasets.preprocessing.normalization.validate_normalizer_artifact(
-            _valid_normalizer_state(),
-            task=steady_task,
-            split_contract=split_contract,
-        )
-
-    for key, replacement in (
-        ("dataset_id", "replacement_dataset"),
-        ("fingerprint", "f" * 64),
-    ):
-        stale_identity = replace(split_contract.role("train").source, **{key: replacement})
-        stale_evidence = replace(split_contract.role("train"), source=stale_identity)
-        stale_contract = replace(split_contract, train=stale_evidence)
-        with pytest.raises(ValueError, match="does not match"):
-            datasets.preprocessing.normalization.validate_normalizer_artifact(
-                artifact,
-                task=steady_task,
-                split_contract=stale_contract,
-            )
-
-    stale_evidence = replace(split_contract.role("train"), membership_digest="e" * 64)
-    stale_contract = replace(split_contract, train=stale_evidence)
-    with pytest.raises(ValueError, match="does not match"):
-        datasets.preprocessing.normalization.validate_normalizer_artifact(
-            artifact,
-            task=steady_task,
-            split_contract=stale_contract,
-        )
 
 
 def test_training_loader_retains_a_partial_batch(

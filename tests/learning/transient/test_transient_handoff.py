@@ -42,7 +42,7 @@ def _config() -> dict[str, Any]:
         "scaling": {},
         "run": {"deterministic": True, "seed": 1},
         "data": {"train_dataset": "train", "additional_evaluation_datasets": []},
-        "training": {"mixed_precision": False},
+        "training": {},
     }
 
 

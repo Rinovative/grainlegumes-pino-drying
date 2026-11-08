@@ -12,6 +12,7 @@ Design principles:
   - Manifest evidence, not directory order or modification time, establishes outcome
   - Expensive artifact hashing occurs only on explicit source admission
   - The cases view reads only immutable records, so re-rendering a settled campaign is byte-identical
+  - A successful row reads the evidence admission requires strictly for either task; only evidence the producer may omit stays optional
 
 This module does NOT:
   - Allocate cases, select split membership, or package Dataset payloads
@@ -20,7 +21,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import csv
 import io
@@ -38,7 +38,10 @@ if TYPE_CHECKING:
 
 from src import common
 from src.generation import generation_campaign_lifecycle as lifecycle
+from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_campaign_identity as identity
+
+from . import generation_publication_campaign_evidence as campaign_evidence
 
 # Fixed leading columns of a campaign's derived cases.csv; sampled parameters and the failed solver log follow.
 _CASES_VIEW_COLUMNS: Final = (
@@ -218,7 +221,7 @@ def list_campaign_cases(
             if (
                 not isinstance(reference, dict)
                 or reference.get("schema_kind") != "generation_campaign_input_reference"
-                or reference.get("schema_version") != 1
+                or not common.serialization.is_schema_version(reference.get("schema_version"), input_service.INPUT_REFERENCE_SCHEMA_VERSION)
             ):
                 msg = "Canonical candidate input reference schema is malformed."
                 raise ValueError(msg)
@@ -380,29 +383,39 @@ def _view_cell(value: object) -> str:
 
 
 def _case_measurements(task: str, row: Mapping[str, Any], *, campaign_directory: Path) -> dict[str, object]:
-    """Return a listed case's runtime, simulated end, final bulk moisture and last failed solver log where recorded."""
+    """Return a listed case's runtime, simulated end, final bulk moisture and last failed solver log where recorded.
+
+    A successful row reads what admission requires of a success, for either task: its status and timing (both belong to the processed
+    publication) and, for a transient case, its canonical final bulk moisture; an unreadable one raises with the case. Only values the producer
+    may omit stay blank: a stationary solve has no time axis, so its status carries no ``t_stop_exact``. A failed row keeps its attempt files
+    optional, because an attempt can end before it writes them.
+    """
     from src.generation.publication import generation_publication_attempt as attempt_service  # noqa: PLC0415 -- cases-view read only
     from src.generation.publication import generation_publication_storage as storage_service  # noqa: PLC0415 -- HDF5 reader for the cases view
 
-    case_directory = campaign_directory / str(row["material_family"]) / str(row["case_id"])
+    case_id = str(row["case_id"])
+    case_directory = campaign_directory / str(row["material_family"]) / case_id
     measured: dict[str, object] = {}
     if row["outcome"] == "successful":
         result = common.paths.resolve_generation_case_result_directory(case_directory)
         evidence = common.paths.resolve_generation_result_evidence_directory(result)
-        status = _optional_json_object(evidence / "status.json") or {}
-        measured["duration_s"] = _optional_number((_optional_json_object(evidence / "timing.json") or {}).get("runtime_s"))
+        status = campaign_evidence.load_json_object(evidence / "status.json", label=f"status of successful case {case_id}")
+        timing = campaign_evidence.load_json_object(evidence / "timing.json", label=f"timing of successful case {case_id}")
+        measured["duration_s"] = _optional_number(timing.get("runtime_s"))
         measured["simulated_end_h"] = _optional_number(status.get("t_stop_exact"))
         if task == "transient_drying":
-            with contextlib.suppress(OSError, ValueError, TypeError):
-                measured["final_bulk_moisture_wb"] = storage_service.read_transient_final_bulk_moisture(
-                    result / common.paths.GENERATION_RESULT_HDF5_FILENAME
-                )
+            canonical = result / common.paths.GENERATION_RESULT_HDF5_FILENAME
+            try:
+                measured["final_bulk_moisture_wb"] = storage_service.read_transient_final_bulk_moisture(canonical)
+            except (OSError, TypeError, ValueError) as error:
+                message = f"Could not read the final bulk moisture of successful case {case_id}: {canonical}"
+                raise ValueError(message) from error
         return measured
     runs = attempt_service.attempt_run_directories(common.paths.resolve_generation_case_attempts_directory(case_directory))
     if row["outcome"] == "failed" and runs:
         attempt = _optional_json_object(runs[-1] / "attempt.json") or {}
         simulated_seconds = _optional_number(attempt.get("final_simulation_time"))
-        solver_log = runs[-1] / "payload" / "runtime" / "solver.log"
+        solver_log = runs[-1] / "payload" / "runtime" / "stdout.log"
         measured["duration_s"] = _optional_number(attempt.get("elapsed_seconds"))
         measured["simulated_end_h"] = None if simulated_seconds is None else simulated_seconds / 3600.0
         measured["solver_log"] = (
@@ -421,7 +434,7 @@ def campaign_cases_csv(
 
     Columns are the outcome and typed reason, runtime, simulated end and final bulk
     moisture where recorded, every sampled parameter its decision recorded and, for
-    a failed case, its last failure bundle's ``solver.log`` relative to the campaign.
+    a failed case, its last failure bundle's ``stdout.log`` relative to the campaign.
     The text depends only on immutable records, so re-rendering a settled campaign is
     byte-identical; it never decides, selects, or validates anything.
     """
@@ -573,7 +586,6 @@ def resolve_raw_case_reference(
         pool_sha = common.serialization.file_sha256(pool_path)
     source_identity = {
         "schema_kind": "generation_source_case_reference",
-        "schema_version": 1,
         "task": task,
         "campaign_name": plan["campaign_name"],
         "source_name": campaign_name,

@@ -167,14 +167,10 @@ def test_meta_statistics_use_parameter_union_without_fit_or_variation_filters() 
     )
     second = case_statistics._case_parameter_values(
         {
-            "generator": {
-                "legacy": {
-                    "parameters": {
-                        "varying_draw": 2.0,
-                        "single_dataset_only": single_dataset_value,
-                        "runtime_target_wet_fraction_limit": 0.04,
-                    }
-                }
+            "parameters": {
+                "varying_draw": 2.0,
+                "single_dataset_only": single_dataset_value,
+                "runtime_target_wet_fraction_limit": 0.04,
             }
         }
     )

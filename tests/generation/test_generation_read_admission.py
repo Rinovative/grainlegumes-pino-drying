@@ -88,6 +88,18 @@ def test_relocated_snapshot_and_frozen_metadata_are_admitted_without_rewriting(r
         lifecycle.campaign_from_frozen_run(loaded, storage_root=row["storage"])
 
 
+def test_evidence_reconstruction_ignores_a_changed_source_projection(relocated_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inspection reads the recorded producer identity as evidence and never compares it with the running code."""
+    row = relocated_run
+    loaded = evidence.load_campaign_run(row["run_id"], storage_root=row["storage"])
+    recorded = row["campaign"].producer_identity["source_implementation_sha256"]
+    monkeypatch.setattr(type(runtime.source_service.GENERATION_SOURCE_PROJECTION), "sha256", lambda _self, _root=None: "0" * 64)
+
+    campaign = lifecycle.campaign_from_frozen_run(loaded, require_executable=False, storage_root=row["storage"])
+
+    assert (campaign.producer_identity or {}).get("source_implementation_sha256") == recorded
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["outside", "traversal", "relative", "root_relative", "root_traversal", "root_filesystem", "changed", "missing", "symlink", "parent_escape"],

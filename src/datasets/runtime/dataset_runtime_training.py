@@ -2,22 +2,25 @@
 
 Responsibilities:
   - Resolve verified steady package runtimes for training and evaluation Datasets
-  - Bind Train/validation/ID-test to the Dataset-owned fixed case partition
+  - Bind Train/validation/ID-test to the Dataset-owned fixed case partition and each additional source to its declared OOD cases
+  - Report the startup phases both tasks share and obtain Train-only scaling through the shared scaling service
   - Seed workers and construct train, validation, ID-test and additional evaluation loaders
 
 Design principles:
   - Membership comes from Dataset manifests; run seeds never repartition data
   - Normalizers are fitted on Train membership only and reused unchanged
+  - The scaling cache is keyed by the identity and the run's recorded model digest; the artifact identity stays data-only
   - Loader and worker seeds do not alter persisted membership identity
 
 This module does NOT:
-  - Define split schemas or normalizer artifact schemas
+  - Define split schemas or scaling artifact schemas
   - Persist run artifacts or resolve experiment paths
 """
 
 from __future__ import annotations
 
 import random
+import time
 from typing import TYPE_CHECKING, Any, Final, cast
 
 import numpy as np
@@ -28,6 +31,7 @@ from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.packages import dataset_packages_manifest as package_manifest
 from src.datasets.preprocessing import dataset_preprocessing_normalization as normalization
+from src.datasets.preprocessing import dataset_preprocessing_scaling as scaling
 from src.datasets.preprocessing import dataset_preprocessing_splits as splits
 from src.datasets.runtime import dataset_runtime_factory as runtime_factory
 from src.datasets.runtime import dataset_runtime_steady as steady
@@ -91,69 +95,22 @@ def _steady_dataset(dataset_id: str, *, storage_root: Path | str | None) -> stea
     return value
 
 
-def _fixed_partition(manifest: Mapping[str, Any], *, dataset_id: str) -> dict[str, Any]:
-    """Require and validate the manifest-owned fixed case partition."""
-    fixed = manifest["case_partition"]
-    if fixed is None:
-        msg = f"Steady Dataset {dataset_id!r} has no fixed case partition; build it from a Dataset plan."
-        raise ValueError(msg)
-    materials = _materials_by_case(manifest)
-    return partition_contract.validate_fixed_partition(fixed, case_ids=tuple(materials), material_by_case=materials)
+def _binding(dataset: steady.SteadyFlowDataset) -> identity.ManifestBinding:
+    """Return the manifest binding the factory attached to a steady runtime."""
+    return cast("identity.ManifestBinding", dataset.manifest_binding)
 
 
-def _materials_by_case(manifest: Mapping[str, Any]) -> dict[str, str]:
-    """Return the source material family of every package case."""
-    return {str(entry["package_case_id"]): str(entry["source"]["material_family"]) for entry in manifest["source_case_identities"]}
+def _split_identity(dataset: steady.SteadyFlowDataset) -> dict[str, Any]:
+    """Return the persisted split identity of one steady runtime."""
+    return splits.split_dataset_identity(_binding(dataset), dataset.payload_identity)
 
 
-def additional_evaluation_components(
-    train_dataset_id: str,
-    additional_evaluation_dataset_ids: Sequence[str],
-    *,
-    storage_root: Path | str | None = None,
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """
-    Return the ordered evaluation packages and their declared OOD case IDs.
-
-    Each selected evaluation Dataset contributes its fixed ``ood`` cases; the
-    training Dataset follows when its own partition holds material-family cases
-    out. Family holdouts must not reuse a training material.
-    """
-    dataset_ids = tuple(additional_evaluation_dataset_ids)
-    if len(dataset_ids) != len(set(dataset_ids)) or train_dataset_id in dataset_ids:
-        msg = "Additional evaluation Dataset IDs must be unique and differ from the training Dataset."
-        raise ValueError(msg)
-    package_manifest.declared_evaluation_assignments(_STEADY_TASK, train_dataset_id, dataset_ids, storage_root=storage_root)
-    train_manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, train_dataset_id, storage_root=storage_root)
-    train_partition = _fixed_partition(train_manifest, dataset_id=train_dataset_id)
-    train_materials = {_materials_by_case(train_manifest)[case] for case in train_partition["train"]}
-    components: list[tuple[str, tuple[str, ...]]] = []
-    for dataset_id in dataset_ids:
-        manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, dataset_id, storage_root=storage_root)
-        partition = _fixed_partition(manifest, dataset_id=dataset_id)
-        materials = _materials_by_case(manifest)
-        if train_materials.intersection(materials[case] for case in partition["ood"]):
-            msg = "Declared family-OOD evaluation reuses a training material family."
-            raise ValueError(msg)
-        components.append((dataset_id, tuple(partition["ood"])))
-    if train_partition["ood"]:
-        components.append((train_dataset_id, tuple(train_partition["ood"])))
-    return tuple(components)
-
-
-def additional_evaluation_dataset(
-    components: Sequence[tuple[str, Sequence[str]]],
-    *,
-    storage_root: Path | str | None = None,
-    loaded: Mapping[str, steady.SteadyFlowDataset] | None = None,
+def _additional_evaluation_dataset(
+    parts: Sequence[tuple[steady.SteadyFlowDataset, Sequence[str]]],
 ) -> tuple[Dataset[Any] | None, tuple[int, ...]]:
-    """Combine the evaluation packages and locate their declared OOD cases."""
-    if not components:
+    """Combine the evaluation packages in split order and locate their declared OOD cases."""
+    if not parts:
         return None, ()
-    parts = [
-        (dict(loaded or {}).get(dataset_id) or _steady_dataset(dataset_id, storage_root=storage_root), case_ids)
-        for dataset_id, case_ids in components
-    ]
     combined = splits.combine_identity_datasets([dataset for dataset, _ in parts])
     positions: list[int] = []
     offset = 0
@@ -168,6 +125,7 @@ def create_dataloaders(
     train_dataset_id: str,
     additional_evaluation_dataset_ids: Sequence[str],
     task: TaskSpec,
+    model_sha256: str,
     storage_root: Path | str | None = None,
     batch_size: int = 32,
     num_workers: int = 0,
@@ -176,9 +134,10 @@ def create_dataloaders(
     loader_seed: int = 9,
     worker_seed: int | None = None,
     split_indices: Mapping[str, Any] | None = None,
-    data_processor: DefaultDataProcessor | None = None,
+    scaling_artifact: Mapping[str, Any] | None = None,
     split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
-) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], DefaultDataProcessor, dict[str, Any]]:
+    startup_callback: scaling.StartupCallback | None = None,
+) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], DefaultDataProcessor, dict[str, Any], dict[str, Any]]:
     """
     Create steady-flow loaders from the Dataset-owned fixed case partition.
 
@@ -190,6 +149,9 @@ def create_dataloaders(
         Published Datasets whose declared OOD cases are evaluated in addition.
     task : TaskSpec
         Authoritative task contract.
+    model_sha256 : str
+        The run's recorded model implementation digest; it binds the scaling cache key, so changed fit or application code
+        refits once while a loss-only change reuses the entry.
     storage_root : Path | str | None, optional
         Explicit storage root; the default project storage is used when omitted.
     batch_size : int, optional
@@ -206,17 +168,20 @@ def create_dataloaders(
         Base worker seed; worker ``i`` receives ``worker_seed + i``. Defaults to
         ``loader_seed``.
     split_indices : Mapping[str, Any] | None, optional
-        Saved membership; it must equal the membership rebuilt from the Datasets.
-    data_processor : DefaultDataProcessor | None, optional
-        Restored processor. When omitted, normalizers are fitted on Train only.
+        Saved split; it must equal the split rebuilt from the Datasets.
+    scaling_artifact : Mapping[str, Any] | None, optional
+        Restored scaling artifact, admitted under this run's scaling identity. When omitted, the normalizers come from
+        the shared scaling cache or are fitted on Train only.
     split_persist_callback : Callable or None, optional
         Persist a newly resolved split before normalizer fitting.
+    startup_callback : Callable or None, optional
+        Receives the startup phase events both tasks report.
 
     Returns
     -------
-    tuple[DataLoader, dict[str, DataLoader | None], DefaultDataProcessor, dict[str, Any]]
+    tuple[DataLoader, dict[str, DataLoader | None], DefaultDataProcessor, dict[str, Any], dict[str, Any]]
         A shuffled train loader, the ``eval`` (validation), ``id_test`` and
-        ``additional_evaluation`` loaders, the processor, and the split payload.
+        ``additional_evaluation`` loaders, the processor, the split payload and the scaling artifact.
 
     Raises
     ------
@@ -224,7 +189,7 @@ def create_dataloaders(
         If seeds, restored split state, or runtimes have incompatible types.
     ValueError
         If a Dataset lacks its fixed partition, OOD declarations are missing,
-        family holdouts reuse training materials, or saved membership drifts.
+        family holdouts reuse training materials, or saved membership or scaling drifts.
 
     """
     loader_seed = _normalized_seed(loader_seed, label="loader_seed")
@@ -232,54 +197,57 @@ def create_dataloaders(
     if num_workers == 0:
         persistent_workers = False
 
-    train_manifest = package_manifest.load_package_manifest_evidence(_STEADY_TASK, train_dataset_id, storage_root=storage_root)
-    fixed = _fixed_partition(train_manifest, dataset_id=train_dataset_id)
     full_train = _steady_dataset(train_dataset_id, storage_root=storage_root)
+    binding = _binding(full_train)
     if full_train.identity.task != task.id:
         msg = f"Training Dataset {train_dataset_id!r} does not belong to task {task.id!r}."
         raise ValueError(msg)
-    additional_dataset, additional_positions = additional_evaluation_dataset(
-        additional_evaluation_components(train_dataset_id, additional_evaluation_dataset_ids, storage_root=storage_root),
-        storage_root=storage_root,
-        loaded={train_dataset_id: full_train},
+    fixed = partition_contract.validate_training_partition(
+        binding.case_partition, dataset_id=train_dataset_id, case_ids=binding.case_ids, material_by_case=binding.materials
     )
-    additional_identity = cast("identity.DatasetIdentity | None", getattr(additional_dataset, "identity", None))
-    evidence = {
-        role: splits.role_evidence(role, full_train.identity, splits.role_positions(full_train.identity, fixed[role], label=role))
-        for role in splits.ID_SPLIT_ROLES
-    }
-    rebuilt = splits.SplitContract(
-        schema_version=splits.SPLIT_SCHEMA_VERSION,
+    assignments = package_manifest.declared_evaluation_assignments(
+        _STEADY_TASK, train_dataset_id, tuple(additional_evaluation_dataset_ids), storage_root=storage_root
+    )
+    sources = [_steady_dataset(dataset_id, storage_root=storage_root) for dataset_id in additional_evaluation_dataset_ids]
+    if fixed["ood"]:
+        sources.append(full_train)
+    parts = [(source, tuple(cast("Mapping[str, Any]", _binding(source).case_partition)["ood"])) for source in sources]
+    splits.reject_role_leakage(binding, fixed, [(_binding(source), case_ids) for source, case_ids in parts])
+    additional_dataset, additional_positions = _additional_evaluation_dataset(parts)
+    rebuilt = splits.build_split(
         task=task.id,
-        task_contract_digest=task.contract_digest,
-        split_seed=int(fixed["seed"]),
+        train_dataset=_split_identity(full_train),
         case_partition=fixed,
-        case_partition_digest=partition_contract.partition_digest(fixed),
-        train=evidence["train"],
-        validation=evidence["validation"],
-        id_test=evidence["id_test"],
-        additional_evaluation=None
-        if additional_identity is None
-        else splits.role_evidence("additional_evaluation", additional_identity, additional_positions),
+        additional_evaluation=[
+            (_split_identity(source), case_ids, assignment) for (source, case_ids), assignment in zip(parts, assignments, strict=True)
+        ],
+        extension=None,
     )
-    split_contract = splits.admit_split_contract(
-        rebuilt.as_payload() if split_indices is None else split_indices,
-        train_identity=full_train.identity,
-        additional_evaluation_identity=additional_identity,
-        expected_split_seed=rebuilt.split_seed,
-    )
-    if split_contract != rebuilt:
-        msg = "Saved steady split does not match the current Dataset partition and evaluation membership."
-        raise ValueError(msg)
+    split_contract = splits.resolve_split(rebuilt, split_indices)
     split_info = split_contract.as_payload()
+    if startup_callback is not None:
+        resolved = splits.resolved_event(split_contract, items=split_contract.train.count, grid=full_train.identity.spatial_shape)
+        startup_callback("dataset_resolved", resolved)
     if split_indices is None and split_persist_callback is not None:
         split_persist_callback(split_info)
 
     train_set = Subset(full_train, list(split_contract.train.index_values))
-    if data_processor is None:
-        fitting_loader = runtime_factory.make_data_loader(train_set, runtime_factory.LoaderSettings(batch_size=batch_size))
-        data_processor = normalization.fit_data_processor(fitting_loader, task=task)
 
+    def fit() -> dict[str, Any]:
+        fitting_loader = runtime_factory.make_data_loader(train_set, runtime_factory.LoaderSettings(batch_size=batch_size))
+        return normalization.processor_state(normalization.fit_data_processor(fitting_loader, task=task))
+
+    artifact = scaling.fit_or_load_scaling(
+        scaling.scaling_identity(split_contract, normalization.preprocessing_spec(task)),
+        model_sha256=model_sha256,
+        fit=fit,
+        storage_root=storage_root,
+        restored=scaling_artifact,
+        startup_callback=startup_callback,
+    )
+    data_processor = normalization.data_processor_from_state(artifact["state"], device="cpu")
+
+    loader_started = time.perf_counter()
     generator = torch.Generator().manual_seed(loader_seed)
     worker_init = _make_worker_init_fn(worker_seed) if num_workers > 0 else None
     train_loader = runtime_factory.make_data_loader(
@@ -302,4 +270,6 @@ def create_dataloaders(
         if additional_dataset is None
         else runtime_factory.make_data_loader(Subset(additional_dataset, list(additional_positions)), evaluation_settings),
     }
-    return train_loader, evaluation_loaders, cast("DefaultDataProcessor", data_processor), split_info
+    if startup_callback is not None:
+        startup_callback("dataloader_ready", {"workers": num_workers, "seconds": time.perf_counter() - loader_started})
+    return train_loader, evaluation_loaders, data_processor, split_info, artifact

@@ -1,8 +1,8 @@
 """Protect exact epoch-boundary resume and strict best/last checkpoint publication.
 
 Responsibilities:
-  - Check exact resumed state, checkpoint roles and payload kinds, transactional restore, cadence,
-    and objective selection
+  - Check exact resumed state, the wall-time last-checkpoint cadence, checkpoint roles and payload
+    kinds, transactional restore, evaluation cadence, and objective selection
 
 Design principles:
   - Synthetic deterministic training distinguishes best selection from last resume state
@@ -17,14 +17,12 @@ import copy
 import hashlib
 import math
 import random
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pytest
 import torch
 from torch import nn
-from torch.amp.grad_scaler import GradScaler
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
@@ -32,6 +30,7 @@ from src import domain, experiments, learning
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from torch.optim.optimizer import Optimizer
 
@@ -42,7 +41,6 @@ _CONTINUATION_KEYS = frozenset(
         "next_epoch",
         "optimizer_state_dict",
         "scheduler_state_dict",
-        "scaler_state_dict",
         "python_rng_state",
         "numpy_rng_state",
         "torch_cpu_rng_state",
@@ -51,6 +49,7 @@ _CONTINUATION_KEYS = frozenset(
         "train_sampler_state_dict",
     }
 )
+_NO_WORK = {"optimizer_steps": 0, "gradient_predictions": 0}
 
 
 class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
@@ -295,6 +294,7 @@ def _run(
     seed: int,
     resume_from: Path | None = None,
     epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
+    training_work: dict[str, int] | None = None,
 ) -> tuple[dict[str, Any], nn.Module, Optimizer, Any, nn.Module, DataLoader[Any]]:
     """
     Execute one synthetic training segment, optionally from ``last_checkpoint.pt``.
@@ -317,6 +317,7 @@ def _run(
         resume_from=resume_from,
         epoch_end_callback=epoch_end_callback,
         checkpoint_identity=_identity(),
+        training_work=training_work,
     )
     return result, model, optimizer, scheduler, loss, train_loader
 
@@ -398,6 +399,8 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "last_checkpoint_path": str(resumed_dir / "last_checkpoint.pt"),
     }
+    # Four epochs of four three-sample groups; the resumed segment continues the counts of its checkpoint.
+    assert resumed_result["training_work"] == full_result["training_work"] == {"optimizer_steps": 16, "gradient_predictions": 48}
     _assert_nested_equal(full_model.state_dict(), resumed_model.state_dict())
     _assert_nested_equal(full_optimizer.state_dict(), resumed_optimizer.state_dict())
     _assert_nested_equal(full_scheduler.state_dict(), resumed_scheduler.state_dict())
@@ -417,8 +420,325 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         "numpy_rng_state",
         "torch_cpu_rng_state",
         "train_loader_generator_state",
+        "training_work",
     ):
         _assert_nested_equal(full_last[key], resumed_last[key])
+
+
+def test_caller_owned_training_work_holds_the_committed_counts_when_an_epoch_callback_stops_the_run(tmp_path: Path) -> None:
+    """A run stopped from its epoch callback, as an Optuna prune does, leaves the counts of every committed epoch with its caller."""
+
+    def stop_after_the_second_epoch(epoch: int, _values: dict[str, float]) -> None:
+        if epoch == 2:
+            raise _StopRunError
+
+    work: dict[str, int] = {}
+    run_dir = tmp_path / "stopped"
+    run_dir.mkdir()
+    with pytest.raises(_StopRunError):
+        _run(run_dir, epochs=4, seed=151, epoch_end_callback=stop_after_the_second_epoch, training_work=work)
+
+    # Two epochs of four three-sample groups.
+    assert work == {"optimizer_steps": 8, "gradient_predictions": 24}
+
+
+class _StopRunError(Exception):
+    """Stop a synthetic run from its epoch callback."""
+
+
+@pytest.mark.parametrize(
+    ("epochs", "evaluation_interval", "values", "seconds_per_epoch", "best_epochs", "last_epochs"),
+    [
+        pytest.param(5, 1, [0.5, 0.6, 0.4, 0.45, 0.47], 0.0, [1, 3], [1, 3, 5], id="new-best-and-terminal"),
+        pytest.param(4, 1, [0.5, 0.6, 0.7, 0.8], 1000.0, [1], [1, 3, 4], id="interval-elapsed"),
+        pytest.param(5, 2, [0.5, 0.6, 0.7], 0.0, [2], [1, 2, 5], id="first-epoch-without-best"),
+    ],
+)
+def test_last_is_published_at_new_bests_elapsed_intervals_and_the_terminal_epoch_only(
+    epochs: int,
+    evaluation_interval: int,
+    values: list[float],
+    seconds_per_epoch: float,
+    best_epochs: list[int],
+    last_epochs: list[int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first epoch and every new best get a ``last``; otherwise ``last`` waits for the 30-minute interval or the loop's end."""
+    model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(23)
+    published: list[tuple[str, int]] = []
+    flags: list[float] = []
+    clock = [0.0]
+    real_save = learning.training.checkpoint.save_checkpoints
+
+    def record(*publications: tuple[dict[str, Any], Path]) -> None:
+        published.extend((payload["checkpoint_role"], payload["completed_epoch"]) for payload, _path in publications)
+        real_save(*publications)
+
+    def observe(_epoch: int, metrics: dict[str, float]) -> None:
+        flags.append(metrics["checkpoint/last_published"])
+        clock[0] += seconds_per_epoch
+
+    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record)
+    monkeypatch.setattr(learning.training.loop.time, "monotonic", lambda: clock[0])
+    result = learning.training.loop.train_loop(
+        config=_config(epochs, evaluation_interval=evaluation_interval),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _ObjectiveStreamMetric(values)},
+        save_dir=tmp_path,
+        epoch_end_callback=observe,
+        checkpoint_identity=_identity("last-cadence"),
+    )
+
+    assert result["status"] == "completed"
+    assert [epoch for role, epoch in published if role == "best"] == best_epochs
+    assert [epoch for role, epoch in published if role == "last"] == last_epochs
+    assert flags == [float(epoch in last_epochs) for epoch in range(1, epochs + 1)]
+    assert result["operational_timing"]["checkpoint_capture_and_publication_attempts"] == len(published)
+
+
+def test_interrupted_run_resumes_from_its_newest_last_and_trains_later_epochs_again(tmp_path: Path) -> None:
+    """
+    Interrupt after an epoch without a ``last`` and resume from the older ``last``.
+
+    The best is not newer than that ``last``, and the resumed run trains the lost
+    epoch again and ends in the uninterrupted run's exact terminal state.
+    """
+    full_dir = tmp_path / "full"
+    resumed_dir = tmp_path / "resumed"
+    full_dir.mkdir()
+    resumed_dir.mkdir()
+    full_result, full_model, full_optimizer, _scheduler, _loss, _loader = _run(full_dir, epochs=5, seed=151)
+    flags: list[float] = []
+
+    def interrupt_after_third(epoch: int, values: dict[str, float]) -> None:
+        flags.append(values["checkpoint/last_published"])
+        if epoch == 3:
+            message = "synthetic interruption"
+            raise RuntimeError(message)
+
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        _run(resumed_dir, epochs=5, seed=151, epoch_end_callback=interrupt_after_third)
+    # Evaluation every second epoch: epoch 1 publishes the first last, epoch 2 the first best with its last, epoch 3 neither.
+    assert flags == [1.0, 1.0, 0.0]
+    last = torch.load(resumed_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    best = torch.load(resumed_dir / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert last["completed_epoch"] == 2
+    assert best["best_epoch"] <= last["completed_epoch"]
+
+    resumed_result, resumed_model, resumed_optimizer, _scheduler, _loss, _loader = _run(
+        resumed_dir, epochs=5, seed=999, resume_from=resumed_dir / "last_checkpoint.pt"
+    )
+
+    assert {key: value for key, value in resumed_result.items() if key != "operational_timing"} == {
+        key: value for key, value in full_result.items() if key != "operational_timing"
+    } | {
+        "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
+        "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
+        "last_checkpoint_path": str(resumed_dir / "last_checkpoint.pt"),
+    }
+    _assert_nested_equal(full_model.state_dict(), resumed_model.state_dict())
+    _assert_nested_equal(full_optimizer.state_dict(), resumed_optimizer.state_dict())
+
+
+def _streamed_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[str, Any]:
+    """Train one evaluation-every-epoch segment whose objective stream fixes every new best."""
+    model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(37)
+    return learning.training.loop.train_loop(
+        config=_config(3, evaluation_interval=1),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _ObjectiveStreamMetric(values)},
+        save_dir=run_dir,
+        checkpoint_identity=_identity("paired-publication"),
+        **kwargs,
+    )
+
+
+def test_failed_last_write_of_a_new_best_epoch_keeps_the_previous_best_and_last_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Fail the last write of an epoch whose new best is already serialized.
+
+    Neither file may change and no staged temporary may remain, so the previous
+    pair still agrees on the selected objective and the run resumes to completion.
+    """
+    previous: dict[str, bytes] = {}
+    real_torch_save = torch.save
+
+    def fail_second_last(payload: Any, stream: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(payload, dict) and payload.get("checkpoint_role") == "last" and payload.get("completed_epoch") == 2:
+            stream.write(b"partial")
+            message = "injected last-write failure"
+            raise OSError(message)
+        real_torch_save(payload, stream, *args, **kwargs)
+
+    def keep_pair(_epoch: int, _values: dict[str, float]) -> None:
+        previous.update({name: (tmp_path / name).read_bytes() for name in ("best_checkpoint.pt", "last_checkpoint.pt")})
+
+    monkeypatch.setattr(torch, "save", fail_second_last)
+    with pytest.raises(OSError, match="injected last-write failure"):
+        _streamed_loop(tmp_path, [0.5, 0.4], epoch_end_callback=keep_pair)
+    monkeypatch.undo()
+
+    assert {name: (tmp_path / name).read_bytes() for name in previous} == previous
+    assert [path.name for path in tmp_path.iterdir() if path.name.startswith(".")] == []
+    best = torch.load(tmp_path / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+    last = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert (best["best_epoch"], best["best_metric"]) == (last["best_epoch"], last["best_metric"]) == (1, 0.5)
+    resumed = _streamed_loop(tmp_path, [0.4, 0.3], resume_from=tmp_path / "last_checkpoint.pt")
+    assert (resumed["status"], resumed["best_epoch"], resumed["best_metric"]) == ("completed", 3, 0.3)
+
+
+def test_failure_between_the_two_renames_leaves_a_best_newer_than_last_that_finalization_rejects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Fail the rename of ``last`` after the new best of epoch 2 is already renamed.
+
+    This is the one window the paired publication leaves open: ``best`` is newer
+    than ``last`` and no staged file remains. Run admission refuses to resume such
+    a pair; a loop that reaches completed finalization with it rejects it too.
+    """
+    real_replace = type(tmp_path).replace
+    last_renames: list[Path] = []
+
+    def fail_second_last_rename(source: Path, target: Path | str) -> Path:
+        if type(source)(target).name == "last_checkpoint.pt":
+            last_renames.append(source)
+            if len(last_renames) == 2:
+                message = "injected last-rename failure"
+                raise OSError(message)
+        return real_replace(source, target)
+
+    monkeypatch.setattr(type(tmp_path), "replace", fail_second_last_rename)
+    with pytest.raises(OSError, match="injected last-rename failure"):
+        _streamed_loop(tmp_path, [0.5, 0.4])
+    monkeypatch.undo()
+
+    assert [path.name for path in tmp_path.iterdir() if path.name.startswith(".")] == []
+    best = torch.load(tmp_path / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+    last = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert (best["best_epoch"], last["completed_epoch"], last["best_epoch"]) == (2, 1, 1)
+    with pytest.raises(RuntimeError, match="Best and last checkpoints disagree"):
+        _streamed_loop(tmp_path, [0.6, 0.7], resume_from=tmp_path / "last_checkpoint.pt")
+
+
+def _trial_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[str, Any]:
+    """Train the streamed segment as an Optuna trial, whose config records a trial layout."""
+    model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(37)
+    config = _config(3, evaluation_interval=1)
+    config["run"]["layout"] = {"trial": "0000__study"}
+    return learning.training.loop.train_loop(
+        config=config,
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _ObjectiveStreamMetric(values)},
+        save_dir=run_dir,
+        checkpoint_identity=_identity("trial"),
+        **kwargs,
+    )
+
+
+def test_trial_publishes_each_new_best_by_one_rename_and_never_a_last(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trial never resumes, so it keeps only its best checkpoint and its result names no last."""
+    published: list[tuple[str, int]] = []
+    flags: list[float] = []
+    real_save = learning.training.checkpoint.save_checkpoints
+
+    def record(*publications: tuple[dict[str, Any], Path]) -> None:
+        assert len(publications) == 1
+        published.extend((payload["checkpoint_role"], payload["completed_epoch"]) for payload, _path in publications)
+        real_save(*publications)
+
+    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record)
+    result = _trial_loop(tmp_path, [0.5, 0.4, 0.6], epoch_end_callback=lambda _epoch, metrics: flags.append(metrics["checkpoint/last_published"]))
+
+    assert (result["status"], result["best_epoch"], result["last_checkpoint_path"], result["next_epoch"]) == ("completed", 2, None, None)
+    assert published == [("best", 1), ("best", 2)]
+    assert flags == [0.0, 0.0, 0.0]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["best_checkpoint.pt"]
+
+
+def test_failed_best_rename_of_a_trial_keeps_the_best_it_already_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With one rename there is no best-newer-than-last window: a failed publication leaves the previously reported best whole."""
+    reported: list[tuple[int, float]] = []
+    real_replace = type(tmp_path).replace
+    best_renames: list[Path] = []
+
+    def fail_second_best_rename(source: Path, target: Path | str) -> Path:
+        if type(source)(target).name == "best_checkpoint.pt":
+            best_renames.append(source)
+            if len(best_renames) == 2:
+                message = "injected best-rename failure"
+                raise OSError(message)
+        return real_replace(source, target)
+
+    monkeypatch.setattr(type(tmp_path), "replace", fail_second_best_rename)
+    with pytest.raises(OSError, match="injected best-rename failure"):
+        _trial_loop(tmp_path, [0.5, 0.4], epoch_end_callback=lambda epoch, metrics: reported.append((epoch, metrics["id/mse"])))
+    monkeypatch.undo()
+
+    best = torch.load(tmp_path / "best_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert reported == [(1, 0.5)]
+    assert (best["best_epoch"], best["best_metric"]) == (1, 0.5)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["best_checkpoint.pt"]
+
+
+def test_failed_staged_cleanup_never_masks_the_publication_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A staged file that cannot be removed after a failed write leaves the write's own error to propagate."""
+    real_torch_save = torch.save
+
+    def fail_last(payload: Any, stream: Any, *args: Any, **kwargs: Any) -> None:
+        if payload.get("checkpoint_role") == "last":
+            message = "injected last-write failure"
+            raise OSError(message)
+        real_torch_save(payload, stream, *args, **kwargs)
+
+    def refuse_unlink(_path: Path, *, missing_ok: bool = False) -> None:
+        del missing_ok
+        message = "injected cleanup failure"
+        raise PermissionError(message)
+
+    monkeypatch.setattr(torch, "save", fail_last)
+    monkeypatch.setattr(type(tmp_path), "unlink", refuse_unlink)
+    with pytest.raises(OSError, match="injected last-write failure"):
+        learning.training.checkpoint.save_checkpoints(
+            ({"checkpoint_role": "best"}, tmp_path / "best_checkpoint.pt"),
+            ({"checkpoint_role": "last"}, tmp_path / "last_checkpoint.pt"),
+        )
+    assert not (tmp_path / "best_checkpoint.pt").exists()
+
+
+def test_next_invocation_drops_staged_checkpoints_a_crash_left_unrenamed(tmp_path: Path) -> None:
+    """A finalize-only resume publishes nothing, so only the loop-start cleanup can remove crash leftovers."""
+    _run(tmp_path, epochs=2, seed=151)
+    leftovers = [tmp_path / f".{name}.staged" for name in ("best_checkpoint.pt", "last_checkpoint.pt")]
+    # A kill inside the staged write leaves the atomic writer's random temporary instead.
+    leftovers += [tmp_path / f".{leftover.name}.k3x9q2.tmp" for leftover in leftovers]
+    for leftover in leftovers:
+        leftover.write_bytes(b"crash leftover")
+
+    resumed, _model, _optimizer, _scheduler, _loss, _loader = _run(tmp_path, epochs=2, seed=999, resume_from=tmp_path / "last_checkpoint.pt")
+
+    assert resumed["status"] == "completed"
+    assert not any(leftover.exists() for leftover in leftovers)
 
 
 def test_resume_at_the_final_epoch_boundary_finalizes_without_training(tmp_path: Path) -> None:
@@ -466,7 +786,6 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         expected_role="best",
         payload_kind="evaluation",
         scheduler_expected=True,
-        amp_expected=False,
         require_best=True,
     )
     last = learning.training.checkpoint.load_checkpoint(
@@ -475,14 +794,13 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         expected_role="last",
         payload_kind="full",
         scheduler_expected=True,
-        amp_expected=False,
         require_best=True,
     )
 
     assert best["checkpoint_role"] == "best"
     assert last["checkpoint_role"] == "last"
     assert last["completed_epoch"] == 3
-    # A steady best is never continued, so it keeps no optimizer, scheduler, scaler, RNG, or loader state.
+    # A steady best is never continued, so it keeps no optimizer, scheduler, RNG, or loader state.
     assert (best["payload_kind"], last["payload_kind"]) == ("evaluation", "full")
     assert _CONTINUATION_KEYS.isdisjoint(best)
     assert "batch_progress" not in best
@@ -494,7 +812,6 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
             expected_role="best",
             payload_kind="full",
             scheduler_expected=True,
-            amp_expected=False,
             require_best=True,
         )
 
@@ -525,8 +842,6 @@ def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mi
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=None,
-            amp_enabled=False,
             loss=loss,
             train_loader=train_loader,
         )
@@ -589,14 +904,13 @@ def test_cpu_checkpoint_ignores_unrelated_host_cuda_rng(
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        scaler=None,
-        amp_enabled=False,
         loss=loss,
         best_metric=None,
         best_epoch=None,
         objective_history=[],
         train_loader=train_loader,
         runtime_device=torch.device("cpu"),
+        training_work=_NO_WORK,
     )
 
     assert payload["torch_cuda_rng_states"] == []
@@ -619,14 +933,13 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
         model=source_model,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
-        scaler=None,
-        amp_enabled=False,
         loss=source_loss,
         best_metric=None,
         best_epoch=None,
         objective_history=[],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
+        training_work=_NO_WORK,
     )
     payload["torch_cuda_rng_states"] = [torch.get_rng_state().clone()]
 
@@ -637,8 +950,6 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        scaler=None,
-        amp_enabled=False,
         loss=loss,
         train_loader=train_loader,
     )
@@ -670,14 +981,13 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
         model=source_model,
         optimizer=source_optimizer,
         scheduler=source_scheduler,
-        scaler=None,
-        amp_enabled=False,
         loss=source_loss,
         best_metric=None,
         best_epoch=None,
         objective_history=[],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
+        training_work=_NO_WORK,
     )
     payload["loss_state_dict"] = {"unexpected": torch.tensor(1.0)}
 
@@ -706,8 +1016,6 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            scaler=None,
-            amp_enabled=False,
             loss=loss,
             train_loader=train_loader,
         )
@@ -809,7 +1117,6 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
         expected_role="last",
         payload_kind="full",
         scheduler_expected=False,
-        amp_expected=False,
         require_best=True,
     )
     assert payload["identity"]["objective"] == objective
@@ -817,29 +1124,28 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
 
 @pytest.mark.parametrize(
     "schema_version",
-    [2.0, 1],
-    ids=("floating-current", "previous-version"),
+    [1.0, 2],
+    ids=("floating-current", "other-version"),
 )
 def test_checkpoint_requires_integer_current_version(
     schema_version: object,
     tmp_path: Path,
 ) -> None:
-    """Reject alternate runtime representations and the previous checkpoint version."""
+    """Reject alternate runtime representations and any other checkpoint version."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _run(run_dir, epochs=2, seed=42)
     payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    assert payload["schema_version"] == learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION == 2
+    assert payload["schema_version"] == learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION == 1
     payload["schema_version"] = schema_version
 
-    with pytest.raises(ValueError, match="schema_version is unsupported"):
+    with pytest.raises(ValueError, match="unsupported checkpoint schema_kind/schema_version"):
         learning.training.checkpoint.validate_checkpoint(
             payload,
             expected_identity=_identity(),
             expected_role="last",
             payload_kind="full",
             scheduler_expected=True,
-            amp_expected=False,
             require_best=True,
         )
 
@@ -860,14 +1166,13 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
         model=model,
         optimizer=optimizer,
         scheduler=scheduler,
-        scaler=None,
-        amp_enabled=False,
         loss=loss,
         best_metric=evaluation_best["best_metric"],
         best_epoch=evaluation_best["best_epoch"],
         objective_history=evaluation_best["objective_history"],
         train_loader=train_loader,
         runtime_device=torch.device("cpu"),
+        training_work=_NO_WORK,
     )
     missing = {key: value for key, value in evaluation_best.items() if key != "loss_state_dict"}
     extra = {**evaluation_best, "optimizer_state_dict": optimizer.state_dict()}
@@ -879,7 +1184,6 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
             expected_role="best",
             payload_kind=kind,
             scheduler_expected=True,
-            amp_expected=False,
             require_best=True,
         )
 
@@ -906,14 +1210,13 @@ def test_writer_admits_continuation_state_only_in_full_payloads() -> None:
         "model": model,
         "optimizer": optimizer,
         "scheduler": scheduler,
-        "scaler": None,
-        "amp_enabled": False,
         "loss": loss,
         "best_metric": 0.5,
         "best_epoch": 1,
         "objective_history": [{"epoch": 1, "objective_id": "mse", "value": 0.5}],
         "train_loader": train_loader,
         "runtime_device": torch.device("cpu"),
+        "training_work": _NO_WORK,
     }
 
     with pytest.raises(ValueError, match="a last checkpoint is always full"):
@@ -927,46 +1230,18 @@ def test_writer_admits_continuation_state_only_in_full_payloads() -> None:
         )
 
 
-def test_cpu_checkpoint_rejects_amp_scaler_state() -> None:
-    """
-    Create checkpoint state with AMP enabled, an active scaler, and concrete CPU runtime.
-
-    Publication must reject the contradiction so saved device facts cannot claim
-    an unsupported mixed-precision continuation path.
-    """
-    model, optimizer, scheduler, loss, train_loader, _ = _components(61)
-    scaler = GradScaler("cpu", init_scale=64.0)
-
-    with pytest.raises(ValueError, match="concrete CUDA runtime device"):
-        learning.training.checkpoint.make_checkpoint(
-            role="last",
-            payload_kind="full",
-            identity=_identity("scaled"),
-            completed_epoch=1,
-            global_step=0,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            amp_enabled=True,
-            loss=loss,
-            best_metric=None,
-            best_epoch=None,
-            objective_history=[],
-            train_loader=train_loader,
-            runtime_device=torch.device("cpu"),
-        )
-
-
 def test_completed_epoch_callback_preserves_evaluation_cadence(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Train three epochs with evaluation interval two and inspect each callback payload.
 
-    Callbacks must follow safe checkpoint publication every epoch, include training
-    state always, and expose objective values only at actual evaluation epochs.
+    With a per-epoch ``last`` cadence, callbacks must follow safe checkpoint publication
+    every epoch, include training state always, and expose objective values only at
+    actual evaluation epochs.
     """
+    monkeypatch.setattr(learning.training.loop, "LAST_CHECKPOINT_INTERVAL_SECONDS", 0)
     run_dir = tmp_path / "callback-cadence"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(28)
@@ -1142,7 +1417,6 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         expected_role="best",
         payload_kind="evaluation",
         scheduler_expected=True,
-        amp_expected=False,
         require_best=True,
     )
     best_state = best["model_state_dict"]
@@ -1212,7 +1486,6 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         checkpoint_identity=_identity("selected-best"),
         best_checkpoint_path=run_dir / "best_checkpoint.pt",
         scheduler_expected=True,
-        amp_expected=False,
         max_physics_cases=2,
     )
     assert selected["selected_epoch"] == 1
@@ -1241,7 +1514,6 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         checkpoint_identity=_identity("selected-best"),
         best_checkpoint_path=run_dir / "best_checkpoint.pt",
         scheduler_expected=True,
-        amp_expected=False,
         max_physics_cases=2,
     )
     settled_metrics = settled["selected_metrics"]
@@ -1260,7 +1532,7 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
     ticks = iter(float(value) for value in range(8))
     observed: dict[str, float] = {}
     real_eval = learning.training.loop.eval_one_epoch
-    real_save = learning.training.checkpoint.save_checkpoint
+    real_save = learning.training.checkpoint.save_checkpoints
     real_scheduler_step = type(scheduler).step
 
     def clock() -> float:
@@ -1275,9 +1547,9 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
         events.append("scheduler")
         real_scheduler_step(instance, value)
 
-    def record_checkpoint(payload: dict[str, Any], path: Path | str) -> None:
+    def record_checkpoint(*publications: tuple[dict[str, Any], Path]) -> None:
         events.append("checkpoint")
-        real_save(payload, path)
+        real_save(*publications)
 
     def record_epoch(_epoch: int, metrics: dict[str, float]) -> None:
         events.extend(("physics_monitor", "wandb_logging"))
@@ -1286,7 +1558,7 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
     monkeypatch.setattr(learning.training.loop.time, "perf_counter", clock)
     monkeypatch.setattr(learning.training.loop, "eval_one_epoch", record_eval)
     monkeypatch.setattr(type(scheduler), "step", record_scheduler)
-    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoint", record_checkpoint)
+    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record_checkpoint)
 
     learning.training.loop.train_loop(
         config=_config(1, evaluation_interval=1),
@@ -1307,9 +1579,10 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
     assert len(clock_positions) == 8
     train_stop = clock_positions[3]
     epoch_stop = clock_positions[6]
-    assert all(events.index(event) > train_stop for event in ("evaluation", "scheduler", "checkpoint"))
+    assert all(events.index(event) > train_stop for event in ("evaluation", "scheduler"))
     assert all(events.index(event) > epoch_stop for event in ("physics_monitor", "wandb_logging"))
-    assert events.index("checkpoint") < epoch_stop
+    # The new best is written with its last after the epoch duration and before the observers.
+    assert epoch_stop < events.index("checkpoint") < events.index("physics_monitor")
     assert observed["system/train_duration_seconds"] == 1.0
     assert observed["system/train_samples_per_second"] == 12.0
     assert observed["system/epoch_duration_seconds"] == 5.0
@@ -1329,14 +1602,12 @@ def test_missing_best_prevents_successful_loop_completion(
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(14)
-    real_save = learning.training.checkpoint.save_checkpoint
+    real_save = learning.training.checkpoint.save_checkpoints
 
-    def drop_best(payload: dict[str, Any], checkpoint_path: Path) -> Path:
-        if payload["checkpoint_role"] == "best":
-            return Path(checkpoint_path)
-        return real_save(payload, checkpoint_path)
+    def drop_best(*publications: tuple[dict[str, Any], Path]) -> None:
+        real_save(*(publication for publication in publications if publication[0]["checkpoint_role"] != "best"))
 
-    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoint", drop_best)
+    monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", drop_best)
     with pytest.raises(FileNotFoundError, match="Required best checkpoint"):
         learning.training.loop.train_loop(
             config={

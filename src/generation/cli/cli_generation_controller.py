@@ -24,7 +24,7 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 from src import common
 from src.generation import controller as controller_service
@@ -45,7 +45,7 @@ def _fail(message: str, *, exit_code: int = 1) -> NoReturn:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="./scripts/generation", description="Run and inspect Generation workflows")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    run = subcommands.add_parser("run", help="start or resume a campaign or benchmark as a Slurm driver job")
+    run = subcommands.add_parser("run", help="start or resume a campaign as a Slurm driver job")
     run.add_argument("config")
     run.add_argument("--materials", nargs="+", help="select configured materials for this original design")
     run.add_argument("--cases-per-material", type=int, help="set natural original-design size per selected material")
@@ -72,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--no-retry",
         action="store_true",
-        help="disable automatic license retries (including within an allocation); set the solver failure budget to 1",
+        help="disable automatic license retries (the node wait and the retry within an allocation)",
     )
     run.add_argument("--dry-run", action="store_true", help="print the resolved plan and check execution readiness; start no work")
     run.add_argument(
@@ -85,7 +85,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--driver-time", default="06:00:00", help="time limit of the submitted driver job as [D-]HH:MM:SS")
     status = subcommands.add_parser("status", help="inspect a config or persisted run ID")
     status.add_argument("target")
-    cancel = subcommands.add_parser("cancel", help="cancel a campaign or benchmark")
+    cancel = subcommands.add_parser("cancel", help="cancel a campaign")
     cancel.add_argument("run_id")
     cancel.add_argument("--force", action="store_true")
     fail_case = subcommands.add_parser("fail-case", help="declare one exhausted solver/validation candidate terminal")
@@ -94,12 +94,14 @@ def _parser() -> argparse.ArgumentParser:
     fail_case.add_argument("case_id")
     fail_case.add_argument("--reason-code", required=True)
     fail_case.add_argument("--detail", required=True)
-    amend = subcommands.add_parser("amend-replacements", help="explicitly raise the replacement capacity of one original batch of a campaign run")
+    amend = subcommands.add_parser("amend-replacements", help="explicitly lower the minimum success rate of one original batch of a campaign run")
     amend.add_argument("run_id")
     amend.add_argument("--material", required=True)
     amend.add_argument("--regime", required=True, help="sampling regime of the original batch, for example natural")
-    amend.add_argument("--capacity", type=int, required=True, help="total replacement candidates the batch may use; it can only grow")
-    amend.add_argument("--reason", required=True, help="why capacity is added after the original design was frozen")
+    amend.add_argument(
+        "--minimum-success-rate", type=float, required=True, help="new rate s with 0 < s <= 1; it can only be lowered (the current value is a no-op)"
+    )
+    amend.add_argument("--reason", required=True, help="why the rate is lowered after the original design was frozen")
     inputs = subcommands.add_parser("inputs", help="generate selected canonical campaign inputs")
     inputs.add_argument("config")
     inputs.add_argument("options", nargs=argparse.REMAINDER)
@@ -151,10 +153,17 @@ def _run_record_command(port: host_service.GenerationHost, layout: host_service.
         operation = "declare-candidate-failure"
         operands = (args.material, args.case_id, "--reason-code", args.reason_code, "--detail", args.detail)
     else:
-        if args.capacity < 1:
-            _fail("--capacity must be an integer >= 1", exit_code=2)
         operation = "amend-replacement-pool"
-        operands = ("--material", args.material, "--regime", args.regime, "--capacity", str(args.capacity), "--reason", args.reason)
+        operands = (
+            "--material",
+            args.material,
+            "--regime",
+            args.regime,
+            "--minimum-success-rate",
+            str(args.minimum_success_rate),
+            "--reason",
+            args.reason,
+        )
     print(port.call(operation, args.run_id, *operands, "--storage-root", str(layout.storage), scheduled=False), end="")
     return 0
 
@@ -193,34 +202,23 @@ def _run(
     """Resolve one run plan, then print it with its readiness, submit its driver job from the login node, or run it inside that job."""
     controller = controller_service.GenerationController(port)
     plan = controller.plan(args.config, allow_incomplete=args.dry_run, scientific_arguments=_scientific_arguments(args))
-    if args.max_admission_cases is not None and plan.kind != "campaign":
-        _fail("--max-admission-cases applies to one source campaign", exit_code=2)
     if args.dry_run:
-        footprint: dict[str, Any] | None
-        if plan.kind == "benchmark":
-            _, inspection = controller.benchmark_resources(plan.config_path)
-            footprint = controller_service.benchmark_scheduler_footprint(
-                inspection["resource_contract"], driver_time=args.driver_time, driver_partition=args.driver_partition
-            )
-        else:
-            footprint = controller_service.scheduler_footprint(
-                controller_service.plan_execution_values(plan.payload),
-                driver_time=args.driver_time,
-                driver_partition=args.driver_partition,
-            )
+        footprint = controller_service.scheduler_footprint(
+            controller_service.plan_execution_values(plan.payload),
+            driver_time=args.driver_time,
+            driver_partition=args.driver_partition,
+        )
         # First stdout line: the unchanged plan plus the Slurm footprint it would ask for (node jobs and driver).
         print(json.dumps({**plan.payload, "identity": plan.identity, "scheduler_footprint": footprint}, sort_keys=True))
         print(controller.preflight(plan), file=sys.stderr)
     elif driver is None:
         controller.run(plan, args.config, max_admission_cases=args.max_admission_cases)
     else:
-        # A benchmark, like a campaign, runs from the frozen source snapshot (commit plus recorded changes) it is bound to.
-        task = "benchmark"
-        if plan.kind == "campaign":
-            parts = common.paths.campaign_run_parts(plan.identity)
-            if parts is None:
-                _fail("Campaign plan is not a current source campaign", exit_code=2)
-            task = parts[0]
+        # A campaign runs from the frozen source snapshot (commit plus recorded changes) it is bound to.
+        parts = common.paths.campaign_run_parts(plan.identity)
+        if parts is None:
+            _fail("Campaign plan is not a current source campaign", exit_code=2)
+        task = parts[0]
         submitted = controller.submit_run_tree(
             plan,
             module="src.generation.cli.cli_generation_controller",

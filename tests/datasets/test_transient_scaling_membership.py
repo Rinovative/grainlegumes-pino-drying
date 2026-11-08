@@ -16,6 +16,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -60,6 +61,28 @@ def _increment_rms(states: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(increments, dim=1).square().mean(dim=1).sqrt()
 
 
+def _create(package: dict[str, Any], sampling: Any, **extra: Any) -> Any:
+    """Create the public transient training loaders on the compact package."""
+    return datasets.runtime.transient_training.create_transient_training_loaders(
+        train_dataset_id=package["train_dataset"],
+        additional_evaluation_dataset_ids=[],
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
+        train_sampling=sampling,
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        model_sha256="a" * 64,
+        storage_root=str(package["root"]),
+        **extra,
+    )
+
+
+def _close(loaders: Any) -> None:
+    """Close every loader Dataset the training loaders own."""
+    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
+    for loader in owned:
+        if loader is not None:
+            loader.dataset.close()
+
+
 def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifact, dict[str, Any], list[str]]:
     """Create the public loaders once and return the fitted scaler, split evidence and scaler cache outcomes."""
     cache_outcomes: list[str] = []
@@ -68,24 +91,11 @@ def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifa
         if event == "scaler_cache":
             cache_outcomes.append(str(values["state"]))
 
-    loaders = datasets.runtime.transient_training.create_transient_training_loaders(
-        train_dataset_id=package["train_dataset"],
-        additional_evaluation_dataset_ids=[],
-        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
-        train_sampling=sampling,
-        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0, hdf5_cache_size=0),
-        storage_root=str(package["root"]),
-        transient_backend_preference="pt_shards",
-        transient_backend_required=True,
-        startup_callback=record,
-    )
+    loaders = _create(package, sampling, startup_callback=record)
     try:
-        return loaders.scaling_artifact, loaders.split, cache_outcomes
+        return loaders.data_processor, loaders.split, cache_outcomes
     finally:
-        owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
-        for loader in owned:
-            if loader is not None:
-                loader.dataset.close()
+        _close(loaders)
 
 
 @pytest.mark.parametrize("sampling", list(_SAMPLING.values()), ids=list(_SAMPLING))
@@ -116,7 +126,7 @@ def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[st
     torch.testing.assert_close(artifact.state_mean.to(torch.float64), train_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
     torch.testing.assert_close(artifact.state_std.to(torch.float64), train_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
     torch.testing.assert_close(artifact.delta_rms.to(torch.float64), _increment_rms(train), rtol=1.0e-5, atol=1.0e-6)
-    assert split["roles"]["scaling_train_one_step"]["case_ids"] == partition["train"]
+    assert split["roles"]["train"]["case_ids"] == partition["train"]
     assert artifact.unique_train_state_count == sum(sequence.shape[0] for sequence in train)
     assert artifact.unique_transition_count == artifact.transition_count == sum(sequence.shape[0] - 1 for sequence in train)
 
@@ -127,3 +137,21 @@ def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[st
     assert restored.digest == artifact.digest
     for name in ("state_mean", "state_std", "delta_rms", "increment_scale"):
         assert torch.equal(getattr(restored, name), getattr(artifact, name))
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign"),
+    [("dataset_identity", {"dataset_id": "foreign"}), ("train_membership_digest", "b" * 64)],
+)
+def test_restored_scaling_state_with_a_foreign_identity_is_refused(transient_package: dict[str, Any], field: str, foreign: Any) -> None:
+    """Refuse a restored artifact whose envelope identity matches while its fitted state repeats another Dataset or membership."""
+    sampling = _SAMPLING["one_step"]
+    first = _create(transient_package, sampling)
+    try:
+        envelope = copy.deepcopy(first.scaling_artifact)
+    finally:
+        _close(first)
+    envelope["state"][field] = foreign
+
+    with pytest.raises(ValueError, match=field):
+        _create(transient_package, sampling, scaling_artifact=envelope)

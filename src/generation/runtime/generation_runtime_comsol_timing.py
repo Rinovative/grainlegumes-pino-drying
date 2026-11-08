@@ -14,7 +14,7 @@ Design principles:
 This module does NOT:
   - Infer solver phases from arbitrary Stationary or Transient text
   - Parse stdout, scheduler timing, polling intervals, or export duration
-  - Mutate completed cases or historical storage
+  - Mutate completed cases or recorded storage
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
+from src import common
 from src.generation.contracts import generation_contracts_profiles as profiles
 
 if TYPE_CHECKING:
@@ -577,13 +578,11 @@ def admit_persisted_solver_timing(
     timing: Mapping[str, Any],
     *,
     simulation_profile: str,
-) -> ComsolSolverTiming | None:
+) -> ComsolSolverTiming:
     """
-    Validate optional additive solver timing in one admitted Generation sidecar.
+    Validate the solver timing in one admitted Generation sidecar.
 
-    Legacy schema-v1 timing sidecars without any solver timing fields remain valid
-    and return ``None``. Any partially present or inconsistent new evidence fails
-    closed.
+    A sidecar without the complete solver-timing fields, or with inconsistent ones, fails closed.
     """
     required = _required_phases(simulation_profile)
     top_fields = {
@@ -591,11 +590,7 @@ def admit_persisted_solver_timing(
         "comsol_transient_drying_seconds",
         "comsol_scientific_solver_seconds",
     }
-    evidence_present = "comsol_solver_timing" in timing
-    present_top_fields = top_fields.intersection(timing)
-    if not evidence_present and not present_top_fields:
-        return None
-    if not evidence_present or present_top_fields != top_fields:
+    if "comsol_solver_timing" not in timing or top_fields.intersection(timing) != top_fields:
         msg = "Case timing contains incomplete COMSOL solver-timing fields."
         raise ValueError(msg)
     payload = timing["comsol_solver_timing"]
@@ -619,7 +614,7 @@ def admit_persisted_solver_timing(
         raise ValueError(msg)
     if (
         payload["schema_kind"] != SOLVER_TIMING_SCHEMA_KIND
-        or payload["schema_version"] != SOLVER_TIMING_SCHEMA_VERSION
+        or not common.serialization.is_schema_version(payload["schema_version"], SOLVER_TIMING_SCHEMA_VERSION)
         or payload["method"] != SOLVER_TIMING_METHOD
         or payload["source_kind"] != SOLVER_TIMING_SOURCE_KIND
         or payload["source_path"] != COMSOL_BATCH_LOG_FILENAME

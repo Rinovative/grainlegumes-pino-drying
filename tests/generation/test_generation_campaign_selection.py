@@ -2,11 +2,13 @@
 
 Responsibilities:
   - Check complete candidate publication, idempotent reuse, and frozen-input admission
-  - Check that an authored replacement capacity is pre-registered once, reproduced exactly on rerun and distinguishable from explicit amendments
+  - Check the success-rate bound, the stop rule and the tolerated failures that size admission
+  - Check that a plan's minimum success rate is pre-registered once, reproduced exactly on rerun and only lowered explicitly
+  - Check that only a plan campaign without an explicit cap records its admission cap as derived (null)
 
 Design principles:
   - Exact candidate bytes and frozen science govern Source admission
-  - Replacement capacity is policy: it never changes the Source identity or the sampling seeds
+  - The minimum success rate is policy: it never changes the Source identity or the sampling seeds
 
 This module does NOT:
   - Execute candidates or build Dataset packages
@@ -25,6 +27,7 @@ import yaml
 
 from src import common, generation
 from src.generation import generation_campaign_lifecycle as lifecycle
+from src.generation.cases import generation_cases_selection as selection
 from src.generation.contracts import generation_contracts_source as source
 from src.generation.publication import generation_publication_catalog as catalog
 
@@ -171,110 +174,169 @@ def test_producer_code_invalidates_reuse_but_documentation_preserves_seeds(
     assert solver_changed.batches[0].seed_base == changed.batches[0].seed_base
 
 
-def _authored(config_path: Path, capacity: Any) -> dict[str, Any]:
-    """Return the test campaign as an in-memory authored value that carries a replacement capacity."""
-    return {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "replacement_capacity": capacity}
+@pytest.mark.parametrize(("successful", "decided", "bound"), [(0, 1, 0.95), (1, 3, 0.8646), (3, 3, 1.0)])
+def test_success_rate_bound_is_the_one_sided_clopper_pearson_upper_limit(successful: int, decided: int, bound: float) -> None:
+    """Bound k of n decided candidates by the 95 % Beta quantile, and by one when every decided candidate succeeded."""
+    assert selection.success_rate_upper_bound(successful, decided) == pytest.approx(bound, abs=1e-4)
 
 
-def test_authored_replacement_capacity_is_preregistered_once_and_reproduced_exactly(
+@pytest.mark.parametrize(
+    ("successful", "decided", "rate", "stopped"),
+    [
+        (0, 0, 1.0, False),  # nothing decided never stops a batch
+        (0, 1, 0.9, False),  # one failure leaves the bound at 0.95
+        (0, 2, 0.9, True),  # a broken batch stops after its second failure
+        (1, 3, 0.8, False),  # the bound 0.865 is still at or above s
+        (1, 4, 0.8, True),  # the bound 0.751 falls below s
+    ],
+)
+def test_a_batch_is_stopped_exactly_when_its_bound_falls_below_its_minimum_success_rate(
+    successful: int,
+    decided: int,
+    rate: float,
+    stopped: bool,
+) -> None:
+    """Stop a batch with at least one decision whose upper bound lies below s, and never while the bound reaches s."""
+    assert selection.success_rate_stopped(successful, decided, minimum_success_rate=rate) is stopped
+
+
+@pytest.mark.parametrize(("count", "rate", "failures"), [(150, 0.9, 24), (30, 0.6, 30), (2, 1.0, 0)])
+def test_tolerated_failures_are_the_most_a_batch_can_have_and_still_reach_its_count(count: int, rate: float, failures: int) -> None:
+    """The last success is admitted at count - 1 successes and f failures; one more failure would stop the batch first."""
+    assert selection.maximum_tolerated_failures(count, rate) == failures
+    assert not selection.success_rate_stopped(count - 1, count - 1 + failures, minimum_success_rate=rate)
+    assert selection.success_rate_stopped(count - 1, count + failures, minimum_success_rate=rate)
+
+
+@pytest.mark.parametrize("rate", [1e-20, 1e-300])
+def test_tolerated_failures_refuse_a_rate_too_small_for_a_bounded_cap(rate: float) -> None:
+    """A rate whose tolerated failures exceed the search bound raises an actionable ValueError, never a scipy error or a hang."""
+    with pytest.raises(ValueError, match="too small"):
+        selection.maximum_tolerated_failures(30, rate)
+
+
+def _authored(config_path: Path, rate: Any) -> dict[str, Any]:
+    """Return the test campaign as an in-memory authored value that carries a Dataset plan's minimum success rate."""
+    return {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": rate}
+
+
+def test_a_plan_rate_is_preregistered_once_reproduced_exactly_and_only_lowered_explicitly(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """The plan's capacity becomes amendment one, a rerun is idempotent, a different value is refused, and explicit additions stay visible."""
+    """The plan's s becomes amendment one; a rerun with another s is refused; an explicit amendment lowers s and a raise is refused."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
     plain = generation.cases.config.load_campaign_config(config_path)
-    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, {"lentil": 2}))
+    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.8))
     assert (campaign.source_name, campaign.campaign_digest, campaign.root_seed) == (plain.source_name, plain.campaign_digest, plain.root_seed)
     storage = tmp_path / "scientific-storage"
     root = lifecycle.create_campaign(campaign, storage_root=storage)
-    assert (
-        lifecycle.load_campaign_plan("steady_flow", campaign.source_name, storage_root=storage)["seed_key"]
-        == lifecycle._resolved_plan(plain)["seed_key"]
-    )
     batch = campaign.batches[0]
 
     def policy() -> dict[str, Any]:
         (entry,) = lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage)
         return entry
 
-    assert (policy()["planned_capacity"], policy()["high_water"]) == (2, 2)
+    assert (policy()["minimum_success_rate"], policy()["successful"], policy()["decided"], policy()["stopped"]) == (0.8, 0, 0, False)
     assert [(item["amendment_index"], item["registered_by"]) for item in policy()["amendments"]] == [(1, "plan")]
     before = {path: path.read_bytes() for path in root.rglob("amendment_*.json")}
     assert lifecycle.create_campaign(campaign, storage_root=storage) == root
     assert {path: path.read_bytes() for path in root.rglob("amendment_*.json")} == before
-
-    other = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, {"lentil": 3}))
-    assert other.source_name == campaign.source_name
-    with pytest.raises(ValueError, match=r"pre-registered per Source.*records 2.*requests 3"):
+    other = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.7))
+    with pytest.raises(ValueError, match=r"pre-registered per Source.*records 0\.8.*requests 0\.7"):
         lifecycle.create_campaign(other, storage_root=storage)
-    with pytest.raises(ValueError, match=r"records 2.*requests 0"):
+    with pytest.raises(ValueError, match=r"records 0\.8.*requests None"):
         lifecycle.create_campaign(plain, storage_root=storage)
 
-    lifecycle.amend_replacement_pool(
-        "steady_flow", campaign.source_name, batch.batch_id, high_water=3, reason="Later explicit addition", storage_root=storage
+    lowered = lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.6, reason="Known hard corner", storage_root=storage
     )
+    assert lowered == (0.8, 0.6)
+    assert lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.6, reason="Repeat", storage_root=storage
+    ) == (0.6, 0.6)
     lifecycle.create_campaign(campaign, storage_root=storage)
-    assert (policy()["planned_capacity"], policy()["high_water"]) == (2, 3)
-    assert [(item["registered_by"], item["reason"]) for item in policy()["amendments"]] == [
-        ("plan", "authored plan generation.replacement_capacity"),
-        ("explicit", "Later explicit addition"),
+    assert policy()["minimum_success_rate"] == 0.6
+    assert [(item["registered_by"], item["minimum_success_rate"], item["reason"]) for item in policy()["amendments"]] == [
+        ("plan", 0.8, "authored plan generation.minimum_success_rate"),
+        ("explicit", 0.6, "Known hard corner"),
     ]
-    with pytest.raises(ValueError, match="cannot decrease"):
-        lifecycle.amend_replacement_pool("steady_flow", campaign.source_name, batch.batch_id, high_water=2, reason="Too low", storage_root=storage)
+    with pytest.raises(ValueError, match="can only be lowered"):
+        lifecycle.amend_minimum_success_rate(
+            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.7, reason="Raise", storage_root=storage
+        )
     with pytest.raises(ValueError, match="non-empty reason"):
-        lifecycle.amend_replacement_pool("steady_flow", campaign.source_name, batch.batch_id, high_water=4, reason=" ", storage_root=storage)
+        lifecycle.amend_minimum_success_rate(
+            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.5, reason=" ", storage_root=storage
+        )
+    common.paths.resolve_generation_selected_pool_path(root).write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="sealed selected-success pool"):
+        lifecycle.amend_minimum_success_rate(
+            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.5, reason="After sealing", storage_root=storage
+        )
 
 
-def test_zero_authored_capacity_records_nothing_and_explicit_amendments_do_not_conflict_with_it(
+def test_only_a_plan_campaign_without_an_explicit_cap_records_a_derived_admission_cap(generation_config_factory: Any) -> None:
+    """A Dataset plan's campaign records null, which follows its rates; an explicit cap and a campaign without a plan keep their integer."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2, max_admission_cases=4)
+
+    def recorded(**kwargs: Any) -> Any:
+        return generation.cases.config.load_campaign_config(config_path, **kwargs).execution_values["submission"]["max_admission_cases"]
+
+    assert recorded(authored_value=_authored(config_path, 0.8)) is None
+    assert recorded(authored_value=_authored(config_path, 0.8), execution_overrides={"max_admission_cases": 4}) == 4
+    assert recorded() == 4
+
+
+@pytest.mark.parametrize("index", [True, 1.0])
+def test_an_amendment_index_must_be_a_non_boolean_integer(generation_config_factory: Any, tmp_path: Path, index: object) -> None:
+    """A JSON ``true`` or ``1.0`` amendment index is malformed history, never amendment one."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.8))
+    storage = tmp_path / "scientific-storage"
+    (path,) = lifecycle.create_campaign(campaign, storage_root=storage).rglob("amendment_*.json")
+    common.serialization.atomic_write_json(path, {**json.loads(path.read_text(encoding="utf-8")), "amendment_index": index})
+    with pytest.raises(ValueError, match="amendments are malformed"):
+        lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage)
+
+
+def test_a_source_without_a_plan_starts_at_one_and_is_lowered_through_its_campaign_handle(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Capacity zero is the default: no amendment is written, and an explicit one on a plain Source is accepted on rerun."""
+    """A plain Source records nothing and uses s = 1; amend-replacements lowers one original batch and a late plan rate is refused."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
-    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, {"lentil": 0}))
+    campaign = generation.cases.config.load_campaign_config(config_path)
     storage = tmp_path / "scientific-storage"
     root = lifecycle.create_campaign(campaign, storage_root=storage)
     assert not list(root.rglob("amendment_*.json"))
-    late = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, {"lentil": 2}))
-    with pytest.raises(ValueError, match=r"records 0.*requests 2"):
-        lifecycle.create_campaign(late, storage_root=storage)
-    assert not list(root.rglob("amendment_*.json"))
-    run_id = f"source~steady_flow~{campaign.source_name}"
-    amended = generation.campaign.amend_replacement_capacity(
-        run_id, "lentil", "natural", capacity=2, reason="Add capacity after the first failure", storage_root=storage
-    )
-    assert (amended["previous_capacity"], amended["capacity"]) == (0, 2)
-    assert (
-        generation.campaign.amend_replacement_capacity(run_id, "lentil", "natural", capacity=2, reason="Repeat", storage_root=storage)["capacity"]
-        == 2
-    )
-    lifecycle.create_campaign(campaign, storage_root=storage)
     (entry,) = lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage)
-    assert (entry["planned_capacity"], entry["high_water"], [item["registered_by"] for item in entry["amendments"]]) == (0, 2, ["explicit"])
+    assert (entry["minimum_success_rate"], entry["amendments"]) == (1.0, [])
+    run_id = f"source~steady_flow~{campaign.source_name}"
+    amended = generation.campaign.amend_minimum_success_rate(
+        run_id, "lentil", "natural", minimum_success_rate=0.5, reason="Accept a known failure", storage_root=storage
+    )
+    assert (amended["previous_minimum_success_rate"], amended["minimum_success_rate"]) == (1.0, 0.5)
+    lifecycle.create_campaign(campaign, storage_root=storage)
+    late = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.9))
+    with pytest.raises(ValueError, match=r"records None.*requests 0\.9"):
+        lifecycle.create_campaign(late, storage_root=storage)
     with pytest.raises(ValueError, match="no unique original batch"):
-        generation.campaign.amend_replacement_capacity(run_id, "lentil", "parameter_ood", capacity=1, reason="No such batch", storage_root=storage)
-    with pytest.raises(ValueError, match="canonical v2 campaign"):
-        generation.campaign.amend_replacement_capacity("legacy-run", "lentil", "natural", capacity=1, reason="No handle", storage_root=storage)
+        generation.campaign.amend_minimum_success_rate(
+            run_id, "lentil", "parameter_ood", minimum_success_rate=0.5, reason="No such batch", storage_root=storage
+        )
+    with pytest.raises(ValueError, match="canonical source campaign"):
+        generation.campaign.amend_minimum_success_rate(
+            "legacy-run", "lentil", "natural", minimum_success_rate=0.5, reason="No handle", storage_root=storage
+        )
 
 
-@pytest.mark.parametrize(
-    ("capacity", "message"),
-    [
-        ({"chickpea": 1}, "outside the campaign"),
-        ({"lentil": -1}, "must be an integer >= 0"),
-        ({"lentil": True}, "must be an integer >= 0"),
-        (3, "must be a mapping"),
-    ],
-)
-def test_authored_replacement_capacity_is_validated_and_belongs_to_plans(
-    generation_config_factory: Any,
-    capacity: Any,
-    message: str,
-) -> None:
-    """Reject unknown materials, negative or non-integer counts, and a capacity written into a standalone campaign file."""
+@pytest.mark.parametrize("rate", [0, 1.5, True, {"lentil": 0.9}])
+def test_a_plan_rate_is_validated_and_belongs_to_plans(generation_config_factory: Any, rate: Any) -> None:
+    """Reject a rate outside (0, 1], a boolean or a mapping, and a rate written into a campaign file."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
-    with pytest.raises((generation.cases.config.GenerationConfigError, TypeError), match=message):
-        generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, capacity))
-    config_path.write_text(yaml.safe_dump(_authored(config_path, {"lentil": 1}), sort_keys=False), encoding="utf-8")
+    with pytest.raises(generation.cases.config.GenerationConfigError, match="0 < s <= 1"):
+        generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, rate))
+    config_path.write_text(yaml.safe_dump(_authored(config_path, 0.9), sort_keys=False), encoding="utf-8")
     with pytest.raises(generation.cases.config.GenerationConfigError, match="pre-registered by a Dataset plan"):
         generation.cases.config.load_campaign_config(config_path)

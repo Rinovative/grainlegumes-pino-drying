@@ -3,7 +3,7 @@
 Responsibilities:
   - Check named supervised/physics components, warmup, normalization, telemetry, and monitor
     failures
-  - Check that the relative H1 data loss treats boundaries as non-periodic
+  - Check that the relative H1 data loss treats boundaries as non-periodic and differentiates in metres
   - Check that every physics term carries gradients through the normalizers to the prediction
 
 Design principles:
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 _MIDPOINT_EPOCH = 2
 _TASK = domain.tasks.registry.get_task("steady_flow")
+_GRID_SPACING = (0.003, 0.004)
 
 
 class _ListMappingDataset(Dataset[dict[str, torch.Tensor]]):
@@ -157,7 +158,7 @@ def test_disabled_physics_exposes_named_zero_components() -> None:
     supervised = configs.resolve(
         configs.direct_config(model_kind="fno", physics_enabled=False),
     )
-    supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"))
+    supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
     task = domain.tasks.registry.get_task(str(supervised["task"]))
     pred = torch.ones((2, task.out_channels, 8, 8))
     target = torch.zeros_like(pred)
@@ -178,7 +179,7 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
     Applied weights and named components must scale linearly and sum exactly,
     while explicit epoch state persists for deterministic resume.
     """
-    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"))
+    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
     normalizer = IdentityNormalizer()
     loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
     inputs, pred, target = _manufactured_batch()
@@ -220,12 +221,89 @@ def test_relative_h1_ignores_the_wrap_between_opposite_boundaries() -> None:
     # Offset chosen so the tent's mean square matches the ramp's 1/3.
     triangle = (0.5 + math.sqrt(1.25)) / 2.0 - (y_grid - 0.5).abs()
     bump = 0.01 * torch.exp(-(((y_grid - 0.5) / 0.1) ** 2))
-    loss = learning.losses.factory.build_data_loss("relative_h1", space="normalized", operator_dimensionality=2)
+    loss = learning.losses.factory.build_data_loss(
+        "relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(1.0 / size, 1.0 / size)
+    )
 
     def relative_h1(target: torch.Tensor) -> float:
         return float(loss((target + bump)[None, None], target[None, None]))
 
     assert relative_h1(ramp) == pytest.approx(relative_h1(triangle), rel=0.05)
+
+
+def _quadratic_relative_h1_reference(spacing_y: float, spacing_x: float, shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Return a quadratic target, its perturbed prediction and the analytic relative H1 on that physical grid.
+
+    Quadratics are differentiated exactly by the central and the third-order one-sided stencils, so
+    the analytic gradients in metres equal the discrete ones at every grid point.
+    """
+    height, width = shape
+    y = (torch.arange(height, dtype=torch.float64) * spacing_y)[:, None].expand(height, width)
+    x = (torch.arange(width, dtype=torch.float64) * spacing_x)[None, :].expand(height, width)
+    target = 1.0 + 2.0 * y + 3.0 * x + y**2 + x * y
+    error = 0.1 * (y**2 + 2.0 * x * y + x)
+    target_fields = (target, 2.0 + 2.0 * y + x, 3.0 + y)
+    error_fields = (error, 0.1 * (2.0 * y + 2.0 * x), 0.1 * (2.0 * y + 1.0))
+    numerator = sum(float((field**2).sum()) for field in error_fields)
+    denominator = sum(float((field**2).sum()) for field in target_fields)
+    return target, target + error, math.sqrt(numerator) / math.sqrt(denominator)
+
+
+def test_relative_h1_differentiates_in_metres_rows_then_columns() -> None:
+    """
+    Compare the factory loss with the analytic relative H1 of a quadratic on a non-square anisotropic grid.
+
+    The spacing list is ordered (rows, columns); swapping it must change the value, so the loss
+    cannot silently differentiate on a unit square or with transposed axes.
+    """
+    spacing_y, spacing_x = 0.5, 0.25
+    target, prediction, expected = _quadratic_relative_h1_reference(spacing_y, spacing_x, (6, 9))
+    pair = (prediction[None, None], target[None, None])
+
+    loss = learning.losses.factory.build_data_loss("relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(spacing_y, spacing_x))
+    swapped = learning.losses.factory.build_data_loss(
+        "relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(spacing_x, spacing_y)
+    )
+
+    assert float(loss(*pair)) == pytest.approx(expected, rel=1e-9)
+    assert float(swapped(*pair)) != pytest.approx(expected, rel=1e-3)
+
+
+def test_relative_h1_requires_a_valid_physical_spacing() -> None:
+    """Reject a missing spacing for relative H1 and malformed spacings, while relative L2 ignores it."""
+    factory = learning.losses.factory
+    with pytest.raises(ValueError, match="requires grid_spacing"):
+        factory.build_data_loss("relative_h1", space="normalized", operator_dimensionality=2)
+    for invalid in ((0.003,), (0.003, float("nan"))):
+        with pytest.raises(ValueError, match="positive finite spacings"):
+            factory.build_relative_h1(2, reduction="mean", grid_spacing=invalid)
+    assert factory.build_data_loss("relative_l2", space="normalized", operator_dimensionality=2) is not None
+
+
+def test_relative_h1_metric_uses_the_loss_spacing() -> None:
+    """
+    Evaluate one sample through the steady metric and through the factory with the same spacing.
+
+    The metric averages the per-field values of its single sample like the data loss, so
+    identical fields give the loss value; the metric also requires a spacing at construction.
+    """
+    spacing = (0.5, 0.25)
+    target, prediction, expected = _quadratic_relative_h1_reference(*spacing, (6, 9))
+    metric_id = "normalized_relative_h1"
+    config = configs.resolve(configs.direct_config())
+    config["evaluation"]["metrics"] = [metric for metric in config["evaluation"]["metrics"] if metric["id"] == metric_id]
+    cpu = torch.device("cpu")
+    channels = len(_TASK.output_names)
+    pred = prediction.expand(1, channels, *prediction.shape)
+    true = target.expand(1, channels, *target.shape)
+
+    with pytest.raises(ValueError, match="requires grid_spacing"):
+        learning.metrics.metrics.build_evaluation_metrics(config, device=cpu)
+    metric = learning.metrics.metrics.build_evaluation_metrics(config, device=cpu, grid_spacing=spacing)[metric_id]
+    metric.update(pred, true, space="normalized", batch_index=0)
+
+    assert metric.compute() == pytest.approx(expected, rel=1e-9)
 
 
 def test_pi_model_families_share_one_dimensionless_loss_path() -> None:
@@ -237,7 +315,7 @@ def test_pi_model_families_share_one_dimensionless_loss_path() -> None:
     """
     for model_kind in ("fno", "uno"):
         config = _physics_config(model_kind=model_kind)
-        loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+        loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
         normalizer = IdentityNormalizer()
         loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
         inputs, pred, target = _manufactured_batch()
@@ -266,7 +344,7 @@ def test_each_physics_term_backpropagates_through_the_normalizers_to_the_predict
     difference of the same term, so no term is detached from the prediction or
     loses the normalization scale on its way back to the model output.
     """
-    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"))
+    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
     # Distinct non-identity means and scales per channel; velocities are given m/s-sized scales.
     input_statistics = [(0.3 + 0.2 * index, 1.5 + 0.5 * index) for index, _ in enumerate(_TASK.input_names)]
     output_statistics = {"p": (0.1, 0.4), "u": (1e-6, 2e-5), "v": (-2e-6, 3e-5)}
@@ -303,12 +381,12 @@ def test_invalid_physics_loss_settings_fail_through_public_factory() -> None:
     derivative_config = _physics_config()
     derivative_config["loss"]["physics"]["derivatives"]["kind"] = "unsupported"  # type: ignore[index]
     with pytest.raises(ValueError, match="Unknown derivative identifier"):
-        learning.losses.factory.build_training_loss(derivative_config, device=torch.device("cpu"))
+        learning.losses.factory.build_training_loss(derivative_config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
 
     warmup_config = _physics_config()
     warmup_config["loss"]["physics"]["continuity_weight"]["warmup"]["kind"] = "cosine"  # type: ignore[index]
     with pytest.raises(ValueError, match="Unknown warmup identifier"):
-        learning.losses.factory.build_training_loss(warmup_config, device=torch.device("cpu"))
+        learning.losses.factory.build_training_loss(warmup_config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
 
 
 class _IdentityScaleModel(torch.nn.Module):
@@ -445,6 +523,8 @@ def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
         "system/train_duration_seconds",
         "system/train_samples_per_second",
         "optimizer_steps",
+        "committed_optimizer_groups",
+        "gradient_predictions",
     }
     assert physics_values["physics/train/loss_continuity"] == pytest.approx(4.0 * 13.0 / 3.0)
     assert physics_values["physics/train/continuity_weight"] == 0.125
@@ -493,7 +573,7 @@ def test_physics_monitor_is_bounded_and_reports_the_three_terms() -> None:
                     physics_enabled=physics_enabled,
                 ),
             )
-            loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+            loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
             normalizer = IdentityNormalizer()
             loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
             model = _ManufacturedMonitorModel()

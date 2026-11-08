@@ -1,5 +1,6 @@
 # Role: steady_flow Optuna study; its experiment section overrides base.yaml. Edit: freely.
-# Supervised UNO hyperparameter search.
+# Supervised UNO hyperparameter search: 30 trials of 300 epochs on validation; copy the selected values into
+# experiments/architecture_comparison/uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495.yaml and the pi-uno_search study.
 #
 # Searches:
 #   - Fourier modes
@@ -17,14 +18,12 @@ study:
   pruner:
     kind: median  # Optuna pruning rule for stopping unpromising trials.
     n_startup_trials: 5  # Trials completed before pruning decisions begin.
-    n_warmup_steps: 100  # Reported objective steps required before pruning can occur.
-    interval_steps: 5  # Objective-step interval between pruning checks.
+    n_warmup_steps: 60  # Reported objective steps (validated epochs) required before pruning can occur.
+    interval_steps: 2  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
 
 experiment:
   task: steady_flow  # Selects the task contract and its compatible data/model/loss validation.
   base: ../base.yaml  # Shared task settings; every value set below overrides them.
-  run:
-    deterministic: false  # Request deterministic kernels where supported; may reduce performance or reject unsupported operations.
   model:
     kind: uno  # Select the architecture family; its params below are interpreted by that family.
     params:
@@ -37,7 +36,9 @@ experiment:
     physics:
       enabled: false  # Enable the physics residual and boundary loss terms.
   optimizer:
-    lr: 0.0003883614530748613  # Initial learning rate; controls the optimizer update scale.
+    lr: 3.883614530748613e-4  # Initial learning rate; controls the optimizer update scale.
+  training:
+    epochs: 300  # Trial epoch budget, shorter than the final run to rank configurations cheaply.
   tracking:
     wandb:
       workflow: optuna_trial  # Workflow label attached to tracking metadata.
@@ -70,8 +71,8 @@ search_space:
   optimizer.lr:
     name: lr  # Readable Optuna parameter name for this configuration path.
     kind: float  # Distribution type used to sample this parameter.
-    low: 0.0001  # Inclusive lower search bound.
-    high: 0.003  # Inclusive upper search bound.
+    low: 1.0e-4  # Inclusive lower search bound.
+    high: 1.0e-2  # Inclusive upper search bound.
     log: true  # Sample this range logarithmically when true.
   data.batch_size:
     name: batch  # Readable Optuna parameter name for this configuration path.

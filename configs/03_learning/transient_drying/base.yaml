@@ -11,9 +11,6 @@ data:
   train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
   additional_evaluation_datasets: []  # Optional built datasets evaluated in addition to the primary validation/test assignments.
   batch_size: 2  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
-  transient_backend_preference: pt_shards  # Preferred transient storage backend: pt_shards or canonical_hdf5.
-  transient_backend_required: true  # Fail if the preferred backend is unavailable instead of falling back.
-  hdf5_cache_size: 0  # Maximum open HDF5 handles retained; zero disables this handle cache.
   spatial_stride: 2  # Spatial subsampling step; larger strides reduce the effective grid resolution.
   num_workers: 0  # Matched B/A1 resume restores the exact partial-epoch sample cursor, which requires main-process loading.
   persistent_workers: false  # No worker processes exist to keep alive.
@@ -28,7 +25,8 @@ scaling:
 
 model:
   params:
-    positional_embedding: null  # Optional positional embedding configuration; null disables it.
+    positional_embedding: null  # No positional embedding: x and y are explicit input channels, and an embedding grid would give one physical point different coordinates at different strides.
+    domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; the fields are not periodic, and padding keeps the FFT wrap-around away from the boundaries.
 
 loss:
   data:
@@ -57,17 +55,15 @@ scheduler:
 
 training:
   mode: matched_a1_b  # A0 -> {B, A1}: B self-feeds rollouts, A1 stays teacher-forced; both start from A0's selected checkpoint.
-  mixed_precision: false  # Enable mixed-precision arithmetic when supported.
   continuation_evaluations: 20  # B and A1 select checkpoints at epoch ends crossing each 1/20 of their measured budget, so both get equal chances.
   a0:
     max_epochs: 100  # A0 epoch budget; the best validation checkpoint is handed to B and A1. --epochs overrides it.
     evaluation_interval: 1  # Roll out the whole validation trajectories every this many epochs; this selects the stage checkpoint.
     additional_evaluation_interval: 1  # Evaluate additional configured datasets at this stage interval.
     gradient_accumulation_steps: 1  # Number of batches accumulated before each optimizer update; increases effective batch size.
-    curriculum:
-      seed: 9  # Seed controlling curriculum length/order sampling.
+    curriculum: {}  # Keeps the one-step teacher-forced default curriculum; its draws derive from run.seed.
   b:
-    max_epochs: 100  # Operational epoch cap; B stops at train_seconds and ends as budget_unmet if this cap comes first.
+    max_epochs: 200  # Operational epoch cap; B stops at train_seconds and ends as budget_unmet if this cap comes first.
     train_seconds: null  # Measured B optimisation budget in seconds, set per experiment or via --train-seconds: A0's measured optimisation time on the same GPU type.
     lr_scale: 1.0  # Factor on the learning rate and plateau floor restored from A0; 1 continues with A0's state unchanged.
     evaluation_interval: 1  # Epoch-end gate for B's selection checks; B validates only where it crossed a new budget point (continuation_evaluations).
@@ -78,9 +74,8 @@ training:
     curriculum:
       lengths: [2, 4, 8, 16, 32]  # Self-fed rollout lengths of this stage's curriculum; they must fit the sampling rollout length.
       milestone_fractions: [0.0, 0.2, 0.4, 0.6, 0.8]  # Fractions of the stage budget at which curriculum lengths advance.
-      seed: 9  # Seed controlling curriculum length/order sampling.
   a1:
-    max_epochs: 100  # Operational epoch cap of the teacher-forced continuation; it takes A0's sampling, curriculum and cadence.
+    max_epochs: 200  # Operational epoch cap of the teacher-forced continuation, which needs about A0's epoch count to match B's seconds; it takes A0's sampling, curriculum and cadence.
     match_to: b.train_seconds  # A1 trains for B's measured seconds from the same A0 checkpoint.
     lr_scale: 1.0  # Factor on the learning rate restored from A0; keep equal to B's unless a sweep selected otherwise.
 

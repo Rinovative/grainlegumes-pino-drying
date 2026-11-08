@@ -1,7 +1,7 @@
 """Parse training CLI arguments and delegate to the reusable run service.
 
 Responsibilities:
-  - Parse config, resume, device, revision, and artifact opt-out arguments
+  - Parse config, resume, device, revision, seed, and artifact opt-out arguments
   - Orchestrate completed-run artifact preparation after training ownership ends
   - Return a non-zero process result for training or post-processing failures
 
@@ -21,7 +21,9 @@ from __future__ import annotations
 import argparse
 import shlex
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 from . import cli_device
 
@@ -52,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the exact training Dataset ID",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        help="Replicate seed replacing run.seed; the run lands in its own seed-N leaf and derives its seed plan from N",
+    )
+    parser.add_argument(
         "--train-seconds",
         type=float,
         help="Matched plan: measured B training-seconds target; A1 matches B's receipt",
@@ -76,7 +83,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default="selected",
         help="Post-training artifacts: selected (default) or none; matched plans also accept all or comma-separated a0,b,a1",
     )
-    parser.add_argument("--max-epochs", type=int, help="Operational epoch cap for one selected matched B or A1 stage or a steady run")
+    parser.add_argument(
+        "--max-epochs", type=int, help="Operational epoch cap for one selected matched B or A1 stage; with --resume also a steady run"
+    )
     return parser
 
 
@@ -106,7 +115,7 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
     print(f"Run admission rejected: {report.get('reason')}", file=sys.stderr)
     print(
         f"  existing run {experiments_console.display_path(report.get('run_dir'))}: status {report.get('status')},"
-        f" epoch {completed if completed is not None else 'unknown'} of {report.get('target_epoch')},"
+        f" saved {completed if completed is not None else 'unknown'} epochs, requested {report.get('target_epoch')},"
         f" last checkpoint {'ok' if report.get('last_checkpoint_available') else 'missing'},"
         f" best checkpoint {'ok' if report.get('best_checkpoint_available') else 'missing'}, {state_label or 'state unavailable'},"
         f" lock {'present' if active is True else 'absent' if active is False else 'unknown'}, resume {report.get('resume_compatibility')}",
@@ -121,6 +130,7 @@ def _append_cli_overrides(command: list[str], args: argparse.Namespace, *, inclu
     for option, value in (
         ("--epochs", args.epochs),
         ("--train-dataset", args.train_dataset),
+        ("--seed", args.seed),
         ("--train-seconds", args.train_seconds),
         ("--rollout-length", args.rollout_length),
         ("--lr-scale", args.lr_scale),
@@ -176,6 +186,22 @@ def _artifact_action_label(role_actions: dict[str, str]) -> str:
     raise RuntimeError(msg)
 
 
+def _validity_label(label: str, note: str | None) -> str:
+    """Replace an artifact status by the invalid-predictions status when the artifacts hold invalid predictions."""
+    return label if note is None else f"completed with invalid predictions ({note})"
+
+
+def _phase_seconds(outcome: dict[str, Any]) -> dict[str, float]:
+    """Sum the training duration parts over the trained stages of one outcome."""
+    stages = outcome.get("stage_outcomes")
+    results = [stage["result"] for stage in stages.values()] if isinstance(stages, dict) else [outcome["result"]]
+    totals: dict[str, float] = {}
+    for result in results:
+        for name, seconds in result.get("phase_seconds", {}).items():
+            totals[name] = totals.get(name, 0.0) + seconds
+    return totals
+
+
 def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     """
     Start, continue or extend a run and return its process result.
@@ -198,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     generation, and reuse. Parser usage errors raise ``SystemExit`` directly.
 
     """
+    started = time.monotonic()
     args = _build_parser().parse_args(argv)
     if args.config_path is not None and args.resume is not None:
         _build_parser().error("--resume continues a saved run from its own config; rerun CONFIG without --resume to continue it")
@@ -232,6 +259,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
         if args.epochs is not None and args.epochs < 1:
             msg = "--epochs must be positive."
             raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
+        if args.seed is not None and args.seed < 0:
+            msg = "--seed must be a non-negative integer."
+            raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
         if args.rollout_length is not None and args.rollout_length < 1:
             msg = "--rollout-length must be positive."
             raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
@@ -244,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
             max_epochs=args.max_epochs,
             epochs=args.epochs,
             train_dataset=args.train_dataset,
+            seed=args.seed,
             train_seconds=args.train_seconds,
             rollout_length=args.rollout_length,
             lr_scale=args.lr_scale,
@@ -282,7 +313,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     result = outcome["result"]
     run_dir = outcome["run_dir"]
     device_resolution = outcome["device_resolution"]
-    best = "" if result["status"] == "budget_unmet" else f" | best epoch {result['best_epoch']} | best metric {result['best_metric']:.3e}"
+    best = (
+        f" after {result['completed_epoch']} epochs (operational cap)"
+        if result["status"] == "budget_unmet"
+        else f" | best epoch {result['best_epoch']} | best metric {result['best_metric']:.3e}"
+    )
     print(f"Training status: {result['status']}{best} | run {console.display_path(run_dir)}")
     stage_runs = outcome.get("stage_runs")
     if isinstance(stage_runs, dict):
@@ -313,10 +348,13 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
         ]
         print(f"Continuation inside a matching Slurm allocation: {' '.join(continuation)}")
     if artifact_stages == "none":
-        print("Post-training artifacts: skipped by --artifacts none")
+        print(
+            f"Post-training artifacts: skipped by --artifacts none | {console.duration_summary(time.monotonic() - started, _phase_seconds(outcome))}"
+        )
         return 2 if result["status"] == "budget_unmet" else 0
     active_artifact_stage: str | None = None
     active_artifact_dir = run_dir
+    artifacts_started = time.monotonic()
     try:
         from src import analysis  # noqa: PLC0415
 
@@ -336,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                 raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
             available = []
             unavailable = []
+            prepared_runs = []
             for name in requested:
                 active_artifact_stage = name
                 active_artifact_dir = stage_runs[name]
@@ -361,10 +400,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                     rebuild_incompatible=trained_here,
                     device_resolution=device_resolution,
                 )
-                print(f"Stage {name} artifacts: {_artifact_action_label(prepared.role_actions)}")
+                prepared_runs.append(prepared)
+                label = _artifact_action_label(prepared.role_actions)
+                print(f"Stage {name} artifacts: {_validity_label(label, analysis.artifacts.service.invalid_prediction_note(prepared))}")
             for name in unavailable:
                 print(f"Stage {name} artifacts: unavailable until training completes ({stage_runs[name]})")
-            artifact_status = "partial" if unavailable else "completed" if requested else "skipped"
+            artifact_status = (
+                "partial"
+                if unavailable
+                else _validity_label("completed" if requested else "skipped", analysis.artifacts.service.invalid_prediction_note(*prepared_runs))
+            )
         else:
             active_artifact_dir = run_dir
             experiments_run.validate_completed_run(run_dir)
@@ -374,7 +419,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                 rebuild_incompatible=not outcome.get("already_complete", False),
                 device_resolution=device_resolution,
             )
-            artifact_status = _artifact_action_label(prepared.role_actions)
+            artifact_status = _validity_label(
+                _artifact_action_label(prepared.role_actions), analysis.artifacts.service.invalid_prediction_note(prepared)
+            )
     except KeyboardInterrupt:
         print("Post-training artifacts: failed", file=sys.stderr)
         if active_artifact_stage is not None:
@@ -396,7 +443,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
         print(f"Recovery: {recovery}", file=sys.stderr)
         return 1
 
-    print(f"Post-training artifacts: {artifact_status} ({device_resolution.device})")
+    durations = console.duration_summary(time.monotonic() - started, {**_phase_seconds(outcome), "artifacts": time.monotonic() - artifacts_started})
+    print(f"Post-training artifacts: {artifact_status} ({device_resolution.device}) | {durations}")
     return 2 if result["status"] == "budget_unmet" else 0
 
 

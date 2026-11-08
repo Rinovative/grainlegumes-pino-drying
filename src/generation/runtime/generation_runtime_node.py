@@ -5,18 +5,16 @@ Responsibilities:
   - Publish tickets and the cancel marker for dispatchers, accepting an exact replay after a dispatcher crash
   - Start ticket steps with srun --exact inside the node allocation and refill free cores when a step ends
   - Enforce strict ticket order, group barriers, core accounting, and the remaining-time gate
-  - Honour a group success target: run candidates only while successes plus running steps stay below it, then skip
-    the group's remaining tickets with a skipped receipt (a failed step frees its place for the next candidate)
   - Stop launching on a cancel marker or termination signal, forward TERM to running steps, and always leave an exit record
 
 Design principles:
-  - The worker knows no campaign or benchmark: dispatchers write immutable tickets, the worker writes receipts
+  - The worker knows no campaign: dispatchers write immutable tickets, the worker writes receipts
   - Every record is published once and never rewritten; an invalid ticket stops the worker explicitly
   - A step starts only when the remaining node time is known and sufficient; unknown time never starts a step
   - Cancellation signals the srun clients, which forward TERM to the step tasks; Slurm reclaims what survives the node job
 
 This module does NOT:
-  - Decide which cases run, interpret step outcomes beyond exit status zero, retry failed steps, or reconcile campaign evidence
+  - Decide which cases run, interpret step outcomes, retry failed steps, or reconcile campaign evidence
   - Submit node jobs or choose nodes, partitions, or node-job slots
 """
 
@@ -88,7 +86,6 @@ _STEP_KEYS: Final = frozenset(
         "label",
         "argv",
         "env",
-        "success_target",
     }
 )
 _STOP_KEYS: Final = frozenset({"schema", "schema_version", "seq", "kind"})
@@ -107,7 +104,7 @@ _KILL_WAIT_SECONDS: Final = 30.0
 _SQUEUE_TIMEOUT_SECONDS: Final = 30
 _STEP_ID_PATTERN: Final = re.compile(r"[0-9]+\.[0-9]+")
 _FOREIGN_JOB_FIELDS: Final = 3
-_NO_STEP_FIELDS: Final[tuple[object, ...]] = (0, 0, "", "", 0, "", (), {}, None)
+_NO_STEP_FIELDS: Final[tuple[object, ...]] = (0, 0, "", "", 0, "", (), {})
 
 
 class StepProcess(Protocol):
@@ -193,8 +190,6 @@ class NodeTicket:
     label: str = ""
     argv: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
-    # Successful steps (exit 0) after which the remaining tickets of this group are skipped; None runs every ticket.
-    success_target: int | None = None
 
     def __post_init__(self) -> None:
         """Validate every field fail-closed and freeze the collections."""
@@ -212,7 +207,6 @@ class NodeTicket:
                 self.label,
                 tuple(self.argv),
                 dict(self.env),
-                self.success_target,
             ) != _NO_STEP_FIELDS:
                 message = "A stop ticket carries no step fields."
                 raise ValueError(message)
@@ -223,8 +217,6 @@ class NodeTicket:
         _require_int(self.group, label="Ticket group", minimum=0)
         _require_int(self.cores, label="Ticket cores", minimum=1)
         _require_int(self.required_seconds, label="Ticket required_seconds", minimum=0)
-        if self.success_target is not None:
-            _require_int(self.success_target, label="Ticket success_target", minimum=1)
         require_slurm_memory(self.memory, label="Ticket memory")
         require_slurm_time(self.time_limit, label="Ticket time_limit")
         _require_text(self.label, _LABEL, label="Ticket label")
@@ -249,7 +241,6 @@ class NodeTicket:
                 label=self.label,
                 argv=list(self.argv),
                 env=dict(self.env),
-                success_target=self.success_target,
             )
         return payload
 
@@ -259,8 +250,7 @@ class NodeTicket:
         if not isinstance(payload, Mapping):
             message = "A node ticket must be a JSON object."
             raise ValueError(message)  # noqa: TRY004 -- one contract error type for every ticket field
-        version = payload.get("schema_version")
-        if payload.get("schema") != TICKET_SCHEMA or type(version) is not int or version != SCHEMA_VERSION:
+        if payload.get("schema") != TICKET_SCHEMA or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION):
             message = f"A node ticket must declare schema {TICKET_SCHEMA!r} version {SCHEMA_VERSION}."
             raise ValueError(message)
         allowed = _STOP_KEYS if payload.get("kind") == STOP_KIND else _STEP_KEYS
@@ -284,7 +274,6 @@ class NodeTicket:
             label=payload.get("label", ""),
             argv=tuple(argv),
             env=payload.get("env", {}),
-            success_target=payload.get("success_target"),
         )
         if expected_seq is not None and ticket.seq != expected_seq:
             message = f"Ticket seq {ticket.seq} differs from its file name sequence {expected_seq}."
@@ -426,8 +415,11 @@ def _read_record(path: Path, *, schema: str, seq: int | None = None) -> dict[str
     payload = _read_json_object(path)
     if payload is None:
         return None
-    version = payload.get("schema_version")
-    if payload.get("schema") != schema or type(version) is not int or version != SCHEMA_VERSION or (seq is not None and payload.get("seq") != seq):
+    if (
+        payload.get("schema") != schema
+        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
+        or (seq is not None and payload.get("seq") != seq)
+    ):
         message = f"Node record {path} does not match schema {schema!r} version {SCHEMA_VERSION}" + ("." if seq is None else f" and seq {seq}.")
         raise ValueError(message)
     return payload
@@ -617,9 +609,6 @@ class _NodeWorker:
         self.last_group: int | None = None
         self.started_count = 0
         self.finished_count = 0
-        self.skipped_count = 0
-        self.group_targets: dict[int, int | None] = {}
-        self.group_successes: dict[int, int] = {}
         self.reason: str | None = None
         self.detail = ""
         self.cancel_requested = False
@@ -666,7 +655,6 @@ class _NodeWorker:
                     "detail": self.detail,
                     "started": self.started_count,
                     "finished": self.finished_count,
-                    "skipped": self.skipped_count,
                     "foreign_jobs_at_end": _foreign_jobs(self.host, self.job_id),
                 },
             )
@@ -676,17 +664,14 @@ class _NodeWorker:
     def _record_finished(
         self,
         ticket: NodeTicket,
-        started_at: str | None,
-        exit_code: int | None,
+        started_at: str,
+        exit_code: int,
         *,
         outcome: str = "exited",
         strict: bool = True,
     ) -> None:
-        """Publish the finished receipt of one step; a skipped ticket has neither a start nor an exit code."""
-        if outcome == "skipped":
-            self.skipped_count += 1
-        else:
-            self.finished_count += 1
+        """Publish the finished receipt of one step."""
+        self.finished_count += 1
         try:
             _publish_once(
                 receipt_path(self.node_directory, ticket.seq, "finished"),
@@ -813,11 +798,6 @@ class _NodeWorker:
             if ticket.kind == STEP_KIND and ticket.cores > self.cores:
                 message = f"Ticket {name} needs {ticket.cores} cores but the node job has {self.cores}."
                 raise _InvalidTicketError(message)
-            if ticket.kind == STEP_KIND:
-                if ticket.group in self.group_targets and self.group_targets[ticket.group] != ticket.success_target:
-                    message = f"Ticket {name} changes the success target of group {ticket.group}."
-                    raise _InvalidTicketError(message)
-                self.group_targets[ticket.group] = ticket.success_target
             self.tickets[seq] = ticket
         stops = [seq for seq, ticket in self.tickets.items() if ticket.kind == STOP_KIND]
         if stops and any(seq > min(stops) for seq in self.tickets):
@@ -832,8 +812,6 @@ class _NodeWorker:
             code = step.process.poll()
             if code is not None:
                 self.running.remove(step)
-                if code == 0:
-                    self.group_successes[step.ticket.group] = self.group_successes.get(step.ticket.group, 0) + 1
                 self._record_finished(step.ticket, step.started_at, code, strict=strict)
 
     def _note_idle(self) -> None:
@@ -877,24 +855,12 @@ class _NodeWorker:
         if self.last_group is not None and ticket.group < self.last_group:
             message = f"Ticket {ticket.seq:06d} lowers the group from {self.last_group} to {ticket.group}."
             raise _InvalidTicketError(message)
-        if ticket.success_target is not None and self.group_successes.get(ticket.group, 0) >= ticket.success_target:
-            self._skip(ticket)
-            return True
         if any(step.ticket.group != ticket.group for step in self.running):
             return False
-        if ticket.success_target is not None and self.group_successes.get(ticket.group, 0) + len(self.running) >= ticket.success_target:
-            return False  # enough candidates run to reach the target; a failing one frees its place for the next
-
         if sum(step.ticket.cores for step in self.running) + ticket.cores > self.cores or not self._time_gate(ticket):
             return False
         self._launch(ticket)
         return True
-
-    def _skip(self, ticket: NodeTicket) -> None:
-        """Mark a ticket of a group that already reached its success target as skipped; it never starts."""
-        self._record_finished(ticket, None, None, outcome="skipped")
-        self.next_seq = ticket.seq + 1
-        self.last_group = ticket.group
 
     def _launch(self, ticket: NodeTicket) -> None:
         """Publish the started receipt, then start the step; a launch failure becomes a finished receipt."""

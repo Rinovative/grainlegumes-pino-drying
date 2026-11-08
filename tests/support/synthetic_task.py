@@ -2,6 +2,8 @@
 
 Responsibilities:
   - Construct an unregistered three-input/two-output TaskSpec and steady-source provenance
+  - Describe an artificial steady Dataset the way metadata admission summarizes it
+  - Build an admitted split payload of either task over synthetic Dataset identities
 
 Design principles:
   - Neutral fields expose hardcoded task assumptions; provenance uses deterministic case-bound
@@ -12,13 +14,12 @@ This module does NOT:
 """
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 from src import common, domain
 from src.datasets.contracts import dataset_contracts_identity as dataset_identity
-from src.datasets.contracts import dataset_contracts_metadata as dataset_metadata
 from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.contracts import dataset_contracts_views as views
 from src.datasets.packages import dataset_packages_reproduction as reproduction
@@ -81,7 +82,7 @@ def build_synthetic_selection_provenance(
         )
     return {
         "schema_kind": "dataset_selection_manifest",
-        "schema_version": 3,
+        "schema_version": dataset_identity.DATASET_PACKAGE_SCHEMA_VERSION,
         "dataset_name": dataset_name,
         "dataset_view": "steady_flow",
         "registered_task_id": task.id,
@@ -288,7 +289,80 @@ def save_steady_package(dataset_root: Path, payload: dict[str, Any]) -> Path:
         "sample_count": identity.sample_count,
         "transition_count": 0,
         "payload_sha256": common.serialization.file_sha256(destination),
+        "derived_payload_sha256": None,
     }
     common.serialization.atomic_write_json(metadata_dir / common.paths.DATASET_MANIFEST_FILENAME, manifest)
-    dataset_metadata.validate_dataset_metadata_directory(metadata_dir, dataset_identity=identity, dataset_path=destination)
     return destination
+
+
+def synthetic_split_payload(
+    task: str,
+    *,
+    train_dataset: str = "train_data",
+    additional: Sequence[tuple[str, Sequence[str]]] = (("ood_data", ("chickpea__case_0001__00000000000a",)),),
+    spatial_view: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """
+    Return one admitted current split payload of either task over synthetic Dataset identities.
+
+    The training Dataset holds four lentil cases split two/one/one; each ``additional`` entry is one
+    evaluation-only Dataset whose listed cases are all declared OOD, kept in the given order. A transient
+    split uses ``spatial_view`` or a canonical 4 x 4 view.
+    """
+    from src.datasets.contracts.dataset_contracts_transient import TRANSIENT_STEP_CONTRACT  # noqa: PLC0415
+    from src.datasets.preprocessing import dataset_preprocessing_splits as splits  # noqa: PLC0415 -- imports Torch
+    from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec  # noqa: PLC0415
+
+    horizon = {"value": 1.0, "unit": TRANSIENT_STEP_CONTRACT.time_unit, "source": TRANSIENT_STEP_CONTRACT.temporal.configured_horizon_source}
+    payload_identity: dict[str, Any] = (
+        {"fingerprint": "f" * 64, "spatial_shape": [8, 8]}
+        if task == "steady_flow"
+        else {"index_digest": "e" * 64, "configured_regular_horizon": horizon}
+    )
+
+    def identity(dataset_id: str, case_ids: Sequence[str], digest: str) -> dict[str, Any]:
+        core = {"dataset_id": dataset_id, "dataset_digest": digest * 64, "channel_contract_digest": views.get_view(task).contract_digest}
+        return core | {"case_ids": list(case_ids)} | payload_identity
+
+    def assignment(dataset_id: str) -> dict[str, Any]:
+        return {"dataset_id": dataset_id, "role": "ood", "relation": "material holdout", "assumptions": []}
+
+    train_cases = [f"lentil__case_{index:04d}__{index:012x}" for index in range(1, 5)]
+    partition = _synthetic_partition(train_cases, material_family="lentil", material_role="id")
+    assert partition is not None
+    parts = [(identity(name, cases, str(index + 1)), list(cases), assignment(name)) for index, (name, cases) in enumerate(additional)]
+    sampling = {"mode": "one_step_transition"}
+    extension = (
+        None
+        if task == "steady_flow"
+        else {
+            "tensorizer": TransientTensorizerSpec.from_mapping(
+                {"input_profile": "canonical_physics_complete_v1", "temporal_conditioning": {"kind": "none"}}
+            ).selection_dict(),
+            "sampling": sampling,
+            "evaluation_sampling": {"mode": "trajectory"},
+            "spatial_view": dict(spatial_view or {"spatial_stride": 1, "canonical_ny": 4, "canonical_nx": 4, "effective_ny": 4, "effective_nx": 4}),
+        }
+    )
+    split = splits.build_split(
+        task=task, train_dataset=identity(train_dataset, train_cases, "0"), case_partition=partition, additional_evaluation=parts, extension=extension
+    )
+    return split.as_payload()
+
+
+def admitted_manifest(task: str, dataset_id: str, **_roots: Path) -> dict[str, Any]:
+    """Return the manifest evidence the one manifest reader admits for an artificial Dataset of either task."""
+    return {
+        "dataset_id": dataset_id,
+        "dataset_view": task,
+        "dataset_digest": "d" * 64,
+        "channel_contract_digest": "b" * 64,
+        "schema_kind": "dataset_selection_manifest",
+        "schema_version": 1,
+        "payload_sha256": "a" * 64,
+        "derived_payload_sha256": "c" * 64 if task == "transient_drying" else None,
+        "sample_count": 4,
+        "source_case_count": 2,
+        "materials": ["lentil", "chickpea"],
+        "source_case_identities": [{"case_id": "case_a"}, {"case_id": "case_b"}],
+    }

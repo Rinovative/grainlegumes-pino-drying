@@ -47,6 +47,13 @@ _ROLLOUT_TARGET_NDIM: Final = 4
 _BOUNDARY_SEQUENCE_NDIM: Final = 2
 _FLOAT32_TIME_TOLERANCE_MULTIPLIER: Final = 4.0
 _FRACTION_ROUNDOFF_TOLERANCE: Final = 4.0 * math.ulp(1.0)
+_ACCOUNTING_ATTRS: Final = (
+    "total_discovered_case_count",
+    "failed_case_count",
+    "incomplete_case_count",
+    "exclusion_reasons",
+    "case_accounting_scope",
+)
 
 
 def _finite_real_value(value: Any) -> float | None:
@@ -143,6 +150,14 @@ def _semantic_mapping(value: object, *, label: str) -> Mapping[str, Any]:
         message = f"Transient EDA {label} must be a semantic mapping."
         raise TypeError(message)
     return value
+
+
+def _require_case_accounting(frame: pd.DataFrame) -> None:
+    """Require the frame's source to report its case accounting; a missing count is never read as zero."""
+    missing = [key for key in _ACCOUNTING_ATTRS if key not in frame.attrs]
+    if missing:
+        msg = f"Transient EDA frame from {frame.attrs.get('dataset_backend', 'an unnamed source')!r} lacks case accounting {missing}."
+        raise ValueError(msg)
 
 
 def validate_transient_frame(frame: pd.DataFrame) -> None:
@@ -456,8 +471,9 @@ def target_attainment_diagnostic(  # noqa: PLR0912 -- one complete diagnostic ad
 ) -> TargetAttainmentDiagnostic:
     """Report canonical target attainment, censoring, duration, and signed gap."""
     validate_transient_frame(frame)
+    _require_case_accounting(frame)
     records: list[dict[str, Any]] = []
-    exclusions: dict[str, int] = dict(frame.attrs.get("exclusion_reasons", {}))
+    exclusions: dict[str, int] = dict(frame.attrs["exclusion_reasons"])
     for case_id, row in frame.iterrows():
         completion = row.get("completion")
         if not isinstance(completion, Mapping):
@@ -570,9 +586,9 @@ def target_attainment_diagnostic(  # noqa: PLR0912 -- one complete diagnostic ad
     valid = len(cases)
     reached_count = int(cases["target_reached"].sum()) if valid else 0
     unreached_count = valid - reached_count
-    total_discovered = int(frame.attrs.get("total_discovered_case_count", len(frame)))
-    failed = int(frame.attrs.get("failed_case_count", 0))
-    incomplete = int(frame.attrs.get("incomplete_case_count", 0))
+    total_discovered = int(frame.attrs["total_discovered_case_count"])
+    failed = int(frame.attrs["failed_case_count"])
+    incomplete = int(frame.attrs["incomplete_case_count"])
     excluded = total_discovered - valid - failed - incomplete
     if excluded < 0:
         msg = "Transient case accounting exceeds the discovered-case count."
@@ -592,10 +608,7 @@ def target_attainment_diagnostic(  # noqa: PLR0912 -- one complete diagnostic ad
         raise ValueError(msg)
     summary = {
         "total_discovered_cases": total_discovered,
-        "case_accounting_scope": frame.attrs.get(
-            "case_accounting_scope",
-            "validated_runtime_item_selection",
-        ),
+        "case_accounting_scope": frame.attrs["case_accounting_scope"],
         "eligible_case_count": valid,
         "valid_completed_cases": valid,
         "outcome_percentage_denominator": "eligible_target_diagnostic_cases",
@@ -979,6 +992,7 @@ def frame_from_transient_items(
             "failed_case_count": 0,
             "incomplete_case_count": 0,
             "exclusion_reasons": {},
+            "case_accounting_scope": "validated_runtime_item_selection",
             "field_names": state_names,
             "field_units": units,
             "field_categories": categories,

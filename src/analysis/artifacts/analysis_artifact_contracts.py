@@ -7,15 +7,21 @@ Responsibilities:
   - Finalize the equal physical-output-group selection objective
   - Build ordered membership digests, completion paths, and payload manifests
   - Hash each file identity at most once per process
-  - Recognize Optuna trial leaves from the validated layout recorded in a saved run config
+  - Recognize Optuna trial leaves from the validated layout recorded in a saved run config and refuse them with one wording
+  - Build and validate the runtime provenance key set both tasks persist
+  - Own the per-case NPZ file name, which is the Dataset package case ID
+  - Declare the per-task analysis projection and the producer evidence every artifact of both tasks records
+  - Own the freshness guard for requested artifacts and stages and the producer check of every comparison
 
 Design principles:
   - Persisted names and schema values have one authoritative owner
   - Objective aggregation delegates to the online group-metric finalizer
   - Physical SSE, counts, and train-fitted scales remain explicit evidence
+  - Reading an artifact validates its recorded analysis digest as evidence; only reuse or continuation of a
+    requested artifact compares it with the running projection
 
 This module does NOT:
-  - Import Torch or run trained-model inference
+  - Import Torch directly or run trained-model inference
   - Write artifact payloads or publish completion markers
   - Admit, rebuild, lock, time, render, or upload artifact caches
 """
@@ -25,14 +31,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import numpy as np
 
-from src import common, domain
+from src import common, domain, experiments, learning
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.domain.tasks.domain_task_spec import OutputGroupSpec
 from src.learning.metrics.learning_metrics import finalize_group_rmse_statistics
 
@@ -44,17 +52,22 @@ if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 
-ARTIFACT_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
-RESIDUAL_SCHEMA_VERSION = 3
+RESIDUAL_SCHEMA_VERSION = 1
 ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
+STEADY_ARTIFACT_KIND = "steady_field"
+INFERENCE_PRECISION = "float32"
+_RUNTIME_REQUIRED_KEYS = frozenset(
+    {"requested_policy", "resolved_device", "device_type", "pytorch_version", "precision", "inference_batch_size", "source_tree_id"}
+)
+_RUNTIME_OPTIONAL_KEYS = frozenset({"cuda_index", "cuda_device_name", "cuda_runtime_version"})
 NORMALIZED_OBJECTIVE_TOLERANCE = {"rtol": 1e-12, "atol": 1e-12}
 NORMALIZED_DIAGNOSTIC_TOLERANCE = {"rtol": 2e-5, "atol": 1e-12}
 EVAL_PAD = 2
 # Artifact residuals use one fixed, most accurate reference operator for every
 # run, independent of the derivative a run was trained with.
 ARTIFACT_DERIVATIVE_KIND = "physical"
-ARTIFACT_DERIVATIVE_EXTENSION = "none"
 _ARTIFACT_IDENTITY_CONTRACT = {
     "schema_kind": "evaluation_artifact_semantic_identity",
     "schema_version": 1,
@@ -72,6 +85,72 @@ ARTIFACT_IDENTITY_CONTRACT_DIGEST = hashlib.sha256(
         sort_keys=True,
     ).encode("utf-8")
 ).hexdigest()
+_PACKAGE_CASE_ID = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*__case_[0-9]{4,}__[0-9a-f]{12}")
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_REBUILD_REMEDY: Final = "rerun only this exact target with --rebuild"
+_ANALYSIS_FILES: Final = (
+    "analysis/artifacts/analysis_artifact_contracts.py",
+    "analysis/artifacts/analysis_artifact_plan.py",
+    "analysis/artifacts/analysis_artifact_service.py",
+    "analysis/artifacts/analysis_artifact_timing.py",
+    "analysis/evaluation/evaluation_prediction_validity.py",
+)
+_ANALYSIS_EXEMPTIONS: Final = {
+    "analysis/artifacts/analysis_artifact_performance.py": "operational progress and performance reporting, outside scientific identity",
+    "analysis/evaluation/evaluation_artifact_loader.py": "admission reads persisted artifacts and produces none",
+    "analysis/presentation/analysis_presentation_curated.py": "curated figures rendered for tracking upload, never persisted evidence",
+    "experiments/config/experiments_config_loader.py": "admission of the saved resolved config, whose recorded identities bind the run",
+    "experiments/experiments_run.py": "admission of the completed run and its checkpoints, bound by their recorded identities",
+    "learning/losses/learning_losses_factory.py": "training H1 loss constructor of the metric module, never reached by artifact metrics",
+    "learning/training/learning_training_checkpoint.py": (
+        "checkpoint schema and projection declarations; recorded identities bind the checkpoint and the model projection is included"
+    ),
+}
+ANALYSIS_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
+    "steady_flow": common.code_identity.CodeProjection(
+        name="analysis_steady_flow",
+        directories=("domain/physics", "learning/metrics"),
+        files=(
+            *_ANALYSIS_FILES,
+            "analysis/artifacts/analysis_artifact_generation.py",
+            "domain/domain_permeability.py",
+            "learning/inference/learning_inference.py",
+        ),
+        excluded_markers=("transient",),
+        exemptions=_ANALYSIS_EXEMPTIONS,
+        includes=(learning.training.checkpoint.MODEL_PROJECTIONS["steady_flow"],),
+    ),
+    "transient_drying": common.code_identity.CodeProjection(
+        name="analysis_transient_drying",
+        directories=("learning/metrics",),
+        files=(
+            *_ANALYSIS_FILES,
+            "analysis/artifacts/analysis_artifact_transient.py",
+            "analysis/evaluation/evaluation_transient_artifact.py",
+            "analysis/evaluation/evaluation_transient_metrics.py",
+            "analysis/evaluation/evaluation_transient_rollout.py",
+            "analysis/evaluation/evaluation_transient_timing.py",
+            "analysis/evaluation/evaluation_transient_validity.py",
+            "datasets/packages/dataset_packages_generated_batch.py",
+            "domain/domain_moisture.py",
+            "experiments/experiments_matched_budget.py",
+            "learning/inference/learning_inference_transient.py",
+        ),
+        excluded_markers=("steady", "_pino"),
+        exemptions={
+            **_ANALYSIS_EXEMPTIONS,
+            "analysis/artifacts/analysis_artifact_generation.py": "steady artifact writer, reached through the service's task dispatch",
+            "analysis/evaluation/evaluation_transient_session.py": "summary of admitted artifacts for tracking, never persisted evidence",
+            "domain/physics/domain_physics_brinkman.py": "steady Brinkman residual contract, reached only by steady artifacts",
+            "domain/physics/domain_physics_contracts.py": "steady physics-kind vocabulary, reached only by the steady payload check",
+            "learning/inference/learning_inference.py": "steady inference reconstruction, reached through the service's task dispatch",
+            "learning/transient/learning_transient_handoff.py": (
+                "training handoff publication; artifacts use only its directory name and bind the manifest bytes by digest"
+            ),
+        },
+        includes=(learning.training.checkpoint.MODEL_PROJECTIONS["transient_drying"],),
+    ),
+}
 
 
 def _identity_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -102,6 +181,7 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
     required_top_level = (
         "provenance_schema_version",
         "artifact_schema_version",
+        "producer",
         "run",
         "model",
         "split_role",
@@ -138,12 +218,13 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
         "identity_contract_sha256": ARTIFACT_IDENTITY_CONTRACT_DIGEST,
         "provenance_schema_version": deepcopy(provenance["provenance_schema_version"]),
         "artifact_schema_version": deepcopy(provenance["artifact_schema_version"]),
+        "producer": validate_analysis_producer(provenance["producer"]),
         "run": run,
         "model": model,
         "split_role": deepcopy(provenance["split_role"]),
         "dataset": _selected_identity_fields(
             provenance["dataset"],
-            fields=("name", "full_case_count", "fingerprint", "data_contract_digest", "saved_membership_digest"),
+            fields=("name", "role", "source_dataset_ids", "source_identities", "case_ids_by_source", "membership_digests", "evaluation_assignments"),
             label="dataset",
         ),
         "selection": _selected_identity_fields(
@@ -265,6 +346,36 @@ def resolve_case_payload_path(
     return candidate
 
 
+def case_payload_filename(case_id: str) -> str:
+    """
+    Return ``<package case id>.npz`` for one exact Dataset package case ID.
+
+    Raises
+    ------
+    ValueError
+        If the ID is not ``<material>__case_<NNNN>__<12 hex>``.
+
+    """
+    if _PACKAGE_CASE_ID.fullmatch(case_id) is None:
+        msg = f"Case payload names require a package case ID '<material>__case_NNNN__<12 hex>', got {case_id!r}."
+        raise ValueError(msg)
+    return f"{case_id}.npz"
+
+
+def dataset_case_payload_filenames(sample_ids: Sequence[str]) -> tuple[str, ...]:
+    """
+    Return unique NPZ names for ordered steady Dataset sample IDs.
+
+    A combined evaluation Dataset qualifies package case IDs as ``<dataset>::<case ID>``.
+    The file keeps the package case ID alone, so a case repeated across components is rejected.
+    """
+    names = tuple(case_payload_filename(sample_id.rpartition("::")[2]) for sample_id in sample_ids)
+    if len(names) != len(set(names)):
+        msg = "Dataset sample IDs map to duplicate case payload names."
+        raise ValueError(msg)
+    return names
+
+
 _FILE_DIGESTS: dict[str, tuple[tuple[int, int, int], str]] = {}
 
 
@@ -296,6 +407,87 @@ def is_optuna_trial_config(config: object) -> bool:
         return False
     common.paths.resolve_config_run_dir({"run": {"layout": layout}, "paths": {"output_root": "."}})
     return True
+
+
+def runtime_provenance(device_metadata: Mapping[str, Any], *, inference_batch_size: int) -> dict[str, Any]:
+    """Return the one runtime provenance key set of both tasks: resolved device, precision, inference batch size and executing source tree."""
+    return {
+        **dict(device_metadata),
+        "precision": INFERENCE_PRECISION,
+        "inference_batch_size": inference_batch_size,
+        "source_tree_id": experiments.identity.executing_source_tree_id(),
+    }
+
+
+def validate_runtime_provenance(value: object) -> int:
+    """Validate runtime provenance of either task without comparing device choices; return its inference batch size."""
+    if not isinstance(value, Mapping):
+        msg = "Artifact runtime provenance must be a mapping."
+        raise TypeError(msg)
+    missing = sorted(_RUNTIME_REQUIRED_KEYS.difference(value))
+    unexpected = sorted(set(value).difference(_RUNTIME_REQUIRED_KEYS | _RUNTIME_OPTIONAL_KEYS))
+    if missing or unexpected:
+        msg = f"Artifact runtime provenance schema mismatch: missing={missing}, unexpected={unexpected}."
+        raise ValueError(msg)
+    texts = ("requested_policy", "resolved_device", "device_type", "pytorch_version", "cuda_device_name", "cuda_runtime_version")
+    if any(key in value and (not isinstance(value[key], str) or not value[key]) for key in texts) or value["precision"] != INFERENCE_PRECISION:
+        msg = f"Artifact runtime provenance needs non-empty device texts and precision {INFERENCE_PRECISION!r}."
+        raise ValueError(msg)
+    if value["source_tree_id"] is not None and not common.paths.is_source_tree_id(value["source_tree_id"]):
+        msg = f"Artifact runtime source_tree_id must be null or <commit12>-<fingerprint12>, got {value['source_tree_id']!r}."
+        raise ValueError(msg)
+    for key, minimum in (("inference_batch_size", 1), ("cuda_index", 0)):
+        number = value.get(key, minimum)
+        if isinstance(number, bool) or not isinstance(number, int) or number < minimum:
+            msg = f"Artifact runtime {key} must be an integer of at least {minimum}."
+            raise TypeError(msg)
+    return int(value["inference_batch_size"])
+
+
+def analysis_producer(task_id: str) -> dict[str, str]:
+    """Return the producer section a new artifact or stage of one task records: the running analysis projection digest."""
+    return {"analysis_sha256": ANALYSIS_PROJECTIONS[task_id].sha256()}
+
+
+def validate_analysis_producer(value: object) -> dict[str, str]:
+    """Admit a recorded producer section as evidence: exactly one lowercase SHA-256, never compared with the running code."""
+    digest = value.get("analysis_sha256") if isinstance(value, Mapping) and set(value) == {"analysis_sha256"} else None
+    if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+        msg = "Artifact producer must be exactly {'analysis_sha256': <lowercase SHA-256>}."
+        raise ValueError(msg)
+    return {"analysis_sha256": digest}
+
+
+def require_current_analysis(provenance: object, *, task_id: str, unit: str) -> None:
+    """Refuse to reuse or continue an artifact or stage whose recorded analysis implementation is not the running one."""
+    producer = provenance.get("producer") if isinstance(provenance, Mapping) else None
+    recorded = producer.get("analysis_sha256") if isinstance(producer, Mapping) else None
+    common.code_identity.require_current_implementation(ANALYSIS_PROJECTIONS[task_id], recorded, unit=unit, remedy=_REBUILD_REMEDY)
+
+
+def require_common_analysis_producer(provenances: Mapping[str, object]) -> None:
+    """Refuse a comparison of artifacts whose recorded analysis implementations differ, or are missing or malformed."""
+    digests: dict[str, str] = {}
+    for label, provenance in provenances.items():
+        try:
+            digests[label] = validate_analysis_producer(provenance.get("producer") if isinstance(provenance, Mapping) else None)["analysis_sha256"]
+        except ValueError as error:
+            msg = f"Artifact {label!r} cannot be compared: {error}"
+            raise ValueError(msg) from error
+    if len(set(digests.values())) > 1:
+        recorded = ", ".join(f"{label}={digest[:12]}" for label, digest in digests.items())
+        msg = f"Artifacts were produced by different analysis implementations ({recorded}); rebuild them with one analysis code using --rebuild."
+        raise ValueError(msg)
+
+
+def refuse_optuna_trial(config: object, *, label: str) -> None:
+    """Refuse an Optuna trial for every artifact path of either task: a trial keeps no checkpoints, so no artifact binds to it."""
+    if is_optuna_trial_config(config):
+        msg = (
+            f"{label} is an Optuna trial, which keeps no checkpoints and has no artifacts. "
+            "Select its parent study directory (its trials are skipped) or a training run instead."
+        )
+        raise ValueError(msg)
 
 
 def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:
@@ -356,6 +548,11 @@ def physical_statistic_columns(field_name: str) -> tuple[str, str, str]:
         f"physical_count_{field_name}",
         f"physical_rmse_{field_name}",
     )
+
+
+def element_count_columns(field_names: Iterable[str]) -> frozenset[str]:
+    """Return the physical and normalized per-case element-count columns of ``field_names``."""
+    return frozenset(columns(field)[1] for field in field_names for columns in (physical_statistic_columns, normalized_statistic_columns))
 
 
 def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
@@ -569,12 +766,15 @@ def aggregate_normalized_group_macro_rmse(
     -------
     dict[str, Any]
         Objective semantics, global field and group statistics, equal group
-        weights, the dimensionless objective value, and agreement tolerance.
+        weights, the dimensionless objective value, agreement tolerance, and the
+        complete-finite-support counts. When any prediction value is non-finite,
+        the objective is unavailable: value and statistics are ``None`` and the
+        counts explain why; it is never computed over the valid subset.
 
     Raises
     ------
     KeyError
-        If any required evidence column is absent.
+        If any required evidence column, including ``prediction_validity``, is absent.
     TypeError, ValueError
         If groups, scales, evidence, counts, or diagnostic consistency fail.
     RuntimeError, FloatingPointError
@@ -596,6 +796,21 @@ def aggregate_normalized_group_macro_rmse(
     if not frame.columns.is_unique:
         msg = "Artifact group macro RMSE cannot consume duplicate DataFrame columns."
         raise ValueError(msg)
+    objective = {
+        "objective_id": "normalized_group_macro_rmse",
+        "kind": "group_macro_rmse",
+        "reduction": "group_macro_element_mean",
+        "space": "physical",
+        "groups": groups,
+        "direction": "minimize",
+        "unit": "1",
+        "agreement_tolerance": dict(NORMALIZED_OBJECTIVE_TOLERANCE),
+        **validity_contract.support_counts(
+            validity_contract.admit_field_prediction_validity(text, channels=fields) for text in frame["prediction_validity"]
+        ),
+    }
+    if not objective["available"]:
+        return {**objective, "value": None, "field_statistics": None, "group_statistics": None}
 
     field_summary: dict[str, dict[str, float | int]] = {}
     for field_name in fields:
@@ -697,19 +912,7 @@ def aggregate_normalized_group_macro_rmse(
     if not math.isfinite(value):
         msg = "Artifact normalized_group_macro_rmse finalized to a non-finite value."
         raise FloatingPointError(msg)
-    return {
-        "objective_id": "normalized_group_macro_rmse",
-        "kind": "group_macro_rmse",
-        "reduction": "group_macro_element_mean",
-        "space": "physical",
-        "groups": groups,
-        "direction": "minimize",
-        "unit": "1",
-        "value": value,
-        "field_statistics": field_summary,
-        "group_statistics": group_summary,
-        "agreement_tolerance": dict(NORMALIZED_OBJECTIVE_TOLERANCE),
-    }
+    return {**objective, "value": value, "field_statistics": field_summary, "group_statistics": group_summary}
 
 
 def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:
@@ -758,7 +961,6 @@ def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:
         },
         "derivatives": {
             "kind": ARTIFACT_DERIVATIVE_KIND,
-            "extension": ARTIFACT_DERIVATIVE_EXTENSION,
             "operator_axes": list(task.operator_axes),
             "grid_axes": ["y", "x"],
         },
@@ -804,6 +1006,12 @@ def ordered_indices_sha256(indices: Iterable[int]) -> str:
     """
     payload = json.dumps(list(indices), separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def artifact_stage_path(save_root: str | Path) -> Path:
+    """Return the one deterministic sibling stage of an artifact target for both tasks."""
+    target = Path(save_root)
+    return target.parent / f".{target.name}.stage"
 
 
 def artifact_provenance_path(save_root: str | Path) -> Path:

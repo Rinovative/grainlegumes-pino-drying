@@ -2,10 +2,11 @@
 
 Responsibilities:
   - Admit only exact current artifact tables and provenance metadata
+  - Treat complete provenance as table and attached provenance agreeing, not as run, timing, or role admission
   - Preserve exact normalized_group_macro_rmse sufficient-statistic aggregates
+  - Admit per-case prediction validity: NaN metrics only for non-finite predictions
   - Flatten source metadata without colliding with authoritative columns
-  - Validate task, objective, units, formulas, role, and membership before plots
-  - Own the per-case NPZ file name, which is the Dataset package case ID
+  - Validate task, objective, units, formulas, role, membership and recorded analysis producer before plots
 
 Design principles:
   - DataFrames carry validated provenance in attrs
@@ -15,6 +16,7 @@ Design principles:
 
 This module does NOT:
   - Generate, repair, or publish artifact payloads
+  - Read artifact roots or admit them against a run, timing, or role; evaluation_artifact_loader does
   - Parse per-case NPZ arrays or render scientific visualizations
   - Infer compatibility from run names, paths, or architecture similarity
 """
@@ -22,8 +24,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
@@ -31,14 +32,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src import common
 from src.analysis.artifacts import contracts
 from src.analysis.presentation import analysis_display_grid as display_grid
 
 from . import evaluation_case as cases
+from . import evaluation_prediction_validity as validity_contract
 
 COMPLETED_RUN_CONFIG_ATTR = "completed_run_config"
-RUNTIME_COMPARISON_ATTR = "runtime_comparison"
-RUNTIME_COMPARISON_ERROR_ATTR = "runtime_comparison_error"
 PRIMARY_OBJECTIVE_ID = "normalized_group_macro_rmse"
 PRIMARY_OBJECTIVE_DEFINITION = {
     "id": PRIMARY_OBJECTIVE_ID,
@@ -65,17 +66,18 @@ _BASE_ARTIFACT_COLUMNS = frozenset(
         "output_units",
         "case_index",
         "source_index",
+        "source_dataset_id",
         "split_local_index",
         "npz_path",
         "meta",
         "inference_time_ms",
+        "prediction_validity",
     }
 )
 _MAX_FLATTENED_SEQUENCE_LENGTH = 4
 _EXACT_GRID_CACHE_ENTRY_LENGTH = 3
 _MINIMUM_DIRECT_MODEL_COMPARISON = 2
 _OUTPUT_GROUP_ENTRY_LENGTH = 2
-_PACKAGE_CASE_ID = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*__case_[0-9]{4,}__[0-9a-f]{12}")
 _STEADY_PHYSICS_COLUMNS = frozenset(
     {
         *STEADY_PHYSICS_METRICS,
@@ -93,36 +95,6 @@ class ComparisonCompatibilityError(ValueError):
     identities. It is distinct from malformed raw value errors, which retain
     ``TypeError`` or ``ValueError`` during individual artifact admission.
     """
-
-
-def case_payload_filename(case_id: str) -> str:
-    """
-    Return ``<package case id>.npz`` for one exact Dataset package case ID.
-
-    Raises
-    ------
-    ValueError
-        If the ID is not ``<material>__case_<NNNN>__<12 hex>``.
-
-    """
-    if _PACKAGE_CASE_ID.fullmatch(case_id) is None:
-        msg = f"Case payload names require a package case ID '<material>__case_NNNN__<12 hex>', got {case_id!r}."
-        raise ValueError(msg)
-    return f"{case_id}.npz"
-
-
-def dataset_case_payload_filenames(sample_ids: Sequence[str]) -> tuple[str, ...]:
-    """
-    Return unique NPZ names for ordered steady Dataset sample IDs.
-
-    A combined evaluation Dataset qualifies package case IDs as ``<dataset>::<case ID>``.
-    The file keeps the package case ID alone, so a case repeated across components is rejected.
-    """
-    names = tuple(case_payload_filename(sample_id.rpartition("::")[2]) for sample_id in sample_ids)
-    if len(names) != len(set(names)):
-        msg = "Dataset sample IDs map to duplicate case payload names."
-        raise ValueError(msg)
-    return names
 
 
 def output_group_fields(frame: pd.DataFrame, *, group_id: str) -> tuple[str, ...]:
@@ -219,16 +191,17 @@ def _string_sequence(
     return result
 
 
-def _validate_metric_values(frame: pd.DataFrame, columns: set[str]) -> None:
-    """Require current-schema scalar metrics to be finite and non-negative."""
+def _validate_metric_values(frame: pd.DataFrame, columns: set[str], *, counts: frozenset[str], valid: np.ndarray) -> None:
+    """Require finite non-negative metrics for valid predictions, and NaN for every non-count metric otherwise."""
     for column in sorted(columns):
         values = frame[column].tolist()
         if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
             msg = f"Evaluation artifact metric {column!r} must contain real scalar values."
             raise TypeError(msg)
         numeric = np.asarray(values, dtype=float)
-        if not np.isfinite(numeric).all() or (numeric < 0.0).any():
-            msg = f"Evaluation artifact metric {column!r} must contain finite non-negative values."
+        reported = valid | (column in counts)
+        if not np.isfinite(numeric[reported]).all() or (numeric[reported] < 0.0).any() or not np.isnan(numeric[~reported]).all():
+            msg = f"Evaluation artifact metric {column!r} must be finite and non-negative for valid predictions and NaN otherwise."
             raise ValueError(msg)
 
 
@@ -310,7 +283,7 @@ def _validate_artifact_table(
     if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in schema_values):
         msg = "artifact_schema_version must contain integer values."
         raise TypeError(msg)
-    if {int(value) for value in schema_values} != {contracts.ARTIFACT_SCHEMA_VERSION}:
+    if not all(common.serialization.is_schema_version(int(value), contracts.ARTIFACT_SCHEMA_VERSION) for value in schema_values):
         msg = f"Evaluation artifact table requires schema version {contracts.ARTIFACT_SCHEMA_VERSION}."
         raise ValueError(msg)
 
@@ -357,7 +330,13 @@ def _validate_artifact_table(
     if missing or unexpected:
         msg = f"Evaluation artifact table schema mismatch: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
-    _validate_metric_values(frame, metrics)
+    documents = [validity_contract.admit_field_prediction_validity(text, channels=output_fields) for text in frame["prediction_validity"]]
+    _validate_metric_values(
+        frame,
+        metrics,
+        counts=contracts.element_count_columns(output_fields),
+        valid=np.asarray([document["status"] == validity_contract.VALID for document in documents], dtype=bool),
+    )
     _validate_membership(frame)
     return task_id, output_fields, output_units
 
@@ -499,8 +478,7 @@ def _validated_provenance(
         ("provenance_schema_version", contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
         ("artifact_schema_version", contracts.ARTIFACT_SCHEMA_VERSION),
     ):
-        value = payload.get(field)
-        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) != expected:
+        if not common.serialization.is_schema_version(payload.get(field), expected):
             msg = f"Evaluation provenance requires integer {field}={expected}."
             raise ValueError(msg)
 
@@ -560,21 +538,13 @@ def _validated_provenance(
         msg = "Artifact selection effective_case_count must be positive."
         raise TypeError(msg)
     dataset = _mapping(payload.get("dataset"), label="provenance.dataset")
-    if not isinstance(dataset.get("fingerprint"), str) or not dataset.get("fingerprint"):
-        msg = "Artifact provenance dataset fingerprint must be non-empty."
-        raise TypeError(msg)
-    if not isinstance(dataset.get("data_contract_digest"), str) or not dataset.get("data_contract_digest"):
-        msg = "Artifact provenance dataset data_contract_digest must be non-empty."
+    if not isinstance(dataset.get("source_identities"), list) or not dataset["source_identities"]:
+        msg = "Artifact provenance dataset must bind at least one source Dataset identity."
         raise TypeError(msg)
     raw_physics = payload.get("physics")
     if raw_physics is not None:
         physics = _mapping(raw_physics, label="provenance.physics")
-        residual_schema_version = physics.get("residual_schema_version")
-        if (
-            isinstance(residual_schema_version, bool)
-            or not isinstance(residual_schema_version, Integral)
-            or int(residual_schema_version) != contracts.RESIDUAL_SCHEMA_VERSION
-        ):
+        if not common.serialization.is_schema_version(physics.get("residual_schema_version"), contracts.RESIDUAL_SCHEMA_VERSION):
             msg = f"Artifact physics requires integer residual_schema_version={contracts.RESIDUAL_SCHEMA_VERSION}."
             raise ValueError(msg)
 
@@ -678,7 +648,9 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
     Notes
     -----
     Metadata may not collide with authoritative table columns. The input frame is
-    not mutated. Provenance-free inputs remain explicitly table-only.
+    not mutated. Provenance-free inputs remain explicitly table-only. Complete
+    provenance means table and attached provenance agree; admission against the
+    run, timing, and role happens only in ``evaluation_artifact_loader``.
 
     """
     provenance = frame_raw.attrs.get("artifact_provenance")
@@ -701,6 +673,9 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
             train_standard_deviations=train_standard_deviations,
             normalization_denominator_floor=denominator_floor,
         )
+        if provenance.get("evaluation") != {"prediction_validity": validity_contract.table_role_prediction_validity(frame_raw)}:
+            msg = "Artifact provenance prediction validity does not match the Parquet validity documents."
+            raise ComparisonCompatibilityError(msg)
     raw_root = frame_raw.attrs.get("artifact_root")
     artifact_root = str(raw_root) if raw_root is not None else None
 
@@ -728,89 +703,14 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def load_evaluation_artifact(artifact_root: str | Path) -> pd.DataFrame:
-    """
-    Load one explicit artifact root and its declared Parquet payload.
-
-    Parameters
-    ----------
-    artifact_root : str | pathlib.Path
-        Exact artifact directory containing current provenance and one manifest-
-        declared Parquet table.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Evaluation frame with validated complete provenance and resolved artifact
-        root attrs.
-
-    Raises
-    ------
-    OSError, TypeError, ValueError, ComparisonCompatibilityError
-        If provenance is unreadable, the manifest does not identify one contained
-        Parquet file, or table/provenance contracts disagree.
-
-    Notes
-    -----
-    The function never scans for alternate tables or provenance sidecars.
-
-    """
-    root = Path(artifact_root).resolve()
-    provenance_path = contracts.artifact_provenance_path(root)
-    try:
-        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        msg = f"Artifact provenance is unreadable: {provenance_path}: {error}"
-        raise ValueError(msg) from error
-    if not isinstance(provenance, Mapping):
-        msg = "Artifact provenance must contain one JSON object."
-        raise TypeError(msg)
-    outputs = _mapping(provenance.get("outputs"), label="provenance.outputs")
-    parquet = _mapping(outputs.get("parquet"), label="provenance.outputs.parquet")
-    parquet_name = parquet.get("path")
-    if not isinstance(parquet_name, str) or not parquet_name or Path(parquet_name).suffix != ".parquet":
-        msg = "Artifact output manifest must declare one Parquet path."
-        raise ValueError(msg)
-    parquet_path = (root / parquet_name).resolve()
-    if not parquet_path.is_relative_to(root) or not parquet_path.is_file():
-        msg = "Declared artifact Parquet payload is missing or escapes its root."
-        raise ValueError(msg)
-    try:
-        computed_outputs = contracts.artifact_output_manifest(root)
-    except (OSError, RuntimeError) as error:
-        msg = f"Artifact output manifest cannot be recomputed for {root}: {error}"
-        raise ValueError(msg) from error
-    if dict(outputs) != computed_outputs:
-        msg = "Artifact output manifest does not match the current payload files."
-        raise ValueError(msg)
-    frame_raw = pd.read_parquet(parquet_path)
-    frame_raw.attrs["artifact_root"] = str(root)
-    frame_raw.attrs["artifact_provenance"] = dict(provenance)
-    frame = build_eval_df(frame_raw)
-    resolved_paths = [
-        contracts.resolve_case_payload_path(
-            root,
-            stored_path,
-            expected_filename=case_payload_filename(Path(str(stored_path)).stem),
-        )
-        for stored_path in frame["npz_path"].tolist()
-    ]
-    if len(set(resolved_paths)) != len(resolved_paths):
-        msg = "Artifact Parquet rows share one NPZ payload."
-        raise ValueError(msg)
-    frame.loc[:, "npz_path"] = [str(path) for path in resolved_paths]
-    return frame
-
-
 def require_complete_provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
     """
-    Return complete current provenance already admitted with an evaluation frame.
+    Return the complete provenance attached to an evaluation frame.
 
     Parameters
     ----------
     frame : pandas.DataFrame
-        Frame produced by :func:`build_eval_df` with provenance attrs or by
-        :func:`load_evaluation_artifact`.
+        Frame produced by :func:`build_eval_df` with provenance attrs.
 
     Returns
     -------
@@ -821,6 +721,12 @@ def require_complete_provenance(frame: pd.DataFrame) -> Mapping[str, Any]:
     ------
     ComparisonCompatibilityError
         If provenance validation was bypassed or frame attrs were lost.
+
+    Notes
+    -----
+    Complete provenance means the table and its attached provenance agree. It does
+    not prove admission against a run, its timing, or its role; that happens only
+    in ``evaluation_artifact_loader``.
 
     """
     if frame.attrs.get("provenance_complete") is not True:
@@ -885,9 +791,7 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
         "output_units": evaluator.get("output_units"),
         "predictive_metrics": evaluator.get("predictive_metrics"),
         "split_role": provenance.get("split_role"),
-        "dataset_fingerprint": provenance.get("dataset", {}).get("fingerprint"),
-        "dataset_data_contract_digest": provenance.get("dataset", {}).get("data_contract_digest"),
-        "saved_membership_digest": provenance.get("dataset", {}).get("saved_membership_digest"),
+        "dataset": provenance.get("dataset"),
         "effective_membership_digest": provenance.get("selection", {}).get("effective_ordered_source_indices_sha256"),
         "effective_case_count": provenance.get("selection", {}).get("effective_case_count"),
     }
@@ -1004,7 +908,9 @@ def validate_comparison(
     ID and OOD roles may coexist. Within each role, dataset fingerprint and saved
     effective membership must match. Across roles, task/objective/schema/field/
     unit semantics still agree. Architecture, hyperparameters, and physics
-    enablement remain comparison dimensions, not blockers.
+    enablement remain comparison dimensions, not blockers. All frames, within
+    and across roles, must record one valid analysis producer; the recorded
+    value is never compared with the running analysis code.
 
     """
     if not datasets:
@@ -1012,26 +918,26 @@ def validate_comparison(
         raise ValueError(msg)
     grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     frames_by_role: dict[str, list[tuple[str, pd.DataFrame]]] = {}
+    provenances: dict[str, Mapping[str, Any]] = {}
     for label, frame in datasets.items():
         if not isinstance(label, str) or not label:
             msg = "Evaluation dataset labels must be non-empty strings."
             raise TypeError(msg)
-        provenance = require_complete_provenance(frame)
+        provenance = provenances[label] = require_complete_provenance(frame)
         if require_physics:
             if frame.attrs.get("task_id") != "steady_flow":
                 msg = f"Physics plots are unavailable for task {frame.attrs.get('task_id')!r}."
                 raise ComparisonCompatibilityError(msg)
-            residual_schema_version = frame.attrs.get("residual_schema_version")
-            if (
-                isinstance(residual_schema_version, bool)
-                or not isinstance(residual_schema_version, Integral)
-                or int(residual_schema_version) != contracts.RESIDUAL_SCHEMA_VERSION
-            ):
+            if not common.serialization.is_schema_version(frame.attrs.get("residual_schema_version"), contracts.RESIDUAL_SCHEMA_VERSION):
                 msg = f"Physics plots require integer residual schema {contracts.RESIDUAL_SCHEMA_VERSION}."
                 raise ComparisonCompatibilityError(msg)
         role = str(provenance.get("split_role"))
         grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))
         frames_by_role.setdefault(role, []).append((label, frame))
+    try:
+        contracts.require_common_analysis_producer(provenances)
+    except ValueError as error:
+        raise ComparisonCompatibilityError(str(error)) from error
 
     reference_global: dict[str, Any] | None = None
     for role, entries in grouped.items():
@@ -1043,7 +949,7 @@ def validate_comparison(
                     "differ in task/objective/schema/formulas/units/dataset/membership."
                 )
                 raise ComparisonCompatibilityError(msg)
-        common = {
+        shared_contract = {
             key: first[key]
             for key in (
                 "task",
@@ -1059,8 +965,8 @@ def validate_comparison(
             )
         }
         if reference_global is None:
-            reference_global = common
-        elif common != reference_global:
+            reference_global = shared_contract
+        elif shared_contract != reference_global:
             msg = "ID and OOD artifact groups use incompatible task/objective/schema/field/unit contracts."
             raise ComparisonCompatibilityError(msg)
     if verify_grid and all(frame.attrs.get("artifact_kind") != "transient_sequence" for frame in datasets.values()):

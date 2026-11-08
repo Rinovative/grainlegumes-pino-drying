@@ -74,7 +74,7 @@ def derive_reference_coefficient(material_kappa_nominal: float, eps_bed_ref: flo
 
 def _solve_reference_porosity_unchecked(sampled_kappa_mean: float, reference_coefficient: float) -> float:
     """Invert one positive Kozeny-Carman target over its complete physical domain."""
-    permeability = _finite(sampled_kappa_mean, label="Sampled mean permeability")
+    permeability = _finite(sampled_kappa_mean, label="Sampled permeability scale")
     coefficient = _finite(reference_coefficient, label="Kozeny-Carman reference coefficient")
     if permeability <= 0.0 or coefficient <= 0.0:
         msg = "Kozeny-Carman permeability and coefficient must be strictly positive."
@@ -253,7 +253,7 @@ def resolve_active_packing_support_for_value(
     if active_ood_unit != "kappa_mean":
         natural_lower, natural_upper = _interval(coupling["natural_porosity_support"], label="Natural porosity support")
         return "natural", natural_lower, natural_upper
-    value = _finite(sampled_kappa_mean, label="Sampled mean permeability")
+    value = _finite(sampled_kappa_mean, label="Sampled permeability scale")
     tails = coupling.get("kappa_ood_porosity_supports")
     if not isinstance(tails, Mapping):
         msg = "kappa_mean OOD has no mapped authored support."

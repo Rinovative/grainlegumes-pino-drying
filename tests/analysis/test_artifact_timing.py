@@ -13,6 +13,7 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -20,6 +21,7 @@ import torch
 from torch import nn
 
 from src import analysis
+from src.analysis.artifacts import analysis_artifact_performance as artifact_performance
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,9 +58,7 @@ def _neural_runtime() -> dict[str, Any]:
 def _dataset_identity() -> dict[str, str]:
     return {
         "name": "batch-a",
-        "fingerprint": "dataset-fingerprint",
-        "data_contract_digest": "data-digest",
-        "saved_membership_digest": "membership-digest",
+        "dataset_provenance_sha256": "dataset-provenance-digest",
         "effective_ordered_source_indices_sha256": "indices-digest",
     }
 
@@ -281,18 +281,28 @@ def test_comsol_timing_rejects_zero_nonfinite_malformed_and_duplicate_records() 
         analysis.artifacts.timing.validate_simulation_batch_timing(duplicate)
 
 
-def test_atomic_round_trip_and_scientific_manifest_exclusion(tmp_path: Path) -> None:
-    """Verify that atomic round trip and scientific manifest exclusion."""
+def test_stage_timing_stays_outside_payloads_and_its_block_is_closed(tmp_path: Path) -> None:
+    """Timing merges into the stage marker atomically, leaves the payload manifest alone and must be complete."""
     artifact_root = tmp_path / "artifact"
     npz_root = artifact_root / "npz"
     npz_root.mkdir(parents=True)
     (artifact_root / "cases.parquet").write_bytes(b"scientific-table")
     (npz_root / "case_0001.npz").write_bytes(b"scientific-case")
+    marker = analysis.artifacts.contracts.artifact_provenance_path(artifact_root)
+    marker.write_text(json.dumps({"run": {"name": "run"}}), encoding="utf-8")
     before = analysis.artifacts.contracts.artifact_output_manifest(artifact_root)
-    path = analysis.artifacts.timing.write_runtime_comparison(artifact_root, _comparison())
-    assert path.name == analysis.artifacts.timing.RUNTIME_COMPARISON_FILENAME
+    snapshot = artifact_performance.ArtifactPerformanceRecorder(device="cpu", dtype="float32").snapshot()
+
+    analysis.artifacts.timing.write_stage_timing(artifact_root, {"report": _comparison()})
+    partial = json.loads(marker.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError, match="--rebuild"):
+        analysis.artifacts.timing.timing_block(partial, records=frozenset({"report"}))
+    analysis.artifacts.timing.write_stage_timing(artifact_root, {"operational_performance": snapshot})
+
+    document = json.loads(marker.read_text(encoding="utf-8"))
+    assert document["run"] == {"name": "run"}
+    assert analysis.artifacts.timing.timing_block(document, records=frozenset({"report"}))["report"] == _comparison()
     assert not list(artifact_root.glob(".*.tmp"))
-    assert analysis.artifacts.timing.load_runtime_comparison(artifact_root) == _comparison()
     assert analysis.artifacts.contracts.artifact_output_manifest(artifact_root) == before
 
 

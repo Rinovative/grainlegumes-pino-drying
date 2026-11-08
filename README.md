@@ -91,7 +91,7 @@ One Dataset plan requests physical cases, selects successful ones and fixes Trai
 
 ## 📄 Project Report
 
-The [VP1 airflow report](docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf) documents the steady methodology and results on which this project builds.
+The [VP1 airflow report](docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf) documents the steady methodology and results on which this project builds. Its [corrigendum](docs/Albertin_2026_PINO_Airflow_PorousMedia_corrigendum.md) lists what is wrong in the report and what this project does instead.
 ## 📊 Visualization
 
 <p align="center">
@@ -180,7 +180,7 @@ srun --partition standard --cpus-per-task 2 --mem 8G --time 01:00:00 \
 
 ```bash
 ../runtime/venvs/native/bin/python -m src.datasets.dataset_packages run \
-  configs/02_datasets/transient_drying/lentil_chickpea_ref_range.yaml --preview
+  configs/02_datasets/transient_drying/lentil_chickpea__ood_kidney_bean.yaml --preview
 ```
 
 2. Train one architecture on the published Dataset:
@@ -196,7 +196,7 @@ srun --partition standard --cpus-per-task 2 --mem 8G --time 01:00:00 \
 
 3. Open `notebooks/04_eval_single_model.ipynb` or `notebooks/05_eval_comparison_models.ipynb` on a compute-node kernel.
 
-The [documentation index](docs/README.md) lists all guides in reading order.
+The [documentation index](docs/README.md) lists all guides in reading order; the [register of scientific decisions](docs/08_scientific_decisions.md) gives every scientific choice with its reason on one page.
 
 </details>
 
@@ -215,15 +215,14 @@ The checkout lives in `repo/`. The sibling `storage/` holds physical Sources, Da
 │   ├── README.md                 # Which config you edit for what, and how often
 │   ├── 01_generation/
 │   │   ├── execution.yaml        # Slurm resources, timeouts, retention
-│   │   ├── physical_model/       # Grid, parameters, materials, operation, task profiles, bibliography
-│   │   └── standalone/           # Source-only campaigns and the CPU core-scaling benchmark
+│   │   └── physical_model/       # Grid, parameters, materials, operation, task profiles, bibliography
 │   ├── 02_datasets/              # Dataset plans per task (materials, counts, roles, split)
 │   └── 03_learning/
 │       ├── steady_flow/          # Shared base.yaml, experiments and Optuna searches
 │       └── transient_drying/     # Shared base.yaml, experiments and Optuna studies
 ├── container/
 │   └── Apptainer.def             # ML container definition
-├── docs/                         # Guides 01–07, VP1 report, figures
+├── docs/                         # Guides 01–07, decision register 08, VP1 report and corrigendum, figures
 ├── notebooks/
 │   ├── 01_eda_generation_inputs.ipynb    # Generation inputs before COMSOL
 │   ├── 02_eda_datasets.ipynb             # Completed cases and Datasets
@@ -235,9 +234,13 @@ The checkout lives in `repo/`. The sibling `storage/` holds physical Sources, Da
 │   ├── provision_native.sh       # Native environment from uv.lock
 │   ├── generation                # Generation CLI entry point
 │   ├── generation_node.sh        # Node-side Generation entry for Slurm jobs
+│   ├── generation_prerequisites.sh  # Shared prerequisite diagnostics for Generation scripts
 │   ├── slurm_ml.sh               # Slurm wrapper for train, optuna, artifacts, probe
+│   ├── slurm_ml_worker.sh        # Job-side ML worker: verifies tree and image, runs the operation
 │   ├── apptainer_exec.sh         # Run a command inside the ML container
-│   └── source_fingerprint.py     # Source snapshots and restore
+│   ├── source_fingerprint.py     # Source snapshots and restore
+│   ├── check_notebooks.py        # Notebook structure and cleared-state check
+│   └── check_package_install.py  # Editable and wheel installation check
 ├── simulation/
 │   ├── steady_flow/              # COMSOL airflow template and digest
 │   └── transient_drying/         # COMSOL drying template and digest

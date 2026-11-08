@@ -3,6 +3,7 @@
 Responsibilities:
   - Check split persistence before fitting and complete Dataset/normalizer/loader validation
   - Check that loader construction caps the worker count at the CPUs available to the process
+  - Check that the validator refuses a transient request instead of checking it partially
 
 Design principles:
   - Tiny fixtures preserve real admission boundaries while replacing external I/O
@@ -13,16 +14,20 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
+from support import configs
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from src import common, datasets, experiments
+from src import common, datasets, domain, experiments
+from src.learning.learning_temporal import TemporalConditioningSpec
+from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,7 +47,6 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
         outputs: Tensor,
         task_id: str,
         data_digest: str,
-        path: Path,
     ) -> None:
         """Store tensors, ordered field names, metadata, and exact identity."""
         sample_ids = tuple(f"{dataset_id}_case_{index}" for index in range(len(inputs)))
@@ -53,7 +57,6 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
         }
         self.input_fields = ["input"]
         self.output_fields = ["output"]
-        self.path = path
         self.identity = datasets.contracts.identity.DatasetIdentity(
             dataset_id=dataset_id,
             task=task_id,
@@ -63,6 +66,12 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
             sample_count=len(sample_ids),
             spatial_shape=tuple(inputs.shape[2:]),
         )
+        self.manifest_binding: datasets.contracts.identity.ManifestBinding | None = None
+
+    @property
+    def payload_identity(self) -> dict[str, Any]:
+        """Return the identity the payload states about itself, as the production runtime does."""
+        return {"fingerprint": self.identity.fingerprint, "spatial_shape": list(self.identity.spatial_shape)}
 
     def __len__(self) -> int:
         """Return the complete source sample count."""
@@ -79,9 +88,10 @@ class _SyntheticDataset(Dataset[dict[str, Any]]):
 
 def _task() -> SimpleNamespace:
     """Return the TaskSpec attributes consumed by complete validation."""
+    # The split schema binds the registered steady task; the channel counts stay fixture-sized.
     return SimpleNamespace(
-        id="test_flow",
-        contract_digest="d" * 64,
+        id="steady_flow",
+        contract_digest=domain.tasks.registry.get_task("steady_flow").contract_digest,
         data_contract_digest="d" * 64,
         tensor_layout=("batch", "channel", "y", "x"),
         normalization_axes=(0, 2, 3),
@@ -118,39 +128,60 @@ def _partition(id_source: _SyntheticDataset) -> dict[str, Any]:
     )
 
 
-def _split_info(
-    *,
-    task: SimpleNamespace,
-    id_source: _SyntheticDataset,
-    ood_source: _SyntheticDataset,
-) -> dict[str, Any]:
-    """Build the current persisted split payload for a fixed 2/1/1 partition and two OOD cases."""
-    splits = datasets.preprocessing.splits
-    partition = _partition(id_source)
-    evidence = {
-        role: splits.role_evidence(role, id_source.identity, splits.role_positions(id_source.identity, partition[role], label=role))
-        for role in splits.ID_SPLIT_ROLES
-    }
-    return splits.SplitContract(
-        schema_version=splits.SPLIT_SCHEMA_VERSION,
-        task=task.id,
-        task_contract_digest=task.contract_digest,
-        split_seed=partition["seed"],
-        case_partition=partition,
-        case_partition_digest=datasets.contracts.partition.partition_digest(partition),
-        train=evidence["train"],
-        validation=evidence["validation"],
-        id_test=evidence["id_test"],
-        additional_evaluation=splits.role_evidence("additional_evaluation", ood_source.identity, (0, 2)),
-    ).as_payload()
+def _ood_partition(ood_source: _SyntheticDataset) -> dict[str, Any]:
+    """Build the fixed partition of an evaluation-only Dataset whose cases are all declared OOD."""
+    case_ids = list(ood_source.identity.sample_ids)
+    return datasets.contracts.partition.build_fixed_partition(
+        case_ids,
+        material_by_case=dict.fromkeys(case_ids, "chickpea"),
+        material_roles={"chickpea": "ood"},
+        recipe={"kind": "exact", "train": [], "validation": [], "id_test": []},
+        seed_input=9,
+        seed=common.random.derive_subseed(9, "split"),
+    )
 
 
-def _manifest(source: _SyntheticDataset, *, material: str, partition: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the manifest evidence fields read by steady loader construction."""
-    return {
+_ASSIGNMENT = {"dataset_id": "ood_data", "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []}
+_PRODUCER = {"training_sha256": "a" * 64, "model_sha256": "b" * 64}
+
+
+def _bind(source: _SyntheticDataset, *, material: str, partition: Mapping[str, Any]) -> dict[str, Any]:
+    """Attach the manifest binding the Dataset factory gives a runtime and return the manifest evidence it reads."""
+    manifest = {
+        "dataset_id": source.identity.dataset_id,
+        "dataset_digest": ("1" if material == "lentil" else "2") * 64,
+        "channel_contract_digest": datasets.contracts.views.get_view("steady_flow").contract_digest,
         "case_partition": partition,
-        "source_case_identities": [{"package_case_id": case_id, "source": {"material_family": material}} for case_id in source.identity.sample_ids],
+        "source_case_identities": [
+            {
+                "package_case_id": case_id,
+                "source": {"material_family": material, "case_input_id": f"input_{case_id}", "simulation_case_id": f"simulation_{case_id}"},
+            }
+            for case_id in source.identity.sample_ids
+        ],
     }
+    source.manifest_binding = datasets.contracts.identity.manifest_binding(manifest)
+    return manifest
+
+
+def _split_info(*, id_source: _SyntheticDataset, ood_source: _SyntheticDataset) -> dict[str, Any]:
+    """Build the current persisted split payload for a fixed 2/1/1 partition and one declared OOD source."""
+    splits = datasets.preprocessing.splits
+    _bind(id_source, material="lentil", partition=_partition(id_source))
+    _bind(ood_source, material="chickpea", partition=_ood_partition(ood_source))
+
+    def identity(source: _SyntheticDataset) -> dict[str, Any]:
+        assert source.manifest_binding is not None
+        return splits.split_dataset_identity(source.manifest_binding, source.payload_identity)
+
+    ood_cases = _ood_partition(ood_source)["ood"]
+    return splits.build_split(
+        task="steady_flow",
+        train_dataset=identity(id_source),
+        case_partition=_partition(id_source),
+        additional_evaluation=[(identity(ood_source), ood_cases, _ASSIGNMENT)],
+        extension=None,
+    ).as_payload()
 
 
 def test_steady_experiment_persists_dataset_partition_before_fitting(
@@ -165,7 +196,6 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         outputs=torch.arange(16, dtype=torch.float32).reshape(4, 1, 2, 2),
         task_id=task.id,
         data_digest=task.data_contract_digest,
-        path=tmp_path / "id_data.pt",
     )
     ood = _SyntheticDataset(
         dataset_id="ood_data",
@@ -173,20 +203,10 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         outputs=torch.arange(16, 32, dtype=torch.float32).reshape(4, 1, 2, 2),
         task_id=task.id,
         data_digest=task.data_contract_digest,
-        path=tmp_path / "ood_data.pt",
-    )
-    ood_ids = list(ood.identity.sample_ids)
-    ood_partition = datasets.contracts.partition.build_fixed_partition(
-        ood_ids,
-        material_by_case=dict.fromkeys(ood_ids, "chickpea"),
-        material_roles={"chickpea": "ood"},
-        recipe={"kind": "exact", "train": [], "validation": [], "id_test": []},
-        seed_input=9,
-        seed=common.random.derive_subseed(9, "split"),
     )
     manifests = {
-        "id_data": _manifest(train, material="lentil", partition=_partition(train)),
-        "ood_data": _manifest(ood, material="chickpea", partition=ood_partition),
+        "id_data": _bind(train, material="lentil", partition=_partition(train)),
+        "ood_data": _bind(ood, material="chickpea", partition=_ood_partition(ood)),
     }
     training = datasets.runtime.training
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: task)
@@ -195,7 +215,7 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         return manifests[dataset_id]
 
     monkeypatch.setattr(training.package_manifest, "load_package_manifest_evidence", load_evidence)
-    monkeypatch.setattr(training.package_manifest, "declared_evaluation_assignments", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(training.package_manifest, "declared_evaluation_assignments", lambda *_args, **_kwargs: [_ASSIGNMENT])
     monkeypatch.setattr(training, "_steady_dataset", lambda dataset_id, *, storage_root: {"id_data": train, "ood_data": ood}[dataset_id])  # noqa: ARG005
     events: list[str] = []
     split_path = tmp_path / "run" / "split_indices.pt"
@@ -206,15 +226,17 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         events.append("persist")
 
     def fit(_loader: DataLoader, *, task: Any) -> object:
-        assert task.id == "test_flow"
+        assert task.id == "steady_flow"
         assert split_path.is_file()
-        persisted = torch.load(split_path, map_location="cpu", weights_only=True)
-        assert persisted["train_indices"].tolist() == [0, 1]
-        assert persisted["validation_indices"].tolist() == [2]
-        assert persisted["id_test_indices"].tolist() == [3]
-        assert persisted["additional_evaluation_indices"].tolist() == [0, 1, 2, 3]
+        persisted = datasets.preprocessing.splits.admit_split(torch.load(split_path, map_location="cpu", weights_only=True))
+        assert persisted.train.index_values == (0, 1)
+        assert persisted.validation.index_values == (2,)
+        assert persisted.id_test.index_values == (3,)
+        assert [part.index_values for part in persisted.additional_evaluation] == [(0, 1, 2, 3)]
         events.append("fit")
-        return object()
+        return datasets.preprocessing.normalization.data_processor_from_state(
+            _normalizer_state(train.data["inputs"], train.data["outputs"], persisted.train.indices), device="cpu"
+        )
 
     monkeypatch.setattr(datasets.preprocessing.normalization, "fit_data_processor", fit)
     config = {
@@ -229,11 +251,16 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
             "persistent_workers": False,
         },
         "paths": {"dataset_root": str(tmp_path / "02_datasets")},
+        "producer": _PRODUCER,
     }
-    loaders = experiments.config.loader.create_dataloaders_from_config(config, split_persist_callback=persist)
+    loaders = experiments.config.loader.create_dataloaders_from_config(
+        config,
+        seed_plan=experiments.run.build_seed_plan(9),
+        split_persist_callback=persist,
+    )
     assert events == ["persist", "fit"]
-    assert {"train", "eval", "id_test", "additional_evaluation"}.issubset(loaders)
-    assert loaders["split_indices"]["metadata"]["case_partition"] == manifests["id_data"]["case_partition"]
+    assert {"train", "eval", "id_test", "additional_evaluation", "scaling_artifact"}.issubset(loaders)
+    assert loaders["split_indices"]["case_partition"] == manifests["id_data"]["case_partition"]
 
 
 @pytest.mark.parametrize(("configured", "available", "effective"), [(8, 4, 4), (0, 4, 0)])
@@ -248,9 +275,9 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
     """Cap the configured worker count at the process affinity and report the cap only when it applies."""
     seen: dict[str, Any] = {}
 
-    def create(**kwargs: Any) -> tuple[None, dict[str, None], None, dict[str, Any]]:
+    def create(**kwargs: Any) -> tuple[None, dict[str, None], None, dict[str, Any], dict[str, Any]]:
         seen.update(kwargs)
-        return None, {"eval": None, "id_test": None, "additional_evaluation": None}, None, {}
+        return None, {"eval": None, "id_test": None, "additional_evaluation": None}, None, {}, {}
 
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: _task())
     monkeypatch.setattr(datasets.runtime.training, "create_dataloaders", create)
@@ -267,9 +294,10 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
             "persistent_workers": False,
         },
         "paths": {"dataset_root": str(tmp_path / "02_datasets")},
+        "producer": _PRODUCER,
     }
 
-    experiments.config.loader.create_dataloaders_from_config(config)
+    experiments.config.loader.create_dataloaders_from_config(config, seed_plan=experiments.run.build_seed_plan(9))
 
     assert seen["num_workers"] == effective
     capped = f"data workers {effective} of {configured} configured ({available} CPUs)"
@@ -277,10 +305,7 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
     assert config["data"]["num_workers"] == configured
 
 
-def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(monkeypatch: pytest.MonkeyPatch) -> None:
     """Return typed PASS evidence while using the maintained scientific owners."""
     task = _task()
     id_inputs = torch.arange(16, dtype=torch.float32).reshape(4, 1, 2, 2)
@@ -293,7 +318,6 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
         outputs=id_outputs,
         task_id=task.id,
         data_digest=task.data_contract_digest,
-        path=tmp_path / "id_data.pt",
     )
     ood_source = _SyntheticDataset(
         dataset_id="ood_data",
@@ -301,7 +325,6 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
         outputs=ood_outputs,
         task_id=task.id,
         data_digest=task.data_contract_digest,
-        path=tmp_path / "ood_data.pt",
     )
     config = {
         "task": task.id,
@@ -310,36 +333,36 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
             "train_dataset": "id_data",
             "additional_evaluation_datasets": ["ood_data"],
         },
-        "paths": {"dataset_root": str(tmp_path / "datasets")},
     }
     build_calls: list[dict[str, int]] = []
 
     def build_loaders(_config: dict[str, Any], *, seed_plan: dict[str, int]) -> dict[str, Any]:
         """Create fresh loaders, processor, and split state for each production call."""
         build_calls.append(seed_plan)
-        split = _split_info(task=task, id_source=id_source, ood_source=ood_source)
-        state = _normalizer_state(id_inputs, id_outputs, split["train_indices"])
+        split = _split_info(id_source=id_source, ood_source=ood_source)
+        contract = datasets.preprocessing.splits.admit_split(split)
+        state = _normalizer_state(id_inputs, id_outputs, contract.train.indices)
         processor = datasets.preprocessing.normalization.data_processor_from_state(state, device="cpu")
         train_generator = torch.Generator().manual_seed(seed_plan["loader"])
         return {
             "train": DataLoader(
-                Subset(id_source, split["train_indices"].tolist()),
+                Subset(id_source, list(contract.train.index_values)),
                 batch_size=2,
                 shuffle=True,
                 generator=train_generator,
             ),
             "eval": DataLoader(
-                Subset(id_source, split["validation_indices"].tolist()),
+                Subset(id_source, list(contract.validation.index_values)),
                 batch_size=2,
                 shuffle=False,
             ),
             "id_test": DataLoader(
-                Subset(id_source, split["id_test_indices"].tolist()),
+                Subset(id_source, list(contract.id_test.index_values)),
                 batch_size=2,
                 shuffle=False,
             ),
             "additional_evaluation": DataLoader(
-                Subset(ood_source, split["additional_evaluation_indices"].tolist()),
+                Subset(ood_source, list(contract.additional_evaluation[0].index_values)),
                 batch_size=2,
                 shuffle=False,
             ),
@@ -347,33 +370,14 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
             "split_indices": split,
         }
 
-    metadata_calls: list[tuple[str, Path, Path]] = []
-
-    def load_metadata(
-        dataset_id: str,
-        *,
-        dataset_identity: Any,
-        metadata_root: Path,
-        dataset_path: Path,
-    ) -> dict[str, str]:
-        """Record complete identity/path binding at the mounted metadata boundary."""
-        assert dataset_identity.dataset_id == dataset_id
-        metadata_calls.append((dataset_id, metadata_root, dataset_path))
-        return {"dataset_id": dataset_id}
-
     monkeypatch.setattr(validation.config_loader, "validate_resolved_config", dict)
     monkeypatch.setattr(validation.config_loader, "validate_resolved_task_contract", lambda _value: task)
     monkeypatch.setattr(validation.config_loader, "create_dataloaders_from_config", build_loaders)
-    monkeypatch.setattr(datasets.contracts.metadata, "load_dataset_metadata", load_metadata)
 
     result = validation.validate_full_data_pipeline(config)
 
     assert isinstance(result, validation.FullDataValidationResult)
     assert len(build_calls) == 2
-    assert metadata_calls == [
-        ("id_data", tmp_path / "datasets", tmp_path / "id_data.pt"),
-        ("ood_data", tmp_path / "datasets", tmp_path / "ood_data.pt"),
-    ]
     assert len(result.dataset_membership) == 5
     assert len(result.channels) == 2
     assert len(result.coverage) == 4
@@ -383,3 +387,53 @@ def test_full_validator_checks_complete_metadata_split_normalizer_and_loaders(
     assert {record.loader for record in result.coverage} == {"ID train", "ID validation", "ID test", "Additional evaluation"}
     assert all(record.inverse_checked for record in result.coverage)
     assert [record.result for record in result.overall[-2:]] == ["INFO", "INFO"]
+
+
+def test_full_validator_refuses_a_transient_request_before_loading_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The validator recomputes per-sample standardization, which the transient pipeline does not use; it refuses instead of half-checking."""
+
+    def load_forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("a refused request must not load data")
+
+    monkeypatch.setattr(validation.config_loader, "create_dataloaders_from_config", load_forbidden)
+
+    with pytest.raises(ValueError, match="transient_drying"):
+        validation.validate_full_data_pipeline(configs.resolve(configs.transient_stage_a_only_config()))
+
+
+@pytest.mark.parametrize(
+    ("field", "foreign"),
+    [("dataset_identity", {"dataset_id": "foreign"}), ("train_membership_digest", "b" * 64)],
+)
+def test_saved_transient_scaling_state_must_repeat_the_envelope_identity(transient_package: dict[str, Any], field: str, foreign: Any) -> None:
+    """Admit the saved scaling state of a matching envelope only when its repeated identity fields equal the envelope identity."""
+    sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
+    loaders = datasets.runtime.transient_training.create_transient_training_loaders(
+        train_dataset_id=transient_package["train_dataset"],
+        additional_evaluation_dataset_ids=[],
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
+        train_sampling=sampling,
+        loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        model_sha256="a" * 64,
+        storage_root=str(transient_package["root"]),
+    )
+    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
+    for loader in owned:
+        if loader is not None:
+            loader.dataset.close()
+    config = {
+        "task": "transient_drying",
+        "task_contract": domain.tasks.registry.get_task("transient_drying").resolved_contract(),
+        "data": {"train_dataset": transient_package["train_dataset"], "additional_evaluation_datasets": [], "spatial_stride": 1},
+        "input_profile": "canonical_physics_complete_v1",
+        "temporal": {"temporal_conditioning": {"kind": "none"}, "sampling": sampling.as_dict()},
+        "scaling": {"mode": "state_std"},
+    }
+    split = datasets.preprocessing.splits.admit_split(loaders.split)
+    envelope = copy.deepcopy(loaders.scaling_artifact)
+
+    admitted: Any = experiments.run._validate_saved_data_contract(config, split, envelope)
+    assert admitted.digest == loaders.data_processor.digest
+    envelope["state"][field] = foreign
+    with pytest.raises(experiments.run.RunLifecycleError, match=field):
+        experiments.run._validate_saved_data_contract(config, split, envelope)

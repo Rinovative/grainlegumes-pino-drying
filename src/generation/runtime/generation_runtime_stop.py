@@ -42,7 +42,6 @@ CANCEL_COMMAND = "Cancel\n"
 STOP_STATUS_FILENAME = "solved.mph.status"
 STOP_EVIDENCE_FILENAME = "stop.json"
 STOP_EVIDENCE_SCHEMA_KIND = "generation_runtime_stop"
-STOP_EVIDENCE_SCHEMA_VERSION = 1
 DEFAULT_POLL_INTERVAL_SECONDS = 0.25
 DEFAULT_ESCALATION_WAIT_SECONDS = 5.0
 _MAX_STATUS_EXCERPT_BYTES = 160
@@ -754,7 +753,6 @@ class SolverStopController:
             evidence_path,
             {
                 "schema_kind": STOP_EVIDENCE_SCHEMA_KIND,
-                "schema_version": STOP_EVIDENCE_SCHEMA_VERSION,
                 "reason": reason,
                 "requested_at": requested_at,
                 "command": STOP_COMMAND.rstrip(),

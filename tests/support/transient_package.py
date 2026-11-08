@@ -25,12 +25,12 @@ import torch
 
 from src import common, datasets, generation
 from src.datasets.packages import dataset_packages_builder as builder
+from src.datasets.packages import dataset_packages_selection as selection
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 from support import generation_fixtures
 from support.generation_fixtures import successful_source_case
 from support.synthetic_task import build_synthetic_selection_provenance
 
-_TARGET_SHARD_BYTES = 1_000_000
 _SELECTOR_KEYS = (
     "campaign_name",
     "campaign_digest",
@@ -64,8 +64,8 @@ def _publish_transient_selection(
 ) -> tuple[str, Path]:
     """Publish and reopen one exact current Dataset with a Dataset-owned partition."""
     request = {
-        "schema_kind": "dataset_selection_request",
-        "schema_version": 2,
+        "schema_kind": selection.SELECTION_SCHEMA_KIND,
+        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "transient_drying",
         "dataset_name": dataset_name,
         "dataset_view": "transient_drying",
@@ -146,7 +146,6 @@ def _build_transient_package(root: Path) -> dict[str, Any]:
             "material_roles": {"lentil": "id"},
         },
     )
-    datasets.packages.transient_shards.build_transient_shards(train_dataset_id, storage_root=storage, target_shard_bytes=_TARGET_SHARD_BYTES)
     canonical = datasets.runtime.transient.TransientPhysicalDataset(
         index_path,
         sampling=datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition"),

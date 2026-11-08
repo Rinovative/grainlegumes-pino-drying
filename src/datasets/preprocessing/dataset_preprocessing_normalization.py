@@ -1,24 +1,23 @@
-"""Own task-aware normalizer fitting, reconstruction, and persisted identity binding.
+"""Own steady per-channel normalizer fitting, reconstruction and preprocessing specification.
 
 Responsibilities:
   - Fit per-channel preprocessing from training membership only
   - Reconstruct processors from isolated persisted tensors
-  - Build and admit dataset-bound normalizer artifacts
+  - State the steady preprocessing specification that the shared scaling identity binds
 
 Design principles:
-  - Preprocessing identity binds task, dataset fingerprint, and train membership
   - Saved tensors are validated on CPU before use
   - Zero-variance channels retain the established denominator floor
 
 This module does NOT:
   - Choose split membership or construct training DataLoaders
-  - Persist normalizer artifacts or resolve experiment paths
+  - Cache, envelope or persist scaling artifacts; the shared scaling service owns that
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 from neuralop.data.transforms.data_processors import DefaultDataProcessor
@@ -26,7 +25,6 @@ from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from src.datasets.preprocessing import dataset_preprocessing_splits as splits
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 
@@ -38,22 +36,6 @@ _REQUIRED_NORMALIZER_STATE_KEYS = (
 )
 _NORMALIZER_STATE_RANK = 4
 _NORMALIZER_DENOMINATOR_FLOOR = 1e-7
-_SHA256_HEX_LENGTH = 64
-_NORMALIZER_ARTIFACT_SCHEMA_KIND = "dataset_bound_normalizer"
-_NORMALIZER_ARTIFACT_SCHEMA_VERSION = 1
-_NORMALIZER_ARTIFACT_KEYS = frozenset(
-    {
-        "schema_kind",
-        "schema_version",
-        "task",
-        "data_contract_digest",
-        "dataset_id",
-        "dataset_fingerprint",
-        "train_membership_digest",
-        "train_sample_count",
-        "state",
-    }
-)
 
 
 def data_processor_from_state(
@@ -139,79 +121,22 @@ def data_processor_from_state(
     return processor
 
 
-def _normalizer_split_identity(
-    split_contract: splits.SplitContract,
-) -> tuple[dict[str, Any], str, int]:
-    """Return exact train-dataset, membership, and sample-count evidence."""
-    train = split_contract.role("train")
-    return train.source.as_dict(), train.membership_digest, train.count
+def preprocessing_spec(task: TaskSpec) -> dict[str, Any]:
+    """Return the steady preprocessing specification bound into the scaling identity."""
+    return {
+        "kind": "unit_gaussian_per_channel",
+        "normalization_axes": list(task.normalization_axes),
+        "denominator_floor": _NORMALIZER_DENOMINATOR_FLOOR,
+        "in_channels": task.in_channels,
+        "out_channels": task.out_channels,
+    }
 
 
-def build_normalizer_artifact(
-    data_processor: DefaultDataProcessor,
-    *,
-    task: TaskSpec,
-    split_contract: splits.SplitContract,
-) -> dict[str, Any]:
-    """Build one persisted normalizer bound to exact train data membership."""
-    train_dataset, membership_digest, train_sample_count = _normalizer_split_identity(split_contract)
+def processor_state(data_processor: DefaultDataProcessor) -> dict[str, Tensor]:
+    """Return isolated CPU normalizer tensors after validating that they reconstruct a processor."""
     state = {key: value.detach().cpu().clone() for key, value in data_processor.state_dict().items()}
     data_processor_from_state(state, device="cpu")
-    dataset_id = train_dataset.get("dataset_id")
-    dataset_fingerprint = train_dataset.get("fingerprint")
-    if (
-        not isinstance(dataset_id, str)
-        or not dataset_id
-        or not isinstance(dataset_fingerprint, str)
-        or len(dataset_fingerprint) != _SHA256_HEX_LENGTH
-        or train_dataset.get("data_contract_digest") != task.data_contract_digest
-    ):
-        message = "Split train dataset identity is incompatible with the task normalizer contract."
-        raise ValueError(message)
-    return {
-        "schema_kind": _NORMALIZER_ARTIFACT_SCHEMA_KIND,
-        "schema_version": _NORMALIZER_ARTIFACT_SCHEMA_VERSION,
-        "task": task.id,
-        "data_contract_digest": task.data_contract_digest,
-        "dataset_id": dataset_id,
-        "dataset_fingerprint": dataset_fingerprint,
-        "train_membership_digest": membership_digest,
-        "train_sample_count": train_sample_count,
-        "state": state,
-    }
-
-
-def validate_normalizer_artifact(
-    artifact: Mapping[str, Any],
-    *,
-    task: TaskSpec,
-    split_contract: splits.SplitContract,
-) -> dict[str, Tensor]:
-    """Validate and return isolated tensors from one dataset-bound normalizer."""
-    if not isinstance(artifact, Mapping) or set(artifact) != _NORMALIZER_ARTIFACT_KEYS:
-        message = "Saved normalizer artifact keys do not match the dataset-bound schema."
-        raise ValueError(message)
-    train_dataset, membership_digest, train_sample_count = _normalizer_split_identity(split_contract)
-    expected = {
-        "schema_kind": _NORMALIZER_ARTIFACT_SCHEMA_KIND,
-        "schema_version": _NORMALIZER_ARTIFACT_SCHEMA_VERSION,
-        "task": task.id,
-        "data_contract_digest": task.data_contract_digest,
-        "dataset_id": train_dataset.get("dataset_id"),
-        "dataset_fingerprint": train_dataset.get("fingerprint"),
-        "train_membership_digest": membership_digest,
-        "train_sample_count": train_sample_count,
-    }
-    observed = {key: artifact.get(key) for key in expected}
-    if observed != expected:
-        message = "Saved normalizer identity does not match the exact task, dataset, fingerprint, and train membership."
-        raise ValueError(message)
-    state = artifact.get("state")
-    if not isinstance(state, Mapping):
-        message = "Saved normalizer artifact state must be a mapping."
-        raise TypeError(message)
-    data_processor_from_state(state, device="cpu")
-    return {key: cast("Tensor", value).detach().cpu().clone() for key, value in state.items()}
+    return state
 
 
 def fit_data_processor(

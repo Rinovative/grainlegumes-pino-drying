@@ -1,7 +1,7 @@
 """Provide reusable steady Darcy-Brinkman equations and dimensionless diagnostics.
 
 Responsibilities:
-  - Compute incompressible Stokes-Brinkman momentum residuals
+  - Compute Darcy-Brinkman momentum residuals with the stationary COMSOL stress
   - Compute the cross-section volume-flux balance implied by div(u) = 0
   - Derive per-sample characteristic scales from task inputs only
   - Bind the steady-flow task fields outside generic numerical kernels
@@ -21,6 +21,9 @@ Notes:
   Scales per sample, with zero outlet gauge pressure and flow from y-min to y-max:
     dp = mean prescribed inlet pressure, G = dp / L_y, U = K_g G / mu, Q = U L_x,
     where K_g is the geometric mean of sqrt(Kxx Kyy) over the grid.
+  Momentum residual, as in COMSOL's Brinkman interface for incompressible flow:
+    R = -grad(p) + div(tau) - mu K^-1 u,
+    tau = (mu/eps)(grad u + grad u^T - (2/3) div(u) I).
   Dimensionless terms:
     momentum: mean over the cropped interior of (Rx^2 + Ry^2) / G^2
     continuity: mean over rows of ((q(y) - mean_y q) / Q)^2 with q(y) = int v dx
@@ -48,6 +51,8 @@ from .domain_physics_derivatives import DerivativeOperator, crop_interior, infer
 # COMSOL "Air" eta(T) evaluated at the stationary template's T_flow_ref = 300.65 K
 # (27.5 degC); the template takes viscosity from the material at that temperature.
 AIR_DYNAMIC_VISCOSITY = 1.85075e-5
+# The stationary COMSOL template's stress K = (mu/eps)(grad u + grad u^T - (2/3) div(u) I).
+STRESS_TRACE_COEFFICIENT = 2.0 / 3.0
 POROSITY_FLOOR = 1e-6
 PERMEABILITY_SCALE_FLOOR = 1e-30
 PERMEABILITY_DETERMINANT_FLOOR = 1e-4
@@ -327,8 +332,9 @@ def brinkman_momentum_residuals(
     Compute the steady two-dimensional Darcy-Brinkman momentum residual.
 
     The implemented convention is ``-grad(p) + div(tau) - mu K^-1 u`` with
-    ``tau = (mu/eps) * (grad(u) + grad(u)^T)``, matching the incompressible
-    Stokes-Brinkman formulation solved by the stationary COMSOL template.
+    ``tau = (mu/eps) * (grad(u) + grad(u)^T - (2/3) div(u) I)``, the stress
+    of COMSOL's Brinkman interface, which keeps the trace term also for
+    incompressible flow.
 
     Parameters
     ----------
@@ -372,8 +378,8 @@ def brinkman_momentum_residuals(
 
     Notes
     -----
-    ``u`` is the superficial (Darcy) velocity. The incompressible stress has no
-    ``2/3 div(u)`` trace term and no inertial or Forchheimer contribution.
+    ``u`` is the superficial (Darcy) velocity. The trace term vanishes where
+    ``div(u) = 0``; there is no inertial or Forchheimer contribution.
     Stabilization clamps affect porosity and permeability inversion only.
     Inputs are not mutated.
 
@@ -400,8 +406,9 @@ def brinkman_momentum_residuals(
     velocity_y_x, velocity_y_y = derivatives.gradient(velocity_y, spacing_x, spacing_y)
 
     coefficient = viscosity / safe_porosity
-    stress_xx = coefficient * 2.0 * velocity_x_x
-    stress_yy = coefficient * 2.0 * velocity_y_y
+    trace = STRESS_TRACE_COEFFICIENT * (velocity_x_x + velocity_y_y)
+    stress_xx = coefficient * (2.0 * velocity_x_x - trace)
+    stress_yy = coefficient * (2.0 * velocity_y_y - trace)
     stress_xy = coefficient * (velocity_x_y + velocity_y_x)
     stress_divergence_x = derivatives.divergence(stress_xx, stress_xy, spacing_x, spacing_y)
     stress_divergence_y = derivatives.divergence(stress_xy, stress_yy, spacing_x, spacing_y)

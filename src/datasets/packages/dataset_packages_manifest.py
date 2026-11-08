@@ -4,19 +4,21 @@ Responsibilities:
   - Admit the exact current manifest schema and ordered Source evidence
   - Bind each contributing Source's replacement policy and candidate outcomes to the selected cases
   - Bind Dataset semantic identity and optional payload-byte hashes
-  - Load full or metadata-only package evidence from the task-qualified Dataset directory
-  - Verify steady payload bindings
+  - Read full or metadata-only package evidence through one reader of the task-qualified Dataset directory
+  - Bind the identity a loaded payload states about itself (steady tensor payload, transient index) to its manifest
   - Project declared OOD Dataset membership for downstream evaluation planning
 
 Design principles:
   - Dataset-view contracts own channel and task interpretation
+  - One manifest validator and one payload-identity binding serve both Dataset views; only the steady payload embeds provenance
   - The task directory and the fixed payload name must agree with the manifest's own view
   - Evidence-only reads explicitly omit rehashing previously admitted payloads
-  - Unsafe paths and unsupported historical manifest schemas fail closed
+  - Unsafe paths and manifests that differ from the current schema fail closed
+  - A recorded conversion digest is evidence: it must be well formed but is never compared with the running conversion code
   - Declared assignment projection does not admit prediction artifacts
 
 This module does NOT:
-  - Build package payloads, publish manifests or migrate historical schemas
+  - Build package payloads or publish manifests
   - Choose Dataset roles or materialize runtime Dataset samples
   - Establish saved-output existence or evaluation-artifact admissibility
 """
@@ -26,16 +28,17 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.datasets.contracts import dataset_contracts_identity as identity
+from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.contracts import dataset_contracts_views as views
+from src.datasets.contracts.dataset_contracts_identity import DATASET_PACKAGE_SCHEMA_KIND, DATASET_PACKAGE_SCHEMA_VERSION
 
-DATASET_PACKAGE_SCHEMA_KIND: Final = "dataset_selection_manifest"
-DATASET_PACKAGE_SCHEMA_VERSION: Final = 3
-_STEADY_TASK: Final = "steady_flow"
+if TYPE_CHECKING:
+    from pathlib import Path
+
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 PACKAGE_PROVENANCE_KEYS: Final = frozenset(
     {
@@ -66,6 +69,7 @@ PACKAGE_MANIFEST_KEYS: Final = PACKAGE_PROVENANCE_KEYS | {
     "source_case_count",
     "transition_count",
     "payload_sha256",
+    "derived_payload_sha256",
 }
 
 
@@ -93,6 +97,11 @@ def _validate_source_outcomes(manifest: Mapping[str, Any]) -> None:
         or [item["source_name"] for item in outcomes] != source_names
     ):
         msg = "Dataset source_outcomes must describe exactly the contributing Sources, in selection order."
+        raise ValueError(msg)
+    selection = manifest["selection"]
+    # Case references carry only the design name, so a revision label is bound here through each case's recorded Source.
+    if isinstance(selection, Mapping) and selection.get("kind") == "design_order" and selection.get("source_names") != source_names:
+        msg = "Design-order Dataset selection must name exactly the Source its cases come from."
         raise ValueError(msg)
     successful = {
         (item["source_name"], row["material_family"], row["case_id"])
@@ -136,8 +145,10 @@ def validate_manifest_content(
     if not isinstance(manifest, dict) or set(manifest) != PACKAGE_MANIFEST_KEYS:
         msg = f"Dataset manifest keys do not match current contract for {dataset_id!r}."
         raise ValueError(msg)
-    if manifest["schema_kind"] != DATASET_PACKAGE_SCHEMA_KIND or manifest["schema_version"] != DATASET_PACKAGE_SCHEMA_VERSION:
-        msg = "Historical Dataset manifest contract is unsupported."
+    if manifest["schema_kind"] != DATASET_PACKAGE_SCHEMA_KIND or not common.serialization.is_schema_version(
+        manifest["schema_version"], DATASET_PACKAGE_SCHEMA_VERSION
+    ):
+        msg = "Dataset manifest schema_kind or schema_version does not match the current contract."
         raise ValueError(msg)
     invocation = manifest["plan_invocation"]
     if invocation is not None and (
@@ -158,9 +169,6 @@ def validate_manifest_content(
     from . import dataset_packages_reproduction as reproduction  # noqa: PLC0415 -- schema-bound producer evidence
 
     reproduction.validate_producer_evidence(manifest["producer_evidence"])
-    if manifest["builder_identity"].get("implementation_sha256") != reproduction.conversion_implementation_sha256(manifest["dataset_view"]):
-        message = "Dataset conversion/interpreter implementation changed; rebuild from its exact Source selection before consumption."
-        raise ValueError(message)
     _positive_int(manifest["sample_count"], label="sample_count")
     _positive_int(manifest["source_case_count"], label="source_case_count")
     _positive_int(manifest["transition_count"], label="transition_count", zero=True)
@@ -195,17 +203,44 @@ def validate_manifest_content(
     ):
         msg = f"Dataset manifest does not bind exact identity for {dataset_id!r}."
         raise ValueError(msg)
-    if validate_payload_hash and common.serialization.file_sha256(payload_path) != manifest["payload_sha256"]:
-        msg = f"Dataset payload bytes disagree with manifest for {dataset_id!r}."
+    from . import dataset_packages_selection as selection  # noqa: PLC0415 -- selection imports the Generation catalog
+
+    selection.validate_selection_request(reproduction.manifest_selection_request(manifest))
+    derived = manifest["derived_payload_sha256"]
+    if (derived is None) == (task == "transient_drying") or (derived is not None and _SHA256_PATTERN.fullmatch(str(derived)) is None):
+        msg = f"Dataset manifest for {dataset_id!r} must bind the transient PT shard receipt digest exactly for the transient view."
         raise ValueError(msg)
+    if validate_payload_hash:
+        from . import dataset_packages_transient_shards as shards  # noqa: PLC0415 -- the shard module imports this validator
+
+        # A missing payload or receipt raises FileNotFoundError naming its path; only differing bytes are refused here.
+        receipt = payload_path.parent / shards.TRANSIENT_PT_SHARD_DIRECTORY / shards.TRANSIENT_PT_RECEIPT_FILENAME
+        if common.serialization.file_sha256(payload_path) != manifest["payload_sha256"] or (
+            derived is not None and common.serialization.file_sha256(receipt) != derived
+        ):
+            msg = f"Dataset payload bytes disagree with manifest for {dataset_id!r}."
+            raise ValueError(msg)
     return dict(manifest)
 
 
-def _load(task: str, dataset_id: str, *, storage_root: Path | str | None, validate_payload_hash: bool) -> dict[str, Any]:
-    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
-    datasets_root = common.paths.get_datasets_root(storage_root=storage_root)
-    path = common.paths.resolve_dataset_manifest_path(task, logical_id, dataset_root=datasets_root)
-    if not path.is_file() or path.is_symlink():
+def read_dataset_manifest(
+    directory: Path,
+    *,
+    task: str,
+    dataset_id: str,
+    payload_path: Path | None = None,
+    validate_payload_hash: bool = True,
+) -> dict[str, Any]:
+    """Admit the manifest of one Dataset folder against the payload that the same folder owns.
+
+    ``payload_path``, when given, is the payload a caller already loaded; it must be the folder's own payload file.
+    """
+    path = directory / common.paths.DATASET_MANIFEST_FILENAME
+    payload = directory / common.paths.get_dataset_payload_filename(task)
+    if payload_path is not None and (payload_path.parent.resolve() != directory.resolve() or payload_path.name != payload.name):
+        msg = "Dataset folder must own its current selection manifest and payload."
+        raise ValueError(msg)
+    if not directory.is_dir() or directory.is_symlink() or not path.is_file() or path.is_symlink():
         msg = f"Dataset manifest is missing or unsafe: {path}."
         raise FileNotFoundError(msg)
     try:
@@ -213,11 +248,75 @@ def _load(task: str, dataset_id: str, *, storage_root: Path | str | None, valida
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         msg = f"Dataset manifest is unreadable: {path}."
         raise ValueError(msg) from error
-    payload = common.paths.resolve_dataset_path(task, logical_id, dataset_root=datasets_root)
     if not payload.is_file() or payload.is_symlink():
         msg = f"Dataset payload is missing or unsafe: {payload}."
         raise FileNotFoundError(msg)
-    return validate_manifest_content(raw, task=task, dataset_id=logical_id, payload_path=payload, validate_payload_hash=validate_payload_hash)
+    return validate_manifest_content(raw, task=task, dataset_id=dataset_id, payload_path=payload, validate_payload_hash=validate_payload_hash)
+
+
+def _validate_payload_identity(
+    manifest: Mapping[str, Any],
+    *,
+    dataset_id: str,
+    task: str,
+    contract_digest: str,
+    sample_count: int,
+    case_ids: Sequence[str],
+) -> None:
+    """Require the identity a loaded payload states about itself to equal its admitted manifest, for every Dataset view.
+
+    The steady tensor payload and the transient trajectory index both state their Dataset ID, task, channel contract digest,
+    sample count and ordered package case IDs.
+    """
+    if (
+        manifest["dataset_id"] != dataset_id
+        or manifest["registered_task_id"] != task
+        or manifest["channel_contract_digest"] != contract_digest
+        or manifest["sample_count"] != sample_count
+        or [entry["package_case_id"] for entry in manifest["source_case_identities"]] != list(case_ids)
+    ):
+        msg = f"Dataset {manifest['dataset_id']!r} payload identity disagrees with its manifest."
+        raise ValueError(msg)
+
+
+def validate_steady_payload_identity(manifest: Mapping[str, Any], dataset_identity: identity.DatasetIdentity) -> None:
+    """Bind a verified steady tensor payload, which also embeds its selection provenance, to its admitted manifest."""
+    _validate_payload_identity(
+        manifest,
+        dataset_id=dataset_identity.dataset_id,
+        task=dataset_identity.task,
+        contract_digest=dataset_identity.data_contract_digest,
+        sample_count=dataset_identity.sample_count,
+        case_ids=dataset_identity.sample_ids,
+    )
+    selection = dataset_identity.source_selection_identity
+    if (
+        dataset_identity.source_provenance != {key: manifest[key] for key in PACKAGE_PROVENANCE_KEYS}
+        or not isinstance(selection, dict)
+        or selection.get("schema_kind") != identity.SOURCE_SELECTION_SCHEMA_KIND
+        or not common.serialization.is_schema_version(selection.get("schema_version"), identity.SOURCE_SELECTION_SCHEMA_VERSION)
+        or selection.get("source_cases") != manifest["source_case_identities"]
+    ):
+        msg = "Steady Dataset payload provenance disagrees with its manifest."
+        raise ValueError(msg)
+
+
+def validate_transient_payload_identity(manifest: Mapping[str, Any], index: Mapping[str, Any]) -> None:
+    """Bind an admitted transient trajectory index, and through it the PT shards built from it, to its manifest."""
+    _validate_payload_identity(
+        manifest,
+        dataset_id=index["dataset_id"],
+        task=index["dataset_view"],
+        contract_digest=index["contract_digest"],
+        sample_count=index["sample_count"],
+        case_ids=[case["package_case_id"] for case in index["cases"]],
+    )
+
+
+def _load(task: str, dataset_id: str, *, storage_root: Path | str | None, validate_payload_hash: bool) -> dict[str, Any]:
+    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
+    directory = common.paths.resolve_dataset_dir(task, logical_id, dataset_root=common.paths.get_datasets_root(storage_root=storage_root))
+    return read_dataset_manifest(directory, task=task, dataset_id=logical_id, validate_payload_hash=validate_payload_hash)
 
 
 def load_package_manifest(task: str, dataset_id: str, *, storage_root: Path | str | None = None) -> dict[str, Any]:
@@ -255,10 +354,10 @@ def declared_evaluation_assignments(
         raise ValueError(msg)
 
     primary_manifest = load_package_manifest_evidence(task, train_dataset_id, storage_root=storage_root)
-    primary_partition = primary_manifest["case_partition"]
-    if primary_partition is None:
-        msg = f"Training Dataset {train_dataset_id!r} must declare a fixed case partition."
-        raise ValueError(msg)
+    materials = {entry["package_case_id"]: entry["source"]["material_family"] for entry in primary_manifest["source_case_identities"]}
+    primary_partition = partition_contract.validate_training_partition(
+        primary_manifest["case_partition"], dataset_id=train_dataset_id, case_ids=tuple(materials), material_by_case=materials
+    )
 
     declared_ids: list[str] = []
     for dataset_id in additional_dataset_ids:
@@ -273,32 +372,3 @@ def declared_evaluation_assignments(
     return [
         {"dataset_id": dataset_id, "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []} for dataset_id in declared_ids
     ]
-
-
-def load_steady_package_manifest(
-    dataset_id: str,
-    *,
-    dataset_identity: identity.DatasetIdentity,
-    dataset_path: Path,
-    metadata_root: Path,
-) -> dict[str, Any]:
-    """Bind an admitted steady payload to its exact package manifest."""
-    logical_id = common.paths.validate_logical_name(dataset_id, label="dataset_id")
-    path = common.paths.resolve_dataset_manifest_path(_STEADY_TASK, logical_id, dataset_root=metadata_root)
-    payload = Path(dataset_path)
-    if not path.is_file() or path.is_symlink() or not payload.is_file() or payload.is_symlink():
-        msg = "Steady Dataset manifest or payload is missing or unsafe."
-        raise FileNotFoundError(msg)
-    manifest = validate_manifest_content(json.loads(path.read_text(encoding="utf-8")), task=_STEADY_TASK, dataset_id=logical_id, payload_path=payload)
-    provenance_keys = PACKAGE_PROVENANCE_KEYS
-    provenance = {key: manifest[key] for key in provenance_keys}
-    if (
-        manifest["dataset_view"] != "steady_flow"
-        or manifest["registered_task_id"] != dataset_identity.task
-        or manifest["sample_count"] != dataset_identity.sample_count
-        or dataset_identity.dataset_id != logical_id
-        or dataset_identity.source_provenance != provenance
-    ):
-        msg = "Steady Dataset payload identity disagrees with its manifest."
-        raise ValueError(msg)
-    return manifest

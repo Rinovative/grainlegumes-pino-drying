@@ -26,7 +26,7 @@ import h5py
 import numpy as np
 import torch
 
-from src import common, datasets, domain, generation
+from src import datasets, domain, generation
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
@@ -324,9 +324,8 @@ def _file_stat(path: Path) -> tuple[int, int]:
 
 def _read_source_balances(path: Path, *, expected_sha256: str, admitted_stat: tuple[int, int]) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Read one admitted source's global series and constants, re-hashing it only if it changed."""
-    if _file_stat(path) != admitted_stat and common.serialization.file_sha256(path) != expected_sha256:
-        msg = f"Transient source changed after Dataset admission: {path}."
-        raise ValueError(msg)
+    if _file_stat(path) != admitted_stat:
+        datasets.contracts.identity.require_admitted_source_bytes(path, expected_sha256)
     profiles = generation.contracts.profiles
     with h5py.File(path, "r") as handle:
         values = _named_array(handle, "global/values", names=tuple(profiles.GLOBAL_FIELD_NAMES), units=tuple(profiles.GLOBAL_FIELD_UNITS))
@@ -376,18 +375,14 @@ def iter_transient_reference_cases(
         raise ValueError(msg)
     factory = datasets.runtime.factory
     contract = datasets.contracts.transient
-    dataset = factory.create_dataset(
+    dataset = factory.create_hdf5_source_dataset(
         factory.DatasetRequest(
             dataset_id=dataset_id,
             dataset_view=_TRANSIENT_TASK_ID,
             transient_sampling=contract.TransientSamplingSpec(mode="trajectory"),
             storage_root=storage_root,
-            transient_backend_preference="canonical_hdf5",
         )
     )
-    if not isinstance(dataset, datasets.runtime.transient.TransientPhysicalDataset):
-        msg = f"Dataset {dataset_id!r} did not resolve to a transient runtime."
-        raise TypeError(msg)
     step = contract.TRANSIENT_STEP_CONTRACT
     state_names = tuple(field.name for field in step.dynamic_state)
     static_names = tuple(field.name for field in step.static_spatial_conditioning)

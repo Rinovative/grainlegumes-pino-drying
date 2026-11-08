@@ -1,7 +1,7 @@
 """Protect transient completed-history admission and adapter rollback.
 
 Responsibilities:
-  - Check completed history, one-ahead crash reconciliation, live non-finite metric classification, exact restore, and handoff state
+  - Check completed history, ahead-of-checkpoint reconciliation, live non-finite metric classification, exact restore, and handoff state
 
 Design principles:
   - Late restore failures roll back common and adapter state transactionally
@@ -76,7 +76,6 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
         "split_contract_digest": digest("split"),
         "split_membership_digests": {
             "train": digest("train-membership"),
-            "scaling_train_one_step": digest("scaling-membership"),
             "validation": digest("validation-membership"),
             "id_test": digest("id-test-membership"),
             "additional_evaluation": digest("additional-evaluation-membership"),
@@ -146,21 +145,20 @@ def test_completed_history_admission_is_exact_and_read_only(
     assert (path.read_bytes() if path.exists() else None) == before
 
 
-def test_reconcile_history_repairs_only_one_ahead_crash_record(tmp_path: Any) -> None:
-    """Retain exact history, truncate one crash-ahead record, and fail closed otherwise."""
+def test_reconcile_history_truncates_records_ahead_of_the_checkpoint_only(tmp_path: Any) -> None:
+    """Retain exact history, truncate epochs trained after the restored last, and fail closed when history is behind."""
     identity = _identity()
     exact = _history_payload(identity, epochs=2)
     _write_history(tmp_path, exact)
     assert history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2) == exact
 
-    ahead = _history_payload(identity, epochs=3)
-    _write_history(tmp_path, ahead)
-    reconciled = history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
-    assert len(reconciled["epochs"]) == 2
-    assert len(json.loads(history.history_path(tmp_path).read_text(encoding="utf-8"))["epochs"]) == 2
-
     _write_history(tmp_path, _history_payload(identity, epochs=4))
-    with pytest.raises(ValueError, match="more than one"):
+    reconciled = history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
+    assert reconciled == exact
+    assert json.loads(history.history_path(tmp_path).read_text(encoding="utf-8")) == exact
+
+    _write_history(tmp_path, _history_payload(identity, epochs=1))
+    with pytest.raises(ValueError, match="behind"):
         history.reconcile_history(tmp_path, task="transient_drying", run_name="run", checkpoint_identity=identity, completed_epoch=2)
     _write_history(tmp_path, _history_payload(_identity("other"), epochs=2))
     with pytest.raises(ValueError, match="identity"):
@@ -239,14 +237,13 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
         model=source_model,
         optimizer=source_optimizer,
         scheduler=None,
-        scaler=None,
-        amp_enabled=False,
         loss=source_loss,
         best_metric=0.5,
         best_epoch=1,
         objective_history=[{"epoch": 1, "objective_id": "mse", "value": 0.5}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
+        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
         adapter=source_adapter,
     )
     model, optimizer, loss, loader = _components(20)
@@ -257,8 +254,6 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
         model=model,
         optimizer=optimizer,
         scheduler=None,
-        scaler=None,
-        amp_enabled=False,
         loss=loss,
         train_loader=loader,
         adapter=adapter,
@@ -287,8 +282,6 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
             model=model,
             optimizer=optimizer,
             scheduler=None,
-            scaler=None,
-            amp_enabled=False,
             loss=loss,
             train_loader=loader,
             adapter=adapter,
@@ -318,14 +311,13 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
         model=source_model,
         optimizer=source_optimizer,
         scheduler=None,
-        scaler=None,
-        amp_enabled=False,
         loss=source_loss,
         best_metric=0.2,
         best_epoch=2,
         objective_history=[{"epoch": 2, "objective_id": "mse", "value": 0.2}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
+        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
         adapter=source_adapter,
     )
     model, optimizer, loss, loader = _components(40)
@@ -337,8 +329,6 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
         model=model,
         optimizer=optimizer,
         scheduler=None,
-        scaler=None,
-        amp_enabled=False,
         loss=loss,
         train_loader=loader,
     )
@@ -362,8 +352,6 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
             model=model,
             optimizer=optimizer,
             scheduler=None,
-            scaler=None,
-            amp_enabled=False,
             loss=loss,
             train_loader=loader,
         )
@@ -383,14 +371,13 @@ def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
         model=source_model,
         optimizer=source_optimizer,
         scheduler=None,
-        scaler=None,
-        amp_enabled=False,
         loss=source_loss,
         best_metric=0.3,
         best_epoch=1,
         objective_history=[{"epoch": 1, "objective_id": "mse", "value": 0.3}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
+        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
         adapter=_Adapter(5),
     )
     assert set(payload).isdisjoint({"optimizer_state_dict", "python_rng_state", "train_loader_generator_state", "next_epoch"})
@@ -404,8 +391,6 @@ def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
             model=model,
             optimizer=optimizer,
             scheduler=None,
-            scaler=None,
-            amp_enabled=False,
             loss=loss,
             train_loader=loader,
         )

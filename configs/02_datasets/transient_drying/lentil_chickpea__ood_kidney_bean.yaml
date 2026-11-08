@@ -1,0 +1,35 @@
+# Role: Dataset plan: materials, case counts and split of one Dataset. Edit: whenever you define a Dataset.
+# Reduced transient set: lentil and chickpea in distribution, kidney_bean held out as material OOD.
+# Validation and ID-test hold 15 trajectories per material: selection rolls whole validation trajectories out autonomously.
+schema_kind: dataset_plan
+schema_version: 1
+task: transient_drying  # Learning task this Dataset is built for.
+generation:
+  sources_config: configs/01_generation/physical_model/sources.yaml  # Literature/evidence catalogue used by the referenced physical parameters.
+  registry_config: configs/01_generation/physical_model/registry.yaml  # Registered material/parameter definitions, units and sampling categories.
+  common_config: configs/01_generation/physical_model/common.yaml  # Shared physical constants, grid and physical output schedule defaults.
+  operations_config: configs/01_generation/physical_model/fixed_bed.yaml  # Bed geometry and operating assumptions; this plan does not duplicate them.
+  profile_config: configs/01_generation/physical_model/profiles/transient_drying.yaml  # Transient task/model, channels and task-specific physical settings.
+  execution_config: configs/01_generation/execution.yaml  # Slurm resources, concurrency, timeouts and retry policy (not physics).
+  sampling:
+    method: lhs  # Full-design LHS per material. Changing a count creates a different design, not a prefix.
+    seed_base: 9200  # Generation root of the transient task; material, block and candidate seeds derive from it. Independent of the split and training seeds.
+  minimum_success_rate: 0.6  # Per material: failed candidates are replaced (Sobol, after the originals) until the count succeeds; admission stops once the one-sided 95 % upper bound of the success rate falls below this value (the 02./03.11. smokes solved 12 of 17, every failure a stall).
+  domain_profile: reference_range  # Natural/reference physical sampling branches from the maintained configs; a physical domain label, not a train/test or OOD assignment.
+materials:
+  lentil:
+    count: 100  # Original physical design size and selected-success target.
+    role: id  # id splits this material into Train/validation/ID-test below.
+  chickpea:
+    count: 100
+    role: id
+  kidney_bean:
+    count: 30  # Whole material held out; evaluated as OOD, never used for training or selection.
+    role: ood
+split:
+  seed: 9  # Dataset seed; with the Generation design order of the selected cases it alone fixes the split.
+  # Fractions apply separately per ID material, before transition/window expansion: floors int(N*train), int(N*validation), remainder to ID-test.
+  # N=100 gives 70/15/15 per material.
+  train_fraction: 0.7
+  validation_fraction: 0.15
+  id_test_fraction: 0.15

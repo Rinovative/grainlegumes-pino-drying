@@ -54,7 +54,7 @@ def test_only_a_horizon_deviating_from_the_configured_one_enters_the_name() -> N
 def test_replacement_batch_locators_extend_the_original_name_and_regime_by_the_candidate_ordinal() -> None:
     """One resolver owns the batch name and locator regime of originals and canonical replacements."""
     assert config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {}) == ("steady_flow__lentil__natural", "natural")
-    design = {"schema_version": config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION, "candidate_ordinal": 3}
+    design = {"schema_version": sampling_service.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION, "candidate_ordinal": 3}
     assert config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {"supplemental_design": design}) == (
         "steady_flow__lentil__natural__replacement_0003",
         "natural_replacement_0003",
@@ -64,7 +64,7 @@ def test_replacement_batch_locators_extend_the_original_name_and_regime_by_the_c
 @pytest.mark.parametrize("ordinal", [0, -1, True, "1", 1.0, None])
 def test_replacement_batch_locators_reject_an_invalid_candidate_ordinal(ordinal: Any) -> None:
     """A canonical replacement without an integer ordinal of at least one has no batch identity."""
-    design = {"schema_version": config_service.CANONICAL_CAMPAIGN_SCHEMA_VERSION, "candidate_ordinal": ordinal}
+    design = {"schema_version": sampling_service.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION, "candidate_ordinal": ordinal}
     with pytest.raises(ValueError, match="invalid candidate ordinal"):
         config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {"supplemental_design": design})
 
@@ -209,7 +209,6 @@ def test_normal_resource_overrides_preserve_science_and_persist_effective_execut
     assert values["cluster"]["concurrent_cases_per_node"] == 3
     assert values["runtime"]["timeout_seconds"] == 1500
     assert values["runtime"]["graceful_stop_reserve_seconds"] == 300
-    assert values["runtime"]["maximum_failed_cases"] == 1
     assert values["runtime"]["license_wait"]["enabled"] is False
     assert values["runtime"]["license_wait"]["in_allocation_retry"]["enabled"] is False
     assert values["submission"]["max_admission_cases"] == 4

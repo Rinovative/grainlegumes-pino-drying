@@ -2,8 +2,9 @@
 
 Responsibilities:
   - Resolve the saved task contract and reconstruct the semantic model kind
-  - Load saved model weights
+  - Load saved model weights only when the run's recorded model digest equals the running model code
   - Load saved normalizer state into a data processor
+  - Reopen each saved split part through the shared runtime factory and refuse drift from its saved identity
   - Build deterministic split-aware evaluation datasets and dataloaders
   - Validate saved field contracts against model and dataset channels
 
@@ -33,14 +34,14 @@ Notes:
       1. Load the saved resolved configuration
       2. Reconstruct the model and load best-checkpoint weights
       3. Restore the admitted normalizer state without refitting
-      4. Admit and apply the requested saved train, evaluation, or OOD membership
+      4. Admit the requested saved train, evaluation, or OOD membership, reopen its parts by Dataset ID and apply it
       5. Build the deterministic loader and return it with the model, processor, and device
 
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -49,7 +50,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from src import common, datasets, experiments
+from src import common, datasets, experiments, learning
 
 from .. import learning_device  # noqa: TID252
 from ..models import learning_models_factory  # noqa: TID252
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
 # ======================================================================
 
 SplitRole = Literal["train", "validation", "id_test", "additional_evaluation"]
+_MODEL_CHANGED_REMEDY = "evaluate it with the model code it was trained with or train a new run with --revision <label>"
 
 
 @dataclass(frozen=True)
@@ -75,21 +77,24 @@ class SplitSelection:
     ----------
     role : {"train", "validation", "id_test", "additional_evaluation"}
         Semantic saved membership being reconstructed.
-    dataset_paths : tuple[pathlib.Path, ...]
-        Current package files resolved for the saved logical dataset selection.
-    evidence : datasets.preprocessing.splits.SplitRoleEvidence
-        Admitted source identity, ordered membership, counts, and digest.
+    evidence : tuple[datasets.preprocessing.splits.SplitRoleEvidence, ...]
+        Admitted source identity and ordered membership of each part; one part for the fixed-partition roles,
+        one per additional Evaluation source otherwise.
 
     """
 
     role: SplitRole
-    dataset_paths: tuple[Path, ...]
-    evidence: datasets.preprocessing.splits.SplitRoleEvidence
+    evidence: tuple[datasets.preprocessing.splits.SplitRoleEvidence, ...]
 
     @property
     def indices(self) -> torch.Tensor:
-        """Return isolated ordered source indices for this selection."""
-        return self.evidence.indices
+        """Return isolated ordered positions in the ordered combination of the parts' complete Datasets."""
+        positions: list[int] = []
+        offset = 0
+        for part in self.evidence:
+            positions.extend(offset + position for position in part.index_values)
+            offset += part.full_count
+        return torch.tensor(positions, dtype=torch.long)
 
 
 class IndexedSubset(Dataset[dict[str, Any]]):
@@ -189,112 +194,39 @@ class IndexedSubset(Dataset[dict[str, Any]]):
 # ======================================================================
 
 
-def _data_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the resolved data config section after validating its shape."""
-    data_cfg = config.get("data")
-    if not isinstance(data_cfg, Mapping):
-        msg = "Run config must contain a mapping at data."
-        raise TypeError(msg)
-    return data_cfg
-
-
-def _configured_dataset_ids(config: Mapping[str, Any], role: SplitRole, *, dataset_root: Path) -> tuple[str, ...]:
-    """
-    Resolve the ordered package IDs behind one saved split role.
-
-    Train, validation and ID-test share the training Dataset. Additional
-    evaluation combines the Datasets that declare OOD cases, in the same order
-    the training loaders used.
-    """
-    data_cfg = _data_section(config)
-    train_dataset = common.paths.validate_logical_name(data_cfg.get("train_dataset"), label="data.train_dataset")
-    if role != "additional_evaluation":
-        return (train_dataset,)
-    raw_additional = data_cfg.get("additional_evaluation_datasets")
-    if not isinstance(raw_additional, list):
-        msg = "Run config data.additional_evaluation_datasets must be a list."
-        raise TypeError(msg)
-    components = datasets.runtime.training.additional_evaluation_components(
-        train_dataset,
-        tuple(raw_additional),
-        storage_root=common.paths.storage_root_for_datasets_root(dataset_root),
-    )
-    return tuple(dataset_id for dataset_id, _ in components)
-
-
 def _validate_split_role(split: str) -> SplitRole:
     """Validate the requested split role."""
-    if split not in datasets.preprocessing.splits.SPLIT_ROLES:
-        allowed = ", ".join(datasets.preprocessing.splits.SPLIT_ROLES)
-        msg = f"Unknown inference split {split!r}. Expected one of: {allowed}."
+    allowed_roles = (*datasets.preprocessing.splits.ID_SPLIT_ROLES, "additional_evaluation")
+    if split not in allowed_roles:
+        msg = f"Unknown inference split {split!r}. Expected one of: {', '.join(allowed_roles)}."
         raise ValueError(msg)
     return cast("SplitRole", split)
 
 
-def _normalize_dataset_paths(
-    value: str | Path | Sequence[str | Path] | None,
-) -> tuple[Path, ...] | None:
-    """Normalize an optional one-or-more-package path override."""
-    if value is None:
-        return None
-    raw = (value,) if isinstance(value, (str, Path)) else tuple(value)
-    if not raw or any(not isinstance(item, (str, Path)) for item in raw):
-        msg = "dataset_path must contain one or more string or Path values."
-        raise TypeError(msg)
-    return tuple(Path(item).expanduser() for item in raw)
-
-
-def _select_split(
-    *,
-    config: Mapping[str, Any],
-    split_indices: Mapping[str, Any],
-    split: str,
-    dataset_root: Path,
-    dataset_paths: tuple[Path, ...] | None,
-) -> SplitSelection:
-    """
-    Bind one requested split role to saved membership and current package paths.
-
-    The saved combined logical identity must agree with ``config.yaml``.
-    Explicit paths change location only; later fingerprint validation still
-    prevents substitution of different package content.
-    """
+def _select_split(*, split_indices: Mapping[str, Any], split: str) -> SplitSelection:
+    """Bind one requested split role to its admitted ordered parts; run admission already bound them to ``config.yaml``."""
     role = _validate_split_role(split)
-    split_contract = datasets.preprocessing.splits.admit_split_contract(split_indices)
-    role_evidence = split_contract.role(role)
-    configured_dataset_ids = _configured_dataset_ids(config, role, dataset_root=dataset_root)
-    saved_dataset_id = role_evidence.source.dataset_id
-    expected_dataset_id = datasets.contracts.identity.combined_dataset_id(configured_dataset_ids)
-    if saved_dataset_id != expected_dataset_id:
-        msg = f"Saved split dataset id for {role!r} does not match config.yaml: {saved_dataset_id!r} != {expected_dataset_id!r}."
-        raise RuntimeError(msg)
-    task = str(config["task"])
-    selected_paths = dataset_paths or tuple(
-        common.paths.resolve_dataset_path(task, dataset_id, dataset_root=dataset_root) for dataset_id in configured_dataset_ids
-    )
-    if len(selected_paths) != len(configured_dataset_ids):
-        msg = "Explicit dataset paths must align with the configured package selection."
+    split_contract = datasets.preprocessing.splits.admit_split(split_indices)
+    parts = split_contract.additional_evaluation if role == "additional_evaluation" else (split_contract.role(role),)
+    if not parts:
+        msg = f"Saved split has no {role!r} membership."
         raise ValueError(msg)
-    return SplitSelection(
-        role=role,
-        dataset_paths=selected_paths,
-        evidence=role_evidence,
-    )
+    return SplitSelection(role=role, evidence=tuple(parts))
 
 
-def _validate_split_indices_for_dataset(
-    *,
-    selection: SplitSelection,
-    dataset: Dataset[Any],
-) -> None:
-    """Bind admitted role evidence to the loaded dataset identity."""
-    dataset_identity = getattr(dataset, "identity", None)
-    if not isinstance(dataset_identity, datasets.contracts.identity.DatasetIdentity):
-        msg = "Inference dataset must expose a verified DatasetIdentity."
-        raise TypeError(msg)
-    if selection.evidence.source != dataset_identity:
-        msg = f"Loaded dataset identity does not match saved {selection.role!r} split evidence."
-        raise RuntimeError(msg)
+def _open_split_sources(selection: SplitSelection, *, dataset_root: Path) -> list[datasets.runtime.steady.SteadyFlowDataset]:
+    """Open each saved part's current package through the shared runtime factory and refuse one whose identity drifted."""
+    storage_root = common.paths.storage_root_for_datasets_root(dataset_root)
+    packages = []
+    for part in selection.evidence:
+        request = datasets.runtime.factory.DatasetRequest(dataset_id=part.dataset_id, dataset_view="steady_flow", storage_root=storage_root)
+        package = datasets.runtime.factory.create_dataset(request)
+        if not isinstance(package, datasets.runtime.steady.SteadyFlowDataset):
+            msg = "Steady Dataset factory returned an unexpected runtime."
+            raise TypeError(msg)
+        datasets.preprocessing.splits.require_source_identity(package, part.dataset, role=part.name, case_ids=part.case_ids)
+        packages.append(package)
+    return packages
 
 
 # ======================================================================
@@ -388,7 +320,6 @@ def load_inference_context_with_resolution(
     *,
     run_dir: str | Path,
     device_resolution: learning_device.DeviceResolution,
-    dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "id_test",
     batch_size: int = 1,
@@ -409,12 +340,10 @@ def load_inference_context_with_resolution(
         `normalizer.pt`, `best_checkpoint.pt`, and `split_indices.pt`.
     device_resolution : learning_device.DeviceResolution
         Immutable runtime decision resolved by the inference or artifact boundary.
-    dataset_path : str | Path | Sequence[str | Path] | None, optional
-        Optional exact final-dataset package path or ordered package paths.
-        Fingerprints and ordered identity must match the saved split.
     dataset_root : str | Path | None, optional
-        Current explicit dataset root used with the saved logical dataset id.
-        Defaults to the current central dataset-root resolution.
+        Current explicit dataset root, which must be the ``02_datasets`` area of a storage root; each saved logical
+        Dataset ID is opened under it through its manifest, and the opened identity and fixed partition must equal
+        the saved split part. Defaults to the central dataset-root resolution.
     split : {"train", "validation", "id_test", "additional_evaluation"}, optional
         Saved split role to load. Train, validation and ID-test use the saved
         training Dataset membership; ``additional_evaluation`` uses the saved holdout membership against the evaluation
@@ -451,21 +380,21 @@ def load_inference_context_with_resolution(
         raise TypeError(msg)
     device = device_resolution.device
     run_dir = Path(run_dir)
-    requested_dataset_paths = _normalize_dataset_paths(dataset_path)
     current_dataset_root = Path(dataset_root).expanduser() if dataset_root is not None else common.paths.get_datasets_root()
     evaluable_run = experiments.run.validate_evaluable_run(run_dir)
 
     cfg = evaluable_run["config"]
+    # Loading the weights continues the trained computation, so the recorded model code must be the running one.
+    common.code_identity.require_current_implementation(
+        learning.training.checkpoint.MODEL_PROJECTIONS[cfg["task"]],
+        cfg["producer"]["model_sha256"],
+        unit=f"Run {evaluable_run['scientific_run_name']}",
+        remedy=_MODEL_CHANGED_REMEDY,
+    )
     split_indices = evaluable_run["split_indices"]
     input_channels, output_channels = _field_contract(cfg)
     seed_plan = experiments.run.configure_reproducibility(cfg, device=device)
-    split_selection = _select_split(
-        config=cfg,
-        split_indices=split_indices,
-        split=str(split),
-        dataset_root=current_dataset_root,
-        dataset_paths=requested_dataset_paths,
-    )
+    split_selection = _select_split(split_indices=split_indices, split=str(split))
 
     experiments.run.seed_process(seed_plan["model_init"], device=device)
     model = _build_model_from_config(cfg, device=device)
@@ -486,13 +415,7 @@ def load_inference_context_with_resolution(
 
     processor = datasets.preprocessing.normalization.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
 
-    task = experiments.config.loader.validate_resolved_task_contract(cfg)
-    source_packages = [datasets.runtime.steady.create_dataset(path, task=task) for path in split_selection.dataset_paths]
-    source_dataset = datasets.preprocessing.splits.combine_identity_datasets(source_packages)
-    _validate_split_indices_for_dataset(
-        selection=split_selection,
-        dataset=source_dataset,
-    )
+    source_dataset = datasets.preprocessing.splits.combine_identity_datasets(_open_split_sources(split_selection, dataset_root=current_dataset_root))
     # ------------------------------
     # HARD GUARDS: field contract <-> dataset
     # ------------------------------
@@ -516,7 +439,6 @@ def load_inference_context_with_resolution(
 def load_inference_context(
     *,
     run_dir: str | Path,
-    dataset_path: str | Path | Sequence[str | Path] | None = None,
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "id_test",
     batch_size: int = 1,
@@ -529,10 +451,8 @@ def load_inference_context(
     ----------
     run_dir : str | Path
         Completed saved run directory.
-    dataset_path : str | Path | Sequence[str | Path] | None, optional
-        Optional exact dataset package path or ordered package paths bound to saved identity.
     dataset_root : str | Path | None, optional
-        Current independent dataset root.
+        Current dataset root; must be the ``02_datasets`` area of a storage root, under which the factory opens each saved Dataset.
     split : {"train", "validation", "id_test", "additional_evaluation"}, optional
         Saved split role.
     batch_size : int, optional
@@ -554,7 +474,6 @@ def load_inference_context(
     return load_inference_context_with_resolution(
         run_dir=run_dir,
         device_resolution=resolution,
-        dataset_path=dataset_path,
         dataset_root=dataset_root,
         split=split,
         batch_size=batch_size,

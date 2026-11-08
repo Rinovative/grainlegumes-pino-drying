@@ -143,7 +143,7 @@ def _case(case_id: str, *, omit: str | None = None) -> timing.TransientTimingCas
         components,
         "cpu",
         "float32",
-        "canonical_hdf5",
+        "a" * 64,
         1,
         cold_timings={"drying_no_rollout_model_seconds": 1_000.0},
         unavailable_reasons=({"comsol_process_seconds": "persisted process timing unavailable"} if omit == "comsol_process_seconds" else {}),
@@ -213,8 +213,7 @@ def test_timing_adapter_preserves_measured_boundaries_and_unavailable_pipeline()
             "complete_execution_seconds": 370.12,
             "component_timing_availability": {"generation_compute_end_to_end_seconds": "queue_wait_not_measured"},
         },
-        dataset_backend="canonical_hdf5",
-        pt_identity=None,
+        pt_identity="a" * 64,
         runtime_metadata={
             "resolved_device": "cpu",
             "processor": "test-cpu",
@@ -394,3 +393,8 @@ def test_serialized_timing_admission_recomputes_aggregates_and_rejects_coercion(
     coerced["cases"][0]["warmup_passes"] = "1"
     with pytest.raises(TypeError, match="scalar fields"):
         timing.admit_transient_timing_report(coerced)
+
+    stale = json.loads(json.dumps(serialized))
+    stale["cases"][0]["dataset_backend"] = "pt_shards"
+    with pytest.raises(ValueError, match="fields are invalid"):
+        timing.admit_transient_timing_report(stale)

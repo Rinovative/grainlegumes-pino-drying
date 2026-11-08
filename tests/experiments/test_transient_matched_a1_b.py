@@ -4,6 +4,7 @@ Responsibilities:
   - Check matched branches, immutable receipts, exact sample cursors, caps, and recovery reporting
   - Check length-homogeneous matched batches, terminal zero cursors, and finalize-only terminal resume
   - Check that only the matched A0 best keeps training state, and partial-epoch evaluation bests
+  - Check that completed terminal controller and curriculum values are valid and equal the final history record
 
 Design principles:
   - Committed compute and unconsumed samples determine restart boundaries
@@ -19,7 +20,7 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
@@ -35,7 +36,9 @@ from src.experiments.cli import cli_train
 from src.learning.training import learning_training_adapter as adapter_contract
 from src.learning.training import learning_training_checkpoint as checkpoint_service
 from src.learning.training import learning_training_loop as loop
+from src.learning.transient import learning_transient_adapter as transient_adapter
 from src.learning.transient import learning_transient_curriculum as curriculum
+from src.learning.transient import learning_transient_history as transient_history
 from src.learning.transient.learning_transient_handoff import HANDOFF_DIRECTORY
 
 if TYPE_CHECKING:
@@ -251,7 +254,6 @@ def _loop_identity() -> dict[str, Any]:
         "split_contract_digest": digest("split"),
         "split_membership_digests": {
             "train": digest("train-membership"),
-            "scaling_train_one_step": digest("scaling-membership"),
             "validation": digest("validation-membership"),
             "id_test": digest("id-membership"),
             "additional_evaluation": digest("additional-evaluation-membership"),
@@ -312,7 +314,6 @@ def test_budget_receipt_is_immutable_and_binds_exact_a0_origin(tmp_path: Path) -
             "budget_complete": True,
             "clock_kind": "train_seconds",
             "train_seconds": 0.31,
-            "successful_optimizer_steps": 3,
             "post_handoff_optimizer_steps": 3,
             "batch_cursor": 1,
         },
@@ -348,7 +349,6 @@ def test_matched_a1_receipt_rejects_budget_value_that_differs_from_train_seconds
             "budget_complete": True,
             "clock_kind": "train_seconds",
             "train_seconds": 0.31,
-            "successful_optimizer_steps": 3,
             "post_handoff_optimizer_steps": 3,
             "batch_cursor": 1,
         },
@@ -423,8 +423,6 @@ def test_fake_clock_cap_stops_after_committed_group_and_resumes_exact_cursor(mon
         torch.nn.MSELoss(),
         torch.device("cpu"),
         adapter,
-        scaler=None,
-        use_amp=False,
         max_optimizer_steps=1,
     )
     assert first["transient/train/operational_cap_reached"] == 1
@@ -447,8 +445,6 @@ def test_fake_clock_cap_stops_after_committed_group_and_resumes_exact_cursor(mon
         torch.nn.MSELoss(),
         torch.device("cpu"),
         adapter,
-        scaler=None,
-        use_amp=False,
         max_train_seconds=committed_seconds + 0.01,
     )
     assert second["transient/train/operational_cap_reached"] == 1
@@ -556,7 +552,7 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
     run_service.config_loader.save_yaml(requested, common.paths.resolve_run_config_path(run_dir))
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": run_service.RUN_SUMMARY_SCHEMA_VERSION, "status": "interrupted", "completed_epoch": 1},
+        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "status": "interrupted", "completed_epoch": 1},
     )
     for path in (
         common.paths.resolve_split_indices_path(run_dir),
@@ -565,7 +561,7 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
         common.paths.resolve_best_checkpoint_file(run_dir),
     ):
         path.touch()
-    monkeypatch.setattr(run_service, "_load_mapping_artifact", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_service, "_read_saved_data_artifacts", lambda *_args: (SimpleNamespace(as_payload=dict), {}))
     monkeypatch.setattr(run_service, "_validate_saved_data_contract", lambda *_args: None)
     monkeypatch.setattr(checkpoint_service, "build_checkpoint_identity", lambda *_args, **_kwargs: {})
     validated_roles: list[str] = []
@@ -644,9 +640,7 @@ def test_trailing_accumulation_group_checks_cap_and_excludes_stop_iteration_wait
     optimizer = SGD(model.parameters(), lr=0.001)
     adapter = _Adapter()
     adapter.gradient_accumulation_steps = 3
-    result = loop._train_adapter_one_epoch(
-        model, loader, optimizer, torch.nn.MSELoss(), torch.device("cpu"), adapter, scaler=None, use_amp=False, **cap
-    )
+    result = loop._train_adapter_one_epoch(model, loader, optimizer, torch.nn.MSELoss(), torch.device("cpu"), adapter, **cap)
     assert result["transient/train/operational_cap_reached"] == 1
     assert result["optimizer_steps"] == 1
     assert sampler.cursor == 2
@@ -717,7 +711,6 @@ def test_train_loop_partial_cap_resumes_same_epoch_then_selects_terminal_partial
         expected_role="best",
         payload_kind=checkpoint_service.best_payload_kind(config),
         scheduler_expected=False,
-        amp_expected=False,
         require_best=True,
         adapter_expected=True,
     )
@@ -773,8 +766,6 @@ def test_only_the_matched_a0_best_keeps_its_training_state_for_handoff(tmp_path:
             model=target,
             optimizer=target_optimizer,
             scheduler=None,
-            scaler=None,
-            amp_enabled=False,
             loss=torch.nn.MSELoss(),
             train_loader=DataLoader(values, batch_size=1, shuffle=True, generator=torch.Generator().manual_seed(5), num_workers=0),
         )
@@ -888,7 +879,6 @@ def test_budget_crossing_in_the_first_trajectory_batch_publishes_a_loadable_zero
             expected_role="last",
             payload_kind="full",
             scheduler_expected=False,
-            amp_expected=False,
             require_best=True,
             adapter_expected=True,
         )
@@ -982,14 +972,14 @@ def test_matched_trajectory_batches_never_mix_lengths_and_resume_on_batch_bounda
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "interrupted"])
-@pytest.mark.parametrize("historical_missing_coverage", [False, True])
+@pytest.mark.parametrize("unpublished_prior_attempt", [False, True])
 def test_completed_summary_refreshes_prior_budget_unmet_clocks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     terminal_status: str,
-    historical_missing_coverage: bool,
+    unpublished_prior_attempt: bool,
 ) -> None:
-    """Preserve capped attempts across completion, failure, interruption, and unknown history."""
+    """Preserve capped attempts across completion, failure, interruption, and an attempt that was killed before publishing its duration."""
     config = configs.resolve(configs.direct_config(), output_root=tmp_path)
     run_dir = run_service.prepare_fresh_run(config, run_dir=tmp_path / "run")
     processor = SimpleNamespace(
@@ -997,11 +987,17 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
         out_normalizer=SimpleNamespace(std=torch.ones(1)),
         to=lambda _device: None,
     )
-    loaders = {"train": [0], "eval": [0], "id_test": [0], "additional_evaluation": None, "data_processor": processor, "split_indices": {}}
+    loaders = {
+        "train": [0],
+        "eval": [0],
+        "id_test": [0],
+        "additional_evaluation": None,
+        "data_processor": processor,
+        "scaling_artifact": {},
+        "split_indices": {},
+    }
+    monkeypatch.setattr(run_service, "_steady_grid_spacing", lambda *_args: (0.003, 0.003))
     monkeypatch.setattr(run_service.config_loader, "create_dataloaders_from_config", lambda *_args, **_kwargs: loaders)
-    monkeypatch.setattr(run_service.datasets.preprocessing.splits, "admit_split_contract", lambda _value: None)
-    monkeypatch.setattr(run_service.datasets.preprocessing.normalization, "build_normalizer_artifact", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(run_service, "_validate_reused_data_state", lambda **_kwargs: None)
     monkeypatch.setattr(run_service.learning.models.factory, "build_model", lambda *_args, **_kwargs: torch.nn.Linear(1, 1))
     monkeypatch.setattr(run_service.learning.losses.factory, "build_training_loss", lambda *_args, **_kwargs: torch.nn.MSELoss())
     monkeypatch.setattr(run_service.learning.metrics.metrics, "build_evaluation_metrics", lambda *_args, **_kwargs: {})
@@ -1016,6 +1012,7 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
         "target_train_seconds": 1.0,
         "completed_epoch": 1,
         "global_step": 1,
+        "training_work": {"optimizer_steps": 1, "gradient_predictions": 2},
         "best_epoch": 1,
         "best_metric": 0.1,
         "objective": objective,
@@ -1056,12 +1053,9 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
     assert first["status"] == "budget_unmet"
     assert first["elapsed_seconds"] == first["attempt_elapsed_seconds"] == 4.0
     assert first["duration_coverage"] == "complete"
-    if historical_missing_coverage:
-        first.pop("duration_coverage")
-        first.pop("measured_elapsed_seconds")
-        first.pop("attempt_elapsed_seconds")
-        first["elapsed_seconds"] = 999.0
-        first["duration_contract"] = {"cumulative_across_resume": True}
+    if unpublished_prior_attempt:
+        # A hard kill leaves the state of the "running" transition: no published duration for that attempt.
+        first.update(duration_coverage="attempt_in_progress", elapsed_seconds=None, attempt_elapsed_seconds=None)
         common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), first)
 
     result.update(status=terminal_status, train_seconds=1.5, global_step=2)
@@ -1069,7 +1063,7 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
     arguments = {
         "run_dir": run_dir,
         "resume_from": run_dir / "last_checkpoint.pt",
-        "restored_data_processor": processor,
+        "restored_scaling_artifact": loaders["scaling_artifact"],
         "saved_split_indices": {},
         "device_resolution": resolution,
     }
@@ -1083,9 +1077,9 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
     assert summary["status"] == terminal_status
     second_seconds = 8.0 if terminal_status == "completed" else 6.0
     assert summary["attempt_elapsed_seconds"] == second_seconds
-    assert summary["measured_elapsed_seconds"] == second_seconds + (0.0 if historical_missing_coverage else 4.0)
-    assert summary["elapsed_seconds"] == (None if historical_missing_coverage else 4.0 + second_seconds)
-    assert summary["duration_coverage"] == ("unknown_prior_attempts" if historical_missing_coverage else "complete")
+    assert summary["measured_elapsed_seconds"] == second_seconds + 4.0
+    assert summary["elapsed_seconds"] == (None if unpublished_prior_attempt else 4.0 + second_seconds)
+    assert summary["duration_coverage"] == ("unknown_prior_attempts" if unpublished_prior_attempt else "complete")
     if terminal_status == "completed":
         assert summary["operational_timing"]["selected_checkpoint_evaluation_seconds"] == 2.0
         assert summary["effective_config_digest"] == checkpoint_identity["effective_config_digest"]
@@ -1093,7 +1087,9 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
 
 
 @pytest.mark.parametrize("alias", ["train_seconds", "target_train_seconds"])
-def test_completed_summary_rejects_budget_alias_that_contradicts_checkpoint_controller(alias: str) -> None:
+def test_completed_summary_rejects_budget_alias_that_contradicts_checkpoint_controller(
+    alias: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Reject stale presentation clocks even when all completion/controller evidence agrees."""
     controller = curriculum.MatchedComputeController(
         arm="B",
@@ -1119,22 +1115,79 @@ def test_completed_summary_rejects_budget_alias_that_contradicts_checkpoint_cont
     summary = {
         "checkpoint_identity": checkpoint_identity,
         "transient_scaling": {"semantic_digest": "c" * 64, "task_contract_digest": "d" * 64},
-        "runtime_backend_provenance": {},
         "terminal_controller": terminal,
         "terminal_curriculum": curriculum_state,
         **run_service._terminal_budget_aliases(controller),
     }
+    monkeypatch.setattr(run_service.transient_adapter_history, "validate_completed_history", lambda *_args, **_kwargs: {"epochs": []})
+    monkeypatch.setattr(run_service.transient_curriculum, "validate_terminal_evidence", lambda *_args, **_kwargs: None)
     arguments = {
-        "config": {"task_contract": {"digest": "d" * 64}, "training": {}},
-        "split_indices": {"runtime_provenance": {}},
+        "config": {"task": "transient_drying", "run": {"name": "b"}, "task_contract": {"digest": "d" * 64}, "training": {}},
         "normalizer_state": SimpleNamespace(digest="c" * 64),
         "checkpoint_identity": checkpoint_identity,
-        "last_checkpoint": {"adapter_state_dict": {"controller": controller, "curriculum": curriculum_state}},
+        "completed_epoch": 1,
     }
-    run_service._validate_transient_completed_summary(summary=summary, **arguments)
+    run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
+    run_service._validate_transient_terminal_state(summary, {"adapter_state_dict": {"controller": controller, "curriculum": curriculum_state}})
     summary[alias] = 0.43219
     with pytest.raises(run_service.RunLifecycleError, match="contradicts its terminal controller"):
-        run_service._validate_transient_completed_summary(summary=summary, **arguments)
+        run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    [
+        pytest.param("terminal_controller", "budget_complete", False, id="incomplete-budget"),
+        pytest.param("terminal_controller", "post_handoff_optimizer_steps", None, id="null-counter"),
+        pytest.param("terminal_curriculum", "draw_index", None, id="null-curriculum"),
+        pytest.param("terminal_controller", "wall_seconds", 0.75, id="disagrees-with-history"),
+    ],
+)
+def test_completed_transient_terminal_values_are_admitted_against_their_final_history_record(
+    section: str, key: str, value: Any, tmp_path: Path
+) -> None:
+    """A trial keeps no last checkpoint, so its completed terminal values must be valid and equal the final epoch record."""
+    controller = curriculum.MatchedComputeController(
+        arm="A0", stage="stage_a_teacher_forcing", clock_kind="optimizer_steps", config_digest="a" * 64, planned_stage_epochs=1
+    )
+    controller.record_completed_work(
+        optimizer_device_seconds=None,
+        microbatches=1,
+        processed_target_transitions=4,
+        forward_transitions=4,
+        wall_seconds=0.5,
+        epoch_index=0,
+        microbatch_index=0,
+    )
+    controller.record_validation_work(0.25)
+    controller.record_within_budget_evaluation(0.5, epoch_index=0)
+    rollout = curriculum.RolloutCurriculumState.create(curriculum.RolloutCurriculum(lengths=(1,), milestone_fractions=(0.0,)), seed=0)
+    # The adapter's own telemetry names the values that the training loop writes into each epoch record.
+    stand_in = SimpleNamespace(spec=SimpleNamespace(controller=controller, stage=controller.stage), curriculum_state=rollout)
+    telemetry = transient_adapter.TransientTrainingAdapter.telemetry_state(cast("transient_adapter.TransientTrainingAdapter", stand_in))
+    checkpoint_identity = {"effective_config_digest": "b" * 64}
+    record_epoch = transient_history.make_epoch_state_callback(
+        tmp_path, task="transient_drying", run_name="a0", checkpoint_identity=checkpoint_identity
+    )
+    record_epoch(1, {f"transient/{name}": float(item) for name, item in telemetry.items() if item is not None})
+    state = controller.state_dict()
+    summary = {
+        "checkpoint_identity": checkpoint_identity,
+        "transient_scaling": {"semantic_digest": "c" * 64, "task_contract_digest": "d" * 64},
+        "terminal_controller": {name: state[name] for name in run_service._TERMINAL_CONTROLLER_KEYS},
+        "terminal_curriculum": {name: getattr(rollout, name) for name in run_service._TERMINAL_CURRICULUM_KEYS},
+    }
+    arguments = {
+        "config": {"task": "transient_drying", "run": {"name": "a0"}, "task_contract": {"digest": "d" * 64}},
+        "normalizer_state": SimpleNamespace(digest="c" * 64),
+        "checkpoint_identity": checkpoint_identity,
+        "completed_epoch": 1,
+    }
+    run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
+
+    summary[section][key] = value
+    with pytest.raises(run_service.RunLifecycleError, match="terminal evidence"):
+        run_service._validate_transient_summary_evidence(tmp_path, summary=summary, **arguments)
 
 
 def test_artifact_all_reports_unfinished_stages_without_masking_budget_unmet(
@@ -1170,7 +1223,10 @@ def test_artifact_all_reports_unfinished_stages_without_masking_budget_unmet(
     monkeypatch.setattr(
         analysis.artifacts.service,
         "load_or_build_run_artifacts",
-        lambda stage_dir, **_kwargs: calls.append(stage_dir) or SimpleNamespace(role_actions={"id": "reused"}),
+        lambda stage_dir, **_kwargs: (
+            calls.append(stage_dir)
+            or SimpleNamespace(role_actions={"id": "reused"}, loaded_run=SimpleNamespace(id_artifact=None, additional_artifact=None))
+        ),
     )
     assert cli_train.main([str(path), "--artifacts", "all"]) == 2
     assert calls == [a0]

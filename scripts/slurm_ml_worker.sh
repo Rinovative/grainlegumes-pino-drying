@@ -111,9 +111,11 @@ else
 fi
 
 # Three header lines; the full digests are persisted with the run in the provenance JSON below.
-printf 'job %s | partition %s | gres %s (CUDA %s) | %s CPUs | %s | %s\nsource %s | commit %s | transition %s\nimage %s | sha256 %s\n' \
+transition_note=""
+[[ "${source_transition}" == explicit ]] && transition_note=" | continued with current code"
+printf 'job %s | partition %s | gres %s (CUDA %s) | %s CPUs | %s | %s\nsource %s | commit %s%s\nimage %s | sha256 %s\n' \
   "${SLURM_JOB_ID}" "${SLURM_JOB_PARTITION}" "${gres}" "${CUDA_VISIBLE_DEVICES:-none}" "${SLURM_CPUS_PER_TASK}" "${requested_memory}" "${requested_time}" \
-  "${SOURCE_TREE_ID}" "${expected_commit:0:12}" "${source_transition}" "${sif_path##*/}" "${sif_sha:0:12}"
+  "${SOURCE_TREE_ID}" "${expected_commit:0:12}" "${transition_note}" "${sif_path##*/}" "${sif_sha:0:12}"
 
 provenance="$(python3 - "${mode}" "${gres}" "${expected_commit}" "${expected_source_sha}" "${source_transition}" "${expected_config_sha}" "${sif_sha}" "${requested_memory}" "${requested_time}" <<'PY'
 import json
@@ -164,31 +166,4 @@ fi
 if [[ "${operation}" == artifacts ]]; then
   exec "${executor}" "${container_args[@]}" python -m src.experiments.cli.cli_build_artifacts "$@"
 fi
-exec "${executor}" "${container_args[@]}" python -c '
-import importlib
-import json
-import os
-import sys
-import torch
-
-mode = sys.argv[1]
-importlib.import_module("src.experiments.cli.cli_train")
-importlib.import_module("src.experiments.cli.cli_optuna")
-importlib.import_module("src.experiments.cli.cli_build_artifacts")
-provenance = json.loads(os.environ["ML_SLURM_PROVENANCE"])
-assert provenance["job_id"] and provenance["sif_sha256"]
-job_id = provenance["job_id"]
-if mode == "gpu":
-    assert torch.cuda.device_count() == 1, "expected exactly one framework-visible GPU"
-    device_name = torch.cuda.get_device_name(0)
-    if provenance["gres"] == "gpu:v100:1":
-        assert device_name == "Tesla V100-PCIE-32GB", f"unexpected V100 model: {device_name}"
-    torch.empty(1, device="cuda").sum().item()
-else:
-    assert mode == "cpu"
-    device_name = "none"
-visible_gpus = torch.cuda.device_count()
-if mode == "cpu":
-    assert visible_gpus == 0, "expected no framework-visible GPUs in CPU mode"
-print(f"ML probe passed: mode={mode} job={job_id} visible_gpus={visible_gpus} device={device_name}")
-' "${mode}"
+exec "${executor}" "${container_args[@]}" python -m src.experiments.cli.cli_probe "${mode}"
