@@ -12,11 +12,9 @@ This module does NOT:
 
 from __future__ import annotations
 
-import copy
 import os
 import shutil
 import subprocess
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -69,13 +67,11 @@ def campaign_path(generation_config_factory: Any) -> Path:
     """Return one compact test-owned steady-flow campaign."""
     path, _template = generation_config_factory(
         simulation_profile="steady_flow",
-        scheduler_kind="slurm",
         natural_count=3,
         campaign_purpose="source_generation",
     )
     execution_path = path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["site"]["python_module"] = "Python/3.12"
     execution["site"]["comsol_module"] = "Comsol/6.4"
     execution_path.write_text(
         yaml.safe_dump(execution, sort_keys=False),
@@ -333,29 +329,6 @@ def test_preflight_fails_clearly_for_missing_import_and_wrong_modules(
         "find_spec",
         original_find_spec,
     )
-    storage, work, venv = _paths(tmp_path / "wrong modules", monkeypatch)
-    _fake_capabilities(monkeypatch)
-    campaign = generation.cases.config.load_campaign_config(
-        campaign_path,
-        require_executable=False,
-    )
-    execution = copy.deepcopy(campaign.execution_values)
-    execution["site"]["python_module"] = "Python/3.13"
-    wrong = replace(campaign, execution_values=execution)
-    monkeypatch.setattr(
-        preflight.config_service,
-        "load_campaign_config",
-        lambda *_args, **_kwargs: wrong,
-    )
-    with pytest.raises(RuntimeError, match=r"Configured Python module expects version 3[.]13"):
-        preflight.run_cpu_preflight(
-            campaign_path,
-            only_batch=None,
-            storage_root=storage,
-            work_root=work,
-            venv_path=venv,
-        )
-    assert not tuple(work.iterdir())
 
 
 def test_preflight_fails_clearly_when_project_package_import_is_missing(
@@ -404,30 +377,22 @@ def test_preflight_fails_clearly_when_scratch_is_not_writable(
         )
 
 
-@pytest.mark.parametrize("wrong_runtime", ["python", "comsol"])
 def test_preflight_rejects_wrong_binding_runtime_version(
-    wrong_runtime: str,
     campaign_path: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Protect configured Python and COMSOL module/runtime versions."""
+    """Protect the configured COMSOL module version against the executable that reports another one."""
     storage, work, venv = _paths(tmp_path, monkeypatch)
     _fake_capabilities(monkeypatch)
-    expected = r"Configured Python module expects version 3[.]12"
-    if wrong_runtime == "python":
-        monkeypatch.setattr(preflight.sys, "version_info", (3, 13, 0, "final", 0))
-        monkeypatch.setattr(preflight.sys, "version", "3.13.0 (synthetic wrong runtime)")
-    else:
-        expected = r"Configured comsol module expects version 6[.]4"
 
-        def wrong_comsol_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
-            assert timeout_seconds > 0.0
-            output = "COMSOL Multiphysics 6.3" if command[0].endswith("/comsol") else "Python 3.12.7; synthetic tool"
-            return {"arguments": command, "exit_code": 0, "output": output}
+    def wrong_comsol_version(command: list[str], *, timeout_seconds: float) -> dict[str, Any]:
+        assert timeout_seconds > 0.0
+        output = "COMSOL Multiphysics 6.3" if command[0].endswith("/comsol") else "Python 3.12.7; synthetic tool"
+        return {"arguments": command, "exit_code": 0, "output": output}
 
-        monkeypatch.setattr(preflight, "_version_output", wrong_comsol_version)
-    with pytest.raises(RuntimeError, match=expected):
+    monkeypatch.setattr(preflight, "_version_output", wrong_comsol_version)
+    with pytest.raises(RuntimeError, match=r"Configured comsol module expects version 6[.]4"):
         preflight.run_cpu_preflight(
             campaign_path,
             only_batch=None,

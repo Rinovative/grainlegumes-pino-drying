@@ -47,7 +47,7 @@ def _spec() -> TransientTrainingSpec:
         task_contract_sha256=_digest("task"),
         tensorizer_sha256=_digest("tensorizer"),
         model_kind="fno",
-        input_profile="canonical_physics_complete_v1",
+        input_profile="canonical_physics_complete",
     )
     controller = MatchedComputeController(
         arm="B",
@@ -127,18 +127,6 @@ def test_validation_work_is_persisted_but_excluded_from_budget_progress() -> Non
     assert adapter.spec.controller.progress == before
     assert adapter.telemetry_state()["validation_seconds"] == pytest.approx(1.25)
     assert adapter.state_dict()["controller"]["validation_seconds"] == pytest.approx(1.25)
-
-
-def test_adapter_uses_only_current_controller_schema() -> None:
-    """Persist schema version 1 and reject controller state from any other schema."""
-    adapter = _adapter_with_fake_tensorizer()
-    current = copy.deepcopy(adapter.state_dict())
-    assert current["controller"]["schema_version"] == 1
-
-    invalid = copy.deepcopy(current)
-    invalid["controller"]["schema_version"] = 2
-    with pytest.raises(ValueError, match="strict schema"):
-        adapter.load_state_dict(invalid)
 
 
 def test_every_stage_selects_checkpoints_on_the_whole_autonomous_trajectory(monkeypatch: pytest.MonkeyPatch) -> None:

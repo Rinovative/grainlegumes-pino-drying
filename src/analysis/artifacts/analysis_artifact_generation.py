@@ -27,7 +27,7 @@ Notes:
     Parquet case table:
       - case_index        : stable one-based source case id
       - source_index      : zero-based position in the ordered concatenation of the role's complete source Datasets
-      - source_dataset_id : source Dataset of the case (one role may span several additional Evaluation Datasets)
+      - source_dataset_id : source Dataset of the case (the material-OOD role may span several Datasets)
       - split_local_index : zero-based position in the saved split
       - npz_path          : path to the corresponding NPZ artifact
       Relative field errors (dimensionless, channel-balanced):
@@ -762,7 +762,7 @@ def _validate_generated_source_indices(provenance: Mapping[str, Any], source_ind
         raise RuntimeError(msg)
 
 
-def _ensure_artifact_targets_absent(save_root: Path, dataset_name: str) -> None:
+def _ensure_artifact_targets_absent(save_root: Path) -> None:
     """
     Enforce create-only semantics for one staged artifact target.
 
@@ -771,7 +771,7 @@ def _ensure_artifact_targets_absent(save_root: Path, dataset_name: str) -> None:
     """
     npz_dir = save_root / "npz"
     candidates = [
-        save_root / f"{dataset_name}.parquet",
+        save_root / common.paths.ANALYSIS_ARTIFACTS_FILENAME,
         contracts.artifact_provenance_path(save_root),
         *sorted(npz_dir.glob("*.npz")),
         *sorted(save_root.glob(".*.tmp")),
@@ -977,7 +977,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     processor: Any,
     device: torch.device,
     save_root: str | Path,
-    dataset_name: str,
     provenance: Mapping[str, Any],
     case_ids: Sequence[str],
     publication_root: str | Path | None = None,
@@ -1006,8 +1005,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         Concrete inference device.
     save_root : str | pathlib.Path
         Empty exact target or staging directory.
-    dataset_name : str
-        Logical dataset name used for the Parquet filename.
     provenance : Mapping[str, Any]
         Versioned request evidence, including the physics contract and exact
         complete membership digest.
@@ -1062,7 +1059,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         expected_case_count=expected_case_count,
     )
     case_files = contracts.dataset_case_payload_filenames(authoritative_case_ids)
-    _ensure_artifact_targets_absent(save_root, dataset_name)
+    _ensure_artifact_targets_absent(save_root)
     model.eval()
 
     # Infer run_dir from save_root for logging/metadata only.
@@ -1297,7 +1294,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         # --------------------------------------------------
         rows.append(
             {
-                "artifact_schema_version": contracts.ARTIFACT_SCHEMA_VERSION,
                 "task_id": task.id,
                 "output_fields": list(task.output_names),
                 "output_units": [field.unit for field in task.outputs],
@@ -1329,7 +1325,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         msg = f"Artifact generation produced {len(df)} cases, expected {expected_case_count} from provenance."
         raise RuntimeError(msg)
 
-    parquet_path = save_root / f"{dataset_name}.parquet"
+    parquet_path = save_root / common.paths.ANALYSIS_ARTIFACTS_FILENAME
     common.serialization.atomic_path_write(
         parquet_path,
         lambda temp_path: df.to_parquet(temp_path, index=False),
@@ -1356,7 +1352,6 @@ def generate_artifacts(
     processor: Any,
     device: torch.device,
     save_root: str | Path,
-    dataset_name: str,
     provenance: Mapping[str, Any],
     case_ids: Sequence[str],
     publication_root: str | Path | None = None,
@@ -1380,8 +1375,6 @@ def generate_artifacts(
         Concrete inference device.
     save_root : str | pathlib.Path
         Exact empty artifact target or staging directory.
-    dataset_name : str
-        Logical dataset name used for the Parquet filename.
     provenance : Mapping[str, Any]
         Exact cache request identity. Generated aggregate and output digests are
         appended only after all case payloads succeed.
@@ -1413,7 +1406,6 @@ def generate_artifacts(
     artifact service. Provenance is always the final completion marker.
 
     """
-    dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
     if task.id == domain.tasks.steady_flow.STEADY_FLOW.id:
         return _generate_steady_flow_artifacts(
             task=task,
@@ -1422,7 +1414,6 @@ def generate_artifacts(
             processor=processor,
             device=device,
             save_root=save_root,
-            dataset_name=dataset_name,
             provenance=provenance,
             case_ids=case_ids,
             publication_root=publication_root,

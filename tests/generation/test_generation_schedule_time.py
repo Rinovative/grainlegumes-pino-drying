@@ -113,7 +113,7 @@ def test_short_source_publication_retains_full_schedule_and_actual_dataset_horiz
     generation.cases.input_generation.generate_input_cases(batch, 1, storage_root=storage)
     monkeypatch.setenv("FAKE_COMSOL_TRANSIENT_TIME_MODE", "configured_horizon")
     monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", generation.campaign.campaign_run_id(campaign, git_commit="a" * 40))
-    outcome = generation.runtime.run_case(batch, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work")
+    outcome = generation.runtime.run_case(batch, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work", scheduler_kind="local")
     assert outcome.status == "completed", outcome
     generation.runtime.validate_completed_case(batch, 1, storage_root=storage, validation_depth="routine")
     artifact = outcome.processed_directory / "case.h5"

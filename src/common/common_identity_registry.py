@@ -31,8 +31,7 @@ from . import common_locking as locking
 from . import common_paths as paths
 from . import common_serialization as serialization
 
-SCHEMA_VERSION = 1
-_ENTRY_KEYS = frozenset({"schema_version", "digest", "target", "kind", "created_at"})
+_ENTRY_KEYS = frozenset({"digest", "target", "kind", "created_at"})
 
 ConflictFactory = Callable[[Path, Path], Exception]
 
@@ -72,7 +71,6 @@ class IdentityRegistry:
         if (
             not isinstance(payload, Mapping)
             or set(payload) != _ENTRY_KEYS
-            or not serialization.is_schema_version(payload["schema_version"], SCHEMA_VERSION)
             or payload["digest"] != digest
             or payload["kind"] not in self.kinds
             or not isinstance(payload["created_at"], str)
@@ -120,7 +118,6 @@ class IdentityRegistry:
         serialization.atomic_write_json(
             entry_path,
             {
-                "schema_version": SCHEMA_VERSION,
                 "digest": digest,
                 "target": requested.relative_to(self.root).as_posix(),
                 "kind": kind,

@@ -272,7 +272,7 @@ def _generation_invocation(run: dict[str, Any] | None, plan: dict[str, Any] | No
             ),
         }
     command = ["./scripts/generation", "run", run["campaign_config"]]
-    for key, flag in (("duration_hours", "--duration-hours"), ("cases_per_material", "--cases-per-material"), ("revision", "--revision")):
+    for key, flag in (("duration_hours", "--duration-hours"), ("revision", "--revision")):
         if overrides.get(key) is not None:
             command.extend((flag, str(overrides[key])))
     if overrides.get("materials"):
@@ -516,7 +516,6 @@ def manifest_selection_request(manifest: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "schema_kind": selection.SELECTION_SCHEMA_KIND,
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": manifest["source_task"],
         "dataset_name": manifest["dataset_name"],
         "dataset_view": manifest["dataset_view"],

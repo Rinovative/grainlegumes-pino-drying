@@ -41,7 +41,6 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
     return pd.DataFrame(
         [
             {
-                "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
                 "task_id": "synthetic",
                 "output_fields": ["target"],
                 "output_units": ["1"],
@@ -76,7 +75,6 @@ def test_dataframe_reader_admits_current_sufficient_statistics() -> None:
     """
     enriched = analysis.evaluation.dataframe.build_eval_df(_current_generic_frame(metadata='{"label": "valid"}'))
 
-    assert enriched.attrs["artifact_schema_version"] == analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION
     assert enriched.attrs["output_fields"] == ("target",)
     assert enriched.attrs["provenance_complete"] is False
     assert analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_ID not in enriched.attrs
@@ -89,20 +87,6 @@ def test_dataframe_reader_rejects_every_unexpected_column() -> None:
     frame["unexpected_metric"] = 0.0
 
     with pytest.raises(ValueError, match="schema mismatch"):
-        analysis.evaluation.dataframe.build_eval_df(frame)
-
-
-@pytest.mark.parametrize(
-    "schema_version",
-    [float(analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION), analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION + 1],
-    ids=("floating-current", "other-version"),
-)
-def test_dataframe_reader_requires_the_current_integer_artifact_version(schema_version: float) -> None:
-    """Reject alternate representations and unsupported Parquet schema versions."""
-    frame = _current_generic_frame(metadata="{}")
-    frame["artifact_schema_version"] = schema_version  # pyright: ignore[reportCallIssue, reportArgumentType]
-
-    with pytest.raises((TypeError, ValueError), match=r"artifact_schema_version|schema version"):
         analysis.evaluation.dataframe.build_eval_df(frame)
 
 
@@ -193,8 +177,6 @@ def test_artifact_metadata_requires_a_json_object(
 def _identity_provenance() -> dict[str, Any]:
     """Return one complete steady provenance document carrying every identity section."""
     return {
-        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "producer": {"analysis_sha256": "e" * 64},
         "run": {
             "name": "run-a",
@@ -253,7 +235,6 @@ def _identity_provenance() -> dict[str, Any]:
             "predictive_metrics": {"rel_l2": "per_case"},
         },
         "physics": {
-            "residual_schema_version": 1,
             "task_id": "synthetic",
             "task_contract_digest": "task-a",
             "equation_kind": "steady_brinkman",
@@ -289,7 +270,6 @@ def test_artifact_identity_tracks_science_but_not_runtime_device() -> None:
     provenance = _identity_provenance()
     baseline = analysis.artifacts.contracts.artifact_identity_digest(provenance)
     mutations = [
-        (("artifact_schema_version",), 999),
         (("producer", "analysis_sha256"), "f" * 64),
         (("run", "effective_config_digest"), "config-b"),
         (("run", "best_checkpoint_sha256"), "checkpoint-b"),
@@ -359,9 +339,9 @@ def test_runtime_provenance_records_the_executing_source_tree(tree_id: str | Non
 
 
 def test_artifact_target_rejects_broad_and_out_of_run_paths(tmp_path: Path) -> None:
-    """Reject the analysis root, the additional-evaluation parent and out-of-run paths."""
+    """Reject the analysis root, an OOD role parent and out-of-run paths."""
     run_dir = tmp_path / "run"
-    for save_root in (run_dir / "analysis", run_dir / "analysis" / "additional_evaluation", tmp_path / "outside"):
+    for save_root in (run_dir / "analysis", run_dir / "analysis" / "material_ood", tmp_path / "outside"):
         with pytest.raises(ValueError, match="exact artifact target"):
             analysis.artifacts.service._validated_artifact_target(run_dir=run_dir, save_root=save_root)
 
@@ -382,7 +362,7 @@ def test_upload_gate_requires_an_explicit_complete_current_artifact(
     monkeypatch.setattr(
         analysis.artifacts.plan,
         "artifact_plan_from_completed",
-        lambda *_args, **_kwargs: SimpleNamespace(id_role=SimpleNamespace(split="eval", dataset_name="dataset"), additional_role=None),
+        lambda *_args, **_kwargs: SimpleNamespace(roles=(SimpleNamespace(split="eval", dataset_name="dataset"),)),
     )
     frame = pd.DataFrame()
     frame.attrs["artifact_provenance"] = {"artifact_kind": "steady_field"}
@@ -437,7 +417,7 @@ def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
     assert marker.read_text(encoding="utf-8") == "keep"
 
     sibling_run = tmp_path / "sibling-symlink-run"
-    sibling_target = sibling_run / "analysis" / "additional_evaluation" / "keep"
+    sibling_target = sibling_run / "analysis" / "material_ood" / "keep"
     sibling_target.mkdir(parents=True)
     sibling_marker = sibling_target / "keep.txt"
     sibling_marker.write_text("keep", encoding="utf-8")
@@ -491,7 +471,7 @@ def test_discovery_skips_unselected_non_completed_runs_and_refuses_a_selected_on
         run = tmp_path / name
         run.mkdir()
         (run / "config.yaml").write_text(json.dumps({"run": {"name": name}}), encoding="utf-8")
-        (run / "summary.json").write_text(json.dumps({"schema_version": 1, "status": status}), encoding="utf-8")
+        (run / "summary.json").write_text(json.dumps({"status": status}), encoding="utf-8")
     admit = service.experiments.run.validate_evaluable_run
     monkeypatch.setattr(
         service.experiments.run,
@@ -532,7 +512,7 @@ def test_discovery_skips_valid_optuna_trials_but_rejects_malformed_layouts_and_n
         directory = root / "run"
         directory.mkdir(parents=True)
         (directory / "config.yaml").write_text(json.dumps({"run": {"layout": {**_TRIAL_LAYOUT, **changes}}}), encoding="utf-8")
-        (directory / "summary.json").write_text(json.dumps({"schema_version": 1, "status": "completed"}), encoding="utf-8")
+        (directory / "summary.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
         return root
 
     assert list(analysis.artifacts.service.iter_run_dirs(leaf(tmp_path / "trial"))) == []
@@ -548,7 +528,7 @@ def test_artifacts_refuse_an_explicitly_selected_optuna_trial_before_reading_any
     trial = tmp_path / "trial"
     trial.mkdir()
     (trial / "config.yaml").write_text(json.dumps({"run": {"layout": _TRIAL_LAYOUT}}), encoding="utf-8")
-    (trial / "summary.json").write_text(json.dumps({"schema_version": 1, "status": "completed"}), encoding="utf-8")
+    (trial / "summary.json").write_text(json.dumps({"status": "completed"}), encoding="utf-8")
     refusal = r"Optuna trial.*no artifacts.*parent study.*training run"
 
     with pytest.raises(ValueError, match=refusal):

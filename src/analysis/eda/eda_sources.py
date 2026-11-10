@@ -150,7 +150,7 @@ class GeneratedOutputEDABatch:
 
     @property
     def discovered_case_count(self) -> int:
-        """Return all primary, supplemental, and replacement candidates."""
+        """Return all primary and replacement candidates."""
         return len(self.candidate_rows)
 
     def case(self, case_id: str) -> GeneratedOutputEDACase:

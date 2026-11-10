@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Map canonical field keys to robust plain-text and Matplotlib symbols
-  - Normalize dimensionless units for scientific presentation
+  - Normalize dimensionless units and unit exponents for scientific presentation
   - Provide one human-readable fallback for undeclared formula symbols
 
 Design principles:
@@ -17,6 +17,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -84,6 +85,8 @@ def has_declared_field_metadata(field: str) -> bool:
 
 TemperatureQuantityKind = Literal["absolute", "difference"]
 _TEMPERATURE_UNITS: Final = frozenset({"K", "degC", "°C"})
+_UNIT_EXPONENT: Final = re.compile(r"\^(-?\d+)")
+_SUPERSCRIPTS: Final = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
 def _validate_quantity_kind(quantity_kind: TemperatureQuantityKind) -> None:
@@ -108,7 +111,9 @@ def display_unit(
     _validate_quantity_kind(quantity_kind)
     if unit in _TEMPERATURE_UNITS:
         return "°C"
-    return "-" if unit == "1" else unit
+    if unit == "1":
+        return "-"
+    return _UNIT_EXPONENT.sub(lambda match: match.group(1).translate(_SUPERSCRIPTS), unit)
 
 
 def display_values(

@@ -48,6 +48,7 @@ _NORMALIZED_MEAN_ATOL = 8e-4
 _NORMALIZED_SCALE_RTOL = 8e-4
 _NORMALIZED_SCALE_ATOL = 8e-4
 _TENSOR_RANK = 4
+_OOD_LABELS: dict[datasets.preprocessing.splits.OodRole, str] = {"material_ood": "Material OOD", "parameter_ood": "Parameter OOD"}
 ResultLabel = Literal["PASS", "INFO"]
 
 
@@ -352,15 +353,10 @@ def _membership_contract(
     label: str,
     *,
     id_contract: _DatasetContract,
-    additional_contracts: tuple[_DatasetContract, ...],
+    ood_contracts: Mapping[str, tuple[_DatasetContract, ...]],
 ) -> _DatasetContract:
-    """Return the tensor contract that owns one membership row."""
-    if label != "Additional evaluation":
-        return id_contract
-    if not additional_contracts:
-        msg = "Additional evaluation membership requires an additional Dataset tensor contract."
-        raise RuntimeError(msg)
-    return additional_contracts[0]
+    """Return the tensor contract that owns one membership row: an OOD part's first source, otherwise the ID Dataset."""
+    return ood_contracts[label][0] if label in ood_contracts else id_contract
 
 
 def _membership_record(
@@ -434,33 +430,28 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     evaluation_loaders = {
         "ID validation": built["eval"],
         "ID test": built["id_test"],
-        **({} if built["additional_evaluation"] is None else {"Additional evaluation": built["additional_evaluation"]}),
+        **{label: built[role] for role, label in _OOD_LABELS.items() if built[role] is not None},
     }
     processor = built["data_processor"]
     split = built["split_indices"]
     normalizer_state = {key: value.detach().cpu().clone() for key, value in processor.state_dict().items()}
 
     id_contract = _validate_tensor_contract(loader=train_loader, role="ID", task=task)
-    additional_loader = built["additional_evaluation"]
-    additional_contracts: tuple[_DatasetContract, ...] = (
-        ()
-        if additional_loader is None
-        else tuple(
-            _validate_tensor_contract(
-                loader=SimpleNamespace(dataset=Subset(component, [])),
-                role=f"Additional evaluation {index}",
-                task=task,
-            )
-            for index, component in enumerate(_components(_full_source_dataset(additional_loader)))
+    ood_contracts: dict[str, tuple[_DatasetContract, ...]] = {
+        label: tuple(
+            _validate_tensor_contract(loader=SimpleNamespace(dataset=Subset(component, [])), role=f"{label} {index}", task=task)
+            for index, component in enumerate(_components(_full_source_dataset(built[role])))
         )
-    )
+        for role, label in _OOD_LABELS.items()
+        if built[role] is not None
+    }
     split_contract = datasets.preprocessing.splits.admit_split(split)
     _require(split_contract.train.dataset["fingerprint"] == id_contract.identity.fingerprint, "split Train identity differs from the ID Dataset")
     role_parts = {
         "ID train": (split_contract.train,),
         "ID validation": (split_contract.validation,),
         "ID test": (split_contract.id_test,),
-        "Additional evaluation": split_contract.additional_evaluation,
+        **{label: split_contract.ood_parts(role) for role, label in _OOD_LABELS.items()},
     }
     expected = {label: _role_sample_ids(role_parts[label]) for label in ("ID train", *evaluation_loaders)}
     id_sets = [set(split_contract.role(role).case_ids) for role in datasets.preprocessing.splits.ID_SPLIT_ROLES]
@@ -638,7 +629,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         *(
             _membership_record(
                 role=label,
-                contract=_membership_contract(label, id_contract=id_contract, additional_contracts=additional_contracts),
+                contract=_membership_contract(label, id_contract=id_contract, ood_contracts=ood_contracts),
                 expected_ids=expected[label],
                 observed_ids=passes[label].observed_ids,
                 shape="BCHW",
@@ -649,7 +640,7 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     )
 
     first_split = split_contract
-    del built, train_loader, evaluation_loaders, additional_loader, processor, id_contract, additional_contracts
+    del built, train_loader, evaluation_loaders, processor, id_contract, ood_contracts
     gc.collect()
     repeated = config_loader.create_dataloaders_from_config(
         effective,

@@ -102,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split",
-        choices=("id", "additional_evaluation"),
+        choices=("id", "material_ood", "parameter_ood"),
         default=None,
         help="Selected transient role for bounded generation; requires --one-case or --case-id.",
     )

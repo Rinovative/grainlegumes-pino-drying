@@ -24,7 +24,7 @@ This module does NOT:
 Notes:
   Role admission:
     - Steady ID and OOD roles come from the saved split contract and are admitted independently under their exact run-owned roots.
-    - Transient drying uses a separate sequence-index path for ID and additional-evaluation roles; explicit scoped roots remain marked partial.
+    - Transient drying uses a separate sequence-index path for ID, material-OOD and parameter-OOD roles; explicit scoped roots remain marked partial.
   Timing:
     - Both tasks carry a required top-level timing block outside scientific identity. A missing or contradictory block refuses the role.
 
@@ -39,7 +39,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 
@@ -53,8 +53,8 @@ from . import evaluation_dataframe as dataframe
 if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
-ArtifactRole = Literal["eval", "additional_evaluation"]
-ArtifactSelectionRole = Literal["id", "additional_evaluation"]
+ArtifactRole = artifact_plan.ArtifactSplit
+ArtifactSelectionRole = artifact_plan.ArtifactDatasetRole
 
 __all__ = [
     "ArtifactRole",
@@ -77,7 +77,7 @@ class EvaluationArtifactLoadError(RuntimeError):
     ----------
     message : str
         Human-readable admission failure and recovery guidance.
-    role : {"eval", "additional_evaluation"} | None
+    role : {"eval", "material_ood", "parameter_ood"} | None
         Rejected artifact role when the failure is role-local.
     run_dir : pathlib.Path | None
         Exact current run directory when it is known.
@@ -128,7 +128,7 @@ class LoadedEvaluationArtifact:
 
     Parameters
     ----------
-    split_role : {"eval", "additional_evaluation"}
+    split_role : {"eval", "material_ood", "parameter_ood"}
         Exact saved split role represented by the artifact.
     dataset_name : str
         Canonical saved dataset identity for the role.
@@ -163,8 +163,8 @@ class LoadedRunArtifacts:
         Exact resolved current run directory.
     id_artifact : LoadedEvaluationArtifact
         Artifact bound to saved ID-test membership and ``analysis/id``.
-    additional_artifact : LoadedEvaluationArtifact
-        Artifact bound to saved additional evaluation membership and its named root.
+    material_ood_artifact, parameter_ood_artifact : LoadedEvaluationArtifact
+        Artifacts bound to saved material-OOD and parameter-OOD membership and their named roots.
 
     """
 
@@ -172,7 +172,8 @@ class LoadedRunArtifacts:
     run_name: str
     run_dir: Path
     id_artifact: LoadedEvaluationArtifact | None
-    additional_artifact: LoadedEvaluationArtifact | None = None
+    material_ood_artifact: LoadedEvaluationArtifact | None = None
+    parameter_ood_artifact: LoadedEvaluationArtifact | None = None
     selected_checkpoint_role: str = "best"
     selected_checkpoint_epoch: int | None = None
     selected_checkpoint_sha256: str = ""
@@ -187,6 +188,14 @@ class LoadedRunArtifacts:
     def storage_alias(self) -> str:
         """Return the mutable current directory leaf used for storage."""
         return self.run_dir.name
+
+    def artifact(self, role: ArtifactSelectionRole) -> LoadedEvaluationArtifact | None:
+        """Return the loaded artifact of one Dataset role, ``None`` when it was not selected or does not exist."""
+        return cast("LoadedEvaluationArtifact | None", getattr(self, f"{role}_artifact"))
+
+    def role_artifacts(self) -> dict[ArtifactSelectionRole, LoadedEvaluationArtifact]:
+        """Return every loaded artifact keyed by its Dataset role, in canonical role order."""
+        return {role: artifact for role in artifact_plan.ARTIFACT_DATASET_ROLES if (artifact := self.artifact(role)) is not None}
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +335,7 @@ def _missing(*, task: str, run_name: str, run_dir: Path, role: ArtifactRole, roo
         Canonical completed-run selection.
     run_dir : pathlib.Path
         Exact current run directory used by the recovery command.
-    role : {"eval", "additional_evaluation"}
+    role : {"eval", "material_ood", "parameter_ood"}
         Missing saved split role.
     root : pathlib.Path
         Exact expected artifact root.
@@ -363,7 +372,7 @@ def _incompatible(
         Canonical completed-run selection.
     run_dir : pathlib.Path
         Exact current run directory used by the recovery command.
-    role : {"eval", "additional_evaluation"}
+    role : {"eval", "material_ood", "parameter_ood"}
         Rejected saved split role.
     root : pathlib.Path
         Exact observed artifact root.
@@ -392,18 +401,13 @@ def _saved_roles(
     run_dir: Path,
     task: str,
     task_spec: TaskSpec,
-) -> tuple[_SavedRole, _SavedRole | None]:
-    """Resolve admitted ID-test and additional evaluation artifact roles from the shared artifact plan."""
+) -> dict[ArtifactSelectionRole, _SavedRole]:
+    """Resolve the admitted ID-test role and every planned OOD role, keyed by Dataset role, from the shared artifact plan."""
     plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_dir)
     if plan.task != task or task_spec.id != task:
         msg = "Saved split task identity contradicts the evaluable run task contract."
         raise ValueError(msg)
-    id_role = _SavedRole(plan=plan.id_role, root=common.paths.resolve_id_analysis_dir(run_dir).absolute())
-    additional = plan.additional_role
-    if additional is None:
-        return id_role, None
-    root = common.paths.resolve_additional_evaluation_analysis_dir(run_dir, additional.dataset_name).absolute()
-    return id_role, _SavedRole(plan=additional, root=root)
+    return {role.dataset_role: _SavedRole(plan=role, root=role.root(run_dir).absolute()) for role in plan.roles}
 
 
 def _expected_run_provenance(
@@ -584,7 +588,7 @@ def _effective_selection(
     selection = _mapping(provenance.get("selection"), label="artifact provenance selection")
     membership_digest = contracts.ordered_indices_sha256(role.source_indices)
     expected = {
-        "index_key": "id_test_indices" if role.split_role == "eval" else "additional_evaluation_indices",
+        "index_key": f"{role.plan.split_role}_indices",
         "full_selected_case_count": len(role.source_indices),
         "effective_case_count": len(role.source_indices),
         "generation_limit": None,
@@ -672,8 +676,8 @@ def _validate_payload_membership(
 
     outputs = _mapping(provenance.get("outputs"), label="artifact provenance outputs")
     parquet_output = _mapping(outputs.get("parquet"), label="artifact provenance outputs.parquet")
-    if parquet_output.get("path") != f"{role.dataset_name}.parquet":
-        msg = "Artifact manifest Parquet path does not match the saved dataset identity."
+    if parquet_output.get("path") != common.paths.ANALYSIS_ARTIFACTS_FILENAME:
+        msg = f"Artifact manifest Parquet path must be {common.paths.ANALYSIS_ARTIFACTS_FILENAME}."
         raise ValueError(msg)
     npz_outputs = outputs.get("npz")
     if not isinstance(npz_outputs, list):
@@ -734,8 +738,6 @@ def _bind_artifact_to_run(
     provenance = dataframe.require_complete_provenance(frame)
     expected_physics = _expected_physics_provenance(task_spec)
     expected_keys = {
-        "provenance_schema_version",
-        "artifact_schema_version",
         "artifact_kind",
         "producer",
         "timing",
@@ -902,14 +904,7 @@ def _read_artifact_root(artifact_root: str | Path) -> pd.DataFrame:
     if not parquet_path.is_relative_to(root) or not parquet_path.is_file():
         msg = "Declared artifact Parquet payload is missing or escapes its root."
         raise ValueError(msg)
-    try:
-        computed_outputs = contracts.artifact_output_manifest(root)
-    except (OSError, RuntimeError) as error:
-        msg = f"Artifact output manifest cannot be recomputed for {root}: {error}"
-        raise ValueError(msg) from error
-    if dict(outputs) != computed_outputs:
-        msg = "Artifact output manifest does not match the current payload files."
-        raise ValueError(msg)
+    contracts.require_output_structure(root, outputs)
     frame_raw = pd.read_parquet(parquet_path)
     frame_raw.attrs["artifact_root"] = str(root)
     frame_raw.attrs["artifact_provenance"] = dict(provenance)
@@ -1107,21 +1102,17 @@ def _transient_role_artifact(
     """Admit one transient sequence role at its canonical root, a private stage, a grid variant or a scoped root."""
     from src.analysis.artifacts import transient  # noqa: PLC0415
 
-    split_role: ArtifactRole = "eval" if selection_role == "id" else "additional_evaluation"
-    role_plan = plan.id_role if selection_role == "id" else plan.additional_role
-    if role_plan is None:
+    split_role = artifact_plan.split_of(selection_role)
+    if split_role != "eval" and split_role not in plan.ood_roles:
         raise _missing(
             task="transient_drying",
             run_name=plan.run_name,
             run_dir=run_dir,
             role=split_role,
-            root=common.paths.resolve_analysis_root(run_dir) / "additional_evaluation",
+            root=common.paths.resolve_analysis_root(run_dir) / split_role,
         )
-    canonical_root = (
-        common.paths.resolve_id_analysis_dir(run_dir)
-        if selection_role == "id"
-        else common.paths.resolve_additional_evaluation_analysis_dir(run_dir, role_plan.dataset_name)
-    ).absolute()
+    role_plan = plan.role(split_role)
+    canonical_root = role_plan.root(run_dir).absolute()
     target = canonical_root if root is None else Path(root).expanduser().resolve(strict=False)
     if not target.exists():
         raise _missing(task="transient_drying", run_name=plan.run_name, run_dir=run_dir, role=split_role, root=target)
@@ -1177,6 +1168,13 @@ def _transient_role_artifact(
     )
 
 
+def _require_role_selection(artifact_roles: tuple[ArtifactSelectionRole, ...]) -> None:
+    """Refuse an empty, repeated or unknown artifact role selection."""
+    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference(artifact_plan.ARTIFACT_DATASET_ROLES):
+        msg = f"artifact_roles must contain unique values from {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
+        raise ValueError(msg)
+
+
 def _load_admitted_transient_run_artifacts(
     run_dir: Path,
     admitted: Mapping[str, Any],
@@ -1186,15 +1184,13 @@ def _load_admitted_transient_run_artifacts(
 ) -> LoadedRunArtifacts:
     """Load completed transient sequence roles without static artifact assumptions."""
     plan = artifact_plan.artifact_plan_from_completed(admitted, run_dir=run_dir)
-    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "additional_evaluation"}):
-        msg = "Transient artifact_roles must contain unique values from {'id', 'additional_evaluation'}."
-        raise ValueError(msg)
+    _require_role_selection(artifact_roles)
     overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
     if set(overrides).difference(artifact_roles):
         msg = "Artifact root overrides must belong to selected transient roles."
         raise ValueError(msg)
-    id_artifact, additional_artifact = (
-        _transient_role_artifact(
+    loaded = {
+        selection_role: _transient_role_artifact(
             run_dir,
             admitted,
             plan,
@@ -1202,17 +1198,17 @@ def _load_admitted_transient_run_artifacts(
             root=overrides.get(selection_role),
             scoped=selection_role in overrides,
         )
+        for selection_role in artifact_plan.ARTIFACT_DATASET_ROLES
         if selection_role in artifact_roles
-        else None
-        for selection_role in cast("tuple[ArtifactSelectionRole, ...]", ("id", "additional_evaluation"))
-    )
+    }
     summary = _mapping(admitted.get("summary"), label="completed transient summary")
     return LoadedRunArtifacts(
         task="transient_drying",
         run_name=plan.run_name,
         run_dir=run_dir,
-        id_artifact=id_artifact,
-        additional_artifact=additional_artifact,
+        id_artifact=loaded.get("id"),
+        material_ood_artifact=loaded.get("material_ood"),
+        parameter_ood_artifact=loaded.get("parameter_ood"),
         selected_checkpoint_role=str(admitted["selected_checkpoint_role"]),
         selected_checkpoint_epoch=int(admitted["selected_checkpoint_epoch"]),
         selected_checkpoint_sha256=str(admitted["selected_checkpoint_sha256"]),
@@ -1234,8 +1230,7 @@ def _load_admitted_run_artifacts(
     if task_spec.id == "transient_drying":
         selected_roles: tuple[ArtifactSelectionRole, ...]
         if artifact_roles is None:
-            plan = artifact_plan.artifact_plan_from_completed(admitted, run_dir=run_dir)
-            selected_roles = ("id", "additional_evaluation") if plan.additional_role is not None else ("id",)
+            selected_roles = artifact_plan.artifact_plan_from_completed(admitted, run_dir=run_dir).dataset_roles
         else:
             selected_roles = artifact_roles
         return _load_admitted_transient_run_artifacts(
@@ -1247,26 +1242,23 @@ def _load_admitted_run_artifacts(
     if artifact_root_overrides:
         msg = "Explicit artifact root overrides are supported only for transient scoped artifacts."
         raise ValueError(msg)
-    context, id_role, additional_role = _steady_role_context(run_dir, admitted, task_spec)
+    context, saved_roles = _steady_role_context(run_dir, admitted, task_spec)
     if artifact_roles is None:
-        artifact_roles = ("id", "additional_evaluation") if additional_role is not None else ("id",)
-    if not artifact_roles or len(set(artifact_roles)) != len(artifact_roles) or set(artifact_roles).difference({"id", "additional_evaluation"}):
-        msg = "artifact_roles must contain unique values from {'id', 'additional_evaluation'}."
+        artifact_roles = tuple(saved_roles)
+    _require_role_selection(artifact_roles)
+    unplanned = [role for role in artifact_roles if role not in saved_roles]
+    if unplanned:
+        msg = f"Evaluable run has no saved {unplanned[0]} role."
         raise ValueError(msg)
-    if "additional_evaluation" in artifact_roles and additional_role is None:
-        msg = "Evaluable run has no saved additional evaluation role."
-        raise ValueError(msg)
-    id_artifact = _load_role(role=id_role, **context) if "id" in artifact_roles else None
-    additional_artifact = (
-        _load_role(role=additional_role, **context) if additional_role is not None and "additional_evaluation" in artifact_roles else None
-    )
+    loaded = {role: _load_role(role=saved_roles[role], **context) for role in artifact_roles}
     evaluation = context["evaluation"]
     return LoadedRunArtifacts(
         task=task_spec.id,
         run_name=context["run_name"],
         run_dir=run_dir,
-        id_artifact=id_artifact,
-        additional_artifact=additional_artifact,
+        id_artifact=loaded.get("id"),
+        material_ood_artifact=loaded.get("material_ood"),
+        parameter_ood_artifact=loaded.get("parameter_ood"),
         selected_checkpoint_role=str(evaluation["selected_checkpoint_role"]),
         selected_checkpoint_epoch=(int(evaluation["selected_checkpoint_epoch"]) if evaluation["selected_checkpoint_epoch"] is not None else None),
         selected_checkpoint_sha256=str(evaluation["selected_checkpoint_sha256"] or ""),
@@ -1291,7 +1283,7 @@ def admit_role_artifact(
         Completed run that owns the role.
     admitted : collections.abc.Mapping
         Completed-run evidence from the run admission gate.
-    selection_role : {"id", "additional_evaluation"}
+    selection_role : {"id", "material_ood", "parameter_ood"}
         Saved role whose exact membership the artifact must carry.
     root : pathlib.Path | str | None, optional
         Private build stage or transient Evaluation-grid variant to admit instead
@@ -1332,10 +1324,10 @@ def admit_role_artifact(
     if evaluation_spatial_stride != 1:
         msg = "Steady artifacts are admitted only on the canonical Evaluation grid."
         raise ValueError(msg)
-    context, id_role, additional_role = _steady_role_context(path, admitted, task_spec)
-    role = id_role if selection_role == "id" else additional_role
+    context, saved_roles = _steady_role_context(path, admitted, task_spec)
+    role = saved_roles.get(selection_role)
     if role is None:
-        msg = "Evaluable run has no saved additional evaluation role."
+        msg = f"Evaluable run has no saved {selection_role} role."
         raise ValueError(msg)
     return _load_role(role=role if root is None else replace(role, root=Path(root).expanduser().absolute()), **context)
 
@@ -1344,8 +1336,8 @@ def _steady_role_context(
     run_dir: Path,
     admitted: Mapping[str, Any],
     task_spec: TaskSpec,
-) -> tuple[dict[str, Any], _SavedRole, _SavedRole | None]:
-    """Validate steady run evidence once and return the role-binding context with both saved roles."""
+) -> tuple[dict[str, Any], dict[ArtifactSelectionRole, _SavedRole]]:
+    """Validate steady run evidence once and return the role-binding context with every saved role."""
     config = _mapping(admitted.get("config"), label="evaluable config")
     summary = _mapping(admitted.get("summary"), label="evaluable summary")
     normalizer_state = _mapping(admitted.get("normalizer_state"), label="evaluable normalizer state")
@@ -1372,7 +1364,7 @@ def _steady_role_context(
         "selected_checkpoint_sha256": admitted["selected_checkpoint_sha256"],
     }
     try:
-        id_role, additional_role = _saved_roles(
+        saved_roles = _saved_roles(
             completed=admitted,
             run_dir=run_dir,
             task=task_spec.id,
@@ -1391,7 +1383,7 @@ def _steady_role_context(
         "task_spec": task_spec,
         "evaluation": evaluation,
     }
-    return context, id_role, additional_role
+    return context, saved_roles
 
 
 def load_run_artifacts(

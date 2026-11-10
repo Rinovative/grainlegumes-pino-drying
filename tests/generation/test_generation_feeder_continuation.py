@@ -1,7 +1,7 @@
 """Protect metadata-only campaign continuation and its explicit compute boundary.
 
 Responsibilities:
-  - Check prepared, absent, and invalid supplemental input evidence
+  - Check prepared, absent, and invalid replacement input evidence
   - Preserve sole-feeder cancellation, scheduler reconciliation, and completion
   - Defer replacement generation and legacy heavy artifact admission; plan no replacement for a stopped batch
   - Check that the stop set and blocking read one candidate snapshot and a decision recorded mid-planning ends planning
@@ -41,7 +41,7 @@ from src.generation.publication import generation_publication_catalog as catalog
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-_RUN = "source~steady_flow~lentil-d1__reference-range__lhs-s9910"
+_RUN = "source~steady_flow~lentil-1__ref-range__sobol-seed-9910"
 
 
 def _view(state: str) -> dict[str, str]:
@@ -53,10 +53,13 @@ def _view(state: str) -> dict[str, str]:
 def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Isolate persisted evidence owners around the actual feeder branching; a campaign without node jobs has no scheduler work."""
     scheduler_evidence = service._scheduler_evidence
-    original = SimpleNamespace(batch_id="primary", batch_name="primary", case_indices=(1,), scientific_values={})
-    replacement = SimpleNamespace(batch_id="replacement", batch_name="replacement", case_indices=(2,), scientific_values={"supplemental_design": {}})
+    original = SimpleNamespace(batch_id="primary", batch_name="primary", material_family="lentil", case_indices=(1,), scientific_values={})
+    replacement = SimpleNamespace(
+        batch_id="replacement", batch_name="replacement", material_family="lentil", case_indices=(2,), scientific_values={"replacement_design": {}}
+    )
     campaign = SimpleNamespace(
         batches=(original,),
+        selected_targets={"lentil": 1},
         profile=SimpleNamespace(id="steady_flow"),
         campaign_name="fixture",
         source_name="fixture__" + "a" * 16,
@@ -76,7 +79,13 @@ def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         campaign=campaign,
         manifest=manifest,
         replacement=replacement,
-        records=[{"reservation": {"batch_id": "primary", "case_id": "case_0001", "origin": "primary"}, "decision": None, "attempts": []}],
+        records=[
+            {
+                "reservation": {"batch_id": "primary", "material_family": "lentil", "case_id": "case_0001", "origin": "primary"},
+                "decision": None,
+                "attempts": [],
+            }
+        ],
         views=[_view("active")],
         pending=0,
         running=1,
@@ -88,7 +97,8 @@ def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         states=[],
         policy=[{"batch_id": "primary", "stopped": False, "amendments": []}],
     )
-    monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: tmp_path)
+    run_directory = common.paths.resolve_generation_campaign_directory("steady_flow", _RUN.split("~")[2], storage_root=tmp_path)
+    monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: run_directory)
     monkeypatch.setattr(service.campaign_evidence, "load_campaign_run", lambda *_a, **_k: manifest)
     monkeypatch.setattr(service.campaign_evidence, "campaign_from_manifest", lambda _m: campaign)
     monkeypatch.setattr(lifecycle, "candidate_records", lambda *_a, **_k: state.records)
@@ -118,8 +128,8 @@ def feeder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     return state
 
 
-def test_prepared_supplemental_inputs_continue_without_full_validation(feeder: SimpleNamespace) -> None:
-    """A prepared supplemental source is evidence-admitted before ordinary feeding."""
+def test_prepared_replacement_inputs_continue_without_full_validation(feeder: SimpleNamespace) -> None:
+    """A prepared replacement source is evidence-admitted before ordinary feeding."""
     feeder.campaign.batches += (feeder.replacement,)
     result = service.resume_campaign(_RUN, storage_root=Path("unused"), metadata_only=True)
     assert result is feeder.manifest
@@ -134,7 +144,7 @@ def test_prepared_supplemental_inputs_continue_without_full_validation(feeder: S
 @pytest.mark.parametrize(
     "error", [FileNotFoundError("missing membership"), FileExistsError("corrupt evidence"), RuntimeError("conflicting identity")]
 )
-def test_supplemental_missing_requests_compute_but_invalid_evidence_fails(
+def test_missing_replacement_inputs_request_compute_but_invalid_evidence_fails(
     feeder: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
@@ -149,7 +159,7 @@ def test_supplemental_missing_requests_compute_but_invalid_evidence_fails(
     if isinstance(error, FileNotFoundError):
         result = service.resume_campaign(_RUN, metadata_only=True)
         assert result["continuation_requires_compute"] is True
-        assert result["continuation_reason"] == "supplemental_inputs_missing"
+        assert result["continuation_reason"] == "replacement_inputs_missing"
         assert "continuation_requires_compute" not in feeder.manifest
     else:
         with pytest.raises(type(error), match=str(error)):
@@ -180,9 +190,16 @@ def test_a_success_recorded_during_the_feed_lifts_its_batch_stop_instead_of_bloc
     feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The stop set and the blocked decision read one snapshot: k/n 0/2 stops at s = 0.8, a success committed mid-feed (1/3) does not."""
-    feeder.campaign.batches = (SimpleNamespace(batch_id="primary", batch_name="primary", case_indices=(1, 2, 3, 4), scientific_values={}),)
+    feeder.campaign.batches = (
+        SimpleNamespace(batch_id="primary", batch_name="primary", material_family="lentil", case_indices=(1, 2, 3, 4), scientific_values={}),
+    )
+    feeder.campaign.selected_targets = {"lentil": 4}
     feeder.records = [
-        {"reservation": {"batch_id": "primary", "case_id": f"case_000{index}", "origin": "primary"}, "decision": None, "attempts": []}
+        {
+            "reservation": {"batch_id": "primary", "material_family": "lentil", "case_id": f"case_000{index}", "origin": "primary"},
+            "decision": None,
+            "attempts": [],
+        }
         for index in (1, 2, 3, 4)
     ]
     for row in feeder.records[:2]:
@@ -208,22 +225,40 @@ def test_a_success_recorded_while_a_replacement_is_planned_ends_planning_for_tha
     feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A success that closes a batch's deficit after the check ends its planning without an error; the other batch gets its replacement."""
-    second = SimpleNamespace(batch_id="second", batch_name="second", case_indices=(1,), scientific_values={})
-    feeder.replacement.scientific_values = {"supplemental_design": {"parent_batch_id": "second", "candidate_id": "replacement__second"}}
+    second = SimpleNamespace(batch_id="second", batch_name="second", material_family="chickpea", case_indices=(1,), scientific_values={})
+    feeder.replacement.scientific_values = {"replacement_design": {"parent_batch_id": "second", "candidate_id": "replacement__second"}}
     feeder.campaign.batches += (second,)
+    feeder.campaign.selected_targets = {"lentil": 1, "chickpea": 1}
+    materials = {"primary": "lentil", "second": "chickpea"}
     feeder.records = [
-        {"reservation": {"batch_id": batch_id, "case_id": "case_0001", "origin": "primary"}, "decision": {"outcome": "failed"}, "attempts": []}
-        for batch_id in ("primary", "second")
+        {
+            "reservation": {"batch_id": batch_id, "material_family": material, "case_id": "case_0001", "origin": "primary"},
+            "decision": {"outcome": "failed"},
+            "attempts": [],
+        }
+        for batch_id, material in materials.items()
     ]
     feeder.policy = [{"batch_id": batch_id, "stopped": False, "amendments": [], "minimum_success_rate": 0.5} for batch_id in ("primary", "second")]
 
     def materialize(_campaign: Any, batch_id: str, **_k: Any) -> SimpleNamespace:
         feeder.materializations.append(batch_id)
         if batch_id == "primary":  # a candidate of this batch is recorded successful after the deficit check
-            reservation = {"batch_id": "primary", "case_id": "case_0002", "origin": "replacement", "design_key": "replacement__primary"}
+            reservation = {
+                "batch_id": "primary",
+                "material_family": "lentil",
+                "case_id": "case_0002",
+                "origin": "replacement",
+                "design_key": "replacement__primary",
+            }
             feeder.records.append({"reservation": reservation, "decision": {"outcome": "successful"}, "attempts": []})
             raise lifecycle.NoReplacementError(batch_id)
-        reservation = {"batch_id": "second", "case_id": "case_0002", "origin": "replacement", "design_key": "replacement__second"}
+        reservation = {
+            "batch_id": "second",
+            "material_family": "chickpea",
+            "case_id": "case_0002",
+            "origin": "replacement",
+            "design_key": "replacement__second",
+        }
         feeder.records.append({"reservation": reservation, "decision": None, "attempts": []})
         feeder.campaign.batches += (feeder.replacement,)
         return feeder.replacement
@@ -268,7 +303,7 @@ def test_cancelled_campaign_does_not_admit_inputs_or_feed(feeder: SimpleNamespac
     assert not feeder.fills
 
 
-def test_changed_source_projection_refuses_continuation_before_supplemental_inputs_or_reconciliation(
+def test_changed_source_projection_refuses_continuation_before_replacement_inputs_or_reconciliation(
     feeder: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A frozen campaign recorded under another Source implementation is not continued with the running code."""
@@ -392,7 +427,8 @@ def test_fresh_metadata_submission_requires_explicit_prepared_inputs(tmp_path: P
     config: Any = SimpleNamespace(total_case_count=1, selected_targets={"lentil": 1})
     monkeypatch.setattr(service, "_repository_commit", lambda: commit)
     monkeypatch.setattr(service, "campaign_run_id", lambda *_a, **_k: _RUN)
-    monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: tmp_path)
+    run_directory = common.paths.resolve_generation_campaign_directory("steady_flow", _RUN.split("~")[2], storage_root=tmp_path)
+    monkeypatch.setattr(service.campaign_evidence, "campaign_run_directory", lambda *_a, **_k: run_directory)
     monkeypatch.setattr(lifecycle, "create_campaign", lambda *_a, **_k: None)
 
     def unexpected_preparation(*_a: Any, **_k: Any) -> None:
@@ -401,4 +437,4 @@ def test_fresh_metadata_submission_requires_explicit_prepared_inputs(tmp_path: P
     monkeypatch.setattr(inputs, "prepare_campaign_inputs", unexpected_preparation)
     with pytest.raises(ValueError, match="prepare-campaign-inputs followed by --inputs-prepared"):
         service.submit_campaign(config, git_commit=commit, metadata_only=True)
-    assert not common.paths.resolve_generation_run_manifest_path(common.paths.resolve_generation_execution_directory(tmp_path)).exists()
+    assert not common.paths.resolve_generation_run_manifest_path(common.paths.resolve_generation_execution_directory(run_directory)).exists()

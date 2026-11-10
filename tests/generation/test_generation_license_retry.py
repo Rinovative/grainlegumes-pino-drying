@@ -23,7 +23,6 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-import yaml
 
 from src import common, generation
 from src.generation import generation_campaign_lifecycle as lifecycle
@@ -197,20 +196,14 @@ def test_startup_waiter_preserves_owned_deadline_and_cancellation_provenance(
 def test_in_allocation_window_receipt_is_immutable_and_controller_scoped(
     generation_config_factory: Any,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Persist one bounded exhausted allocation window without changing wait authority."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
-    execution_path = config_path.parent / "execution.yaml"
-    execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["runtime"]["license_wait"]["in_allocation_retry"] = {
-        "enabled": True,
-        "maximum_window_seconds": 17.0,
-        "pause_after_capacity_failure_seconds": 3.0,
-    }
-    execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 17.0)
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     evidence = license_service.classify_temporary_license_capacity(_OBSERVED_CAPACITY_TEXT)
     assert evidence is not None
@@ -311,10 +304,10 @@ def test_status_artifact_recovery_receipt_precedes_and_completes_cleanup(
     tmp_path: Path,
 ) -> None:
     """Persist exact pending evidence before unlink and complete it afterward."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     work_directory = tmp_path / "owned-work"
     work_directory.mkdir()
@@ -439,10 +432,10 @@ def test_status_recovery_loader_admits_atomic_publication_and_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Read no partial receipt, then preserve pending-to-complete publication."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     run_id = "source~transient_drying~concurrent_status_recovery__0123456789abcdef"
@@ -571,10 +564,10 @@ def test_status_recovery_directory_remains_fail_closed(
     tmp_path: Path,
 ) -> None:
     """Reject every non-owned, unsafe, malformed, or identity-conflicting entry."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     run_id = f"source~transient_drying~fail_closed_{mutation}__0123456789abcdef"
@@ -630,12 +623,11 @@ def test_concurrent_status_recovery_directories_remain_independent(
 ) -> None:
     """Reconcile two actively publishing case/job directories independently."""
     config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
         natural_count=2,
     )
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     run_id = "source~transient_drying~parallel_status_recovery__0123456789abcdef"
@@ -729,10 +721,10 @@ def test_temporary_license_wait_loader_admits_atomic_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Ignore only the exact mutable wait receipt's in-flight atomic sibling."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     run_id = "source~transient_drying~concurrent_license_wait__0123456789abcdef"
@@ -793,14 +785,11 @@ def test_temporary_license_wait_loader_admits_atomic_update(
     assert wait["retry_count"] == 1
 
 
-def test_license_retry_backoff_is_exponential_and_bounded() -> None:
+def test_license_retry_backoff_is_exponential_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     """Increase a test-owned retry delay without exceeding its cap."""
-    policy = {
-        "enabled": True,
-        "initial_delay_seconds": 7.0,
-        "maximum_delay_seconds": 11.0,
-        "maximum_wait_seconds": 50.0,
-    }
+    monkeypatch.setattr(license_service, "INITIAL_BACKOFF_SECONDS", 7.0)
+    monkeypatch.setattr(license_service, "MAXIMUM_BACKOFF_SECONDS", 11.0)
+    policy = {"enabled": True, "maximum_wait_seconds": 50.0}
     cumulative = 0.0
     delays: list[float] = []
     for attempt_index in range(1, 7):
@@ -816,14 +805,11 @@ def test_license_retry_backoff_is_exponential_and_bounded() -> None:
     assert cumulative == 50.0
 
 
-def test_unbounded_license_retry_wait_never_exhausts() -> None:
+def test_unbounded_license_retry_wait_never_exhausts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Interpret a null maximum wait as indefinitely controller-retryable."""
-    policy = {
-        "enabled": True,
-        "initial_delay_seconds": 3.0,
-        "maximum_delay_seconds": 8.0,
-        "maximum_wait_seconds": None,
-    }
+    monkeypatch.setattr(license_service, "INITIAL_BACKOFF_SECONDS", 3.0)
+    monkeypatch.setattr(license_service, "MAXIMUM_BACKOFF_SECONDS", 8.0)
+    policy = {"enabled": True, "maximum_wait_seconds": None}
 
     assert (
         license_service.bounded_retry_delay_seconds(
@@ -851,14 +837,11 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Treat zero-exit capacity as retryable, then publish the same case normally."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=0.5,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 0.5)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     work = tmp_path / "work"
@@ -893,11 +876,10 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
         storage_root=storage,
     )
     assert wait is not None
-    retry_policy = config.execution_values["runtime"]["license_wait"]
     assert wait["latest_dispatch_key"] == "701-1"
     assert wait["recent_dispatch_keys"] == ["701-1"]
     assert wait["retry_count"] == 1
-    assert wait["delay_before_next_attempt_seconds"] == retry_policy["initial_delay_seconds"]
+    assert wait["delay_before_next_attempt_seconds"] == license_service.INITIAL_BACKOFF_SECONDS
     assert wait["retry_budget_remaining"] is True
     assert wait["feature"] in {"Brinkman Equations (br)", "COMSOL license acquisition"}
     assert wait["error_code"] == ("-4,132" if wait["feature"] == "Brinkman Equations (br)" else None)
@@ -950,7 +932,7 @@ def test_zero_exit_license_attempt_releases_scratch_and_later_succeeds(
     )
     assert outcome.status == "completed"
     timing = json.loads((outcome.processed_directory / "evidence" / "timing.json").read_text(encoding="utf-8"))
-    assert timing["license_wait_seconds"] == retry_policy["initial_delay_seconds"]
+    assert timing["license_wait_seconds"] == license_service.INITIAL_BACKOFF_SECONDS
     assert attempt_service.latest_case_attempt(config, 1, storage_root=storage) is None
     assert generation.runtime.completed_case_is_valid(
         config,
@@ -976,15 +958,11 @@ def test_silent_controller_deadline_becomes_license_blocked_without_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Route the controller-owned TERM status through existing operational retry."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=0.05,
-        in_allocation_pause_after_capacity_failure_seconds=0.01,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 0.05)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)
@@ -1039,15 +1017,12 @@ def test_cancellation_between_capacity_checkouts_remains_cancelled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Give cancellation priority after a capacity checkout and before retry."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=1.0,
-        in_allocation_pause_after_capacity_failure_seconds=0.1,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 1.0)
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_PAUSE_SECONDS", 0.1)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)
@@ -1103,14 +1078,11 @@ def test_unowned_sigterm_remains_a_genuine_solver_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Never reinterpret an arbitrary process status minus fifteen as capacity."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=1.0,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 1.0)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)
@@ -1143,6 +1115,44 @@ def test_unowned_sigterm_remains_a_genuine_solver_failure(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("entry_path", ["authored_rule", "no_retry_flag"])
+def test_disabled_license_protection_fails_the_case_without_wait_or_window(
+    entry_path: str,
+    generation_config_factory: Any,
+    fake_comsol: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the protection off, a capacity failure is an ordinary solver failure: no wait receipt, no allocation window."""
+    config_path, _template = generation_config_factory(executable=fake_comsol, license_retry_enabled=entry_path != "authored_rule")
+    overrides = {"no_retry": True} if entry_path == "no_retry_flag" else None
+    config = generation.cases.config.load_campaign_config(config_path, execution_overrides=overrides).batch("transient_drying__lentil__test")
+    assert config.execution_values["runtime"]["license_wait"]["enabled"] is False
+    storage = tmp_path / "storage"
+    _prepare_current_source_inputs(config, 1, storage)
+    run_id = _source_run_id(config)
+    monkeypatch.setenv("GENERATION_CAMPAIGN_RUN_ID", run_id)
+    _dispatch_environment(monkeypatch, "706", 1)
+    monkeypatch.setenv("FAKE_COMSOL_MODE", "license_capacity")
+
+    with pytest.raises(license_service.TemporaryLicenseCapacityError):
+        generation.runtime.run_case(
+            config,
+            1,
+            cores_per_case=1,
+            scheduler_kind="slurm",
+            storage_root=storage,
+            work_root=tmp_path / "work",
+        )
+
+    attempt = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
+    assert attempt is not None
+    assert (attempt.payload["case_state"], attempt.payload["failure_stage"]) == ("failed", "solver")
+    assert license_service.load_temporary_license_wait(config, 1, campaign_run_id=run_id, storage_root=storage) is None
+    assert license_service.load_in_allocation_license_window(config, 1, campaign_run_id=run_id, dispatch_key="706-1", storage_root=storage) is None
+
+
+@pytest.mark.integration
 def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     generation_config_factory: Any,
     fake_comsol: Path,
@@ -1150,15 +1160,11 @@ def test_capacity_failures_then_solver_start_keep_one_allocation_and_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Retry twice, then keep the third process alive for the scientific solve."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=1.0,
-        in_allocation_pause_after_capacity_failure_seconds=0.01,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 1.0)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)
@@ -1226,16 +1232,11 @@ def test_two_workers_search_for_capacity_without_a_global_launch_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Allow two independent allocations to run checkout processes concurrently."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        natural_count=2,
-        in_allocation_maximum_window_seconds=0.6,
-        in_allocation_pause_after_capacity_failure_seconds=0.01,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 0.6)
+    config_path, _template = generation_config_factory(executable=fake_comsol, natural_count=2)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 2, storage)
@@ -1302,14 +1303,11 @@ def test_valid_success_overrides_an_earlier_license_warning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep a complete validated result successful despite an earlier warning."""
-    config_path, _template = generation_config_factory(
-        executable=fake_comsol,
-        scheduler_kind="slurm",
-        in_allocation_maximum_window_seconds=2.0,
-    )
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 2.0)
+    config_path, _template = generation_config_factory(executable=fake_comsol)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)
@@ -1347,15 +1345,10 @@ def test_persisted_retry_budget_exhaustion_is_terminal_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reconstruct cumulative wait receipts and close a test-owned budget."""
-    config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
-        license_initial_delay_seconds=2.0,
-        license_maximum_delay_seconds=5.0,
-        license_maximum_wait_seconds=12.0,
-    )
+    config_path, _template = generation_config_factory(license_maximum_wait_seconds=12.0)
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     policy = config.execution_values["runtime"]["license_wait"]
     run_id = _source_run_id(config)
@@ -1420,10 +1413,10 @@ def test_wait_uniqueness_is_per_dispatch_key_within_one_allocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Accept two dispatches of one allocation, but never the same dispatch twice."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     run_id = _source_run_id(config)
     storage = tmp_path / "storage"
@@ -1458,11 +1451,10 @@ def test_license_retry_cleanup_failure_becomes_terminal(
     """Do not auto-retry a capacity attempt whose marked scratch did not clean."""
     config_path, _template = generation_config_factory(
         executable=fake_comsol,
-        scheduler_kind="slurm",
     )
     config = generation.cases.config.load_generation_config(
         config_path,
-        only_batch="transient_drying__lentil__natural",
+        only_batch="transient_drying__lentil__test",
     )
     storage = tmp_path / "storage"
     _prepare_current_source_inputs(config, 1, storage)

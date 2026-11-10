@@ -34,9 +34,9 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
 
 
-def _split(arm: str, *, additional: tuple[tuple[str, tuple[str, ...]], ...] = ()) -> dict[str, Any]:
+def _split(arm: str, *, material_ood: tuple[tuple[str, tuple[str, ...]], ...] = ()) -> dict[str, Any]:
     """Return one admitted transient split; B differs from A0/A1 only in its strategy-owned Train sampling."""
-    split = synthetic_split_payload("transient_drying", train_dataset="transient_dataset", additional=additional)
+    split = synthetic_split_payload("transient_drying", train_dataset="transient_dataset", material_ood=material_ood)
     if arm == "b":
         rollout = {"mode": "trajectory", "rollout_length": 2}
         split["extension"]["sampling"] = datasets.contracts.transient.TransientSamplingSpec.from_mapping(rollout).as_dict()
@@ -62,12 +62,12 @@ def _matched_receipt() -> dict[str, Any]:
             },
             "data": {
                 "train_dataset": "transient_dataset",
-                "additional_evaluation_datasets": [],
+                "material_ood_datasets": [],
                 "evaluation_assignments": [],
                 "case_partition": {"kind": "exact", "train": ["train"], "validation": ["val"], "id_test": ["test"]},
                 "spatial_stride": 1,
             },
-            "input_profile": "canonical_physics_complete_v1",
+            "input_profile": "canonical_physics_complete",
             "temporal": {"temporal_conditioning": "time"},
             "model": {"kind": "fno", "params": {"hidden_channels": 8}},
             "evaluation": {"objective": {"id": "objective"}},
@@ -106,7 +106,7 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
     identity = {
         "model_kind": "fno",
         "model_parameters": {"hidden_channels": 8},
-        "input_profile": "canonical_physics_complete_v1",
+        "input_profile": "canonical_physics_complete",
         "boundary_representation": "both_interval_endpoints_with_startup_support",
         "scaling_identity": {"semantic_digest": "scale"},
     }
@@ -201,7 +201,7 @@ def test_a0_evidence_rejects_projected_zero_without_terminal_proof(
         analysis.evaluation.workflow._transient_arm_evidence(prepared.loaded_run)
 
 
-def test_workflow_filters_absent_additional_evaluation_and_validates_exact_three_arm_lineage(
+def test_workflow_filters_absent_ood_roles_and_validates_exact_three_arm_lineage(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -264,7 +264,7 @@ def test_workflow_filters_absent_additional_evaluation_and_validates_exact_three
         ),
         (
             analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),
-            analysis.evaluation.workflow.EvaluationContextSpec("additional_evaluation", "Additional evaluation", "additional_evaluation"),
+            analysis.evaluation.workflow.EvaluationContextSpec("material_ood", "Material OOD", "material_ood"),
         ),
     )
     assert workflow.task == "transient_drying"
@@ -309,7 +309,7 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
             },
             "data": {
                 "train_dataset": "dataset",
-                "additional_evaluation_datasets": [],
+                "material_ood_datasets": [],
                 "evaluation_assignments": [],
                 "case_partition": {"kind": "exact", "train": ["case-a"], "validation": ["case-b"], "id_test": ["case-c"]},
                 "spatial_stride": 1,
@@ -406,7 +406,7 @@ def test_single_model_uses_partitioned_case_union_while_comparison_requires_pair
         def __init__(self) -> None:
             self.by_frame = {
                 "Single ID": single_cases[:2],
-                "Single Additional evaluation": single_cases[2:],
+                "Single Material OOD": single_cases[2:],
                 "UNO ID": single_cases[:2],
                 "FNO ID": single_cases[2:],
             }
@@ -421,7 +421,7 @@ def test_single_model_uses_partitioned_case_union_while_comparison_requires_pair
     union = analysis.evaluation.workflow._transient_selection_case_ids(
         current,
         display_labels=("Single",),
-        roles=("id", "additional_evaluation"),
+        roles=("id", "material_ood"),
         single_model=True,
     )
     assert union == single_cases
@@ -490,7 +490,7 @@ def test_workspace_wrappers_convert_ordered_paths_and_close_task_mismatch(
         sections=("summary",),
     )
     assert [selection.label for selection in calls[0][0]] == ["First", "Second"]
-    assert [spec.artifact_role for spec in calls[0][1]] == ["id", "additional_evaluation"]
+    assert [spec.artifact_role for spec in calls[0][1]] == ["id", "material_ood", "parameter_ood"]
     assert calls[0][2]["auto_build_missing"] is False
     assert calls[0][2]["rebuild_incompatible"] is True
     assert calls[0][2]["device_policy"] == "cpu"
@@ -584,13 +584,13 @@ def test_generic_transient_comparison_rejects_mismatched_role_membership(
 
 def test_physical_projection_drops_only_the_sampling_extension() -> None:
     """The physical split keeps every Dataset identity and role membership, without the task's item expansion."""
-    split = _split("b", additional=(("additional", ("chickpea__case_0001__00000000000a",)),))
+    split = _split("b", material_ood=(("additional", ("chickpea__case_0001__00000000000a",)),))
     before = deepcopy(split)
     physical = analysis.evaluation.artifact_loader._physical_split(split)
     assert split == before
     assert set(physical) == {"dataset_identity", "roles"}
-    assert physical["dataset_identity"]["additional_evaluation"][0]["dataset_id"] == "additional"
-    assert physical["roles"]["additional_evaluation"]["parts"][0]["case_ids"] == ["chickpea__case_0001__00000000000a"]
+    assert physical["dataset_identity"]["material_ood"][0]["dataset_id"] == "additional"
+    assert physical["roles"]["material_ood"]["parts"][0]["case_ids"] == ["chickpea__case_0001__00000000000a"]
     physical["dataset_identity"]["train"]["index_digest"] = "changed_copy"
     assert split == before
 
@@ -611,14 +611,14 @@ def test_strategy_sampling_does_not_change_physical_role_or_lineage() -> None:
     assert first_artifact.frame.attrs["artifact_provenance"] == first_raw
 
 
-@pytest.mark.parametrize("role", ["train", "validation", "id_test", "additional_evaluation"])
+@pytest.mark.parametrize("role", ["train", "validation", "id_test", "material_ood"])
 def test_lineage_rejects_changes_in_every_physical_role(role: str) -> None:
     """Even unchanged evaluated ID cases cannot conceal a different training/validation split."""
     first = _prepared(Path("a0"), "a0").loaded_run
     second = _prepared(Path("b"), "b").loaded_run
     assert second.id_artifact is not None
     roles = second.id_artifact.frame.attrs["transient_physical_split"]["roles"]
-    roles[role] = {"parts": [{"case_ids": ["different_case"]}]} if role == "additional_evaluation" else {"case_ids": ["different_case"]}
+    roles[role] = {"parts": [{"case_ids": ["different_case"]}]} if role == "material_ood" else {"case_ids": ["different_case"]}
     workflow = analysis.evaluation.workflow
     assert workflow._transient_arm_evidence(first).split_id != workflow._transient_arm_evidence(second).split_id
     third = _prepared(Path("a1"), "a1").loaded_run
@@ -655,7 +655,8 @@ def test_transient_loader_attaches_existing_admitted_all_role_projection(
     root.mkdir(parents=True)
     (root / "artifact_provenance.json").write_text("{}")
     transient = analysis.artifacts.transient
-    plan = SimpleNamespace(id_role=SimpleNamespace(dataset_name="transient_dataset"), additional_role=None, run_name="run_b")
+    id_role = SimpleNamespace(dataset_name="transient_dataset", root=lambda _run_dir: root)
+    plan = SimpleNamespace(id_role=id_role, ood_roles={}, run_name="run_b", role=lambda _split: id_role)
     monkeypatch.setattr(analysis.artifacts.plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
     index = SimpleNamespace(frame=pd.DataFrame(), provenance={}, unavailable_horizons=(), identity_sha256="identity")
     monkeypatch.setattr(transient, "validate_transient_role_artifact_index", lambda *_args, **_kwargs: index)

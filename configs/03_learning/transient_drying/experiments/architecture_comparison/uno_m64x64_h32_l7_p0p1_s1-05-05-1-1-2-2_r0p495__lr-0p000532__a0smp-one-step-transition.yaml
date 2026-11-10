@@ -1,0 +1,27 @@
+# Role: one transient_drying matched A0 -> {B, A1} experiment; states only what differs from base.yaml and the U-NO defaults. Edit: freely.
+
+model:
+  kind: uno  # Architecture family; its params below are interpreted by that family.
+  params:
+    modes_x: 64  # Fourier modes retained along the x axis.
+    modes_y: 64  # Fourier modes retained along the y axis.
+    hidden_channels: 32  # Width of the hidden feature representation.
+    n_layers: 7  # Number of U-NO layers; affects capacity and compute.
+    mode_ratio: 0.4951318201313778  # Fraction controlling the intermediate Fourier-mode allocation.
+    uno_scalings: [[1, 1], [0.5, 0.5], [0.5, 0.5], [1, 1], [1, 1], [2, 2], [2, 2]]  # Per-layer [y, x] spatial scaling schedule; its length must match n_layers.
+
+optimizer:
+  lr: 5.319714363424885e-4  # Initial learning rate; placeholder until the uno_a0_search study selects it.
+
+training:
+  a0:
+    sampling:
+      mode: one_step_transition  # Teacher-forced single-transition training examples; A0's curriculum stays the one-step default.
+  b:
+    sampling:
+      mode: rollout_window  # Self-fed rollout windows of the base rollout_length.
+      window_stride: 32  # Step between rollout-window starts in the sampled trajectory.
+      window_offset: 0  # Starting offset applied when selecting rollout windows.
+
+task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.
+base: ../../base.yaml  # Shared task settings; every value set in this file overrides them.

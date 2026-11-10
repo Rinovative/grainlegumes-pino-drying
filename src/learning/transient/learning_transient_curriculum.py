@@ -29,16 +29,12 @@ from typing import Any, ClassVar, Final, Literal, overload
 
 import torch
 
-from src import common
-
 TrainingStage = Literal["stage_a_teacher_forcing", "stage_b_self_fed"]
 ComparisonArm = Literal["A0", "B", "A1"]
 ClockKind = Literal["cuda_device_seconds", "optimizer_steps", "train_seconds"]
 BudgetControl = Literal["stage_epochs", "train_seconds"]
 DEFAULT_ROLLOUT_LENGTHS: Final = (2, 4, 8, 16, 32)
 DEFAULT_MILESTONE_FRACTIONS: Final = (0.0, 0.2, 0.4, 0.6, 0.8)
-_CURRICULUM_SCHEMA_VERSION: Final = 1
-_CONTROLLER_SCHEMA_VERSION: Final = 1
 # Immutable controller semantics shared by checkpoint admission and the stage digest.
 _CONTROLLER_IDENTITY_FIELDS: Final = (
     "arm",
@@ -52,7 +48,6 @@ _CONTROLLER_IDENTITY_FIELDS: Final = (
     "matched_receipt_sha256",
     "evaluation_points",
 )
-_HANDOFF_SCHEMA_VERSION: Final = 1
 _SHA256_LENGTH: Final = 64
 # Every other terminal controller and curriculum value is kept in each completed-epoch history record under its adapter
 # telemetry name, which is the value's own name unless renamed here.
@@ -207,7 +202,6 @@ class TeacherHandoffIdentity:
     def as_dict(self) -> dict[str, str | int]:
         """Return strict serializable handoff evidence."""
         return {
-            "schema_version": _HANDOFF_SCHEMA_VERSION,
             "source_run_name": self.source_run_name,
             "source_checkpoint_sha256": self.source_checkpoint_sha256,
             "source_scaling_sha256": self.source_scaling_sha256,
@@ -221,7 +215,6 @@ class TeacherHandoffIdentity:
     def from_mapping(cls, value: Mapping[str, Any]) -> TeacherHandoffIdentity:
         """Admit exact serialized handoff evidence."""
         expected = {
-            "schema_version",
             "source_run_name",
             "source_checkpoint_sha256",
             "source_scaling_sha256",
@@ -230,14 +223,10 @@ class TeacherHandoffIdentity:
             "model_kind",
             "input_profile",
         }
-        if (
-            not isinstance(value, Mapping)
-            or set(value) != expected
-            or not common.serialization.is_schema_version(value["schema_version"], _HANDOFF_SCHEMA_VERSION)
-        ):
+        if not isinstance(value, Mapping) or set(value) != expected:
             msg = "Teacher handoff evidence does not match the current strict schema."
             raise ValueError(msg)
-        return cls(**{key: value[key] for key in expected if key != "schema_version"})
+        return cls(**{key: value[key] for key in expected})
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +277,7 @@ class RolloutCurriculum:
 
     def as_dict(self) -> dict[str, Any]:
         """Return strict serializable curriculum semantics."""
-        return {"schema_version": _CURRICULUM_SCHEMA_VERSION, "lengths": list(self.lengths), "milestone_fractions": list(self.milestone_fractions)}
+        return {"lengths": list(self.lengths), "milestone_fractions": list(self.milestone_fractions)}
 
     @property
     def digest(self) -> str:
@@ -388,7 +377,6 @@ class RolloutCurriculumState:
             not isinstance(value, Mapping)
             or set(value) != required
             or value["curriculum"] != self.curriculum.as_dict()
-            or not common.serialization.is_schema_version(value["curriculum"]["schema_version"], _CURRICULUM_SCHEMA_VERSION)
             or value["curriculum_digest"] != self.curriculum.digest
         ):
             msg = "Saved curriculum state does not match the configured curriculum."
@@ -580,7 +568,6 @@ class MatchedComputeController:
     def state_dict(self) -> dict[str, Any]:
         """Return strict checkpointable controller evidence."""
         values = {name: getattr(self, name) for name in self.__dataclass_fields__}
-        values["schema_version"] = _CONTROLLER_SCHEMA_VERSION
         values["teacher_handoff"] = None if self.teacher_handoff is None else self.teacher_handoff.as_dict()
         return values
 
@@ -589,13 +576,10 @@ class MatchedComputeController:
         if not isinstance(value, Mapping):
             msg = "Saved transient budget state must be a mapping."
             raise TypeError(msg)
-        if set(value) != set(self.state_dict()) or not common.serialization.is_schema_version(
-            value.get("schema_version"), _CONTROLLER_SCHEMA_VERSION
-        ):
+        if set(value) != set(self.state_dict()):
             msg = "Saved transient budget state does not match the strict schema."
             raise ValueError(msg)
         candidate = dict(value)
-        candidate.pop("schema_version")
         handoff = candidate["teacher_handoff"]
         candidate["teacher_handoff"] = None if handoff is None else TeacherHandoffIdentity.from_mapping(handoff)
         restored = MatchedComputeController(**candidate)

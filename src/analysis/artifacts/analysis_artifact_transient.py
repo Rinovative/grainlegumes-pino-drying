@@ -65,7 +65,6 @@ _SOURCE_SELECTOR_KEYS = (
 )
 _TIMING_REPETITIONS = 3
 _RESUME_EVIDENCE_SCHEMA_KIND = "evaluation_transient_resume_case"
-_RESUME_EVIDENCE_SCHEMA_VERSION = 1
 # Per-case component evidence the generator writes next to its timing report; resume and role admission both require exactly these fields.
 _COMPONENT_TEXT_FIELDS = ("model_clock", "wall_clock")
 _COMPONENT_MAPPING_FIELDS = (
@@ -1149,7 +1148,6 @@ def _restore_resumed_case_evidence(
     """Restore exact compact case evidence without Dataset or model execution."""
     required = {
         "schema_kind",
-        "schema_version",
         "case_id",
         "material_family",
         "identity",
@@ -1166,7 +1164,6 @@ def _restore_resumed_case_evidence(
     material = value["material_family"]
     if (
         value["schema_kind"] != _RESUME_EVIDENCE_SCHEMA_KIND
-        or not common.serialization.is_schema_version(value["schema_version"], _RESUME_EVIDENCE_SCHEMA_VERSION)
         or value["case_id"] != case_id
         or not isinstance(material, str)
         or not material
@@ -1269,8 +1266,7 @@ def _role_spatial_representation_evidence(
         message = "Transient spatial compatibility evidence is incomplete."
         raise ValueError(message)
     return {
-        "schema_version": datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION,
-        "inference_contract": "transient_physical_rollout_evaluation_grid_v1",
+        "inference_contract": "transient_physical_rollout_evaluation_grid",
         "source_grid": {
             "shape": list(training.source_shape),
             "owner": "canonical_generation_dataset_package",
@@ -1405,7 +1401,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
             message = "Transient artifact saved role contains duplicate case identities."
             raise ValueError(message)
         resume_identity = {
-            "artifact_schema_version": (sequence_artifact.TRANSIENT_SEQUENCE_SCHEMA_VERSION),
             "run_name": admitted_completed["scientific_run_name"],
             "resolved_config_sha256": run_identity.resolved_config_digest(config),
             "effective_config_digest": admitted_completed["effective_config_digest"],
@@ -1719,7 +1714,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     metric_statistics=case_statistics,
                     resume_evidence={
                         "schema_kind": _RESUME_EVIDENCE_SCHEMA_KIND,
-                        "schema_version": _RESUME_EVIDENCE_SCHEMA_VERSION,
                         "case_id": package_case_id,
                         "material_family": material,
                         "identity": dict(identity),
@@ -1915,7 +1909,6 @@ def _validate_role_spatial_representation(
     """Bind role and record grid evidence to exact completed-run spatial owners."""
     evidence = loaded.provenance.get("spatial_representation")
     required = {
-        "schema_version",
         "inference_contract",
         "source_grid",
         "training_grid",
@@ -1949,19 +1942,10 @@ def _validate_role_spatial_representation(
         "interpolation": "forbidden",
     }
     if (
-        not common.serialization.is_schema_version(
-            evidence["schema_version"], datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION
-        )
-        or evidence["inference_contract"] != "transient_physical_rollout_evaluation_grid_v1"
+        evidence["inference_contract"] != "transient_physical_rollout_evaluation_grid"
         or evidence["source_grid"] != {"shape": list(training.source_shape), "owner": "canonical_generation_dataset_package"}
         or evidence["training_grid"] != training.as_dict()
         or evidence["evaluation_grid"] != evaluation.as_dict()
-        or not all(
-            common.serialization.is_schema_version(
-                evidence[grid]["schema_version"], datasets.contracts.transient.TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION
-            )
-            for grid in ("training_grid", "evaluation_grid")
-        )
         or evidence["checkpoint_identity"] != expected_checkpoint
         or evidence["field_alignment"] != expected_fields
     ):

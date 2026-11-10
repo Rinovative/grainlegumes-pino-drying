@@ -15,7 +15,7 @@ Design principles:
 
 This module does NOT:
   - Load final datasets into model-ready samples. ``src.datasets.runtime.factory`` owns that
-  - Choose training/evaluation ratios or random seeds. The authored Dataset plan owns them
+  - Choose design counts or seeds. The authored Dataset plan owns them
   - Publish dataset files. Dataset package services own publication
 """
 
@@ -38,10 +38,7 @@ if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 DATASET_PACKAGE_SCHEMA_KIND: Final = "dataset_selection_manifest"
-DATASET_PACKAGE_SCHEMA_VERSION: Final = 1
 SOURCE_SELECTION_SCHEMA_KIND: Final = "dataset_source_selection"
-SOURCE_SELECTION_SCHEMA_VERSION: Final = 1
-TRAINING_DATASET_SCHEMA_VERSION = 1
 TRAINING_DATASET_SCHEMA_KIND = "dataset_steady_tensor_payload"
 CASE_FINGERPRINT_VERSION = 1
 TRAINING_TENSOR_DTYPE: Final = "float32"
@@ -51,7 +48,6 @@ _FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
 _DATASET_CONVERSION_CONTRACTS: Final = {
     "steady_flow": {
         "schema_kind": "dataset_conversion_contract",
-        "source_schema_version": 1,
         "tensor_dtype": TRAINING_TENSOR_DTYPE,
         "case_fingerprint_version": CASE_FINGERPRINT_VERSION,
         "permeability_representation": {
@@ -63,8 +59,6 @@ _DATASET_CONVERSION_CONTRACTS: Final = {
     },
     "transient_drying": {
         "schema_kind": "dataset_conversion_contract",
-        "source_schema_version": 1,
-        "index_schema_version": 1,
         "transition_selection": "consecutive_regular_states_excluding_irregular_stop",
         "target_semantics": "next_state_minus_current_state",
         "payload_semantics": "portable_source_hdf5_transition_index",
@@ -72,7 +66,6 @@ _DATASET_CONVERSION_CONTRACTS: Final = {
 }
 _REQUIRED_KEYS = frozenset(
     {
-        "schema_version",
         "schema_kind",
         "dataset_id",
         "task",
@@ -138,6 +131,7 @@ class ManifestBinding:
     case_ids: tuple[str, ...]
     physical_sources: Mapping[str, tuple[str, str]]
     materials: Mapping[str, str]
+    design_kinds: Mapping[str, str]
     case_partition: Mapping[str, Any] | None
 
     def split_identity(self) -> dict[str, Any]:
@@ -162,6 +156,7 @@ def manifest_binding(manifest: Mapping[str, Any]) -> ManifestBinding:
             str(entry["package_case_id"]): (str(entry["source"]["case_input_id"]), str(entry["source"]["simulation_case_id"])) for entry in entries
         },
         materials={str(entry["package_case_id"]): str(entry["source"]["material_family"]) for entry in entries},
+        design_kinds={str(entry["package_case_id"]): str(entry["design"]["design_kind"]) for entry in entries},
         case_partition=copy.deepcopy(manifest["case_partition"]),
     )
 
@@ -216,9 +211,7 @@ def dataset_conversion_contract_identity(dataset_view: str) -> dict[str, Any]:
 def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """Select the positive content and interpretation dependencies of a package."""
     value = dict(provenance)
-    if value.get("schema_kind") != DATASET_PACKAGE_SCHEMA_KIND or not common.serialization.is_schema_version(
-        value.get("schema_version"), DATASET_PACKAGE_SCHEMA_VERSION
-    ):
+    if value.get("schema_kind") != DATASET_PACKAGE_SCHEMA_KIND:
         msg = "Dataset package uses an unsupported selection contract."
         raise ValueError(msg)
     dataset_view = _require_non_empty_string(value.get("dataset_view"), label="Dataset package dataset_view")
@@ -267,7 +260,8 @@ def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str
             "decision_sha256",
         }
         required_design = {
-            "sampling_method",
+            "design_recipe",
+            "design_kind",
             "original_design_size",
             "candidate_position",
             "origin",
@@ -304,7 +298,6 @@ def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str
         projected_cases.append(copy.deepcopy(dict(source_case)))
     package_keys = (
         "schema_kind",
-        "schema_version",
         "dataset_view",
         "registered_task_id",
         "source_task",
@@ -327,6 +320,7 @@ def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str
             fixed,
             case_ids=[entry["package_case_id"] for entry in projected_cases],
             material_by_case={entry["package_case_id"]: entry["source"]["material_family"] for entry in projected_cases},
+            design_kind_by_case={entry["package_case_id"]: entry["design"]["design_kind"] for entry in projected_cases},
         )
     payload["case_partition"] = copy.deepcopy(fixed)
     payload["source_case_identities"] = projected_cases
@@ -334,18 +328,13 @@ def package_semantic_identity_payload(provenance: Mapping[str, Any]) -> dict[str
 
 
 def package_content_digest(value: Mapping[str, Any]) -> str:
-    """Return the digest of a Dataset's scientific content, without split-generation provenance.
+    """Return the digest of a Dataset's scientific content, independent of its name.
 
-    Two Datasets with the same interpretation, source cases, builder and ordered
-    Train/validation/test/OOD membership are the same content even when other
-    split seeds or recipes produced that membership. The seeds and recipe stay in
-    the manifest as provenance.
+    The content is the semantic identity: interpretation, builder, the source cases with their design provenance
+    (Generation seed, design recipe, design kind and position of every case, hence the counts) and the role
+    membership those design kinds determine.
     """
-    payload = package_semantic_identity_payload(value)
-    partition = payload.get("case_partition")
-    if isinstance(partition, dict):
-        payload["case_partition"] = {key: item for key, item in partition.items() if key not in {"seed_input", "seed", "recipe"}}
-    return hashlib.sha256(_canonical_json(payload, label="Dataset content identity")).hexdigest()
+    return hashlib.sha256(_canonical_json(package_semantic_identity_payload(value), label="Dataset content identity")).hexdigest()
 
 
 def package_identity_from_provenance(provenance: Mapping[str, Any]) -> tuple[str, str]:
@@ -530,9 +519,6 @@ def validate_dataset_data_contract_digest(
 
 
 def _validate_task_header(payload: Mapping[str, Any], task: TaskSpec, *, label: str) -> None:
-    if not common.serialization.is_schema_version(payload.get("schema_version"), TRAINING_DATASET_SCHEMA_VERSION):
-        msg = f"{label} schema_version must be integer {TRAINING_DATASET_SCHEMA_VERSION}."
-        raise ValueError(msg)
     if payload.get("schema_kind") != TRAINING_DATASET_SCHEMA_KIND:
         msg = f"{label} schema_kind must be {TRAINING_DATASET_SCHEMA_KIND!r}."
         raise ValueError(msg)
@@ -626,9 +612,8 @@ def build_training_dataset_payload(
     normalized_case_fingerprints = _require_sha256_sequence(case_fingerprints, label="case_fingerprints")
     normalized_selection_identity = _json_mapping_copy(source_selection_identity, label="source_selection_identity")
     if (
-        set(normalized_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
+        set(normalized_selection_identity) != {"schema_kind", "source_cases"}
         or normalized_selection_identity["schema_kind"] != SOURCE_SELECTION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(normalized_selection_identity["schema_version"], SOURCE_SELECTION_SCHEMA_VERSION)
         or not isinstance(normalized_selection_identity["source_cases"], list)
         or len(normalized_selection_identity["source_cases"]) != len(normalized_sample_ids)
     ):
@@ -663,7 +648,6 @@ def build_training_dataset_payload(
         msg = "Dataset input/output tensor dtypes differ."
         raise ValueError(msg)
     payload: dict[str, Any] = {
-        "schema_version": TRAINING_DATASET_SCHEMA_VERSION,
         "schema_kind": TRAINING_DATASET_SCHEMA_KIND,
         "dataset_id": normalized_dataset_id,
         "task": task.id,
@@ -701,7 +685,7 @@ def validate_training_dataset_payload(
     task: TaskSpec,
     verify_content: bool = False,
 ) -> DatasetIdentity:
-    """Validate one version-1 training dataset and optionally rehash all content."""
+    """Validate one training dataset and optionally rehash all content."""
     mapping = _require_mapping(payload, label="Training dataset")
     _require_exact_keys(mapping, label="Training dataset")
     _validate_task_header(mapping, task, label="Training dataset")
@@ -713,9 +697,8 @@ def validate_training_dataset_payload(
         raise ValueError(msg)
     source_selection_identity = _json_mapping_copy(mapping.get("source_selection_identity"), label="source_selection_identity")
     if (
-        set(source_selection_identity) != {"schema_kind", "schema_version", "source_cases"}
+        set(source_selection_identity) != {"schema_kind", "source_cases"}
         or source_selection_identity["schema_kind"] != SOURCE_SELECTION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(source_selection_identity["schema_version"], SOURCE_SELECTION_SCHEMA_VERSION)
         or not isinstance(source_selection_identity["source_cases"], list)
         or len(source_selection_identity["source_cases"]) != sample_count
     ):

@@ -39,12 +39,10 @@ if TYPE_CHECKING:
 CASE_WORKSPACE_MARKER: Final = path_contract.CASE_WORKSPACE_MARKER
 WORKER_WORKSPACE_MARKER: Final = ".generation-worker-workspace.json"
 PUBLICATION_STAGING_MARKER: Final = ".generation-publication-staging.json"
-WORKSPACE_SCHEMA_VERSION: Final = 1
 _SLURM_JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
 _CASE_MARKER_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "run_id",
         "case_id",
         "simulation_profile",
@@ -61,7 +59,6 @@ _CASE_MARKER_KEYS: Final = frozenset(
 _WORKER_MARKER_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "run_id",
         "work_directory",
         "created_at",
@@ -74,7 +71,6 @@ _WORKER_MARKER_KEYS: Final = frozenset(
 _PUBLICATION_MARKER_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "run_id",
         "case_id",
         "storage_root",
@@ -158,7 +154,6 @@ def create_case_workspace(
     run_id = workspace_run_id(config)
     marker = {
         "schema_kind": "generation_case_workspace",
-        "schema_version": WORKSPACE_SCHEMA_VERSION,
         "run_id": run_id,
         "case_id": common.paths.validate_logical_name(case_id, label="case_id"),
         "simulation_profile": config.profile.id,
@@ -274,12 +269,7 @@ def _guard_cleanup_target(
         expected_keys=marker_keys,
         label=f"{marker_kind} marker",
     )
-    if (
-        marker.get("schema_kind") != marker_kind
-        or not common.serialization.is_schema_version(marker.get("schema_version"), WORKSPACE_SCHEMA_VERSION)
-        or marker.get("run_id") != expected_run_id
-        or marker.get("work_directory") != str(resolved_target)
-    ):
+    if marker.get("schema_kind") != marker_kind or marker.get("run_id") != expected_run_id or marker.get("work_directory") != str(resolved_target):
         message = f"Cleanup marker identity does not match its directory: {resolved_target}"
         raise ValueError(message)
     if expected_case_id is not None and marker.get("case_id") != expected_case_id:
@@ -337,7 +327,6 @@ def create_cleanup_probe(
     directory = Path(tempfile.mkdtemp(prefix="vp2-preflight-", dir=root)).resolve()
     marker = {
         "schema_kind": "generation_case_workspace",
-        "schema_version": WORKSPACE_SCHEMA_VERSION,
         "run_id": "preflight",
         "case_id": "preflight-probe",
         "simulation_profile": "preflight",
@@ -373,7 +362,6 @@ def initialize_worker_workspace(
     safe_run_id = common.paths.validate_logical_name(run_id, label="campaign_run_id")
     marker = {
         "schema_kind": "generation_worker_workspace",
-        "schema_version": WORKSPACE_SCHEMA_VERSION,
         "run_id": safe_run_id,
         "work_directory": str(resolved),
         "created_at": _utc_now(),
@@ -438,7 +426,6 @@ def create_publication_staging(
     directory = Path(tempfile.mkdtemp(prefix="publication.", dir=root)).resolve()
     marker = {
         "schema_kind": "generation_publication_staging",
-        "schema_version": WORKSPACE_SCHEMA_VERSION,
         "run_id": safe_run_id,
         "case_id": safe_case_id,
         "storage_root": str(storage),

@@ -1,13 +1,13 @@
 """Compose one Dataset plan through the maintained Generation and Dataset services.
 
 Responsibilities:
-  - Validate a readable plan and explicit temporary execution overrides
+  - Validate a readable plan, its per-material design counts and explicit temporary execution overrides
   - Admit the plan's minimum success rate, from which the Generation campaign derives its admission cap unless one is explicit
   - Compute the Dataset name and the physical Source name from the resolved plan, never from authored text
   - Describe the Slurm footprint and Source run identity of a plan run for read-only preview
   - Reuse Generation admission/continuation, design-order selection and task payload publication
   - Submit the Dataset driver from the login node to run from its campaign's frozen source tree
-  - Freeze Dataset-owned case roles and membership before training
+  - Freeze Dataset-owned case roles, derived from the design kinds, before training
   - Own the plan's physical horizon override: validated once at load and read from the plan by every action
 
 Design principles:
@@ -17,7 +17,8 @@ Design principles:
     (``new_source``), under the same label, and changes neither seeds nor the scientific campaign digest
   - Physical Sources never receive Dataset evaluation roles
   - The minimum success rate is authored policy: it changes neither the Dataset name nor the Generation seeds
-  - Membership follows Generation's design order, so only the Generation seed and the split seed shape a Dataset
+  - Every count is a power of two, so each design prefix keeps the balance of scrambled Sobol points
+  - Membership and roles follow the fixed designs: the Generation seed, the design kinds and the counts shape a Dataset; no split seed
   - The source is frozen on the login node only; the driver job runs from the tree and never calls Git
   - Existing stage implementations own their atomic evidence and failures
   - A published Dataset folder is complete at its rename; the driver's still-growing job log stays in its log area
@@ -31,12 +32,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import math
 import os
 import shlex
-from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import yaml
 
@@ -47,19 +46,60 @@ if TYPE_CHECKING:
 
     from src.generation.generation_controller import GenerationController
 
-_CONFIG_KEYS = ("sources_config", "registry_config", "common_config", "operations_config", "profile_config", "execution_config")
-_SPLIT_ROLES = ("train_fraction", "validation_fraction", "id_test_fraction")
-_PLAN_SCHEMA_VERSION = 1
-_PLAN_KEYS = {"schema_kind", "schema_version", "task", "generation", "materials", "split"}
-_PLAN_TASKS = ("steady_flow", "transient_drying")
-_HORIZON_TASKS = ("transient_drying",)
+_CONFIG_KEYS: Final = (
+    "sources_config",
+    "registry_config",
+    "common_config",
+    "operations_config",
+    "bed_fields_config",
+    "profile_config",
+    "execution_config",
+)
+_PLAN_KEYS: Final = frozenset({"schema_kind", "task", "materials", "generation"})
+_GENERATION_KEYS: Final = frozenset({"seed_base", "minimum_success_rate", *_CONFIG_KEYS})
+_PLAN_TASKS: Final = ("steady_flow", "transient_drying")
+_HORIZON_TASKS: Final = ("transient_drying",)
+# Design kinds a material role requires and admits; an OOD material draws from its own test design.
+_ROLE_KINDS: Final = {"id": (("train", "validation", "test"), ("parameter_ood",)), "ood": (("test",), ())}
+_NAME_LABELS: Final = {"train": "train", "validation": "val", "test": "test", "parameter_ood": "pood"}
+
+
+def _power_of_two(value: object, *, label: str) -> int:
+    """Return one design count that is an integer power of two (1, 2, 4, ...)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value & (value - 1):
+        msg = f"Dataset plan {label} must be an integer power of two >= 1 (1, 2, 4, ...), got {value!r}."
+        raise ValueError(msg)
+    return value
+
+
+def _designs(materials: object) -> dict[str, dict[str, int]]:
+    """Validate the authored materials and return their design counts per design kind, in plan and design-kind order."""
+    if not isinstance(materials, dict) or not materials:
+        msg = "Dataset plan materials must be a non-empty mapping of material to role and design counts."
+        raise ValueError(msg)
+    designs: dict[str, dict[str, int]] = {}
+    for material, specification in materials.items():
+        common.paths.validate_logical_name(material, label="material")
+        role = specification.get("role") if isinstance(specification, dict) else None
+        if role not in _ROLE_KINDS:
+            msg = f"Dataset plan materials.{material}.role must be id or ood."
+            raise ValueError(msg)
+        required, optional = _ROLE_KINDS[role]
+        kinds = set(specification) - {"role"}
+        if not set(required) <= kinds or kinds - {*required, *optional}:
+            msg = f"Dataset plan materials.{material} with role {role} requires {list(required)} and admits {list(optional)}, got {sorted(kinds)}."
+            raise ValueError(msg)
+        designs[material] = {
+            kind: _power_of_two(specification[kind], label=f"materials.{material}.{kind}")
+            for kind in generation.contracts.vocabulary.DESIGN_KINDS
+            if kind in kinds
+        }
+    return designs
 
 
 def load_dataset_plan(
     path: Path | str,
     *,
-    counts: Sequence[str] | None = None,
-    split_fractions: str | None = None,
     revision: str | None = None,
     new_source: bool = False,
     duration_hours: float | None = None,
@@ -67,6 +107,7 @@ def load_dataset_plan(
     """
     Resolve one authored plan and compute its Dataset and Source names without touching scientific storage.
 
+    The domain profile is derived: the reference range, extended when any material has a ``parameter_ood`` design.
     A transient plan names its physical horizon (``__h-<hours>``) only when the
     ``duration_hours`` override differs from the horizon of the referenced common config.
 
@@ -80,66 +121,31 @@ def load_dataset_plan(
     if not isinstance(value, dict) or value.get("schema_kind") != "dataset_plan":
         msg = "Dataset plan must be a mapping with schema_kind dataset_plan."
         raise ValueError(msg)
-    if not common.serialization.is_schema_version(value.get("schema_version"), _PLAN_SCHEMA_VERSION):
-        msg = f"Dataset plan schema_version must be {_PLAN_SCHEMA_VERSION}, got {value.get('schema_version')!r}."
-        raise ValueError(msg)
     if set(value) != _PLAN_KEYS:
-        msg = f"Dataset plan must use exactly the fields {sorted(_PLAN_KEYS)}."
+        msg = f"Dataset plan must use exactly the fields {sorted(_PLAN_KEYS)}, got {sorted(value)}."
         raise ValueError(msg)
     plan = copy.deepcopy(value)
     if plan["task"] not in _PLAN_TASKS:
         msg = f"Dataset plan task must be one of {_PLAN_TASKS}."
         raise ValueError(msg)
     generation_plan = plan["generation"]
-    if (
-        not isinstance(generation_plan, dict)
-        or not {*_CONFIG_KEYS, "domain_profile", "minimum_success_rate"}.issubset(generation_plan)
-        or set(generation_plan) - {*_CONFIG_KEYS, "sampling", "domain_profile", "minimum_success_rate"}
-    ):
-        msg = "Generation must reference the six maintained configs, sampling, domain_profile and minimum_success_rate."
+    if not isinstance(generation_plan, dict) or set(generation_plan) != _GENERATION_KEYS:
+        found = sorted(generation_plan) if isinstance(generation_plan, dict) else generation_plan
+        msg = f"Dataset plan generation must use exactly the fields {sorted(_GENERATION_KEYS)}, got {found}."
         raise ValueError(msg)
     if any(not isinstance(generation_plan[key], str) or not generation_plan[key] for key in _CONFIG_KEYS):
         msg = "Generation configuration references must be non-empty paths."
         raise ValueError(msg)
     _validate_profile_task(generation_plan["profile_config"], plan["task"])
-    sampling = generation_plan.get("sampling")
-    if not isinstance(sampling, dict) or set(sampling) != {"method", "seed_base"} or sampling["method"] != "lhs":
-        msg = "Dataset plan preserves the existing lhs sampling method and seed_base."
-        raise ValueError(msg)
-    seed = sampling["seed_base"]
+    seed = generation_plan["seed_base"]
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
-        msg = "Generation seed_base must be a uint32 integer."
+        msg = "Dataset plan generation.seed_base must be a uint32 integer."
         raise ValueError(msg)
-    materials = plan["materials"]
-    if not isinstance(materials, dict) or not materials:
-        msg = "Dataset plan requires explicit material counts and roles."
-        raise ValueError(msg)
-    if counts:
-        seen: set[str] = set()
-        for item in counts:
-            material, separator, count = item.partition("=")
-            if not separator or material not in materials or material in seen:
-                msg = "Count overrides require unique authored MATERIAL=POSITIVE_COUNT entries."
-                raise ValueError(msg)
-            materials[material]["count"] = int(count)
-            seen.add(material)
-    for material, specification in materials.items():
-        common.paths.validate_logical_name(material, label="material")
-        if not isinstance(specification, dict) or set(specification) != {"count", "role"}:
-            msg = "Each material requires only count and role (id or ood)."
-            raise ValueError(msg)
-        if (
-            isinstance(specification["count"], bool)
-            or not isinstance(specification["count"], int)
-            or specification["count"] < 1
-            or specification["role"] not in {"id", "ood"}
-        ):
-            msg = "Material counts must be positive integers and roles explicit id/ood."
-            raise ValueError(msg)
+    plan["designs"] = _designs(plan["materials"])
+    plan["domain_profile"] = generation.contracts.campaign_identity.domain_profile(plan["designs"])
     generation_plan["minimum_success_rate"] = generation.cases.config.validate_minimum_success_rate(
         generation_plan["minimum_success_rate"], label="generation.minimum_success_rate"
     )
-    _validate_split(plan["split"], materials, split_fractions)
     plan["duration_hours"] = duration_hours
     plan["horizon_override_hours"] = _horizon_override_hours(generation_plan, plan["task"], duration_hours)
     plan["name"] = derive_dataset_name(plan, revision=revision)
@@ -149,20 +155,13 @@ def load_dataset_plan(
     return plan
 
 
-def _id_split_counts(count: int, fractions: Sequence[float]) -> tuple[int, int, int]:
-    """Return the Train, validation and ID-test case counts of one ID material (floors, remainder to test)."""
-    train = int(count * fractions[0])
-    validation = int(count * fractions[1])
-    return train, validation, count - train - validation
-
-
 def derive_dataset_name(plan: Mapping[str, Any], *, revision: str | None = None) -> str:
-    """Name a resolved plan by its materials, split counts, physical domain and Generation seed.
+    """Name a resolved plan by its materials, design counts, physical domain and Generation seed.
 
     Parameters
     ----------
     plan : Mapping[str, Any]
-        Validated plan with its count, split and fraction overrides applied.
+        Validated plan with its derived designs and domain profile.
     revision : str | None, optional
         Label appended as ``__rev-<label>`` to deliberately keep a second Dataset
         of otherwise identical content; it does not name or change the Source.
@@ -170,29 +169,25 @@ def derive_dataset_name(plan: Mapping[str, Any], *, revision: str | None = None)
     Returns
     -------
     str
-        ``<material>-train<a>-val<b>-test<c>`` (``<material>-ood<n>`` for a held-out
-        material) joined by ``+`` in plan order, then ``__<domain>__lhs-seed-<seed>``,
+        ``<material>-train<a>-val<b>-test<c>[-pood<d>]`` (``<material>-ood<n>`` for a held-out
+        material) joined by ``+`` in plan order, then ``__<domain>__sobol-seed-<seed>``,
         ``__h-<hours>`` for a deviating transient horizon and the optional revision.
 
     Raises
     ------
     ValueError
-        If the domain profile, material or revision is unsupported or the name is not one safe path component.
+        If a material or revision is unsupported or the name is not one safe path component.
 
     """
-    fractions = [plan["split"][key] for key in _SPLIT_ROLES]
     members: list[str] = []
-    for material, specification in plan["materials"].items():
+    for material, designs in plan["designs"].items():
         slug = generation.contracts.material_registry.material_slug(material)
-        if specification["role"] == "ood":
-            members.append(f"{slug}-ood{specification['count']}")
+        if plan["materials"][material]["role"] == "ood":
+            members.append(f"{slug}-ood{designs['test']}")
         else:
-            train, validation, test = _id_split_counts(specification["count"], fractions)
-            members.append(f"{slug}-train{train}-val{validation}-test{test}")
-    generation_plan = plan["generation"]
-    domain = generation.contracts.campaign_identity.domain_token(generation_plan["domain_profile"])
-    sampling = generation_plan["sampling"]
-    name = f"{'+'.join(members)}__{domain}__{sampling['method']}-seed-{sampling['seed_base']}"
+            members.append("-".join((slug, *(f"{_NAME_LABELS[kind]}{count}" for kind, count in designs.items()))))
+    domain = generation.contracts.campaign_identity.domain_token(plan["domain_profile"])
+    name = f"{'+'.join(members)}__{domain}__sobol-seed-{plan['generation']['seed_base']}"
     if plan["horizon_override_hours"] is not None:
         name += f"__{generation.contracts.campaign_identity.horizon_token(plan['horizon_override_hours'])}"
     if revision is not None:
@@ -207,15 +202,14 @@ def derive_source_name(plan: Mapping[str, Any]) -> str:
     Parameters
     ----------
     plan : Mapping[str, Any]
-        Validated plan with its count overrides applied; ``plan["generation"]["revision"]``
-        is present only when the run asked for a new Source.
+        Validated plan; ``plan["generation"]["revision"]`` is present only when the run asked for a new Source.
 
     Returns
     -------
     str
-        The canonical design name ``<material>-<count>+...__<domain>__lhs-seed-<seed>``
-        (plus ``__h-<hours>`` for a deviating horizon) that Generation gives an unrevised campaign, then ``__rev-<label>`` when the
-        plan asks for a new Source. Seeds and the campaign digest do not change.
+        The canonical design name ``<material>-<n>...+...__<domain>__sobol-seed-<seed>`` with each material's design
+        sizes in design-kind order (plus ``__h-<hours>`` for a deviating horizon) that Generation gives an unrevised
+        campaign, then ``__rev-<label>`` when the plan asks for a new Source. Seeds and the campaign digest do not change.
 
     Raises
     ------
@@ -223,12 +217,9 @@ def derive_source_name(plan: Mapping[str, Any]) -> str:
         If the design or the revision cannot form a Source name.
 
     """
-    sampling = plan["generation"]["sampling"]
     name = generation.contracts.campaign_identity.canonical_campaign_name(
-        {material: specification["count"] for material, specification in plan["materials"].items()},
-        domain_profile=plan["generation"]["domain_profile"],
-        mode=sampling["method"],
-        root_seed=sampling["seed_base"],
+        plan["designs"],
+        root_seed=plan["generation"]["seed_base"],
         horizon_hours=plan["horizon_override_hours"],
     )
     revision = plan["generation"].get("revision")
@@ -262,54 +253,20 @@ def _validate_profile_task(profile_config: str, task: str) -> None:
         raise ValueError(msg)
 
 
-def _validate_split(split: dict[str, Any], materials: Mapping[str, Any], split_fractions: str | None) -> None:
-    """Validate explicit fractions with unchanged per-material floor rounding."""
-    if not isinstance(split, dict) or set(split) != {"seed", "train_fraction", "validation_fraction", "id_test_fraction"}:
-        msg = "Dataset split requires its own seed and three fractions."
-        raise ValueError(msg)
-    if isinstance(split["seed"], bool) or not isinstance(split["seed"], int) or split["seed"] < 0:
-        msg = "Dataset split seed must be a non-negative integer."
-        raise ValueError(msg)
-    if split_fractions is not None:
-        fraction_texts = split_fractions.split(",")
-        if len(fraction_texts) != len(_SPLIT_ROLES):
-            msg = "--split-fractions requires TRAIN,VALIDATION,TEST."
-            raise ValueError(msg)
-        for key, fraction_text in zip(_SPLIT_ROLES, fraction_texts, strict=True):
-            split[key] = float(Fraction(fraction_text))
-    # Preview checks the existing floor counts without allocating fictional cases.
-    fractions = [split[key] for key in _SPLIT_ROLES]
-    if any(
-        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 < value < 1 for value in fractions
-    ) or not math.isclose(sum(fractions), 1.0, abs_tol=1e-12, rel_tol=0):
-        msg = "Split fractions must be finite, positive and sum to one."
-        raise ValueError(msg)
-    for material, spec in materials.items():
-        if spec["role"] == "id" and min(_id_split_counts(spec["count"], fractions)) < 1:
-            msg = f"Existing split rounding leaves {material} without a case in every role; explicitly change counts or fractions."
-            raise ValueError(msg)
-
-
 def _scientific_overrides(plan: Mapping[str, Any]) -> dict[str, float] | None:
     """Return the Generation overrides of the admitted plan horizon."""
     return None if plan["duration_hours"] is None else {"duration_hours": plan["duration_hours"]}
 
 
-def _split_recipe(plan: Mapping[str, Any]) -> dict[str, Any]:
-    return {"kind": "seeded_material_fraction", **{key: plan["split"][key] for key in _SPLIT_ROLES}}
-
-
 def authored_campaign(plan: Mapping[str, Any]) -> dict[str, Any]:
-    """Project physical Generation settings without Dataset names, roles or splits."""
+    """Project physical Generation settings, the seed and the designs, without Dataset names or roles."""
     generation_plan = plan["generation"]
     return {
         "schema_kind": "generation_source_campaign",
-        "schema_version": generation.cases.config.CAMPAIGN_SCHEMA_VERSION,
         **{key: generation_plan[key] for key in _CONFIG_KEYS},
-        "sampling": {**generation_plan["sampling"], "counts": {"natural": {material: spec["count"] for material, spec in plan["materials"].items()}}},
+        "sampling": {"seed_base": generation_plan["seed_base"], "designs": copy.deepcopy(plan["designs"])},
         "materials": list(plan["materials"]),
         "minimum_success_rate": generation_plan["minimum_success_rate"],
-        "domain_profile": generation_plan["domain_profile"],
         **({"revision": generation_plan["revision"]} if "revision" in generation_plan else {}),
     }
 
@@ -346,13 +303,10 @@ def preview_dataset_plan(plan: Mapping[str, Any], *, execution_overrides: Mappin
         "directory": f"02_datasets/{plan['task']}/{plan['name']}",
         "materials": copy.deepcopy(plan["materials"]),
         "minimum_success_rate": plan["generation"]["minimum_success_rate"],
-        "generation_seed_base": plan["generation"]["sampling"]["seed_base"],
+        "generation_seed_base": plan["generation"]["seed_base"],
+        "domain_profile": plan["domain_profile"],
         "selection": {"kind": "design_order"},
-        "split": {
-            "seed_input": plan["split"]["seed"],
-            "seed": common.random.derive_subseed(plan["split"]["seed"], "split"),
-            "recipe": _split_recipe(plan),
-        },
+        "partition": "design_kind",
         "physical_duration_hours_override": plan["duration_hours"],
         "execution_overrides": effective_execution_overrides(execution_overrides),
         "source_name": source_name,
@@ -364,7 +318,7 @@ def preview_dataset_plan(plan: Mapping[str, Any], *, execution_overrides: Mappin
         "actual_outcomes": "not measured by preview",
         "collision": (
             "Same name reuses identical content; different content under the same name is refused (pass --revision <label>); "
-            "identical content under another name is refused (docs/03_datasets.md, Names and identity)."
+            "identical content under another name is refused (docs/04_datasets.md, Names and identity)."
         ),
         "execution": (
             "Run in a modest nonexclusive CPU Slurm allocation. Generation submits separate solver jobs; "
@@ -419,7 +373,7 @@ def _admitted_execution(
     if require_allocation and not os.environ.get("SLURM_JOB_ID"):
         msg = (
             "Dataset assembly must run in a CPU Slurm allocation: start `run` on the login node, which submits its own driver job, "
-            "or use --preview for read-only login inspection."
+            "or use --dry-run for read-only login inspection."
         )
         raise RuntimeError(msg)
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != plan.get("_authored_sha256"):
@@ -496,24 +450,18 @@ def run_dataset_plan(
 
     request = {
         "schema_kind": selection.SELECTION_SCHEMA_KIND,
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": plan["task"],
         "dataset_view": plan["task"],
         "dataset_name": plan["name"],
         "selection": {
             "kind": "design_order",
             "source_names": [result.source_name],
-            "target_counts": {material: spec["count"] for material, spec in plan["materials"].items()},
+            "target_counts": copy.deepcopy(plan["designs"]),
         },
         "source_cases": [],
     }
-    fixed_spec = {
-        "seed_input": plan["split"]["seed"],
-        "seed": common.random.derive_subseed(plan["split"]["seed"], "split"),
-        "recipe": _split_recipe(plan),
-        "material_roles": {material: spec["role"] for material, spec in plan["materials"].items()},
-    }
+    material_roles = {material: spec["role"] for material, spec in plan["materials"].items()}
     # One atomic publication holds the manifest and the complete payload of either task (transient: index and PT shards).
     # The still-running driver keeps writing its job log, so the log stays in its log area and never enters the immutable folder.
-    publication = builder.build_dataset_selection(request, partition_spec=fixed_spec, plan_invocation=list(invocation))
+    publication = builder.build_dataset_selection(request, material_roles=material_roles, plan_invocation=list(invocation))
     return {"status": "OK", "source_run": result.run_id, "dataset": publication}

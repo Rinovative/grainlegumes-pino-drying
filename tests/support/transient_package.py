@@ -60,19 +60,18 @@ def _publish_transient_selection(
     *,
     source_cases: list[dict[str, str]],
     dataset_name: str,
-    partition_spec: dict[str, Any],
+    material_roles: dict[str, str],
 ) -> tuple[str, Path]:
     """Publish and reopen one exact current Dataset with a Dataset-owned partition."""
     request = {
         "schema_kind": selection.SELECTION_SCHEMA_KIND,
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "transient_drying",
         "dataset_name": dataset_name,
         "dataset_view": "transient_drying",
         "selection": {"kind": "exact"},
         "source_cases": source_cases,
     }
-    published = builder.build_dataset_selection(request, storage_root=storage_root, partition_spec=partition_spec)
+    published = builder.build_dataset_selection(request, storage_root=storage_root, material_roles=material_roles)
     dataset_id = published["dataset_id"]
     manifest = datasets.packages.load_package_manifest("transient_drying", dataset_id, storage_root=storage_root)
     index_path = Path(published["payload_path"])
@@ -94,22 +93,28 @@ def _clone_item(value: Any) -> Any:
 
 
 def _build_transient_package(root: Path) -> dict[str, Any]:
-    """Build five real Source decisions and one partitioned immutable training selection."""
+    """Build five real Source decisions (Train 2, validation 1, test 2) and one partitioned immutable training selection."""
     project_root = root / "project"
     factory = generation_fixtures.make_generation_config_factory(project_root)
     config_path, _ = factory(
         simulation_profile="transient_drying",
         executable=generation_fixtures.write_fake_comsol(root),
-        natural_count=5,
+        designs={"train": 2, "validation": 1, "test": 2},
         grid_overrides={"nx": 16, "ny": 16, "Lx": 1.5, "Ly": 1.5},
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
     storage = root / "scientific-storage"
     source_root = generation.lifecycle.create_campaign(campaign, storage_root=storage)
-    batch = campaign.batches[0]
-    inputs = generation.cases.input_generation.generate_input_cases(batch, 5, storage_root=storage)
-    for case_index in batch.case_indices:
-        successful_source_case(campaign.source_name, batch, case_index, storage, root / "work")
+    input_sources: dict[str, dict[str, Any]] = {}
+    for batch in campaign.batches:
+        inputs = generation.cases.input_generation.generate_input_cases(batch, len(batch.case_indices), storage_root=storage)
+        for case_index in batch.case_indices:
+            successful_source_case(campaign.source_name, batch, case_index, storage, root / "work")
+        input_sources[batch.batch_name] = {
+            "input_generation_id": inputs.input_generation_id,
+            "source_git_commit": "a" * 40,
+            "case_indices": list(batch.case_indices),
+        }
     run_id = generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
     run_dir = generation.publication.campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -120,13 +125,7 @@ def _build_transient_package(root: Path) -> dict[str, Any]:
         run_directory=run_dir,
         scheduler_log_directory=root / "logs",
         storage_root=storage,
-        input_sources={
-            batch.batch_name: {
-                "input_generation_id": inputs.input_generation_id,
-                "source_git_commit": "a" * 40,
-                "case_indices": list(batch.case_indices),
-            }
-        },
+        input_sources=input_sources,
     )
     common.serialization.atomic_write_json(
         generation.publication.campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage), run_manifest
@@ -139,12 +138,7 @@ def _build_transient_package(root: Path) -> dict[str, Any]:
         storage,
         source_cases=selectors[:4],
         dataset_name="transient_train_lifecycle",
-        partition_spec={
-            "seed_input": 31,
-            "seed": 31,
-            "recipe": {"kind": "seeded_material_fraction", "train_fraction": 0.5, "validation_fraction": 0.25, "id_test_fraction": 0.25},
-            "material_roles": {"lentil": "id"},
-        },
+        material_roles={"lentil": "id"},
     )
     canonical = datasets.runtime.transient.TransientPhysicalDataset(
         index_path,

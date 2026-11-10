@@ -1,13 +1,14 @@
-"""Render physics-diagnostic tables as static scientific figures.
+"""Render component-check tables as static scientific figures.
 
 Responsibilities:
   - Plot steady residual floors, crop sweeps, edge profiles, and term decompositions
   - Plot residual maps with the shared field-map scale contract
   - Plot derivative-backend differences and perturbation sensitivity ratios
+  - Plot Fourier-mode truncation curves against the maintained mode counts
   - Plot transient balance closures, field-versus-COMSOL differences, and sorption residuals
 
 Design principles:
-  - Figures consume diagnostic tables and never recompute physics
+  - Figures consume component-check tables and never recompute physics
   - Categorical colours follow one fixed colour-blind-checked order, never a cycle
   - Logarithmic magnitude axes; one quantity per axis
 
@@ -25,7 +26,7 @@ from matplotlib.ticker import LogFormatterSciNotation
 
 from src.analysis import presentation
 
-from . import physics_diagnostics_steady as steady
+from . import component_checks_steady as steady
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -89,7 +90,7 @@ def plot_crop_sweep(residuals: pd.DataFrame, *, dtype: str = "float32") -> Figur
     Parameters
     ----------
     residuals : pandas.DataFrame
-        Output of :func:`physics_diagnostics_steady.summarize_reference_residuals`.
+        Output of :func:`component_checks_steady.summarize_reference_residuals`.
     dtype : str, optional
         Precision rows to show.
 
@@ -159,7 +160,7 @@ def plot_edge_profiles(profiles: Mapping[str, pd.DataFrame]) -> Figure:
     Parameters
     ----------
     profiles : Mapping[str, pandas.DataFrame]
-        Backend label to :func:`physics_diagnostics_steady.edge_profiles` output.
+        Backend label to :func:`component_checks_steady.edge_profiles` output.
 
     Returns
     -------
@@ -219,7 +220,7 @@ def plot_residual_maps(
         colorbar = figure.colorbar(image, ax=list(axes[0]), shrink=0.9, extend=scale.extend)
         colorbar.set_ticks([10.0**exponent for exponent in range(-5, 1)])
         colorbar.ax.yaxis.set_major_formatter(LogFormatterSciNotation())
-        colorbar.set_label("|R| / G")
+        colorbar.set_label(f"|R|/G [{presentation.field_labels.display_unit('1')}]")
     figure.suptitle(f"Momentum residual magnitude, {case_label}")
     return figure
 
@@ -335,6 +336,48 @@ def plot_sensitivity(sensitivity: pd.DataFrame) -> Figure:
     axes[0].set_yticks(range(len(perturbations)), perturbations)
     axes[0].invert_yaxis()
     axes[0].legend(frameon=False, fontsize="small")
+    return figure
+
+
+def plot_mode_curves(errors: pd.DataFrame, settings: pd.DataFrame, *, title: str) -> Figure:
+    """
+    Plot the worst truncation error against the kept mode count per axis.
+
+    Parameters
+    ----------
+    errors : pandas.DataFrame
+        Steady or transient truncation-error rows of :mod:`component_checks_spectral`.
+    settings : pandas.DataFrame
+        :func:`component_checks_spectral.maintained_mode_settings`; its mode
+        counts are marked by dotted lines.
+    title : str
+        Figure title.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        One panel per axis; colour per field, solid without and dashed with
+        domain padding; maximum over cases (and states and increments).
+
+    """
+    fields = list(dict.fromkeys(errors["field"]))
+    figure, axes = plt.subplots(1, 2, figsize=(12.0, 4.0), sharey=True, layout="constrained")
+    for axis, name in zip(axes, ("y", "x"), strict=True):
+        curves = errors[errors["axis"] == name]
+        for position, field in enumerate(fields):
+            for padding, group in curves[curves["field"] == field].groupby("padding"):
+                worst = group.groupby(f"modes_{name}")["relative_l2"].max()
+                style = {"color": series_color(position), "marker": "o", "markersize": 3, "label": f"{field}, padding {padding:g}"}
+                axis.plot(worst.index, worst.to_numpy(), "-" if padding == 0 else "--", **style)
+        for count in sorted(set(settings[f"modes_{name}"])):
+            axis.axvline(count, **_REFERENCE_LINE)
+        axis.set_xscale("log", base=2)
+        axis.set_yscale("log")
+        axis.set_xlabel(f"n_modes along {name} (other axis complete)")
+        axis.grid(visible=True, which="major", color="0.9")
+    axes[0].set_ylabel("relative L2 error / field std (worst case)")
+    axes[0].legend(frameon=False, fontsize="small")
+    figure.suptitle(title, wrap=True)
     return figure
 
 

@@ -30,6 +30,7 @@ from support import configs, optuna_trials, run_state
 from support.synthetic_task import build_synthetic_selection_provenance, save_steady_package
 
 from src import analysis, common, datasets, domain, experiments, learning
+from src.experiments import experiments_wandb_schema as wandb_schema
 
 pytestmark = pytest.mark.integration
 
@@ -55,8 +56,8 @@ _ID_DATASET, _ID_DIGEST = datasets.contracts.identity.package_identity_from_prov
 _OOD_DATASET, _ = datasets.contracts.identity.package_identity_from_provenance(_OOD_PROVENANCE)
 _SECOND_OOD_DATASET, _ = datasets.contracts.identity.package_identity_from_provenance(_SECOND_OOD_PROVENANCE)
 _PROVENANCES = {_ID_DATASET: _ID_PROVENANCE, _OOD_DATASET: _OOD_PROVENANCE, _SECOND_OOD_DATASET: _SECOND_OOD_PROVENANCE}
-# The one additional-evaluation role covers both OOD Datasets in configured order.
-_ADDITIONAL_DATASET = datasets.contracts.identity.combined_dataset_id((_OOD_DATASET, _SECOND_OOD_DATASET))
+# The one material-OOD role covers both OOD Datasets in configured order.
+_MATERIAL_OOD_DATASET = datasets.contracts.identity.combined_dataset_id((_OOD_DATASET, _SECOND_OOD_DATASET))
 # Both axes hold at least the 10 points spectral Fourier continuation needs.
 _SHAPE = (12, 12)
 _ARTIFACT_CROP = 2
@@ -79,6 +80,8 @@ class CompletedLifecycle:
         Original strict final payloads used for split and normalizer assertions.
     completed : dict[str, Any]
         Result of strict completed-run validation after best/last roles diverge.
+    epoch_metrics : list[dict[str, float]]
+        The completed-epoch payloads the training loop handed to its epoch-end consumers.
 
     Notes
     -----
@@ -93,6 +96,7 @@ class CompletedLifecycle:
     id_payload: dict[str, Any]
     ood_payload: dict[str, Any]
     completed: dict[str, Any]
+    epoch_metrics: list[dict[str, float]]
 
 
 def _case_components(
@@ -140,7 +144,7 @@ def _training_dataset_payload(
     dataset_id: str,
     offsets: tuple[float, ...],
 ) -> dict[str, Any]:
-    """Build one final version-1 synthetic dataset entirely in memory."""
+    """Build one final synthetic dataset entirely in memory."""
     provenance = _PROVENANCES[dataset_id]
     sample_ids = [entry["package_case_id"] for entry in provenance["source_case_identities"]]
     cases = [_case_components(task, case_id=case_id, offset=offset) for case_id, offset in zip(sample_ids, offsets, strict=True)]
@@ -150,7 +154,6 @@ def _training_dataset_payload(
         sample_ids=sample_ids,
         source_selection_identity={
             "schema_kind": "dataset_source_selection",
-            "schema_version": 1,
             "source_cases": provenance["source_case_identities"],
         },
         source_identities=[case[2] for case in cases],
@@ -215,7 +218,7 @@ def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
     raw["data"].update(
         {
             "train_dataset": _ID_DATASET,
-            "additional_evaluation_datasets": [_OOD_DATASET, _SECOND_OOD_DATASET],
+            "material_ood_datasets": [_OOD_DATASET, _SECOND_OOD_DATASET],
             "batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
@@ -252,7 +255,7 @@ def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
         {
             "epochs": 1,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
         }
     )
     raw["tracking"]["wandb"]["mode"] = "disabled"
@@ -368,11 +371,13 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
     )
     environment = pytest.MonkeyPatch()
     environment.delenv("WANDB_API_KEY", raising=False)
+    epoch_metrics: list[dict[str, float]] = []
     try:
         experiments.run.execute_prepared_run(
             config,
             run_dir=run_dir,
             persisted_config=config,
+            epoch_end_callback=lambda _epoch, metrics: epoch_metrics.append(dict(metrics)),
             device_resolution=learning.device.resolve_device("cpu"),
         )
     finally:
@@ -402,6 +407,7 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
         id_payload=id_payload,
         ood_payload=ood_payload,
         completed=completed,
+        epoch_metrics=epoch_metrics,
     )
 
 
@@ -441,9 +447,27 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         seed_plan=seed_plan,
     )
     assert datasets.preprocessing.splits.admit_split(rebuilt["split_indices"]) == split
-    assert split.split_seed == common.random.derive_subseed(9, "split")
+    assert split.train_subset is None
     assert dict(split.case_partition) == _ID_PROVENANCE["case_partition"]
-    assert [part.dataset_id for part in split.additional_evaluation] == [_OOD_DATASET, _SECOND_OOD_DATASET]
+    assert [part.dataset_id for part in split.material_ood] == [_OOD_DATASET, _SECOND_OOD_DATASET]
+
+    # The curated W&B series have real producers; physics training and CUDA are off in this run, so those series are not projected.
+    config = lifecycle.config
+    definitions = experiments.tracking.automatic_history_metric_definitions(
+        config["evaluation"]["metrics"],
+        objective_id=str(config["evaluation"]["objective"]["id"]),
+        physics_training_enabled=bool(config["loss"]["physics"]["enabled"]),
+        physics_monitor_enabled=bool(config["tracking"]["wandb"]["monitor"]["enabled"]),
+        cuda_enabled=False,
+        task_id="steady_flow",
+        ood_roles=split.ood_roles,
+    )
+    # Only the material part is declared here; the empty parameter part produced no series.
+    assert split.ood_roles == ("material_ood",)
+    assert not any(key.startswith("parameter_ood/") for epoch in lifecycle.epoch_metrics for key in epoch)
+    assert {definition.source_key for definition in definitions} <= set().union(*lifecycle.epoch_metrics)
+    projected_selected = {wandb_schema.selected_summary_key(definition.source_key) for definition in definitions} - {None}
+    assert projected_selected <= set(lifecycle.completed["summary"]["selected_metrics"])
 
     train_indices = split.train.indices
     normalizer_artifact = torch.load(
@@ -513,8 +537,8 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         device_policy="cpu",
     )
     frames = generated[str(lifecycle.run_dir.resolve())]
-    assert set(frames) == {"eval", "additional_evaluation"}
-    role_evidence: dict[analysis.artifacts.plan.ArtifactSplit, Any] = {"eval": (split.id_test,), "additional_evaluation": split.additional_evaluation}
+    assert set(frames) == {"eval", "material_ood"}
+    role_evidence: dict[analysis.artifacts.plan.ArtifactSplit, Any] = {"eval": (split.id_test,), "material_ood": split.material_ood}
     plan = analysis.artifacts.plan.artifact_plan_from_completed(lifecycle.completed, run_dir=lifecycle.run_dir)
     for role, evidence in role_evidence.items():
         frame = frames[role]
@@ -559,24 +583,21 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
             # ID artifacts evaluate ID-test membership; checkpoint selection used validation.
             continue
         assert float(artifact_summary["value"]) == pytest.approx(
-            lifecycle.completed["summary"]["selected_metrics"][f"selected/additional_evaluation/{objective_id}"],
+            lifecycle.completed["summary"]["selected_metrics"][f"selected/material_ood/{objective_id}"],
             rel=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["rtol"],
             abs=analysis.artifacts.contracts.NORMALIZED_OBJECTIVE_TOLERANCE["atol"],
         )
 
     id_target = common.paths.resolve_id_analysis_dir(lifecycle.run_dir)
-    ood_target = common.paths.resolve_additional_evaluation_analysis_dir(
-        lifecycle.run_dir,
-        _ADDITIONAL_DATASET,
-    )
+    ood_target = common.paths.resolve_ood_analysis_dir(lifecycle.run_dir, "material_ood", _MATERIAL_OOD_DATASET)
     targets = (id_target, ood_target)
-    assert (id_target / f"{_ID_DATASET}.parquet").is_file()
-    assert (ood_target / f"{_ADDITIONAL_DATASET}.parquet").is_file()
+    assert (id_target / "artifacts.parquet").is_file()
+    assert (ood_target / "artifacts.parquet").is_file()
     loaded_id = analysis.evaluation.artifact_loader._read_artifact_root(id_target)
     assert loaded_id.attrs["provenance_complete"] is True
     assert loaded_id.attrs["artifact_root"] == str(id_target.resolve())
     assert loaded_id["source_index"].tolist() == list(split.id_test.index_values)
-    for role, target in zip(("eval", "additional_evaluation"), targets, strict=True):
+    for role, target in zip(("eval", "material_ood"), targets, strict=True):
         stored_provenance = json.loads((target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
         assert stored_provenance["outputs"] == analysis.artifacts.contracts.artifact_output_manifest(target)
         assert stored_provenance["run"]["normalizer_sha256"] == lifecycle.completed["summary"]["normalizer_sha256"]
@@ -590,7 +611,6 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert stored_provenance["normalizer"]["sha256"] == lifecycle.completed["summary"]["normalizer_sha256"]
         assert stored_provenance["evaluator"]["group_objective_evidence"]["squared_error_accumulation_dtype"] == "float64"
         physics = stored_provenance["physics"]
-        assert physics["residual_schema_version"] == analysis.artifacts.contracts.RESIDUAL_SCHEMA_VERSION
         assert physics["task_contract_digest"] == domain.tasks.registry.get_task("steady_flow").contract_digest
         assert physics["derivatives"] == {
             "kind": "physical",
@@ -627,7 +647,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         device_policy="cpu",
     )
     pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["eval"], frames["eval"])
-    pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["additional_evaluation"], frames["additional_evaluation"])
+    pd.testing.assert_frame_equal(cached[str(lifecycle.run_dir.resolve())]["material_ood"], frames["material_ood"])
     assert _artifact_inventory(targets) == before_cache
 
     provenance_path = id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME
@@ -667,7 +687,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert _artifact_inventory((id_target,)) == incompatible_cache
     provenance_path.write_text(valid_provenance, encoding="utf-8")
 
-    parquet_path = id_target / f"{_ID_DATASET}.parquet"
+    parquet_path = id_target / "artifacts.parquet"
     valid_parquet = parquet_path.read_bytes()
     parquet_path.write_bytes(valid_parquet + b"corrupt")
     corrupted_parquet_cache = _artifact_inventory((id_target,))
@@ -685,23 +705,22 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert _artifact_inventory((id_target,)) == corrupted_parquet_cache
     parquet_path.write_bytes(valid_parquet)
 
+    # The load admits the payload structure only; a changed case payload is refused by its digest when the case opens.
     corrupted_npz = Path(frames["eval"].iloc[0]["npz_path"])
     corrupted_npz.write_bytes(corrupted_npz.read_bytes() + b"corrupt")
     corrupted_cache = _artifact_inventory((id_target,))
-    with pytest.raises(
-        analysis.artifacts.service.ArtifactCacheError,
-        match="output manifest does not match",
-    ):
-        analysis.artifacts.service.run_or_load_artifacts(
-            run_dir=lifecycle.run_dir,
-            dataset_name=_ID_DATASET,
-            split="eval",
-            device_resolution=learning.device.resolve_device("cpu"),
-            dataset_root=lifecycle.dataset_root,
-        )
+    loaded = analysis.artifacts.service.run_or_load_artifacts(
+        run_dir=lifecycle.run_dir,
+        dataset_name=_ID_DATASET,
+        split="eval",
+        device_resolution=learning.device.resolve_device("cpu"),
+        dataset_root=lifecycle.dataset_root,
+    )
+    with pytest.raises(ValueError, match="Steady case payload digest changed"):
+        analysis.evaluation.case.load_case(loaded, 0)
     assert _artifact_inventory((id_target,)) == corrupted_cache
 
-    sibling_marker = common.paths.resolve_additional_evaluation_analysis_dir(lifecycle.run_dir, "unselected_ood") / "keep.txt"
+    sibling_marker = common.paths.resolve_ood_analysis_dir(lifecycle.run_dir, "material_ood", "unselected_ood") / "keep.txt"
     sibling_marker.parent.mkdir(parents=True)
     sibling_marker.write_text("keep", encoding="utf-8")
     rebuilt_artifacts = analysis.artifacts.service.build_artifacts(
@@ -718,8 +737,8 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         frames["eval"],
     )
     pd.testing.assert_frame_equal(
-        rebuilt_artifacts[str(lifecycle.run_dir.resolve())]["additional_evaluation"],
-        frames["additional_evaluation"],
+        rebuilt_artifacts[str(lifecycle.run_dir.resolve())]["material_ood"],
+        frames["material_ood"],
     )
 
 
@@ -736,7 +755,7 @@ def test_additional_part_whose_package_changed_since_training_is_refused(
     completed_lifecycle: CompletedLifecycle,
     tmp_path: Path,
 ) -> None:
-    """Refuse the additional-evaluation role when one part's current package differs from its saved split identity."""
+    """Refuse the material-OOD role when one part's current package differs from its saved split identity."""
     run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run")
     dataset_root = tmp_path / "02_datasets"
     shutil.copytree(completed_lifecycle.dataset_root, dataset_root)
@@ -745,12 +764,12 @@ def test_additional_part_whose_package_changed_since_training_is_refused(
     with pytest.raises(RuntimeError, match=rf"{_SECOND_OOD_DATASET!r} contradicts its saved split Dataset identity"):
         analysis.artifacts.service.run_or_load_artifacts(
             run_dir=run_dir,
-            dataset_name=_ADDITIONAL_DATASET,
-            split="additional_evaluation",
+            dataset_name=_MATERIAL_OOD_DATASET,
+            split="material_ood",
             device_resolution=learning.device.resolve_device("cpu"),
             dataset_root=dataset_root,
         )
-    assert not common.paths.resolve_additional_evaluation_analysis_dir(run_dir, _ADDITIONAL_DATASET).exists()
+    assert not common.paths.resolve_ood_analysis_dir(run_dir, "material_ood", _MATERIAL_OOD_DATASET).exists()
 
 
 def _rewrite_parquet_npz_paths(artifact_root: Path, values: list[str]) -> None:
@@ -781,9 +800,9 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         (
             analysis.evaluation.workflow.EvaluationContextSpec(key="id", label="ID", artifact_role="id"),
             analysis.evaluation.workflow.EvaluationContextSpec(
-                key="additional_evaluation",
-                label="Additional evaluation",
-                artifact_role="additional_evaluation",
+                key="material_ood",
+                label="Material OOD",
+                artifact_role="material_ood",
             ),
         ),
         dataset_root=completed_lifecycle.dataset_root,
@@ -791,19 +810,19 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
     )
     generated = evaluation.prepared_runs[0]
     first = generated.loaded_run
-    assert generated.role_actions == {"id": "generated", "additional_evaluation": "generated"}
+    assert generated.role_actions == {"id": "generated", "material_ood": "generated"}
     assert generated.artifact_device == "cpu"
     assert first.storage_alias == "paper_model_a"
     assert first.scientific_run_name == completed_lifecycle.config["run"]["name"]
     assert first.id_artifact is not None
-    assert first.additional_artifact is not None
+    assert first.material_ood_artifact is not None
     assert evaluation.report[0]["artifact_device"] == "cpu"
-    assert evaluation.report[0]["artifact_actions"] == {"id": "generated", "additional_evaluation": "generated"}
+    assert evaluation.report[0]["artifact_actions"] == {"id": "generated", "material_ood": "generated"}
     checkpoint_digest = first.selected_checkpoint_sha256
     evaluation.close()
 
     id_root = first.id_artifact.root
-    raw_id = pd.read_parquet(id_root / f"{_ID_DATASET}.parquet")
+    raw_id = pd.read_parquet(id_root / "artifacts.parquet")
     relative_paths = tuple(Path(value).parts for value in raw_id["npz_path"])
     expected_paths = tuple(("npz", f"{_SAMPLE_IDS[int(source_index)]}.npz") for source_index in raw_id["source_index"])
     assert relative_paths == expected_paths
@@ -823,12 +842,12 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         device_policy="cpu",
     )
     loaded = reused.loaded_run
-    assert reused.role_actions == {"id": "reused", "additional_evaluation": "reused"}
+    assert reused.role_actions == {"id": "reused", "material_ood": "reused"}
     assert reused.artifact_device is None
     assert loaded.storage_alias == "promoted_model"
     assert loaded.scientific_run_name == first.scientific_run_name
     assert loaded.id_artifact is not None
-    assert loaded.additional_artifact is not None
+    assert loaded.material_ood_artifact is not None
     assert loaded.selected_checkpoint_sha256 == checkpoint_digest
     assert all(Path(value).is_relative_to(loaded.id_artifact.root) for value in loaded.id_artifact.frame["npz_path"])
 
@@ -864,13 +883,13 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         before_read = _artifact_inventory((moved,))
         reread = analysis.evaluation.artifact_loader.load_run_artifacts(moved)
         assert reread.id_artifact is not None
-        assert reread.additional_artifact is not None
+        assert reread.material_ood_artifact is not None
         pd.testing.assert_frame_equal(reread.id_artifact.frame, loaded.id_artifact.frame)
-        pd.testing.assert_frame_equal(reread.additional_artifact.frame, loaded.additional_artifact.frame)
+        pd.testing.assert_frame_equal(reread.material_ood_artifact.frame, loaded.material_ood_artifact.frame)
         assert reread.selected_checkpoint_sha256 == checkpoint_digest
         assert _artifact_inventory((moved,)) == before_read
         prepared_read = analysis.artifacts.service.load_or_build_run_artifacts(moved, auto_build_missing=False)
-        assert prepared_read.role_actions == {"id": "reused", "additional_evaluation": "reused"}
+        assert prepared_read.role_actions == {"id": "reused", "material_ood": "reused"}
         assert prepared_read.artifact_device is None
         assert prepared_read.loaded_run.selected_checkpoint_sha256 == checkpoint_digest
 
@@ -883,27 +902,27 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         with pytest.raises(analysis.evaluation.artifact_loader.IncompatibleEvaluationArtifactsError):
             analysis.evaluation.artifact_loader.load_run_artifacts(moved)
         provenance_path.write_bytes(original_provenance)
-        parquet_path = loaded.id_artifact.root / f"{_ID_DATASET}.parquet"
+        parquet_path = loaded.id_artifact.root / "artifacts.parquet"
         original_parquet = parquet_path.read_bytes()
         parquet_path.write_bytes(original_parquet + b"changed")
         with pytest.raises(analysis.evaluation.artifact_loader.IncompatibleEvaluationArtifactsError):
             analysis.evaluation.artifact_loader.load_run_artifacts(moved)
         parquet_path.write_bytes(original_parquet)
-        absent_ood = loaded.additional_artifact.root.with_name("retained-ood")
-        loaded.additional_artifact.root.rename(absent_ood)
+        absent_ood = loaded.material_ood_artifact.root.with_name("retained-ood")
+        loaded.material_ood_artifact.root.rename(absent_ood)
         with pytest.raises(analysis.evaluation.artifact_loader.MissingEvaluationArtifactsError):
-            analysis.artifacts.service.load_or_build_run_artifacts(moved, artifact_roles=("additional_evaluation",), auto_build_missing=False)
-        absent_ood.rename(loaded.additional_artifact.root)
+            analysis.artifacts.service.load_or_build_run_artifacts(moved, artifact_roles=("material_ood",), auto_build_missing=False)
+        absent_ood.rename(loaded.material_ood_artifact.root)
 
-    raw_moved = pd.read_parquet(loaded.id_artifact.root / f"{_ID_DATASET}.parquet")
+    raw_moved = pd.read_parquet(loaded.id_artifact.root / "artifacts.parquet")
     escaping = raw_moved["npz_path"].tolist()
     escaping[0] = f"../npz/{_SAMPLE_IDS[int(raw_moved.iloc[0]['source_index'])]}.npz"
     _rewrite_parquet_npz_paths(loaded.id_artifact.root, escaping)
     with pytest.raises(analysis.evaluation.artifact_loader.IncompatibleEvaluationArtifactsError, match=r"npz_path|relative NPZ"):
         analysis.evaluation.artifact_loader.load_run_artifacts(moved)
-    shutil.rmtree(loaded.additional_artifact.root)
+    shutil.rmtree(loaded.material_ood_artifact.root)
     with pytest.raises(analysis.evaluation.artifact_loader.MissingEvaluationArtifactsError):
-        analysis.evaluation.artifact_loader.load_run_artifacts(moved, artifact_roles=("additional_evaluation",))
+        analysis.evaluation.artifact_loader.load_run_artifacts(moved, artifact_roles=("material_ood",))
 
 
 def _rewrite_as_optuna_trial(run_dir: Path) -> dict[str, Any]:
@@ -1030,7 +1049,7 @@ def test_rerunning_an_authored_request_with_more_epochs_continues_the_run_in_pla
     raw = copy.deepcopy(saved)
     for key in ("task_contract", "paths", "producer"):
         raw.pop(key)
-    for key in ("name", "naming_schema_version", "layout"):
+    for key in ("name", "layout"):
         raw["run"].pop(key)
     for key in ("project", "entity", "tags"):
         raw["tracking"]["wandb"].pop(key)
@@ -1128,12 +1147,12 @@ def _mutate_split_identity(run_dir: Path, dataset_root: Path) -> None:
 
 
 def _mutate_split_datasets(run_dir: Path, dataset_root: Path) -> None:
-    """Drop the last additional Evaluation part, leaving an admissible split that no longer matches config.yaml."""
+    """Drop the last material-OOD part, leaving an admissible split that no longer matches config.yaml."""
     del dataset_root
     path = common.paths.resolve_split_indices_path(run_dir)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    aligned = (payload["dataset_identity"]["additional_evaluation"], payload["roles"]["additional_evaluation"]["parts"])
-    for parts in (*aligned, payload["evaluation_assignments"]):
+    aligned = (payload["dataset_identity"]["material_ood"], payload["roles"]["material_ood"]["parts"])
+    for parts in (*aligned, payload["evaluation_assignments"]["material_ood"]):
         parts.pop()
     common.serialization.atomic_torch_save(payload, path)
     _refresh_summary_digest(
@@ -1158,27 +1177,16 @@ def _mutate_checkpoint_identity(run_dir: Path, dataset_root: Path) -> None:
 
 
 def _mutate_checkpoint_schema(run_dir: Path, dataset_root: Path) -> None:
-    """Replace the valid best-checkpoint schema version."""
+    """Replace the valid best-checkpoint schema kind."""
     del dataset_root
     path = common.paths.resolve_best_checkpoint_file(run_dir)
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["schema_version"] = 0
+    payload["schema_kind"] = "other_payload"
     common.serialization.atomic_torch_save(payload, path)
     _refresh_summary_digest(
         run_dir,
         summary_key="best_checkpoint_sha256",
         artifact_path=path,
-    )
-
-
-def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
-    """Remove the run-summary schema marker."""
-    del dataset_root
-    summary = experiments.run.read_run_summary(run_dir)
-    summary.pop("schema_version")
-    common.serialization.atomic_write_json(
-        common.paths.resolve_run_summary_path(run_dir),
-        summary,
     )
 
 
@@ -1191,8 +1199,7 @@ def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
         (_mutate_split_identity, "train membership digest mismatch"),
         (_mutate_split_datasets, "Saved split Datasets do not match the configured"),
         (_mutate_checkpoint_identity, "Checkpoint run identity"),
-        (_mutate_checkpoint_schema, "Malformed or unsupported checkpoint schema_kind/schema_version"),
-        (_remove_run_schema, "Unsupported or missing run summary schema"),
+        (_mutate_checkpoint_schema, "Malformed or unsupported checkpoint schema_kind"),
     ],
     ids=(
         "task",
@@ -1202,7 +1209,6 @@ def _remove_run_schema(run_dir: Path, dataset_root: Path) -> None:
         "split-datasets",
         "checkpoint",
         "checkpoint-schema",
-        "run-schema",
     ),
 )
 def test_saved_run_mismatches_are_rejected_before_forward(
@@ -1213,7 +1219,7 @@ def test_saved_run_mismatches_are_rejected_before_forward(
     match: str,
 ) -> None:
     """
-    Corrupt one saved task/config/dataset/split/split-Dataset/checkpoint/run-schema layer.
+    Corrupt one saved task/config/dataset/split/split-Dataset/checkpoint-schema layer.
 
     Every parametrized mutation keeps unrelated outer evidence valid where needed
     but must fail its owning admission check before FNO forward, proving the complete
@@ -1241,6 +1247,22 @@ def test_saved_run_mismatches_are_rejected_before_forward(
             split="id_test",
             device_policy="cpu",
         )
+
+
+@pytest.mark.parametrize("role", ["best", "last"])
+def test_changed_checkpoint_is_rejected_by_digest_before_it_is_deserialized(
+    completed_lifecycle: CompletedLifecycle,
+    tmp_path: Path,
+    role: str,
+) -> None:
+    """Refuse a checkpoint whose bytes differ from the summary before pickle loading could run its content."""
+    run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run")
+    path = common.paths.resolve_best_checkpoint_file(run_dir) if role == "best" else common.paths.resolve_last_checkpoint_file(run_dir)
+    path.write_bytes(b"not a pickle")  # a load before the digest check would raise an unpickling error instead
+    with pytest.raises(experiments.run.RunLifecycleError, match=f"{role} checkpoint digest mismatch"):
+        experiments.run.validate_completed_run(run_dir)
+    with pytest.raises(experiments.run.RunLifecycleError, match=f"{role} checkpoint digest mismatch"):
+        analysis.evaluation.artifact_loader.load_run_artifacts(run_dir)
 
 
 @pytest.mark.parametrize("filename", common.paths.EVALUABLE_RUN_REQUIRED_FILES)

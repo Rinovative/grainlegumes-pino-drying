@@ -33,12 +33,11 @@ from src import common
 from src.experiments import experiments_console as console
 
 _SCHEMA_KIND: Final = "evaluation_artifact_operational_performance"
-_SCHEMA_VERSION: Final = 1
 _KIBIBYTE: Final = 1024
 _GIBIBYTE: Final = 1024**3
 _MINIMUM_ETA_CASES: Final = 2
 _HEARTBEAT_SECONDS: Final = 60.0
-_SPLIT_LABELS: Final = {"id": "ID test set", "eval": "ID test set", "additional_evaluation": "additional evaluation set"}
+_SPLIT_LABELS: Final = {"id": "ID test set", "eval": "ID test set", "material_ood": "material-OOD set", "parameter_ood": "parameter-OOD set"}
 _PHASES: Final = frozenset(
     {
         "preflight",
@@ -149,7 +148,6 @@ class ArtifactPerformanceRecorder:
         ]
         return {
             "schema_kind": _SCHEMA_KIND,
-            "schema_version": _SCHEMA_VERSION,
             "total_seconds": total,
             "stages": stages,
             "counts": dict(sorted(self._counts.items())),
@@ -439,7 +437,6 @@ def validate_operational_performance(value: object) -> dict[str, Any]:
     """Validate one bounded operational snapshot without treating it as identity."""
     if not isinstance(value, Mapping) or set(value) != {
         "schema_kind",
-        "schema_version",
         "total_seconds",
         "stages",
         "counts",
@@ -450,7 +447,7 @@ def validate_operational_performance(value: object) -> dict[str, Any]:
     }:
         message = "Artifact operational performance fields do not match the schema."
         raise ValueError(message)
-    if value["schema_kind"] != _SCHEMA_KIND or not common.serialization.is_schema_version(value["schema_version"], _SCHEMA_VERSION):
+    if value["schema_kind"] != _SCHEMA_KIND:
         message = "Artifact operational performance schema is unsupported."
         raise ValueError(message)
     total = value["total_seconds"]
@@ -528,7 +525,6 @@ def validate_operational_performance(value: object) -> dict[str, Any]:
         raise ValueError(message)
     return {
         "schema_kind": value["schema_kind"],
-        "schema_version": value["schema_version"],
         "total_seconds": float(total),
         "stages": [dict(item) for item in stages],
         "counts": dict(counts),

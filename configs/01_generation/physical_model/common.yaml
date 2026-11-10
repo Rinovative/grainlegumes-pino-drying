@@ -1,8 +1,70 @@
 # Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
-# Shared Generation model and storage contract. Values here are model inputs or file-format tolerances, not per-run CPU controls.
+# Shared Generation model and storage settings: grid, output times, fixed physical values, then tolerances. The formula contract,
+# input-file adapters and the fixed time and storage fields are owned by the loader (src/generation/cases/generation_cases_config.py).
 schema_kind: generation_common
-schema_version: 1
-generator_version: 1
+# Boundary-inclusive output grid: nx and ny are point counts; Lx, Ly, and Lz are physical dimensions in metres.
+grid:
+  nx: 401
+  ny: 251
+  Lx: 1.2
+  Ly: 0.75
+  Lz: 0.8
+  boundaries_included: true
+grid_provenance:
+  nx:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  ny:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  Lx:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  Ly:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  Lz:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  dx:
+    evidence: derived
+    source_refs:
+    - transient_comsol_model_report
+    method: Boundary-inclusive output spacing Lx/(Nx-1).
+    verification: mathematically_reproduced
+  dy:
+    evidence: derived
+    source_refs:
+    - transient_comsol_model_report
+    method: Boundary-inclusive output spacing Ly/(Ny-1).
+    verification: mathematically_reproduced
+  boundaries_included:
+    evidence: project_baseline
+    source_refs:
+    - pino_airflow_project
+# Physical output horizon and sampling interval in hours: saved output times, not internal (adaptive) solver steps.
+time:
+  start: 0.0
+  stop: 168.0
+  interval: 1.0
+time_provenance:
+  start:
+    evidence: project_baseline
+    source_refs:
+    - transient_comsol_model_report
+  stop:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
+  interval:
+    evidence: synthetic_design
+    source_refs:
+    - transient_comsol_model_report
 # Fixed model constants and boundary limits shared by the selected profile; units and provenance are attached to each value.
 scientific_fixed_values:
   # Reference temperature used to condition the stationary airflow template.
@@ -192,136 +254,6 @@ scientific_fixed_values:
     provenance:
       evidence: synthetic_design
       source_refs: []
-# Boundary-inclusive output grid: nx and ny are point counts; Lx, Ly, and Lz are physical dimensions in metres.
-grid:
-  nx: 401
-  ny: 251
-  Lx: 1.2
-  Ly: 0.75
-  Lz: 0.8
-  boundaries_included: true
-grid_provenance:
-  nx:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  ny:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  Lx:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  Ly:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  Lz:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  dx:
-    evidence: derived
-    source_refs:
-    - transient_comsol_model_report
-    method: Boundary-inclusive output spacing Lx/(Nx-1).
-    verification: mathematically_reproduced
-  dy:
-    evidence: derived
-    source_refs:
-    - transient_comsol_model_report
-    method: Boundary-inclusive output spacing Ly/(Ny-1).
-    verification: mathematically_reproduced
-  boundaries_included:
-    evidence: project_baseline
-    source_refs:
-    - pino_airflow_project
-# Physical output horizon and sampling interval in hours; these settings define saved output times, not internal solver steps. An irregular diagnostic stop is not regular training output.
-time:
-  start: 0.0
-  stop: 168.0
-  interval: 1.0
-  internal_steps: adaptive
-  irregular_stop_state: diagnostic_only
-time_provenance:
-  start:
-    evidence: project_baseline
-    source_refs:
-    - transient_comsol_model_report
-  stop:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  interval:
-    evidence: synthetic_design
-    source_refs:
-    - transient_comsol_model_report
-  internal_steps:
-    evidence: project_baseline
-    source_refs:
-    - transient_comsol_model_report
-  irregular_stop_state:
-    evidence: project_baseline
-    source_refs:
-    - transient_comsol_model_report
-# On-disk input filenames, delimiters, and ordered columns consumed by the simulation templates.
-input_contract:
-  spatial:
-    filename: fields.csv
-    delimiter: ;
-    columns:
-      steady_flow:
-      - x
-      - y
-      - Kxx
-      - Kxy
-      - Kyy
-      - eps_bed
-      - p_in_bc
-      transient_drying:
-      - x
-      - y
-      - Kxx
-      - Kxy
-      - Kyy
-      - eps_bed
-      - p_in_bc
-      - X_0_db_field
-  scalar:
-    filename: scalars.csv
-    delimiter: ;
-    columns:
-    - name
-    - value
-    - unit
-  schedule:
-    filename: schedule.csv
-    delimiter: ;
-    columns:
-    - t
-    - T_in_bc
-    - omega_in_bc
-# Relative and absolute tolerances for distinct generated-state consistency checks.
-validation:
-  transient_initial_state:
-    rtol: 1.0e-04
-    atol: 1.0e-10
-  transient_bulk_moisture:
-    rtol: 1.0e-05
-    atol: 1.0e-09
-# Processed-output encoding and chunk layout. Float32 tolerances govern conversion fidelity, not solver accuracy.
-storage:
-  schema_version: 1
-  converter_version: 1
-  compression: gzip
-  compression_level: 4
-  shuffle: true
-  float32_rtol: 1.0e-06
-  float32_atol: 1.0e-12
-  chunk_time: 1
-  chunk_y: 64
-  chunk_x: 64
 # Global physical admissibility bounds used alongside material-specific support; they do not replace those material records.
 parameter_values:
   eps_min_global:
@@ -338,35 +270,20 @@ parameter_values:
       evidence: project_baseline
       source_refs:
       - pino_airflow_project
-# Formula strings document the COMSOL/model contract and are not executable YAML expressions.
-physical_formulas:
-  w_surf_balance: f_surf*d(w_surf)/dt = j_int - m_evap
-  w_int_balance: (1-f_surf)*d(w_int)/dt = -j_int
-  w_gr: f_surf*w_surf + (1-f_surf)*w_int
-  w_gr_0: rho_bu_dry*X_0_db_field; w_surf(0)=w_int(0)=w_gr_0
-  r_surf: r_surf_0
-  r_int: r_int_surf*r_surf
-  j_int: (1-f_surf)*r_int*(w_int-w_surf)
-  m_evap: f_surf*r_surf*max(w_surf-w_eq,0)
-  X_db: w_gr/rho_bu_dry
-  X_wb: w_gr/(rho_bu_dry+w_gr)
-  X_wb_from_X_db: X_db/(1+X_db)
-  X_db_from_X_wb: X_wb/(1-X_wb)
-  X_wb_bulk: integral(w_gr)/(integral(rho_bu_dry)+integral(w_gr))
-  rho_bu_dry: rho_bu_dry_ref*(1-eps_bed)/(1-eps_bed_ref)
-  solid_phase_density: rho_bu_dry/(1-eps_bed)
-  cp_gr_eff: cp_gr_dry + X_db*cp_w
-  volumetric_heat_capacity: rho_bu_dry*cp_gr_eff
-  k_eff: k_gr*(2*k_gr+k_air-2*eps_bed*(k_gr-k_air))/(2*k_gr+k_air+eps_bed*(k_gr-k_air))
-  phi_eff: min(max(phi,1e-6),0.999)
-  X_eq_db: 0.01*(A_osw+B_osw*(T-273.15[K]))*(phi_eff/(1-phi_eff))^C_osw
-  w_eq: rho_bu_dry*X_eq_db
-  osw_ratio_0: (100*X_0_db_field/(A_osw+B_osw*(T_init-273.15[K])))^(1/C_osw)
-  phi_init: osw_ratio_0/(1+osw_ratio_0)
-  Q_evap: -h_fg*m_evap
-  f_wet_dm: integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)
-  total_water_balance: d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out
-physical_formulas_provenance:
-  evidence: project_baseline
-  source_refs:
-  - transient_comsol_model_report
+# Relative and absolute tolerances for distinct generated-state consistency checks.
+validation:
+  transient_initial_state:
+    rtol: 1.0e-04
+    atol: 1.0e-10
+  transient_bulk_moisture:
+    rtol: 1.0e-05
+    atol: 1.0e-09
+# Processed-output layout (HDF5 gzip level and chunks). Float32 tolerances govern conversion fidelity, not solver accuracy.
+storage:
+  compression_level: 4
+  shuffle: true
+  float32_rtol: 1.0e-06
+  float32_atol: 1.0e-12
+  chunk_time: 1
+  chunk_y: 64
+  chunk_x: 64

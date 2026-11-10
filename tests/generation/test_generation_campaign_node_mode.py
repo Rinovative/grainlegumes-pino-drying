@@ -4,7 +4,7 @@ Responsibilities:
   - Check the node-job seat choice, submission order, lease result, and recovery of interrupted submissions
   - Check that each registered profile has its own Slurm job code and an unknown profile is refused
   - Check dispatch capacity, ticket contents, dispatch order, recovery at each crash point, and draining
-  - Check the run.json validators and the refusal of another schema version
+  - Check the run.json validators
   - Check the per-dispatch scheduler view, not-started persistence, worker binding, cancellation replay, licence retry, and node-job status
   - Check that the rendered status of a live campaign shows its active resources, admission cap and admission count
   - Check that every validly published case gets exactly one success decision, from its worker or else from the feeder
@@ -74,7 +74,6 @@ def test_first_feed_submits_a_node_job_and_dispatches_ticketed_case_steps(genera
     campaign = make_campaign(generation_config_factory, natural_count=2)
     manifest = submit(campaign, world)
 
-    assert manifest["schema_version"] == campaign_evidence.RUN_MANIFEST_SCHEMA_VERSION == 1
     assert "scheduler_job_name" not in manifest
     assert manifest["state"] == "active"
     assert manifest["node_job_intent"] is None
@@ -206,7 +205,7 @@ def test_node_job_submitted_before_the_crash_is_recovered_without_a_second_sbatc
     assert world.jobs() == [["7001", "gen-seat-1", "PENDING", record["token"], ""]]
     if evidence == "worker_record":
         world.set_state("7001", "COMPLETED")
-        node_record = {"schema": node.NODE_RECORD_SCHEMA, "schema_version": node.SCHEMA_VERSION, "job_id": "7001"}
+        node_record = {"schema": node.NODE_RECORD_SCHEMA, "job_id": "7001"}
         (node_directory(campaign, world, record) / node.NODE_RECORD_FILE).write_text(json.dumps(node_record), encoding="utf-8")
 
     recovered = feed(campaign, world)
@@ -430,7 +429,6 @@ def _valid_run(run_id: str) -> dict[str, Any]:
     """Return a minimal consistent run record with one submitted node job and one dispatched case step."""
     return {
         "schema_kind": "generation_campaign_run",
-        "schema_version": 1,
         "campaign_run_id": run_id,
         "slurm_job_ids": ["7001"],
         "node_job_intent": None,
@@ -499,13 +497,12 @@ _MUTATIONS: dict[str, tuple[Callable[[dict[str, Any]], object], str]] = {
     ),
     "stop_ticket_without_draining": (lambda run: run["node_jobs"][0].update(stop_ticket_seq=1), "node-job record 1 is inconsistent"),
     "node_job_intent_names_nothing": (lambda run: run.update(node_job_intent=NODE_ID), "node-job intent is inconsistent"),
-    "unsupported_schema_version": (lambda run: run.update(schema_version=2), "Unsupported or malformed campaign-run manifest"),
 }
 
 
 @pytest.mark.parametrize("name", sorted(_MUTATIONS))
 def test_scheduler_ownership_reader_fails_closed_on_every_broken_node_job_or_dispatch_rule(world: FakeSlurm, name: str) -> None:
-    """The light reader accepts the valid shape and rejects each broken equality, reference, uniqueness, or version rule."""
+    """The light reader accepts the valid shape and rejects each broken equality, reference, or uniqueness rule."""
     run_id = "source~steady_flow~lentil-1__ref-range__lhs-seed-41001"
     path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=world.storage)
     path.parent.mkdir(parents=True)
@@ -535,35 +532,6 @@ def test_scheduler_ownership_reader_refuses_while_a_node_job_submission_is_unres
         campaign_evidence.load_campaign_scheduler_job_ids(run_id, storage_root=world.storage)
 
 
-def test_run_manifest_of_another_schema_is_refused_for_execution_resume_admission_and_tree_restore(
-    generation_config_factory: Any, world: FakeSlurm
-) -> None:
-    """A run.json of another schema version is neither continued, resumed, read for ownership, nor used to restore a source tree."""
-    campaign = make_campaign(generation_config_factory)
-    world.add_foreign_job("gen-seat-1", "6001")
-    world.add_foreign_job("gen-seat-2", "6002")
-    created = submit(campaign, world)
-    run_id = created["campaign_run_id"]
-    path = campaign_evidence.campaign_run_manifest_path(run_id, storage_root=world.storage)
-    other_schema = {key: value for key, value in created.items() if key not in {"node_jobs", "node_job_intent"}}
-    other_schema.update(schema_version=2, scheduler_job_name="sf-campaign-abcd")
-    path.write_text(json.dumps(other_schema), encoding="utf-8")
-
-    refusals: list[Callable[[], Any]] = [
-        lambda: campaign_evidence.load_campaign_run(run_id, storage_root=world.storage),
-        lambda: campaign_evidence.load_campaign_scheduler_job_ids(run_id, storage_root=world.storage),
-        lambda: generation.campaign.feed_campaign(run_id, storage_root=world.storage),
-        lambda: generation.campaign.resume_campaign(run_id, storage_root=world.storage),
-        lambda: submit(campaign, world),
-        lambda: generation.campaign.campaign_status(run_id, storage_root=world.storage),
-        lambda: generation.campaign.bound_source_snapshot(run_id, storage_root=world.storage),
-    ]
-    for refuse in refusals:
-        with pytest.raises(ValueError, match="Unsupported or malformed campaign-run manifest"):
-            refuse()
-    assert world.sbatch_arguments() == []
-
-
 def _age_node_job(campaign: Any, world: FakeSlurm, index: int = 0, *, seconds: int = 300) -> None:
     """Move the first observation of one ended node job into the past, as the passing of the not-started grace would."""
     path = campaign_evidence.campaign_run_manifest_path(run_id_of(campaign), storage_root=world.storage)
@@ -578,7 +546,6 @@ def _finished_receipt(directory: Path, seq: int, *, seconds_ago: int, outcome: s
     ended = datetime.now(UTC) - timedelta(seconds=seconds_ago)
     receipt = {
         "schema": node.FINISHED_RECEIPT_SCHEMA,
-        "schema_version": node.SCHEMA_VERSION,
         "seq": seq,
         "started_at": (ended - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "ended_at": ended.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -908,7 +875,7 @@ def test_case_worker_binds_to_its_dispatch_and_fails_closed_otherwise(
 def _campaign_with_dispatched_replacement(generation_config_factory: Any, world: FakeSlurm) -> tuple[Any, dict[str, Any]]:
     """Fail the only original of an s = 0.9 campaign (bound 0.95 after one failure) and let the feeder dispatch its replacement."""
     config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=1, max_admission_cases=4, node_jobs=1, cores_per_node=2
+        simulation_profile="steady_flow", natural_count=1, max_admission_cases=4, node_jobs=1, cores_per_node=2
     )
     authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.9}
     campaign = generation.cases.config.load_campaign_config(config_path, authored_value=authored)

@@ -430,7 +430,6 @@ def test_rerunning_a_completed_run_returns_without_training(
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
         {
-            "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "status": "completed",
             "completed_epoch": config["training"]["epochs"],
             "best_epoch": 1,
@@ -492,27 +491,10 @@ def test_only_completed_runs_pass_the_shallow_evaluable_check(tmp_path: Path, st
         (run_dir / filename).touch()
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": 1, "status": status},
+        {"status": status},
     )
 
     assert common.paths.is_evaluable_run_dir(run_dir) is evaluable
-
-
-@pytest.mark.parametrize("invalid_version", [True, 2])
-def test_run_summary_requires_type_exact_schema_version(
-    tmp_path: Path,
-    invalid_version: object,
-) -> None:
-    """Reject every non-current integer and numeric lookalike before lifecycle use."""
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-    common.serialization.atomic_write_json(
-        common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": invalid_version, "status": "completed"},
-    )
-
-    with pytest.raises(experiments.run.RunLifecycleError, match="run summary schema"):
-        experiments.run.read_run_summary(run_dir)
 
 
 def test_optuna_trial_paths_are_study_and_trial_qualified(tmp_path: Path) -> None:
@@ -795,7 +777,7 @@ def test_resume_allows_only_duration_increase_and_runtime_location_changes() -> 
 @pytest.mark.parametrize(
     ("section", "replacement"),
     [
-        ("data", {"train_dataset": "other", "additional_evaluation_datasets": ["ood"]}),
+        ("data", {"train_dataset": "other", "material_ood_datasets": ["ood"]}),
         ("model", {"kind": "tiny", "params": {"width": 8}}),
     ],
 )

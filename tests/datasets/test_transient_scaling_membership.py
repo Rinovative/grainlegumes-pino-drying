@@ -4,9 +4,10 @@ Responsibilities:
   - Fit the scaler through ``create_transient_training_loaders`` on the compact published transient package
   - Compare the fitted state moments, increment RMS and counts with Train-only values recomputed from the published PT shards
   - Require an identity-bound scaler cache hit to restore the identical fitted evidence
+  - Fit a ``train_subset`` run on its Train prefix only and record the subset in the split
 
 Design principles:
-  - The package holds held-out cases whose state values lie outside every Train case, so fitting on any other membership is visible
+  - The package's held-out cases move the state moments away from the Train-only values, so fitting on any other membership is visible
   - Expected statistics use the documented definition on test-read tensors and never call scaler code
   - Both Train sampling branches (direct one-step items and a separately selected one-step fitting Dataset) must give the same Train-only fit
 
@@ -61,12 +62,13 @@ def _increment_rms(states: list[torch.Tensor]) -> torch.Tensor:
     return torch.cat(increments, dim=1).square().mean(dim=1).sqrt()
 
 
-def _create(package: dict[str, Any], sampling: Any, **extra: Any) -> Any:
+def _create(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None, **extra: Any) -> Any:
     """Create the public transient training loaders on the compact package."""
     return datasets.runtime.transient_training.create_transient_training_loaders(
         train_dataset_id=package["train_dataset"],
-        additional_evaluation_dataset_ids=[],
-        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
+        material_ood_dataset_ids=[],
+        train_subset=train_subset,
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("none")),
         train_sampling=sampling,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
         model_sha256="a" * 64,
@@ -77,13 +79,13 @@ def _create(package: dict[str, Any], sampling: Any, **extra: Any) -> Any:
 
 def _close(loaders: Any) -> None:
     """Close every loader Dataset the training loaders own."""
-    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
+    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test)
     for loader in owned:
         if loader is not None:
             loader.dataset.close()
 
 
-def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifact, dict[str, Any], list[str]]:
+def _fit(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None) -> tuple[TransientScalingArtifact, dict[str, Any], list[str]]:
     """Create the public loaders once and return the fitted scaler, split evidence and scaler cache outcomes."""
     cache_outcomes: list[str] = []
 
@@ -91,7 +93,7 @@ def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifa
         if event == "scaler_cache":
             cache_outcomes.append(str(values["state"]))
 
-    loaders = _create(package, sampling, startup_callback=record)
+    loaders = _create(package, sampling, train_subset=train_subset, startup_callback=record)
     try:
         return loaders.data_processor, loaders.split, cache_outcomes
     finally:
@@ -102,8 +104,8 @@ def _fit(package: dict[str, Any], sampling: Any) -> tuple[TransientScalingArtifa
 def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[str, Any], sampling: Any) -> None:
     """Fit state moments and increment RMS on Train cases only, and restore them identically from the cache.
 
-    The held-out cases carry strictly larger values than every Train case in at least one channel, so a fit that
-    admits validation or ID-test evidence changes the statistics beyond tolerance.
+    The held-out cases move the pooled state mean by more than 1 % in at least one channel, so a fit that admits
+    validation or ID-test evidence changes the statistics beyond tolerance.
     """
     partition = transient_package["case_partition"]
     by_case = _published_states(transient_package)
@@ -114,12 +116,8 @@ def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[st
 
     train_mean, train_std = _channel_moments(train)
     all_mean, _ = _channel_moments(list(by_case.values()))
-    case_means = [sequence.to(torch.float64).mean(dim=(0, 2, 3)) for sequence in (*train, *held_out)]
-    train_means, held_out_means = torch.stack(case_means[: len(train)]), torch.stack(case_means[len(train) :])
-    separated = held_out_means.min(dim=0).values > train_means.max(dim=0).values
-    assert bool(separated.any()), "fixture premise: held-out cases must lie outside the Train range in some channel"
     shifted = (all_mean - train_mean).abs() > 0.01 * train_mean.abs()
-    assert bool(shifted[separated].all()), "fixture premise: Train-only differs from the whole Dataset"
+    assert bool(shifted.any()), "fixture premise: Train-only moments differ from the whole Dataset"
 
     artifact, split, first_cache = _fit(transient_package, sampling)
 
@@ -137,6 +135,27 @@ def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[st
     assert restored.digest == artifact.digest
     for name in ("state_mean", "state_std", "delta_rms", "increment_scale"):
         assert torch.equal(getattr(restored, name), getattr(artifact, name))
+
+
+def test_a_train_subset_fits_its_scaler_on_the_train_prefix_only(transient_package: dict[str, Any]) -> None:
+    """``train_subset`` 1 trains and fits on the first Train case of the ID material and records the subset in the split."""
+    partition = transient_package["case_partition"]
+    by_case = _published_states(transient_package)
+    assert len(partition["train"]) == 2
+    prefix = [by_case[partition["train"][0]]]
+    whole_mean, _ = _channel_moments([by_case[case_id] for case_id in partition["train"]])
+    prefix_mean, prefix_std = _channel_moments(prefix)
+    assert bool(((whole_mean - prefix_mean).abs() > 0.01 * prefix_mean.abs()).any()), "fixture premise: the prefix differs from all Train"
+
+    artifact, split, _ = _fit(transient_package, _SAMPLING["one_step"], train_subset=1)
+
+    assert split["train_subset"] == 1
+    assert split["roles"]["train"]["case_ids"] == partition["train"][:1]
+    torch.testing.assert_close(artifact.state_mean.to(torch.float64), prefix_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    torch.testing.assert_close(artifact.state_std.to(torch.float64), prefix_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    assert artifact.unique_train_state_count == prefix[0].shape[0]
+    with pytest.raises(ValueError, match=r"data.train_subset 4 exceeds the Train cases of \['lentil'\]"):
+        _fit(transient_package, _SAMPLING["one_step"], train_subset=4)
 
 
 @pytest.mark.parametrize(

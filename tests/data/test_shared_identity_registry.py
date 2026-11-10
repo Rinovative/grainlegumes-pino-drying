@@ -164,10 +164,9 @@ def test_targets_outside_the_root_and_unknown_kinds_are_refused(tmp_path: Path) 
         lambda entry: entry.update(target="../escape"),
         lambda entry: entry.update(target="/absolute"),
         lambda entry: entry.update(kind="dataset"),
-        lambda entry: entry.update(schema_version=2),
         lambda entry: entry.update(extra="field"),
     ],
-    ids=["digest", "parent-target", "absolute-target", "kind", "schema", "extra-key"],
+    ids=["digest", "parent-target", "absolute-target", "kind", "extra-key"],
 )
 def test_malformed_entries_fail_closed(tmp_path: Path, mutate: Callable[[dict[str, Any]], object]) -> None:
     """A corrupt entry is an error, never a free slot for a duplicate."""

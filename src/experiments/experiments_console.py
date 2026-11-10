@@ -202,9 +202,9 @@ class ConsoleReporter:
         parts = [f"epoch {epoch:>{len(str(target))}}/{target}", f"loss {_num(metrics.get('train/loss_total'))}{_loss_components(metrics)}"]
         if id_key in metrics:
             parts.append(f"val {_num(metrics[id_key])}{' *best' if metrics.get('checkpoint/new_best') == 1.0 else ''}")
-        additional_key = f"additional_evaluation/{self.objective_id}"
-        if additional_key in metrics:
-            parts.append(f"add-val {_num(metrics[additional_key])}")
+        for role, label in (("material_ood", "ood"), ("parameter_ood", "pood")):
+            if f"{role}/{self.objective_id}" in metrics:
+                parts.append(f"{label} {_num(metrics[f'{role}/{self.objective_id}'])}")
         if "physics/id/momentum_residual_mse" in metrics:
             residuals = (metrics[f"physics/id/{name}"] for name in ("momentum_residual_mse", "flux_balance_mse", "pressure_boundary_mse"))
             parts.append("phys mom/flux/bnd " + "/".join(_num(value, digits=2) for value in residuals))

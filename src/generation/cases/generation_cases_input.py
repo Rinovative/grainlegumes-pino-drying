@@ -48,8 +48,6 @@ from . import generation_cases_admission as admission_service
 from . import generation_cases_case as case_service
 from . import generation_cases_config as config_service
 
-INPUT_TRANSACTION_SCHEMA_VERSION = 1
-INPUT_REFERENCE_SCHEMA_VERSION: Final = 1
 INPUT_GENERATION_ACTIONS: Final = ("dry_run", "execute")
 
 
@@ -61,11 +59,9 @@ class CampaignInputGenerationRequest:
     storage_root: Path | str
     action: str = "dry_run"
     only_batch: str | None = None
-    all_batches: bool = False
     only_regime: str | None = None
     case_start: int | None = None
     case_count: int | None = None
-    all_cases: bool = False
     git_commit: str | None = None
 
 
@@ -111,7 +107,6 @@ def _manifest_base(
     scientific = config.scientific_values
     base = {
         "schema_kind": admission_service.INPUT_BATCH_SCHEMA_KIND,
-        "schema_version": admission_service.INPUT_BATCH_SCHEMA_VERSION,
         "campaign_id": scientific["campaign_id"],
         "campaign_purpose": scientific["campaign_purpose"],
         "batch_name": config.batch_name,
@@ -124,9 +119,7 @@ def _manifest_base(
         "case_input_config_digest": config.case_input_config_digest,
         "scientific_config_digest": config.scientific_config_digest,
         "git_commit": case_service.source_service.required_git_commit(),
-        "generator_version": scientific["generator_version"],
         "producer_identity": source_service.input_producer_identity(),
-        "case_schema_version": case_service.CASE_SCHEMA_VERSION,
         "case_contract_digest": case_service.CASE_CONTRACT_DIGEST,
         "template_relative_path": config.template_relative_path,
         "template_sha256": config.template_sha256,
@@ -444,7 +437,6 @@ def _write_input_reference(
         inputs_directory / common.paths.GENERATION_INPUT_REFERENCE_FILENAME,
         {
             "schema_kind": "generation_campaign_input_reference",
-            "schema_version": INPUT_REFERENCE_SCHEMA_VERSION,
             "batch_storage_name": batch_storage_name,
             "input_generation_id": input_generation_id,
             "case_id": case_id,
@@ -638,7 +630,6 @@ def _recover_input_transaction(
         or set(journal)
         != {
             "schema_kind",
-            "schema_version",
             "batch_id",
             "batch_storage_name",
             "input_generation_id",
@@ -646,7 +637,6 @@ def _recover_input_transaction(
             "new_case_ids",
         }
         or journal.get("schema_kind") != "generation_input_transaction"
-        or not common.serialization.is_schema_version(journal.get("schema_version"), INPUT_TRANSACTION_SCHEMA_VERSION)
         or journal.get("batch_id") != batch_id
         or journal.get("batch_storage_name") != batch_storage_name
         or journal.get("input_generation_id") != base["input_generation_id"]
@@ -699,7 +689,6 @@ def _write_input_transaction_journal(
         transaction / "transaction.json",
         {
             "schema_kind": "generation_input_transaction",
-            "schema_version": INPUT_TRANSACTION_SCHEMA_VERSION,
             "batch_id": batch_id,
             "batch_storage_name": batch_storage_name,
             "input_generation_id": input_generation_id,
@@ -737,8 +726,8 @@ def _emit_case_progress(
 
 
 def _canonical_replacement_design(config: config_service.GenerationConfig, regime: str, case_index: int) -> dict[str, Any] | None:
-    """Require one exact supplemental locator before reserving its case ID."""
-    design = config.scientific_values.get("supplemental_design")
+    """Require one exact replacement locator before reserving its case ID."""
+    design = config.scientific_values.get("replacement_design")
     if design is None:
         return None
     if not isinstance(design, dict) or design.get("batch_locator_regime") != regime or design.get("material_case_index") != case_index:
@@ -768,7 +757,9 @@ def generate_input_cases(
         config.batch_storage_name, input_generation_id, storage_root=storage_root
     )
     lock_path = common.paths.resolve_generation_input_lock_path(config.batch_storage_name, storage_root=storage_root)
-    transaction = common.paths.resolve_generation_input_transaction_directory(input_generation_id, storage_root=storage_root)
+    transaction = common.paths.resolve_generation_input_transaction_directory(
+        config.batch_storage_name, input_generation_id, storage_root=storage_root
+    )
     campaign_parts = common.paths.campaign_batch_parts(config.batch_storage_name)
     if campaign_parts is None:
         message = f"Input generation requires a campaign batch locator, got {config.batch_storage_name!r}."
@@ -850,9 +841,9 @@ def generate_input_cases(
 
                     case_payload = json.loads((staged_case / "case.json").read_text(encoding="utf-8"))
                     seed_evidence = case_payload["seed_evidence"]
-                    supplemental = _canonical_replacement_design(config, regime, case_index)
-                    replacement = supplemental is not None
-                    replacement_design = supplemental if supplemental is not None else {}
+                    canonical_design = _canonical_replacement_design(config, regime, case_index)
+                    replacement = canonical_design is not None
+                    replacement_design = canonical_design if canonical_design is not None else {}
                     lifecycle.reserve_candidate(
                         task,
                         campaign_name,
@@ -871,7 +862,7 @@ def generate_input_cases(
                         },
                         derived_seeds={"batch": seed_evidence["batch_seed"], "case": seed_evidence["case_seed"], **seed_evidence["subseeds"]},
                         batch_id=str(replacement_design["parent_batch_id"]) if replacement else config.batch_id,
-                        design_evidence=supplemental if replacement else None,
+                        design_evidence=canonical_design,
                         expected_case_id=case_id,
                         storage_root=storage_root,
                     )
@@ -951,27 +942,11 @@ def _resolve_campaign_request(
     request: CampaignInputGenerationRequest,
 ) -> tuple[config_service.CampaignConfig, tuple[tuple[config_service.GenerationConfig, tuple[int, ...]], ...]]:
     """Validate one request and resolve exact campaign batch membership."""
-    if not isinstance(request.all_batches, bool) or not isinstance(request.all_cases, bool):
-        message = "all_batches and all_cases must be booleans."
-        raise TypeError(message)
-    if request.all_batches == (request.only_batch is not None):
-        message = "Select exactly one of only_batch or all_batches."
-        raise ValueError(message)
-    if request.all_cases == (request.case_count is not None):
-        message = "Select exactly one of case_count or all_cases."
-        raise ValueError(message)
-    if request.all_cases and request.case_start is not None:
-        message = "case_start cannot be combined with all_cases."
+    if request.case_count is None and request.case_start is not None:
+        message = "case_start requires case_count."
         raise ValueError(message)
     campaign = config_service.load_campaign_config(request.campaign_config)
-    if request.all_batches:
-        batches = campaign.batches
-    else:
-        only_batch = request.only_batch
-        if only_batch is None:
-            message = "A single-batch input request requires only_batch."
-            raise RuntimeError(message)
-        batches = (campaign.batch(only_batch),)
+    batches = campaign.batches if request.only_batch is None else (campaign.batch(request.only_batch),)
     if request.only_regime is not None:
         batches = tuple(batch for batch in batches if batch.sampling_regime == request.only_regime)
     if not batches:
@@ -979,10 +954,7 @@ def _resolve_campaign_request(
         raise ValueError(message)
     selections = []
     for batch in batches:
-        case_count = len(batch.case_indices) if request.all_cases else request.case_count
-        if case_count is None:
-            message = "Input generation requires case_count or all_cases."
-            raise ValueError(message)
+        case_count = len(batch.case_indices) if request.case_count is None else request.case_count
         selections.append(
             (
                 batch,
@@ -1032,15 +1004,11 @@ def _equivalent_cli_command(
         "inputs",
         campaign_argument,
     ]
-    if request.all_batches:
-        command.append("--all-batches")
-    else:
+    if request.only_batch is not None:
         command.extend(("--only-batch", str(request.only_batch)))
     if request.only_regime is not None:
         command.extend(("--only-regime", request.only_regime))
-    if request.all_cases:
-        command.append("--all-cases")
-    else:
+    if request.case_count is not None:
         if request.case_start is not None:
             command.extend(("--case-start", str(request.case_start)))
         command.extend(("--case-count", str(request.case_count)))
@@ -1065,7 +1033,7 @@ def _ensure_campaign_plan_for_inputs(
         message = "Selected campaign inputs exceed the frozen material success targets."
         raise ValueError(message)
     try:
-        plan = lifecycle.load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
+        plan = lifecycle.load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root, requested=campaign)
     except FileNotFoundError as error:
         message = "Partial canonical input preparation requires an existing complete campaign plan."
         raise FileNotFoundError(message) from error

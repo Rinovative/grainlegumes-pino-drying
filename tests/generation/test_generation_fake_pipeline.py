@@ -38,6 +38,7 @@ from src.generation.contracts import generation_contracts_source as source_servi
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.publication import generation_publication_catalog as catalog
 from src.generation.runtime import generation_runtime_host as host_service
+from src.generation.runtime import generation_runtime_license as license_service
 
 pytestmark = pytest.mark.integration
 
@@ -64,15 +65,15 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
     root = lifecycle.create_campaign(campaign, storage_root=storage)
     assert [row["campaign_name"] for row in catalog.list_campaigns("steady_flow", storage_root=storage)] == [campaign.campaign_name]
     plan = json.loads((root / "_record/campaign_plan.json").read_text(encoding="utf-8"))
-    assert (plan["schema_kind"], plan["schema_version"]) == ("generation_source_campaign_plan", 1)
-    assert plan["original_design_sizes"] == {"lentil": 2}
+    assert plan["schema_kind"] == "generation_source_campaign_plan"
+    assert plan["original_design_sizes"] == {"lentil": {"test": 2}}
     assert all(key not in plan for key in ("material_roles", "membership", "dataset_packages"))
 
     primary = campaign.batches[0]
     inputs = generation.cases.input_generation.generate_input_cases(primary, 2, storage_root=storage)
-    assert inputs.metadata_directory == root / "lentil" / "_record" / "natural"
-    assert inputs.raw_directory == root / "lentil"
-    assert not (root / "lentil" / "batches").exists()
+    assert inputs.metadata_directory == root / "materials" / "lentil" / "_record" / "test"
+    assert inputs.raw_directory == root / "materials" / "lentil"
+    assert not (root / "materials" / "lentil" / "batches").exists()
     assert not list(root.rglob("input_generations"))
     references = generation.cases.input_generation.admit_configured_input_references(primary, storage_root=storage)
     first = references[1].case_payload()
@@ -89,7 +90,7 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
         ):
             step.setenv(name, value)
         with pytest.raises(generation.runtime.CaseExecutionError):
-            generation.runtime.run_case(primary, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work")
+            generation.runtime.run_case(primary, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work", scheduler_kind="local")
     lifecycle.decide_candidate(
         "steady_flow",
         campaign.source_name,
@@ -130,11 +131,21 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
 
     # Without a plan s is 1, so the first failure stops the batch; one failure in two decisions keeps the bound above 0.9.
     lifecycle.amend_minimum_success_rate(
-        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.9, reason="Synthetic tolerated failure", storage_root=storage
+        "steady_flow",
+        campaign.source_name,
+        primary.material_family,
+        minimum_success_rate=0.9,
+        reason="Synthetic tolerated failure",
+        storage_root=storage,
     )
     replacement = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
     assert replacement.case_indices == (3,)
-    assert replacement.scientific_values["supplemental_design"]["sampling_algorithm"] == "sobol"
+    # The replacement is the next unused point of its parent's design: point 2 after the original points 0 and 1.
+    assert replacement.scientific_values["replacement_design"]["design_index"] == len(primary.case_indices)
+    assert replacement.seed_base == primary.seed_base
+    assert primary.seed_base is not None
+    assert replacement.case_seed(3) == generation.cases.seeding.derive_seed(primary.seed_base, "case", str(len(primary.case_indices)))
+    assert replacement.scientific_values["sampling"]["design_seed"] == primary.scientific_values["sampling"]["design_seed"]
     generation.cases.input_generation.generate_input_cases(replacement, 1, storage_root=storage)
     successful_source_case(campaign.source_name, replacement, 3, storage, tmp_path / "work")
     discovery = generation.cases.admission.discover_input_batches(storage, task="steady_flow", validation_depth="evidence")
@@ -144,6 +155,9 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
     selected = lifecycle.selected_successes("steady_flow", campaign.source_name, storage_root=storage)
     assert [record["reservation"]["case_id"] for record in selected] == ["case_0002", "case_0003"]
     assert [record["reservation"]["origin"] for record in selected] == ["primary", "replacement"]
+    assert [record["decision"]["case_hdf5_relative"] for record in selected] == [  # the locator that Dataset manifests store
+        f"01_generation/steady_flow/{campaign.source_name}/materials/lentil/{case_id}/result/case.h5" for case_id in ("case_0002", "case_0003")
+    ]
     rows = catalog.list_campaign_cases("steady_flow", campaign.source_name, storage_root=storage)
     assert [(row["case_id"], row["outcome"], row["selected"]) for row in rows] == [
         ("case_0001", "failed", False),
@@ -181,7 +195,6 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
         assert timing.simulation_profile == "steady_flow"
         with h5py.File(admitted.hdf5_path, "r") as handle:
             assert handle.attrs["schema_kind"] == "generation_source_case_hdf5"
-            assert handle.attrs["schema_version"] == 1
             assert handle.attrs["domain_profile"] == "reference_range"
             assert "material_role" not in handle.attrs
             assert "evaluation_regime" not in handle.attrs
@@ -194,25 +207,30 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
     driver_log.parent.mkdir(parents=True)
     driver_log.write_text("[1/4] Run plan\n", encoding="utf-8")
     host_service.link_job_logs(root, [driver_log])
-    assert sorted(entry.name for entry in root.iterdir()) == [".state", "_record", "lentil", "logs"]
-    assert _tree(root / "logs") == {"generation-run-4711.log"}
-    assert sorted(entry.name for entry in (root / "lentil").iterdir()) == ["_record", "case_0001", "case_0002", "case_0003"]
-    assert _tree(root / "_record") == {"campaign_plan.json", "execution", "execution/run.json"}
-    assert _tree(root / "lentil/_record") == {
-        "natural",
-        "natural/input_generation_manifest.json",
-        "natural/resolved_generation_config.json",
-        "natural/replacements",
-        "natural/replacements/amendment_0001.json",
-        "natural_replacement_0001",
-        "natural_replacement_0001/input_generation_manifest.json",
-        "natural_replacement_0001/resolved_generation_config.json",
+    assert sorted(entry.name for entry in root.iterdir()) == ["_record", "materials"]  # cases.csv follows when the campaign settles
+    assert not any(path.name == ".state" for path in root.parent.rglob("*"))  # the stage's single .state sits beside the task folders
+    locks = {path.name for path in (storage / "01_generation/.state/locks").iterdir()}
+    prefix = f"steady_flow~{campaign.source_name}~"
+    assert {f"{prefix}controller.lock", f"{prefix}lentil~test~inputs.lock", f"{prefix}lentil~test~case_0001.lock"} <= locks
+    assert all(name.startswith(prefix) and name.endswith(".lock") for name in locks)
+    assert sorted(entry.name for entry in (root / "materials").iterdir()) == ["lentil"]
+    assert sorted(entry.name for entry in (root / "materials/lentil").iterdir()) == ["_record", "case_0001", "case_0002", "case_0003"]
+    assert _tree(root / "_record") == {"campaign_plan.json", "execution", "execution/run.json", "logs", "logs/generation-run-4711.log"}
+    assert _tree(root / "materials/lentil/_record") == {
+        "amendments",
+        "amendments/amendment_0001.json",
+        "test",
+        "test/input_generation_manifest.json",
+        "test/resolved_generation_config.json",
+        "test_replacement_0001",
+        "test_replacement_0001/input_generation_manifest.json",
+        "test_replacement_0001/resolved_generation_config.json",
     }
     inputs_tree = {"inputs", "inputs/case.json", "inputs/fields.csv", "inputs/input_reference.json"}
     records = {"_record", "_record/reservation.json", "_record/decision.json"}
     bundle = "_record/attempts/run_0001"
     failed_runtime = ("execution_provenance.json", "solver_steps.csv", "stderr.log", "stdout.log", "timing.json")
-    assert _tree(root / "lentil/case_0001") == {
+    assert _tree(root / "materials/lentil/case_0001") == {
         *inputs_tree,
         *records,
         "_record/attempts",
@@ -224,7 +242,7 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
         *(f"{bundle}/payload/runtime/{name}" for name in failed_runtime),
     }
     evidence = ("execution_provenance.json", "processing_provenance.json", "solver.log", "status.json", "timing.json")
-    assert _tree(root / "lentil/case_0002") == {
+    assert _tree(root / "materials/lentil/case_0002") == {
         *inputs_tree,
         *records,
         "result",
@@ -323,7 +341,6 @@ def test_staged_admission_resumes_same_full_design_after_first_success(
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
-        scheduler_kind="slurm",
         natural_count=3,
         max_admission_cases=1,
         node_jobs=1,
@@ -336,7 +353,7 @@ def test_staged_admission_resumes_same_full_design_after_first_success(
     first = submit(campaign, world)
     assert world.leases == ["7001"]
     assert [(item["case"]["case_id"], item["mode"], item["job_id"]) for item in first["submissions"]] == [("case_0001", "initial", "7001")]
-    assert lifecycle.load_campaign_plan("steady_flow", campaign.source_name, storage_root=storage)["original_design_sizes"] == {"lentil": 3}
+    assert lifecycle.load_campaign_plan("steady_flow", campaign.source_name, storage_root=storage)["original_design_sizes"] == {"lentil": {"test": 3}}
 
     successful_source_case(campaign.source_name, original_batch, 1, storage, tmp_path / "work")
     world.finish_dispatches(first)
@@ -401,7 +418,6 @@ def test_four_case_smoke_capacity_continuation_keeps_original_design(
     config_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         executable=fake_comsol,
-        scheduler_kind="slurm",
         natural_count=4,
         max_admission_cases=1,
         node_jobs=1,
@@ -429,7 +445,9 @@ def test_four_case_smoke_capacity_continuation_keeps_original_design(
     world.finish_dispatches(continued)
     continued = feed(campaign, world)
     assert continued["state"] == "complete"
-    assert lifecycle.load_campaign_plan("transient_drying", campaign.source_name, storage_root=storage)["original_design_sizes"] == {"lentil": 4}
+    assert lifecycle.load_campaign_plan("transient_drying", campaign.source_name, storage_root=storage)["original_design_sizes"] == {
+        "lentil": {"test": 4}
+    }
     assert len(lifecycle.selected_successes("transient_drying", campaign.source_name, storage_root=storage)) == 4
     assert config_path.read_bytes() == original_config
     assert (config_path.parent / "execution.yaml").read_bytes() == original_execution
@@ -491,7 +509,12 @@ def test_failed_replacement_is_terminalized_and_the_next_replacement_completes_s
     assert _fail_candidate(run_id, "lentil", "case_0001", storage=storage).is_file()
     # One success in three decisions keeps the bound (0.865) at or above 0.8, so the second replacement is still admitted.
     lifecycle.amend_minimum_success_rate(
-        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.8, reason="Synthetic tolerated failures", storage_root=storage
+        "steady_flow",
+        campaign.source_name,
+        primary.material_family,
+        minimum_success_rate=0.8,
+        reason="Synthetic tolerated failures",
+        storage_root=storage,
     )
 
     first = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
@@ -511,7 +534,7 @@ def test_failed_replacement_is_terminalized_and_the_next_replacement_completes_s
         )
 
     second = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
-    design = second.scientific_values["supplemental_design"]
+    design = second.scientific_values["replacement_design"]
     assert (second.case_indices, design["candidate_ordinal"], design["target_slot"], design["parent_failed_case_id"]) == ((4,), 2, 1, "case_0001")
     generation.cases.input_generation.generate_input_cases(second, 1, storage_root=storage)
     successful_source_case(campaign.source_name, second, 4, storage, tmp_path / "work")
@@ -562,7 +585,12 @@ def test_replacement_batch_passes_terminal_validation_under_its_canonical_identi
     )
     successful_source_case(campaign.source_name, primary, 2, storage, tmp_path / "work")
     lifecycle.amend_minimum_success_rate(
-        "steady_flow", campaign.source_name, primary.batch_id, minimum_success_rate=0.9, reason="Synthetic tolerated failure", storage_root=storage
+        "steady_flow",
+        campaign.source_name,
+        primary.material_family,
+        minimum_success_rate=0.9,
+        reason="Synthetic tolerated failure",
+        storage_root=storage,
     )
     replacement = lifecycle.materialize_replacement_batch(campaign, primary.batch_id, storage_root=storage)
     generation.cases.input_generation.generate_input_cases(replacement, 1, storage_root=storage)
@@ -571,7 +599,7 @@ def test_replacement_batch_passes_terminal_validation_under_its_canonical_identi
     manifest_path = generation.runtime.finalize_batch(replacement, storage_root=storage)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["batch_name"] == f"{primary.batch_name}__replacement_0001"
-    assert manifest["batch_storage_name"] == f"source~steady_flow~{campaign.source_name}~lentil~natural_replacement_0001"
+    assert manifest["batch_storage_name"] == f"source~steady_flow~{campaign.source_name}~lentil~test_replacement_0001"
     assert generation.runtime.admit_terminal_batch(replacement.batch_storage_name, storage_root=storage).batch_name == replacement.batch_name
 
     for wrong_name in (primary.batch_name, f"{primary.batch_name}__replacement_0002"):
@@ -625,7 +653,7 @@ class _FeederCampaign:
             step.setenv("FAKE_COMSOL_MODE", comsol_mode)
             if error is not None:
                 step.setattr(campaign_runtime.cluster_service, "run_campaign_case", stopped)
-            with pytest.raises(generation.runtime.CaseExecutionError):
+            with pytest.raises((generation.runtime.CaseExecutionError, license_service.TemporaryLicenseCapacityError)):
                 campaign_runtime.run_campaign_case_job(
                     self.run_id, record["case"]["batch_name"], int(record["case"]["case_index"]), storage_root=self.storage, work_root=self.work
                 )
@@ -652,12 +680,11 @@ def feeder_campaign(
     config_path, _template = generation_config_factory(
         simulation_profile="steady_flow",
         executable=fake_comsol,
-        scheduler_kind="slurm",
         natural_count=2,
         node_jobs=1,
         cores_per_node=2,
         timeout=1.0,  # fake COMSOL's timeout mode outlasts it, so the runtime times the solve out
-        in_allocation_retry_enabled=False,  # its silent startup would otherwise read as license capacity
+        license_retry_enabled=False,  # its silent startup would otherwise read as license capacity
     )
     authored = {**yaml.safe_load(config_path.read_text(encoding="utf-8")), "minimum_success_rate": 0.8}
     campaign = generation.cases.config.load_campaign_config(
@@ -681,7 +708,7 @@ def test_feeder_replaces_failed_original_and_failed_replacement_while_the_bound_
     fed.end_step("case_0003", "FAILED", "1:0")
     after_second = fed.fail("case_0003")
     assert [item["case"]["case_id"] for item in after_second["submissions"]][-1] == "case_0004"
-    assert fed.batch(4).scientific_values["supplemental_design"]["parent_failed_case_id"] == "case_0001"
+    assert fed.batch(4).scientific_values["replacement_design"]["parent_failed_case_id"] == "case_0001"
     pending = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)
     assert {case["case_id"]: case["terminal_decision"] for case in pending["cases"]} == {
         "case_0001": "failed",
@@ -711,9 +738,9 @@ def test_a_lowered_rate_raises_only_a_derived_admission_cap(feeder_campaign: _Fe
     fed.fail("case_0001")
     fed.end_step("case_0003", "FAILED", "1:0")
     fed.fail("case_0003")
-    batch_id = fed.campaign.batches[0].batch_id
+    material = fed.campaign.batches[0].material_family
     lifecycle.amend_minimum_success_rate(
-        "steady_flow", fed.campaign.source_name, batch_id, minimum_success_rate=0.6, reason="Synthetic", storage_root=fed.storage
+        "steady_flow", fed.campaign.source_name, material, minimum_success_rate=0.6, reason="Synthetic", storage_root=fed.storage
     )
     fed.end_step("case_0004", "FAILED", "1:0")
     after = fed.fail("case_0004")  # k/n 1/4 keeps the bound 0.751 at or above 0.6
@@ -808,6 +835,8 @@ def test_the_feeder_decides_stalled_and_timed_out_solves_itself_and_writes_the_c
     assert campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)["state"] == "complete"
     view = common.paths.resolve_generation_campaign_directory("steady_flow", fed.campaign.source_name, storage_root=fed.storage) / "cases.csv"
     written = view.read_bytes()
+    assert sorted(entry.name for entry in view.parent.iterdir()) == ["_record", "cases.csv", "materials"]  # a settled campaign has three entries
+    assert not any(path.name == ".state" for path in view.parent.parent.rglob("*"))
     rows = list(csv.DictReader(written.decode("utf-8").splitlines()))
     assert [(row["case_id"], row["origin"], row["outcome"], row["reason_code"]) for row in rows] == [
         ("case_0001", "original", "failed", "stalled"),
@@ -815,15 +844,37 @@ def test_the_feeder_decides_stalled_and_timed_out_solves_itself_and_writes_the_c
         ("case_0003", "replacement", "failed", "timed_out"),
         ("case_0004", "replacement", "successful", ""),
     ]
-    sampled = json.loads((view.parent / "lentil/case_0003/inputs/case.json").read_text(encoding="utf-8"))["sampled_values"]
-    assert {name: float(rows[2][name]) for name in sampled} == pytest.approx(sampled)
-    assert rows[2]["solver_log"] == "lentil/case_0003/_record/attempts/run_0001/payload/runtime/stdout.log"
+    sampled = json.loads((view.parent / "materials/lentil/case_0003/inputs/case.json").read_text(encoding="utf-8"))["sampled_values"]
+    registry = lifecycle.load_campaign_plan("steady_flow", fed.campaign.source_name, storage_root=fed.storage)["batches"][0]["scientific_values"][
+        "material"
+    ]["parameter_registry"]
+    columns = [name for name, entry in registry.items() if entry["classification"] == "sampled"]
+    header = list(rows[2])
+    assert header == ["material", "case_id", "origin", "outcome", "reason_code", "detail", "duration_s", *columns, "solver_log"]
+    assert not {"T_flow_ref", "p_ref", "p_out", "simulated_end_h", "final_bulk_moisture_wb"} & set(header)
+    assert {name: float(rows[2][name]) for name in columns} == pytest.approx({name: sampled[name] for name in columns})
+    assert rows[2]["solver_log"] == "materials/lentil/case_0003/_record/attempts/run_0001/payload/runtime/stdout.log"
     assert (view.parent / rows[2]["solver_log"]).is_file()
     assert rows[0]["solver_log"] == ""  # the stand-in for the stalled solve left no failure bundle
     assert float(rows[3]["duration_s"]) >= 0
     campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
     assert view.read_bytes() == written
     assert len(fed.world.sbatch_arguments()) == 1  # the automatic decisions never drained the node job before the replacement
+
+
+def test_a_license_capacity_failure_without_protection_is_decided_like_a_solver_error(
+    feeder_campaign: _FeederCampaign, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the licence protection off (the fixture's), capacity is a solver error: decided, counted and replaced automatically."""
+    fed = feeder_campaign
+    fed.run_step(monkeypatch, "case_0001", comsol_mode="license_capacity")
+    campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    decided = fed.decision("case_0001")
+    assert decided is not None
+    assert (decided["outcome"], decided["class"], decided["reason_code"]) == ("failed", "solver", "solver_error")
+    assert "license capacity" in decided["detail"]
+    replaced = campaign_runtime.feed_campaign(fed.run_id, storage_root=fed.storage)
+    assert replaced["submissions"][-1]["case"]["case_id"] == "case_0003"
 
 
 def test_a_validation_failure_is_never_decided_by_the_feeder_and_stops_the_driver_with_fail_case(
@@ -859,6 +910,6 @@ def test_an_automatic_decision_that_stops_the_batch_ends_blocked_and_names_the_w
     assert [(job["draining"], job["stop_ticket_seq"]) for job in blocked["node_jobs"]] == [(True, 5)]
     assert len(blocked["submissions"]) == 4  # nothing was dispatched on the way to blocked
     stop = campaign_runtime.campaign_status(fed.run_id, storage_root=fed.storage)["success_rate_stop"]
-    assert "lentil (natural): k/n 1/4" in stop
+    assert "lentil: k/n 1/4" in stop
     assert "--revision LABEL" in stop
-    assert f"amend-replacements {fed.run_id} --material MATERIAL --regime REGIME --minimum-success-rate S --reason TEXT" in stop
+    assert f"amend-replacements {fed.run_id} --material MATERIAL --minimum-success-rate S --reason TEXT" in stop

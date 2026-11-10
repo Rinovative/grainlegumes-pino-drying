@@ -1,0 +1,480 @@
+# Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
+# Bed, permeability, porosity, inlet-pressure and initial-moisture field statistics: every operator-owned registry coordinate outside the operation block.
+schema_kind: generation_bed_fields
+# Named field coordinates with natural and optional parameter-OOD supports. Nominals and supports use each registry transform (registry.yaml).
+parameter_values:
+  # Coefficient of variation controlling permeability-field spread.
+  kappa_cv:
+    lower: 0.25
+    upper: 0.65
+    ood:
+    - lower: 0.8
+      upper: 1.05
+    nominal: 0.45
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Correlated in effect with perturbation amplitude but acts after structure normalization. The narrow near-zero
+        low tail is rejected because it would not meet the non-marginal tail-width rule.
+  # Relative coarse bed-field correlation length.
+  bed.structure.coarse_len_rel:
+    lower: 0.06
+    upper: 0.16
+    ood:
+    - lower: 0.03
+      upper: 0.045
+    - lower: 0.2
+      upper: 0.28
+    nominal: 0.1
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Partly coupled to coarse weight.
+  bed.structure.fine_len_rel:
+    lower: 0.02
+    upper: 0.07
+    ood:
+    - lower: 0.009
+      upper: 0.014
+    - lower: 0.09
+      upper: 0.13
+    nominal: 0.04
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Partly coupled to perturbation granularity.
+  # Independent coarse contribution; the fine contribution is derived as its complement.
+  bed.structure.coarse_weight:
+    lower: 0.35
+    upper: 0.7
+    ood:
+    - lower: 0.18
+      upper: 0.28
+    - lower: 0.78
+      upper: 0.86
+    nominal: 0.55
+    distribution: uniform_in_logit_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Strongly redundant if fine weight were independently sampled; complement prevents that.
+  bed.structure.fine_ani_x:
+    lower: 0.65
+    upper: 1.55
+    ood:
+    - lower: 0.4
+      upper: 0.55
+    - lower: 1.85
+      upper: 2.4
+    nominal: 1.0
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Together with y multiplier only their ratio controls aspect while product controls area.
+  bed.structure.fine_ani_y:
+    lower: 0.65
+    upper: 1.55
+    ood:
+    - lower: 0.4
+      upper: 0.55
+    - lower: 1.85
+      upper: 2.4
+    nominal: 1.0
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Same scale/aspect coupling as fine_ani_x; candidate for later reparameterization.
+  bed.structure.cross_scale_corr:
+    lower: 0.25
+    upper: 0.7
+    ood:
+    - lower: -0.15
+      upper: 0.1
+    - lower: 0.82
+      upper: 0.95
+    nominal: 0.5
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Low direct scalar sensitivity but visible topology effect.
+  # Amplitude of local bed-only perturbations.
+  bed.perturbations.amplitude:
+    lower: 0.08
+    upper: 0.28
+    ood:
+    - lower: 0.36
+      upper: 0.5
+    nominal: 0.18
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Can resemble high kappa_cv; retain because it changes localization, not only contrast. The narrow near-zero low
+        tail is rejected by the non-marginal tail-width rule.
+  bed.perturbations.granularity:
+    lower: 0.3
+    upper: 0.7
+    ood:
+    - lower: 0.12
+      upper: 0.22
+    - lower: 0.8
+      upper: 0.92
+    nominal: 0.5
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Partly overlaps fine_len_rel.
+  bed.perturbations.sign_bias:
+    lower: 0.35
+    upper: 0.65
+    ood:
+    - lower: 0.15
+      upper: 0.25
+    - lower: 0.75
+      upper: 0.85
+    nominal: 0.5
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: May be visually weak after normalization; sentinel field test required.
+  # Principal-permeability ratio at unit strength: local r = 1 + strength*(max_ratio - 1)*|b|^exponent, |b| <= 1; k1 = kappa*sqrt(r), k2 = kappa/sqrt(r), k1/k2 = r.
+  permeability.anisotropy.max_ratio:
+    lower: 1.2
+    upper: 2.2
+    ood:
+    - lower: 2.6
+      upper: 3.2
+    nominal: 1.6
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: literature_transfer
+      source_refs:
+      - lentil_airflow_resistance_sokhansanj
+      - corn_airflow_anisotropy_kay
+      - grain_bed_anisotropy_khatchatourian
+      note: Measured directional airflow resistance of lentil beds (horizontal about half of vertical, ratio about 2) and shelled corn (horizontal 45-58 % of vertical, ratio about 1.7-2.2); the anisotropy grows as grains become less spherical; the cited evidence gives no directional ratios for chickpea or kidney bean, so the range is transferred across the legume materials; the OOD band exceeds the measured ratios; interacts with strength and exponent.
+  # Exponent mapping bed structure magnitude to permeability anisotropy.
+  permeability.anisotropy.exponent:
+    lower: 0.8
+    upper: 2.5
+    ood:
+    - lower: 3.2
+      upper: 4.0
+    nominal: 1.5
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Interacts with max ratio and strength; the low tail is rejected because it is too narrow relative to the ID support.
+  # Strength of the permeability anisotropy mapping.
+  permeability.anisotropy.strength:
+    lower: 0.4
+    upper: 1.0
+    ood:
+    - lower: 0.1
+      upper: 0.25
+    nominal: 0.7
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: High interaction with max ratio; values above one rejected as outside VP1 formula semantics.
+  # Small orientation perturbation used before spatial smoothing.
+  permeability.orientation.jitter:
+    lower: 0.005
+    upper: 0.02
+    ood:
+    - lower: 0.03
+      upper: 0.05
+    nominal: 0.012
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Can be visually weak after orientation smoothing; the near-zero low tail is rejected by the tail-width rule.
+  # Relative spatial smoothing length for the permeability orientation field.
+  permeability.orientation.smooth_len_rel:
+    lower: 0.04
+    upper: 0.16
+    ood:
+    - lower: 0.015
+      upper: 0.025
+    - lower: 0.22
+      upper: 0.32
+    nominal: 0.08
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Interacts with coarse/fine field scales.
+  # Relative spatial smoothing length for porosity texture.
+  porosity.smooth_len_rel:
+    lower: 0.03
+    upper: 0.09
+    ood:
+    - lower: 0.12
+      upper: 0.18
+    nominal: 0.055
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Partly shares bed backbone but preserves distinct texture; the short low tail is rejected by the non-marginal
+        tail-width rule.
+  # Amplitude of local porosity texture around the generated bed field.
+  porosity.texture_amp:
+    lower: 0.003
+    upper: 0.015
+    ood:
+    - lower: 0.02
+      upper: 0.03
+    nominal: 0.008
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Low amplitude may be invisible; require RMS and clipping diagnostics. Only the clearly visible high tail is retained.
+  # Base inlet-pressure level (inlet profile = this value * (1 + shape)); its unit and transform are declared by the parameter registry.
+  pressure_bc.mean:
+    lower: 250.0
+    upper: 750.0
+    ood:
+    - lower: 900.0
+      upper: 1200.0
+    nominal: 500.0
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Not redundant; strongest VP1 scalar association. The low-pressure tail is rejected because its stable support
+        would be narrow relative to ID.
+  # Amplitude of the sinusoidal inlet-pressure component; sin_freq and sin_phase define its shape.
+  pressure_bc.sin_amp:
+    lower: -0.02
+    upper: 0.02
+    ood:
+    - lower: -0.05
+      upper: -0.03
+    - lower: 0.03
+      upper: 0.05
+    nominal: 0.0
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Can overlap Gaussian and linear shapes; field-level orthogonality monitor recommended.
+  pressure_bc.sin_freq:
+    lower: 0.5
+    upper: 1.5
+    ood:
+    - lower: 2.0
+      upper: 3.0
+    nominal: 1.0
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Low when sinusoidal amplitude is near zero; conditional sensitivity. The short low-frequency tail is rejected
+        by the tail-width rule.
+  pressure_bc.sin_phase:
+    lower: 0.0
+    upper: 6.283185307179586
+    nominal: 3.141592653589793
+    distribution: circular_uniform_on_[0,2*pi)
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: No disjoint physical tail exists on a complete circle.
+  # Number of Gaussian inlet-pressure features; amplitude, width, and jitter control their shape.
+  pressure_bc.gauss_count:
+    lower: 1
+    upper: 5
+    ood:
+    - lower: 7.0
+      upper: 9.0
+    nominal: 3
+    distribution: discrete_uniform_inclusive
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Interacts with Gaussian width/amplitude.
+  pressure_bc.gauss_amp:
+    lower: -0.06
+    upper: 0.06
+    ood:
+    - lower: -0.14
+      upper: -0.09
+    - lower: 0.09
+      upper: 0.14
+    nominal: 0.0
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Interacts with count and width.
+  pressure_bc.gauss_width:
+    lower: 0.02
+    upper: 0.1
+    ood:
+    - lower: 0.008
+      upper: 0.014
+    - lower: 0.14
+      upper: 0.22
+    nominal: 0.05
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Count-width interaction; below-grid supports rejected.
+  pressure_bc.gauss_jitter:
+    lower: 0.1
+    upper: 0.5
+    ood:
+    - lower: 0.65
+      upper: 0.85
+    nominal: 0.3
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Potentially weak after component aggregation; the narrow near-zero tail is rejected.
+  # Amplitude of the linear inlet-pressure trend along x on the inlet edge.
+  pressure_bc.linear_amp:
+    lower: -0.03
+    upper: 0.03
+    ood:
+    - lower: -0.08
+      upper: -0.05
+    - lower: 0.05
+      upper: 0.08
+    nominal: 0.0
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: project_baseline
+      source_refs:
+      - pino_airflow_project
+      note: Distinct first-order mode but can correlate with broad Gaussian terms.
+  # Relative coarse correlation length of the initial-moisture field.
+  initial_moisture.structure.coarse_len_rel:
+    lower: 0.08
+    upper: 0.24
+    ood:
+    - lower: 0.035
+      upper: 0.055
+    - lower: 0.3
+      upper: 0.42
+    nominal: 0.14
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Interacts with coarse weight.
+  initial_moisture.structure.fine_len_rel:
+    lower: 0.025
+    upper: 0.08
+    ood:
+    - lower: 0.01
+      upper: 0.016
+    - lower: 0.11
+      upper: 0.16
+    nominal: 0.045
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Field can be diffusion-smoothed rapidly; pilot sensitivity needed.
+  # Independent coarse contribution to initial-moisture structure; the fine contribution is complementary.
+  initial_moisture.structure.coarse_weight:
+    lower: 0.4
+    upper: 0.75
+    ood:
+    - lower: 0.2
+      upper: 0.3
+    - lower: 0.82
+      upper: 0.9
+    nominal: 0.58
+    distribution: uniform_in_logit_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Complement removes exact redundancy.
+  initial_moisture.structure.fine_ani_x:
+    lower: 0.7
+    upper: 1.4
+    ood:
+    - lower: 0.4
+      upper: 0.55
+    - lower: 1.75
+      upper: 2.2
+    nominal: 1.0
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Area/aspect coupling with y multiplier.
+  initial_moisture.structure.fine_ani_y:
+    lower: 0.7
+    upper: 1.4
+    ood:
+    - lower: 0.4
+      upper: 0.55
+    - lower: 1.75
+      upper: 2.2
+    nominal: 1.0
+    distribution: uniform_in_log_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: Area/aspect coupling with x multiplier.
+  initial_moisture.structure.cross_scale_corr:
+    lower: 0.25
+    upper: 0.7
+    ood:
+    - lower: -0.15
+      upper: 0.1
+    - lower: 0.82
+      upper: 0.95
+    nominal: 0.5
+    distribution: uniform_in_registry_transform_space
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+      note: May have weak scalar output effect but affects topology.

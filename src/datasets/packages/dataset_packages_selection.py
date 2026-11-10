@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING, Any, Final
 
 from src import common
 from src.datasets.contracts import dataset_contracts_views as views
+from src.generation.contracts.generation_contracts_vocabulary import DESIGN_KINDS
 from src.generation.publication import generation_publication_catalog as catalog
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 SELECTION_SCHEMA_KIND: Final = "dataset_selection_request"
-SELECTION_SCHEMA_VERSION: Final = 1
 SOURCE_REFERENCE_ORDER: Final = (
     "campaign_name",
     "campaign_digest",
@@ -48,7 +48,6 @@ _SINGLE_SOURCE_MESSAGE: Final = (
 _REQUEST_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "source_task",
         "dataset_name",
         "dataset_view",
@@ -123,32 +122,33 @@ def select_exact_cases(
 def select_ordered_cases(
     task: str,
     source_names: Sequence[str],
-    target_counts: Mapping[str, int],
+    target_counts: Mapping[str, Mapping[str, int]],
     *,
     storage_root: Path | str | None = None,
 ) -> tuple[dict[str, str], ...]:
-    """Take each material's first successful cases in design order and retain exact references.
+    """Take each material's first successful cases of each design kind in design order and retain exact references.
 
-    Design order lists the original cases by case index, then the Sobol replacements by
-    candidate ordinal, which is the order Generation selects its own success targets in. That order
+    Design order lists a design's original points by point index, then its replacements (the next points of the
+    same design) by candidate position, which is the order Generation selects its own success targets in. That order
     is defined within one Source only, so exactly one Source is admitted; ``exact`` selection covers
-    several. Generation reserves a replacement only while its success target exceeds the successful
-    and pending candidates, so a Source never holds more successes of a material than its target,
+    several. Generation reserves a replacement only while a design's success target exceeds its successful
+    and pending candidates, so a Source never holds more successes of a design than its target,
     which equals the requested count in a Dataset plan. The first ``count`` successes are then the
-    whole pool; a smaller pool raises ``ValueError``.
+    whole pool; a smaller pool raises ``ValueError``. The result lists materials in request order and, within
+    each, the design kinds in request order.
     """
     names = tuple(source_names)
     if len(names) != 1:
         raise ValueError(_SINGLE_SOURCE_MESSAGE)
-    if not target_counts or any(isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in target_counts.values()):
-        msg = "Ordered Dataset selection requires positive material target counts."
-        raise ValueError(msg)
-    pools: dict[str, list[tuple[tuple[bool, int, str, str], dict[str, str]]]] = {material: [] for material in target_counts}
+    pools: dict[tuple[str, str], list[tuple[tuple[bool, int, str, str], dict[str, str]]]] = {
+        (material, kind): [] for material, kinds in target_counts.items() for kind in kinds
+    }
     physical_seen: set[str] = set()
     for name in names:
         common.paths.validate_logical_name(name, label="source campaign")
         for row in catalog.list_campaign_cases(task, name, storage_root=storage_root):
-            if row["outcome"] != "successful" or row["material_family"] not in pools:
+            key = (row["material_family"], row["sampling_regime"])
+            if row["outcome"] != "successful" or key not in pools:
                 continue
             reference = _reference_from_row(row)
             if reference["case_input_id"] in physical_seen:
@@ -156,13 +156,14 @@ def select_ordered_cases(
                 raise ValueError(msg)
             physical_seen.add(reference["case_input_id"])
             order = (row["origin"] != "primary", int(row["candidate_position"]), reference["campaign_name"], reference["case_id"])
-            pools[reference["material_family"]].append((order, reference))
+            pools[key].append((order, reference))
     selected: list[dict[str, str]] = []
-    for material, count in target_counts.items():
-        if len(pools[material]) < count:
-            msg = f"Ordered Dataset selection lacks {count} successful {material} cases."
+    for (material, kind), pool in pools.items():
+        count = target_counts[material][kind]
+        if len(pool) < count:
+            msg = f"Ordered Dataset selection lacks {count} successful {material} {kind} cases."
             raise ValueError(msg)
-        selected.extend(reference for _order, reference in sorted(pools[material], key=lambda entry: entry[0])[:count])
+        selected.extend(reference for _order, reference in sorted(pool, key=lambda entry: entry[0])[:count])
     return tuple(selected)
 
 
@@ -172,7 +173,7 @@ def validate_selection_request(value: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(value, Mapping) or set(value) != expected_keys:
         msg = "Dataset selection request keys do not match the current schema."
         raise ValueError(msg)
-    if value["schema_kind"] != SELECTION_SCHEMA_KIND or not common.serialization.is_schema_version(value["schema_version"], SELECTION_SCHEMA_VERSION):
+    if value["schema_kind"] != SELECTION_SCHEMA_KIND:
         msg = "Dataset selection request uses an unsupported contract."
         raise ValueError(msg)
     task = common.paths.validate_logical_name(value["source_task"], label="source_task")
@@ -218,7 +219,6 @@ def validate_selection_request(value: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(msg)
     return {
         "schema_kind": SELECTION_SCHEMA_KIND,
-        "schema_version": value["schema_version"],
         "source_task": task,
         "dataset_name": dataset_name,
         "dataset_view": view,
@@ -227,8 +227,8 @@ def validate_selection_request(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _ordered_request_inputs(method: Mapping[str, Any]) -> tuple[list[str], Mapping[str, int]]:
-    """Admit the declared ordered source pool and target counts."""
+def _ordered_request_inputs(method: Mapping[str, Any]) -> tuple[list[str], Mapping[str, Mapping[str, int]]]:
+    """Admit the declared ordered source pool and the target counts per material and design kind."""
     if set(method) != {"kind", "source_names", "target_counts"} or method.get("kind") != "design_order":
         msg = "Design-order Dataset selection method evidence is invalid."
         raise ValueError(msg)
@@ -244,10 +244,15 @@ def _ordered_request_inputs(method: Mapping[str, Any]) -> tuple[list[str], Mappi
     if not isinstance(counts, Mapping) or not counts or any(not isinstance(material, str) for material in counts):
         msg = "Design-order material counts must be a non-empty mapping."
         raise ValueError(msg)
-    for material, count in counts.items():
+    for material, kinds in counts.items():
         common.paths.validate_logical_name(material, label="source material")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-            msg = "Design-order material target counts must be positive integers."
+        if (
+            not isinstance(kinds, Mapping)
+            or not kinds
+            or set(kinds) - set(DESIGN_KINDS)
+            or any(isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in kinds.values())
+        ):
+            msg = f"Design-order target counts of {material!r} must map design kinds {list(DESIGN_KINDS)} to positive integers."
             raise ValueError(msg)
     return names, counts
 

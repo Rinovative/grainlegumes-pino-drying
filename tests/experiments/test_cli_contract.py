@@ -27,7 +27,7 @@ from src import analysis, common, experiments, learning
 from src.experiments.cli import cli_build_artifacts, cli_config_preflight, cli_optuna, cli_train
 
 _CLI_USAGE_ERROR = 2
-_NO_ARTIFACTS = SimpleNamespace(id_artifact=None, additional_artifact=None)
+_NO_ARTIFACTS = SimpleNamespace(role_artifacts=dict)
 
 
 def test_public_cli_rejects_one_unknown_option() -> None:
@@ -119,7 +119,7 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
         assert selected is run_dir
         post_training_call.update(kwargs)
         events.append("artifacts prepared")
-        return SimpleNamespace(role_actions={"id": "reused", "additional_evaluation": "generated"}, loaded_run=_NO_ARTIFACTS)
+        return SimpleNamespace(role_actions={"id": "reused", "material_ood": "generated"}, loaded_run=_NO_ARTIFACTS)
 
     def capture_build(**kwargs: object) -> dict[str, object]:
         artifact_cli_call.update(kwargs)
@@ -239,7 +239,7 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
                 "--case-id",
                 "case-c",
                 "--split",
-                "additional_evaluation",
+                "material_ood",
                 "--output-root",
                 str(output_root),
                 "--device",
@@ -254,7 +254,7 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
         "run_dir": run_dir,
         "dataset_root": tmp_path / "datasets",
         "output_root": output_root,
-        "split": "additional_evaluation",
+        "split": "material_ood",
         "case_ids": ["case-a", "case-c"],
         "one_case": False,
         "device_policy": "cuda",
@@ -467,7 +467,7 @@ def _prepared_with_validity(valid: int, total: int) -> SimpleNamespace:
     """Return prepared artifacts whose only role carries ``valid`` of ``total`` valid predictions."""
     evidence = {"status_counts": {"VALID": valid}, "case_count": total}
     artifact = SimpleNamespace(frame=SimpleNamespace(attrs={"artifact_provenance": {"evaluation": {"prediction_validity": evidence}}}))
-    return SimpleNamespace(role_actions={"id": "generated"}, loaded_run=SimpleNamespace(id_artifact=artifact, additional_artifact=None))
+    return SimpleNamespace(role_actions={"id": "generated"}, loaded_run=SimpleNamespace(role_artifacts=lambda: {"id": artifact}))
 
 
 @pytest.mark.parametrize(("valid", "status"), [(0, "completed with invalid predictions (valid 0 of 2)"), (2, "generated")])
@@ -653,7 +653,7 @@ def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
     assert plan["storage"] == f"sqlite:///{study_dir / f'{study_name}.db'}"
     assert plan["study"]["role"] is None
     assert plan["dataset_roles"]["train"]["dataset_id"] == "synthetic_train_override"
-    assert plan["dataset_roles"]["additional_evaluation"][0]["dataset_id"] == "synthetic_ood"
+    assert plan["dataset_roles"]["material_ood"][0]["dataset_id"] == "synthetic_ood"
     assert described == ["synthetic_train_override", "synthetic_ood"]
     assert "semantic_signature" in plan
     assert not output_root.exists()

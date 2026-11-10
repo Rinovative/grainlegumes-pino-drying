@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import itertools
 import json
+import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -217,8 +219,6 @@ def _steady_artifact(
     ]
     root = tmp_path / "steady"
     provenance = {
-        "provenance_schema_version": analysis.artifacts.contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": analysis.artifacts.contracts.ARTIFACT_SCHEMA_VERSION,
         "run": {"name": "steady", "task": task.id},
         "model": {"parameter_counts": {"total": 1, "trainable": 1}},
         "split_role": "eval",
@@ -244,7 +244,6 @@ def _steady_artifact(
         processor=_IdentityProcessor(task),
         device=torch.device("cpu"),
         save_root=root,
-        dataset_name="steady",
         provenance=provenance,
         case_ids=list(case_ids if call_case_ids is None else call_case_ids),
     )
@@ -394,7 +393,6 @@ def test_non_steady_task_is_rejected_by_artifact_generation(tmp_path: Path, synt
             processor=_IdentityProcessor(synthetic_task),
             device=torch.device("cpu"),
             save_root=tmp_path / "target",
-            dataset_name="synthetic_train",
             provenance={},
             case_ids=[],
         )
@@ -447,7 +445,7 @@ def test_steady_artifact_publishes_a_nonfinite_case_with_counts_instead_of_value
     evidence = stored["evaluation"]["prediction_validity"]
     assert evidence["status_counts"] == {"VALID": 1, "FINITE_BUT_PHYSICALLY_INVALID": 0, "NONFINITE": 1}
 
-    analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids), dataset_name="steady")
+    analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids))
     loaded = analysis.evaluation.artifact_loader._read_artifact_root(root)
     assert loaded.attrs[analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_ID] == aggregate
 
@@ -475,15 +473,16 @@ def test_steady_payload_contradicting_its_validity_document_is_refused_on_write_
         arrays["pred"][position] = value
         np.savez_compressed(path, **arrays)
         with pytest.raises(analysis.artifacts.service.ArtifactCacheError, match=message):
-            analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids), dataset_name="steady")
-        # Cache hits and reads admit published bytes through the same output-manifest digests.
-        with pytest.raises(ValueError, match="output manifest does not match"):
-            analysis.evaluation.artifact_loader._read_artifact_root(root)
+            analysis.artifacts.service._validate_staged_case_payloads(root, request=_staged_request(provenance, case_ids))
+        # A read admits the structure only; the changed payload is refused by its digest when its case opens.
+        frame = analysis.evaluation.artifact_loader._read_artifact_root(root)
+        with pytest.raises(ValueError, match="Steady case payload digest changed"):
+            analysis.evaluation.case.load_case(frame, position[0])
         path.write_bytes(original)
 
     provenance_path = analysis.artifacts.contracts.artifact_provenance_path(root)
     stored = json.loads(provenance_path.read_text(encoding="utf-8"))
-    parquet_path = root / "steady.parquet"
+    parquet_path = root / "artifacts.parquet"
     table = pd.read_parquet(parquet_path)
     table.loc[1, "prediction_validity"] = table.loc[0, "prediction_validity"]
     table.to_parquet(parquet_path, index=False)
@@ -491,6 +490,133 @@ def test_steady_payload_contradicting_its_validity_document_is_refused_on_write_
     common.serialization.atomic_write_json(provenance_path, stored)
     with pytest.raises(ValueError, match="valid predictions"):
         analysis.evaluation.artifact_loader._read_artifact_root(root)
+
+
+def test_steady_load_checks_structure_only_and_each_payload_digest_when_its_case_opens(tmp_path: Path) -> None:
+    """A never-opened changed payload does not block the load; structure and Parquet changes do."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    _frame, root, _provenance = _steady_artifact(tmp_path, _SteadyProjection(task), case_ids=(_CASE_ID, _OTHER_CASE_ID))
+    loader = analysis.evaluation.artifact_loader
+    untouched = root / "npz" / f"{_OTHER_CASE_ID}.npz"
+    original = untouched.read_bytes()
+    untouched.write_bytes(original + b"changed")
+    frame = loader._read_artifact_root(root)
+    analysis.evaluation.case.load_case(frame, 0)
+    with pytest.raises(ValueError, match="Steady case payload digest changed"):
+        analysis.evaluation.case.load_case(frame, 1)
+    untouched.write_bytes(original)
+
+    extra = root / "npz" / "extra.npz"
+    extra.write_bytes(original)
+    with pytest.raises(ValueError, match="output manifest does not match"):
+        loader._read_artifact_root(root)
+    extra.unlink()
+
+    moved = untouched.with_name("renamed.npz")
+    untouched.rename(moved)
+    with pytest.raises(ValueError, match="output manifest does not match"):
+        loader._read_artifact_root(root)
+    moved.rename(untouched)
+
+    moved = root / "renamed.npz"  # outside npz/, so only the symlink itself can trigger the rejection
+    untouched.rename(moved)
+    untouched.symlink_to(moved)
+    with pytest.raises(ValueError, match="output manifest does not match"):
+        loader._read_artifact_root(root)
+    untouched.unlink()
+    moved.rename(untouched)
+
+    parquet = root / "artifacts.parquet"
+    parquet_bytes = parquet.read_bytes()
+    parquet.write_bytes(parquet_bytes + b"changed")
+    with pytest.raises(ValueError, match="output manifest does not match"):
+        loader._read_artifact_root(root)
+    parquet.write_bytes(parquet_bytes)
+    loader._read_artifact_root(root)
+
+
+def test_steady_case_replaced_after_its_digest_check_is_not_parsed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The digest is taken on the handle the case is parsed from, so a path swapped before the parse changes nothing."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    _frame, root, _provenance = _steady_artifact(tmp_path, _SteadyProjection(task), case_ids=(_CASE_ID, _OTHER_CASE_ID))
+    frame = analysis.evaluation.artifact_loader._read_artifact_root(root)
+    baseline = analysis.evaluation.case.load_case(frame, 0)
+    path = root / "npz" / f"{_CASE_ID}.npz"
+    with np.load(path, allow_pickle=False) as payload:
+        arrays = {name: payload[name] for name in payload.files}
+    arrays["source_index"] = arrays["source_index"] + 100
+    sibling = root / "replacement.tmp"
+    with sibling.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+    original_load = np.load
+
+    def replacing_load(*args: Any, **kwargs: Any) -> Any:
+        sibling.replace(path)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(np, "load", replacing_load)
+    assert analysis.evaluation.case.load_case(frame, 0).source_index == baseline.source_index
+
+
+def test_steady_case_changed_in_place_while_it_is_read_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An in-place change of the verified file during the parse is refused instead of returned as verified data."""
+    task = domain.tasks.steady_flow.STEADY_FLOW
+    _frame, root, _provenance = _steady_artifact(tmp_path, _SteadyProjection(task), case_ids=(_CASE_ID,))
+    frame = analysis.evaluation.artifact_loader._read_artifact_root(root)
+    path = root / "npz" / f"{_CASE_ID}.npz"
+    original_load = np.load
+
+    def appending_load(*args: Any, **kwargs: Any) -> Any:
+        loaded = original_load(*args, **kwargs)
+        with path.open("ab") as appended:
+            appended.write(b"\0")
+        return loaded
+
+    monkeypatch.setattr(np, "load", appending_load)
+    with pytest.raises(ValueError, match="changed while it was read"):
+        analysis.evaluation.case.load_case(frame, 0)
+
+
+def test_cached_digest_is_not_reused_for_the_same_inode_on_another_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file that differs from the cached one only in its device is hashed again, not served from the cache."""
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"current")
+    common.serialization.cached_file_sha256(path)
+    hashed: list[str] = []
+    original_sha256 = common.serialization._stream_sha256
+    real_fstat = os.fstat
+
+    def counted_sha256(stream: Any) -> str:
+        hashed.append(stream.name)
+        return original_sha256(stream)
+
+    def other_device(descriptor: int) -> Any:
+        status = real_fstat(descriptor)
+        return SimpleNamespace(st_dev=status.st_dev + 1, st_ino=status.st_ino, st_size=status.st_size, st_mtime_ns=status.st_mtime_ns)
+
+    monkeypatch.setattr(common.serialization, "_stream_sha256", counted_sha256)
+    monkeypatch.setattr(common.serialization.os, "fstat", other_device)
+    common.serialization.cached_file_sha256(path)
+    assert hashed == [str(path)]
+
+
+def test_cached_digest_and_its_identity_come_from_one_open_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path swapped between taking the identity and hashing never caches the new bytes' digest under the old identity."""
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"first")
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"second")
+    original_sha256 = common.serialization.file_sha256
+
+    def swapping_sha256(target: Path | str) -> str:
+        # A second open by path is where the swap could slip in between identity and digest.
+        replacement.replace(path)
+        return original_sha256(target)
+
+    monkeypatch.setattr(common.serialization, "file_sha256", swapping_sha256)
+    first_digest = original_sha256(path)
+    assert common.serialization.cached_file_sha256(path) == first_digest
+    assert common.serialization._FILE_DIGESTS[str(path)][1] == first_digest
 
 
 def test_physical_cross_permeability_is_reconstructed_from_its_ratio() -> None:
@@ -568,7 +694,6 @@ def test_synthetic_task_flows_through_final_dataset_contract(
         sample_ids=("case_0000",),
         source_selection_identity={
             "schema_kind": "dataset_source_selection",
-            "schema_version": 1,
             "source_cases": [source_case],
         },
         source_identities=(source_identity,),
@@ -624,7 +749,7 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
             run_name="same-scientific-name",
             task="steady_flow",
             id_role=_role_plan(("case",)),
-            additional_role=None,
+            ood_roles={},
         ),
     )
     monkeypatch.setattr(service, "run_or_load_artifacts", lambda **kwargs: pd.DataFrame({"run": [str(kwargs["run_dir"])]}))
@@ -642,29 +767,37 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
 @pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
 @pytest.mark.parametrize("part_count", [0, 2])
 def test_artifact_plan_projects_the_admitted_split_of_either_task(tmp_path: Path, task: str, part_count: int) -> None:
-    """Plan the ID role and one additional role over all split parts in split order, or none without parts."""
+    """Plan the ID role and each OOD role over its split parts in split order, and no role for an empty part."""
     parts = (("ood_b", ("pea__case_0002__00000000000b",)), ("ood_a", ("chickpea__case_0001__00000000000a",)))[:part_count]
-    split = synthetic_split_payload(task, additional=parts)
+    parameter = ("lentil__case_0009__000000000009",)[: min(part_count, 1)]
+    split = synthetic_split_payload(task, material_ood=parts, parameter_ood=parameter)
     completed = {"config": {"task": task, "run": {"name": "scientific-run"}, "data": {"train_dataset": "train_data"}}, "split_indices": split}
     plan = analysis.artifacts.plan.artifact_plan_from_completed(completed, run_dir=tmp_path)
     assert plan.id_role.source_dataset_ids == ("train_data",)
     assert plan.id_role.case_ids == tuple(split["roles"]["id_test"]["case_ids"])
     if not part_count:
-        assert plan.additional_role is None
-        with pytest.raises(FileNotFoundError, match="no saved additional Evaluation"):
-            plan.role("additional_evaluation")
+        assert dict(plan.ood_roles) == {}
+        assert plan.dataset_roles == ("id",)
+        for split_name in ("material_ood", "parameter_ood"):
+            with pytest.raises(FileNotFoundError, match=f"no saved {split_name} artifact role"):
+                plan.role(split_name)
         return
-    role = plan.role("additional_evaluation")
+    assert plan.dataset_roles == ("id", "material_ood", "parameter_ood")
+    role = plan.role("material_ood")
     assert role.source_dataset_ids == ("ood_b", "ood_a")
     assert role.case_source_dataset_ids == ("ood_b", "ood_a")
     assert role.dataset_name == datasets.contracts.identity.combined_dataset_id(("ood_b", "ood_a"))
     assert [item["dataset_id"] for item in role.evaluation_assignments] == ["ood_b", "ood_a"]
+    parameter_role = plan.role("parameter_ood")
+    assert parameter_role.source_dataset_ids == ("train_data",)
+    assert parameter_role.case_ids == parameter
+    assert parameter_role.root(tmp_path) == tmp_path / "analysis" / "parameter_ood" / "train_data"
 
 
-def test_artifact_plan_refuses_additional_parts_sharing_a_case_id(tmp_path: Path) -> None:
-    """Prevent additional Evaluation parts from colliding in case payload and timing identities."""
+def test_artifact_plan_refuses_material_ood_parts_sharing_a_case_id(tmp_path: Path) -> None:
+    """Prevent material-OOD parts from colliding in case payload and timing identities."""
     shared = ("chickpea__case_0001__00000000000a",)
-    split = synthetic_split_payload("steady_flow", additional=(("ood_a", shared), ("ood_b", shared)))
+    split = synthetic_split_payload("steady_flow", material_ood=(("ood_a", shared), ("ood_b", shared)))
     completed = {"config": {"task": "steady_flow", "run": {"name": "run"}, "data": {"train_dataset": "train_data"}}, "split_indices": split}
     with pytest.raises(ValueError, match="share package case IDs"):
         analysis.artifacts.plan.artifact_plan_from_completed(completed, run_dir=tmp_path)

@@ -25,6 +25,7 @@ from support import configs, optuna_trials
 from support.synthetic_task import synthetic_split_payload
 
 from src import experiments
+from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 
 tracking = experiments.tracking
 
@@ -157,7 +158,7 @@ def _current_transient_config(*, mode: str = "online") -> dict[str, Any]:
     ood_id = "synthetic_transient_evaluation"
     raw = configs.transient_matched_config()
     raw["data"]["train_dataset"] = train_id
-    raw["data"]["additional_evaluation_datasets"] = [ood_id]
+    raw["data"]["material_ood_datasets"] = [ood_id]
     raw["tracking"]["wandb"]["mode"] = mode
     plan = configs.resolve_plan(raw)
     config = copy.deepcopy(dict(plan.a0))
@@ -199,6 +200,7 @@ def test_disabled_tracking_has_no_sdk_or_filesystem_side_effects(
         config,
         run_dir=tmp_path,
         state_updater=update,
+        ood_roles=(),
     )
     session.log_epoch(1, {"train/loss_total": 2.0})
     session.log_evaluation_summary(
@@ -225,19 +227,20 @@ def test_offline_evaluation_summary_is_bounded_flat_and_persisted(
         _resolved_config(mode="offline"),
         run_dir=tmp_path,
         state_updater=update,
+        ood_roles=(),
     )
     metric_prefix = "evaluation/0/id/autonomous_full/full/cumulative"
-    additional_prefix = "evaluation/0/additional_evaluation/autonomous_full/full/cumulative"
+    additional_prefix = "evaluation/0/material_ood/autonomous_full/full/cumulative"
     evidence = {
         f"{metric_prefix}/normalized_drying_group_macro_rmse": 0.25,
         f"{metric_prefix}/contributing_case_count": 3,
         f"{additional_prefix}/normalized_drying_group_macro_rmse": 0.4,
         "evaluation/pipeline/0/c_available": 0,
         "evaluation/identity/checkpoint_sha256": "a" * 64,
-        "evaluation/identity/dataset/additional_evaluation/name": "independent_diagnostic",
-        "evaluation/identity/input_profile": "canonical_physics_complete_v1",
+        "evaluation/identity/dataset/material_ood/name": "independent_diagnostic",
+        "evaluation/identity/input_profile": "canonical_physics_complete",
         "evaluation/id/normalized_group_macro_rmse": 0.3,
-        "evaluation/additional_evaluation/nonfinite_value_count": 2,
+        "evaluation/material_ood/nonfinite_value_count": 2,
         "evaluation/timing/component/batch_amortized_neural_operator_forward_seconds/median_seconds": 0.01,
     }
     session.log_evaluation_summary(evidence)
@@ -276,6 +279,30 @@ def test_offline_evaluation_summary_is_bounded_flat_and_persisted(
         )
 
 
+def test_unavailable_transient_summary_uploads_its_support_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admit the four support counts an unavailable transient metric publishes in place of its errors, as counts only."""
+    fake = _FakeWandb()
+    _patch_wandb(monkeypatch, fake)
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path, ood_roles=())
+    prefix = "evaluation/0/id/teacher_forced_one_step/1/endpoint"
+    counts = {f"{prefix}/{name}": value for name, value in (("required_value_count", 8), ("computed_value_count", 8), ("finite_value_count", 5))}
+    counts[f"{prefix}/nonfinite_value_count"] = 3
+
+    session.log_evaluation_summary(counts)
+
+    assert {key: value for key, value in fake.runs[0].summary.items() if key.startswith("evaluation/")} == counts
+    with pytest.raises(tracking.TrackingError, match="non-negative integer"):
+        session.log_evaluation_summary({f"{prefix}/required_value_count": 0.5})
+
+
+def test_support_count_vocabulary_matches_the_validity_contract() -> None:
+    """Keep the tracking literal (no import of the analysis package) equal to the names the evaluation publishes."""
+    assert set(tracking._SUPPORT_COUNT_METRICS) == set(validity_contract.SUPPORT_COUNT_FIELDS)
+
+
 _RMSE_KEY = "evaluation/0/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse"
 _NONFINITE_KEY = "evaluation/id/nonfinite_value_count"
 
@@ -300,7 +327,7 @@ def test_evaluation_summary_replacement_removes_only_stale_tracker_keys(
     _patch_wandb(monkeypatch, fake)
     state, update = _state_recorder()
     config = _resolved_config()
-    first = tracking.initialize_wandb(config, run_dir=tmp_path, state_updater=update)
+    first = tracking.initialize_wandb(config, run_dir=tmp_path, state_updater=update, ood_roles=())
     first.log_evaluation_summary({_RMSE_KEY: 0.25, _NONFINITE_KEY: 0})
     first.log_evaluation_summary({_NONFINITE_KEY: 3})
     summary = fake.runs[0].summary
@@ -321,6 +348,7 @@ def test_evaluation_summary_replacement_removes_only_stale_tracker_keys(
             resume=True,
             persisted_run_id=first.run_id,
             previous_evaluation_summary_keys=keys,
+            ood_roles=(),
         )
         fake.runs[-1].summary.update(summary)
         resumed.log_evaluation_summary({_NONFINITE_KEY: 5})
@@ -335,7 +363,7 @@ def test_evaluation_summary_replacement_needs_summary_key_removal(
     """Fail closed when stale tracker keys exist but the run summary cannot remove keys."""
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path)
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path, ood_roles=())
     monkeypatch.setattr(fake.runs[0], "summary", _SummaryWithoutRemoval())
     session.log_evaluation_summary({_RMSE_KEY: 0.25, _NONFINITE_KEY: 0})
     session.log_evaluation_summary({_RMSE_KEY: 0.5, _NONFINITE_KEY: 1})
@@ -357,6 +385,7 @@ def test_online_authentication_is_checked_before_sdk_import(
             _resolved_config(),
             run_dir=tmp_path,
             state_updater=update,
+            ood_roles=(),
         )
     assert fake.initializations == []
     assert state["status"] == "failed_before_start"
@@ -377,14 +406,16 @@ def test_fresh_runs_are_isolated_and_resume_reuses_persisted_identity(
         config,
         run_dir=tmp_path / "first",
         state_updater=first_update,
+        ood_roles=(),
     )
-    second = tracking.initialize_wandb(config, run_dir=tmp_path / "second")
+    second = tracking.initialize_wandb(config, run_dir=tmp_path / "second", ood_roles=())
     resumed = tracking.initialize_wandb(
         config,
         run_dir=tmp_path / "first",
         resume=True,
         persisted_run_id=first.run_id,
         previous_last_logged_epoch=2,
+        ood_roles=(),
     )
     assert first.run_id != second.run_id
     assert resumed.run_id == first.run_id == first_state["wandb_run_id"]
@@ -404,7 +435,7 @@ def test_resume_from_an_older_last_keeps_the_first_attempt_history_of_retrained_
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config()
-    first = tracking.initialize_wandb(config, run_dir=tmp_path)
+    first = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
     state, update = _state_recorder()
     resumed = tracking.initialize_wandb(
         config,
@@ -413,6 +444,7 @@ def test_resume_from_an_older_last_keeps_the_first_attempt_history_of_retrained_
         persisted_run_id=first.run_id,
         previous_last_logged_epoch=4,
         state_updater=update,
+        ood_roles=(),
     )
 
     resumed.log_epoch(3, {"train/loss_total": 1.0})
@@ -435,7 +467,7 @@ def test_offline_mode_needs_no_key_and_preserves_resume_identity(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     config = _resolved_config(mode="offline")
-    fresh = tracking.initialize_wandb(config, run_dir=tmp_path)
+    fresh = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=())
     state, update = _state_recorder()
     resumed = tracking.initialize_wandb(
         config,
@@ -443,6 +475,7 @@ def test_offline_mode_needs_no_key_and_preserves_resume_identity(
         resume=True,
         persisted_run_id=fresh.run_id,
         state_updater=update,
+        ood_roles=(),
     )
     assert resumed.run_id == fresh.run_id
     assert all(item["mode"] == "offline" for item in fake.initializations)
@@ -472,7 +505,7 @@ def test_sdk_is_silent_and_online_state_is_node_local_while_offline_state_stays_
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
-    session = tracking.initialize_wandb(_resolved_config(mode=mode), run_dir=run_dir)
+    session = tracking.initialize_wandb(_resolved_config(mode=mode), run_dir=run_dir, ood_roles=())
 
     assert fake.setups == [{"silent": True}]
     sdk_dir = Path(fake.initializations[0]["dir"])
@@ -497,7 +530,7 @@ def test_failed_online_finish_preserves_the_node_local_sdk_state_in_the_run_fold
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir)
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir, ood_roles=())
     state_file = _write_sdk_state(Path(fake.initializations[0]["dir"]))
     fake.runs[0].fail_finish = True
 
@@ -522,7 +555,7 @@ def test_failed_sdk_state_copy_is_a_warning_and_never_masks_the_finish_outcome(
     _patch_wandb(monkeypatch, fake)
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir)
+    session = tracking.initialize_wandb(_resolved_config(), run_dir=run_dir, ood_roles=())
     _write_sdk_state(Path(fake.initializations[0]["dir"]))
     session._observer_failed = True  # an earlier observer operation failed
     fake.runs[0].fail_finish = finish_fails
@@ -572,8 +605,8 @@ def test_semantic_config_is_path_free_and_preserves_active_science(
     else:
         assert payload["loss"]["physics"] == {"enabled": False}
     assert payload["data"]["datasets"]["train"]["dataset_id"] == "artificial-train"
-    assert [part["dataset_id"] for part in payload["data"]["datasets"]["additional_evaluation"]] == ["ood_data"]
-    assert payload["data"]["split"]["roles"]["additional_evaluation"]["parts"][0]["case_ids"] == ["chickpea__case_0001__00000000000a"]
+    assert [part["dataset_id"] for part in payload["data"]["datasets"]["material_ood"]] == ["ood_data"]
+    assert payload["data"]["split"]["roles"]["material_ood"]["parts"][0]["case_ids"] == ["chickpea__case_0001__00000000000a"]
     assert payload["data"]["split"]["artifact_sha256"] == "2" * 64
     assert payload["provenance"]["config_digest"] == "1" * 64
     assert {"effective_config", "paths", "tracking"}.isdisjoint(payload)
@@ -618,12 +651,10 @@ def test_transient_tracking_definitions_and_semantic_payload_use_existing_keys()
         physics_monitor_enabled=False,
         cuda_enabled=False,
         task_id="transient_drying",
+        ood_roles=("material_ood",),
     )
     destinations = {definition.wandb_key for definition in definitions}
-    assert "Loss/w_int" in destinations
-    assert "Overview/objective_validation" in destinations
-    assert "Accuracy/Validation/T" in destinations
-    assert all(not destination.startswith("Transient/") for destination in destinations)
+    assert {"Loss/data-w_int", "Overview/objective-id", "Fields/material-id-temperature", "Moisture/material-id-w_gr_physical"} <= destinations
     assert len(destinations) == len(definitions)
 
 
@@ -647,13 +678,12 @@ def test_current_transient_session_projects_curated_history_and_config_group(
     fake = _FakeWandb()
     _patch_wandb(monkeypatch, fake)
 
-    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic)
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, semantic_config=semantic, ood_roles=("material_ood", "parameter_ood"))
 
     initialization = fake.initializations[0]
     configured_identity = initialization["config"]["data"]["configured_identity"]
     definitions = session.history_metric_definitions
     destinations = {definition.wandb_key for definition in definitions}
-    assert all(not destination.startswith("Transient/") for destination in destinations)
     layout = config["run"]["layout"]
     assert initialization["project"] == experiments.config.defaults.WANDB_TASK_PROJECTS["transient_drying"]
     assert initialization["group"] == f"{layout['family']}/{layout['config_name']}"
@@ -666,10 +696,10 @@ def test_current_transient_session_projects_curated_history_and_config_group(
     assert config["data"]["train_dataset"] not in initialization["group"]
     assert fake.runs[0].summary == {
         "data/train_dataset": config["data"]["train_dataset"],
-        "data/ood_datasets": config["data"]["additional_evaluation_datasets"],
+        "data/ood_datasets": config["data"]["material_ood_datasets"],
     }
     assert configured_identity["train_dataset"] == config["data"]["train_dataset"]
-    assert configured_identity["additional_evaluation_datasets"] == config["data"]["additional_evaluation_datasets"]
+    assert configured_identity["material_ood_datasets"] == config["data"]["material_ood_datasets"]
     metrics = {definition.source_key: 1.0 for definition in definitions}
     metrics["system/cuda_peak_memory_allocated_bytes"] = _PROJECTED_GIB * _GIB_BYTES
     metrics["system/session_elapsed_seconds"] = 5.0  # telemetry outside the curated list is not logged
@@ -679,7 +709,9 @@ def test_current_transient_session_projects_curated_history_and_config_group(
     payload, step = fake.runs[0].logs[-1]
     assert step == 1
     assert set(payload) == {"epoch", *destinations}
-    assert payload["Performance/cuda_peak_memory_gib"] == _PROJECTED_GIB
+    assert payload["Performance/memory-cuda_peak_gib"] == _PROJECTED_GIB
+    assert payload["Fields/material-id-temperature"] == payload["Fields/parameter-id-temperature"] == 1.0  # one ID source feeds both pages
+    assert list(payload) == ["epoch", *(definition.wandb_key for definition in definitions)]  # projection order, not producer order
 
 
 def _steady_loop_telemetry(config: dict[str, Any]) -> dict[str, float]:
@@ -688,7 +720,7 @@ def _steady_loop_telemetry(config: dict[str, Any]) -> dict[str, float]:
         "train/loss_total",
         "train/loss_data",
         "optimization/learning_rate",
-        "additional_evaluation/objective_difference",
+        "material_ood/objective_difference",
         "system/epoch_duration_seconds",
         "system/train_duration_seconds",
         "system/train_samples_per_second",
@@ -696,7 +728,7 @@ def _steady_loop_telemetry(config: dict[str, Any]) -> dict[str, float]:
         "checkpoint/new_best",
         "global_step",
     ]
-    names += [f"{role}/{metric['id']}" for role in ("id", "additional_evaluation") for metric in config["evaluation"]["metrics"]]
+    names += [f"{role}/{metric['id']}" for role in ("id", "material_ood") for metric in config["evaluation"]["metrics"]]
     names += [f"physics/id/{name}" for name in ("momentum_residual_mse", "flux_balance_mse", "pressure_boundary_mse")]
     for term in ("momentum", "continuity", "boundary"):
         names += [f"physics/train/loss_{term}", f"physics/train/{term}_weight"]
@@ -713,7 +745,8 @@ def test_steady_session_is_grouped_by_config_and_logs_the_curated_history(
     config = _resolved_config(physics_enabled=True)
     layout = config["run"]["layout"]
 
-    session = tracking.initialize_wandb(config, run_dir=tmp_path)
+    # Only the material part is configured here, so no parameter-OOD row is defined or logged.
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=("material_ood",))
 
     initialization = fake.initializations[0]
     assert initialization["project"] == experiments.config.defaults.WANDB_TASK_PROJECTS["steady_flow"]
@@ -725,21 +758,47 @@ def test_steady_session_is_grouped_by_config_and_logs_the_curated_history(
 
     payload, _step = fake.runs[0].logs[-1]
     keys = set(payload) - {"epoch"}
-    validation = {key.removeprefix("Accuracy/Validation/") for key in keys if key.startswith("Accuracy/Validation/")}
-    ood = {key.removeprefix("Accuracy/OOD/") for key in keys if key.startswith("Accuracy/OOD/")}
-    assert validation == ood
-    assert {"normalized_rmse_p", "physical_velocity_vector_rmse"} <= ood
-    assert {key for key in keys if not key.startswith("Accuracy/")} == {
-        *(f"Overview/{name}" for name in ("objective_validation", "objective_ood", "ood_gap", "train_loss", "learning_rate")),
-        *(f"Loss/{name}" for name in ("data", "momentum", "continuity", "boundary")),
-        *(f"Physics/Validation/{name}" for name in ("momentum", "flux_balance", "pressure_boundary")),
-        *(f"Physics/Weight/{name}" for name in ("momentum", "continuity", "boundary")),
-        *(f"Performance/{name}" for name in ("epoch_seconds", "train_seconds", "samples_per_second")),
+    assert {key.partition("/")[0] for key in keys} == {"Overview", "Training", "Physics", "Fields", "Physical", "Norms", "Performance"}
+    assert {key for key in keys if key.startswith(("Fields/", "Physical/", "Norms/"))} == {
+        f"{section}/material-{label}-{name}"
+        for section, names in (("Fields", "puv"), ("Physical", "puv"), ("Norms", ("velocity", "relative_l2", "relative_h1")))
+        for label in ("id", "ood")
+        for name in names
+    }
+    assert {key for key in keys if key.startswith(("Overview/", "Training/", "Physics/", "Performance/"))} == {
+        *(f"Overview/{name}" for name in ("objective-id", "objective-material", "transfer_gap-material", "train-loss_total")),
+        *(f"Training/{name}" for name in ("learning_rate", "loss_data", "optimizer_steps")),
+        *(f"Training/weight-{term}" for term in ("momentum", "continuity", "boundary")),
+        *(f"Physics/{role}-{term}" for role in ("train", "val") for term in ("momentum", "continuity", "boundary")),
+        *(f"Performance/{name}" for name in ("duration-epoch", "duration-train", "rate-samples_per_second")),
     }
     # The local summary carries the counts in every terminal state, a pruned or failed run included.
     work = {"optimizer_steps": 3, "gradient_predictions": 6}
     session.finish(status="pruned", result=None, local_summary={"training_work": work})
     assert fake.runs[0].summary["training_work"] == work
+
+
+def test_terminal_summary_copies_only_the_selected_metrics_the_history_projects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the objective and the projected series in the W&B summary; summary.json keeps the complete selected metrics locally."""
+    fake = _FakeWandb()
+    _patch_wandb(monkeypatch, fake)
+    config = _resolved_config(physics_enabled=True)
+    session = tracking.initialize_wandb(config, run_dir=tmp_path, ood_roles=("material_ood",))
+    objective = f"selected/id/{config['evaluation']['objective']['id']}"
+    selected = {
+        objective: 0.1,
+        "selected/id/normalized_rmse_p": 0.2,
+        "selected/id/physical_velocity_vector_rmse": 0.3,
+        "selected/physics/flux_balance_mse": 0.4,
+    }
+
+    session.finish(status="completed", result={"selected_metrics": selected})
+
+    copied = {key: value for key, value in fake.runs[0].summary.items() if key.startswith("selected/")}
+    assert copied == {key: value for key, value in selected.items() if key != "selected/id/physical_velocity_vector_rmse"}
 
 
 class _TrialStub:
@@ -794,6 +853,7 @@ def test_optuna_trials_group_by_study_directory_and_log_the_report_and_best_valu
             _trial_config(tmp_path, trial_number=3, epochs=epochs, revision=revision),
             run_dir=tmp_path / f"ep{epochs}",
             semantic_config={"tuning": {"trial_number": 3}},
+            ood_roles=(),
         )
         for epochs, revision, _study_dir in studies
     ]
@@ -805,18 +865,18 @@ def test_optuna_trials_group_by_study_directory_and_log_the_report_and_best_valu
         assert initialization["tags"] == ["fno", "optuna"]
     assert len({initialization["name"] for initialization in fake.initializations}) == len(studies)
 
-    sessions[0].log_epoch(1, {"id/normalized_group_macro_rmse": 0.5, "optuna/objective": 0.5, "optuna/best_objective": 0.4})
+    sessions[0].log_epoch(1, {"id/normalized_group_macro_rmse": 0.5, "optuna/best_objective": 0.4})
     payload, _step = fake.runs[0].logs[-1]
-    assert payload["Optuna/objective"] == 0.5
+    assert payload["Overview/objective-id"] == 0.5
     assert payload["Optuna/best_objective"] == 0.4
     summaries = {name: options["summary"] for name, options in fake.runs[0].metric_definitions if name.startswith(("Optuna/", "Overview/"))}
-    assert summaries["Optuna/objective"] is summaries["Optuna/best_objective"] is None  # SDK default: the summary keeps the history's last value
-    assert summaries["Overview/train_loss"] == "none"
+    assert summaries["Optuna/best_objective"] is None  # SDK default: the summary keeps the history's last value
+    assert summaries["Overview/objective-id"] == "none"
 
     sessions[0].finish(status="completed", result={"best_metric": 0.4})
     terminal = fake.runs[0].summary
     assert terminal["Optuna/trial_number"] == 3
-    assert {"Optuna/objective", "Optuna/best_objective"}.isdisjoint(terminal)  # only the history aggregates define them
+    assert "Optuna/best_objective" not in terminal  # only the history aggregate defines it
 
 
 def test_model_parameter_counts_ignore_device_and_dtype() -> None:
@@ -843,6 +903,7 @@ def test_requested_history_failures_are_fail_closed(
         _resolved_config(mode=mode),
         run_dir=tmp_path,
         state_updater=update,
+        ood_roles=(),
     )
     fake.runs[0].fail_log = True
     with pytest.raises(tracking.TrackingIOError, match=rf"{mode} W&B history"):
@@ -866,6 +927,7 @@ def test_initialization_and_finish_errors_are_redacted_and_fail_closed(
             _resolved_config(),
             run_dir=tmp_path,
             state_updater=update,
+            ood_roles=(),
         )
     assert secret not in str(captured.value)
     assert secret not in str(state)
@@ -877,6 +939,7 @@ def test_initialization_and_finish_errors_are_redacted_and_fail_closed(
         _resolved_config(),
         run_dir=tmp_path,
         state_updater=finish_update,
+        ood_roles=(),
     )
     finish_fake.runs[0].fail_finish = True
     with pytest.raises(tracking.TrackingIOError, match="finish"):
@@ -897,11 +960,11 @@ def test_artifact_upload_enforces_enablement_allowlist_and_root_boundary(
     provenance = analysis_root / "artifact_provenance.json"
     provenance.write_text("{}\n", encoding="utf-8")
 
-    disabled = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path)
+    disabled = tracking.initialize_wandb(_resolved_config(), run_dir=tmp_path, ood_roles=())
     with pytest.raises(tracking.TrackingUploadError, match="disabled"):
         disabled.upload_files({"artifact_provenance": provenance})
 
-    session = tracking.initialize_wandb(_resolved_config(upload=True), run_dir=tmp_path)
+    session = tracking.initialize_wandb(_resolved_config(upload=True), run_dir=tmp_path, ood_roles=())
     with pytest.raises(tracking.TrackingUploadError, match="Unsupported"):
         session.upload_files({"arbitrary": provenance})
     outside = tmp_path / "outside" / "artifact_provenance.json"
@@ -958,6 +1021,6 @@ def test_wandb_config_rejects_invalid_values(
 ) -> None:
     """Reject malformed tracking settings through the public resolver."""
     raw = configs.direct_config()
-    raw["tracking"] = {"wandb": settings}
+    raw["tracking"]["wandb"].update(settings)
     with pytest.raises(ValueError, match=match):
         configs.resolve(raw)

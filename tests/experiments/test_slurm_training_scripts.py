@@ -276,8 +276,8 @@ def test_cpu_submission_preserves_training_arguments(harness: _Harness) -> None:
     assert "Slurm job ID: 12345" in result.stdout
     arguments = _args(harness.sbatch_capture)
     assert "--gres" not in " ".join(arguments)
-    assert f"--output={harness.runtime}/logs/ml/slurm-%j.out" in arguments
-    assert f"--error={harness.runtime}/logs/ml/slurm-%j.err" in arguments
+    assert f"--output={harness.runtime}/logs/ml/train-%j.out" in arguments
+    assert f"--error={harness.runtime}/logs/ml/train-%j.err" in arguments
     assert arguments[-19:] == [
         "/workspace/repo/config.yaml",
         "--epochs",
@@ -588,7 +588,6 @@ def test_invalid_shared_ml_arguments_fail_before_submission(
     "arguments",
     [
         [*_resources("cpu"), "--gres", "gpu:v100:1", "train", "config.yaml"],
-        [*_resources("gpu"), "train", "config.yaml"],
         [*_resources("gpu"), "--gres", "gpu:0:1", "train", "config.yaml"],
         [*_resources("gpu"), "--gres", "gpu:v100:1", "train", "config.yaml", "--device", "cpu"],
         [*_resources("cpu"), "train", "--resume"],
@@ -609,6 +608,54 @@ def test_invalid_resource_or_training_arguments_fail_before_submission(harness: 
 
     assert result.returncode != 0
     assert not harness.sbatch_capture.exists()
+
+
+def _allocation(harness: _Harness) -> list[str]:
+    """Return the resource arguments of the last submission, without the job name and paths."""
+    prefixes = ("--partition=", "--cpus-per-task=", "--mem=", "--time=", "--gres=")
+    return sorted(argument for argument in _args(harness.sbatch_capture) if argument.startswith(prefixes))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "mode", "expected"),
+    [
+        (
+            ["train", "config.yaml"],
+            "gpu",
+            ["--cpus-per-task=4", "--gres=gpu:rtx6000ada:1", "--mem=32G", "--partition=gpu", "--time=04:00:00"],
+        ),
+        (
+            ["optuna", "config.yaml"],
+            "gpu",
+            ["--cpus-per-task=4", "--gres=gpu:rtx6000ada:1", "--mem=32G", "--partition=gpu", "--time=04:00:00"],
+        ),
+        (
+            ["artifacts", "--task", "steady_flow"],
+            "gpu",
+            ["--cpus-per-task=4", "--gres=gpu:rtx6000ada:1", "--mem=32G", "--partition=gpu", "--time=02:00:00"],
+        ),
+        (["probe"], "cpu", ["--cpus-per-task=4", "--mem=16G", "--partition=standard", "--time=00:10:00"]),
+        (
+            ["--mode", "cpu", "--time", "01:00:00", "artifacts", "--task", "steady_flow"],
+            "cpu",
+            ["--cpus-per-task=4", "--mem=16G", "--partition=standard", "--time=01:00:00"],
+        ),
+        (
+            ["--mode", "gpu", "--mem", "8G", "train", "config.yaml"],
+            "gpu",
+            ["--cpus-per-task=4", "--gres=gpu:rtx6000ada:1", "--mem=8G", "--partition=gpu", "--time=04:00:00"],
+        ),
+    ],
+)
+def test_omitted_resource_options_take_the_operation_and_mode_defaults(
+    harness: _Harness, arguments: list[str], mode: str, expected: list[str]
+) -> None:
+    """Every omitted resource option resolves to its default and an explicit one wins."""
+    result = _submit(harness, *arguments)
+
+    assert result.returncode == 0, result.stderr
+    assert _allocation(harness) == expected
+    assert _worker_arguments(harness)[0] == mode
 
 
 def test_overlapping_roots_fail_before_submission(harness: _Harness) -> None:
@@ -987,8 +1034,8 @@ def test_worker_rejects_the_live_checkout_as_project_root(harness: _Harness) -> 
 def test_job_log_names_are_defined_once_appended_to_and_reach_the_executor(harness: _Harness) -> None:
     """The sbatch log templates, the append mode and the job's own log paths all come from one definition."""
     assert _train(harness).returncode == 0
-    stdout_template = f"{harness.runtime}/logs/ml/slurm-%j.out"
-    stderr_template = f"{harness.runtime}/logs/ml/slurm-%j.err"
+    stdout_template = f"{harness.runtime}/logs/ml/train-%j.out"
+    stderr_template = f"{harness.runtime}/logs/ml/train-%j.err"
     arguments = _args(harness.sbatch_capture)
     assert {f"--output={stdout_template}", f"--error={stderr_template}", "--open-mode=append"} <= set(arguments)
 
@@ -996,8 +1043,8 @@ def test_job_log_names_are_defined_once_appended_to_and_reach_the_executor(harne
 
     assert worker_result.returncode == 0, worker_result.stderr
     assert harness.job_log_capture.read_text(encoding="utf-8").split("\n") == [
-        f"{harness.runtime}/logs/ml/slurm-12345.out",
-        f"{harness.runtime}/logs/ml/slurm-12345.err",
+        f"{harness.runtime}/logs/ml/train-12345.out",
+        f"{harness.runtime}/logs/ml/train-12345.err",
     ]
 
 
@@ -1164,7 +1211,7 @@ def _make_job_logs(runtime: Path) -> tuple[Path, Path]:
     """Create the stdout and stderr logs of one finished test job below the runtime root."""
     logs = runtime / "logs" / "ml"
     logs.mkdir(parents=True)
-    paths = (logs / "slurm-77.out", logs / "slurm-77.err")
+    paths = (logs / "train-77.out", logs / "train-77.err")
     for path in paths:
         path.write_text(path.name, encoding="utf-8")
     return paths
@@ -1247,14 +1294,43 @@ def test_apptainer_executor_links_the_recorded_job_logs_once_and_keeps_the_conta
         tmp_path,
         executor_roots,
         owners=["/workspace/storage/runs/one", "/workspace/storage/runs/two", "/workspace/storage/runs/one"],
-        job_logs=[stdout_log, stderr_log, runtime / "logs" / "ml" / "slurm-77.missing"],
+        job_logs=[stdout_log, stderr_log, runtime / "logs" / "ml" / "train-77.missing"],
     )
 
     assert _warnings(result, tmp_path) == []
     for owner in (first, second):
-        assert sorted(path.name for path in (owner / "logs").iterdir()) == ["slurm-77.err", "slurm-77.out"]
+        assert sorted(path.name for path in (owner / "logs").iterdir()) == ["train-77.err", "train-77.out"]
         assert all((owner / "logs" / log.name).samefile(log) for log in (stdout_log, stderr_log))
     assert "JOB_LOG_OWNERS_FILE=/workspace/tmp/job-log-owners" in _args(tmp_path / "apptainer.args")
+
+
+def test_apptainer_executor_does_not_link_an_empty_job_log(tmp_path: Path, executor_roots: tuple[Path, Path, Path]) -> None:
+    """An empty log (typically the stderr of a clean job) stays only in the runtime log directory."""
+    storage, runtime, _ = executor_roots
+    stdout_log, stderr_log = _make_job_logs(runtime)
+    stderr_log.write_text("", encoding="utf-8")
+    owner = storage / "runs" / "one"
+    owner.mkdir(parents=True)
+
+    result = _run_executor_after_job(tmp_path, executor_roots, owners=["/workspace/storage/runs/one"], job_logs=[stdout_log, stderr_log])
+
+    assert _warnings(result, tmp_path) == []
+    assert [path.name for path in (owner / "logs").iterdir()] == ["train-77.out"]
+
+
+def test_apptainer_executor_creates_no_logs_directory_when_every_job_log_is_empty(tmp_path: Path, executor_roots: tuple[Path, Path, Path]) -> None:
+    """A job with only empty logs leaves the owner folder without a logs/ directory."""
+    storage, runtime, _ = executor_roots
+    paths = _make_job_logs(runtime)
+    for path in paths:
+        path.write_text("", encoding="utf-8")
+    owner = storage / "runs" / "one"
+    owner.mkdir(parents=True)
+
+    result = _run_executor_after_job(tmp_path, executor_roots, owners=["/workspace/storage/runs/one"], job_logs=list(paths))
+
+    assert _warnings(result, tmp_path) == []
+    assert not (owner / "logs").exists()
 
 
 @pytest.mark.parametrize("missing", ["job-logs", "record"])

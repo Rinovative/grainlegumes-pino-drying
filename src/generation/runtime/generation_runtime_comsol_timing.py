@@ -25,7 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal
 
-from src import common
 from src.generation.contracts import generation_contracts_profiles as profiles
 
 if TYPE_CHECKING:
@@ -33,7 +32,6 @@ if TYPE_CHECKING:
 
 COMSOL_BATCH_LOG_FILENAME: Final = "comsol_batch.log"
 SOLVER_TIMING_SCHEMA_KIND: Final = "comsol_solver_timing"
-SOLVER_TIMING_SCHEMA_VERSION: Final = 1
 SOLVER_TIMING_METHOD: Final = "comsol_batch_log_top_level_solution_time"
 SOLVER_TIMING_SOURCE_KIND: Final = "comsol_batch_log"
 
@@ -121,7 +119,6 @@ class ComsolSolverTiming:
         """Return the compact persisted parser evidence."""
         return {
             "schema_kind": SOLVER_TIMING_SCHEMA_KIND,
-            "schema_version": SOLVER_TIMING_SCHEMA_VERSION,
             "method": SOLVER_TIMING_METHOD,
             "source_kind": SOLVER_TIMING_SOURCE_KIND,
             "source_path": COMSOL_BATCH_LOG_FILENAME,
@@ -596,7 +593,6 @@ def admit_persisted_solver_timing(
     payload = timing["comsol_solver_timing"]
     expected_keys = {
         "schema_kind",
-        "schema_version",
         "method",
         "source_kind",
         "source_path",
@@ -614,7 +610,6 @@ def admit_persisted_solver_timing(
         raise ValueError(msg)
     if (
         payload["schema_kind"] != SOLVER_TIMING_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload["schema_version"], SOLVER_TIMING_SCHEMA_VERSION)
         or payload["method"] != SOLVER_TIMING_METHOD
         or payload["source_kind"] != SOLVER_TIMING_SOURCE_KIND
         or payload["source_path"] != COMSOL_BATCH_LOG_FILENAME

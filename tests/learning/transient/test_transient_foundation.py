@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -41,6 +42,9 @@ _EXPECTED_UNIQUE_STATES = 3
 _EXPECTED_TRANSITIONS = 2
 _STREAMING_TRANSITIONS = 20
 _STREAMING_STATES = _STREAMING_TRANSITIONS + 1
+_F_SURF_INDEX = 2
+_W_SURF_INDEX = 2
+_W_INT_INDEX = 3
 
 
 def _digest(label: str) -> str:
@@ -53,9 +57,12 @@ def _item(
     *,
     startup: float = 0.0,
     regular_omega: tuple[float, float] = (0.1, 0.2),
+    f_surf: float = 0.25,
 ) -> dict[str, Any]:
     """Return one tiny raw physical one-step Train item."""
     state = torch.arange(16, dtype=torch.float32).reshape(4, 2, 2) + index
+    scalars = torch.arange(8, dtype=torch.float32)
+    scalars[_F_SURF_INDEX] = f_surf
     boundary = torch.tensor(
         [
             300.0,
@@ -75,7 +82,7 @@ def _item(
         "target": torch.ones_like(state),
         "static": torch.arange(28, dtype=torch.float32).reshape(7, 2, 2),
         "boundary": boundary,
-        "scalars": torch.arange(8, dtype=torch.float32),
+        "scalars": scalars,
         "time": {
             "t_n": torch.tensor(float(index)),
             "t_n_plus_1": torch.tensor(float(index + 1)),
@@ -90,7 +97,7 @@ def _item(
 
 
 def _spec(
-    profile: str = "canonical_physics_complete_v1",
+    profile: str = "canonical_physics_complete",
     temporal: learning_temporal.TemporalConditioningKind = "normalized_current_time",
 ) -> TransientTensorizerSpec:
     """Return one authoritative tensorizer selection."""
@@ -153,8 +160,8 @@ def _batch(
 @pytest.mark.parametrize(
     ("profile", "temporal", "expected_channels"),
     [
-        ("canonical_physics_complete_v1", "none", 28),
-        ("canonical_physics_complete_v1", "normalized_current_time", 29),
+        ("canonical_physics_complete", "none", 28),
+        ("canonical_physics_complete", "normalized_current_time", 29),
     ],
 )
 def test_profiles_derive_exact_channels(
@@ -285,6 +292,7 @@ def test_scaling_streams_one_shot_items_against_float64_population_reference() -
         )
         item["static"] = item["static"] + index * 0.5
         item["scalars"] = item["scalars"] + index * 0.25
+        item["scalars"][_F_SURF_INDEX] = 0.2 + index * 0.03
         items.append(item)
 
     artifact = fit_transient_scaling(
@@ -332,6 +340,36 @@ def test_scaling_streams_one_shot_items_against_float64_population_reference() -
     )
     assert artifact.unique_train_state_count == _STREAMING_STATES
     assert artifact.unique_transition_count == artifact.transition_count == _STREAMING_TRANSITIONS
+
+
+def test_grain_moisture_std_uses_each_cases_f_surf_over_unique_states_and_terminal() -> None:
+    """Match the float64 population std of w_gr over every unique state plus one terminal state per case."""
+    items = []
+    expected_values = []
+    for case, f_surf, offset in (("a", 0.25, 0.0), ("b", 0.6, 3.0)):
+        case_items = [_item(index, f_surf=f_surf) for index in range(2)]
+        for item in case_items:
+            item["state"] = item["state"] + offset
+            item["metadata"]["simulation_case_id"] = case
+        states = [item["state"] for item in case_items] + [case_items[-1]["state"] + case_items[-1]["target"]]
+        fraction = float(torch.tensor(f_surf, dtype=torch.float32))
+        expected_values.extend(
+            fraction * state[_W_SURF_INDEX].to(torch.float64) + (1.0 - fraction) * state[_W_INT_INDEX].to(torch.float64) for state in states
+        )
+        items.extend(case_items)
+
+    artifact = fit_transient_scaling(
+        items,
+        tensorizer=_spec(),
+        dataset_identity={"dataset_id": "synthetic"},
+        train_membership_digest=_digest("grain-moisture"),
+        horizon=10.0,
+    )
+
+    assert artifact.grain_moisture_std is not None
+    expected = torch.stack(expected_values).std(unbiased=False).to(dtype=torch.float32)
+    assert artifact.grain_moisture_std.shape == ()
+    torch.testing.assert_close(artifact.grain_moisture_std, expected, rtol=1.0e-6, atol=1.0e-7)
 
 
 def test_scaling_isolates_reused_one_shot_buffers() -> None:
@@ -487,7 +525,6 @@ def test_scaling_serialization_is_strict_and_device_independent() -> None:
     """Reject tensorizer tampering and keep runtime transfer hash-stable."""
     artifact = _artifact()
     state = artifact.state_dict()
-    assert state["schema_version"] == 1
     restored = TransientScalingArtifact.from_state_dict(state)
     on_cpu = restored.to(torch.device("cpu"))
 
@@ -520,6 +557,31 @@ def test_scaling_serialization_is_strict_and_device_independent() -> None:
     changed_embedding["tensorizer"]["positional_embedding"] = "grid"
     with pytest.raises(ValueError, match="tensorizer identity"):
         TransientScalingArtifact.from_state_dict(changed_embedding)
+
+
+def test_grain_moisture_std_is_optional_in_serialization_and_keeps_old_digests() -> None:
+    """Round-trip the fitted scale, admit a state without it unchanged, and refuse any other key set or an invalid scale."""
+    artifact = _artifact()
+    state = artifact.state_dict()
+    restored = TransientScalingArtifact.from_state_dict(state)
+    assert restored.grain_moisture_std is not None
+    assert artifact.grain_moisture_std is not None
+    assert torch.equal(restored.grain_moisture_std, artifact.grain_moisture_std)
+    assert restored.digest == artifact.digest
+    moved = restored.to(torch.device("cpu"))
+    assert moved.grain_moisture_std is not None
+    assert moved.digest == artifact.digest
+
+    legacy_state = {key: value for key, value in state.items() if key != "grain_moisture_std"}
+    legacy = TransientScalingArtifact.from_state_dict(legacy_state)
+    assert legacy.grain_moisture_std is None
+    assert legacy.state_dict() == legacy_state
+    assert legacy.digest == replace(artifact, grain_moisture_std=None).digest != artifact.digest
+
+    with pytest.raises(ValueError, match="keys"):
+        TransientScalingArtifact.from_state_dict({**state, "unexpected": 1.0})
+    with pytest.raises(ValueError, match="non-negative"):
+        replace(artifact, grain_moisture_std=torch.tensor(-1.0))
 
 
 def _expected_identity(artifact: TransientScalingArtifact) -> dict[str, Any]:

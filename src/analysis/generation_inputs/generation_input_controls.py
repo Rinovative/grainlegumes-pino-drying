@@ -40,16 +40,6 @@ CASE_LABEL_WIDTH_PX = 54
 CASE_VALUE_WIDTH_PX = 63
 CASE_SELECTOR_WIDTH_PX = CASE_LABEL_WIDTH_PX + CASE_VALUE_WIDTH_PX
 CASE_STEP_WIDTH_PX = 40
-CONTROL_ROW_VERTICAL_GAP_PX = 4
-CONTROL_ROW_HORIZONTAL_GAP_PX = 6
-
-_CONTROL_LAYOUT = widgets.Layout(
-    display="flex",
-    flex_flow="row wrap",
-    align_items="center",
-    grid_gap=(f"{CONTROL_ROW_VERTICAL_GAP_PX}px {CONTROL_ROW_HORIZONTAL_GAP_PX}px"),
-    width="100%",
-)
 _DATASET_LAYOUT = widgets.Layout(
     width=f"{DATASET_SELECTOR_WIDTH_PX}px",
     max_width="100%",
@@ -113,7 +103,7 @@ class FieldAtlasControls:
     @property
     def widget(self) -> widgets.VBox:
         """Return one case row and the maintained independent field selector."""
-        return widgets.VBox((widgets.HBox((self.dataset, self.case), layout=_CONTROL_LAYOUT), self.fields.container))
+        return widgets.VBox((ui.components.ui_control_row(self.dataset, self.case), self.fields.container))
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind automatic rendering without eagerly opening scientific arrays."""
@@ -262,17 +252,11 @@ class PairCaseControls:
     @property
     def widget(self) -> widgets.VBox:
         """Return two compact selector rows and an optional local scale lock."""
-        first = widgets.HBox(
-            (self.dataset_a, self.case_a, self.previous_a, self.following_a),
-            layout=_CONTROL_LAYOUT,
-        )
-        second = widgets.HBox(
-            (self.dataset_b, self.case_b, self.previous_b, self.following_b),
-            layout=_CONTROL_LAYOUT,
-        )
+        first = ui.components.ui_control_row(self.dataset_a, self.case_a, self.previous_a, self.following_a)
+        second = ui.components.ui_control_row(self.dataset_b, self.case_b, self.previous_b, self.following_b)
         children: list[widgets.Widget] = [first, second]
         if self.scale_lock is not None:
-            children.append(widgets.HBox((self.scale_lock,), layout=_CONTROL_LAYOUT))
+            children.append(ui.components.ui_control_row(self.scale_lock))
         return widgets.VBox(tuple(children))
 
     def set_callback(self, callback: Callable[[], None]) -> None:
@@ -503,10 +487,7 @@ class DatasetControls:
     @property
     def widget(self) -> widgets.HBox:
         """Return the compact local dataset selector."""
-        return widgets.HBox(
-            (self.dataset,),
-            layout=_CONTROL_LAYOUT,
-        )
+        return ui.components.ui_control_row(self.dataset)
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind the automatic render callback for dataset changes."""
@@ -557,7 +538,11 @@ class CampaignOutcomeControls:
         )
         self.case = widgets.Dropdown(description="Evidence:")
         self.widget = widgets.VBox(
-            (widgets.HBox((self.campaign, self.material)), widgets.HBox((self.outcome, self.origin)), self.case, self.parameter)
+            (
+                ui.components.ui_control_row(self.campaign, self.material),
+                ui.components.ui_control_row(self.outcome, self.origin),
+                ui.components.ui_control_row(self.case, self.parameter),
+            )
         )
         self._callback: Callable[[], None] | None = None
         self._updating = False

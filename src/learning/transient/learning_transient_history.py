@@ -27,7 +27,6 @@ from typing import Any
 
 from src import common
 
-_HISTORY_SCHEMA_VERSION = 1
 _HISTORY_FILENAME = "history.json"
 _MAX_METRIC_KEY_LENGTH = 160
 
@@ -73,12 +72,8 @@ def _reject_nonfinite_live_metrics(epoch: int, metrics: Mapping[str, Any]) -> No
 
 def _admit_history(payload: Any, *, task: str, run_name: str, checkpoint_identity: Mapping[str, Any]) -> dict[str, Any]:
     """Validate history identity and gap-free ordered record sequence."""
-    required = {"schema_version", "task", "run_name", "checkpoint_identity_digest", "epochs"}
-    if (
-        not isinstance(payload, Mapping)
-        or set(payload) != required
-        or not common.serialization.is_schema_version(payload["schema_version"], _HISTORY_SCHEMA_VERSION)
-    ):
+    required = {"task", "run_name", "checkpoint_identity_digest", "epochs"}
+    if not isinstance(payload, Mapping) or set(payload) != required:
         msg = "Transient history schema is invalid."
         raise ValueError(msg)
     if payload["task"] != task or payload["run_name"] != run_name:
@@ -92,7 +87,6 @@ def _admit_history(payload: Any, *, task: str, run_name: str, checkpoint_identit
         msg = "Transient history epochs must be a list."
         raise TypeError(msg)
     return {
-        "schema_version": _HISTORY_SCHEMA_VERSION,
         "task": task,
         "run_name": run_name,
         "checkpoint_identity_digest": _identity_digest(checkpoint_identity),
@@ -153,7 +147,6 @@ def reconcile_history(
             msg = "Transient resume checkpoint has no durable history.json."
             raise FileNotFoundError(msg)
         return {
-            "schema_version": _HISTORY_SCHEMA_VERSION,
             "task": task,
             "run_name": run_name,
             "checkpoint_identity_digest": _identity_digest(checkpoint_identity),
@@ -189,7 +182,6 @@ def make_epoch_state_callback(
         initial_history
         if initial_history is not None
         else {
-            "schema_version": _HISTORY_SCHEMA_VERSION,
             "task": task,
             "run_name": run_name,
             "checkpoint_identity_digest": _identity_digest(checkpoint_identity),

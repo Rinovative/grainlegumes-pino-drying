@@ -30,7 +30,7 @@ from typing import Literal
 from src.analysis.evaluation import evaluation_run_discovery as run_discovery
 
 EvaluationScope = Literal["aggregate", "single"]
-ArtifactRole = Literal["id", "additional_evaluation", "both"]
+ArtifactRole = Literal["id", "material_ood", "parameter_ood", "all"]
 EvaluationProtocol = Literal[
     "teacher_forced_one_step",
     "autonomous_full",
@@ -42,7 +42,7 @@ SelectionObserver = Callable[
 ]
 
 _SCOPE_VALUES = frozenset({"aggregate", "single"})
-_ARTIFACT_ROLES = frozenset({"id", "additional_evaluation", "both"})
+_ARTIFACT_ROLES = frozenset({"id", "material_ood", "parameter_ood", "all"})
 _TRANSIENT_PROTOCOLS = frozenset(
     {
         "teacher_forced_one_step",

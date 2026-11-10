@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Build direct, matched transient, stage-A-only transient, steady and transient-A0 Optuna requests and write temporary YAML files
-  - Derive the test-owned config source whose name equals a request's model label and resolve requests with it
+  - Derive the in-memory test-owned config source named like a request's model label and resolve requests with it
 
 Design principles:
   - Each builder returns explicit test-owned values independently of production experiment files
@@ -90,9 +90,11 @@ def direct_config(
         },
         "data": {
             "train_dataset": "synthetic_train",
-            "additional_evaluation_datasets": ["synthetic_ood"],
+            "material_ood_datasets": ["synthetic_ood"],
+            "train_subset": None,
             "batch_size": 2,
             "num_workers": 0,
+            "pin_memory": True,
             "persistent_workers": False,
         },
         "model": {"kind": model_kind, "params": model_params},
@@ -101,12 +103,12 @@ def direct_config(
             "physics": physics,
         },
         "evaluation": {"objective": {"id": "normalized_group_macro_rmse"}},
-        "optimizer": {"kind": "adamw", "lr": 1.0e-3, "weight_decay": 0.0},
+        "optimizer": {"kind": "adamw", "lr": 1.0e-3, "weight_decay": 0.0, "betas": [0.9, 0.999], "second_moment_floor": 1.0e-6},
         "scheduler": {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 2, "min_lr": 1.0e-6},
         "training": {
             "epochs": 3,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
         },
         "tracking": {
             "wandb": {
@@ -174,14 +176,15 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
         },
         "data": {
             "train_dataset": "synthetic_transient_train",
-            "additional_evaluation_datasets": ["synthetic_transient_ood"],
+            "material_ood_datasets": ["synthetic_transient_ood"],
+            "train_subset": None,
             "batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
             "persistent_workers": False,
             "spatial_stride": 1,
         },
-        "input_profile": "canonical_physics_complete_v1",
+        "input_profile": "canonical_physics_complete",
         "temporal": temporal,
         "scaling": {"mode": "state_std"},
         "loss": {
@@ -243,7 +246,7 @@ def transient_matched_config(
     a0 = {
         "max_epochs": 4,
         "evaluation_interval": 1,
-        "additional_evaluation_interval": 1,
+        "ood_evaluation_interval": 1,
         "gradient_accumulation_steps": 1,
         **_teacher_forced_stage(model_kind=model_kind),
     }
@@ -255,7 +258,7 @@ def transient_matched_config(
         "train_seconds": 0.25,
         "lr_scale": 1.0,
         "evaluation_interval": 1,
-        "additional_evaluation_interval": 1,
+        "ood_evaluation_interval": 1,
         "gradient_accumulation_steps": 1,
         "sampling": b_sampling,
         "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
@@ -288,7 +291,7 @@ def transient_stage_a_only_config(
         "epochs": epochs,
         "stage_schedule": {"mode": "stage_a_only", "budget_unit": "epochs", "total_epochs": epochs},
         "evaluation_interval": 1,
-        "additional_evaluation_interval": 1,
+        "ood_evaluation_interval": 1,
         "stage": "a",
         "comparison_arm": "a0",
         "gradient_accumulation_steps": 1,
@@ -350,21 +353,22 @@ def optuna_transient_a0_config() -> dict[str, Any]:
     request = optuna_config()
     request["study"]["mode"] = "stage_a_only"
     request["experiment"] = transient_stage_a_only_config()
-    request["experiment"]["data"]["additional_evaluation_datasets"] = []
+    request["experiment"]["data"]["material_ood_datasets"] = []
     request["experiment"]["tracking"]["wandb"]["workflow"] = "optuna_trial"
     return request
 
 
 def source_for(raw: Mapping[str, Any]) -> config_naming.ConfigSource:
-    """Return the test-family source named exactly like the request's model label.
+    """Return the in-memory test-family source named like the file ``write_config`` writes for the request.
 
-    A request too incomplete to label gets a placeholder source: the resolver reports
-    that request's own schema error before it ever checks the config name.
+    That name is the model label and the learning rate, the two leaves such a file sets. A source without
+    its file is not name-checked. A request too incomplete to label gets a placeholder source.
     """
     task = raw.get("task")
     try:
         effective = config_loader.deep_merge(config_defaults.get_task_defaults(str(task)), raw)
-        return config_naming.ConfigSource(str(task), TEST_FAMILY, config_naming.model_label(effective))
+        name = config_naming.config_name(effective, {"model": raw["model"], "optimizer": {"lr": raw["optimizer"]["lr"]}})
+        return config_naming.ConfigSource(str(task), TEST_FAMILY, name)
     except (KeyError, TypeError, ValueError):
         return config_naming.ConfigSource(str(task), TEST_FAMILY, "unlabelled")
 
@@ -379,16 +383,20 @@ def resolve_plan(raw: Mapping[str, Any], **kwargs: Any) -> transient_plan.Matche
     return transient_plan.resolve_matched_a1_b_plan(raw, source=source_for(raw), **kwargs)
 
 
-def write_config(directory: Path, payload: Mapping[str, Any], *, canonical_root: Path | None = None) -> Path:
-    """Write an executable request into ``directory`` under its model-label file name.
+def write_config(directory: Path, payload: Mapping[str, Any], *, canonical_root: Path | None = None, family: str = TEST_FAMILY) -> Path:
+    """Write an executable request as a maintained config below ``canonical_root`` (default ``directory``).
 
-    With ``canonical_root`` the file lands in that root's canonical
-    ``configs/03_learning/<task>/experiments/tests/`` tree instead.
+    The request lands in that root's canonical ``configs/03_learning/<task>/`` tree: a task ``base.yaml``
+    with everything except the model and the learning rate, and an ``experiments/<family>/`` file that
+    sets only these two, named after them as the loader requires of every config file.
     """
     source = source_for(payload)
-    if canonical_root is not None:
-        directory = canonical_root / "configs" / "03_learning" / source.task / "experiments" / source.family
-    return write_yaml(directory / f"{source.name}.yaml", payload)
+    tree = (directory if canonical_root is None else canonical_root) / "configs" / "03_learning" / source.task
+    shared = {key: value for key, value in payload.items() if key not in {"task", "model"}}
+    shared["optimizer"] = {key: value for key, value in payload["optimizer"].items() if key != "lr"}
+    write_yaml(tree / "base.yaml", shared)
+    authored = {"model": payload["model"], "optimizer": {"lr": payload["optimizer"]["lr"]}}
+    return write_yaml(tree / "experiments" / family / f"{source.name}.yaml", {"task": source.task, "base": "../../base.yaml", **authored})
 
 
 def write_yaml(path: Path, payload: Mapping[str, Any]) -> Path:

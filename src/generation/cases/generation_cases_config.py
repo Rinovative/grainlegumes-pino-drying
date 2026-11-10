@@ -15,10 +15,11 @@ This module does NOT:
   - Generate samples or fields, execute COMSOL, or modify templates
 
 Notes:
-  Execution node-job contract (schema_version 1):
-    - execution.cluster holds the validated derived fields concurrent_cases_per_node
+  Execution node-job contract:
+    - The authored groups run, rules, node_job, site and internals resolve into the runtime, submission, cluster and
+      site values that consumers read; the resolved cluster holds the derived fields concurrent_cases_per_node
       (site.cores_per_node // cores_per_case) and node_job_memory (<int>G, concurrent_cases_per_node
-      * memory_per_case + node_memory_overhead), next to the computed cores_per_node, scheduler_kind and partition
+      * memory_per_case + node_memory_overhead), next to the copied cores_per_node and partition
     - A node job above node_memory_limit, or one whose node_job_wall_time does not exceed
       timeout_seconds plus 600 s, is rejected; the concurrency is never reduced silently
     - The COMSOL batch licence arguments and the scheduler allocation options are pipeline-owned
@@ -48,6 +49,7 @@ from src.generation.contracts import generation_contracts_source as source_servi
 from src.generation.contracts import generation_contracts_templates as templates
 from src.generation.contracts.generation_contracts_vocabulary import (
     CAMPAIGN_PURPOSES,
+    DESIGN_KINDS,
     MATERIAL_ROLES,
 )
 
@@ -55,16 +57,7 @@ from . import generation_cases_sampling as sampling_service
 from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
-CONFIG_SCHEMA_VERSION = 1
-CAMPAIGN_SCHEMA_VERSION = 1
-EXECUTION_SCHEMA_VERSION = 1
-COMMON_SCHEMA_VERSION = 1
-CONDITIONING_SCHEMA_VERSION = 1
-OPERATIONS_SCHEMA_VERSION = 1
 _MAX_FILESYSTEM_COMPONENT_BYTES = 255
-PROFILE_SCHEMA_VERSION = 1
-CANONICAL_HDF5_SCHEMA_VERSION = 1
-CANONICAL_HDF5_CONVERTER_VERSION = 1
 CASE_ID_WIDTH = 4
 _MAXIMUM_GZIP_COMPRESSION_LEVEL = 9
 _MAXIMUM_TRANSIENT_INITIAL_STATE_RTOL = 1.0e-4
@@ -108,6 +101,51 @@ _FINAL_PHYSICAL_FORMULAS = {
     "f_wet_dm": "integral(rho_bu_dry*indicator(X_wb>X_target_wb))/integral(rho_bu_dry)",
     "total_water_balance": "d/dt(m_w_gr+m_v_gas)=m_dot_v_in-m_dot_v_out",
 }
+# Contract blocks the loader owns instead of mirroring them in YAML: they enter every scientific record from here, with this provenance.
+_CODE_CONTRACT_PROVENANCE: Final = {"evidence": "project_baseline", "source_refs": ["transient_comsol_model_report"]}
+_FIXED_TIME_FIELDS: Final = {"internal_steps": "adaptive", "irregular_stop_state": "diagnostic_only"}
+_FIXED_STORAGE_FIELDS: Final = {"compression": "gzip"}
+_INPUT_FILENAMES: Final = {"spatial": "fields.csv", "scalar": "scalars.csv", "schedule": "schedule.csv"}
+_INPUT_DELIMITER: Final = ";"
+_OPERATION_ID: Final = "fixed_bed"
+_OPERATION_CONSTRAINTS: Final = {
+    "heater_only": True,
+    "humidity_ratio_conserved": "omega_source_air(t)=omega_in_bc(t)",
+    "source_relative_humidity": "RH(T_amb,omega_in_bc(t),p_ref)",
+    "inlet_relative_humidity": "RH(T_in_bc(t),omega_in_bc(t),p_ref)",
+    "infeasible_schedule_policy": "reject_complete_schedule_and_deterministically_resample",
+    "porosity_natural_support_policy": "realized_mean_must_retain_natural_or_kappa_mean_ood_state",
+}
+# Registry coordinates fixed_bed.yaml owns; bed_fields.yaml owns every other operator-owned coordinate (bed, permeability, porosity,
+# inlet-pressure shape and initial-moisture structure), and the material files own these.
+_OPERATION_BLOCK: Final = "operation"
+_MATERIAL_OWNED_PARAMETERS: Final = frozenset(
+    {
+        "kappa_mean",
+        "initial_moisture.mean_db",
+        "initial_moisture.amplitude_db",
+        "rho_bu_dry_ref",
+        "eps_bed_ref",
+        "k_gr",
+        "cp_gr_dry",
+        "X_target_wb",
+        "oswin",
+        "r_surf_0",
+        "r_int_surf",
+        "f_surf",
+    }
+)
+_GLOBAL_PARAMETERS: Final = frozenset({"eps_min_global", "eps_max_global"})
+# The layered configuration files a campaign (and so a Dataset plan's generation block) references.
+_CAMPAIGN_REFERENCES: Final = (
+    "sources_config",
+    "registry_config",
+    "common_config",
+    "operations_config",
+    "bed_fields_config",
+    "profile_config",
+    "execution_config",
+)
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _COMSOL_OWNED_ARGUMENTS = (
     "-autosave",
@@ -203,9 +241,9 @@ def resolve_batch_locators(
     material_family : str
         Material family of the batch.
     sampling_regime : str
-        Sampling regime of the original batch; a replacement keeps its parent regime.
+        Design kind of the original batch; a replacement keeps its parent's kind.
     scientific : Mapping[str, Any]
-        Resolved scientific values whose optional ``supplemental_design`` marks a
+        Resolved scientific values whose optional ``replacement_design`` marks a
         canonical replacement.
 
     Returns
@@ -223,7 +261,7 @@ def resolve_batch_locators(
 
     """
     batch_name = build_batch_name(simulation_profile, material_family, sampling_regime)
-    design = scientific.get("supplemental_design")
+    design = scientific.get("replacement_design")
     if design is None:
         return batch_name, sampling_regime
     ordinal = design.get("candidate_ordinal") if isinstance(design, Mapping) else None
@@ -294,21 +332,12 @@ class GenerationConfig:
         return f"case_{case_index:0{CASE_ID_WIDTH}d}"
 
     def case_seed(self, case_index: int) -> int:
-        """Return the label-derived master seed for one executable case."""
+        """Return the master seed of one executable case from its design seed and design point index, never its case index."""
         self.case_id(case_index)
         if self.seed_base is None:
             message = f"Batch {self.batch_name!r} has no resolved seed."
             raise ValueError(message)
-        assignment = self.assignments[case_index]
-        return seeding.derive_seed(
-            self.seed_base,
-            "case",
-            self.profile.id,
-            self.material_family,
-            self.sampling_regime,
-            str(assignment["assignment_role"]),
-            str(case_index),
-        )
+        return seeding.derive_seed(self.seed_base, "case", str(self.assignments[case_index]["design_index"]))
 
     def case_assignment(self, case_index: int) -> dict[str, Any]:
         """Return an isolated material, regime, and OOD assignment."""
@@ -341,7 +370,7 @@ class CampaignConfig:
     duplicate_case_input_policy: str
     execution_values: dict[str, Any]
     root_seed: int
-    sampling_mode: str
+    designs: dict[str, dict[str, int]]
     selected_targets: dict[str, int]
     composition_sources: tuple[dict[str, Any], ...] = ()
     scientific_overrides: Mapping[str, Any] | None = None
@@ -398,7 +427,7 @@ class CampaignConfig:
             for batch in self.batches
             if batch.profile.id == profile_id and batch.material_family == material_family and batch.sampling_regime == sampling_regime
         )
-        matches = tuple(batch for batch in matches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+        matches = tuple(batch for batch in matches if not isinstance(batch.scientific_values.get("replacement_design"), dict))
         if len(matches) > 1:
             message = (
                 "Campaign batch identities are ambiguous for "
@@ -500,21 +529,6 @@ def _integer(value: Any, *, label: str, minimum: int = 0) -> int:
     return value
 
 
-def validate_relative_file(value: Any, *, label: str, suffix: str | None = None) -> str:
-    """Return one safe case-local filename."""
-    if not isinstance(value, str) or not value or value.strip() != value:
-        message = f"{label} must be one non-empty case-local filename."
-        raise GenerationConfigError(message)
-    path = Path(value)
-    if path.name != value or path.is_absolute() or value in {".", ".."} or "\x00" in value:
-        message = f"{label} must be one non-empty case-local filename, got {value!r}."
-        raise GenerationConfigError(message)
-    if suffix is not None and path.suffix.lower() != suffix:
-        message = f"{label} must end in {suffix!r}, got {value!r}."
-        raise GenerationConfigError(message)
-    return value
-
-
 def _delimiter(value: Any, *, label: str) -> str:
     """Return one supported deterministic text-table delimiter."""
     if value == "\t":
@@ -602,6 +616,7 @@ def validation_error_details(path: Path | str, error: Exception) -> dict[str, An
         "sources": "sources_config",
         "registry": "registry_config",
         "operations": "operations_config",
+        "bed_fields": "bed_fields_config",
         "profile": "profile_config",
         "execution": "execution_config",
     }
@@ -681,28 +696,20 @@ def _validate_grid(value: Any) -> dict[str, Any]:
 
 
 def _validate_time(value: Any) -> dict[str, Any]:
-    """Validate a regular output-time contract and derive its exact nodes."""
+    """Validate a regular output-time contract, add the fixed adaptive-solver fields and derive its exact nodes."""
     time = _mapping(value, label="common.time")
-    expected = {"start", "stop", "interval", "internal_steps", "irregular_stop_state"}
-    _exact_keys(time, required=expected, optional=set(), label="common.time")
-    normalized = {
+    _exact_keys(time, required={"start", "stop", "interval"}, optional=set(), label="common.time")
+    normalized: dict[str, Any] = {
         "start": _finite(time["start"], label="common.time.start"),
         "stop": _finite(time["stop"], label="common.time.stop"),
         "interval": _finite(time["interval"], label="common.time.interval"),
-        "internal_steps": time["internal_steps"],
-        "irregular_stop_state": time["irregular_stop_state"],
+        **_FIXED_TIME_FIELDS,
     }
     if normalized["start"] < 0.0 or normalized["stop"] <= normalized["start"]:
         message = "common.time must have 0 <= start < stop."
         raise GenerationConfigError(message)
     if normalized["interval"] <= 0.0:
         message = "common.time.interval must be strictly positive."
-        raise GenerationConfigError(message)
-    if normalized["internal_steps"] != "adaptive":
-        message = "common.time.internal_steps must use the supported adaptive solver policy."
-        raise GenerationConfigError(message)
-    if normalized["irregular_stop_state"] != "diagnostic_only":
-        message = "common.time.irregular_stop_state must remain diagnostic_only."
         raise GenerationConfigError(message)
     step_count = (normalized["stop"] - normalized["start"]) / normalized["interval"]
     regular_intervals = round(step_count)
@@ -840,80 +847,25 @@ def _validate_scientific_fixed(
     return resolved_values, records
 
 
-def _validate_input_contract(value: Any) -> dict[str, Any]:
-    """Validate canonical profile-specific spatial, scalar, and schedule adapters."""
-    contract = _mapping(value, label="common.input_contract")
-    _exact_keys(contract, required={"spatial", "scalar", "schedule"}, optional=set(), label="common.input_contract")
-    expected_filenames = {"spatial": "fields.csv", "scalar": "scalars.csv", "schedule": "schedule.csv"}
-    filenames: set[str] = set()
-    normalized: dict[str, Any] = {}
-    for name in ("spatial", "scalar", "schedule"):
-        adapter = _mapping(contract[name], label=f"common.input_contract.{name}")
-        _exact_keys(adapter, required={"filename", "delimiter", "columns"}, optional=set(), label=f"common.input_contract.{name}")
-        filename = validate_relative_file(adapter["filename"], label=f"common.input_contract.{name}.filename", suffix=".csv")
-        if filename != expected_filenames[name]:
-            message = f"{name} adapter must use canonical filename {expected_filenames[name]!r}."
-            raise GenerationConfigError(message)
-        if filename in filenames:
-            msg = "Input adapter filenames must be unique."
-            raise GenerationConfigError(msg)
-        filenames.add(filename)
-        normalized[name] = {
-            "filename": filename,
-            "delimiter": _delimiter(adapter["delimiter"], label=f"common.input_contract.{name}.delimiter"),
-        }
-        columns = adapter["columns"]
-        if name == "spatial":
-            by_profile = _mapping(columns, label="common.input_contract.spatial.columns")
-            expected_profiles = set(profiles.available_profiles())
-            _exact_keys(by_profile, required=expected_profiles, optional=set(), label="common.input_contract.spatial.columns")
-            normalized["spatial"]["columns_by_profile"] = {}
-            for profile_id in profiles.available_profiles():
-                expected = list(profiles.spatial_input_fields(profile_id))
-                if by_profile[profile_id] != expected:
-                    message = f"Spatial adapter for {profile_id!r} must use exact columns {expected}."
-                    raise GenerationConfigError(message)
-                normalized["spatial"]["columns_by_profile"][profile_id] = expected
-        else:
-            expected = ["name", "value", "unit"] if name == "scalar" else list(profiles.SCHEDULE_FIELDS)
-            if columns != expected:
-                message = f"{name} adapter must use exact columns {expected}."
-                raise GenerationConfigError(message)
-            normalized[name]["columns"] = list(columns)
-    return normalized
+def _input_contract() -> dict[str, Any]:
+    """Return the canonical spatial, scalar, and schedule adapters the simulation templates read."""
+    return {
+        "spatial": {
+            "filename": _INPUT_FILENAMES["spatial"],
+            "delimiter": _INPUT_DELIMITER,
+            "columns_by_profile": {profile_id: list(profiles.spatial_input_fields(profile_id)) for profile_id in profiles.available_profiles()},
+        },
+        "scalar": {"filename": _INPUT_FILENAMES["scalar"], "delimiter": _INPUT_DELIMITER, "columns": ["name", "value", "unit"]},
+        "schedule": {"filename": _INPUT_FILENAMES["schedule"], "delimiter": _INPUT_DELIMITER, "columns": list(profiles.SCHEDULE_FIELDS)},
+    }
 
 
 def _validate_storage(value: Any) -> dict[str, Any]:
-    """Validate the versioned HDF5 conversion and configured layout settings."""
-    storage = _mapping(value, label="common.storage")
-    expected = {
-        "schema_version",
-        "converter_version",
-        "compression",
-        "compression_level",
-        "shuffle",
-        "float32_rtol",
-        "float32_atol",
-        "chunk_time",
-        "chunk_y",
-        "chunk_x",
-    }
-    _exact_keys(storage, required=expected, optional=set(), label="common.storage")
-    storage["schema_version"] = _integer(storage["schema_version"], label="common.storage.schema_version", minimum=1)
-    storage["converter_version"] = _integer(
-        storage["converter_version"],
-        label="common.storage.converter_version",
-        minimum=1,
-    )
-    if (
-        not common.serialization.is_schema_version(storage["schema_version"], CANONICAL_HDF5_SCHEMA_VERSION)
-        or storage["converter_version"] != CANONICAL_HDF5_CONVERTER_VERSION
-    ):
-        msg = f"Canonical storage must use schema {CANONICAL_HDF5_SCHEMA_VERSION} and converter {CANONICAL_HDF5_CONVERTER_VERSION!r}."
-        raise GenerationConfigError(msg)
-    if storage["compression"] != "gzip":
-        message = "Canonical HDF5 schema v1 supports gzip compression."
-        raise GenerationConfigError(message)
+    """Validate the configured HDF5 layout settings and add the fixed compression."""
+    authored = _mapping(value, label="common.storage")
+    expected = {"compression_level", "shuffle", "float32_rtol", "float32_atol", "chunk_time", "chunk_y", "chunk_x"}
+    _exact_keys(authored, required=expected, optional=set(), label="common.storage")
+    storage = {**_FIXED_STORAGE_FIELDS, **authored}
     storage["compression_level"] = _integer(
         storage["compression_level"],
         label="common.storage.compression_level",
@@ -1010,33 +962,18 @@ def _validate_common(
     common_config = _mapping(value, label="generation common configuration")
     expected = {
         "schema_kind",
-        "schema_version",
-        "generator_version",
         "parameter_values",
         "scientific_fixed_values",
-        "physical_formulas",
-        "physical_formulas_provenance",
         "grid",
         "grid_provenance",
         "time",
         "time_provenance",
-        "input_contract",
         "validation",
         "storage",
     }
     _exact_keys(common_config, required=expected, optional={"schedule_time", "schedule_time_provenance"}, label="generation common configuration")
-    if common_config["schema_kind"] != "generation_common" or not common.serialization.is_schema_version(
-        common_config["schema_version"], COMMON_SCHEMA_VERSION
-    ):
+    if common_config["schema_kind"] != "generation_common":
         message = "Unsupported generation common configuration schema."
-        raise GenerationConfigError(message)
-    common_config["generator_version"] = _integer(
-        common_config["generator_version"],
-        label="generation common generator_version",
-        minimum=1,
-    )
-    if common_config["generator_version"] != seeding.GENERATOR_VERSION:
-        message = f"generator_version must be {seeding.GENERATOR_VERSION!r}."
         raise GenerationConfigError(message)
     common_config["parameter_values"] = _mapping(common_config["parameter_values"], label="common.parameter_values")
     if set(common_config["parameter_values"]) != {"eps_min_global", "eps_max_global"}:
@@ -1045,17 +982,11 @@ def _validate_common(
     for name, record in common_config["parameter_values"].items():
         materials.resolve_value_record(record, sources=sources, label=f"common.parameter_values.{name}")
 
-    formulas = _mapping(common_config["physical_formulas"], label="common.physical_formulas")
-    _exact_keys(formulas, required=set(_FINAL_PHYSICAL_FORMULAS), optional=set(), label="common.physical_formulas")
-    if formulas != _FINAL_PHYSICAL_FORMULAS:
-        message = "common.physical_formulas must match the frozen final VP2 formula contract exactly."
-        raise GenerationConfigError(message)
-    common_config["physical_formulas"] = formulas
-    common_config["physical_formulas_provenance"] = provenance_service.resolve_provenance(
-        common_config["physical_formulas_provenance"],
-        sources=sources,
-        label="common.physical_formulas_provenance",
-    )
+    contract_provenance = provenance_service.resolve_provenance(_CODE_CONTRACT_PROVENANCE, sources=sources, label="code contract provenance")
+    common_config["physical_formulas"] = copy.deepcopy(_FINAL_PHYSICAL_FORMULAS)
+    common_config["physical_formulas_provenance"] = contract_provenance
+    common_config["input_contract"] = _input_contract()
+    fixed_time_provenance = {name: copy.deepcopy(contract_provenance) for name in _FIXED_TIME_FIELDS}
 
     fixed_values, fixed_records = _validate_scientific_fixed(
         common_config["scientific_fixed_values"],
@@ -1073,10 +1004,10 @@ def _validate_common(
     common_config["time"] = _validate_time(common_config["time"])
     common_config["time_provenance"] = _validate_provenance_owners(
         common_config["time_provenance"],
-        expected_names={"start", "stop", "interval", "internal_steps", "irregular_stop_state"},
+        expected_names={"start", "stop", "interval"},
         sources=sources,
         label="common.time_provenance",
-    )
+    ) | copy.deepcopy(fixed_time_provenance)
     schedule_keys = {"schedule_time", "schedule_time_provenance"}
     if schedule_keys.intersection(common_config):
         if not schedule_keys.issubset(common_config):
@@ -1094,137 +1025,34 @@ def _validate_common(
         common_config["schedule_time"] = schedule_time
         common_config["schedule_time_provenance"] = _validate_provenance_owners(
             common_config["schedule_time_provenance"],
-            expected_names={"start", "stop", "interval", "internal_steps", "irregular_stop_state"},
+            expected_names={"start", "stop", "interval"},
             sources=sources,
             label="common.schedule_time_provenance",
-        )
-    common_config["input_contract"] = _validate_input_contract(common_config["input_contract"])
+        ) | copy.deepcopy(fixed_time_provenance)
     common_config["validation"] = _validate_validation(common_config["validation"])
     common_config["storage"] = _validate_storage(common_config["storage"])
     return common_config
 
 
-def _validate_steady_flow_conditioning(
-    value: Any,
-    *,
-    fixed_values: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Validate exhaustive package-fixed stationary-airflow conditioning."""
-    conditioning = _mapping(
-        value,
-        label="generation profile steady_flow_conditioning",
-    )
-    _exact_keys(
-        conditioning,
-        required={
-            "schema_kind",
-            "schema_version",
-            "exhaustive",
-            "stationary_solution_contract_id",
-            "dependencies",
-            "additional_case_varying_solver_scalars",
-        },
-        optional=set(),
-        label="generation profile steady_flow_conditioning",
-    )
-    if (
-        conditioning["schema_kind"] != "steady_flow_conditioning"
-        or not common.serialization.is_schema_version(conditioning["schema_version"], CONDITIONING_SCHEMA_VERSION)
-        or conditioning["exhaustive"] is not True
-        or conditioning["stationary_solution_contract_id"] != "vp2_stationary_airflow_v1"
-    ):
-        message = "The steady-flow conditioning header is not the binding exhaustive VP2 contract."
-        raise GenerationConfigError(message)
-    dependencies = conditioning["dependencies"]
-    if not isinstance(dependencies, list):
-        message = "steady_flow_conditioning.dependencies must be an ordered list."
-        raise TypeError(message)
-    validated: list[dict[str, Any]] = []
-    for index, raw in enumerate(dependencies):
-        label = f"steady_flow_conditioning.dependencies[{index}]"
-        dependency = _mapping(raw, label=label)
-        _exact_keys(
-            dependency,
-            required={"name", "affects_stationary_solution", "owner", "unit"},
-            optional={"fixed_value"},
-            label=label,
-        )
-        name = dependency["name"]
-        if not isinstance(name, str) or not name:
-            message = f"{label}.name must be non-empty text."
-            raise TypeError(message)
-        if dependency["affects_stationary_solution"] is not True:
-            message = f"{label} must explicitly affect the stationary solution."
-            raise GenerationConfigError(message)
-        owner = dependency["owner"]
-        if owner not in {"model_input", "package_fixed"}:
-            message = f"{label}.owner must be model_input or package_fixed."
-            raise GenerationConfigError(message)
-        unit = dependency["unit"]
-        if not isinstance(unit, str) or not unit:
-            message = f"{label}.unit must be non-empty text."
-            raise TypeError(message)
-        if owner == "model_input":
-            if "fixed_value" in dependency:
-                message = f"{label} model inputs cannot author fixed_value."
-                raise GenerationConfigError(message)
-        elif "fixed_value" in dependency:
-            _finite(
-                dependency["fixed_value"],
-                label=f"{label}.fixed_value",
-            )
-        validated.append(dependency)
-    model_input_names = tuple(name for name in profiles.STEADY_SPATIAL_INPUT_FIELDS if name not in {"x", "y"})
-    expected_dependencies = (*model_input_names, *profiles.STATIONARY_FIXED_FIELDS)
-    names = tuple(str(dependency["name"]) for dependency in validated)
-    if names != expected_dependencies:
-        message = f"steady_flow_conditioning.dependencies must be exactly {list(expected_dependencies)} in order."
-        raise GenerationConfigError(message)
-    additional = _name_list(
-        conditioning["additional_case_varying_solver_scalars"],
-        label="steady_flow_conditioning.additional_case_varying_solver_scalars",
-        allow_empty=True,
-    )
-    if additional:
-        message = "The canonical steady template permits no additional case-varying solver scalars."
-        raise GenerationConfigError(message)
-    declared = {str(dependency["name"]): dependency for dependency in validated}
-    static_units: dict[str, str] = dict(
-        zip(
-            profiles.STEADY_STATIC_FIELD_NAMES,
-            profiles.STEADY_STATIC_FIELD_UNITS,
-            strict=True,
-        )
-    )
-    expected_model_inputs = {name: static_units[name] for name in model_input_names}
-    for name, unit in expected_model_inputs.items():
-        if declared[name] != {
-            "name": name,
-            "affects_stationary_solution": True,
-            "owner": "model_input",
-            "unit": unit,
-        }:
-            message = f"Steady-flow conditioning for {name!r} must be owned only by fields.csv."
-            raise GenerationConfigError(message)
-    for name, unit in zip(
-        profiles.STATIONARY_FIXED_FIELDS,
-        profiles.STATIONARY_FIXED_UNITS,
-        strict=True,
-    ):
-        expected_value = float(fixed_values[name])
-        declared[name]["fixed_value"] = expected_value
-        if declared[name] != {
-            "name": name,
-            "affects_stationary_solution": True,
-            "owner": "package_fixed",
-            "unit": unit,
-            "fixed_value": expected_value,
-        }:
-            message = f"Steady-flow conditioning for {name!r} disagrees with the resolved common-value contract."
-            raise GenerationConfigError(message)
-    conditioning["dependencies"] = validated
-    conditioning["additional_case_varying_solver_scalars"] = []
-    return conditioning
+def _steady_flow_conditioning(fixed_values: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the exhaustive stationary-airflow conditioning both profiles share: the fields.csv inputs and the fixed common values."""
+    static_units: dict[str, str] = dict(zip(profiles.STEADY_STATIC_FIELD_NAMES, profiles.STEADY_STATIC_FIELD_UNITS, strict=True))
+    model_inputs = [
+        {"name": name, "affects_stationary_solution": True, "owner": "model_input", "unit": static_units[name]}
+        for name in profiles.STEADY_SPATIAL_INPUT_FIELDS
+        if name not in {"x", "y"}
+    ]
+    package_fixed = [
+        {"name": name, "affects_stationary_solution": True, "owner": "package_fixed", "unit": unit, "fixed_value": float(fixed_values[name])}
+        for name, unit in zip(profiles.STATIONARY_FIXED_FIELDS, profiles.STATIONARY_FIXED_UNITS, strict=True)
+    ]
+    return {
+        "schema_kind": "steady_flow_conditioning",
+        "exhaustive": True,
+        "stationary_solution_contract_id": "vp2_stationary_airflow",
+        "dependencies": [*model_inputs, *package_fixed],
+        "additional_case_varying_solver_scalars": [],
+    }
 
 
 def _validate_mapping_value(
@@ -1241,9 +1069,7 @@ def _validate_mapping_value(
         message = f"{label} is incomplete; an explicit executable mapping declaration is required."
         raise GenerationConfigError(message)
     if isinstance(value, Mapping) and "state" in value:
-        message = (
-            f"{label} uses obsolete persistent export-mapping verification state; generation profile schema_version 1 requires a scalar declaration."
-        )
+        message = f"{label} uses obsolete persistent export-mapping verification state; the generation profile requires a scalar declaration."
         raise GenerationConfigError(message)
     if not isinstance(value, str) or not value or value.strip() != value or any(character in value for character in ("\x00", "\n", "\r")):
         message = f"{label} must be safe non-empty text."
@@ -1265,7 +1091,6 @@ def _validate_profile_config(
     value: Any,
     *,
     profile: profiles.SimulationProfile,
-    fixed_values: Mapping[str, Any],
     require_executable: bool,
 ) -> tuple[dict[str, Any], templates.ResolvedTemplateIdentity]:
     """Validate configured template identity and explicit export mappings."""
@@ -1273,33 +1098,18 @@ def _validate_profile_config(
         message = "require_executable must be boolean."
         raise TypeError(message)
     config = _mapping(value, label="generation profile configuration")
-    expected = {
-        "schema_kind",
-        "schema_version",
-        "simulation_profile",
-        "template",
-        "steady_flow_conditioning",
-        "exports",
-    }
+    expected = {"schema_kind", "simulation_profile", "template", "exports"}
     _exact_keys(
         config,
         required=expected,
         optional=set(),
         label="generation profile configuration",
     )
-    if (
-        config["schema_kind"] != "generation_profile"
-        or not common.serialization.is_schema_version(config["schema_version"], PROFILE_SCHEMA_VERSION)
-        or config["simulation_profile"] != profile.id
-    ):
+    if config["schema_kind"] != "generation_profile" or config["simulation_profile"] != profile.id:
         message = "Generation profile configuration schema or profile identity is invalid."
         raise GenerationConfigError(message)
     template = templates.resolve_template_identity(config["template"])
     config["template"] = template.relative_path
-    config["steady_flow_conditioning"] = _validate_steady_flow_conditioning(
-        config["steady_flow_conditioning"],
-        fixed_values=fixed_values,
-    )
     exports = config["exports"]
     if not isinstance(exports, list):
         message = "generation profile exports must be an ordered list."
@@ -1408,44 +1218,19 @@ def _validate_operations(
     definitions: Mapping[str, Mapping[str, Any]],
     time_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate material-independent operating-distribution ownership."""
+    """Validate the operating and inlet-schedule distributions and add the fixed operation identity and rules."""
     operations = _mapping(value, label="generation operations configuration")
-    expected = {
-        "schema_kind",
-        "schema_version",
-        "operation_id",
-        "constraints",
-        "boundary_schedule",
-        "parameter_values",
-    }
-    _exact_keys(operations, required=expected, optional=set(), label="generation operations configuration")
-    if operations["schema_kind"] != "generation_operations" or not common.serialization.is_schema_version(
-        operations["schema_version"], OPERATIONS_SCHEMA_VERSION
-    ):
+    _exact_keys(
+        operations,
+        required={"schema_kind", "parameter_values", "boundary_schedule"},
+        optional=set(),
+        label="generation operations configuration",
+    )
+    if operations["schema_kind"] != "generation_operations":
         message = "Unsupported generation operations schema."
         raise GenerationConfigError(message)
-    if operations["operation_id"] != "fixed_bed":
-        message = "The maintained operation configuration must use operation_id fixed_bed."
-        raise GenerationConfigError(message)
-    constraints = _mapping(operations["constraints"], label="operations.constraints")
-    expected_constraints = {
-        "heater_only": True,
-        "humidity_ratio_conserved": "omega_source_air(t)=omega_in_bc(t)",
-        "source_relative_humidity": "RH(T_amb,omega_in_bc(t),p_ref)",
-        "inlet_relative_humidity": "RH(T_in_bc(t),omega_in_bc(t),p_ref)",
-        "infeasible_schedule_policy": "reject_complete_schedule_and_deterministically_resample",
-        "porosity_natural_support_policy": ("realized_mean_must_retain_natural_or_kappa_mean_ood_state"),
-    }
-    _exact_keys(
-        constraints,
-        required=set(expected_constraints),
-        optional=set(),
-        label="operations.constraints",
-    )
-    if constraints != expected_constraints:
-        message = "operations.constraints must match the supplied heater, humidity, rejection, and porosity policies."
-        raise GenerationConfigError(message)
-    operations["constraints"] = constraints
+    operations["operation_id"] = _OPERATION_ID
+    operations["constraints"] = copy.deepcopy(_OPERATION_CONSTRAINTS)
 
     boundary_schedule = _mapping(
         operations["boundary_schedule"],
@@ -1500,34 +1285,9 @@ def _validate_operations(
     }
     operations["boundary_schedule"] = boundary_schedule
 
-    parameter_values = _mapping(operations["parameter_values"], label="operations.parameter_values")
-    material_owned = {
-        "kappa_mean",
-        "initial_moisture.mean_db",
-        "initial_moisture.amplitude_db",
-        "rho_bu_dry_ref",
-        "eps_bed_ref",
-        "k_gr",
-        "cp_gr_dry",
-        "X_target_wb",
-        "oswin",
-        "r_surf_0",
-        "r_int_surf",
-        "f_surf",
-    }
-    derived_parameters = {name for name, definition in definitions.items() if definition.get("kind") == "derived"}
-    expected_parameters = set(definitions).difference(derived_parameters).difference(material_owned).difference({"eps_min_global", "eps_max_global"})
-    if set(parameter_values) != expected_parameters:
-        missing = sorted(expected_parameters.difference(parameter_values))
-        unknown = sorted(set(parameter_values).difference(expected_parameters))
-        message = f"operations.parameter_values ownership mismatch: missing={missing}, unknown={unknown}."
-        raise GenerationConfigError(message)
-    for name, record in parameter_values.items():
-        materials.resolve_value_record(
-            record,
-            sources=sources,
-            label=f"operations.parameter_values.{name}",
-        )
+    parameter_values = _validate_parameter_owner(
+        operations["parameter_values"], definitions=definitions, operation_block=True, sources=sources, label="operations.parameter_values"
+    )
     try:
         schedule_service.validate_temporal_support_resolution(
             parameter_values,
@@ -1538,6 +1298,51 @@ def _validate_operations(
         raise GenerationConfigError(message) from error
     operations["parameter_values"] = parameter_values
     return operations
+
+
+def _validate_parameter_owner(
+    value: Any,
+    *,
+    definitions: Mapping[str, Mapping[str, Any]],
+    operation_block: bool,
+    sources: Mapping[str, Mapping[str, Any]],
+    label: str,
+) -> dict[str, Any]:
+    """Validate the exact operator-owned registry coordinates inside or outside the operation block, with their provenance."""
+    parameter_values = _mapping(value, label=label)
+    expected = {
+        name
+        for name, definition in definitions.items()
+        if definition.get("kind") != "derived"
+        and name not in _MATERIAL_OWNED_PARAMETERS | _GLOBAL_PARAMETERS
+        and (definition.get("block") == _OPERATION_BLOCK) == operation_block
+    }
+    if set(parameter_values) != expected:
+        missing = sorted(expected.difference(parameter_values))
+        unknown = sorted(set(parameter_values).difference(expected))
+        message = f"{label} ownership mismatch: missing={missing}, unknown={unknown}."
+        raise GenerationConfigError(message)
+    for name, record in parameter_values.items():
+        materials.resolve_value_record(record, sources=sources, label=f"{label}.{name}")
+    return parameter_values
+
+
+def _validate_bed_fields(
+    value: Any,
+    *,
+    sources: Mapping[str, Mapping[str, Any]],
+    definitions: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Validate the bed, permeability, porosity, inlet-pressure and initial-moisture field statistics."""
+    label = "generation bed-field configuration"
+    bed_fields = _mapping(value, label=label)
+    _exact_keys(bed_fields, required={"schema_kind", "parameter_values"}, optional=set(), label=label)
+    if bed_fields["schema_kind"] != "generation_bed_fields":
+        message = "Unsupported generation bed-field schema."
+        raise GenerationConfigError(message)
+    return _validate_parameter_owner(
+        bed_fields["parameter_values"], definitions=definitions, operation_block=False, sources=sources, label="bed_fields.parameter_values"
+    )
 
 
 def _name_list(value: Any, *, label: str, allow_empty: bool = False) -> tuple[str, ...]:
@@ -1561,39 +1366,18 @@ def _uint32(value: Any, *, label: str) -> int:
     return number
 
 
-def _validate_batch_counts(
-    value: Any,
-    *,
-    materials_in_order: tuple[str, ...],
-    seen: tuple[str, ...],
-    regimes: tuple[str, ...],
-) -> dict[str, dict[str, int]]:
-    """Validate positive batch counts and normalize material ordering."""
-    counts = _mapping(value, label="campaign.sampling.counts")
-    _exact_keys(counts, required=set(regimes), optional=set(), label="campaign.sampling.counts")
+def _validate_designs(value: Any, *, materials_in_order: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    """Validate one positive design size per configured material and design kind, in material and design-kind order."""
+    designs = _mapping(value, label="campaign.sampling.designs")
+    _exact_keys(designs, required=set(materials_in_order), optional=set(), label="campaign.sampling.designs")
     normalized: dict[str, dict[str, int]] = {}
-    for regime in regimes:
-        raw = _mapping(counts[regime], label=f"campaign.sampling.counts.{regime}")
-        if not raw:
-            message = f"campaign.sampling.counts.{regime} must declare at least one material."
-            raise GenerationConfigError(message)
-        allowed = materials_in_order if regime == "natural" else seen
-        unknown = set(raw).difference(allowed)
-        if unknown:
-            message = f"campaign.sampling.counts.{regime} references materials outside its eligible role: {sorted(unknown)}."
-            raise GenerationConfigError(message)
-        if regime == "natural" and set(raw) != set(materials_in_order):
-            missing = set(materials_in_order).difference(raw)
-            message = f"campaign.sampling.counts.natural is missing configured materials {sorted(missing)}."
-            raise GenerationConfigError(message)
-        ordered_materials = tuple(material_family for material_family in allowed if material_family in raw)
-        normalized[regime] = {
-            material_family: _integer(
-                raw[material_family],
-                label=f"campaign.sampling.counts.{regime}.{material_family}",
-                minimum=0 if regime == "parameter_ood" else 1,
-            )
-            for material_family in ordered_materials
+    for material_family in materials_in_order:
+        kinds = _mapping(designs[material_family], label=f"campaign.sampling.designs.{material_family}")
+        _exact_keys(kinds, required=set(), optional=set(DESIGN_KINDS), label=f"campaign.sampling.designs.{material_family}")
+        normalized[material_family] = {
+            kind: _integer(kinds[kind], label=f"campaign.sampling.designs.{material_family}.{kind}", minimum=1)
+            for kind in DESIGN_KINDS
+            if kind in kinds
         }
     return normalized
 
@@ -1627,36 +1411,32 @@ def _validate_parameter_ood_policy(
     return policy
 
 
-def _build_assignments(
+def design_point_assignment(
     material_family: str,
     sampling_regime: str,
     *,
     material_role: str,
-    case_count: int,
-    ood_allocation: tuple[Mapping[str, str], ...],
-) -> dict[int, dict[str, Any]]:
-    """Build deterministic material and parameter-OOD assignments."""
-    if sampling_regime == "parameter_ood" and len(ood_allocation) != case_count:
-        message = "Parameter-OOD assignment count disagrees with its eligible-unit allocation."
-        raise GenerationConfigError(message)
-    assignments: dict[int, dict[str, Any]] = {}
-    for case_index in range(1, case_count + 1):
-        regime_index = case_index - 1
-        allocated = ood_allocation[regime_index] if sampling_regime == "parameter_ood" else None
-        ood_group = None if allocated is None else allocated["ood_group"]
-        assignment_role = str(allocated["unit_id"]) if allocated is not None else material_role
-        assignment = {
-            "case_index": case_index,
-            "regime_index": regime_index,
-            "material_family": material_family,
-            "sampling_regime": sampling_regime,
-            "assignment_role": assignment_role,
-            "ood_group": ood_group,
-            "ood_unit_id": None if allocated is None else allocated["unit_id"],
-            "ood_units_per_case": 1 if allocated is not None else 0,
-        }
-        assignments[case_index] = assignment
-    return assignments
+    case_index: int,
+    design_index: int,
+    eligible_units: tuple[Mapping[str, str], ...],
+) -> dict[str, Any]:
+    """Return the assignment of design point ``design_index`` executed as material-local case ``case_index``.
+
+    A parameter-OOD point takes eligible unit ``design_index mod n``, so the point carries the same unit in every plan.
+    """
+    allocated = (
+        sampling_service.allocate_ood_units(eligible_units, case_count=1, first_point=design_index)[0] if sampling_regime == "parameter_ood" else None
+    )
+    return {
+        "case_index": case_index,
+        "design_index": design_index,
+        "material_family": material_family,
+        "sampling_regime": sampling_regime,
+        "assignment_role": material_role if allocated is None else str(allocated["unit_id"]),
+        "ood_group": None if allocated is None else allocated["ood_group"],
+        "ood_unit_id": None if allocated is None else allocated["unit_id"],
+        "ood_units_per_case": 0 if allocated is None else 1,
+    }
 
 
 def _safe_text_or_none(value: Any, *, label: str) -> str | None:
@@ -1695,7 +1475,7 @@ def parse_wall_time_seconds(value: Any, *, label: str) -> int:
 
 def _validated_node_job_wall_time(value: Any, *, timeout_seconds: float) -> str:
     """Return the HH:MM:SS node-job time that fits one complete case and stays within a day."""
-    label = "execution.cluster.node_job_wall_time"
+    label = "execution.node_job.node_job_wall_time"
     text = _safe_text_or_none(value, label=label)
     if text is None:
         message = f"{label} must use HH:MM:SS."
@@ -1707,67 +1487,24 @@ def _validated_node_job_wall_time(value: Any, *, timeout_seconds: float) -> str:
     required_seconds = timeout_seconds + _NODE_PUBLICATION_MARGIN_SECONDS
     if wall_seconds <= required_seconds:
         message = (
-            f"{label} ({text}) must exceed execution.runtime.timeout_seconds plus a {_NODE_PUBLICATION_MARGIN_SECONDS} s publication margin "
+            f"{label} ({text}) must exceed execution.run.timeout_seconds plus a {_NODE_PUBLICATION_MARGIN_SECONDS} s publication margin "
             f"({required_seconds:g} s), so that one case fits into a fresh node job."
         )
         raise GenerationConfigError(message)
     return text
 
 
-def _validated_license_wait(value: Any) -> dict[str, Any]:
-    """Return one validated bounded node-wide licence wait and in-allocation retry policy."""
-    label = "execution.runtime.license_wait"
+def validated_license_wait(value: Any, *, label: str) -> dict[str, Any]:
+    """Return the validated licence-wait rule: ``enabled`` and a positive finite ``maximum_wait_seconds``."""
     wait = _mapping(value, label=label)
-    _exact_keys(
-        wait,
-        required={
-            "enabled",
-            "initial_delay_seconds",
-            "maximum_delay_seconds",
-            "maximum_wait_seconds",
-            "in_allocation_retry",
-        },
-        optional=set(),
-        label=label,
-    )
+    _exact_keys(wait, required={"enabled", "maximum_wait_seconds"}, optional=set(), label=label)
     if not isinstance(wait["enabled"], bool):
         message = f"{label}.enabled must be boolean."
         raise TypeError(message)
-    for key in (
-        "initial_delay_seconds",
-        "maximum_delay_seconds",
-        "maximum_wait_seconds",
-    ):
-        wait[key] = _finite(wait[key], label=f"{label}.{key}")
-        if wait[key] <= 0.0:
-            message = f"{label}.{key} must be positive."
-            raise GenerationConfigError(message)
-    if wait["maximum_delay_seconds"] < wait["initial_delay_seconds"]:
-        message = f"{label}.maximum_delay_seconds must be at least initial_delay_seconds."
+    wait["maximum_wait_seconds"] = _finite(wait["maximum_wait_seconds"], label=f"{label}.maximum_wait_seconds")
+    if wait["maximum_wait_seconds"] <= 0.0:
+        message = f"{label}.maximum_wait_seconds must be positive."
         raise GenerationConfigError(message)
-    if wait["maximum_wait_seconds"] < wait["initial_delay_seconds"]:
-        message = f"{label}.maximum_wait_seconds must be at least initial_delay_seconds."
-        raise GenerationConfigError(message)
-    in_allocation = _mapping(wait["in_allocation_retry"], label=f"{label}.in_allocation_retry")
-    _exact_keys(
-        in_allocation,
-        required={
-            "enabled",
-            "maximum_window_seconds",
-            "pause_after_capacity_failure_seconds",
-        },
-        optional=set(),
-        label=f"{label}.in_allocation_retry",
-    )
-    if not isinstance(in_allocation["enabled"], bool):
-        message = f"{label}.in_allocation_retry.enabled must be boolean."
-        raise TypeError(message)
-    for key in ("maximum_window_seconds", "pause_after_capacity_failure_seconds"):
-        in_allocation[key] = _finite(in_allocation[key], label=f"{label}.in_allocation_retry.{key}")
-        if in_allocation[key] <= 0.0:
-            message = f"{label}.in_allocation_retry.{key} must be positive."
-            raise GenerationConfigError(message)
-    wait["in_allocation_retry"] = in_allocation
     return wait
 
 
@@ -1776,27 +1513,21 @@ def _require_execution_schema(execution: Mapping[str, Any]) -> None:
     if execution.get("schema_kind") != "generation_execution":
         msg = "Unsupported generation execution configuration schema."
         raise GenerationConfigError(msg)
-    if not common.serialization.is_schema_version(execution.get("schema_version"), EXECUTION_SCHEMA_VERSION):
-        msg = (
-            f"Generation execution configuration schema_version {execution.get('schema_version')!r} is not supported; "
-            f"schema_version {EXECUTION_SCHEMA_VERSION} is required."
-        )
-        raise GenerationConfigError(msg)
 
 
 def _derive_node_job_resources(cluster: dict[str, Any], *, cores_per_node: int) -> None:
     """Derive concurrency and memory of one node job from the authored case step; reject what does not fit."""
     if cluster["cores_per_case"] > cores_per_node:
-        msg = "execution.cluster.cores_per_case must not exceed site.cores_per_node."
+        msg = "execution.run.cores_per_case must not exceed execution.site.cores_per_node."
         raise GenerationConfigError(msg)
     concurrent_cases = cores_per_node // cluster["cores_per_case"]
-    case_mib = parse_slurm_memory_mib(cluster["memory_per_case"], label="execution.cluster.memory_per_case")
-    overhead_mib = parse_slurm_memory_mib(cluster["node_memory_overhead"], label="execution.cluster.node_memory_overhead")
-    limit_mib = parse_slurm_memory_mib(cluster["node_memory_limit"], label="execution.cluster.node_memory_limit")
+    case_mib = parse_slurm_memory_mib(cluster["memory_per_case"], label="execution.node_job.memory_per_case")
+    overhead_mib = parse_slurm_memory_mib(cluster["node_memory_overhead"], label="execution.node_job.node_memory_overhead")
+    limit_mib = parse_slurm_memory_mib(cluster["node_memory_limit"], label="execution.node_job.node_memory_limit")
     node_gib = math.ceil((concurrent_cases * case_mib + overhead_mib) / _SLURM_MEMORY_UNIT_MIB["G"])
     if node_gib * _SLURM_MEMORY_UNIT_MIB["G"] > limit_mib:
         msg = (
-            f"execution.cluster needs {node_gib}G per node job ({concurrent_cases} concurrent cases x {cluster['memory_per_case']} "
+            f"execution.node_job needs {node_gib}G per node job ({concurrent_cases} concurrent cases x {cluster['memory_per_case']} "
             f"+ {cluster['node_memory_overhead']}) but node_memory_limit is {cluster['node_memory_limit']}; "
             "raise cores_per_case or lower memory_per_case, the concurrency is never reduced silently."
         )
@@ -1805,183 +1536,157 @@ def _derive_node_job_resources(cluster: dict[str, Any], *, cores_per_node: int) 
     cluster["node_job_memory"] = f"{node_gib}G"
 
 
+_EXECUTION_GROUPS: Final = {
+    "run": ({"node_jobs", "cores_per_case", "timeout_seconds", "retention", "max_admission_cases"}, set()),
+    "rules": ({"license_wait", "extra_arguments"}, {"stall_stop"}),
+    "node_job": (
+        {"node_job_wall_time", "memory_per_case", "node_memory_overhead", "node_memory_limit", "scheduler_options"},
+        set(),
+    ),
+    "site": ({"partition", "cores_per_node", "comsol_module", "comsol_executable", "python_executable"}, set()),
+    "internals": ({"poll_interval_seconds", "graceful_stop_reserve_seconds"}, set()),
+}
+
+
+def _require_execution_layout(execution: Mapping[str, Any]) -> None:
+    """Require the exact top-level groups and the exact keys of every group; removed keys and the old layout fail here."""
+    _exact_keys(
+        execution,
+        required={"schema_kind", *_EXECUTION_GROUPS},
+        optional=set(),
+        label="generation execution configuration",
+    )
+    for group, (required, optional) in _EXECUTION_GROUPS.items():
+        _exact_keys(_mapping(execution[group], label=f"execution.{group}"), required=required, optional=optional, label=f"execution.{group}")
+
+
 def _apply_execution_overrides(value: Any, requested: Mapping[str, Any] | None) -> dict[str, Any]:
     """Apply explicit normal resource choices before authoritative validation."""
     execution = copy.deepcopy(_mapping(value, label="generation execution configuration"))
     _require_execution_schema(execution)
+    _require_execution_layout(execution)
     overrides = dict(requested or {})
     allowed = {"node_jobs", "max_admission_cases", "cores_per_case", "case_timeout_seconds", "no_retry"}
     if set(overrides) - allowed:
         message = "Unsupported normal execution overrides."
         raise GenerationConfigError(message)
     if "node_jobs" in overrides:
-        execution["cluster"]["node_jobs"] = _integer(overrides["node_jobs"], label="run.node_jobs", minimum=1)
+        execution["run"]["node_jobs"] = _integer(overrides["node_jobs"], label="run.node_jobs", minimum=1)
     if "max_admission_cases" in overrides:
-        execution["submission"]["max_admission_cases"] = _integer(overrides["max_admission_cases"], label="run.max_admission_cases", minimum=1)
+        execution["run"]["max_admission_cases"] = _integer(overrides["max_admission_cases"], label="run.max_admission_cases", minimum=1)
     if "cores_per_case" in overrides:
-        execution["cluster"]["cores_per_case"] = _integer(overrides["cores_per_case"], label="run.cores_per_case", minimum=1)
+        execution["run"]["cores_per_case"] = _integer(overrides["cores_per_case"], label="run.cores_per_case", minimum=1)
     if "case_timeout_seconds" in overrides:
         timeout = _finite(overrides["case_timeout_seconds"], label="run.case_timeout_seconds")
         if timeout <= 0:
             message = "run.case_timeout_seconds must be positive."
             raise GenerationConfigError(message)
-        reserve = min(_finite(execution["runtime"]["graceful_stop_reserve_seconds"], label="runtime.graceful_stop_reserve_seconds"), timeout / 5)
-        execution["runtime"]["timeout_seconds"] = timeout
-        execution["runtime"]["graceful_stop_reserve_seconds"] = reserve
+        reserve_label = "execution.internals.graceful_stop_reserve_seconds"
+        reserve = min(_finite(execution["internals"]["graceful_stop_reserve_seconds"], label=reserve_label), timeout / 5)
+        execution["run"]["timeout_seconds"] = timeout
+        execution["internals"]["graceful_stop_reserve_seconds"] = reserve
     if "no_retry" in overrides:
         if not isinstance(overrides["no_retry"], bool):
             message = "run.no_retry must be boolean."
             raise GenerationConfigError(message)
         if overrides["no_retry"]:
-            license_wait = execution["runtime"]["license_wait"]
-            license_wait["enabled"] = False
-            license_wait["in_allocation_retry"]["enabled"] = False
+            validated_license_wait(execution["rules"]["license_wait"], label="execution.rules.license_wait")
+            execution["rules"]["license_wait"]["enabled"] = False
     return execution
 
 
 def _validate_execution(value: Any, *, campaign_purpose: str) -> dict[str, Any]:
-    """Validate authored execution owners and derive repeated runtime fields."""
-    execution = _mapping(value, label="generation execution configuration")
-    _require_execution_schema(execution)
-    _exact_keys(
-        execution,
-        required={"schema_kind", "schema_version", "runtime", "retention", "submission", "cluster", "site"},
-        optional=set(),
-        label="generation execution configuration",
-    )
+    """Validate the authored execution groups and resolve them into the runtime, submission, cluster and site values consumers read."""
+    authored = _mapping(value, label="generation execution configuration")
+    _require_execution_schema(authored)
     if campaign_purpose not in CAMPAIGN_PURPOSES:
         message = f"execution retention has no supported campaign purpose {campaign_purpose!r}."
         raise GenerationConfigError(message)
+    run, rules, node_job = authored["run"], authored["rules"], authored["node_job"]
+    site, internals = authored["site"], authored["internals"]
 
-    site = _mapping(execution["site"], label="execution.site")
-    site_keys = {
-        "cpu_host",
-        "scheduler",
-        "partition",
-        "cores_per_node",
-        "python_module",
-        "comsol_module",
-        "python_executable",
-        "comsol_executable",
-    }
-    _exact_keys(site, required=site_keys, optional=set(), label="execution.site")
-    for key in site_keys.difference({"cores_per_node"}):
+    for key in ("partition", "comsol_module", "python_executable", "comsol_executable"):
         site[key] = _safe_text_or_none(site[key], label=f"execution.site.{key}")
         if site[key] is None:
             msg = f"execution.site.{key} must be configured."
             raise GenerationConfigError(msg)
-    if site["scheduler"] not in {"local", "slurm"}:
-        msg = "execution.site.scheduler must be local or slurm."
-        raise GenerationConfigError(msg)
     site["cores_per_node"] = _integer(site["cores_per_node"], label="execution.site.cores_per_node", minimum=1)
 
-    runtime = _mapping(execution["runtime"], label="execution.runtime")
-    _exact_keys(
-        runtime,
-        required={
-            "timeout_seconds",
-            "graceful_stop_reserve_seconds",
-            "extra_arguments",
-            "license_wait",
-        },
-        optional={"stall_stop"},
-        label="execution.runtime",
-    )
-    runtime["timeout_seconds"] = _finite(runtime["timeout_seconds"], label="execution.runtime.timeout_seconds")
-    runtime["graceful_stop_reserve_seconds"] = _finite(
-        runtime["graceful_stop_reserve_seconds"],
-        label="execution.runtime.graceful_stop_reserve_seconds",
-    )
+    runtime: dict[str, Any] = {
+        "timeout_seconds": _finite(run["timeout_seconds"], label="execution.run.timeout_seconds"),
+        "graceful_stop_reserve_seconds": _finite(
+            internals["graceful_stop_reserve_seconds"],
+            label="execution.internals.graceful_stop_reserve_seconds",
+        ),
+        "extra_arguments": rules["extra_arguments"],
+        "license_wait": validated_license_wait(rules["license_wait"], label="execution.rules.license_wait"),
+    }
     if not 0.0 < runtime["graceful_stop_reserve_seconds"] < runtime["timeout_seconds"]:
-        message = "execution.runtime.graceful_stop_reserve_seconds must be positive and shorter than timeout_seconds."
+        message = "execution.internals.graceful_stop_reserve_seconds must be positive and shorter than run.timeout_seconds."
         raise GenerationConfigError(message)
-    if "stall_stop" in runtime:
-        runtime["stall_stop"] = _validated_stall_stop(runtime["stall_stop"])
-    runtime["license_wait"] = _validated_license_wait(runtime["license_wait"])
+    if "stall_stop" in rules:
+        runtime["stall_stop"] = _validated_stall_stop(rules["stall_stop"])
 
     arguments = runtime["extra_arguments"]
     if not isinstance(arguments, list) or not all(
         isinstance(item, str) and item and not any(char in item for char in ("\x00", "\n", "\r")) for item in arguments
     ):
-        msg = "execution.runtime.extra_arguments must be an ordered list of safe arguments."
+        msg = "execution.rules.extra_arguments must be an ordered list of safe arguments."
         raise GenerationConfigError(msg)
     if any(item.casefold() == owned or item.casefold().startswith(f"{owned}=") for item in arguments for owned in _COMSOL_OWNED_ARGUMENTS):
-        msg = "execution.runtime.extra_arguments cannot override runtime-owned COMSOL arguments."
+        msg = "execution.rules.extra_arguments cannot override runtime-owned COMSOL arguments."
         raise GenerationConfigError(msg)
     runtime["executable"] = site["comsol_executable"]
     runtime["module_initialization"] = [f"module load {site['comsol_module']}"]
 
-    retention = execution["retention"]
+    retention = run["retention"]
     if retention not in {"full", "compact"}:
-        message = "execution.retention must be full or compact."
+        message = "execution.run.retention must be full or compact."
         raise GenerationConfigError(message)
 
-    submission = _mapping(execution["submission"], label="execution.submission")
-    _exact_keys(
-        submission,
-        required={"max_admission_cases", "poll_interval_seconds"},
-        optional=set(),
-        label="execution.submission",
-    )
-    submission["max_admission_cases"] = _integer(
-        submission["max_admission_cases"],
-        label="execution.submission.max_admission_cases",
-        minimum=1,
-    )
-    submission["poll_interval_seconds"] = _integer(
-        submission["poll_interval_seconds"],
-        label="execution.submission.poll_interval_seconds",
-        minimum=1,
-    )
-
-    cluster = _mapping(execution["cluster"], label="execution.cluster")
-    cluster_keys = {
-        "cores_per_case",
-        "node_jobs",
-        "memory_per_case",
-        "node_memory_overhead",
-        "node_memory_limit",
-        "node_job_wall_time",
-        "scheduler_options",
+    submission = {
+        "max_admission_cases": _integer(run["max_admission_cases"], label="execution.run.max_admission_cases", minimum=1),
+        "poll_interval_seconds": _integer(internals["poll_interval_seconds"], label="execution.internals.poll_interval_seconds", minimum=1),
     }
-    _exact_keys(cluster, required=cluster_keys, optional=set(), label="execution.cluster")
-    cluster["cores_per_case"] = _integer(
-        cluster["cores_per_case"],
-        label="execution.cluster.cores_per_case",
-        minimum=1,
-    )
-    cluster["node_jobs"] = _integer(cluster["node_jobs"], label="execution.cluster.node_jobs", minimum=1)
+
+    cluster = {
+        "cores_per_case": _integer(run["cores_per_case"], label="execution.run.cores_per_case", minimum=1),
+        "node_jobs": _integer(run["node_jobs"], label="execution.run.node_jobs", minimum=1),
+        **{key: node_job[key] for key in ("memory_per_case", "node_memory_overhead", "node_memory_limit")},
+    }
     if cluster["node_jobs"] > MAXIMUM_NODE_JOBS:
         msg = (
-            f"execution.cluster.node_jobs must be between 1 and {MAXIMUM_NODE_JOBS}, the per-user cap of node jobs on the shared 32-core "
+            f"execution.run.node_jobs must be between 1 and {MAXIMUM_NODE_JOBS}, the per-user cap of node jobs on the shared 32-core "
             f"standard nodes, got {cluster['node_jobs']}."
         )
         raise GenerationConfigError(msg)
     for key in ("memory_per_case", "node_memory_overhead", "node_memory_limit"):
-        parse_slurm_memory_mib(cluster[key], label=f"execution.cluster.{key}")
+        parse_slurm_memory_mib(cluster[key], label=f"execution.node_job.{key}")
     cluster["node_job_wall_time"] = _validated_node_job_wall_time(
-        cluster["node_job_wall_time"],
+        node_job["node_job_wall_time"],
         timeout_seconds=float(runtime["timeout_seconds"]),
     )
-    options = cluster["scheduler_options"]
+    options = node_job["scheduler_options"]
     if not isinstance(options, list) or not all(isinstance(item, str) and item.startswith("--") for item in options):
-        msg = "execution.cluster.scheduler_options must be long scheduler arguments."
+        msg = "execution.node_job.scheduler_options must be long scheduler arguments."
         raise GenerationConfigError(msg)
     option_names = [re.split(r"[=\s]", option, maxsplit=1)[0] for option in options]
     if any(name in _SCHEDULER_OWNED_OPTIONS or name.startswith(_SCHEDULER_OWNED_OPTION_PREFIXES) for name in option_names):
-        msg = "execution.cluster.scheduler_options cannot override pipeline-owned allocation directives."
+        msg = "execution.node_job.scheduler_options cannot override pipeline-owned allocation directives."
         raise GenerationConfigError(msg)
+    cluster["scheduler_options"] = options
     cluster["cores_per_node"] = site["cores_per_node"]
-    cluster["scheduler_kind"] = site["scheduler"]
     cluster["partition"] = site["partition"]
     _derive_node_job_resources(cluster, cores_per_node=site["cores_per_node"])
 
-    execution["site"] = site
-    execution["runtime"] = runtime
-    execution["retention_policy"] = retention
-    execution["submission"] = submission
-    execution["cluster"] = cluster
-    return execution
+    return {
+        "schema_kind": authored["schema_kind"],
+        "site": site,
+        "runtime": runtime,
+        "retention_policy": retention,
+        "submission": submission,
+        "cluster": cluster,
+    }
 
 
 def resolve_execution_values(
@@ -2056,8 +1761,6 @@ _COUPLED_RECORD_SEMANTIC_KEYS: Final = frozenset(
 _MATERIAL_PROVENANCE_KEYS: Final = frozenset({"effective_parameter_provenance", "material_scope"})
 _SCIENTIFIC_IDENTITY_KEYS: Final = (
     "schema_kind",
-    "schema_version",
-    "generator_version",
     "simulation_profile",
     "reference_template",
     "campaign_seed",
@@ -2079,10 +1782,8 @@ _SCIENTIFIC_IDENTITY_KEYS: Final = (
     "storage",
     "available_learning_views",
     "airflow_source",
-    "supplemental_design",
+    "replacement_design",
     "boundary_schedule",
-    "boundary_schedule_handoff_version",
-    "schedule_generator_version",
     "physical_formulas",
     "validation",
     "time",
@@ -2105,8 +1806,6 @@ _SCIENTIFIC_PROVENANCE_KEYS: Final = frozenset(
     }
 )
 _CASE_INPUT_IDENTITY_KEYS: Final = (
-    "schema_version",
-    "generator_version",
     "campaign_seed",
     "material",
     "operation_config_digest",
@@ -2120,10 +1819,8 @@ _CASE_INPUT_IDENTITY_KEYS: Final = (
     "stationary_fixed_ownership",
     "grid",
     "input_contract",
-    "supplemental_design",
+    "replacement_design",
     "boundary_schedule",
-    "boundary_schedule_handoff_version",
-    "schedule_generator_version",
     "physical_formulas",
     "time",
     "schedule_time",
@@ -2263,7 +1960,7 @@ def _assignment_identity(value: Any, *, index: int) -> dict[str, Any]:
     semantic = frozenset(
         {
             "case_index",
-            "regime_index",
+            "design_index",
             "material_family",
             "sampling_regime",
             "assignment_role",
@@ -2291,8 +1988,6 @@ def _scientific_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]
     missing = sorted(
         {
             "schema_kind",
-            "schema_version",
-            "generator_version",
             "simulation_profile",
             "reference_template",
             "campaign_seed",
@@ -2332,14 +2027,7 @@ def _input_identity_config(scientific: Mapping[str, Any]) -> dict[str, Any]:
 
 def _campaign_references(campaign: dict[str, Any], *, source_path: Path) -> None:
     """Resolve each explicit layered campaign reference in place."""
-    for key in (
-        "sources_config",
-        "registry_config",
-        "common_config",
-        "operations_config",
-        "profile_config",
-        "execution_config",
-    ):
+    for key in _CAMPAIGN_REFERENCES:
         campaign[key] = _reference_path(campaign[key], source_path=source_path, label=f"campaign.{key}")
 
 
@@ -2350,34 +2038,16 @@ def _validate_campaign_header(
 ) -> dict[str, Any]:
     """Validate one concise campaign and derive its canonical material union."""
     campaign = _mapping(value, label="generation campaign configuration")
-    if campaign.get("schema_kind") != "generation_source_campaign" or not common.serialization.is_schema_version(
-        campaign.get("schema_version"), CAMPAIGN_SCHEMA_VERSION
-    ):
+    if campaign.get("schema_kind") != "generation_source_campaign":
         message = (
-            f"Unsupported generation campaign schema in {source_path}: found {campaign.get('schema_kind')!r} version "
-            f"{campaign.get('schema_version')!r}, expected 'generation_source_campaign' version {CAMPAIGN_SCHEMA_VERSION}."
+            f"Unsupported generation campaign schema in {source_path}: found {campaign.get('schema_kind')!r}, expected 'generation_source_campaign'."
         )
         raise GenerationConfigError(message)
-    required = {
-        "schema_kind",
-        "schema_version",
-        "sources_config",
-        "registry_config",
-        "common_config",
-        "operations_config",
-        "profile_config",
-        "execution_config",
-        "materials",
-        "domain_profile",
-        "sampling",
-    }
+    required = {"schema_kind", *_CAMPAIGN_REFERENCES, "materials", "sampling"}
     _exact_keys(campaign, required=required, optional={"revision", "minimum_success_rate"}, label="generation campaign configuration")
     campaign["campaign_purpose"] = "source_generation"
     _campaign_references(campaign, source_path=source_path)
     campaign["materials"] = _name_list(campaign["materials"], label="campaign.materials", allow_empty=False)
-    if campaign["domain_profile"] not in campaign_identity.SUPPORTED_DOMAIN_PROFILES:
-        msg = "Unsupported campaign source domain profile."
-        raise GenerationConfigError(msg)
     return campaign
 
 
@@ -2391,7 +2061,6 @@ def _build_batch(
     case_count: int,
     case_start: int,
     campaign_seed: int,
-    sampling_method: str,
     parameter_ood: Mapping[str, Any],
     common_config: Mapping[str, Any],
     registry_metadata: Mapping[str, Mapping[str, str]],
@@ -2405,40 +2074,34 @@ def _build_batch(
     material_role: str,
     evaluation_regime: str,
 ) -> GenerationConfig:
-    """Build one immutable profile-projected generation batch."""
+    """Build one immutable profile-projected batch: the first ``case_count`` points of one fixed design (its ``sampling_regime`` kind)."""
     material_family = str(material["material_family"])
-    batch_kind = sampling_regime
-    batch_name = build_batch_name(profile.id, material_family, batch_kind)
-    batch_seed = seeding.derive_seed(
-        campaign_seed,
-        "generation_batch",
-        profile.id,
-        material_family,
-        sampling_regime,
-        evaluation_regime,
-    )
+    batch_name = build_batch_name(profile.id, material_family, sampling_regime)
+    batch_seed = seeding.design_seed(campaign_seed, material_family, sampling_regime)
     registry = material["parameter_registry"]
     groups = materials.active_ood_groups(registry, profile.id)
     eligible_units = sampling_service.eligible_ood_units(material, groups=groups) if sampling_regime == "parameter_ood" else ()
+    assignments = {
+        case_start + index: design_point_assignment(
+            material_family,
+            sampling_regime,
+            material_role=material_role,
+            case_index=case_start + index,
+            design_index=index,
+            eligible_units=eligible_units,
+        )
+        for index in range(case_count)
+    }
     ood_allocation = sampling_service.allocate_ood_units(eligible_units, case_count=case_count) if sampling_regime == "parameter_ood" else ()
     resolved_parameter_ood = copy.deepcopy(dict(parameter_ood))
     resolved_parameter_ood["eligible_units"] = [copy.deepcopy(dict(unit)) for unit in eligible_units]
     resolved_parameter_ood["case_allocation"] = [
-        {"case_index": case_start + index - 1, **copy.deepcopy(dict(unit))} for index, unit in enumerate(ood_allocation, start=1)
+        {"case_index": case_start + index, **copy.deepcopy(unit)} for index, unit in enumerate(ood_allocation)
     ]
     allocation_counts = dict.fromkeys((unit["unit_id"] for unit in eligible_units), 0)
     for unit in ood_allocation:
         allocation_counts[unit["unit_id"]] += 1
     resolved_parameter_ood["allocation_counts"] = allocation_counts
-    assignments = _build_assignments(
-        material_family,
-        sampling_regime,
-        material_role=material_role,
-        case_count=case_count,
-        ood_allocation=ood_allocation,
-    )
-    if case_start != 1:
-        assignments = {case_start + index - 1: {**assignment, "case_index": case_start + index - 1} for index, assignment in assignments.items()}
     case_indices = tuple(assignments)
     active_blocks = tuple(material["active_sampling_blocks"])
     active_block_parameters = {block: tuple(name for name in sampling_block_contract[block] if name in registry) for block in active_blocks}
@@ -2446,13 +2109,7 @@ def _build_batch(
     sampling_plan = sampling_service.build_sampling_plan(
         registry=registry,
         case_count=case_count,
-        seed_base=batch_seed,
-        method=sampling_method,
-        blocks=active_blocks,
-        block_parameters=active_block_parameters,
-    )
-    block_dimensions = materials.sampling_block_dimensions(
-        registry,
+        design_seed=batch_seed,
         blocks=active_blocks,
         block_parameters=active_block_parameters,
     )
@@ -2478,26 +2135,19 @@ def _build_batch(
     active_registry_metadata = {name: copy.deepcopy(registry_metadata[name]) for name in registry}
     scientific: dict[str, Any] = {
         "schema_kind": "resolved_generation_batch",
-        "schema_version": CONFIG_SCHEMA_VERSION,
-        "generator_version": seeding.GENERATOR_VERSION,
         "simulation_profile": profile.id,
         "reference_template": {"sha256": template.sha256},
         "campaign_id": campaign_id,
         "campaign_purpose": campaign_purpose,
         "campaign_seed": campaign_seed,
         "domain_profile": evaluation_regime,
-        "natural_support_state": ("natural" if sampling_regime == "natural" else "parameter_ood"),
+        "natural_support_state": ("parameter_ood" if sampling_regime == "parameter_ood" else "natural"),
         "material": copy.deepcopy(dict(material)),
         "material_config_digest": material_digest,
         "operation_config_digest": operations_digest,
         "sampling_regime": sampling_regime,
         "case_count": case_count,
-        "sampling": {
-            "method": sampling_method,
-            "seed_base": batch_seed,
-            "blocks": sampling_plan,
-            "block_dimensions": block_dimensions,
-        },
+        "sampling": sampling_plan,
         "parameter_ood": resolved_parameter_ood,
         "assignments": [assignments[index] for index in case_indices],
         "registry_metadata": active_registry_metadata,
@@ -2528,8 +2178,6 @@ def _build_batch(
         scientific.update(
             {
                 "boundary_schedule": copy.deepcopy(dict(common_config["_boundary_schedule"])),
-                "boundary_schedule_handoff_version": schedule_service.COMSOL_BOUNDARY_HANDOFF_VERSION,
-                "schedule_generator_version": schedule_service.SCHEDULE_GENERATOR_VERSION,
                 "physical_formulas": copy.deepcopy(dict(common_config["physical_formulas"])),
                 "physical_formulas_provenance": copy.deepcopy(dict(common_config["physical_formulas_provenance"])),
                 "validation": copy.deepcopy(dict(common_config["validation"])),
@@ -2545,9 +2193,7 @@ def _build_batch(
         scientific["operation_constraints"] = {
             "porosity_natural_support_policy": common_config["_operation_constraints"]["porosity_natural_support_policy"]
         }
-    conditioning = common_config["_steady_flow_conditioning"]
-    if conditioning is not None:
-        scientific["steady_flow_conditioning"] = copy.deepcopy(conditioning)
+    scientific["steady_flow_conditioning"] = copy.deepcopy(common_config["_steady_flow_conditioning"])
 
     scientific_digest = compute_scientific_config_digest(scientific)
     case_input_digest = compute_case_input_config_digest(scientific)
@@ -2579,7 +2225,7 @@ def _build_batch(
 
 
 def _apply_design_overrides(campaign: dict[str, Any], overrides: Mapping[str, Any]) -> None:
-    """Apply an explicit material subset, natural original-design size and Source revision."""
+    """Apply an explicit material subset and Source revision."""
     if "revision" in overrides:
         campaign["revision"] = overrides["revision"]
     if "materials" in overrides:
@@ -2588,16 +2234,8 @@ def _apply_design_overrides(campaign: dict[str, Any], overrides: Mapping[str, An
             message = "Run materials must select configured campaign materials."
             raise GenerationConfigError(message)
         campaign["materials"] = tuple(material for material in campaign["materials"] if material in selected)
-        for branch in campaign["sampling"]["counts"].values():
-            for material in tuple(branch):
-                if material not in selected:
-                    del branch[material]
-    if "cases_per_material" in overrides:
-        count = _integer(overrides["cases_per_material"], label="run.cases_per_material", minimum=1)
-        if set(campaign["sampling"]["counts"]) != {"natural"}:
-            message = "Run case-count overrides require a natural-only source design."
-            raise GenerationConfigError(message)
-        campaign["sampling"]["counts"]["natural"] = dict.fromkeys(campaign["materials"], count)
+        designs = _mapping(campaign["sampling"].get("designs"), label="campaign.sampling.designs")
+        campaign["sampling"]["designs"] = {material: kinds for material, kinds in designs.items() if material in selected}
 
 
 def validate_minimum_success_rate(value: Any, *, label: str) -> float:
@@ -2624,12 +2262,12 @@ def authored_minimum_success_rate(authored: Mapping[str, Any] | None) -> float |
 
 def _validated_stall_stop(value: Any) -> dict[str, float]:
     """Validate the optional stall rule; a check time at or after the timeout's orderly stop leaves only the timeout in effect."""
-    rule = _mapping(value, label="execution.runtime.stall_stop")
-    _exact_keys(rule, required={"check_after_seconds", "minimum_simulated_seconds"}, optional=set(), label="execution.runtime.stall_stop")
-    check_after = _finite(rule["check_after_seconds"], label="execution.runtime.stall_stop.check_after_seconds")
-    minimum = _finite(rule["minimum_simulated_seconds"], label="execution.runtime.stall_stop.minimum_simulated_seconds")
+    rule = _mapping(value, label="execution.rules.stall_stop")
+    _exact_keys(rule, required={"check_after_seconds", "minimum_simulated_seconds"}, optional=set(), label="execution.rules.stall_stop")
+    check_after = _finite(rule["check_after_seconds"], label="execution.rules.stall_stop.check_after_seconds")
+    minimum = _finite(rule["minimum_simulated_seconds"], label="execution.rules.stall_stop.minimum_simulated_seconds")
     if check_after <= 0.0 or minimum <= 0.0:
-        message = "execution.runtime.stall_stop needs positive check_after_seconds and minimum_simulated_seconds."
+        message = "execution.rules.stall_stop needs positive check_after_seconds and minimum_simulated_seconds."
         raise GenerationConfigError(message)
     return {"check_after_seconds": check_after, "minimum_simulated_seconds": minimum}
 
@@ -2648,7 +2286,7 @@ def _apply_duration_override(common_config: dict[str, Any], overrides: Mapping[s
             raise GenerationConfigError(message)
         original_time = copy.deepcopy(common_config["time"])
         original_schedule = copy.deepcopy(common_config.get("schedule_time", original_time))
-        shortened = {key: original_time[key] for key in ("start", "stop", "interval", "internal_steps", "irregular_stop_state")}
+        shortened = {key: original_time[key] for key in ("start", "stop", "interval")}
         shortened["stop"] = shortened["start"] + duration
         common_config["time"] = _validate_time(shortened)
         if common_config["time"]["stop"] < original_schedule["stop"]:
@@ -2674,7 +2312,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         source_path=source_path,
     )
     overrides = {} if scientific_overrides is None else copy.deepcopy(dict(scientific_overrides))
-    unknown_overrides = set(overrides).difference({"materials", "cases_per_material", "duration_hours", "revision"})
+    unknown_overrides = set(overrides).difference({"materials", "duration_hours", "revision"})
     if unknown_overrides:
         message = f"Unsupported scientific run overrides: {sorted(unknown_overrides)}."
         raise GenerationConfigError(message)
@@ -2711,6 +2349,12 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         definitions=definitions,
         time_contract=common_config.get("schedule_time", common_config["time"]),
     )
+    bed_fields = _validate_bed_fields(
+        _load_yaml(campaign["bed_fields_config"], label="generation bed-field configuration"),
+        sources=sources,
+        definitions=definitions,
+    )
+    operations["parameter_values"] = {**bed_fields, **operations["parameter_values"]}
     profile_raw = _load_yaml(
         campaign["profile_config"],
         label="generation profile configuration",
@@ -2726,7 +2370,6 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
     profile_config, template = _validate_profile_config(
         profile_raw,
         profile=profile,
-        fixed_values=common_config["scientific_fixed_values"],
         require_executable=require_executable,
     )
     campaign_purpose = str(campaign["campaign_purpose"])
@@ -2768,49 +2411,25 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         material_digests[material_family] = common.serialization.canonical_json_sha256(projected)
 
     sampling = _mapping(campaign["sampling"], label="campaign.sampling")
-    _exact_keys(sampling, required={"method", "seed_base", "counts"}, optional=set(), label="campaign.sampling")
-    raw_counts = _mapping(sampling["counts"], label="campaign.sampling.counts")
-    supported_sampling_regimes = ("natural", "parameter_ood")
-    unknown_sampling_regimes = set(raw_counts).difference(supported_sampling_regimes)
-    if unknown_sampling_regimes:
-        message = f"campaign.sampling.counts has unsupported regimes {sorted(unknown_sampling_regimes)}."
-        raise GenerationConfigError(message)
-    if "natural" not in raw_counts:
-        message = "campaign.sampling.counts must declare natural source cases."
-        raise GenerationConfigError(message)
-    expected_domain_profile = "reference_and_parameter_extension" if "parameter_ood" in raw_counts else "reference_range"
-    if campaign["domain_profile"] != expected_domain_profile:
-        msg = f"Source domain profile must be {expected_domain_profile!r} for its declared physical sampling branches."
-        raise GenerationConfigError(msg)
-    if campaign_purpose != "source_generation" and set(raw_counts) != {"natural"}:
-        message = f"{campaign_purpose} campaigns support only natural sampling."
-        raise GenerationConfigError(message)
-    sampling_regimes = tuple(regime for regime in supported_sampling_regimes if regime in raw_counts)
+    _exact_keys(sampling, required={"seed_base", "designs"}, optional=set(), label="campaign.sampling")
     campaign_seed = _uint32(
         sampling["seed_base"],
         label="campaign.sampling.seed_base",
     )
     material_roles = {"seen": campaign["materials"], "near_family_ood": (), "far_family_ood": (), "extreme_family_ood": ()}
-    counts = _validate_batch_counts(
-        raw_counts,
-        materials_in_order=campaign["materials"],
-        seen=material_roles["seen"],
-        regimes=sampling_regimes,
-    )
-    selected_targets = {material: sum(regime_counts.get(material, 0) for regime_counts in counts.values()) for material in campaign["materials"]}
+    designs = _validate_designs(sampling["designs"], materials_in_order=campaign["materials"])
+    domain_profile = campaign_identity.domain_profile(designs)
+    sampling_regimes = tuple(kind for kind in DESIGN_KINDS if any(kind in kinds for kinds in designs.values()))
+    selected_targets = {material: sum(kinds.values()) for material, kinds in designs.items()}
     name_horizon = (
         campaign_identity.deviating_horizon_hours(physical_horizon_hours(common_config["time"]), configured_horizon)
         if profile.id == profiles.TRANSIENT_DRYING_PROFILE
         else None
     )
-    expected_name = campaign_identity.canonical_campaign_name(
-        selected_targets,
-        domain_profile=campaign["domain_profile"],
-        mode=str(sampling["method"]),
-        root_seed=campaign_seed,
-        horizon_hours=name_horizon,
-    )
-    campaign_name = expected_name
+    try:
+        campaign_name = campaign_identity.canonical_campaign_name(designs, root_seed=campaign_seed, horizon_hours=name_horizon)
+    except ValueError as error:
+        raise GenerationConfigError(str(error)) from error
     composition_sources: tuple[dict[str, Any], ...] = ()
     campaign_id = campaign_name
 
@@ -2839,7 +2458,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
 
     common_with_profile = copy.deepcopy(common_config)
     common_with_profile["_profile_exports"] = profile_config["exports"]
-    common_with_profile["_steady_flow_conditioning"] = profile_config["steady_flow_conditioning"]
+    common_with_profile["_steady_flow_conditioning"] = _steady_flow_conditioning(common_config["scientific_fixed_values"])
     common_with_profile["_operation_constraints"] = operations["constraints"]
     common_with_profile["_boundary_schedule"] = operations["boundary_schedule"]
     active_names = set(materials.profile_parameter_names(definitions, profile.id))
@@ -2860,9 +2479,10 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
     batches: list[GenerationConfig] = []
     material_case_offsets: dict[str, int] = {}
     for sampling_regime in sampling_regimes:
-        for material_family, count in counts[sampling_regime].items():
-            if count == 0:
+        for material_family, kinds in designs.items():
+            if sampling_regime not in kinds:
                 continue
+            count = kinds[sampling_regime]
             material_role = "source"
             evaluation_regime = "parameter_extension" if sampling_regime == "parameter_ood" else "reference_range"
             batches.append(
@@ -2875,7 +2495,6 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
                     case_count=count,
                     case_start=material_case_offsets.get(material_family, 0) + 1,
                     campaign_seed=campaign_seed,
-                    sampling_method=str(sampling["method"]),
                     parameter_ood=parameter_ood,
                     common_config=common_with_profile,
                     registry_metadata=registry_metadata,
@@ -2906,14 +2525,14 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
     campaign_scientific = {
         "schema_kind": "resolved_generation_campaign",
         "producer_identity": producer_identity,
-        "schema_version": 1,
         "campaign_name": campaign_name,
         "campaign_id": campaign_id,
         "campaign_purpose": campaign_purpose,
         "simulation_profile": profile.id,
         "materials": list(campaign["materials"]),
-        "domain_profile": campaign["domain_profile"],
-        "sampling_method": sampling["method"],
+        "domain_profile": domain_profile,
+        "design_recipe": sampling_service.DESIGN_RECIPE,
+        "designs": copy.deepcopy(designs),
         "sampling_regimes": list(sampling_regimes),
         "parameter_ood_policy": parameter_ood,
         "parameter_ood_allocations": {
@@ -2944,7 +2563,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         package_request_digest=package_request_digest,
         campaign_id=campaign_id,
         campaign_purpose=campaign_purpose,
-        domain_profile=campaign["domain_profile"],
+        domain_profile=domain_profile,
         evaluation_regimes=evaluation_regimes,
         profile=profile,
         template=template,
@@ -2954,17 +2573,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         source_registry=copy.deepcopy(sources),
         source_files=(
             source_path,
-            *(
-                campaign[key]
-                for key in (
-                    "sources_config",
-                    "registry_config",
-                    "common_config",
-                    "operations_config",
-                    "profile_config",
-                    "execution_config",
-                )
-            ),
+            *(campaign[key] for key in _CAMPAIGN_REFERENCES),
             *(materials.material_config_directory() / f"{material_family}.yaml" for material_family in campaign["materials"]),
         ),
         total_case_count=total_case_count,
@@ -2973,7 +2582,7 @@ def load_campaign_config(  # noqa: PLR0915 -- one centralized campaign resolver
         duplicate_case_input_policy=duplicate_case_input_policy,
         execution_values=execution,
         root_seed=campaign_seed,
-        sampling_mode=str(sampling["method"]),
+        designs=designs,
         selected_targets=selected_targets,
         composition_sources=composition_sources,
         scientific_overrides=overrides,

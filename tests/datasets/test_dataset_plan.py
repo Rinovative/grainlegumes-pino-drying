@@ -1,8 +1,11 @@
 """Protect the ordinary Dataset plan and CLI handoffs.
 
 Responsibilities:
-  - Preserve plan defaults, explicit small overrides, and the role boundary between Sources and Datasets
-  - Check the computed Dataset name, the plan schema, the Dataset-only revision and the explicit new Source that reuses its label
+  - Preserve the authored plan, its derived designs and domain, and the role boundary between Sources and Datasets
+  - Check the computed Dataset name, the power-of-two counts, the role and key schema, the Dataset-only revision and the
+    explicit new Source that reuses its label
+  - Check that a design point keeps its seeds and coordinates in every plan that requests it
+  - Check that both tasks move every parameter-OOD point outside natural support, over the groups their Dataset view declares
   - Verify preview, staged continuation, publication, PT, and the public CLI allocation boundary
   - Verify that a login-node run freezes the source and submits its own driver job, which refuses live code inside an allocation
   - Verify that dirty sources are always admitted
@@ -32,10 +35,9 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import yaml
 
-from src import common, generation
+from src import common, datasets, generation
 from src.datasets import dataset_packages as cli
 from src.datasets import dataset_plan
-from src.datasets.contracts import dataset_contracts_partition as partition
 from src.datasets.packages import dataset_packages_builder as builder
 from src.datasets.packages import dataset_packages_manifest as manifests
 from src.generation import generation_controller
@@ -54,21 +56,22 @@ def _base_plan(task: str = "transient_drying") -> dict[str, Any]:
     """Return a fresh test-owned Dataset plan; it only references the maintained Generation configs the loader reads."""
     return {
         "schema_kind": "dataset_plan",
-        "schema_version": 1,
         "task": task,
+        "materials": {
+            "lentil": {"role": "id", "train": 1, "validation": 1, "test": 1},
+            "chickpea": {"role": "id", "train": 1, "validation": 1, "test": 1},
+        },
         "generation": {
+            "seed_base": 41,
+            "minimum_success_rate": 0.8,
             "sources_config": f"{_PHYSICAL_MODEL}/sources.yaml",
             "registry_config": f"{_PHYSICAL_MODEL}/registry.yaml",
             "common_config": f"{_PHYSICAL_MODEL}/common.yaml",
             "operations_config": f"{_PHYSICAL_MODEL}/fixed_bed.yaml",
+            "bed_fields_config": f"{_PHYSICAL_MODEL}/bed_fields.yaml",
             "profile_config": f"{_PHYSICAL_MODEL}/profiles/{task}.yaml",
             "execution_config": "configs/01_generation/execution.yaml",
-            "sampling": {"method": "lhs", "seed_base": 41},
-            "minimum_success_rate": 0.8,
-            "domain_profile": "reference_range",
         },
-        "materials": {"lentil": {"count": 10, "role": "id"}, "chickpea": {"count": 10, "role": "id"}},
-        "split": {"seed": 7, "train_fraction": 0.5, "validation_fraction": 0.25, "id_test_fraction": 0.25},
     }
 
 
@@ -94,84 +97,77 @@ def _read_preview(capsys: pytest.CaptureFixture[str]) -> tuple[dict[str, Any], d
     return json.loads(first), json.loads(rest)
 
 
-def _small_materials() -> dict[str, dict[str, Any]]:
-    """Return the three-case override with each material's authored role."""
-    return {material: {"count": 3, "role": specification["role"]} for material, specification in _base_plan()["materials"].items()}
-
-
 def _small_plan(path: Path, *, duration_hours: float | None = None) -> dict[str, Any]:
-    return dataset_plan.load_dataset_plan(path, counts=("lentil=3", "chickpea=3"), split_fractions="1/3,1/3,1/3", duration_hours=duration_hours)
+    return dataset_plan.load_dataset_plan(path, duration_hours=duration_hours)
 
 
-def test_documented_defaults_and_small_overrides_preserve_authored_plan(plan_path: Path) -> None:
-    """Keep public scientific defaults and temporary overrides distinct from YAML."""
-    original_bytes = plan_path.read_bytes()
-
-    authored = _base_plan()
-
-    defaults = dataset_plan.load_dataset_plan(plan_path)
-    preview = dataset_plan.preview_dataset_plan(defaults)
-    assert defaults["materials"] == authored["materials"]
-    assert defaults["generation"]["sampling"]["seed_base"] == authored["generation"]["sampling"]["seed_base"]
-    assert defaults["split"] == authored["split"]
-    assert preview["split"]["seed"] == common.random.derive_subseed(authored["split"]["seed"], "split")
-
-    small = dataset_plan.load_dataset_plan(
-        plan_path,
-        counts=("lentil=3", "chickpea=3"),
-        split_fractions="1/3,1/3,1/3",
-    )
-    assert small["materials"] == _small_materials()
-    assert tuple(small["split"][key] for key in ("train_fraction", "validation_fraction", "id_test_fraction")) == pytest.approx((1 / 3, 1 / 3, 1 / 3))
-    assert plan_path.read_bytes() == original_bytes
-
-    case_materials = {
-        f"{material}-{index}": material for material, specification in small["materials"].items() for index in range(specification["count"])
+def _pood_and_ood(authored: dict[str, Any]) -> None:
+    """Give lentil a parameter-OOD design and hold chickpea out as material OOD."""
+    authored["materials"] = {
+        "lentil": {"role": "id", "train": 4, "validation": 2, "test": 2, "parameter_ood": 1},
+        "chickpea": {"role": "ood", "test": 8},
     }
-    membership = partition.resolve_case_partition(
-        tuple(case_materials),
-        {
-            "kind": "seeded_material_fraction",
-            "train_fraction": 1 / 3,
-            "validation_fraction": 1 / 3,
-            "id_test_fraction": 1 / 3,
-        },
-        split_seed=common.random.derive_subseed(small["split"]["seed"], "split"),
-        material_by_case=case_materials,
-    )
-    assert {role: len(cases) for role, cases in membership.items()} == {"train": 2, "validation": 2, "id_test": 2}
-    assert all(sum(case_materials[case] == material for case in cases) == 1 for cases in membership.values() for material in small["materials"])
 
 
-def test_dataset_name_is_computed_from_materials_split_domain_and_seed(tmp_path: Path) -> None:
-    """The name states the resolved content: split counts of ID materials, held-out materials, domain and Generation seed."""
+def test_loader_derives_designs_and_domain_and_preserves_the_authored_plan(plan_path: Path, tmp_path: Path) -> None:
+    """The plan yields its design counts per kind and its domain; loading never rewrites the authored file."""
+    original_bytes = plan_path.read_bytes()
+    plan = dataset_plan.load_dataset_plan(plan_path)
+    assert plan["designs"] == {"lentil": {"train": 1, "validation": 1, "test": 1}, "chickpea": {"train": 1, "validation": 1, "test": 1}}
+    assert plan["domain_profile"] == "reference_range"
+    assert plan_path.read_bytes() == original_bytes
+    extended = dataset_plan.load_dataset_plan(_write_plan(tmp_path, _pood_and_ood))
+    assert extended["designs"] == {"lentil": {"train": 4, "validation": 2, "test": 2, "parameter_ood": 1}, "chickpea": {"test": 8}}
+    assert extended["domain_profile"] == "reference_and_parameter_extension"
+
+
+def test_dataset_name_is_computed_from_design_counts_domain_and_seed(tmp_path: Path) -> None:
+    """The name states the resolved content: design counts of ID materials, held-out materials, domain and Generation seed."""
 
     def mutate(authored: dict[str, Any]) -> None:
-        authored["materials"] = {"lentil": {"count": 10, "role": "id"}, "chickpea": {"count": 7, "role": "ood"}}
-        authored["generation"]["domain_profile"] = "reference_and_parameter_extension"
-        authored["generation"]["sampling"]["seed_base"] = 123
-        authored["split"].update(train_fraction=0.5, validation_fraction=0.25, id_test_fraction=0.25)
+        _pood_and_ood(authored)
+        authored["generation"]["seed_base"] = 123
 
     path = _write_plan(tmp_path, mutate)
 
-    assert dataset_plan.load_dataset_plan(path)["name"] == "lentil-train5-val2-test3+chickpea-ood7__ref-param-ext__lhs-seed-123"
-    overridden = dataset_plan.load_dataset_plan(path, counts=("lentil=4",), split_fractions="1/2,1/4,1/4")
-    assert overridden["name"] == "lentil-train2-val1-test1+chickpea-ood7__ref-param-ext__lhs-seed-123"
+    assert dataset_plan.load_dataset_plan(path)["name"] == "lentil-train4-val2-test2-pood1+chickpea-ood8__ref-param-ext__sobol-seed-123"
     # Only a horizon that deviates from the configured one is named, so an override equal to it adds no token.
     common_config = yaml.safe_load((common.paths.get_project_root() / f"{_PHYSICAL_MODEL}/common.yaml").read_text(encoding="utf-8"))
     configured_hours = generation.cases.config.physical_horizon_hours(common_config["time"])
     assert dataset_plan.load_dataset_plan(path, duration_hours=configured_hours)["name"] == dataset_plan.load_dataset_plan(path)["name"]
-    assert dataset_plan.load_dataset_plan(path, duration_hours=4)["name"].endswith("__lhs-seed-123__h-4")
-    with pytest.raises(ValueError, match="without a case in every role"):
-        dataset_plan.load_dataset_plan(path, counts=("lentil=2",))
+    assert dataset_plan.load_dataset_plan(path, duration_hours=4)["name"].endswith("__sobol-seed-123__h-4")
+
+
+@pytest.mark.parametrize("count", [3, 0, -2, True, 2.0, "4", None])
+def test_every_design_count_must_be_a_power_of_two(tmp_path: Path, count: object) -> None:
+    """Counts 1, 2, 4, ... keep each Sobol prefix balanced; any other count, a bool or a non-integer is refused."""
+    path = _write_plan(tmp_path, lambda authored: authored["materials"]["lentil"].update(validation=count))
+    with pytest.raises(ValueError, match=r"materials\.lentil\.validation must be an integer power of two"):
+        dataset_plan.load_dataset_plan(path)
+
+
+@pytest.mark.parametrize(
+    ("specification", "message"),
+    [
+        ({"role": "id", "train": 1, "test": 1}, "requires"),
+        ({"role": "id", "train": 1, "validation": 1, "test": 1, "count": 1}, "admits"),
+        ({"role": "ood", "train": 1, "test": 1}, "admits"),
+        ({"role": "ood", "test": 1, "parameter_ood": 1}, "admits"),
+        ({"train": 1, "validation": 1, "test": 1}, "role must be id or ood"),
+    ],
+)
+def test_material_roles_admit_only_their_design_kinds(tmp_path: Path, specification: dict[str, Any], message: str) -> None:
+    """An ID material needs Train, validation and test and may add parameter OOD; an OOD material takes only its test design."""
+    path = _write_plan(tmp_path, lambda authored: authored["materials"].update(lentil=specification))
+    with pytest.raises(ValueError, match=message):
+        dataset_plan.load_dataset_plan(path)
 
 
 def test_minimum_success_rate_is_authored_policy_that_changes_neither_identity_nor_the_execution_overrides(tmp_path: Path) -> None:
-    """The rate changes neither name, seeds nor split; only an explicit cap is an override, the campaign derives the default from the rate."""
+    """The rate changes neither name nor seeds; only an explicit cap is an override, the campaign derives the default from the rate."""
 
     def with_rate(rate: float) -> dict[str, Any]:
-        path = _write_plan(tmp_path, lambda authored: authored["generation"].update(minimum_success_rate=rate))
-        return dataset_plan.load_dataset_plan(path, counts=("lentil=3", "chickpea=30"), split_fractions="1/3,1/3,1/3")
+        return dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored["generation"].update(minimum_success_rate=rate)))
 
     strict, tolerant = with_rate(1.0), with_rate(0.6)
     assert strict["name"] == tolerant["name"]
@@ -184,7 +180,6 @@ def test_minimum_success_rate_is_authored_policy_that_changes_neither_identity_n
     assert campaigns[0]["sampling"] == campaigns[1]["sampling"]
     preview = dataset_plan.preview_dataset_plan(tolerant)
     assert (preview["minimum_success_rate"], preview["execution_overrides"]) == (0.6, {})
-    assert preview["split"] == dataset_plan.preview_dataset_plan(strict)["split"]
 
 
 @pytest.mark.parametrize("value", [None, 0, 1.5, True, "0.9", {"lentil": 0.9}])
@@ -236,10 +231,9 @@ def test_new_source_names_the_source_under_the_dataset_revision_label(plan_path:
 
 def test_source_name_is_the_generation_default_and_a_new_source_changes_only_the_source_locator(plan_path: Path) -> None:
     """The derived Source name is what Generation resolves; a new Source keeps seeds, batch identities and the campaign digest."""
-    overrides = {"counts": ("lentil=3", "chickpea=3"), "split_fractions": "1/3,1/3,1/3"}
-    plain = dataset_plan.load_dataset_plan(plan_path, **overrides)
-    dataset_only = dataset_plan.load_dataset_plan(plan_path, revision="converter-fix", **overrides)
-    fresh = dataset_plan.load_dataset_plan(plan_path, revision="converter-fix", new_source=True, **overrides)
+    plain = dataset_plan.load_dataset_plan(plan_path)
+    dataset_only = dataset_plan.load_dataset_plan(plan_path, revision="converter-fix")
+    fresh = dataset_plan.load_dataset_plan(plan_path, revision="converter-fix", new_source=True)
 
     def resolve(plan: dict[str, Any]) -> Any:
         return generation.cases.config.load_campaign_config(plan_path, require_executable=False, authored_value=dataset_plan.authored_campaign(plan))
@@ -281,29 +275,66 @@ def test_revision_label_follows_one_grammar_for_dataset_and_source(label: str, p
     assert accepted(lambda: dataset_plan.load_dataset_plan(plan_path, revision=label, new_source=True)) is expected
 
 
-def test_plan_schema_rejects_authored_name_selection_seed_and_other_versions(tmp_path: Path) -> None:
-    """The plan computes its name and orders membership by design; extra keys and other schema versions are refused."""
-    for extra in ({"name": "authored-name"}, {"selection_seed": 42}):
+def test_plan_schema_rejects_removed_unknown_and_missing_keys_and_other_versions(tmp_path: Path) -> None:
+    """The plan computes its name, domain and roles; removed, unknown or missing keys are refused."""
+    for extra in ({"name": "authored-name"}, {"split": {"seed": 7}}):
         with pytest.raises(ValueError, match="exactly the fields"):
             dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored, extra=extra: authored.update(extra)))
-    with pytest.raises(ValueError, match=r"schema_version must be 1, got 2"):
-        dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored.update(schema_version=2)))
-    # The Source name is derived like the Dataset name; only --revision with --new-source varies it, never the YAML.
-    for key in ("source_name", "revision"):
-        with pytest.raises(ValueError, match="six maintained configs"):
-            dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored, key=key: authored["generation"].update({key: "authored-source"})))
+    # The Source name and the domain are derived; only --revision with --new-source varies the Source name, never the YAML.
+    for key in ("sampling", "domain_profile", "source_name", "revision"):
+        with pytest.raises(ValueError, match="generation must use exactly the fields"):
+            dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored, key=key: authored["generation"].update({key: "authored"})))
+    with pytest.raises(ValueError, match="generation must use exactly the fields"):
+        dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored["generation"].pop("seed_base")))
 
 
-def test_generation_projection_contains_physics_but_no_dataset_roles_or_split(plan_path: Path) -> None:
-    """Keep material roles and case partition in Dataset identity, not Source design."""
+def test_generation_projection_contains_seed_and_designs_but_no_dataset_roles(plan_path: Path) -> None:
+    """Keep material roles and case roles in Dataset identity, not Source design."""
     plan = _small_plan(plan_path)
     campaign = dataset_plan.authored_campaign(plan)
 
-    assert campaign["sampling"]["seed_base"] == plan["generation"]["sampling"]["seed_base"]
-    assert campaign["sampling"]["counts"] == {"natural": {"lentil": 3, "chickpea": 3}}
+    assert campaign["sampling"] == {"seed_base": plan["generation"]["seed_base"], "designs": plan["designs"]}
     assert set(campaign["materials"]) == {"lentil", "chickpea"}
-    assert not {"name", "dataset_name", "selection", "roles", "split"} & campaign.keys()
-    assert all(isinstance(count, int) for count in campaign["sampling"]["counts"]["natural"].values())
+    assert not {"name", "dataset_name", "selection", "roles", "split", "domain_profile"} & campaign.keys()
+
+
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_both_tasks_move_each_parameter_ood_point_outside_natural_support(tmp_path: Path, task: str) -> None:
+    """A parameter-OOD design resolves for both tasks over the groups the task's Dataset view declares; each point moves its allocated unit."""
+    path = _write_plan(tmp_path, lambda authored: authored["materials"]["lentil"].update(parameter_ood=2), task=task)
+    plan = dataset_plan.load_dataset_plan(path)
+    campaign = generation.cases.config.load_campaign_config(path, require_executable=False, authored_value=dataset_plan.authored_campaign(plan))
+    (batch,) = (batch for batch in campaign.batches if batch.sampling_regime == "parameter_ood")
+    assert (batch.material_family, batch.scientific_values["natural_support_state"]) == ("lentil", "parameter_ood")
+    declared = datasets.contracts.views.get_view(task).parameter_ood_blocks
+    assert declared
+    assert tuple(batch.scientific_values["parameter_ood"]["groups"]) == declared
+    allocation = batch.scientific_values["parameter_ood"]["case_allocation"]
+    assert [entry["case_index"] for entry in allocation] == list(batch.case_indices)
+    for entry in allocation:
+        provenance = generation.cases.sampling.sample_case(batch, entry["case_index"]).ood_provenance
+        assert (provenance["natural_support_state"], provenance["active_unit_id"]) == ("parameter_ood", entry["unit_id"])
+
+
+def test_a_design_point_keeps_its_seeds_and_coordinates_in_every_plan(tmp_path: Path) -> None:
+    """Point i of a design is the same case in a small and a large plan, whatever the other materials and design kinds request."""
+    small = dataset_plan.load_dataset_plan(_write_plan(tmp_path, lambda authored: authored["materials"].pop("chickpea")))
+    large_path = tmp_path / "large.yaml"
+    large_path.write_bytes(_write_plan(tmp_path, _pood_and_ood).read_bytes())
+    large = dataset_plan.load_dataset_plan(large_path)
+
+    def batches(plan: dict[str, Any], path: Path) -> dict[tuple[str, str], Any]:
+        campaign = generation.cases.config.load_campaign_config(path, require_executable=False, authored_value=dataset_plan.authored_campaign(plan))
+        return {(batch.material_family, batch.sampling_regime): batch for batch in campaign.batches}
+
+    first, second = batches(small, tmp_path / "plan.yaml"), batches(large, large_path)
+    for kind in ("train", "validation", "test"):
+        one, four = first[("lentil", kind)], second[("lentil", kind)]
+        design = one.scientific_values["sampling"]
+        assert design["design_seed"] == four.scientific_values["sampling"]["design_seed"]
+        assert one.case_seed(one.case_indices[0]) == four.case_seed(four.case_indices[0])
+        prefix = generation.cases.sampling.design_points(seed=design["design_seed"], dimensions=design["dimensions"], count=len(four.case_indices))
+        assert (generation.cases.sampling.design_points(seed=design["design_seed"], dimensions=design["dimensions"], count=1) == prefix[:1]).all()
 
 
 def test_preview_does_not_construct_generation_controller(tmp_path: Path, plan_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -428,10 +459,6 @@ def test_staged_generation_publishes_neither_dataset_nor_pt_and_retains_invocati
         "src.datasets.dataset_packages",
         "run",
         "plan.yaml",
-        "--count",
-        "lentil=3",
-        "--count",
-        "chickpea=3",
         "--duration-hours",
         "4",
         "--node-jobs",
@@ -469,8 +496,8 @@ def test_staged_generation_publishes_neither_dataset_nor_pt_and_retains_invocati
     assert set(generation_calls[0]) == {"path", "campaign", "scientific_overrides", "execution_overrides"}
 
 
-def test_complete_run_forwards_exact_selection_partition_and_invocation(plan_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bind the one publication to the plan's selection, fixed partition, and invocation."""
+def test_complete_run_forwards_exact_selection_material_roles_and_invocation(plan_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the one publication to the plan's design counts, material roles, and invocation."""
     monkeypatch.setenv("SLURM_JOB_ID", "test-allocation")
     plan = _small_plan(plan_path, duration_hours=4)
     invocation = ("python", "-m", "src.datasets.dataset_packages", "run", "plan.yaml", "--max-admission-cases", "6")
@@ -504,22 +531,10 @@ def test_complete_run_forwards_exact_selection_partition_and_invocation(plan_pat
     assert publication_calls[0]["request"]["selection"] == {
         "kind": "design_order",
         "source_names": ["lentil-chickpea__abc"],
-        "target_counts": {"lentil": 3, "chickpea": 3},
+        "target_counts": plan["designs"],
     }
     assert publication_calls[0]["request"]["source_cases"] == []
-    split_seed = _base_plan()["split"]["seed"]
-    expected_seed = common.random.derive_subseed(split_seed, "split")
-    assert publication_calls[0]["partition_spec"] == {
-        "seed_input": split_seed,
-        "seed": expected_seed,
-        "recipe": {
-            "kind": "seeded_material_fraction",
-            "train_fraction": pytest.approx(1 / 3),
-            "validation_fraction": pytest.approx(1 / 3),
-            "id_test_fraction": pytest.approx(1 / 3),
-        },
-        "material_roles": {material: specification["role"] for material, specification in _small_materials().items()},
-    }
+    assert publication_calls[0]["material_roles"] == {"lentil": "id", "chickpea": "id"}
     assert publication_calls[0]["plan_invocation"] == list(invocation)
     assert len(publication_calls) == 1
 
@@ -540,14 +555,8 @@ def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
         "dataset_packages",
         "run",
         str(plan_path),
-        "--count",
-        "lentil=3",
-        "--count",
-        "chickpea=3",
         "--revision",
         "smoke",
-        "--split-fractions",
-        "1/3,1/3,1/3",
         "--duration-hours",
         "4",
         "--node-jobs",
@@ -557,7 +566,7 @@ def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
         "--cores-per-case",
         "8",
     ]
-    monkeypatch.setattr(sys, "argv", [*arguments, "--preview"])
+    monkeypatch.setattr(sys, "argv", [*arguments, "--dry-run"])
     assert cli.main() == 0
     footprint, preview = _read_preview(capsys)
     assert footprint["identity"] == f"source~transient_drying~{dataset_plan.derive_source_name(_small_plan(plan_path))}__h-4"
@@ -571,10 +580,9 @@ def test_cli_preview_and_run_preserve_readonly_and_allocation_boundaries(
     # The --duration-hours 4 horizon is part of the computed name, before the revision.
     assert preview["dataset"] == _small_plan(plan_path)["name"] + "__h-4__rev-smoke"
     authored = _base_plan()
-    assert preview["materials"] == _small_materials()
-    assert preview["generation_seed_base"] == authored["generation"]["sampling"]["seed_base"]
-    assert preview["selection"] == {"kind": "design_order"}
-    assert preview["split"]["seed"] == common.random.derive_subseed(authored["split"]["seed"], "split")
+    assert preview["materials"] == authored["materials"]
+    assert preview["generation_seed_base"] == authored["generation"]["seed_base"]
+    assert (preview["domain_profile"], preview["selection"], preview["partition"]) == ("reference_range", {"kind": "design_order"}, "design_kind")
     assert preview["physical_duration_hours_override"] == 4
     assert preview["execution_overrides"] == {"node_jobs": 1, "max_admission_cases": 6, "cores_per_case": 8}
     assert not storage.exists()
@@ -622,13 +630,7 @@ def test_cli_new_source_needs_a_revision_and_names_the_source_under_it(
         "dataset_packages",
         "run",
         str(plan_path),
-        "--count",
-        "lentil=3",
-        "--count",
-        "chickpea=3",
-        "--split-fractions",
-        "1/3,1/3,1/3",
-        "--preview",
+        "--dry-run",
     ]
     default_source = dataset_plan.derive_source_name(_small_plan(plan_path))
 
@@ -728,6 +730,7 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
             "train": ["a", "b", "c", "d"],
             "validation": ["e"],
             "id_test": ["f"],
+            "parameter_ood": [],
             "ood": [],
             "material_roles": {"lentil": "id", "chickpea": "id"},
         },
@@ -757,7 +760,7 @@ def test_cli_driver_summarizes_the_published_dataset_instead_of_dumping_json(
         "DATASET COMPLETE: example-dataset (transient_drying)",
         "Published: 02_datasets/transient_drying/example-dataset",
         "Contents: 6 Source cases; 618 samples; 618 transitions",
-        "Split: train 4  validation 1  id_test 1  ood 0  (lentil=id, chickpea=id)",
+        "Split: train 4  validation 1  id_test 1  parameter_ood 0  ood 0  (lentil=id, chickpea=id)",
     ]
     # A slot whose first replacement failed too reads as a chain, as on the live board.
     assert lines[4:7] == [
@@ -863,6 +866,4 @@ def test_complete_steady_run_publishes_partition_and_keeps_driver_log_outside(tm
     assert list(published.iterdir()) == []
     assert driver_log.is_file()
     assert publication_calls[0]["request"]["dataset_view"] == "steady_flow"
-    assert publication_calls[0]["partition_spec"]["material_roles"] == {
-        material: specification["role"] for material, specification in plan["materials"].items()
-    }
+    assert publication_calls[0]["material_roles"] == {material: specification["role"] for material, specification in plan["materials"].items()}

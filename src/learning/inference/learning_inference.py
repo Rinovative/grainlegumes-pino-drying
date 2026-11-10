@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 # RUN CONTRACT
 # ======================================================================
 
-SplitRole = Literal["train", "validation", "id_test", "additional_evaluation"]
+SplitRole = Literal["train", "validation", "id_test", "material_ood", "parameter_ood"]
 _MODEL_CHANGED_REMEDY = "evaluate it with the model code it was trained with or train a new run with --revision <label>"
 
 
@@ -75,16 +75,19 @@ class SplitSelection:
 
     Attributes
     ----------
-    role : {"train", "validation", "id_test", "additional_evaluation"}
+    role : {"train", "validation", "id_test", "material_ood", "parameter_ood"}
         Semantic saved membership being reconstructed.
     evidence : tuple[datasets.preprocessing.splits.SplitRoleEvidence, ...]
         Admitted source identity and ordered membership of each part; one part for the fixed-partition roles,
-        one per additional Evaluation source otherwise.
+        one per OOD Evaluation source otherwise.
+    train_subset : int | None
+        The saved split's ``train_subset``, against which a reopened Train part is checked.
 
     """
 
     role: SplitRole
     evidence: tuple[datasets.preprocessing.splits.SplitRoleEvidence, ...]
+    train_subset: int | None
 
     @property
     def indices(self) -> torch.Tensor:
@@ -196,7 +199,7 @@ class IndexedSubset(Dataset[dict[str, Any]]):
 
 def _validate_split_role(split: str) -> SplitRole:
     """Validate the requested split role."""
-    allowed_roles = (*datasets.preprocessing.splits.ID_SPLIT_ROLES, "additional_evaluation")
+    allowed_roles = (*datasets.preprocessing.splits.ID_SPLIT_ROLES, *datasets.preprocessing.splits.OOD_SPLIT_ROLES)
     if split not in allowed_roles:
         msg = f"Unknown inference split {split!r}. Expected one of: {', '.join(allowed_roles)}."
         raise ValueError(msg)
@@ -207,11 +210,11 @@ def _select_split(*, split_indices: Mapping[str, Any], split: str) -> SplitSelec
     """Bind one requested split role to its admitted ordered parts; run admission already bound them to ``config.yaml``."""
     role = _validate_split_role(split)
     split_contract = datasets.preprocessing.splits.admit_split(split_indices)
-    parts = split_contract.additional_evaluation if role == "additional_evaluation" else (split_contract.role(role),)
+    parts = split_contract.ood_parts(role) if role in datasets.preprocessing.splits.OOD_SPLIT_ROLES else (split_contract.role(role),)
     if not parts:
         msg = f"Saved split has no {role!r} membership."
         raise ValueError(msg)
-    return SplitSelection(role=role, evidence=tuple(parts))
+    return SplitSelection(role=role, evidence=tuple(parts), train_subset=split_contract.train_subset)
 
 
 def _open_split_sources(selection: SplitSelection, *, dataset_root: Path) -> list[datasets.runtime.steady.SteadyFlowDataset]:
@@ -224,7 +227,9 @@ def _open_split_sources(selection: SplitSelection, *, dataset_root: Path) -> lis
         if not isinstance(package, datasets.runtime.steady.SteadyFlowDataset):
             msg = "Steady Dataset factory returned an unexpected runtime."
             raise TypeError(msg)
-        datasets.preprocessing.splits.require_source_identity(package, part.dataset, role=part.name, case_ids=part.case_ids)
+        datasets.preprocessing.splits.require_source_identity(
+            package, part.dataset, role=part.name, case_ids=part.case_ids, train_subset=selection.train_subset
+        )
         packages.append(package)
     return packages
 
@@ -344,9 +349,9 @@ def load_inference_context_with_resolution(
         Current explicit dataset root, which must be the ``02_datasets`` area of a storage root; each saved logical
         Dataset ID is opened under it through its manifest, and the opened identity and fixed partition must equal
         the saved split part. Defaults to the central dataset-root resolution.
-    split : {"train", "validation", "id_test", "additional_evaluation"}, optional
+    split : {"train", "validation", "id_test", "material_ood", "parameter_ood"}, optional
         Saved split role to load. Train, validation and ID-test use the saved
-        training Dataset membership; ``additional_evaluation`` uses the saved holdout membership against the evaluation
+        training Dataset membership; ``material_ood`` and ``parameter_ood`` use the saved holdout membership against the evaluation
         final dataset recorded by training. Default is `eval`.
     batch_size : int, optional
         Evaluation batch size. Default is 1.
@@ -453,7 +458,7 @@ def load_inference_context(
         Completed saved run directory.
     dataset_root : str | Path | None, optional
         Current dataset root; must be the ``02_datasets`` area of a storage root, under which the factory opens each saved Dataset.
-    split : {"train", "validation", "id_test", "additional_evaluation"}, optional
+    split : {"train", "validation", "id_test", "material_ood", "parameter_ood"}, optional
         Saved split role.
     batch_size : int, optional
         Inference batch size.

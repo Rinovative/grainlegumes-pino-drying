@@ -24,19 +24,17 @@ from src.generation.contracts import generation_contracts_campaign_identity as i
 from src.generation.publication import generation_publication_campaign_evidence as evidence
 
 
-def test_source_name_uses_registered_material_order_and_original_design() -> None:
+def test_source_name_uses_registered_material_order_design_sizes_and_derived_domain() -> None:
     name = identity.canonical_campaign_name(
-        {"chickpea": 50, "lentil": 50, "kidney_bean": 20},
-        domain_profile="reference_range",
-        mode="lhs",
+        {"chickpea": {"train": 4, "validation": 2, "test": 2}, "lentil": {"train": 4, "validation": 2, "test": 2}, "kidney_bean": {"test": 8}},
         root_seed=9200,
         horizon_hours=None,
     )
-    assert name == "lentil-50+chickpea-50+kidney-bean-20__ref-range__lhs-seed-9200"
+    assert name == "lentil-4-2-2+chickpea-4-2-2+kidney-bean-8__ref-range__sobol-seed-9200"
     extended = identity.canonical_campaign_name(
-        {"lentil": 3}, domain_profile="reference_and_parameter_extension", mode="sobol", root_seed=7, horizon_hours=None
+        {"lentil": {"train": 1, "validation": 1, "test": 1, "parameter_ood": 1}}, root_seed=7, horizon_hours=None
     )
-    assert extended == "lentil-3__ref-param-ext__sobol-seed-7"
+    assert extended == "lentil-1-1-1-1__ref-param-ext__sobol-seed-7"
     assert identity.horizon_token(4.5) == "h-4p5"
     with pytest.raises(ValueError, match="positive finite"):
         identity.horizon_token(0)
@@ -47,26 +45,25 @@ def test_only_a_horizon_deviating_from_the_configured_one_enters_the_name() -> N
     assert identity.deviating_horizon_hours(168, 168.0) is None
     deviating = identity.deviating_horizon_hours(4.0, 168.0)
     assert deviating == 4.0
-    name = identity.canonical_campaign_name({"lentil": 3}, domain_profile="reference_range", mode="lhs", root_seed=7, horizon_hours=deviating)
-    assert name == "lentil-3__ref-range__lhs-seed-7__h-4"
+    name = identity.canonical_campaign_name({"lentil": {"test": 2}}, root_seed=7, horizon_hours=deviating)
+    assert name == "lentil-2__ref-range__sobol-seed-7__h-4"
 
 
 def test_replacement_batch_locators_extend_the_original_name_and_regime_by_the_candidate_ordinal() -> None:
     """One resolver owns the batch name and locator regime of originals and canonical replacements."""
-    assert config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {}) == ("steady_flow__lentil__natural", "natural")
-    design = {"schema_version": sampling_service.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION, "candidate_ordinal": 3}
-    assert config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {"supplemental_design": design}) == (
-        "steady_flow__lentil__natural__replacement_0003",
-        "natural_replacement_0003",
+    assert config_service.resolve_batch_locators("steady_flow", "lentil", "train", {}) == ("steady_flow__lentil__train", "train")
+    design = {"candidate_ordinal": 3}
+    assert config_service.resolve_batch_locators("steady_flow", "lentil", "train", {"replacement_design": design}) == (
+        "steady_flow__lentil__train__replacement_0003",
+        "train_replacement_0003",
     )
 
 
 @pytest.mark.parametrize("ordinal", [0, -1, True, "1", 1.0, None])
 def test_replacement_batch_locators_reject_an_invalid_candidate_ordinal(ordinal: Any) -> None:
     """A canonical replacement without an integer ordinal of at least one has no batch identity."""
-    design = {"schema_version": sampling_service.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION, "candidate_ordinal": ordinal}
     with pytest.raises(ValueError, match="invalid candidate ordinal"):
-        config_service.resolve_batch_locators("steady_flow", "lentil", "natural", {"supplemental_design": design})
+        config_service.resolve_batch_locators("steady_flow", "lentil", "train", {"replacement_design": {"candidate_ordinal": ordinal}})
 
 
 def test_domain_token_is_the_short_path_safe_name_of_every_supported_profile() -> None:
@@ -78,18 +75,17 @@ def test_domain_token_is_the_short_path_safe_name_of_every_supported_profile() -
         identity.domain_token("unlisted_profile")
 
 
-def test_source_name_rejects_unsupported_material_domain_and_sampler() -> None:
+def test_source_name_rejects_unregistered_materials_and_unsupported_design_shapes() -> None:
     with pytest.raises(ValueError, match="registered"):
-        identity.canonical_campaign_name({"unmeasured": 2}, domain_profile="reference_range", mode="lhs", root_seed=1, horizon_hours=None)
-    with pytest.raises(ValueError, match="domain profile"):
-        identity.canonical_campaign_name({"lentil": 2}, domain_profile="id", mode="lhs", root_seed=1, horizon_hours=None)
-    with pytest.raises(ValueError, match="Unsupported campaign sampling mode"):
-        identity.canonical_campaign_name({"lentil": 2}, domain_profile="reference_range", mode="compose", root_seed=1, horizon_hours=None)
+        identity.canonical_campaign_name({"unmeasured": {"test": 2}}, root_seed=1, horizon_hours=None)
+    for designs in ({"train": 2, "test": 2}, {"test": 2, "parameter_ood": 1}, {"test": 0}):
+        with pytest.raises(ValueError, match=r"Design kinds|positive integers"):
+            identity.canonical_campaign_name({"lentil": designs}, root_seed=1, horizon_hours=None)
 
 
 def test_same_name_different_semantics_conflicts() -> None:
     with pytest.raises(ValueError, match="conflicting frozen scientific semantics"):
-        identity.assert_campaign_semantics("lentil-2__ref-range__lhs-seed-1", "a" * 64, "b" * 64)
+        identity.assert_campaign_semantics("lentil-2__ref-range__sobol-seed-1", "a" * 64, "b" * 64)
 
 
 def test_authored_source_resolves_role_neutral_design(generation_config_factory: Any) -> None:
@@ -104,18 +100,20 @@ def test_authored_source_resolves_role_neutral_design(generation_config_factory:
     assert "evaluation_regime" not in campaign.batches[0].scientific_values
 
 
-def test_ordinary_run_overrides_resolve_small_design_and_preserve_schedule(generation_config_factory: Any) -> None:
-    """Finite overrides change resolved science without changing authored configuration."""
-    config_path, _ = generation_config_factory(simulation_profile="transient_drying", natural_count=6)
+def test_ordinary_run_overrides_resolve_a_short_horizon_and_preserve_design_and_schedule(generation_config_factory: Any) -> None:
+    """Finite overrides change resolved science without changing authored configuration or the design."""
+    config_path, _ = generation_config_factory(simulation_profile="transient_drying", natural_count=4)
     authored = config_path.read_bytes()
     baseline = config_service.load_campaign_config(config_path, require_executable=False)
-    overrides = {"materials": ["lentil"], "cases_per_material": 4, "duration_hours": 4.0}
+    overrides = {"materials": ["lentil"], "duration_hours": 4.0}
     campaign = config_service.load_campaign_config(config_path, require_executable=False, scientific_overrides=overrides)
     scientific = campaign.batches[0].scientific_values
     assert config_path.read_bytes() == authored
     assert campaign.total_case_count == 4
     assert campaign.selected_targets == {"lentil": 4}
     assert campaign.root_seed == baseline.root_seed
+    with pytest.raises(config_service.GenerationConfigError, match="Unsupported scientific run overrides"):
+        config_service.load_campaign_config(config_path, require_executable=False, scientific_overrides={"cases_per_material": 2})
     assert scientific["grid"] == baseline.batches[0].scientific_values["grid"]
     assert scientific["time"]["stop"] == 4.0
     assert scientific["time"]["regular_times"] == [0.0, 1.0, 2.0, 3.0, 4.0]
@@ -210,7 +208,6 @@ def test_normal_resource_overrides_preserve_science_and_persist_effective_execut
     assert values["runtime"]["timeout_seconds"] == 1500
     assert values["runtime"]["graceful_stop_reserve_seconds"] == 300
     assert values["runtime"]["license_wait"]["enabled"] is False
-    assert values["runtime"]["license_wait"]["in_allocation_retry"]["enabled"] is False
     assert values["submission"]["max_admission_cases"] == 4
     lifecycle.create_campaign(bounded, storage_root=tmp_path)
     plan = lifecycle.load_campaign_plan(bounded.profile.id, bounded.source_name, storage_root=tmp_path)
@@ -240,7 +237,7 @@ def test_normal_resource_overrides_reject_invalid_values(generation_config_facto
 
 def test_source_name_is_the_label_and_validates_the_digest_it_is_frozen_with() -> None:
     """The label names the folder as written; the digest is validated, never embedded."""
-    label = "lentil-2__ref-range__lhs-seed-17"
+    label = "lentil-2__ref-range__sobol-seed-17"
     assert identity.source_name(label, "a" * 64) == label
     assert identity.source_name(label, "b" * 64) == label
     with pytest.raises(ValueError, match="SHA-256"):
@@ -268,7 +265,7 @@ def test_source_name_is_the_label_and_validates_the_digest_it_is_frozen_with() -
 )
 def test_revision_grammar_is_one_rule_and_the_revised_label_is_a_valid_source_name(label: str, valid: bool) -> None:
     """A revision is lowercase letters and digits joined by single separators; only such labels form a Source name."""
-    design = "lentil-2__ref-range__lhs-seed-17"
+    design = "lentil-2__ref-range__sobol-seed-17"
     if not valid:
         with pytest.raises(ValueError, match="Revision"):
             identity.revision_label(label)
@@ -324,19 +321,21 @@ def test_scientific_revision_override_equals_the_authored_key(generation_config_
 
 
 def test_seed_key_depends_on_scientific_design_and_not_on_the_display_name() -> None:
-    """Candidate seeds survive renaming but change with counts, seed base, or purpose."""
+    """Candidate seeds survive renaming but change with design sizes, design kinds, seed base, or purpose."""
     design = {
         "task": "transient_drying",
         "domain_profile": "reference_range",
-        "sampling_method": "lhs",
+        "design_recipe": sampling_service.DESIGN_RECIPE,
         "seed_base": 9220,
         "purpose": "source_generation",
     }
-    key = seeding.campaign_seed_key(design_sizes={"lentil": 3, "chickpea": 3}, **design)
-    assert key == seeding.campaign_seed_key(design_sizes={"chickpea": 3, "lentil": 3}, **design)
-    assert key != seeding.campaign_seed_key(design_sizes={"lentil": 4, "chickpea": 3}, **design)
-    assert key != seeding.campaign_seed_key(design_sizes={"lentil": 3, "chickpea": 3}, **{**design, "seed_base": 9221})
-    assert key != seeding.campaign_seed_key(design_sizes={"lentil": 3, "chickpea": 3}, **{**design, "purpose": "other"})
+    designs = {"lentil": {"test": 2}, "chickpea": {"test": 2}}
+    key = seeding.campaign_seed_key(designs=designs, **design)
+    assert key == seeding.campaign_seed_key(designs={"chickpea": {"test": 2}, "lentil": {"test": 2}}, **design)
+    assert key != seeding.campaign_seed_key(designs={**designs, "lentil": {"test": 4}}, **design)
+    assert key != seeding.campaign_seed_key(designs={**designs, "lentil": {"train": 2}}, **design)
+    assert key != seeding.campaign_seed_key(designs=designs, **{**design, "seed_base": 9221})
+    assert key != seeding.campaign_seed_key(designs=designs, **{**design, "purpose": "other"})
 
 
 def test_dataset_plan_envelope_reuses_source_and_preserves_frozen_authorship(
@@ -346,15 +345,15 @@ def test_dataset_plan_envelope_reuses_source_and_preserves_frozen_authorship(
     """Roles, splits and plan location remain outside the physical Source identity."""
     path, _ = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
     authored = yaml.safe_load(path.read_text())
-    for key in ("sources_config", "registry_config", "common_config", "operations_config", "profile_config", "execution_config"):
+    for key in ("sources_config", "registry_config", "common_config", "operations_config", "bed_fields_config", "profile_config", "execution_config"):
         authored[key] = str((path.parent / authored[key]).resolve())
     authored["revision"] = "my-readable-source"
     plans = common.paths.get_project_root() / "configs/02_datasets"
     plans.mkdir(parents=True)
     first = plans / "first.yaml"
     second = plans / "second.yaml"
-    first.write_text("roles: {lentil: train}\nsplit_seed: 11\n")
-    second.write_text("roles: {lentil: test}\nsplit_seed: 29\n")
+    first.write_text("materials: {lentil: {role: id}}\n")
+    second.write_text("materials: {lentil: {role: ood}}\n")
     before = first.read_bytes(), second.read_bytes()
     campaigns = [config_service.load_campaign_config(p, authored_value=authored) for p in (first, second)]
     label = f"{campaigns[0].campaign_name}__rev-my-readable-source"

@@ -468,6 +468,7 @@ def test_monitoring_failure_does_not_change_the_simulated_case_path(
         cores_per_case=1,
         worker_slot=0,
         progress_reporter=BrokenReporter(),
+        scheduler_kind="local",
     )
 
     assert result.canonical_case.path.is_file()

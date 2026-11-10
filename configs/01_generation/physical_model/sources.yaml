@@ -1,7 +1,6 @@
 # Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
 # Bibliographic catalogue referenced by material and model provenance; source_key values are stable identifiers, not claims that every value is measured.
 schema_kind: generation_sources
-schema_version: 1
 # Each record supplies citation, identifier, locator, and source type used by provenance references.
 sources:
 - source_key: ba
@@ -36,9 +35,10 @@ sources:
 - source_key: lentil_drying
   citation: Mangueira, E. R. et al. (2021). Analysis of the thin layer drying kinetic
     of brown lentil grains. Research, Society and Development, 10.
-  identifier: RSD article 19258
-  canonical_locator: https://rsdjournal.org/rsd/article/view/19258
-  alternate_locators: []
+  identifier: doi:10.33448/rsd-v10i10.19258
+  canonical_locator: https://doi.org/10.33448/rsd-v10i10.19258
+  alternate_locators:
+  - https://rsdjournal.org/rsd/article/view/19258
   source_type: journal_article
 - source_key: swiss_crops
   citation: swiss granum (2026). Empfehlungen fuer Uebernahmebedingungen und gesetzliche
@@ -56,7 +56,7 @@ sources:
   alternate_locators: []
   source_type: journal_article
 - source_key: chickpea_oswin_source
-  citation: Armstrong, P. R., Maghirang, E. B., Bhadriraju, S., & McNeill, S. G. (2017).
+  citation: Armstrong, P. R., Maghirang, E. B., Subramanyam, Bh., & McNeill, S. G. (2017).
     Equilibrium Moisture Content of Kabuli Chickpea, Black Sesame, and White Sesame
     Seeds. Applied Engineering in Agriculture, 33(5), 737-742.
   identifier: doi:10.13031/aea.12460
@@ -73,18 +73,20 @@ sources:
   alternate_locators: []
   source_type: journal_article
 - source_key: kidney_physical
-  citation: Isik, E. & Unal, H. (2011). Some physical properties of white kidney beans
-    (Phaseolus vulgaris L.). African Journal of Biotechnology, 10.
-  identifier: stable journal PDF
-  canonical_locator: https://academicjournals.org/journal/AJB/article-full-text-pdf/A932BBF38233
-  alternate_locators: []
+  citation: Isik, E. & Unal, H. (2011). Some engineering properties of white kidney beans
+    (Phaseolus vulgaris L.). African Journal of Biotechnology, 10(82).
+  identifier: doi:10.5897/AJB11.1341
+  canonical_locator: https://doi.org/10.5897/AJB11.1341
+  alternate_locators:
+  - https://academicjournals.org/journal/AJB/article-full-text-pdf/A932BBF38233
   source_type: journal_article
 - source_key: kidney_oswin_source
   citation: Campos, R. C. et al. (2016). Bean grain hysteresis with induced mechanical
     damage. Revista Brasileira de Engenharia Agricola e Ambiental, 20(10), 930-935.
-  identifier: stable PDF; journal article 20(10):930-935
-  canonical_locator: https://pdfs.semanticscholar.org/7400/4771a004cf1530362e41e9969bc9ff3551cb.pdf
-  alternate_locators: []
+  identifier: doi:10.1590/1807-1929/agriambi.v20n10p930-935
+  canonical_locator: https://doi.org/10.1590/1807-1929/agriambi.v20n10p930-935
+  alternate_locators:
+  - https://pdfs.semanticscholar.org/7400/4771a004cf1530362e41e9969bc9ff3551cb.pdf
   source_type: journal_article
 - source_key: kidney_drying
   citation: Doymaz, I. (2016). Hot-Air Drying and Rehydration Characteristics of Red
@@ -124,8 +126,8 @@ sources:
   source_type: institutional_record
 - source_key: canola_thermal
   citation: Yu, D., Shrestha, B. L. & Baik, O.-D. (2015). Thermal conductivity, specific
-    heat, thermal diffusivity, and bulk density of canola seeds. Journal of Food Engineering,
-    165, 156-165.
+    heat, thermal diffusivity, and emissivity of stored canola seeds with their temperature
+    and moisture content. Journal of Food Engineering, 165, 156-165.
   identifier: doi:10.1016/j.jfoodeng.2015.05.012
   canonical_locator: https://doi.org/10.1016/j.jfoodeng.2015.05.012
   alternate_locators: []
@@ -147,9 +149,10 @@ sources:
 - source_key: canola_drying
   citation: Costa, L. M. et al. (2020). Drying kinetics of Hyola 430 hybrid canola
     (Brassica napus L.) seeds. Australian Journal of Crop Science, 14(10), 1623-1629.
-  identifier: AJCS 14(10):1623-1629
-  canonical_locator: https://www.cropj.com/costa_14_10_2020_1623_1629.pdf
-  alternate_locators: []
+  identifier: doi:10.21475/ajcs.20.14.10.p2400
+  canonical_locator: https://doi.org/10.21475/ajcs.20.14.10.p2400
+  alternate_locators:
+  - https://www.cropj.com/costa_14_10_2020_1623_1629.pdf
   source_type: journal_article
 - source_key: canola_drying_gazor
   citation: Gazor, H. R. et al. (2010). Modelling the drying kinetics of canola in
@@ -209,18 +212,11 @@ sources:
   canonical_locator: https://doi.org/10.1016/j.biosystemseng.2017.10.005
   alternate_locators: []
   source_type: journal_article
-- source_key: swiss_oil_2026
-  citation: swiss granum (2026). Übernahmebedingungen Ölsaaten Ernte 2026, Ausgabe
-    19. März 2026.
-  identifier: 2026-03-19 edition
-  canonical_locator: local:upload/2026-03-19_Uebernahmebedingungen_Oelsaaten_2026_D(3).pdf
-  alternate_locators: []
-  source_type: official_guidance
 - source_key: pino_airflow_project
   citation: Albertin, R. M. (2026). PINO Airflow Porous Media. Vertiefungsprojekt,
     OST.
   identifier: SHA-256 5fcae206aff935195eea0f8b149747c1a3e83fef16899d8533c0f89b3fbd954e
-  canonical_locator: local:upload/Albertin_2026_PINO_Airflow_PorousMedia(20260809-103733).pdf
+  canonical_locator: docs/Albertin_2026_PINO_Airflow_PorousMedia.pdf
   alternate_locators: []
   source_type: project_report
 - source_key: transient_comsol_model_report

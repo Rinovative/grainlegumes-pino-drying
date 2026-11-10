@@ -249,14 +249,15 @@ def _loop_identity() -> dict[str, Any]:
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
         "resume_contract_digest": digest("resume"),
-        "dataset_ids": {"train": "synthetic-train", "additional_evaluation": "synthetic-additional-evaluation"},
-        "dataset_fingerprints": {"train": digest("train"), "additional_evaluation": digest("additional-evaluation")},
+        "dataset_ids": {"train": "synthetic-train", "material_ood": "synthetic-material-ood", "parameter_ood": "synthetic-parameter-ood"},
+        "dataset_fingerprints": {"train": digest("train"), "material_ood": digest("material-ood"), "parameter_ood": digest("parameter-ood")},
         "split_contract_digest": digest("split"),
         "split_membership_digests": {
             "train": digest("train-membership"),
             "validation": digest("validation-membership"),
             "id_test": digest("id-membership"),
-            "additional_evaluation": digest("additional-evaluation-membership"),
+            "material_ood": digest("material-ood-membership"),
+            "parameter_ood": digest("parameter-ood-membership"),
         },
         "normalizer_sha256": digest("normalizer"),
         "numerical_environment": checkpoint_service.numerical_environment_identity(),
@@ -552,7 +553,7 @@ def test_failed_stage_recovery_checks_saved_checkpoint_and_rejects_missing_state
     run_service.config_loader.save_yaml(requested, common.paths.resolve_run_config_path(run_dir))
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "status": "interrupted", "completed_epoch": 1},
+        {"status": "interrupted", "completed_epoch": 1},
     )
     for path in (
         common.paths.resolve_split_indices_path(run_dir),
@@ -654,7 +655,7 @@ def test_train_loop_partial_cap_resumes_same_epoch_then_selects_terminal_partial
         "training": {
             "epochs": 2,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
             "comparison_arm": "a1",
             "matched_a1_b": {"role": "a1"},
         },
@@ -728,7 +729,7 @@ def test_only_the_matched_a0_best_keeps_its_training_state_for_handoff(tmp_path:
         "training": {
             "epochs": 1,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
             "comparison_arm": "a0",
             "stage_schedule": {"mode": mode},
         },
@@ -782,7 +783,7 @@ def test_budget_point_arm_validates_only_at_epochs_that_crossed_a_new_point(tmp_
         "training": {
             "epochs": 6,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
             "comparison_arm": "b",
             "matched_a1_b": {"role": "b"},
         },
@@ -825,7 +826,7 @@ def _windowed_terminal_loop(
         "training": {
             "epochs": epochs,
             "evaluation_interval": 1,
-            "additional_evaluation_interval": 1,
+            "ood_evaluation_interval": 1,
             "comparison_arm": "b",
             "matched_a1_b": {"role": "b"},
         },
@@ -991,7 +992,8 @@ def test_completed_summary_refreshes_prior_budget_unmet_clocks(
         "train": [0],
         "eval": [0],
         "id_test": [0],
-        "additional_evaluation": None,
+        "material_ood": None,
+        "parameter_ood": None,
         "data_processor": processor,
         "scaling_artifact": {},
         "split_indices": {},
@@ -1104,7 +1106,7 @@ def test_completed_summary_rejects_budget_alias_that_contradicts_checkpoint_cont
             task_contract_sha256="d" * 64,
             tensorizer_sha256="f" * 64,
             model_kind="fno",
-            input_profile="canonical_physics_complete_v1",
+            input_profile="canonical_physics_complete",
         ),
         planned_train_seconds=2.0,
         train_seconds=1.89419,
@@ -1224,8 +1226,7 @@ def test_artifact_all_reports_unfinished_stages_without_masking_budget_unmet(
         analysis.artifacts.service,
         "load_or_build_run_artifacts",
         lambda stage_dir, **_kwargs: (
-            calls.append(stage_dir)
-            or SimpleNamespace(role_actions={"id": "reused"}, loaded_run=SimpleNamespace(id_artifact=None, additional_artifact=None))
+            calls.append(stage_dir) or SimpleNamespace(role_actions={"id": "reused"}, loaded_run=SimpleNamespace(role_artifacts=dict))
         ),
     )
     assert cli_train.main([str(path), "--artifacts", "all"]) == 2

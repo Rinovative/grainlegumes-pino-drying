@@ -171,7 +171,7 @@ def run_campaign_case(
     task: CampaignTask,
     *,
     cores_per_case: int,
-    scheduler_kind: str = "slurm",
+    scheduler_kind: str,
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
     input_references: Mapping[int, admission_service.InputCaseReference] | None = None,

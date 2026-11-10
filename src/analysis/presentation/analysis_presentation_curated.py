@@ -303,7 +303,7 @@ def render_curated_transient_analysis(
         media_files[name] = target / f"{name}.png"
         figures[name] = transient_plot.plot_training_performance_vs_compute(training_performance)
     for name in ("transient_state_maps", "transient_central_error_time", "transient_timing_distributions", "transient_timing_speedups"):
-        figures[name].suptitle(f"Saved model: {primary_frame}")
+        figures[name].suptitle(f"Saved model: {primary_frame}", wrap=True)
     for name, figure in figures.items():
         _save_figure(figure, media_files[name])
     return TransientCuratedAnalysisBundle(

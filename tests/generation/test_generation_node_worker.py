@@ -25,6 +25,7 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -356,7 +357,7 @@ def test_ticket_launcher_must_be_a_regular_non_symlink_generation_node_file(harn
 def test_stop_ticket_carries_no_step_fields() -> None:
     """A stop ticket is exactly a sequence number and its kind."""
     stop = node.NodeTicket(seq=3, kind=node.STOP_KIND)
-    assert stop.to_payload() == {"schema": node.TICKET_SCHEMA, "schema_version": 1, "seq": 3, "kind": "stop"}
+    assert stop.to_payload() == {"schema": node.TICKET_SCHEMA, "seq": 3, "kind": "stop"}
     with pytest.raises(ValueError, match="stop ticket"):
         node.NodeTicket(seq=3, kind=node.STOP_KIND, cores=1)
 
@@ -427,7 +428,6 @@ def test_publish_node_cancel_is_idempotent_and_refuses_a_non_file_marker(harness
         (lambda payload: payload.update(extra=1), "differ from the contract"),
         (lambda payload: payload.pop("label"), "differ from the contract"),
         (lambda payload: payload.update(schema="other"), "must declare schema"),
-        (lambda payload: payload.update(schema_version=True), "must declare schema"),
         (lambda payload: payload.update(argv="not-a-list"), "argv must be a list"),
         (lambda payload: payload.update(seq=2), "file name sequence"),
     ],
@@ -867,8 +867,56 @@ def test_cli_links_a_campaign_node_job_log_and_a_failed_link_keeps_the_exit_code
     # The .err file does not exist, so its link fails after the .out link succeeded.
     monkeypatch.setattr(cli_generation.host_service, "job_log_files", lambda _templates: (out, harness.root / "node-4242.err"))
     assert cli_generation.main(["run-node-worker", str(worker.node_directory), "--cores", "4"]) == 0
-    assert (campaign / "logs/node-4242.out").samefile(out)
+    assert (campaign / "_record/logs/node-4242.out").samefile(out)
     assert "Warning: could not link job logs" in capsys.readouterr().err
+
+    def unresolvable(_runtime_root: Path) -> NoReturn:
+        message = "runtime root unavailable"
+        raise RuntimeError(message)
+
+    fresh = replace(harness, node_directory=campaign / "_record/execution/node_jobs" / ("e" * 16))
+    (fresh.node_directory / "tickets").mkdir(parents=True)
+    fresh.stop(1)
+    monkeypatch.setattr(cli_generation.cluster_service, "node_job_log_templates", unresolvable)
+    assert cli_generation.main(["run-node-worker", str(fresh.node_directory), "--cores", "4"]) == 0
+    assert capsys.readouterr().err.count("Warning: could not link the node job logs: runtime root unavailable") == 2
+
+
+@pytest.mark.parametrize("mode", ["returns", "raises", "raises-silently"])
+def test_cli_links_a_node_err_that_holds_text_when_the_worker_ends_but_not_an_empty_one(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """The .err is empty at worker start, so the end of the worker links it again: failure lines reach the campaign, an empty one does not."""
+    campaign = harness.root / "campaign"
+    worker = replace(harness, node_directory=campaign / "_record/execution/node_jobs" / ("f" * 16))
+    (worker.node_directory / "tickets").mkdir(parents=True)
+    out, err = harness.root / "node-4242.out", harness.root / "node-4242.err"
+    out.write_text("preflight\n", encoding="utf-8")
+    err.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_generation.host_service, "job_log_files", lambda _templates: (out, err))
+    ended = SimpleNamespace(detail="done", reason="stop_ticket", started=0, finished=0, exit_code=0)
+
+    def run(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        if mode != "raises-silently":
+            err.write_text("srun: error: step failed\n", encoding="utf-8")
+        if mode != "returns":
+            message = "worker crashed"
+            raise RuntimeError(message)
+        return ended
+
+    monkeypatch.setattr(cli_generation.node_service, "run_node_worker", run)
+    with err.open("a", buffering=1, encoding="utf-8") as stderr, monkeypatch.context() as patch:  # the job's stderr is its .err file
+        patch.setattr(sys, "stderr", stderr)
+        cli_generation.main(["run-node-worker", str(worker.node_directory), "--cores", "4"])
+    assert (campaign / "_record/logs/node-4242.err").samefile(err)
+    assert (campaign / "_record/logs/node-4242.out").samefile(out)
+
+    quiet = harness.root / "quiet.err"
+    quiet.write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_generation.host_service, "job_log_files", lambda _templates: (out, quiet))
+    monkeypatch.setattr(cli_generation.node_service, "run_node_worker", lambda *_a, **_k: ended)
+    cli_generation.main(["run-node-worker", str(worker.node_directory), "--cores", "4"])
+    assert not (campaign / "_record/logs/quiet.err").exists()
 
 
 _DURATION = r"(?:\d+ s|\d+ min \d\d s|\d+ h \d\d min)"

@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 import torch
+import yaml
 
 from src import common, datasets, domain, experiments, learning
 from src.experiments.config import experiments_config_naming as config_naming
@@ -50,15 +51,16 @@ from src.experiments.config import experiments_config_transient_plan as transien
 
 from . import experiments_tuning_search_space as search_space
 
-STUDY_SIGNATURE_SCHEMA_VERSION = 1
-TRIAL_LIFECYCLE_SCHEMA_VERSION = 1
 _STUDY_SIGNATURE_ATTR = "semantic_signature"
 _STUDY_SIGNATURE_PAYLOAD_ATTR = "semantic_signature_payload"
-_STUDY_SIGNATURE_SCHEMA_ATTR = "semantic_signature_schema_version"
 _RESOLVED_OBJECTIVE_ATTR = "resolved_objective"
 _SAMPLER_METADATA_ATTR = "sampler_metadata"
 _NUMERICAL_ENVIRONMENT_ATTR = "numerical_environment"
 _STUDY_SUMMARY_FILENAME = "study_summary.json"
+_BEST_CONFIG_FILENAME = "best_config.yaml"
+# Trial budget, tracking workflow, seeds and layout belong to the study, not to the config its best trial yields; so does the
+# single-stage sampling of a transient A0 study, which a matched experiment states per stage.
+_STUDY_ONLY_PATHS = frozenset({"training", "tracking", "run", "temporal.sampling"})
 _PARAMETER_IMPORTANCE_MIN_COMPLETED_TRIALS = 20
 _STUDY_ROLES = frozenset({"production"})
 _MODEL_PARAMS_PREFIX = "model.params."
@@ -649,6 +651,9 @@ def load_optuna_study_config(
     _validate_search_space_choices(base_config, search_parameters)
     _validate_transient_study_policy(base_config, search_parameters)
     _validate_study_mode(base_config, mode=study["mode"])
+    if not _task_base_path(base_config["task"]).is_file():
+        msg = f"The task base {_task_base_path(base_config['task'])} that the best config is exported against is missing."
+        raise ValueError(msg)
 
     return OptunaStudyConfig(
         path=source_path,
@@ -660,11 +665,11 @@ def load_optuna_study_config(
 
 
 def _validate_reporting_contract(base_config: Mapping[str, Any]) -> int:
-    """Require one shared positive validation, diagnostic, and physics cadence."""
+    """Require one shared positive validation, OOD (both parts), and physics cadence."""
     training = _as_mapping(base_config.get("training"), label="experiment.training")
     wandb = _as_mapping(_as_mapping(base_config.get("tracking"), label="experiment.tracking").get("wandb"), label="tracking.wandb")
     monitor = _as_mapping(wandb.get("monitor"), label="tracking.wandb.monitor")
-    diagnostic_key = "additional_evaluation_interval"
+    diagnostic_key = "ood_evaluation_interval"
     intervals = {
         "ID": _require_exact_int(training.get("evaluation_interval"), label="training.evaluation_interval", minimum=1),
         "diagnostic": _require_exact_int(training.get(diagnostic_key), label=f"training.{diagnostic_key}", minimum=1),
@@ -784,7 +789,7 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Schema version, SHA-256 digest, and canonical payload covering task,
+        SHA-256 digest and canonical payload covering task,
         scientific config, search space, objective, sampler/pruner, reporting, and
         trial lifecycle policy.
 
@@ -814,10 +819,8 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
         raise ValueError(msg)
     dataset_roles = {"binding": "validated_physical_packages", "roles": copy.deepcopy(validated.dataset_identities)}
     payload = {
-        "schema_version": STUDY_SIGNATURE_SCHEMA_VERSION,
         "task": {
             "id": validated.base_config["task"],
-            "schema_version": validated.base_config["task_contract"]["schema_version"],
             "contract_digest": validated.base_config["task_contract"]["digest"],
         },
         "scientific_base_config": _scientific_base_config(validated.base_config),
@@ -840,8 +843,6 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
             "pruning_subset": "id_only",
         },
         "trial_lifecycle": {
-            "schema_version": TRIAL_LIFECYCLE_SCHEMA_VERSION,
-            "run_summary_schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "outcomes": list(_TRIAL_OUTCOMES),
             "resume_policy": "new_trials_only",
             "trial_count_policy": "additional_fresh_trials_per_invocation",
@@ -851,7 +852,6 @@ def build_study_signature(config: OptunaStudyConfig) -> dict[str, Any]:
         "hpo_implementation_sha256": _hpo_implementation_sha256(validated.base_config["task"]),
     }
     return {
-        "schema_version": STUDY_SIGNATURE_SCHEMA_VERSION,
         "digest": common.serialization.canonical_json_sha256(payload),
         "payload": payload,
     }
@@ -909,10 +909,10 @@ def describe_optuna_study_config(config: OptunaStudyConfig) -> dict[str, Any]:
 
 
 def _study_dir(config: OptunaStudyConfig) -> Path:
-    """Return the task-, dataset- and epoch-budget-owned study directory under the experiments root."""
+    """Return the task-, dataset- (with its Train subset) and epoch-budget-owned study directory under the experiments root."""
     return common.paths.resolve_study_dir(
         str(config.base_config["task"]),
-        str(config.base_config["data"]["train_dataset"]),
+        experiments.config.loader.layout_dataset(config.base_config),
         str(config.study["name"]),
         config.base_config["training"]["epochs"],
         config.base_config["run"].get("revision"),
@@ -922,7 +922,7 @@ def _study_dir(config: OptunaStudyConfig) -> Path:
 
 def _database_study_id(config: OptunaStudyConfig) -> str:
     """Return the storage-wide study identifier, unique across tasks, Datasets, epoch budgets and revisions."""
-    return f"{config.base_config['task']}/{config.base_config['data']['train_dataset']}/{_study_dir(config).name}"
+    return f"{config.base_config['task']}/{experiments.config.loader.layout_dataset(config.base_config)}/{_study_dir(config).name}"
 
 
 def _resolve_study_paths(config: OptunaStudyConfig) -> _OptunaStudyPaths:
@@ -939,7 +939,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate exact configured Dataset selections without assigning package roles."""
     data = _as_mapping(config.get("data"), label="experiment.data")
     train_dataset = _require_nonempty_string(data.get("train_dataset"), label="data.train_dataset")
-    diagnostic_key = "additional_evaluation_datasets"
+    diagnostic_key = "material_ood_datasets"
     raw_diagnostic = data.get(diagnostic_key)
     if not isinstance(raw_diagnostic, list):
         msg = f"data.{diagnostic_key} must be a list of configured Dataset ids."
@@ -964,7 +964,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
             "dataset_view": manifest["dataset_view"],
             "dataset_digest": manifest["dataset_digest"],
             "channel_contract_digest": manifest["channel_contract_digest"],
-            "manifest_schema": {"kind": manifest["schema_kind"], "version": manifest["schema_version"]},
+            "manifest_schema": {"kind": manifest["schema_kind"]},
             "payload_sha256": manifest["payload_sha256"],
             "derived_payload_sha256": manifest["derived_payload_sha256"],
             "sample_count": manifest["sample_count"],
@@ -976,7 +976,7 @@ def _configured_dataset_identities(config: Mapping[str, Any]) -> dict[str, Any]:
 
     return {
         "train": summarize(train_dataset),
-        "additional_evaluation": [summarize(dataset_id) for dataset_id in diagnostic_datasets],
+        "material_ood": [summarize(dataset_id) for dataset_id in diagnostic_datasets],
     }
 
 
@@ -1427,7 +1427,7 @@ def run_trial(
                 raise NonFiniteTrialError(message)
             epoch_reporter(epoch, metrics)
             if epoch_reporter.best_value is not None:
-                metrics.update({"optuna/objective": float(metrics[key]), "optuna/best_objective": epoch_reporter.best_value})
+                metrics["optuna/best_objective"] = epoch_reporter.best_value
 
         _validate_transient_study_policy(config, validated_config.search_space)
         duplicate = _duplicate_trial_outcome(config, trial)
@@ -1589,10 +1589,9 @@ def _publish_study_signature(
     """
     Attach the complete semantic signature and objective to a new study.
 
-    Schema version, digest, canonical payload, and full objective are published
+    Digest, canonical payload, and full objective are published
     together before optimization so later reopen admission can fail closed.
     """
-    study.set_user_attr(_STUDY_SIGNATURE_SCHEMA_ATTR, signature["schema_version"])
     study.set_user_attr(_STUDY_SIGNATURE_ATTR, signature["digest"])
     study.set_user_attr(_STUDY_SIGNATURE_PAYLOAD_ATTR, signature["payload"])
     study.set_user_attr(_RESOLVED_OBJECTIVE_ATTR, dict(objective))
@@ -1624,7 +1623,6 @@ def _validate_existing_study(
     if environment is None:
         environment = learning.training.checkpoint.numerical_environment_identity()
     required = {
-        _STUDY_SIGNATURE_SCHEMA_ATTR: signature["schema_version"],
         _STUDY_SIGNATURE_ATTR: signature["digest"],
         _STUDY_SIGNATURE_PAYLOAD_ATTR: signature["payload"],
         _RESOLVED_OBJECTIVE_ATTR: dict(objective),
@@ -1635,47 +1633,6 @@ def _validate_existing_study(
     if missing:
         msg = f"Existing Optuna study is missing required semantic metadata: {missing}."
         raise ValueError(msg)
-
-    def require_schema_version(value: Any, expected: int, *, label: str) -> None:
-        if not common.serialization.is_schema_version(value, expected):
-            msg = f"Existing Optuna study {label} must be schema version {expected}."
-            raise ValueError(msg)
-
-    require_schema_version(
-        study.user_attrs[_STUDY_SIGNATURE_SCHEMA_ATTR],
-        STUDY_SIGNATURE_SCHEMA_VERSION,
-        label=_STUDY_SIGNATURE_SCHEMA_ATTR,
-    )
-    actual_payload = study.user_attrs[_STUDY_SIGNATURE_PAYLOAD_ATTR]
-    if not isinstance(actual_payload, Mapping):
-        msg = "Existing Optuna study semantic signature payload must be a mapping."
-        raise TypeError(msg)
-    actual_task = actual_payload.get("task")
-    actual_lifecycle = actual_payload.get("trial_lifecycle")
-    if not isinstance(actual_task, Mapping) or not isinstance(actual_lifecycle, Mapping):
-        msg = "Existing Optuna study semantic signature has invalid task or trial lifecycle metadata."
-        raise TypeError(msg)
-    require_schema_version(
-        actual_payload.get("schema_version"),
-        STUDY_SIGNATURE_SCHEMA_VERSION,
-        label="signature payload",
-    )
-    expected_payload = signature["payload"]
-    require_schema_version(
-        actual_task.get("schema_version"),
-        expected_payload["task"]["schema_version"],
-        label="task contract",
-    )
-    require_schema_version(
-        actual_lifecycle.get("schema_version"),
-        TRIAL_LIFECYCLE_SCHEMA_VERSION,
-        label="trial lifecycle",
-    )
-    require_schema_version(
-        actual_lifecycle.get("run_summary_schema_version"),
-        common.paths.RUN_SUMMARY_SCHEMA_VERSION,
-        label="run summary",
-    )
 
     mismatched = sorted(key for key, value in required.items() if study.user_attrs.get(key) != value)
     if mismatched:
@@ -1825,10 +1782,86 @@ def _study_lifecycle_summary(
     }
 
 
-def _publish_study_lifecycle_summary(paths: _OptunaStudyPaths, summary: Mapping[str, Any]) -> None:
-    """Persist the bounded inventory only beside repository-owned local storage."""
-    if paths.local_storage_path is not None:
-        common.serialization.atomic_write_json(paths.study_dir / _STUDY_SUMMARY_FILENAME, dict(summary))
+def _task_base_path(task: str) -> Path:
+    """Return the maintained ``base.yaml`` of one task, wherever a study file lives."""
+    return Path(common.paths.get_project_root(), *config_naming.CONFIG_TREE, task, experiments.config.loader.AUTHORED_BASE_FILENAME)
+
+
+def _authored_difference(
+    merged: Mapping[str, Any], base: Mapping[str, Any], search_paths: Sequence[str], *, prefix: str = "", study_only: bool = False
+) -> dict[str, Any]:
+    """Return the leaves of ``merged`` that differ from ``base``; study-only sections keep only the searched paths."""
+    result: dict[str, Any] = {}
+    for key, value in merged.items():
+        path = f"{prefix}.{key}" if prefix else key
+        only = study_only or path in _STUDY_ONLY_PATHS
+        base_value = base.get(key)
+        if isinstance(value, Mapping):
+            nested = _authored_difference(value, base_value if isinstance(base_value, Mapping) else {}, search_paths, prefix=path, study_only=only)
+            if nested:
+                result[key] = nested
+        elif value != base_value or key not in base:
+            if not only or any(searched == path or searched.startswith(f"{path}.") for searched in search_paths):
+                result[key] = value
+    return result
+
+
+def _best_experiment_yaml(config: OptunaStudyConfig, summary: Mapping[str, Any], study_name: str) -> str:
+    """Return the best trial as an experiment config on the task's ``base.yaml`` that trains once copied into ``experiments/``."""
+    overrides = {
+        parameter.path: parameter.value if parameter.kind == "fixed" else summary["best_parameters"][parameter.name]
+        for parameter in config.search_space
+    }
+    authored = experiments.config.loader.load_yaml(config.path)["experiment"]
+    merged = experiments.config.loader.apply_authored_base(authored, origin=config.path)
+    for path, value in overrides.items():
+        # An omitted default is absent from the authored block: its first missing level is copied from the resolved config.
+        authored_node: Any = merged
+        resolved_node: Any = config.base_config
+        for token in path.split("."):
+            key: Any = int(token) if isinstance(authored_node, list) else token
+            if isinstance(authored_node, dict) and key not in authored_node:
+                authored_node[key] = copy.deepcopy(resolved_node[key])
+                break
+            authored_node, resolved_node = authored_node[key], resolved_node[int(token) if isinstance(resolved_node, list) else token]
+        search_space.set_config_path(merged, path, value)
+    base = experiments.config.loader.load_yaml(_task_base_path(config.base_config["task"]))
+    task = merged.pop("task")
+    best_config = search_space.apply_trial_overrides(config.base_config, overrides)
+    differences = config_naming.complete_token_groups(_authored_difference(merged, base, list(overrides)), best_config)
+    if config.study["mode"] == "stage_a_only":  # a transient A0 study: the matched experiment states A0's sampling per stage
+        a0 = {**differences.get("training", {}), "sampling": copy.deepcopy(config.base_config["temporal"]["sampling"])}
+        curriculum = config.base_config["training"]["curriculum"]
+        if curriculum != experiments.config.defaults.get_task_defaults(task)["training"]["curriculum"]:
+            a0["curriculum"] = copy.deepcopy(curriculum)
+        differences["training"] = {"a0": a0}
+    body = {"task": task, "base": "../../base.yaml", **experiments.config.loader.ordered_sections(differences)}
+    label = config_naming.config_name(best_config, differences)
+    best = f"# Best trial {summary['best_trial_number']} of study {study_name}, objective {summary['best_objective']:.6g}; "
+    if config.study["mode"] == "stage_a_only":
+        header = (
+            f"{best}transfer these values into the matched experiment under configs/03_learning/{task}/experiments/architecture_comparison/, "
+            "which carries B's sampling and training.b.train_seconds (A0's measured time per architecture); the name is "
+            f"{label}; B/A1 settings it sets appear in the pair folder (configs/README.md).\n"
+        )
+    else:
+        header = f"{best}copy to configs/03_learning/{task}/experiments/<group>/{label}.yaml to train it.\n"
+    return header + yaml.dump(body, default_flow_style=False, sort_keys=False)
+
+
+def _publish_study_lifecycle_summary(paths: _OptunaStudyPaths, summary: Mapping[str, Any], config: OptunaStudyConfig) -> None:
+    """Persist the best trial's config, then the summary as the commit record, only beside repository-owned local storage.
+
+    The best config is built before anything is written, so a build error leaves both files untouched.
+    """
+    if paths.local_storage_path is None:
+        return
+    best_path = paths.study_dir / _BEST_CONFIG_FILENAME
+    if summary["best_trial_number"] is None:
+        best_path.unlink(missing_ok=True)
+    else:
+        common.serialization.atomic_write_text(best_path, _best_experiment_yaml(config, summary, paths.study_dir.name))
+    common.serialization.atomic_write_json(paths.study_dir / _STUDY_SUMMARY_FILENAME, dict(summary))
 
 
 def _emit_study_summary(summary: Mapping[str, Any], *, storage: str, summary_file: str | None) -> None:
@@ -1985,7 +2018,10 @@ def run_optuna_study(
             elapsed_seconds=time.perf_counter() - invocation_started,
             include_importance=False,
         )
-        _publish_study_lifecycle_summary(study_paths, summary)
+        try:
+            _publish_study_lifecycle_summary(study_paths, summary, study_config)
+        except Exception as publication_error:  # noqa: BLE001 -- the original study error must reach the caller
+            sys.stderr.write(f"Warning: the study summary was not published after the study failed: {publication_error}\n")
         _emit_study_summary(
             summary,
             storage=storage_label,
@@ -2002,7 +2038,7 @@ def run_optuna_study(
         elapsed_seconds=time.perf_counter() - invocation_started,
         include_importance=True,
     )
-    _publish_study_lifecycle_summary(study_paths, summary)
+    _publish_study_lifecycle_summary(study_paths, summary, study_config)
     _emit_study_summary(
         summary,
         storage=storage_label,

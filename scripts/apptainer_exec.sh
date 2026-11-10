@@ -107,13 +107,19 @@ fi
 TEMP_DIRECTORY="$(mktemp -d "${SCRATCH_PARENT}/vp2-apptainer.${SLURM_JOB_ID:-local}.XXXXXXXX")"
 
 # A container cannot hard-link across the separate storage and runtime binds (EXDEV), so the host links the Slurm logs after the run:
-# JOB_LOG_FILES (host paths, one per line) go into logs/ of every folder the job recorded in JOB_LOG_OWNERS_FILE. This runs in the
+# JOB_LOG_FILES (host paths, one per line; empty files are skipped) go into logs/ of every folder the job recorded in JOB_LOG_OWNERS_FILE. This runs in the
 # EXIT trap, so it never changes the exit status or aborts the cleanup: errexit is off, every problem is one warning, nothing exits.
 link_job_logs() (
   set +e
   local record="${TEMP_DIRECTORY}/job-log-owners" storage line owner log target identity error
+  local -a logs=()
   [[ -n "${JOB_LOG_FILES:-}" && -f "${record}" ]] || return 0
   storage="$(realpath -e -- "${STORAGE_ROOT}")" || return 0
+  # The files to link are decided once, before any owner: a warning appended to the .err during the loop cannot change the set.
+  while IFS= read -r log; do
+    [[ -f "${log}" && ! -L "${log}" && -s "${log}" ]] && logs+=("${log}")
+  done <<<"${JOB_LOG_FILES}"
+  (( ${#logs[@]} > 0 )) || return 0
   while IFS= read -r line; do
     # The container records resolved paths, so an owner must be its own canonical path: `..` or a symbolic link cannot lead out.
     owner="${storage}/${line#/workspace/storage/}"
@@ -125,8 +131,7 @@ link_job_logs() (
       printf 'Warning: could not create %s/logs: %s\n' "${owner}" "${error}" >&2
       continue
     fi
-    while IFS= read -r log; do
-      [[ -f "${log}" && ! -L "${log}" ]] || continue
+    for log in "${logs[@]}"; do
       target="${owner}/logs/${log##*/}"
       if [[ -e "${target}" || -L "${target}" ]]; then
         [[ "${target}" -ef "${log}" ]] || printf 'Warning: %s is a different file; %s was not linked.\n' "${target}" "${log}" >&2
@@ -142,7 +147,7 @@ link_job_logs() (
         rm -f -- "${target}"
         printf 'Warning: %s changed while it was linked; the link was removed.\n' "${log}" >&2
       fi
-    done <<<"${JOB_LOG_FILES}"
+    done
   done < <(sort -u -- "${record}")
   return 0
 )

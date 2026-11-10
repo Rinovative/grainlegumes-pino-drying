@@ -1,7 +1,7 @@
 """Protect deterministic, content-bound dataset and saved-membership identity.
 
 Responsibilities:
-  - Check content fingerprints, ordered membership, saved splits, additional Evaluation parts, normalizer state, and partial batches
+  - Check content fingerprints, ordered membership, saved splits, material-OOD parts, normalizer state, and partial batches
 
 Design principles:
   - Operational provenance cannot replace scientific content identity
@@ -49,7 +49,6 @@ def _reordered_payload(
         sample_ids=[payload["sample_ids"][index] for index in order],
         source_selection_identity={
             "schema_kind": "dataset_source_selection",
-            "schema_version": 1,
             "source_cases": provenance["source_case_identities"],
         },
         source_identities=[payload["source_identities"][index] for index in order],
@@ -124,7 +123,6 @@ def test_source_metadata_is_aligned_and_fingerprint_bound(
         outputs=original["outputs"],
     )
 
-    assert original["schema_version"] == datasets.contracts.identity.TRAINING_DATASET_SCHEMA_VERSION
     assert original["source_metadata"][0]["case_id"] == "case_0000"
     assert changed["dataset_fingerprint"] != original["dataset_fingerprint"]
 
@@ -170,7 +168,6 @@ def test_ordered_membership_changes_fingerprint(
         sample_ids=original["sample_ids"][:-1],
         source_selection_identity={
             "schema_kind": "dataset_source_selection",
-            "schema_version": 1,
             "source_cases": missing_provenance["source_case_identities"],
         },
         source_identities=original["source_identities"][:-1],
@@ -238,10 +235,11 @@ def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additiona
     """Build steady loaders from published Dataset partitions."""
     return datasets.runtime.training.create_dataloaders(
         train_dataset_id=train,
-        additional_evaluation_dataset_ids=additional,
+        material_ood_dataset_ids=additional,
         task=task,
         model_sha256="a" * 64,
         storage_root=root,
+        train_subset=None,
         num_workers=0,
         pin_memory=False,
         persistent_workers=False,
@@ -249,34 +247,37 @@ def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additiona
     )
 
 
-def test_two_additional_evaluation_datasets_keep_their_own_identity_membership_and_assignment(
+def test_two_material_ood_datasets_keep_their_own_identity_membership_and_assignment(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """Record each additional Evaluation Dataset as its own split part and evaluate their declared cases in order."""
+    """Record each configured material-OOD Dataset as its own part and evaluate their declared cases in order; no parameter-OOD part."""
     _publish(tmp_path, training_dataset_payload_factory("combined_train", material_role="id"))
-    _publish(tmp_path, training_dataset_payload_factory("parameter_ood", material_family="chickpea", material_role="ood"))
+    _publish(tmp_path, training_dataset_payload_factory("chickpea_ood", material_family="chickpea", material_role="ood"))
     _publish(tmp_path, training_dataset_payload_factory("family_ood", material_family="kidney_bean", material_role="ood"))
     _train_loader, loaders, _processor, split_info, _scaling = _loaders(
         tmp_path,
         steady_task,
         "combined_train",
-        ("parameter_ood", "family_ood"),
+        ("chickpea_ood", "family_ood"),
         batch_size=2,
     )
 
     split = datasets.preprocessing.splits.admit_split(split_info)
     assert split.train.dataset_id == "combined_train"
-    assert [part.dataset_id for part in split.additional_evaluation] == ["parameter_ood", "family_ood"]
-    assert [assignment["dataset_id"] for assignment in split.evaluation_assignments] == ["parameter_ood", "family_ood"]
-    assert len({part.dataset["dataset_digest"] for part in split.additional_evaluation}) == 2
-    assert len({part.membership_digest for part in split.additional_evaluation}) == 2
-    assert all(part.count == part.full_count for part in split.additional_evaluation)
+    assert [part.dataset_id for part in split.material_ood] == ["chickpea_ood", "family_ood"]
+    assert [assignment["dataset_id"] for assignment in split.evaluation_assignments["material_ood"]] == ["chickpea_ood", "family_ood"]
+    assert len({part.dataset["dataset_digest"] for part in split.material_ood}) == 2
+    assert len({part.membership_digest for part in split.material_ood}) == 2
+    assert all(part.count == part.full_count for part in split.material_ood)
     assert split.as_payload() == split_info
-    evaluated = loaders["additional_evaluation"]
+    evaluated = loaders["material_ood"]
     assert evaluated is not None
     assert sum(len(batch["y"]) for batch in evaluated) == _COMBINED_OOD_SAMPLE_COUNT
+    # The training Dataset declares no parameter-OOD cases, so that part is empty and gets no loader.
+    assert split.ood_roles == ("material_ood",)
+    assert loaders["parameter_ood"] is None
 
 
 def test_family_holdout_must_not_reuse_a_training_material(

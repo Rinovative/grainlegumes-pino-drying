@@ -13,20 +13,27 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import re
+import shutil
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import optuna
 import pytest
+import yaml
 from support import configs, optuna_trials
 from support.synthetic_task import admitted_manifest
 
 from src import common, datasets, experiments
+from src.experiments.config import experiments_config_preflight as preflight
+from src.experiments.config import experiments_config_transient_plan as transient_plan
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
+
+_REPOSITORY = Path(__file__).resolve().parents[2]
 
 optuna_runtime = experiments.tuning.optuna
 search_space = experiments.tuning.search_space
@@ -311,10 +318,10 @@ def test_study_identity_binds_manifest_evidence_through_the_one_reader(task: str
 
     identities = optuna_runtime._configured_dataset_identities(config)
 
-    additional = config["data"]["additional_evaluation_datasets"]
+    additional = config["data"]["material_ood_datasets"]
     root = common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"])
     assert captured == [(task, root)] * (1 + len(additional))
-    assert [item["dataset_id"] for item in identities["additional_evaluation"]] == additional
+    assert [item["dataset_id"] for item in identities["material_ood"]] == additional
     assert identities["train"]["payload_sha256"] == "a" * 64
     assert identities["train"]["derived_payload_sha256"] == ("c" * 64 if task == "transient_drying" else None)
     assert identities["train"]["source_case_identity_digest"] == common.serialization.canonical_json_sha256(
@@ -374,14 +381,237 @@ def test_study_run_binds_its_physical_dataset_before_database(
 def test_transient_study_signature_binds_physical_package_identity(tmp_path: Path) -> None:
     """Change study identity when validated physical Dataset evidence changes."""
     loaded = _load_a0_study(tmp_path)
-    first = replace(loaded, dataset_identities={"train": {"dataset_digest": "a" * 64}, "additional_evaluation": []})
-    second = replace(loaded, dataset_identities={"train": {"dataset_digest": "b" * 64}, "additional_evaluation": []})
+    first = replace(loaded, dataset_identities={"train": {"dataset_digest": "a" * 64}, "material_ood": []})
+    second = replace(loaded, dataset_identities={"train": {"dataset_digest": "b" * 64}, "material_ood": []})
 
     first_signature = optuna_runtime.build_study_signature(first)
     second_signature = optuna_runtime.build_study_signature(second)
 
     assert first_signature["digest"] != second_signature["digest"]
     assert first_signature["payload"]["dataset_roles"]["binding"] == "validated_physical_packages"
+
+
+_MAINTAINED_STUDIES = {"steady_flow": "fno_search", "transient_drying": "fno_a0_search"}
+
+
+def _best_values(study: optuna_runtime.OptunaStudyConfig) -> dict[str, Any]:
+    """Return one value per sampled parameter that differs from the study's authored choice where the space allows."""
+    return {
+        parameter.name: parameter.values[-1] if parameter.kind == "categorical" else parameter.high
+        for parameter in study.search_space
+        if parameter.kind != "fixed"
+    }
+
+
+def _study_paths(study_dir: Path) -> optuna_runtime._OptunaStudyPaths:
+    """Return the paths of a study directory below a test-owned root."""
+    study_dir.mkdir(parents=True, exist_ok=True)
+    return optuna_runtime._OptunaStudyPaths(study_dir, study_dir / "trials", "sqlite:///s.db", study_dir / "s.db")
+
+
+@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
+def test_best_config_trains_once_copied_into_the_experiments_tree(task: str, tmp_path: Path) -> None:
+    """The best trial becomes an experiment config on the task base that the maintained loaders admit as a train config."""
+    configs_root = _REPOSITORY / "configs/03_learning" / task
+    study = optuna_runtime.load_optuna_study_config(configs_root / "optuna" / f"{_MAINTAINED_STUDIES[task]}.yaml", train_dataset="synthetic_dataset")
+    best = _best_values(study)
+    paths = _study_paths(tmp_path / "study__ep-300")
+    summary = {"study_name": "s", "best_trial_number": 7, "best_objective": 0.25, "best_parameters": best}
+
+    optuna_runtime._publish_study_lifecycle_summary(paths, summary, study)
+
+    text = (paths.study_dir / "best_config.yaml").read_text(encoding="utf-8")
+    header = text.splitlines()[0]
+    assert header.startswith("# Best trial 7 of study study__ep-300, objective 0.25;")
+    if task == "steady_flow":
+        label = re.search(r"/([^/<>]+)\.yaml", header)
+        assert label is not None
+        stem = label.group(1)
+        assert "__lr-" in stem  # The copy target is the full config name: the best trial's learning rate is named.
+    else:
+        # A transient study names only its A0 part; B/A1 settings of the architecture experiment appear in its pair folder, not in the name.
+        stem = "best"
+        pinned = "fno_m96x160_h96_l4_p0p1__bs-4__lr-0p003__a0smp-one-step-transition"  # the best trial's batch size and rate, no default curriculum
+        assert f"the name is {pinned}; B/A1 settings it sets appear in the pair folder" in header
+    target = tmp_path / "configs/03_learning" / task
+    (target / "experiments/group").mkdir(parents=True)
+    shutil.copy(configs_root / "base.yaml", target / "base.yaml")
+    config_path = target / "experiments/group" / f"{stem}.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    shared = experiments.config.loader.load_yaml(configs_root / "base.yaml")
+
+    authored = experiments.config.loader.load_authored_config(config_path)
+
+    assert authored["tracking"]["wandb"]["workflow"] == "train"
+    assert authored["run"] == shared["run"]
+    if task == "steady_flow":
+        result = preflight.inspect_config(config_path, train_dataset="synthetic_dataset")
+        assert (result.family, authored["training"]) == ("experiment", shared["training"])
+        assert result.run_label.startswith(stem)
+    else:
+        # A transient matched experiment must also state B's rollout sampling, which no A0 study tunes; a default curriculum stays unstated.
+        assert authored["training"]["a0"]["sampling"] == {"mode": "one_step_transition"}
+        assert "curriculum" not in yaml.safe_load(text)["training"]["a0"]
+        assert authored["training"]["b"] == shared["training"]["b"]
+    for parameter in study.search_space:
+        node: Any = authored
+        for token in parameter.path.split("."):
+            node = node[int(token)] if isinstance(node, list) else node[token]
+        assert node == best[parameter.name]
+    assert transient_plan.is_matched_a1_b_config(authored) == (task == "transient_drying")
+
+
+_ACCUMULATION = {"name": "accumulation", "kind": "categorical", "values": [1, 2]}
+
+
+def test_best_config_of_an_external_steady_study_exports_against_the_task_base(tmp_path: Path) -> None:
+    """The task's own base.yaml is used wherever the study file lives, and the copied export resolves."""
+    study = optuna_runtime.load_optuna_study_config(_write_study(tmp_path / "external"))
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    text = (paths.study_dir / "best_config.yaml").read_text(encoding="utf-8")
+    exported = yaml.safe_load(text)
+    assert exported["optimizer"]["lr"] == 0.002
+    target = tmp_path / "configs/03_learning/steady_flow"
+    (target / "experiments/group").mkdir(parents=True)
+    shutil.copy(_REPOSITORY / "configs/03_learning/steady_flow/base.yaml", target / "base.yaml")
+    config_path = target / "experiments/group" / f"{re.search(r'/<group>/(.+)[.]yaml to train', text).group(1)}.yaml"  # type: ignore[union-attr]
+    config_path.write_text(text, encoding="utf-8")
+    assert experiments.config.loader.load_authored_config(config_path)["optimizer"]["lr"] == 0.002
+    assert preflight.inspect_config(config_path, train_dataset="synthetic_train").family == "experiment"
+
+
+def test_best_config_of_a_study_tuning_one_physics_weight_exports_the_whole_weight_groups(tmp_path: Path) -> None:
+    """A name token that shows several leaves is exported with all of them, so the copy loads under the name its header states."""
+    payload = configs.optuna_config(physics_enabled=True)
+    for term in ("momentum_weight", "continuity_weight", "boundary_weight"):
+        del payload["experiment"]["loss"]["physics"][term]  # omitted defaults: the study states none of them
+    payload["search_space"]["loss.physics.momentum_weight.target"] = {"name": "momentum", "kind": "float", "low": 0.5, "high": 2.0}
+    study = optuna_runtime.load_optuna_study_config(_write_study(tmp_path / "external", payload))
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002, "momentum": 1.5}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    text = (paths.study_dir / "best_config.yaml").read_text(encoding="utf-8")
+    physics = yaml.safe_load(text)["loss"]["physics"]
+    resolved = study.base_config["loss"]["physics"]
+    assert physics["momentum_weight"]["target"] == 1.5
+    for term in ("continuity_weight", "boundary_weight"):
+        assert physics[term]["target"] == resolved[term]["target"]
+    assert {term: physics[term]["warmup"]["epochs"] for term in resolved if term.endswith("_weight")} == {
+        term: resolved[term]["warmup"]["epochs"] for term in resolved if term.endswith("_weight")
+    }
+    target = tmp_path / "configs/03_learning/steady_flow"
+    (target / "experiments/group").mkdir(parents=True)
+    shutil.copy(_REPOSITORY / "configs/03_learning/steady_flow/base.yaml", target / "base.yaml")
+    config_path = target / "experiments/group" / f"{re.search(r'/<group>/(.+)[.]yaml to train', text).group(1)}.yaml"  # type: ignore[union-attr]
+    config_path.write_text(text, encoding="utf-8")
+    assert preflight.inspect_config(config_path, train_dataset="synthetic_train").family == "experiment"
+
+
+def test_best_config_of_an_a0_study_puts_a_searched_training_value_under_the_a0_stage(tmp_path: Path) -> None:
+    """A searched omitted default of a transient A0 study exports, at the A0 path where the matched plan reads it."""
+    payload = configs.optuna_transient_a0_config()
+    del payload["experiment"]["training"]["gradient_accumulation_steps"]  # an omitted default: the resolved config supplies 1
+    payload["search_space"]["training.gradient_accumulation_steps"] = _ACCUMULATION
+    study = optuna_runtime.load_optuna_study_config(
+        configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
+    )
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002, "accumulation": 2}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
+    assert set(training) == {"a0"}
+    assert training["a0"]["gradient_accumulation_steps"] == 2
+
+
+def test_best_config_of_an_a0_study_without_authored_sampling_takes_the_resolved_one(tmp_path: Path) -> None:
+    """The A0 move follows the study mode, not the authored keys: omitted sampling comes from the resolved config."""
+    payload = configs.optuna_transient_a0_config()
+    del payload["experiment"]["temporal"]["sampling"]
+    payload["search_space"]["training.gradient_accumulation_steps"] = _ACCUMULATION
+    study = optuna_runtime.load_optuna_study_config(
+        configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
+    )
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002, "accumulation": 2}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
+    assert set(training) == {"a0"}
+    assert training["a0"]["sampling"] == study.base_config["temporal"]["sampling"]
+    assert training["a0"]["gradient_accumulation_steps"] == 2
+    assert "curriculum" not in training["a0"]  # the code-default curriculum is not stated
+
+
+def test_best_config_of_an_a0_study_states_a_non_default_curriculum_under_the_a0_stage(tmp_path: Path) -> None:
+    """A curriculum that differs from the code default is part of A0's identity and exports under the A0 stage."""
+    payload = configs.optuna_transient_a0_config()
+    experiment = configs.transient_stage_a_only_config(model_kind="rno")  # its curriculum [2, 4] differs from the default
+    experiment["data"]["material_ood_datasets"] = []
+    experiment["tracking"]["wandb"]["workflow"] = "optuna_trial"
+    payload["experiment"] = experiment
+    study = optuna_runtime.load_optuna_study_config(
+        configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
+    )
+    paths = _study_paths(tmp_path / "study")
+    best = {"hidden_channels": 12, "learning_rate": 0.002}
+
+    optuna_runtime._publish_study_lifecycle_summary(
+        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
+    )
+
+    training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
+    assert training["a0"]["curriculum"] == study.base_config["training"]["curriculum"] != {"lengths": [1], "milestone_fractions": [0.0]}
+
+
+def test_a_study_without_the_task_base_is_refused_when_it_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The task base the export needs is checked at the start of the study, not after its trials."""
+    monkeypatch.setattr(optuna_runtime, "_task_base_path", lambda _task: tmp_path / "missing" / "base.yaml")
+
+    with pytest.raises(ValueError, match="task base"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path))
+
+
+def test_best_config_follows_the_summary_and_a_build_error_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The summary stays the commit record: a failed build keeps both files, and a missing best trial deletes a stale config."""
+    study = optuna_runtime.load_optuna_study_config(
+        _REPOSITORY / "configs/03_learning/steady_flow/optuna/fno_search.yaml", train_dataset="synthetic_dataset"
+    )
+    paths = _study_paths(tmp_path / "study")
+    best_path, summary_path = paths.study_dir / "best_config.yaml", paths.study_dir / "study_summary.json"
+    best = {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": _best_values(study)}
+    optuna_runtime._publish_study_lifecycle_summary(paths, best, study)
+    before = (best_path.read_bytes(), summary_path.read_bytes())
+
+    def failing_build(*_args: object) -> str:
+        message = "synthetic build error"
+        raise RuntimeError(message)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(optuna_runtime, "_best_experiment_yaml", failing_build)
+        with pytest.raises(RuntimeError, match="synthetic build error"):
+            optuna_runtime._publish_study_lifecycle_summary(paths, {**best, "best_trial_number": 2}, study)
+    assert (best_path.read_bytes(), summary_path.read_bytes()) == before
+
+    optuna_runtime._publish_study_lifecycle_summary(paths, {**best, "best_trial_number": None, "best_objective": None, "best_parameters": {}}, study)
+    assert not best_path.exists()
+    assert summary_path.is_file()
 
 
 def test_transient_optuna_rejects_noncentral_declared_objective(tmp_path: Path) -> None:

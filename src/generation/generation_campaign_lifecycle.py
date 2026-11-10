@@ -6,10 +6,12 @@ Responsibilities:
   - Record distinct operational attempts and terminal candidate decisions
   - Require a solver attempt's reason to be the runtime's typed stop reason (stalled, timed_out, solver_error) or unclassified
   - Derive deterministic selected-success membership from canonical evidence
-  - Pre-register a Dataset plan's minimum success rate per original batch at creation and append later explicit lowerings with their reason
-  - Report each original batch's minimum success rate, its amendment history, its decided counts and whether it is stopped
+  - Pre-register a Dataset plan's minimum success rate per material at creation and append later explicit lowerings with their reason,
+    each as one atomic numbered record of the material
+  - Report each original batch's material rate, its material's amendment history and decided counts and whether it is stopped
   - Resolve the execution batch that carries each reserved candidate's scheduler and input identity
-  - Derive a batch's next replacement design, or raise one exception when its deficit is closed or its rate stops it
+  - Derive a batch's next replacement (the next unused point of its own design), or raise one exception when its deficit
+    is closed or its material's rate stops it
 
 Design principles:
   - Candidate IDs are never recycled after a failure
@@ -33,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from src import common
+from src.generation.cases import generation_cases_sampling as sampling_service
 from src.generation.cases import generation_cases_seeding as seeding
 from src.generation.cases import generation_cases_selection as selection_service
 from src.generation.contracts import generation_contracts_campaign_identity as identity
@@ -41,18 +44,33 @@ from src.generation.contracts import generation_contracts_material_registry as m
 _SHA256: Final = re.compile(r"[0-9a-f]{64}\Z")
 _ORIGINS: Final = frozenset({"primary", "replacement"})
 _ATTEMPT_CLASSES: Final = frozenset({"solver", "validation", "submission", "license", "filesystem", "publication", "controller"})
-_ATTEMPT_SCHEMA: Final = ("generation_candidate_attempt", 1)
+_ATTEMPT_SCHEMA_KIND: Final = "generation_candidate_attempt"
 # A solver attempt's reason is the runtime's own classification of the stop (its RuntimeFailureReason) or ``unclassified``.
 RUNTIME_SOLVER_REASONS: Final = frozenset({"stalled", "timed_out", "solver_error"})
 UNCLASSIFIED_SOLVER_REASON: Final = "unclassified"
-_CAMPAIGN_PLAN_SCHEMA_VERSION: Final = 1
-_AMENDMENT_SCHEMA: Final = ("generation_minimum_success_rate_amendment", 1)
-_EPOCH_SCHEMA_VERSION: Final = 1
+_AMENDMENT_SCHEMA_KIND: Final = "generation_minimum_success_rate_amendment"
+_REPLACEMENT_DESIGN_SCHEMA_KIND: Final = "generation_source_replacement_design"
+_REPLACEMENT_DESIGN_KEYS: Final = frozenset(
+    {
+        "schema_kind",
+        "campaign_plan_sha256",
+        "parent_campaign_digest",
+        "parent_batch_id",
+        "parent_scientific_config_digest",
+        "parent_failed_case_id",
+        "candidate_id",
+        "candidate_ordinal",
+        "design_index",
+        "target_slot",
+        "material_case_index",
+        "batch_locator_regime",
+    }
+)
 _AMENDMENT_SOURCES: Final = frozenset({"plan", "explicit"})
-# A batch without a recorded amendment, a campaign without a Dataset plan, stops at its first terminal failure.
+# A material without a recorded amendment, in a campaign without a Dataset plan, stops at its first terminal failure.
 DEFAULT_MINIMUM_SUCCESS_RATE: Final = 1.0
 _EPOCH_OWNED_FIELDS: Final = frozenset(
-    {"schema_kind", "schema_version", "campaign_run_id", "campaign_digest", "epoch_index", "first_submission_index", "previous_sha256"}
+    {"schema_kind", "campaign_run_id", "campaign_digest", "epoch_index", "first_submission_index", "previous_sha256"}
 )
 
 if TYPE_CHECKING:
@@ -91,12 +109,10 @@ def _write_new_json(path: Path, value: Mapping[str, Any]) -> None:
 
 def _require_attempt_contract(attempt: Mapping[str, Any], *, label: object) -> None:
     """Reject an attempt record of another schema or a solver attempt without a typed runtime reason."""
-    if (
-        attempt.get("schema_kind") != _ATTEMPT_SCHEMA[0]
-        or not common.serialization.is_schema_version(attempt.get("schema_version"), _ATTEMPT_SCHEMA[1])
-        or (attempt.get("class") == "solver" and attempt.get("reason_code") not in {*RUNTIME_SOLVER_REASONS, UNCLASSIFIED_SOLVER_REASON})
+    if attempt.get("schema_kind") != _ATTEMPT_SCHEMA_KIND or (
+        attempt.get("class") == "solver" and attempt.get("reason_code") not in {*RUNTIME_SOLVER_REASONS, UNCLASSIFIED_SOLVER_REASON}
     ):
-        msg = f"Candidate attempt is not a schema-{_ATTEMPT_SCHEMA[1]} record with a typed solver reason: {label}."
+        msg = f"Candidate attempt is not a {_ATTEMPT_SCHEMA_KIND} record with a typed solver reason: {label}."
         raise ValueError(msg)
 
 
@@ -150,9 +166,9 @@ def _plan_seed_key(plan: Mapping[str, Any]) -> str:
     """Recompute the scientific seed key from the plan fields it is derived from."""
     return seeding.campaign_seed_key(
         task=str(plan["task"]),
-        design_sizes=plan["original_design_sizes"],
+        designs=plan["original_design_sizes"],
         domain_profile=str(plan["domain_profile"]),
-        sampling_method=str(plan["sampling_mode"]),
+        design_recipe=str(plan["design_recipe"]),
         seed_base=int(plan["root_seed"]),
         purpose=str(plan["campaign_purpose"]),
     )
@@ -170,7 +186,6 @@ def _resolved_plan(campaign: config_service.CampaignConfig) -> dict[str, Any]:
     """Capture every case-generating value required for independent inspection."""
     plan: dict[str, Any] = {
         "schema_kind": "generation_source_campaign_plan",
-        "schema_version": _CAMPAIGN_PLAN_SCHEMA_VERSION,
         "task": campaign.profile.id,
         "campaign_name": campaign.campaign_name,
         "source_name": campaign.source_name,
@@ -181,11 +196,10 @@ def _resolved_plan(campaign: config_service.CampaignConfig) -> dict[str, Any]:
         "domain_profile": campaign.domain_profile,
         "campaign_id": campaign.campaign_id,
         "root_seed": campaign.root_seed,
-        "seed_derivation_version": 1,
         "seed_key": "",
-        "sampling_mode": campaign.sampling_mode,
+        "design_recipe": sampling_service.DESIGN_RECIPE,
         "selected_targets": dict(campaign.selected_targets),
-        "original_design_sizes": dict(campaign.selected_targets),
+        "original_design_sizes": copy.deepcopy(campaign.designs),
         "materials": list(campaign.material_inventory),
         "source_registry": copy.deepcopy(campaign.source_registry),
         "scientific_overrides": dict(campaign.scientific_overrides or {}),
@@ -228,14 +242,14 @@ def create_campaign(
     """Create or reattach to a same-name, same-science campaign.
 
     A Dataset plan's ``minimum_success_rate`` is pre-registered only when the
-    campaign is created, once per original batch; reattaching must repeat it exactly.
+    campaign is created, once per material; reattaching must repeat it exactly.
     """
     root = _root(campaign.profile.id, campaign.source_name, storage_root)
     plan_path = common.paths.resolve_generation_campaign_plan_path(root)
     expected = _resolved_plan(campaign)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
         if plan_path.exists():
-            observed = _read_json(plan_path)
+            observed = load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root, requested=campaign)
             identity.assert_campaign_semantics(campaign.source_name, campaign.campaign_digest, str(observed.get("campaign_digest")))
             if (
                 observed.get("task") != campaign.profile.id
@@ -249,21 +263,31 @@ def create_campaign(
             if observed_batches != expected_batches:
                 msg = f"Campaign {campaign.source_name!r} conflicts with its frozen case design."
                 raise ValueError(msg)
-            _register_authored_rate(root, expected, _authored_rate(campaign), creating=False, storage_root=storage_root)
         else:
             # Register before the plan so an interrupted creation retries into the same state.
-            _register_authored_rate(root, expected, _authored_rate(campaign), creating=True, storage_root=storage_root)
+            _register_authored_rate(root, expected, _authored_rate(campaign), storage_root=storage_root)
             _write_new_json(plan_path, expected)
     return root
 
 
-def load_campaign_plan(task: str, campaign_name: str, *, storage_root: Path | str | None = None) -> dict[str, Any]:
-    """Read the frozen resolved plan without reopening mutable YAML."""
+def load_campaign_plan(
+    task: str,
+    campaign_name: str,
+    *,
+    storage_root: Path | str | None = None,
+    requested: config_service.CampaignConfig | None = None,
+) -> dict[str, Any]:
+    """Read the frozen resolved plan without reopening mutable YAML, with every material's rate history validated against it.
+
+    This is the one reader of ``campaign_plan.json``, so every reopen path (reattachment, partial input preparation,
+    continuation, feeding, status, sealing, Dataset evidence) fails closed on lost or malformed rate evidence. A caller
+    that reopens the campaign for a requested configuration passes it as ``requested``: the minimum success rate is
+    outside the campaign digest, so its authored rate must equal the frozen plan's. Each amendment record is one atomic
+    file, so the validation needs no lock.
+    """
     root = _root(task, campaign_name, storage_root)
     plan = _read_json(common.paths.resolve_generation_campaign_plan_path(root))
-    if plan.get("schema_kind") != "generation_source_campaign_plan" or not common.serialization.is_schema_version(
-        plan.get("schema_version"), _CAMPAIGN_PLAN_SCHEMA_VERSION
-    ):
+    if plan.get("schema_kind") != "generation_source_campaign_plan":
         msg = f"Unsupported frozen campaign plan: {root}."
         raise ValueError(msg)
     if (
@@ -277,6 +301,10 @@ def load_campaign_plan(task: str, campaign_name: str, *, storage_root: Path | st
         msg = f"Frozen campaign plan seed key disagrees with its scientific design: {root}."
         raise ValueError(msg)
     _require_unique_execution_keys(plan["batches"])
+    if requested is not None and (rate := _authored_rate(requested)) != (frozen_rate := _plan_rate(plan)):
+        raise _rate_conflict(campaign_name, frozen_rate, rate)
+    for material in _plan_materials(plan):
+        _material_amendments(plan, material, storage_root=storage_root)
     return plan
 
 
@@ -300,7 +328,6 @@ def _validate_execution_epoch(
     """Check one epoch before either admitting or publishing its immutable bytes."""
     if (
         record.get("schema_kind") != "generation_campaign_execution_epoch"
-        or not common.serialization.is_schema_version(record.get("schema_version"), _EPOCH_SCHEMA_VERSION)
         or record.get("campaign_run_id") != manifest["campaign_run_id"]
         or record.get("campaign_digest") != manifest["campaign_digest"]
         or record.get("epoch_index") != index
@@ -365,7 +392,6 @@ def append_execution_epoch(manifest: Mapping[str, Any], record: Mapping[str, Any
     payload = {
         **record,
         "schema_kind": "generation_campaign_execution_epoch",
-        "schema_version": _EPOCH_SCHEMA_VERSION,
         "campaign_run_id": manifest["campaign_run_id"],
         "campaign_digest": manifest["campaign_digest"],
         "epoch_index": len(previous) + 1,
@@ -396,7 +422,7 @@ def campaign_with_execution(campaign: config_service.CampaignConfig, execution_v
 
 def _cases_directory(root: Path, material: str) -> Path:
     """Return the material directory of one campaign, its case namespace beside the reserved ``_record/``."""
-    return root / common.paths.validate_logical_name(material, label="material")
+    return common.paths.resolve_generation_campaign_material_directory(root, material)
 
 
 def _reservations(root: Path, material: str) -> list[dict[str, Any]]:
@@ -404,7 +430,7 @@ def _reservations(root: Path, material: str) -> list[dict[str, Any]]:
     directory = _cases_directory(root, material)
     if not directory.exists():
         return []
-    if directory.is_symlink() or directory.parent.is_symlink() or not directory.is_dir():
+    if not directory.is_dir():
         msg = f"Material case namespace is unsafe: {directory}."
         raise ValueError(msg)
     entries = common.paths.generation_material_case_directories(directory)
@@ -430,20 +456,20 @@ def _reservations(root: Path, material: str) -> list[dict[str, Any]]:
 
 
 def _case_namespace_has_symlink(case_directory: Path) -> bool:
-    """Return whether the case, its material, its campaign, or its ``_record/`` is a symlink."""
+    """Return whether the case or its ``_record/`` is a symlink; the material resolver and ``_root`` admit every ancestor."""
     record = common.paths.resolve_generation_case_record_directory(case_directory)
-    return any(path.is_symlink() for path in (case_directory, case_directory.parent, case_directory.parent.parent, record))
+    return any(path.is_symlink() for path in (case_directory, record))
 
 
 def _publish_reserved_case(root: Path, material: str, reservation: Mapping[str, Any]) -> Path:
     """Publish a new case directory together with its reservation in one rename under the controller lock."""
     case_id = str(reservation["case_id"])
+    final = _cases_directory(root, material) / case_id  # the resolver refuses symlinks before anything is staged, created or renamed
     staging = common.paths.resolve_generation_reservation_staging_directory(root, material) / case_id
     if staging.exists() or staging.is_symlink():
         # A leftover was never published: no reader sees staging, and the controller lock excludes other writers.
         shutil.rmtree(staging)
     _write_new_json(common.paths.resolve_generation_case_reservation_path(staging), reservation)
-    final = _cases_directory(root, material) / case_id
     final.parent.mkdir(parents=True, exist_ok=True)
     staging.rename(final)
     return final
@@ -545,7 +571,6 @@ def reserve_candidate(
                 "candidate_position": candidate_position,
                 "target_slot": target_slot,
                 "root_seed": plan["root_seed"],
-                "seed_derivation_version": plan["seed_derivation_version"],
                 "candidate_seed": seeding.derive_seed(plan["root_seed"], "campaign_candidate", task, plan["seed_key"], material, origin, design_key),
                 "derived_seeds": dict(derived_seeds),
                 "design_evidence": None if design_evidence is None else copy.deepcopy(dict(design_evidence)),
@@ -578,8 +603,7 @@ def record_candidate_attempt(
         msg = "Attempt requires a stable stage/class/reason and human detail."
         raise ValueError(msg)
     record = {
-        "schema_kind": _ATTEMPT_SCHEMA[0],
-        "schema_version": _ATTEMPT_SCHEMA[1],
+        "schema_kind": _ATTEMPT_SCHEMA_KIND,
         "case_id": case_id,
         "attempt_index": attempt_index,
         "stage": stage,
@@ -739,7 +763,6 @@ def _selected_pool_receipt(task: str, campaign_name: str, *, storage_root: Path 
     plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
     return {
         "schema_kind": "generation_campaign_selected_pool",
-        "schema_version": 1,
         "task": task,
         "campaign_name": campaign_name,
         "campaign_digest": plan["campaign_digest"],
@@ -769,14 +792,17 @@ def load_selected_pool(task: str, campaign_name: str, *, storage_root: Path | st
         raise FileNotFoundError(msg)
     recorded = _read_json(path)
     expected = _selected_pool_receipt(task, campaign_name, storage_root=storage_root)
-    if recorded != expected or not common.serialization.is_schema_version(recorded["schema_version"], expected["schema_version"]):
+    if recorded != expected:
         msg = "Canonical selected pool differs from its frozen plan and selected decisions."
         raise ValueError(msg)
     return recorded
 
 
 def seal_selected_pool(task: str, campaign_name: str, *, storage_root: Path | str | None = None) -> dict[str, Any]:
-    """Publish one immutable exact success membership with decision byte hashes."""
+    """Publish one immutable exact success membership with decision byte hashes.
+
+    The receipt reads the frozen plan under the controller lock, which validates every material's rate history first.
+    """
     root = _root(task, campaign_name, storage_root)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
         receipt = _selected_pool_receipt(task, campaign_name, storage_root=storage_root)
@@ -784,20 +810,21 @@ def seal_selected_pool(task: str, campaign_name: str, *, storage_root: Path | st
     return receipt
 
 
-def _rate_amendments(directory: Path, batch_id: str) -> tuple[dict[str, Any], ...]:
-    """Read one batch's append-only minimum-success-rate history from its design directory; each explicit amendment lowers the rate."""
-    if directory.is_symlink() or directory.parent.is_symlink():
-        msg = "Minimum success rate evidence contains a symlink."
-        raise ValueError(msg)
+def _recorded_amendments(plan: Mapping[str, Any], material_family: str, *, storage_root: Path | str | None) -> tuple[dict[str, Any], ...]:
+    """Read one material's append-only minimum-success-rate records; each is one atomic file named by its contiguous index."""
+    directory = common.paths.resolve_generation_material_amendments_directory(
+        plan["task"], plan["source_name"], material_family, storage_root=storage_root
+    )
     paths = sorted(directory.glob("amendment_*.json")) if directory.is_dir() else ()
     records = tuple(_read_json(path) for path in paths)
     current = DEFAULT_MINIMUM_SUCCESS_RATE
-    for index, record in enumerate(records, start=1):
+    for index, (path, record) in enumerate(zip(paths, records, strict=True), start=1):
         rate = record.get("minimum_success_rate")
         if (
-            record.get("schema_kind") != _AMENDMENT_SCHEMA[0]
-            or not common.serialization.is_schema_version(record.get("schema_version"), _AMENDMENT_SCHEMA[1])
-            or record.get("batch_id") != batch_id
+            path.name != f"amendment_{index:04d}.json"
+            or record.get("schema_kind") != _AMENDMENT_SCHEMA_KIND
+            or record.get("campaign_digest") != plan["campaign_digest"]
+            or record.get("material_family") != material_family
             or type(record.get("amendment_index")) is not int
             or record["amendment_index"] != index
             or record.get("registered_by") not in _AMENDMENT_SOURCES
@@ -808,30 +835,49 @@ def _rate_amendments(directory: Path, batch_id: str) -> tuple[dict[str, Any], ..
             or (record["registered_by"] == "plan" and index != 1)
             or (record["registered_by"] == "explicit" and rate >= current)
         ):
-            msg = "Minimum success rate amendments are malformed or do not lower the rate."
+            msg = f"Minimum success rate amendments are malformed or do not lower the rate: {material_family!r} {path.name}."
             raise ValueError(msg)
         current = rate
     return records
 
 
-def _frozen_batch(plan: Mapping[str, Any], batch_id: str) -> Mapping[str, Any]:
-    """Return the one original batch of a frozen plan that owns a minimum success rate."""
-    matches = [batch for batch in plan["batches"] if batch["batch_id"] == batch_id]
-    if len(matches) != 1:
-        msg = "A minimum success rate requires one frozen batch identity."
+def _plan_rate(plan: Mapping[str, Any]) -> float | None:
+    """Return the minimum success rate the plan's authored Dataset plan pre-registers, or ``None`` without one."""
+    from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config validation
+
+    return config_service.authored_minimum_success_rate(plan["authored_value"])
+
+
+def _material_amendments(plan: Mapping[str, Any], material_family: str, *, storage_root: Path | str | None) -> tuple[dict[str, Any], ...]:
+    """Read one material's validated history bound to its frozen plan: record 1 carries the plan's rate exactly when it has one.
+
+    Raises
+    ------
+    ValueError
+        If the records are malformed, or a plan rate lacks its record 1 (lost evidence, never the plan-less s = 1), or a
+        plan-less campaign holds a plan record.
+
+    """
+    records = _recorded_amendments(plan, material_family, storage_root=storage_root)
+    plan_rate = _plan_rate(plan)
+    recorded = records[0]["minimum_success_rate"] if records and records[0]["registered_by"] == "plan" else None
+    if recorded != plan_rate:
+        msg = (
+            f"Minimum success rate evidence of {material_family!r} does not match its frozen plan: the pre-registered plan rate "
+            f"{plan_rate} needs record 1 registered by the plan with that rate, found {recorded}."
+        )
         raise ValueError(msg)
-    return matches[0]
-
-
-def _batch_amendments(batch: Mapping[str, Any], *, storage_root: Path | str | None) -> tuple[dict[str, Any], ...]:
-    """Read the validated minimum-success-rate history of one frozen original batch."""
-    directory = common.paths.resolve_generation_replacements_directory(batch["batch_storage_name"], storage_root=storage_root)
-    return _rate_amendments(directory, batch["batch_id"])
+    return records
 
 
 def _current_rate(amendments: Sequence[Mapping[str, Any]]) -> float:
-    """Return the rate of the last amendment, else the fail-closed default."""
+    """Return the rate of the last amendment, else s = 1, which only a plan-less material reaches (a plan rate requires record 1)."""
     return float(amendments[-1]["minimum_success_rate"]) if amendments else DEFAULT_MINIMUM_SUCCESS_RATE
+
+
+def _plan_materials(plan: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the materials of the plan's original batches in plan order."""
+    return tuple(dict.fromkeys(batch["material_family"] for batch in plan["batches"]))
 
 
 def replacement_policy(
@@ -841,25 +887,28 @@ def replacement_policy(
     storage_root: Path | str | None = None,
     records: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Report every original batch's minimum success rate, its amendment history, its decided counts and whether it is stopped.
+    """Report every original batch's material rate, its amendment history, its material's decided counts and whether it is stopped.
 
-    ``successful`` (k) and ``decided`` (n) count the batch's originals and replacements with a terminal decision, read
-    from ``records`` when the caller decides on that same snapshot; a stopped batch admits no fresh candidate of its own
-    until an amendment lowers its rate below the bound.
+    The stop is per material: ``minimum_success_rate`` is the material's one rate (the latest of its amendment records)
+    and ``amendments`` its history, and ``successful`` (k) and ``decided`` (n) count every original and replacement of
+    the material, over all its designs, with a terminal decision, read from ``records`` when the caller decides on that
+    same snapshot. A stopped material admits no fresh candidate until an amendment lowers its rate below the bound.
     """
     plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
     records = candidate_records(task, campaign_name, storage_root=storage_root) if records is None else records
+    histories = {material: _material_amendments(plan, material, storage_root=storage_root) for material in _plan_materials(plan)}
     policy: list[dict[str, Any]] = []
     for batch in plan["batches"]:
-        amendments = _batch_amendments(batch, storage_root=storage_root)
+        amendments = histories[batch["material_family"]]
         rate = _current_rate(amendments)
-        successful, decided = selection_service.decided_counts([row for row in records if row["reservation"]["batch_id"] == batch["batch_id"]])
+        successful, decided = selection_service.decided_counts(
+            [row for row in records if row["reservation"]["material_family"] == batch["material_family"]]
+        )
         policy.append(
             {
                 "material_family": batch["material_family"],
                 "sampling_regime": batch["sampling_regime"],
                 "batch_id": batch["batch_id"],
-                "sampling_algorithm": "sobol",
                 "minimum_success_rate": rate,
                 "amendments": [
                     {key: amendment[key] for key in ("amendment_index", "minimum_success_rate", "registered_by", "reason")}
@@ -876,21 +925,21 @@ def replacement_policy(
 def _append_amendment(
     root: Path,
     plan: Mapping[str, Any],
-    batch: Mapping[str, Any],
+    material_family: str,
+    amendments: Sequence[Mapping[str, Any]],
     *,
     rate: float,
     reason: str,
     registered_by: str,
     storage_root: Path | str | None,
 ) -> float:
-    """Append one minimum-success-rate amendment while the caller holds the controller lock; return the batch's current rate."""
+    """Publish the record after ``amendments``, read by the caller under the controller lock, atomically; return the current rate."""
     if common.paths.resolve_generation_selected_pool_path(root).exists():
         msg = "A sealed selected-success pool cannot change its minimum success rate."
         raise RuntimeError(msg)
-    amendments = _batch_amendments(batch, storage_root=storage_root)
     current = _current_rate(amendments)
     if registered_by == "plan" and amendments:
-        msg = "A pre-registered plan rate must be the first amendment of its batch."
+        msg = "A pre-registered plan rate must be the first amendment of its material."
         raise ValueError(msg)
     if registered_by == "explicit" and rate == current:
         return current
@@ -898,14 +947,15 @@ def _append_amendment(
         msg = f"A minimum success rate can only be lowered: {rate} is above the current {current}."
         raise ValueError(msg)
     index = len(amendments) + 1
-    directory = common.paths.resolve_generation_replacements_directory(batch["batch_storage_name"], storage_root=storage_root)
+    directory = common.paths.resolve_generation_material_amendments_directory(
+        plan["task"], plan["source_name"], material_family, storage_root=storage_root
+    )
     _write_new_json(
         directory / f"amendment_{index:04d}.json",
         {
-            "schema_kind": _AMENDMENT_SCHEMA[0],
-            "schema_version": _AMENDMENT_SCHEMA[1],
+            "schema_kind": _AMENDMENT_SCHEMA_KIND,
             "campaign_digest": plan["campaign_digest"],
-            "batch_id": batch["batch_id"],
+            "material_family": material_family,
             "amendment_index": index,
             "minimum_success_rate": rate,
             "registered_by": registered_by,
@@ -918,15 +968,17 @@ def _append_amendment(
 def amend_minimum_success_rate(
     task: str,
     campaign_name: str,
-    batch_id: str,
+    material_family: str,
     *,
     minimum_success_rate: float,
     reason: str,
     storage_root: Path | str | None = None,
 ) -> tuple[float, float]:
-    """Explicitly lower one original batch's minimum success rate and record why; return the previous and the current rate.
+    """Explicitly lower one material's minimum success rate and record why; return the previous and the current rate.
 
-    Repeating the current rate records nothing; a higher rate and a sealed selected pool are refused.
+    The amendment is one atomic record of the material, so every original batch of it reads the new rate at once or,
+    before its publication, the old one. Repeating the current rate records nothing; a higher rate and a sealed
+    selected pool are refused.
     """
     from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config validation
 
@@ -935,11 +987,16 @@ def amend_minimum_success_rate(
         msg = "A minimum success rate amendment requires a non-empty reason."
         raise ValueError(msg)
     plan = load_campaign_plan(task, campaign_name, storage_root=storage_root)
-    batch = _frozen_batch(plan, batch_id)
+    if material_family not in _plan_materials(plan):
+        msg = f"Campaign {campaign_name!r} has no original batch of material {material_family!r}."
+        raise ValueError(msg)
     root = _root(task, campaign_name, storage_root)
     with common.locking.exclusive_file_lock(_controller_lock(root), blocking=True):
-        previous = _current_rate(_batch_amendments(batch, storage_root=storage_root))
-        return previous, _append_amendment(root, plan, batch, rate=rate, reason=reason, registered_by="explicit", storage_root=storage_root)
+        amendments = _material_amendments(plan, material_family, storage_root=storage_root)
+        current = _append_amendment(
+            root, plan, material_family, amendments, rate=rate, reason=reason, registered_by="explicit", storage_root=storage_root
+        )
+        return _current_rate(amendments), current
 
 
 def _authored_rate(campaign: config_service.CampaignConfig) -> float | None:
@@ -949,29 +1006,37 @@ def _authored_rate(campaign: config_service.CampaignConfig) -> float | None:
     return config_service.authored_minimum_success_rate(campaign.authored_value)
 
 
-def _register_authored_rate(
-    root: Path,
-    plan: Mapping[str, Any],
-    rate: float | None,
-    *,
-    creating: bool,
-    storage_root: Path | str | None,
-) -> None:
-    """Pre-register a Dataset plan's minimum success rate for each original batch at creation and refuse any later difference."""
-    for batch in plan["batches"]:
-        amendments = _batch_amendments(batch, storage_root=storage_root)
+def _rate_conflict(source_name: str, recorded: float | None, requested: float | None, *, material: str | None = None) -> ValueError:
+    """Return the refusal of a requested authored rate that differs from the one the Source records."""
+    subject = "The minimum success rate" if material is None else f"The minimum success rate of {material!r}"
+    return ValueError(
+        f"{subject} is pre-registered per Source: {source_name!r} records {recorded} from its authored plan, but the plan now "
+        f"requests {requested}. Restore the recorded value, lower it explicitly with amend-replacements, or create a new Source."
+    )
+
+
+def _register_authored_rate(root: Path, plan: Mapping[str, Any], rate: float | None, *, storage_root: Path | str | None) -> None:
+    """Pre-register a Dataset plan's minimum success rate for each material before the plan is frozen.
+
+    ``plan`` is the requested plan, frozen only after this registration, so its records are read without the plan binding;
+    a retry after an interrupted creation keeps the records of the same rate and refuses any other.
+    """
+    for material in _plan_materials(plan):
+        amendments = _recorded_amendments(plan, material, storage_root=storage_root)
         recorded = amendments[0]["minimum_success_rate"] if amendments and amendments[0]["registered_by"] == "plan" else None
         if recorded == rate:
             continue
-        if rate is None or not creating or amendments:
-            msg = (
-                f"The minimum success rate of {batch['material_family']!r} ({batch['sampling_regime']}) is pre-registered per Source: "
-                f"{plan['source_name']!r} records {recorded} from its authored plan, but the plan now requests {rate}. "
-                "Restore the recorded value, lower it explicitly with amend-replacements, or create a new Source."
-            )
-            raise ValueError(msg)
+        if rate is None or amendments:
+            raise _rate_conflict(plan["source_name"], recorded, rate, material=material)
         _append_amendment(
-            root, plan, batch, rate=rate, reason="authored plan generation.minimum_success_rate", registered_by="plan", storage_root=storage_root
+            root,
+            plan,
+            material,
+            amendments,
+            rate=rate,
+            reason="authored plan generation.minimum_success_rate",
+            registered_by="plan",
+            storage_root=storage_root,
         )
 
 
@@ -986,9 +1051,9 @@ def execution_batch(campaign: config_service.CampaignConfig, reservation: Mappin
         matches = [
             batch
             for batch in campaign.batches
-            if isinstance(batch.scientific_values.get("supplemental_design"), dict)
-            and batch.scientific_values["supplemental_design"].get("parent_batch_id") == parent_id
-            and batch.scientific_values["supplemental_design"].get("candidate_id") == reservation.get("design_key")
+            if isinstance(batch.scientific_values.get("replacement_design"), dict)
+            and batch.scientific_values["replacement_design"].get("parent_batch_id") == parent_id
+            and batch.scientific_values["replacement_design"].get("candidate_id") == reservation.get("design_key")
         ]
     else:
         matches = [batch for batch in campaign.batches if batch.batch_id == parent_id]
@@ -998,11 +1063,16 @@ def execution_batch(campaign: config_service.CampaignConfig, reservation: Mappin
     return matches[0]
 
 
+def _replacement_candidate_id(design: Mapping[str, Any]) -> str:
+    """Return the deterministic candidate ID of one replacement design: a digest of every other field."""
+    return f"replacement__{common.serialization.canonical_json_sha256({**design, 'candidate_id': ''})[:24]}"
+
+
 def _replacement_locators(parent: config_service.GenerationConfig, design: Mapping[str, Any]) -> tuple[str, str]:
     """Resolve the canonical batch name and locator regime of one replacement design under its parent batch."""
     from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config materialization
 
-    return config_service.resolve_batch_locators(parent.profile.id, parent.material_family, parent.sampling_regime, {"supplemental_design": design})
+    return config_service.resolve_batch_locators(parent.profile.id, parent.material_family, parent.sampling_regime, {"replacement_design": design})
 
 
 def _resolved_replacement_batch(
@@ -1010,18 +1080,21 @@ def _resolved_replacement_batch(
     parent: config_service.GenerationConfig,
     design: Mapping[str, Any],
 ) -> config_service.GenerationConfig:
-    """Rebuild one one-case batch from exact frozen supplemental evidence."""
+    """Rebuild one one-case batch that executes the next point ``design_index`` of its parent's design."""
     from src.generation.cases import generation_cases_config as config_service  # noqa: PLC0415 -- runtime-only config materialization
 
     case_index = int(design["material_case_index"])
-    ordinal = int(design["candidate_ordinal"])
-    target_slot = int(design["target_slot"])
-    assignment = parent.case_assignment(target_slot)
-    assignment["case_index"] = case_index
-    assignment["regime_index"] = max(int(value["regime_index"]) for value in parent.assignments.values()) + ordinal
+    assignment = config_service.design_point_assignment(
+        parent.material_family,
+        parent.sampling_regime,
+        material_role=parent.material_role,
+        case_index=case_index,
+        design_index=int(design["design_index"]),
+        eligible_units=tuple(parent.scientific_values["parameter_ood"]["eligible_units"]),
+    )
     scientific = copy.deepcopy(parent.scientific_values)
     scientific.update(
-        {"case_count": 1, "case_index_start": case_index, "assignments": [assignment], "supplemental_design": copy.deepcopy(dict(design))}
+        {"case_count": 1, "case_index_start": case_index, "assignments": [assignment], "replacement_design": copy.deepcopy(dict(design))}
     )
     batch_name, _ = _replacement_locators(parent, design)
     storage_name = f"source~{campaign.profile.id}~{campaign.source_name}~{parent.material_family}~{design['batch_locator_regime']}"
@@ -1047,20 +1120,19 @@ def replacement_batch_from_reservation(
     storage_root: Path | str | None = None,
 ) -> config_service.GenerationConfig:
     """Reconstruct a published replacement without mutable YAML or a new campaign."""
-    from src.generation.cases import generation_cases_sampling as sampling  # noqa: PLC0415 -- validate frozen scientific sample
-
     design = reservation.get("design_evidence")
     if (
         reservation.get("origin") != "replacement"
         or not isinstance(design, dict)
-        or not common.serialization.is_schema_version(design.get("schema_version"), sampling.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION)
+        or set(design) != _REPLACEMENT_DESIGN_KEYS
+        or design["schema_kind"] != _REPLACEMENT_DESIGN_SCHEMA_KIND
     ):
         msg = "Reservation is not one canonical replacement design."
         raise ValueError(msg)
-    ordinal = design.get("candidate_ordinal")
-    case_index = design.get("material_case_index")
-    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (ordinal, case_index)):
-        msg = "Replacement reservation has an invalid candidate ordinal or case index."
+    ordinal = design["candidate_ordinal"]
+    case_index = design["material_case_index"]
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in (ordinal, case_index, design["target_slot"])):
+        msg = "Replacement reservation has an invalid candidate ordinal, case index or target slot."
         raise ValueError(msg)
     matches = [batch for batch in campaign.batches if batch.batch_id == reservation.get("batch_id")]
     if len(matches) != 1:
@@ -1077,19 +1149,18 @@ def replacement_batch_from_reservation(
         or design.get("parent_campaign_digest") != campaign.campaign_digest
         or design.get("parent_batch_id") != parent.batch_id
         or design.get("parent_scientific_config_digest") != parent.scientific_config_digest
-        or design.get("root_seed") != campaign.root_seed
+        or design.get("design_index") != len(parent.case_indices) + ordinal - 1
         or reservation.get("material_family") != parent.material_family
         or reservation.get("case_id") != f"case_{case_index:04d}"
         or design.get("batch_locator_regime") != _replacement_locators(parent, design)[1]
     ):
-        msg = "Replacement reservation conflicts with its frozen campaign science or material-local case ID."
+        msg = "Replacement reservation conflicts with its frozen campaign science, design point or material-local case ID."
         raise ValueError(msg)
-    unbound = {**design, "candidate_id": "", "physical_values": None, "physical_values_sha256": None}
-    if design.get("candidate_id") != f"replacement__{common.serialization.canonical_json_sha256(unbound)[:24]}":
+    if design.get("candidate_id") != _replacement_candidate_id(design):
         msg = "Replacement candidate identity disagrees with its deterministic design."
         raise ValueError(msg)
     batch = _resolved_replacement_batch(campaign, parent, design)
-    sampling.sample_case(batch, batch.case_indices[0])
+    sampling_service.sample_case(batch, batch.case_indices[0])
     return batch
 
 
@@ -1099,22 +1170,19 @@ def materialize_replacement_batch(
     *,
     storage_root: Path | str | None = None,
 ) -> config_service.GenerationConfig:
-    """Derive the next one-case Sobol design inside the original campaign.
+    """Derive the one-case replacement batch that executes the next unused point of the batch's own design.
+
+    The k-th replacement of a batch of N originals takes design point N + k - 1, so replacements are prefix-stable.
 
     Raises
     ------
     NoReplacementError
-        If the batch's records, read here, leave no success deficit or its minimum success rate stops it; a decision
-        recorded after the caller's own check leads here, so the caller ends planning for this batch.
+        If the batch's records, read here, leave no success deficit or its material's minimum success rate stops it; a
+        decision recorded after the caller's own check leads here, so the caller ends planning for this batch.
     RuntimeError
-        If a primary is undecided or unreserved, or no failed target slot is free.
+        If a primary of the material is undecided or unreserved, or no failed target slot is free.
 
     """
-    from src.generation.cases import generation_cases_sampling as sampling  # noqa: PLC0415 -- runtime-only scientific sampling
-
-    if campaign.sampling_mode not in {"lhs", "sobol"}:
-        msg = "Generated replacements require one canonical sampled campaign."
-        raise ValueError(msg)
     plan = load_campaign_plan(campaign.profile.id, campaign.source_name, storage_root=storage_root)
     if plan["campaign_digest"] != campaign.campaign_digest:
         msg = "Replacement campaign differs from its frozen scientific plan."
@@ -1131,18 +1199,19 @@ def materialize_replacement_batch(
     batch_records = [row for row in material_records if row["reservation"]["batch_id"] == batch_id]
     target = len(parent.case_indices)
     primaries = [row for row in batch_records if row["reservation"]["origin"] == "primary"]
-    if len(primaries) != target or any(row["decision"] is None for row in primaries):
-        msg = "All primary candidates in the batch must settle before deterministic replacement planning."
-        raise RuntimeError(msg)
-    if sum(row["reservation"]["origin"] == "primary" for row in material_records) != plan["selected_targets"][material]:
+    material_primaries = [row for row in material_records if row["reservation"]["origin"] == "primary"]
+    if len(material_primaries) != plan["selected_targets"][material]:
         msg = "All material primary slots must be reserved before allocating a replacement case ID."
+        raise RuntimeError(msg)
+    if any(row["decision"] is None for row in material_primaries):
+        msg = "All primary candidates of the material must settle before deterministic replacement planning."
         raise RuntimeError(msg)
     if selection_service.replacement_deficit(batch_records, target=target) < 1:
         msg = "The batch needs no replacement: its success deficit is closed after active replacement work."
         raise NoReplacementError(msg)
-    rate = _current_rate(_batch_amendments(_frozen_batch(plan, batch_id), storage_root=storage_root))
-    if selection_service.success_rate_stopped(*selection_service.decided_counts(batch_records), minimum_success_rate=rate):
-        msg = "The batch is stopped by its minimum success rate and admits no replacement."
+    rate = _current_rate(_material_amendments(plan, material, storage_root=storage_root))
+    if selection_service.success_rate_stopped(*selection_service.decided_counts(material_records), minimum_success_rate=rate):
+        msg = "The material is stopped by its minimum success rate and admits no replacement."
         raise NoReplacementError(msg)
     failed = sorted((row for row in primaries if row["decision"]["outcome"] == "failed"), key=lambda row: row["reservation"]["case_id"])
     occupied_slots = {
@@ -1158,53 +1227,24 @@ def materialize_replacement_batch(
     target_slot = int(failed_primary["reservation"]["target_slot"])
     ordinal = sum(row["reservation"]["origin"] == "replacement" for row in batch_records) + 1
     case_index = len(material_records) + 1
-    round_index = ordinal
-    plan_sha = common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root))
-    sampling_seed = seeding.derive_seed(campaign.root_seed, "campaign_replacement_pool_v1", campaign.profile.id, plan["seed_key"], batch_id)
-    sampling_plans = parent.scientific_values["sampling"]["blocks"]
-    point = sampling.supplemental_unit_point(
-        registry=parent.scientific_values["material"]["parameter_registry"],
-        blocks=tuple(sampling_plans),
-        block_parameters={block: tuple(spec["parameters"]) for block, spec in sampling_plans.items()},
-        seed=sampling_seed,
-        ordinal=ordinal,
-    )
-    block_seeds = {block: seeding.derive_seed(sampling_seed, "supplemental_replacement", block) for block in point}
     design = {
-        "schema_kind": "generation_source_supplemental_design",
-        "schema_version": sampling.SUPPLEMENTAL_DESIGN_SCHEMA_VERSION,
-        "campaign_plan_sha256": plan_sha,
+        "schema_kind": _REPLACEMENT_DESIGN_SCHEMA_KIND,
+        "campaign_plan_sha256": common.serialization.file_sha256(common.paths.resolve_generation_campaign_plan_path(root)),
         "parent_campaign_digest": campaign.campaign_digest,
         "parent_batch_id": batch_id,
         "parent_scientific_config_digest": parent.scientific_config_digest,
         "parent_failed_case_id": failed_primary["reservation"]["case_id"],
         "candidate_id": "",
         "candidate_ordinal": ordinal,
-        "batch_ordinal": ordinal,
-        "round": round_index,
-        "population": ordinal,
+        "design_index": target + ordinal - 1,
         "target_slot": target_slot,
         "material_case_index": case_index,
-        "root_seed": campaign.root_seed,
-        "seed_derivation_version": 1,
         "batch_locator_regime": "",
-        "sampling_algorithm": "sobol",
-        "sampling_seed": sampling_seed,
-        "block_seeds": block_seeds,
-        "unit_point": point,
-        "unit_point_sha256": common.serialization.canonical_json_sha256({"unit_point": point}),
-        "physical_values": None,
-        "physical_values_sha256": None,
     }
     design["batch_locator_regime"] = _replacement_locators(parent, design)[1]
-    design["candidate_id"] = f"replacement__{common.serialization.canonical_json_sha256(design)[:24]}"
-    sample = sampling.sample_case(_resolved_replacement_batch(campaign, parent, design), case_index)
-    design["physical_values"] = sample.values
-    design["physical_values_sha256"] = common.serialization.canonical_json_sha256({"physical_values": sample.values})
+    design["candidate_id"] = _replacement_candidate_id(design)
     final = _resolved_replacement_batch(campaign, parent, design)
-    if sampling.sample_case(final, case_index).values != sample.values:
-        msg = "Replacement sample changed after scientific identity was finalized."
-        raise RuntimeError(msg)
+    sampling_service.sample_case(final, case_index)
     return final
 
 
@@ -1329,7 +1369,7 @@ def campaign_from_frozen_run(
         duplicate_case_input_policy=plan["duplicate_case_input_policy"],
         execution_values=copy.deepcopy(plan["execution_values"]),
         root_seed=int(plan["root_seed"]),
-        sampling_mode=str(plan["sampling_mode"]),
+        designs=copy.deepcopy(plan["original_design_sizes"]),
         selected_targets={material: int(count) for material, count in plan["selected_targets"].items()},
         composition_sources=tuple(copy.deepcopy(plan.get("composition_sources", ()))),
         scientific_overrides=copy.deepcopy(plan["scientific_overrides"]),

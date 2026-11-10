@@ -4,6 +4,7 @@ Responsibilities:
   - Register steady-flow and transient-drying Dataset-view identities
   - Normalize authoritative learned and transition contracts for inspection
   - Expose ordered fields, tensor groups, and runtime-resolved shape semantics
+  - Declare each view's parameter-OOD groups, both tasks alike, as static constants of the profile-active registry groups
 
 Design principles:
   - Trainable-task registration remains owned by ``src.domain.tasks``
@@ -47,7 +48,11 @@ _CHANNEL_SAMPLE_LAYOUT: Final = ("channel",)
 
 @dataclass(frozen=True, slots=True)
 class DatasetViewSpec:
-    """Describe one buildable Dataset view and its source relevance contract."""
+    """Describe one buildable Dataset view and its source relevance contract.
+
+    ``parameter_ood_blocks`` are the registry ``ood_group`` names active for the profile that simulates the task; a test
+    compares them with the groups Generation records in a parameter-OOD batch, so registry drift fails a test, not a run.
+    """
 
     id: DatasetViewId
     registered_task_id: str
@@ -288,14 +293,14 @@ _VIEWS: Final = MappingProxyType(
             id="steady_flow",
             registered_task_id="steady_flow",
             source_profiles=_source_profiles("steady_flow"),
-            parameter_ood_blocks=("airflow",),
+            parameter_ood_blocks=("bed", "operation"),
             contract_digest=_steady_contract_digest(),
         ),
         "transient_drying": DatasetViewSpec(
             id="transient_drying",
             registered_task_id="transient_drying",
             source_profiles=_source_profiles("transient_drying"),
-            parameter_ood_blocks=(),
+            parameter_ood_blocks=("bed", "operation", "initial_moisture", "material_properties"),
             contract_digest=transient_contract.transient_contract_digest(),
         ),
     }

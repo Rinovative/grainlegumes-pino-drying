@@ -1,7 +1,8 @@
-"""Define immutable campaign, evaluation, and Dataset-membership vocabulary.
+"""Define immutable campaign, design, evaluation, and Dataset-membership vocabulary.
 
 Responsibilities:
   - Declare typed evaluation-regime and ID-membership identifiers
+  - Own the design kinds of a material and their canonical order
   - Own stable campaign-purpose and material-role collections
 
 Design principles:
@@ -26,6 +27,8 @@ EvaluationRegime: TypeAlias = Literal[  # noqa: UP040 -- public runtime aliases 
 ]
 
 ID_MEMBERSHIPS: tuple[IdMembership, ...] = ("train", "validation", "id_test")
+# One fixed Sobol design per material and kind; a Source batch's sampling regime is its design kind.
+DESIGN_KINDS = ("train", "validation", "test", "parameter_ood")
 EVALUATION_REGIMES: tuple[EvaluationRegime, ...] = (
     "id",
     "parameter_ood",

@@ -45,6 +45,7 @@ def build_synthetic_selection_provenance(
     def digest(label: str) -> str:
         return hashlib.sha256(f"{dataset_name}:{label}".encode()).hexdigest()
 
+    kinds = _synthetic_design_kinds(len(sample_ids), material_role=material_role)
     cases = []
     for position, case_id in enumerate(sample_ids):
         cases.append(
@@ -69,7 +70,8 @@ def build_synthetic_selection_provenance(
                     "selected_pool_sha256": None,
                 },
                 "design": {
-                    "sampling_method": "lhs",
+                    "design_recipe": "scrambled_sobol_single_sequence",
+                    "design_kind": kinds[position],
                     "original_design_size": len(sample_ids),
                     "candidate_position": position,
                     "origin": "primary",
@@ -82,7 +84,6 @@ def build_synthetic_selection_provenance(
         )
     return {
         "schema_kind": "dataset_selection_manifest",
-        "schema_version": dataset_identity.DATASET_PACKAGE_SCHEMA_VERSION,
         "dataset_name": dataset_name,
         "dataset_view": "steady_flow",
         "registered_task_id": task.id,
@@ -118,7 +119,7 @@ def build_synthetic_selection_provenance(
                     {
                         "case_id": case_id,
                         "material_family": material_family,
-                        "sampling_regime": "natural",
+                        "sampling_regime": kinds[position],
                         "origin": "primary",
                         "candidate_position": position,
                         "target_slot": position,
@@ -153,6 +154,14 @@ def build_synthetic_selection_provenance(
     }
 
 
+def _synthetic_design_kinds(count: int, *, material_role: str | None) -> list[str]:
+    """Return the design kind of each synthetic case: an ID material's first half Train, one validation, the rest test."""
+    if material_role != "id":
+        return ["test"] * count
+    half = max(1, count // 2)
+    return ["train"] * half + ["validation"] * min(1, count - half) + ["test"] * max(0, count - half - 1)
+
+
 def _synthetic_partition(
     sample_ids: Sequence[str],
     *,
@@ -163,20 +172,11 @@ def _synthetic_partition(
     if material_role is None:
         return None
     case_ids = list(sample_ids)
-    half = max(1, len(case_ids) // 2)
-    recipe = {
-        "kind": "exact",
-        "train": case_ids[:half],
-        "validation": case_ids[half : half + 1],
-        "id_test": case_ids[half + 1 :],
-    }
     return partition_contract.build_fixed_partition(
         case_ids,
         material_by_case=dict.fromkeys(case_ids, material_family),
+        design_kind_by_case=dict(zip(case_ids, _synthetic_design_kinds(len(case_ids), material_role=material_role), strict=True)),
         material_roles={material_family: material_role},
-        recipe=recipe,
-        seed_input=9,
-        seed=common.random.derive_subseed(9, "split"),
     )
 
 
@@ -200,7 +200,6 @@ def build_synthetic_task() -> domain.tasks.spec.TaskSpec:
     spec = domain.tasks.spec
     return spec.TaskSpec(
         id="synthetic_field_task",
-        schema_version=spec.TASK_SCHEMA_VERSION,
         inputs=(
             spec.FieldSpec("feature_a", "state", "unit_in_a", "identity"),
             spec.FieldSpec("feature_b", "state", "unit_in_b", "identity"),
@@ -299,15 +298,16 @@ def synthetic_split_payload(
     task: str,
     *,
     train_dataset: str = "train_data",
-    additional: Sequence[tuple[str, Sequence[str]]] = (("ood_data", ("chickpea__case_0001__00000000000a",)),),
+    material_ood: Sequence[tuple[str, Sequence[str]]] = (("ood_data", ("chickpea__case_0001__00000000000a",)),),
+    parameter_ood: Sequence[str] = (),
     spatial_view: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """
     Return one admitted current split payload of either task over synthetic Dataset identities.
 
-    The training Dataset holds four lentil cases split two/one/one; each ``additional`` entry is one
-    evaluation-only Dataset whose listed cases are all declared OOD, kept in the given order. A transient
-    split uses ``spatial_view`` or a canonical 4 x 4 view.
+    The training Dataset holds four lentil cases split two/one/one plus the ``parameter_ood`` lentil cases it declares
+    parameter-OOD; each ``material_ood`` entry is one evaluation-only Dataset whose listed cases are all declared OOD,
+    kept in the given order. A transient split uses ``spatial_view`` or a canonical 4 x 4 view.
     """
     from src.datasets.contracts.dataset_contracts_transient import TRANSIENT_STEP_CONTRACT  # noqa: PLC0415
     from src.datasets.preprocessing import dataset_preprocessing_splits as splits  # noqa: PLC0415 -- imports Torch
@@ -324,20 +324,29 @@ def synthetic_split_payload(
         core = {"dataset_id": dataset_id, "dataset_digest": digest * 64, "channel_contract_digest": views.get_view(task).contract_digest}
         return core | {"case_ids": list(case_ids)} | payload_identity
 
-    def assignment(dataset_id: str) -> dict[str, Any]:
-        return {"dataset_id": dataset_id, "role": "ood", "relation": "material holdout", "assumptions": []}
+    def assignment(dataset_id: str, role: str = "material_ood") -> dict[str, Any]:
+        return {"dataset_id": dataset_id, "role": role, "relation": "declared holdout", "assumptions": []}
 
     train_cases = [f"lentil__case_{index:04d}__{index:012x}" for index in range(1, 5)]
-    partition = _synthetic_partition(train_cases, material_family="lentil", material_role="id")
-    assert partition is not None
-    parts = [(identity(name, cases, str(index + 1)), list(cases), assignment(name)) for index, (name, cases) in enumerate(additional)]
+    source_cases = [*train_cases, *parameter_ood]
+    partition = partition_contract.build_fixed_partition(
+        source_cases,
+        material_by_case=dict.fromkeys(source_cases, "lentil"),
+        design_kind_by_case=dict(
+            zip(source_cases, [*_synthetic_design_kinds(len(train_cases), material_role="id"), *["parameter_ood"] * len(parameter_ood)], strict=True)
+        ),
+        material_roles={"lentil": "id"},
+    )
+    parts = [(identity(name, cases, str(index + 1)), list(cases), assignment(name)) for index, (name, cases) in enumerate(material_ood)]
+    train_identity = identity(train_dataset, source_cases, "0")
+    parameter_parts = [(train_identity, list(parameter_ood), assignment(train_dataset, "parameter_ood"))] if parameter_ood else []
     sampling = {"mode": "one_step_transition"}
     extension = (
         None
         if task == "steady_flow"
         else {
             "tensorizer": TransientTensorizerSpec.from_mapping(
-                {"input_profile": "canonical_physics_complete_v1", "temporal_conditioning": {"kind": "none"}}
+                {"input_profile": "canonical_physics_complete", "temporal_conditioning": {"kind": "none"}}
             ).selection_dict(),
             "sampling": sampling,
             "evaluation_sampling": {"mode": "trajectory"},
@@ -345,7 +354,13 @@ def synthetic_split_payload(
         }
     )
     split = splits.build_split(
-        task=task, train_dataset=identity(train_dataset, train_cases, "0"), case_partition=partition, additional_evaluation=parts, extension=extension
+        task=task,
+        train_dataset=train_identity,
+        case_partition=partition,
+        train_subset=None,
+        material_by_case=dict.fromkeys(source_cases, "lentil"),
+        ood_parts={"material_ood": parts, "parameter_ood": parameter_parts},
+        extension=extension,
     )
     return split.as_payload()
 
@@ -358,7 +373,6 @@ def admitted_manifest(task: str, dataset_id: str, **_roots: Path) -> dict[str, A
         "dataset_digest": "d" * 64,
         "channel_contract_digest": "b" * 64,
         "schema_kind": "dataset_selection_manifest",
-        "schema_version": 1,
         "payload_sha256": "a" * 64,
         "derived_payload_sha256": "c" * 64 if task == "transient_drying" else None,
         "sample_count": 4,

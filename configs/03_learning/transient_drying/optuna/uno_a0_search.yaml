@@ -1,11 +1,11 @@
-# Role: transient_drying U-NO A0 study (stage_a_only); uses no base.yaml because its single-stage training keys differ. Edit: freely.
-# Tunes the teacher-forced A0 that B and A1 continue from; copy the selected values into the matched experiment config.
-# Shared semantic values (data, loss, scaling, scheduler, objective) must stay equal to ../base.yaml.
+# Role: transient_drying U-NO A0 study (stage_a_only); cannot inherit base.yaml, so its experiment restates the shared values. Edit: freely.
+# Tunes the teacher-forced A0 that B and A1 continue from; copy the selected values into the matched experiment config. Only the model, lr, temporal.sampling, training, run.device and tracking workflow may differ from base.yaml; a test keeps the rest equal.
+
 study:
+  n_trials: 24  # Maximum number of trials requested for the study.
   mode: stage_a_only  # Transient protocol searched by this study: A0 alone.
   role: production  # Study role used by the experiment workflow.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
-  n_trials: 24  # Maximum number of trials requested for the study.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.
     multivariate: true  # Allow the TPE sampler to model parameter interactions.
@@ -15,42 +15,65 @@ study:
     n_warmup_steps: 8  # Reported objective steps (epochs) required before pruning can occur.
     interval_steps: 1  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
 
+# One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
+search_space:
+  model.params.modes_x: {name: modes_x, kind: categorical, values: [32, 48, 64]}
+  model.params.modes_y: {name: modes_y, kind: categorical, values: [32, 48]}  # 64 exceeds the 63 Y modes a 5-layer U-NO admits on the 126 x 201 training grid.
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 32, 64]}
+  model.params.n_layers: {name: n_layers, kind: categorical, values: [5, 7]}  # U-NO supports exactly 5 or 7 layers.
+  model.params.mode_ratio: {name: mode_ratio, kind: float, low: 0.4, high: 0.6}
+  optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 3.0e-3, log: true}
+  data.batch_size: {name: batch, kind: categorical, values: [2, 4]}
+
 experiment:
-  task: transient_drying  # Selects the task contract and its compatible data/model/loss validation.
-  run:
-    seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
-    deterministic: false  # Equal to base.yaml; strict deterministic CUDA rejects kernels these transient models use (cumsum and others).
-    device: auto  # Requested compute device; auto selects an available supported device.
-  data:
-    train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
-    additional_evaluation_datasets: []  # Optional built datasets evaluated in addition to the primary validation/test assignments.
-    batch_size: 2  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
-    spatial_stride: 2  # Spatial subsampling step; larger strides reduce the effective grid resolution.
-    num_workers: 0  # Equal to base.yaml; the matched B/A1 stages require main-process loading, and the benchmark measured 905 items/s with 0 workers against 33-37 with 2-4.
-    persistent_workers: false  # No worker processes exist to keep alive.
-  input_profile: canonical_physics_complete_v1  # Selects the versioned transient input/state profile expected by the dataset and model.
+  model:
+    kind: uno  # Architecture family; its params below are interpreted by that family.
+    params:
+      modes_x: 64  # Search base value: Fourier modes along the x axis.
+      modes_y: 48  # Search base value: Fourier modes along the y axis; a 5-layer U-NO admits at most 63 on the training grid.
+      hidden_channels: 32  # Search base value: width of the hidden feature representation.
+      n_layers: 7  # Search base value: number of U-NO layers; uno_scalings stays unset so each depth uses its default [y, x] scaling schedule.
+      mode_ratio: 0.4951318201313778  # Search base value: fraction controlling the intermediate Fourier-mode allocation.
+      positional_embedding: null  # No positional embedding: x and y are explicit input channels.
+      domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field.
+  optimizer:
+    lr: 5.319714363424885e-4  # Search base value: initial learning rate.
+    kind: adamw  # Optimizer implementation; the training contract supports AdamW.
+    weight_decay: 1.0e-4  # AdamW decoupled weight-decay coefficient.
   temporal:
     sampling:
-      mode: one_step_transition  # Select the temporal sample shape for a stage-A-only protocol.
+      mode: one_step_transition  # Teacher-forced single-transition training examples; A0's curriculum stays the one-step default.
     temporal_conditioning:
-      kind: none  # Choose whether normalized current time is appended as an input channel; none adds no time channel.
-  scaling:
-    mode: state_std  # Selects the state/increment scaling rule used by transient training and evaluation.
-  model:
-    kind: uno  # Select the architecture family; its params below are interpreted by that family.
-    params:
-      modes_x: 64  # Fourier modes retained along the x axis.
-      modes_y: 48  # Fourier modes retained along the y axis; a 5-layer U-NO admits at most 63 on the training grid.
-      hidden_channels: 32  # Width of the model’s hidden feature representation.
-      n_layers: 7  # Number of architecture layers/blocks; affects capacity and compute.
-      mode_ratio: 0.4951318201313778  # UNO fraction controlling intermediate Fourier-mode allocation.
-      channel_mlp_skip: linear  # Channel-MLP skip connection type.
-      positional_embedding: null  # No positional embedding: x and y are explicit input channels.
-      domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; equal to ../base.yaml.
+      kind: none  # Whether normalized current time is appended as an input channel; none adds no time channel.
+  training:
+    epochs: 40  # Trial epoch budget of this single-stage run, shorter than the matched a0.max_epochs to rank configurations cheaply; equals stage_schedule.total_epochs.
+    stage_schedule:
+      mode: stage_a_only  # A0 alone; the only transient protocol Optuna searches.
+      budget_unit: epochs  # Unit used to express the training budget.
+      total_epochs: 40  # Trial epoch budget; must equal training.epochs.
+    evaluation_interval: 1  # Roll out the whole validation trajectories every this many stage epochs; this selects the stage checkpoint.
+    ood_evaluation_interval: 1  # Evaluate the material-OOD and parameter-OOD roles at this stage interval.
+  run:
+    seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
+    deterministic: false  # Strict deterministic CUDA rejects kernels these transient models use (cumsum and others).
+    device: auto  # Differs from base.yaml (cuda): requested compute device; auto selects an available supported device.
+  data:
+    train_dataset: null  # Exact built Dataset ID; null needs --train-dataset.
+    train_subset: null  # null trains on every Train case; a power of two N trains on the first N Train cases per ID material (learning curve).
+    batch_size: 2  # Search base value: cases per optimizer batch.
+    spatial_stride: 2  # Spatial subsampling step; larger strides reduce the effective grid resolution.
+    material_ood_datasets: []  # Optional built datasets whose declared OOD cases join the training Dataset's in the material-OOD role.
+    num_workers: 0  # The matched B/A1 stages require main-process loading, and the benchmark measured 905 items/s with 0 workers against 33-37 with 2-4.
+    persistent_workers: false  # No worker processes exist to keep alive.
+  scheduler:
+    kind: reduce_on_plateau  # Learning-rate schedule policy.
+    factor: 0.5  # Multiplicative learning-rate reduction after a plateau.
+    patience: 10  # Validation checks without improvement before reducing the learning rate; one check per epoch at evaluation_interval 1.
+    min_lr: 1.0e-6  # Lower bound for the scheduled learning rate.
   loss:
     data:
-      kind: huber  # Select the supervised error formulation; valid choices depend on the task contract.
-      space: scaled_increment  # Space in which supervised error is measured, such as normalized state or scaled increment.
+      kind: huber  # Supervised error formulation; valid choices depend on the task contract.
+      space: scaled_increment  # Space in which the supervised error is measured, such as normalized state or scaled increment.
       weight: 1.0  # Multiplier on the supervised data-loss term.
       beta: 1.0  # Huber transition scale between quadratic and linear error behavior.
       channel_weights: [1.0, 1.0, 1.0, 1.0]  # Per-channel multipliers for the supervised loss; order follows the task state channels.
@@ -59,71 +82,16 @@ experiment:
       enabled: false  # Enable the physics residual and boundary loss terms.
   evaluation:
     objective:
-      id: normalized_drying_group_macro_rmse  # Metric used to compare trials/checkpoints and drive the scheduler or study objective.
-  optimizer:
-    kind: adamw  # Optimizer implementation; current training contract supports AdamW.
-    lr: 0.0005319714363424885  # Initial learning rate; controls the optimizer update scale.
-    weight_decay: 0.0001  # AdamW decoupled weight-decay coefficient.
-  scheduler:
-    kind: reduce_on_plateau  # Learning-rate schedule policy.
-    factor: 0.5  # Multiplicative learning-rate reduction after a plateau.
-    patience: 10  # Validation checks without improvement before reducing the learning rate; one check per epoch at evaluation_interval 1.
-    min_lr: 1.0e-06  # Lower bound for the scheduled learning rate.
-  training:
-    epochs: 40  # Trial epoch budget of this single-stage run, shorter than the matched a0.max_epochs to rank configurations cheaply; equals stage_schedule.total_epochs.
-    stage_schedule:
-      mode: stage_a_only  # A0 alone; the only transient protocol Optuna searches.
-      budget_unit: epochs  # Unit used to express the training budget.
-      total_epochs: 40  # Trial epoch budget; must equal training.epochs.
-    evaluation_interval: 1  # Roll out the whole validation trajectories every this many stage epochs; this selects the stage checkpoint.
-    additional_evaluation_interval: 1  # Evaluate additional configured datasets at this stage interval.
-    stage: a  # Stage selector for a single-stage protocol.
-    comparison_arm: a0  # Comparison-arm identifier recorded with the training result.
-    gradient_accumulation_steps: 1  # Number of batches accumulated before each optimizer update; increases effective batch size.
-    curriculum:
-      lengths: [1]  # Self-fed rollout lengths of this stage's curriculum; they must fit the sampling rollout length.
-      milestone_fractions: [0.0]  # Fractions of the stage budget at which curriculum lengths advance.
-    teacher_handoff: null  # Optional teacher-state handoff configuration; null disables handoff.
+      id: normalized_drying_group_macro_rmse  # Metric that compares trials and checkpoints and drives the scheduler and the study objective.
+  input_profile: canonical_physics_complete  # Transient input/state profile expected by the dataset and model.
+  scaling:
+    mode: state_std  # State/increment scaling rule used by transient training and evaluation.
   tracking:
     wandb:
+      workflow: optuna_trial  # Differs from base.yaml (train): workflow label attached to tracking metadata.
       mode: online  # W&B logging mode, such as online or offline.
-      workflow: optuna_trial  # Workflow label attached to tracking metadata.
       monitor:
         enabled: false  # Enable periodic qualitative/diagnostic monitoring.
         interval: 1  # Monitoring interval in epochs.
         max_cases: 1  # Maximum cases sampled for each monitoring pass.
-
-search_space:
-  # uno_scalings stays unset so each depth uses its default [y, x] scaling schedule.
-  model.params.modes_x:
-    name: modes_x  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [32, 48, 64]  # Allowed categorical choices for this parameter.
-  model.params.modes_y:
-    name: modes_y  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [32, 48]  # 64 exceeds the 63 Y modes a 5-layer U-NO admits on the 126 x 201 training grid.
-  model.params.hidden_channels:
-    name: hidden_channels  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [16, 32, 64]  # Allowed categorical choices for this parameter.
-  model.params.n_layers:
-    name: n_layers  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [5, 7]  # UNO supports exactly 5 or 7 layers.
-  model.params.mode_ratio:
-    name: mode_ratio  # Readable Optuna parameter name for this configuration path.
-    kind: float  # Distribution type used to sample this parameter.
-    low: 0.4  # Inclusive lower search bound.
-    high: 0.6  # Inclusive upper search bound.
-    log: false  # Sample this range logarithmically when true.
-  optimizer.lr:
-    name: lr  # Readable Optuna parameter name for this configuration path.
-    kind: float  # Distribution type used to sample this parameter.
-    low: 0.0001  # Inclusive lower search bound.
-    high: 0.003  # Inclusive upper search bound.
-    log: true  # Sample this range logarithmically when true.
-  data.batch_size:
-    name: batch  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [2, 4]  # Allowed categorical choices for this parameter.
+  task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.

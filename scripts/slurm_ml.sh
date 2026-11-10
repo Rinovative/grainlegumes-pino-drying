@@ -4,14 +4,15 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/slurm_ml.sh --mode cpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--max-epochs N] [--continue-with-current-code]
-  scripts/slurm_ml.sh --mode cpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS train --resume STAGE [--max-epochs N] [--continue-with-current-code]
-  scripts/slurm_ml.sh --mode gpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS --gres gpu:TYPE:1 train --resume STAGE [--max-epochs N] [--continue-with-current-code]
-  scripts/slurm_ml.sh --mode gpu --partition PARTITION --cpus-per-task N --mem SIZE --time HH:MM:SS --gres gpu:TYPE:1 train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--artifacts selected|none] [--continue-with-current-code]
-  scripts/slurm_ml.sh [same resource options] optuna CONFIG [--epochs N] [--train-dataset ID] [--revision LABEL] [Optuna CLI options] [--continue-with-current-code]
-  scripts/slurm_ml.sh [same resource options] artifacts [artifact CLI options]
-  scripts/slurm_ml.sh [same resource options] probe
+  scripts/slurm_ml.sh [RESOURCES] train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--max-epochs N] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] train --resume STAGE [--max-epochs N] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] optuna CONFIG [--epochs N] [--train-dataset ID] [--revision LABEL] [Optuna CLI options] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] artifacts [artifact CLI options]
+  scripts/slurm_ml.sh [RESOURCES] probe
 
+RESOURCES are all optional: [--mode cpu|gpu] [--partition PARTITION] [--cpus-per-task N] [--mem SIZE] [--time HH:MM:SS] [--gres gpu:TYPE:1].
+Defaults: mode gpu (probe: cpu); 4 CPUs; cpu: partition standard, 16G; gpu: partition gpu,
+32G, gres gpu:rtx6000ada:1; time 04:00:00 (train, optuna), 02:00:00 (artifacts), 00:10:00 (probe).
 GPU TYPE is v100, rtxa6000, or rtx6000ada. The probe checks the allocated
 container and ML CLIs without opening datasets or starting workloads.
 Rerunning train CONFIG continues an existing run automatically (more --epochs
@@ -77,6 +78,18 @@ while (( $# > 0 )); do
   esac
 done
 
+[[ "${operation:-}" == train || "${operation:-}" == optuna || "${operation:-}" == artifacts || "${operation:-}" == probe ]] || fail 2 "Choose train, optuna, artifacts, or probe."
+# Defaults for every omitted resource option; an explicit option always wins.
+case "${operation}" in
+  probe) mode="${mode:-cpu}"; wall_time="${wall_time:-00:10:00}" ;;
+  artifacts) mode="${mode:-gpu}"; wall_time="${wall_time:-02:00:00}" ;;
+  *) mode="${mode:-gpu}"; wall_time="${wall_time:-04:00:00}" ;;
+esac
+cpus="${cpus:-4}"
+case "${mode}" in
+  cpu) partition="${partition:-standard}"; memory="${memory:-16G}" ;;
+  gpu) partition="${partition:-gpu}"; memory="${memory:-32G}"; gres="${gres:-gpu:rtx6000ada:1}" ;;
+esac
 [[ "${mode}" == cpu || "${mode}" == gpu ]] || fail 2 "--mode must be cpu or gpu."
 [[ "${partition}" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] || fail 2 "--partition requires one Slurm partition name."
 [[ "${cpus}" =~ ^[1-9][0-9]*$ ]] || fail 2 "--cpus-per-task must be a positive integer."
@@ -87,7 +100,6 @@ if [[ "${mode}" == cpu ]]; then
 else
   [[ "${gres}" =~ ^gpu:(v100|rtxa6000|rtx6000ada):1$ ]] || fail 2 "GPU mode requires --gres gpu:v100:1, gpu:rtxa6000:1, or gpu:rtx6000ada:1."
 fi
-[[ "${operation:-}" == train || "${operation:-}" == optuna || "${operation:-}" == artifacts || "${operation:-}" == probe ]] || fail 2 "Choose train, optuna, artifacts, or probe."
 [[ -x "${LIVE_WORKER}" && -x "${EXECUTOR}" ]] || fail 1 "The Slurm worker and Apptainer executor must be executable."
 [[ -d "${STORAGE_ROOT}" && -r "${STORAGE_ROOT}" && -w "${STORAGE_ROOT}" ]] || fail 1 "Storage root must exist and be readable and writable: ${STORAGE_ROOT}"
 paths_overlap() {
@@ -417,8 +429,8 @@ sif_sha="${sif_sha%% *}"
 log_directory="${RUNTIME_ROOT}/logs/ml"
 mkdir -p -- "${log_directory}"
 # The one definition of the log names: sbatch expands %j, and the job links the files into its run and study folders.
-stdout_template="${log_directory}/slurm-%j.out"
-stderr_template="${log_directory}/slurm-%j.err"
+stdout_template="${log_directory}/${operation}-%j.out"
+stderr_template="${log_directory}/${operation}-%j.err"
 job_name="ml-${operation}-${task}"
 job_name="${job_name:0:80}"
 

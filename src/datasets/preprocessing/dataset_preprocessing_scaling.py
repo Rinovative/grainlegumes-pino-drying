@@ -40,8 +40,7 @@ if TYPE_CHECKING:
     from src.datasets.preprocessing import dataset_preprocessing_splits as splits
 
 SCALING_ARTIFACT_SCHEMA_KIND: Final = "train_scaling_artifact"
-SCALING_ARTIFACT_SCHEMA_VERSION: Final = 1
-_ARTIFACT_KEYS: Final = frozenset({"schema_kind", "schema_version", "identity", "identity_sha256", "producer", "state"})
+_ARTIFACT_KEYS: Final = frozenset({"schema_kind", "identity", "identity_sha256", "producer", "state"})
 _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 StartupCallback = Callable[[str, Mapping[str, Any]], None]
 
@@ -63,7 +62,6 @@ def build_scaling_artifact(identity: Mapping[str, Any], state: Mapping[str, Any]
     """Wrap one task-fitted scaling state in its identity-bound envelope with the model digest of the code that fitted it."""
     return {
         "schema_kind": SCALING_ARTIFACT_SCHEMA_KIND,
-        "schema_version": SCALING_ARTIFACT_SCHEMA_VERSION,
         "identity": copy.deepcopy(dict(identity)),
         "identity_sha256": common.serialization.canonical_json_sha256(dict(identity)),
         "producer": {"model_sha256": model_sha256},
@@ -103,7 +101,6 @@ def admit_scaling_artifact(value: Any, *, identity: Mapping[str, Any]) -> dict[s
         not isinstance(value, dict)
         or set(value) != _ARTIFACT_KEYS
         or value["schema_kind"] != SCALING_ARTIFACT_SCHEMA_KIND
-        or not common.serialization.is_schema_version(value["schema_version"], SCALING_ARTIFACT_SCHEMA_VERSION)
         or not isinstance(value["identity"], dict)
         or value["identity_sha256"] != common.serialization.canonical_json_sha256(value["identity"])
         or not isinstance(value["producer"], dict)

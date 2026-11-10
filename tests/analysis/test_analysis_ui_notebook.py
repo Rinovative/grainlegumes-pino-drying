@@ -1,10 +1,12 @@
-"""Protect notebook render ownership, PDF naming, and shared selection controls.
+"""Protect notebook render ownership, failure display, notebooks-folder export, and shared controls.
 
 Responsibilities:
-  - Check render supersession, PDF naming, channel rebinding, and scope controls
+  - Check render supersession, in-place failure display, export destination and naming
+  - Check the shared panel header, channel rebinding, and scope controls
 
 Design principles:
   - Only the latest admitted selection owns displayed figures and export state
+  - Exports reach only the repository's notebooks folder, resolved at export time
 
 This module does NOT:
   - Validate scientific field values or manage persisted artifacts
@@ -13,12 +15,14 @@ This module does NOT:
 from __future__ import annotations
 
 from threading import Event, Thread
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
+import pytest
 from matplotlib.figure import Figure
 
+from src.analysis.generation_inputs import generation_input_panel
 from src.analysis.ui import analysis_ui_components as components
 from src.analysis.ui import analysis_ui_notebook as notebook_ui
 from src.analysis.ui import analysis_ui_viewers as viewers
@@ -26,18 +30,46 @@ from src.analysis.ui import analysis_ui_viewers as viewers
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
+FIXED_TIMESTAMP = "20261015_123000"
+
+
+class _FixedTimestamp:
+    def strftime(self, _format: str) -> str:
+        return FIXED_TIMESTAMP
+
+
+class _FixedDateTime:
+    @staticmethod
+    def now(_tz: object) -> _FixedTimestamp:
+        return _FixedTimestamp()
+
+
+@pytest.fixture
+def project_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Provide a temporary project root with a real ``notebooks`` folder and no source-tree mode."""
+    (tmp_path / "notebooks").mkdir()
+    monkeypatch.setattr(notebook_ui.common.paths, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(notebook_ui.common.paths, "source_tree_id", lambda *_args, **_kwargs: None)
+    return tmp_path
+
+
+def _open_panel(monkeypatch: pytest.MonkeyPatch, state: dict[str, Any], *sections: widgets.Widget) -> widgets.VBox:
+    """Build a lazy panel, press its opener, and return the rendered panel."""
+    displayed: list[object] = []
+    monkeypatch.setattr(notebook_ui, "display", displayed.append)
+    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
+    notebook_ui.make_lazy_panel_with_tabs(sections or (widgets.VBox(),), export_state=state)
+    opener = displayed[-1]
+    assert isinstance(opener, widgets.Button)
+    opener.click()
+    rendered = displayed[-1]
+    assert isinstance(rendered, widgets.VBox)
+    return rendered
 
 
 def _export_button(panel: widgets.VBox) -> widgets.Button:
     """Return the rendered panel's PDF export trigger."""
     return next(child for child in panel.children[0].children if isinstance(child, widgets.Button) and child.description == "Export PDF")
-
-
-def _export_directory(panel: widgets.VBox) -> widgets.Text:
-    """Return the visible output-directory field below the panel header."""
-    row = panel.children[1]
-    return next(child for child in row.children if isinstance(child, widgets.Text))
 
 
 def test_older_completed_render_cannot_publish_after_newer_selection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,11 +109,101 @@ def test_older_completed_render_cannot_publish_after_newer_selection(monkeypatch
     assert export_state["plot_name"] == "new"
 
 
-def test_export_prefers_sanitized_viewer_stem_and_never_overwrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Use viewer context over generic names while retaining timestamp collision protection."""
-    displayed: list[object] = []
-    monkeypatch.setattr(notebook_ui, "display", displayed.append)
-    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
+def test_failing_render_shows_failure_clears_export_and_is_replaced_by_next_render(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising plot function is shown in place with an escaped traceback; a later render replaces it."""
+    displayed: list[Any] = []
+    monkeypatch.setattr(viewers, "display", displayed.append)
+    output = widgets.Output()
+    stale = plt.figure()
+    state: dict[str, Any] = {"fig": stale, "figures": (stale,)}
+
+    def failing() -> Figure:
+        message = "<boom>"
+        raise RuntimeError(message)
+
+    viewers.render_figure(out=output, plot_func=failing, export_state=state, export_plot_name="bad")
+
+    html = displayed[-1].data
+    assert "View failed" in html
+    assert "RuntimeError: &lt;boom&gt;" in html
+    assert "<details><summary>Traceback</summary><pre>" in html
+    assert "<boom>" not in html
+    assert state["fig"] is None
+    assert state["figures"] == ()
+    assert state["plot_name"] == "bad"
+
+    good = Figure()
+    viewers.render_figure(out=output, plot_func=lambda: good, export_state=state, export_plot_name="good")
+    assert displayed[-1] is good
+    assert state["fig"] is good
+
+
+def test_failing_dropdown_entry_leaves_other_entries_renderable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A raising entry shows its failure while another entry of the section still renders."""
+    shown: list[Any] = []
+    monkeypatch.setattr(viewers, "display", shown.append)
+    monkeypatch.setattr(notebook_ui, "display", shown.append)
+    figure = Figure()
+    state: dict[str, Any] = {}
+
+    def failing() -> Figure:
+        message = "entry failed"
+        raise ValueError(message)
+
+    section = notebook_ui.make_dropdown_section(
+        [("Bad", failing, "bad"), ("Good", lambda: figure, "good")],
+        export_state=state,
+        select_first=True,
+    )
+    dropdown = section.children[0]
+    dropdown.value = 0
+    assert "ValueError: entry failed" in shown[-1].data
+    dropdown.value = 1
+    assert shown[-1] is figure
+    assert state["fig"] is figure
+    assert state["plot_name"] == "good"
+
+
+def test_view_selector_has_one_width_in_both_modes() -> None:
+    """The first-entry and prompt dropdowns share the standard selector width."""
+    sections = [
+        notebook_ui.make_dropdown_section([("Good", Figure, "good")], export_state={}, select_first=select_first) for select_first in (True, False)
+    ]
+    widths = {section.children[0].layout.width for section in sections}
+    assert widths == {f"{notebook_ui.STANDARD_VIEW_SELECTOR_WIDTH_PX}px"}
+
+
+def test_control_row_wraps_keeps_child_order_and_spaces_children() -> None:
+    """Every control row wraps, preserves order and gives each child the shared margin."""
+    first = widgets.Dropdown(options=["a"])
+    second = widgets.Checkbox()
+    row = components.ui_control_row(first, second)
+    assert row.children == (first, second)
+    assert row.layout.flex_flow == "row wrap"
+    assert row.layout.width == "100%"
+    assert first.layout.margin == second.layout.margin == "0 12px 6px 0"
+
+
+def test_panel_header_holds_close_export_and_status_without_directory_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shell header is one row of close button, export button and status; no text field exists."""
+    rendered = _open_panel(monkeypatch, {})
+    header = rendered.children[0]
+    close, export, status = header.children
+    assert isinstance(close, widgets.Button)
+    assert close.description == "Close"
+    assert isinstance(export, widgets.Button)
+    assert export.description == "Export PDF"
+    assert isinstance(status, widgets.Output)
+
+    def walk(widget: widgets.Widget) -> list[widgets.Widget]:
+        return [widget, *(item for child in getattr(widget, "children", ()) for item in walk(child))]
+
+    assert not any(isinstance(item, widgets.Text) for item in walk(rendered))
+
+
+def test_export_lands_in_notebooks_folder_with_sanitized_stem_and_never_overwrites(project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use viewer context for the stem; a second export in the same second keeps the first file."""
+    monkeypatch.setattr(notebook_ui, "datetime", _FixedDateTime)
     figure = plt.figure()
     state = {
         "fig": figure,
@@ -91,152 +213,129 @@ def test_export_prefers_sanitized_viewer_stem_and_never_overwrites(tmp_path: Pat
         "filename_stem": "Drying / ID: Case #7",
         "filename_prefix": "ignored-prefix",
     }
-    notebook_ui.make_lazy_panel_with_tabs((widgets.VBox(),), export_state=state, export_dir=str(tmp_path))
-    opener = displayed[-1]
-    assert isinstance(opener, widgets.Button)
-    opener.click()
-    rendered = displayed[-1]
-    assert isinstance(rendered, widgets.VBox)
-    button = _export_button(rendered)
+    button = _export_button(_open_panel(monkeypatch, state))
     button.click()
     button.click()
-    names = sorted(path.name for path in tmp_path.glob("*.pdf"))
-    assert len(names) == 2
-    assert names[0].startswith("drying_id_case_7_")
-    assert names[0] != names[1]
+    assert sorted(path.name for path in (project_root / "notebooks").iterdir()) == [
+        f"drying_id_case_7_{FIXED_TIMESTAMP}.pdf",
+        f"drying_id_case_7_{FIXED_TIMESTAMP}_1.pdf",
+    ]
+    assert sorted(path.name for path in project_root.iterdir()) == ["notebooks"]
     plt.close(figure)
 
 
-def test_export_collision_skips_dangling_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_collision_skips_dangling_symlink(project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A dangling export-name symlink is occupied and cannot redirect PDF writing."""
-
-    class FixedTimestamp:
-        def strftime(self, _format: str) -> str:
-            return "20261015_123000"
-
-    class FixedDateTime:
-        @staticmethod
-        def now(_tz: object) -> FixedTimestamp:
-            return FixedTimestamp()
-
-    monkeypatch.setattr(notebook_ui, "datetime", FixedDateTime)
-    displayed: list[object] = []
-    monkeypatch.setattr(notebook_ui, "display", displayed.append)
-    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
-    allowed = tmp_path / "exports"
-    allowed.mkdir()
-    protected = tmp_path / "immutable-artifacts"
-    protected.mkdir()
-    followed_target = protected / "redirected.pdf"
-    timestamp = FixedTimestamp().strftime("%Y%m%d_%H%M%S")
-    stem = "collision-check"
-    dangling_candidate = allowed / f"{stem}_{timestamp}.pdf"
+    monkeypatch.setattr(notebook_ui, "datetime", _FixedDateTime)
+    folder = project_root / "notebooks"
+    elsewhere = project_root / "elsewhere"
+    elsewhere.mkdir()
+    followed_target = elsewhere / "redirected.pdf"
+    dangling_candidate = folder / f"collision-check_{FIXED_TIMESTAMP}.pdf"
     dangling_candidate.symlink_to(followed_target)
     figure = plt.figure()
-    state = {"fig": figure, "figures": (), "plot_name": stem}
+    _export_button(_open_panel(monkeypatch, {"fig": figure, "figures": (), "plot_name": "collision-check"})).click()
 
-    notebook_ui.make_lazy_panel_with_tabs(
-        (widgets.VBox(),),
-        export_state=state,
-        export_dir=str(allowed),
-        protected_export_roots=(protected,),
-    )
-    opener = displayed[-1]
-    assert isinstance(opener, widgets.Button)
-    opener.click()
-    rendered = displayed[-1]
-    assert isinstance(rendered, widgets.VBox)
-    _export_button(rendered).click()
-
-    exported = allowed / f"{stem}_{timestamp}_1.pdf"
-    assert exported.is_file()
-    assert dangling_candidate.is_symlink()
+    assert (folder / f"collision-check_{FIXED_TIMESTAMP}_1.pdf").is_file()
     assert dangling_candidate.readlink() == followed_target
     assert not followed_target.exists()
-    assert tuple(protected.iterdir()) == ()
     plt.close(figure)
 
 
-def test_export_writes_only_to_explicitly_selected_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Viewing creates no folder; an explicit user-selected folder receives the PDF."""
-    displayed: list[object] = []
-    monkeypatch.setattr(notebook_ui, "display", displayed.append)
-    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
-    requested = tmp_path / "initial-choice"
-    selected = tmp_path / "user-selected"
+def test_export_reserves_final_filename_without_following_new_symlink(project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An output entry appearing after name selection cannot redirect the actual write."""
+    target = project_root / "must-not-exist.pdf"
+    chosen = project_root / "notebooks" / "new-entry.pdf"
+
+    def occupied_after_selection(_directory: Path, **_kwargs: object) -> Path:
+        chosen.symlink_to(target)
+        return chosen
+
+    monkeypatch.setattr(notebook_ui, "_next_export_path", occupied_after_selection)
+    figure = Figure()
+    _export_button(_open_panel(monkeypatch, {"fig": figure})).click()
+    assert chosen.is_symlink()
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("case", ["source_tree", "missing", "symlink"])
+def test_export_refusal_is_visible_and_writes_nothing(
+    case: str, project_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A frozen source tree, a missing notebooks folder and a symlinked one are refused with a message."""
+    folder = project_root / "notebooks"
+    if case == "source_tree":
+        monkeypatch.setattr(notebook_ui.common.paths, "source_tree_id", lambda *_args, **_kwargs: "abc123def456-0123456789ab")
+    elif case == "missing":
+        folder.rmdir()
+    else:
+        folder.rmdir()
+        real = project_root / "real"
+        real.mkdir()
+        folder.symlink_to(real, target_is_directory=True)
+    figure = Figure()
+    _export_button(_open_panel(monkeypatch, {"fig": figure})).click()
+    assert "[Export]" in capsys.readouterr().out
+    assert not any(project_root.rglob("*.pdf"))
+    assert not (folder.exists() and not folder.is_symlink() and any(folder.iterdir()))
+
+
+def test_write_export_uses_suffix_and_removes_file_of_failed_writer(project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shared writer sanitizes the stem and serves other suffixes; a failing writer leaves no file and shows the failure."""
+    shown: list[Any] = []
+    monkeypatch.setattr(viewers, "display", shown.append)
+    folder = project_root / "notebooks"
+
+    def writing(output: Any) -> None:
+        output.write(b"GIF89a")
+
+    notebook_ui.write_export(widgets.Output(), stem="Sample / A", suffix=".gif", write=writing)
+    (written,) = folder.iterdir()
+    assert written.name.startswith("sample_a_")
+    assert written.suffix == ".gif"
+    assert written.read_bytes() == b"GIF89a"
+
+    def failing(_output: object) -> None:
+        message = "encoder failed"
+        raise OSError(message)
+
+    notebook_ui.write_export(widgets.Output(), stem="bad", suffix=".gif", write=failing)
+    assert "OSError: encoder failed" in shown[-1].data
+    assert [path.name for path in folder.iterdir()] == [written.name]
+
+
+def test_write_export_open_failure_leaves_existing_file_untouched(project_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An open error other than an occupied name is shown and never unlinks the chosen path."""
+    shown: list[Any] = []
+    monkeypatch.setattr(viewers, "display", shown.append)
+    foreign = project_root / "notebooks" / "foreign.pdf"
+    foreign.write_bytes(b"keep")
+    monkeypatch.setattr(notebook_ui, "_next_export_path", lambda *_args, **_kwargs: foreign)
+
+    def refuse_open(_path: Path, *_args: object, **_kwargs: object) -> None:
+        message = "open refused"
+        raise PermissionError(message)
+
+    monkeypatch.setattr("pathlib.Path.open", refuse_open)
+    called: list[object] = []
+    notebook_ui.write_export(widgets.Output(), stem="x", suffix=".pdf", write=called.append)
+    assert "PermissionError: open refused" in shown[-1].data
+    assert not called
+    monkeypatch.undo()
+    assert foreign.read_bytes() == b"keep"
+
+
+def test_generation_input_export_uses_the_shared_destination_rule(project_root: Path) -> None:
+    """The generation-input shell exports through the same notebooks-folder writer."""
+    shell = object.__new__(generation_input_panel._GenerationInputPanelShell)
     figure = plt.figure()
-    state: dict[str, object] = {}
-    section = notebook_ui.make_dropdown_section(
-        [("Small figure", lambda: figure, "small_figure")],
-        export_state=state,
-        select_first=True,
-    )
-
-    notebook_ui.make_lazy_panel_with_tabs(
-        (section,),
-        export_state=state,
-        export_dir=str(requested),
-    )
-    assert not requested.exists()
-    opener = displayed[-1]
-    assert isinstance(opener, widgets.Button)
-    opener.click()
-    rendered = displayed[-1]
-    assert isinstance(rendered, widgets.VBox)
-    assert not requested.exists()
-    assert state["fig"] is figure
-
-    directory = _export_directory(rendered)
-    directory.value = str(selected)
-    _export_button(rendered).click()
-
-    assert directory.value == str(selected)
-    assert not requested.exists()
-    pdfs = tuple(selected.glob("*.pdf"))
-    assert len(pdfs) == 1
-    assert pdfs[0].is_file()
+    shell._status_output = widgets.Output()
+    shell._export_state = {"fig": figure, "plot_name": "Input View"}
+    shell._export_current()
+    (written,) = (project_root / "notebooks").iterdir()
+    assert written.name.startswith("input_view_")
+    assert written.suffix == ".pdf"
     plt.close(figure)
-
-
-def test_export_requires_nonblank_directory_and_protects_artifact_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Blank and immutable artifact destinations produce no filesystem writes."""
-    displayed: list[object] = []
-    monkeypatch.setattr(notebook_ui, "display", displayed.append)
-    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
-    state = {"fig": Figure(), "figures": (), "plot_name": "Small figure"}
-    protected = tmp_path / "immutable-artifacts"
-    protected.mkdir()
-    notebook_ui.make_lazy_panel_with_tabs(
-        (widgets.VBox(),),
-        export_state=state,
-        export_dir="",
-        protected_export_roots=(protected,),
-    )
-    opener = displayed[-1]
-    assert isinstance(opener, widgets.Button)
-    opener.click()
-    rendered = displayed[-1]
-    assert isinstance(rendered, widgets.VBox)
-    _export_button(rendered).click()
-    assert tuple(tmp_path.iterdir()) == (protected,)
-
-    directory = _export_directory(rendered)
-    directory.value = str(protected)
-    _export_button(rendered).click()
-    assert tuple(protected.iterdir()) == ()
-
-    requested = protected / "export"
-    directory.value = str(requested)
-    _export_button(rendered).click()
-    assert not requested.exists()
-    assert tuple(protected.iterdir()) == ()
-
-    link = tmp_path / "artifact-link"
-    link.symlink_to(protected, target_is_directory=True)
-    directory.value = str(link / "through-link")
-    _export_button(rendered).click()
-    assert not (link / "through-link").exists()
-    assert tuple(protected.iterdir()) == ()
 
 
 def test_empty_selection_supersedes_inflight_figure_and_export(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -268,7 +367,7 @@ def test_empty_selection_supersedes_inflight_figure_and_export(monkeypatch: pyte
 
 def test_export_stem_uses_prefix_then_generic_fallback() -> None:
     """Keep legacy prefix and generic plot names backward-compatible."""
-    assert notebook_ui._export_stem({"filename_prefix": "Transient \u2013 OOD", "plot_name": "generic"}) == "transient_ood_generic"
+    assert notebook_ui._export_stem({"filename_prefix": "Transient – OOD", "plot_name": "generic"}) == "transient_ood_generic"  # noqa: RUF001
     assert notebook_ui._export_stem({"plot_name": "Generic / Plot"}) == "generic_plot"
 
 
@@ -307,37 +406,3 @@ def test_channel_rebind_and_scope_choices_preserve_selected_meaning() -> None:
     assert detail.children == (aggregate,)
     components.ui_set_scope_detail(detail, tuple(row.children))
     assert detail.children == row.children
-
-
-def test_export_reserves_final_filename_without_following_new_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An output entry appearing after name selection cannot redirect the actual write."""
-    displayed: list[object] = []
-    monkeypatch.setattr(notebook_ui, "display", displayed.append)
-    monkeypatch.setattr(notebook_ui, "clear_output", lambda **_kwargs: None)
-    protected = tmp_path / "immutable"
-    protected.mkdir()
-    target = protected / "must-not-exist.pdf"
-    chosen = tmp_path / "comparison" / "new-entry.pdf"
-
-    def occupied_after_selection(_directory: Path, **_kwargs: object) -> Path:
-        chosen.symlink_to(target)
-        return chosen
-
-    monkeypatch.setattr(notebook_ui, "_next_export_path", occupied_after_selection)
-    figure = Figure()
-    notebook_ui.make_lazy_panel_with_tabs(
-        (widgets.VBox(),),
-        export_state={"fig": figure},
-        export_dir=str(chosen.parent),
-        protected_export_roots=(protected,),
-    )
-    open_button = displayed[-1]
-    assert isinstance(open_button, widgets.Button)
-    open_button.click()
-    panel = displayed[-1]
-    assert isinstance(panel, widgets.VBox)
-    _export_button(panel).click()
-    assert chosen.is_symlink()
-    assert not target.exists()
-    assert tuple(protected.iterdir()) == ()
-    plt.close(figure)

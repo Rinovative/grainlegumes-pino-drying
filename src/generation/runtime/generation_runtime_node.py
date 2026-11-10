@@ -49,7 +49,6 @@ STARTED_RECEIPT_SCHEMA: Final = "generation_node_started_receipt"
 FINISHED_RECEIPT_SCHEMA: Final = "generation_node_finished_receipt"
 NODE_RECORD_SCHEMA: Final = "generation_node"
 NODE_EXIT_SCHEMA: Final = "generation_node_exit"
-SCHEMA_VERSION: Final = 1
 STEP_KIND: Final = "step"
 STOP_KIND: Final = "stop"
 TICKETS_DIRECTORY: Final = "tickets"
@@ -75,7 +74,6 @@ _REMAINING = re.compile(r"(?:(?P<days>[0-9]+)-)?(?:(?P<hours>[0-9]+):)?(?P<minut
 _STEP_KEYS: Final = frozenset(
     {
         "schema",
-        "schema_version",
         "seq",
         "kind",
         "group",
@@ -88,7 +86,7 @@ _STEP_KEYS: Final = frozenset(
         "env",
     }
 )
-_STOP_KEYS: Final = frozenset({"schema", "schema_version", "seq", "kind"})
+_STOP_KEYS: Final = frozenset({"schema", "seq", "kind"})
 _EXIT_CODES: Final = {
     "stop_ticket": 0,
     "cancelled": 0,
@@ -230,7 +228,7 @@ class NodeTicket:
 
     def to_payload(self) -> dict[str, Any]:
         """Return the JSON object a dispatcher publishes for this ticket."""
-        payload: dict[str, Any] = {"schema": TICKET_SCHEMA, "schema_version": SCHEMA_VERSION, "seq": self.seq, "kind": self.kind}
+        payload: dict[str, Any] = {"schema": TICKET_SCHEMA, "seq": self.seq, "kind": self.kind}
         if self.kind == STEP_KIND:
             payload.update(
                 group=self.group,
@@ -250,8 +248,8 @@ class NodeTicket:
         if not isinstance(payload, Mapping):
             message = "A node ticket must be a JSON object."
             raise ValueError(message)  # noqa: TRY004 -- one contract error type for every ticket field
-        if payload.get("schema") != TICKET_SCHEMA or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION):
-            message = f"A node ticket must declare schema {TICKET_SCHEMA!r} version {SCHEMA_VERSION}."
+        if payload.get("schema") != TICKET_SCHEMA:
+            message = f"A node ticket must declare schema {TICKET_SCHEMA!r}."
             raise ValueError(message)
         allowed = _STOP_KEYS if payload.get("kind") == STOP_KIND else _STEP_KEYS
         if set(payload) != allowed:
@@ -415,12 +413,8 @@ def _read_record(path: Path, *, schema: str, seq: int | None = None) -> dict[str
     payload = _read_json_object(path)
     if payload is None:
         return None
-    if (
-        payload.get("schema") != schema
-        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
-        or (seq is not None and payload.get("seq") != seq)
-    ):
-        message = f"Node record {path} does not match schema {schema!r} version {SCHEMA_VERSION}" + ("." if seq is None else f" and seq {seq}.")
+    if payload.get("schema") != schema or (seq is not None and payload.get("seq") != seq):
+        message = f"Node record {path} does not match schema {schema!r}" + ("." if seq is None else f" and seq {seq}.")
         raise ValueError(message)
     return payload
 
@@ -630,7 +624,6 @@ class _NodeWorker:
             destination,
             {
                 "schema": NODE_RECORD_SCHEMA,
-                "schema_version": SCHEMA_VERSION,
                 "job_id": self.job_id,
                 "host": self.host,
                 "cpu_model": read_cpu_model(),
@@ -648,7 +641,6 @@ class _NodeWorker:
                 self.node_directory / NODE_EXIT_FILE,
                 {
                     "schema": NODE_EXIT_SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
                     "job_id": self.job_id,
                     "ended_at": _utc_now(),
                     "reason": self.reason,
@@ -677,7 +669,6 @@ class _NodeWorker:
                 receipt_path(self.node_directory, ticket.seq, "finished"),
                 {
                     "schema": FINISHED_RECEIPT_SCHEMA,
-                    "schema_version": SCHEMA_VERSION,
                     "seq": ticket.seq,
                     "started_at": started_at,
                     "ended_at": _utc_now(),
@@ -869,7 +860,6 @@ class _NodeWorker:
             receipt_path(self.node_directory, ticket.seq, "started"),
             {
                 "schema": STARTED_RECEIPT_SCHEMA,
-                "schema_version": SCHEMA_VERSION,
                 "seq": ticket.seq,
                 "started_at": started_at,
                 "host": self.host,

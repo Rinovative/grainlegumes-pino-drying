@@ -1,35 +1,17 @@
-# Role: Dataset plan: materials, case counts and split of one Dataset. Edit: whenever you define a Dataset.
-# Reduced steady set: lentil and chickpea in distribution, kidney_bean held out as material OOD.
-# Train 800 matches the VP1 training size; validation and ID-test hold 50 cases per material.
+# Role: Dataset plan of the reduced steady set (demo size): lentil and chickpea in distribution, kidney_bean as material OOD. Edit: only to change the demo set.
 schema_kind: dataset_plan
-schema_version: 1
-task: steady_flow  # Learning task this Dataset is built for.
+task: steady_flow
+materials:  # Plan order = name order. Counts per design kind, each a power of two; an OOD material draws from its own test design.
+  lentil: {role: id, train: 512, validation: 64, test: 128}
+  chickpea: {role: id, train: 512, validation: 64, test: 128}
+  kidney_bean: {role: ood, test: 128}
 generation:
-  sources_config: configs/01_generation/physical_model/sources.yaml  # Literature/evidence catalogue used by the referenced physical parameters.
-  registry_config: configs/01_generation/physical_model/registry.yaml  # Registered material/parameter definitions, units and sampling categories.
-  common_config: configs/01_generation/physical_model/common.yaml  # Shared physical constants, grid and physical output schedule defaults.
-  operations_config: configs/01_generation/physical_model/fixed_bed.yaml  # Bed geometry and operating assumptions; this plan does not duplicate them.
-  profile_config: configs/01_generation/physical_model/profiles/steady_flow.yaml  # Steady-flow task/model, exported fields and stationary-solution contract.
-  execution_config: configs/01_generation/execution.yaml  # Slurm resources, concurrency, timeouts and retry policy (not physics).
-  sampling:
-    method: lhs  # Full-design LHS per material. Changing a count creates a different design, not a prefix.
-    seed_base: 9300  # Generation root of the steady task; material, block and candidate seeds derive from it. Independent of the split and training seeds.
-  minimum_success_rate: 0.9  # Per material: failed candidates are replaced (Sobol, after the originals) until the count succeeds; admission stops once the one-sided 95 % upper bound of the success rate falls below this value (the 03.11. smoke solved 8 of 8).
-  domain_profile: reference_range  # Natural/reference physical sampling branches from the maintained configs; a physical domain label, not a train/test or OOD assignment.
-materials:
-  lentil:
-    count: 500  # Original physical design size and selected-success target.
-    role: id  # id splits this material into Train/validation/ID-test below.
-  chickpea:
-    count: 500
-    role: id
-  kidney_bean:
-    count: 150  # Whole material held out; evaluated as OOD, never used for training or selection.
-    role: ood
-split:
-  seed: 9  # Dataset seed; with the Generation design order of the selected cases it alone fixes the split.
-  # Fractions apply separately per ID material: floors int(N*train), int(N*validation), remainder to ID-test.
-  # N=500 gives 400/50/50 per material.
-  train_fraction: 0.8
-  validation_fraction: 0.1
-  id_test_fraction: 0.1
+  seed_base: 9300  # Generation root of the steady task; every design seed derives from it, the material and the design kind.
+  minimum_success_rate: 0.9  # Per material: stop replacing once the one-sided 95 % upper bound of the success rate falls below this value.
+  sources_config: configs/01_generation/physical_model/sources.yaml
+  registry_config: configs/01_generation/physical_model/registry.yaml
+  common_config: configs/01_generation/physical_model/common.yaml
+  operations_config: configs/01_generation/physical_model/fixed_bed.yaml
+  bed_fields_config: configs/01_generation/physical_model/bed_fields.yaml
+  profile_config: configs/01_generation/physical_model/profiles/steady_flow.yaml
+  execution_config: configs/01_generation/execution.yaml

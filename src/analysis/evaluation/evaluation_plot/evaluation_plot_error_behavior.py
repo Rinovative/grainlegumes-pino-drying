@@ -35,6 +35,7 @@ from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 
 if TYPE_CHECKING:
@@ -214,6 +215,7 @@ def plot_predictive_error_distributions(
         figsize=(6.4 * len(datasets), 7.4),
         squeeze=False,
         sharey="row",
+        layout="constrained",
     )
     for column, (dataset_label, frame) in enumerate(datasets.items()):
         count = min(max_cases, len(frame))
@@ -248,13 +250,10 @@ def plot_predictive_error_distributions(
         handles,
         [field.matplotlib_label for field in fields],
         title="Local-error field",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.925),
-        ncol=len(fields),
+        loc="outside right upper",
         frameon=True,
     )
-    figure.subplots_adjust(top=0.80, bottom=0.10, left=0.08, right=0.98, hspace=0.38, wspace=0.22)
-    layout.title_over_axes(figure, title, tuple(axes.flat), y=0.985)
+    layout.title_over_axes(figure, title, tuple(axes.flat))
     return figure
 
 
@@ -329,11 +328,12 @@ def _map_figure(
         full = {
             label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) for label, frame in datasets.items()
         }
+        colorbar_unit = "%" if relative_percent else field.unit
         definition = field_maps.build_field_map(
             np.concatenate([values.ravel() for values in full.values()]),
             semantic=field_maps.FieldMapSemantic.RELATIVE_ERROR if relative_percent else field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
             field=field.key,
-            unit="%" if relative_percent else field.unit,
+            unit=colorbar_unit,
             display_transform=metric_label,
             comparison_scope="selected Evaluation models",
             bound_policy="full selected model/case grids",
@@ -353,7 +353,9 @@ def _map_figure(
             prefix = f"{heading}\n" if row == 0 else ""
             axes[row, column].set_title(f"{prefix}{field.matplotlib_label} {metric_label}", fontsize=11)
             axes[row, column].set_aspect("equal")
-            layout.add_map_colorbar(figure, image, axes[row, column], label="%" if relative_percent else field.unit)
+            layout.add_map_colorbar(
+                figure, image, axes[row, column], label=f"[{field_labels.display_unit(colorbar_unit, quantity_kind='difference')}]"
+            )
     first_summary = summaries[id(next(iter(datasets.values())))]
     layout.apply_map_grid_axis_labels(
         axes,
@@ -388,7 +390,7 @@ def plot_mean_error_maps(
             datasets=datasets,
             max_cases=max_cases,
             attribute="local_relative_error_mean",
-            metric_label="relative error [% of reference RMS]",
+            metric_label="relative error (of reference RMS)",
             title="Mean relative error maps",
             relative_percent=True,
             display_spatial_stride=display_spatial_stride,
@@ -431,7 +433,7 @@ def _plot_normalized_mean_error_maps(
             )
         for column, (label, frame) in enumerate(datasets.items()):
             axis = axes[row, column]
-            axis.set_title(f"{field.matplotlib_label} normalized absolute error [1]" + (f"\n{label}" if row == 0 else ""))
+            axis.set_title(f"{field.matplotlib_label} normalized absolute error" + (f"\n{label}" if row == 0 else ""))
             if reason is not None:
                 axis.text(0.5, 0.5, f"Unavailable: {reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
                 continue
@@ -446,7 +448,7 @@ def _plot_normalized_mean_error_maps(
                 **definition.contourf_kwargs(),
             )
             axis.set_aspect("equal")
-            layout.add_map_colorbar(figure, image, axis, label="1 (train state std; >1 extended)")
+            layout.add_map_colorbar(figure, image, axis, label=f"|e|/s_train [{field_labels.display_unit('1')}]")
     first_summary = summaries[id(next(iter(datasets.values())))]
     layout.apply_map_grid_axis_labels(
         axes,

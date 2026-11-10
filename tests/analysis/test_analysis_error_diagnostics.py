@@ -109,9 +109,31 @@ def test_transient_state_std_is_used_even_for_delta_rms_training_and_derived_is_
     )
     assert isinstance(contradicted, str)
     assert "contradicts" in contradicted
-    derived = diagnostics.transient_reference_scale(state, field="w_gr", unit="1", state_order=("T", "phi"), dataset_identity="train")
+    derived = diagnostics.transient_reference_scale(state, field="X_db", unit="1", state_order=("T", "phi"), dataset_identity="train")
     assert isinstance(derived, str)
     assert "derived" in derived
+
+
+def test_transient_w_gr_scale_needs_the_persisted_grain_moisture_std_and_the_same_identity_checks() -> None:
+    """w_gr is normalized by the saved train scale; older scaling states stay unavailable with their own reason."""
+    state = {"state_std": [2.0, 0.25], "train_membership_digest": "train", "state_names": ["T", "phi"], "grain_moisture_std": 0.05}
+    kwargs = {"field": "w_gr", "unit": "1", "state_order": ("T", "phi"), "dataset_identity": "train"}
+    scale = diagnostics.transient_reference_scale(state, **kwargs)
+    assert isinstance(scale, diagnostics.ReferenceScale)
+    assert scale.source == "saved_run_normalizer.grain_moisture_std"
+    np.testing.assert_allclose(scale.value, 0.05)
+    contradicted = diagnostics.transient_reference_scale(state, **kwargs, expected_scaler_identity="different")
+    assert isinstance(contradicted, str)
+    assert "contradicts" in contradicted
+    foreign = diagnostics.transient_reference_scale({**state, "train_membership_digest": "other"}, **kwargs)
+    assert isinstance(foreign, str)
+    assert "membership" in foreign
+    non_positive = diagnostics.transient_reference_scale({**state, "grain_moisture_std": 0.0}, **kwargs)
+    assert isinstance(non_positive, str)
+    assert "strictly positive" in non_positive
+    older = diagnostics.transient_reference_scale({key: value for key, value in state.items() if key != "grain_moisture_std"}, **kwargs)
+    assert isinstance(older, str)
+    assert "predates the persisted w_gr train scale" in older
 
 
 def test_reference_scale_rejects_non_train_direct_construction_and_field_mismatch() -> None:

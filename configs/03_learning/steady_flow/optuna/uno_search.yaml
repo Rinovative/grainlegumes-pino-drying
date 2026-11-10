@@ -1,17 +1,9 @@
-# Role: steady_flow Optuna study; its experiment section overrides base.yaml. Edit: freely.
-# Supervised UNO hyperparameter search: 30 trials of 300 epochs on validation; copy the selected values into
-# experiments/architecture_comparison/uno_m64x64_h32_l7_s1-05-05-1-1-2-2_r0p495.yaml and the pi-uno_search study.
-#
-# Searches:
-#   - Fourier modes
-#   - hidden channels
-#   - network depth
-#   - continuous mode ratio
-#   - learning rate
-#   - batch size
+# Role: steady_flow Optuna study; its experiment section states only what differs from base.yaml and the U-NO defaults. Edit: freely.
+# Supervised U-NO search: 30 trials of 300 epochs on validation; copy the selected values into experiments/architecture_comparison/uno_m64x64_h32_l7_p0p1_s1-05-05-1-1-2-2_r0p495__lr-0p000532.yaml (renamed with the selected learning rate, `lr`) and the pi-uno_search study.
+
 study:
-  seed: 9  # Seed controlling Optuna sampling/pruning randomness.
   n_trials: 30  # Maximum number of trials requested for the study.
+  seed: 9  # Seed controlling Optuna sampling/pruning randomness.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.
     multivariate: true  # Allow the TPE sampler to model parameter interactions.
@@ -21,60 +13,31 @@ study:
     n_warmup_steps: 60  # Reported objective steps (validated epochs) required before pruning can occur.
     interval_steps: 2  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
 
+# One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
+search_space:
+  model.params.modes_x: {name: modes_x, kind: categorical, values: [32, 48, 64]}
+  model.params.modes_y: {name: modes_y, kind: categorical, values: [32, 48, 64]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [16, 32, 64]}
+  model.params.n_layers: {name: n_layers, kind: categorical, values: [5, 7]}
+  model.params.mode_ratio: {name: mode_ratio, kind: float, low: 0.4, high: 0.6}
+  optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
+  data.batch_size: {name: batch, kind: categorical, values: [16, 32]}
+
 experiment:
-  task: steady_flow  # Selects the task contract and its compatible data/model/loss validation.
-  base: ../base.yaml  # Shared task settings; every value set below overrides them.
   model:
-    kind: uno  # Select the architecture family; its params below are interpreted by that family.
+    kind: uno  # Architecture family; its params below are interpreted by that family.
     params:
-      modes_x: 64  # Fourier modes retained along the x axis.
-      modes_y: 64  # Fourier modes retained along the y axis.
-      hidden_channels: 32  # Width of the model’s hidden feature representation.
-      n_layers: 5  # Number of architecture layers/blocks; affects capacity and compute.
-      mode_ratio: 0.5  # UNO fraction controlling intermediate Fourier-mode allocation.
-  loss:
-    physics:
-      enabled: false  # Enable the physics residual and boundary loss terms.
+      modes_x: 64  # Search base value: Fourier modes along the x axis.
+      modes_y: 64  # Search base value: Fourier modes along the y axis.
+      hidden_channels: 32  # Search base value: width of the hidden feature representation.
+      n_layers: 5  # Search base value: number of U-NO layers; uno_scalings stays unset so each depth uses its default scaling schedule.
+      mode_ratio: 0.5  # Search base value: fraction controlling the intermediate Fourier-mode allocation.
   optimizer:
-    lr: 3.883614530748613e-4  # Initial learning rate; controls the optimizer update scale.
+    lr: 3.883614530748613e-4  # Search base value: initial learning rate.
   training:
     epochs: 300  # Trial epoch budget, shorter than the final run to rank configurations cheaply.
   tracking:
     wandb:
       workflow: optuna_trial  # Workflow label attached to tracking metadata.
-
-search_space:
-  # UNO architecture.
-  model.params.modes_x:
-    name: modes_x  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [32, 48, 64]  # Allowed categorical choices for this parameter.
-  model.params.modes_y:
-    name: modes_y  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [32, 48, 64]  # Allowed categorical choices for this parameter.
-  model.params.hidden_channels:
-    name: hidden_channels  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [16, 32, 64]  # Allowed categorical choices for this parameter.
-  model.params.n_layers:
-    name: n_layers  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [5, 7]  # Allowed categorical choices for this parameter.
-  model.params.mode_ratio:
-    name: mode_ratio  # Readable Optuna parameter name for this configuration path.
-    kind: float  # Distribution type used to sample this parameter.
-    low: 0.4  # Inclusive lower search bound.
-    high: 0.6  # Inclusive upper search bound.
-    log: false  # Sample this range logarithmically when true.
-  # Optimisation.
-  optimizer.lr:
-    name: lr  # Readable Optuna parameter name for this configuration path.
-    kind: float  # Distribution type used to sample this parameter.
-    low: 1.0e-4  # Inclusive lower search bound.
-    high: 1.0e-2  # Inclusive upper search bound.
-    log: true  # Sample this range logarithmically when true.
-  data.batch_size:
-    name: batch  # Readable Optuna parameter name for this configuration path.
-    kind: categorical  # Distribution type used to sample this parameter.
-    values: [16, 32]  # Allowed categorical choices for this parameter.
+  task: steady_flow  # Selects the task contract and its compatible data, model and loss validation.
+  base: ../base.yaml  # Shared task settings; every value set in this section overrides them.

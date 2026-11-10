@@ -46,11 +46,8 @@ if TYPE_CHECKING:
     from src.generation.validation.generation_validation_policy import DiagnosticRecord
 
 ATTEMPT_SCHEMA_KIND: Final = "generation_case_attempt"
-ATTEMPT_SCHEMA_VERSION: Final = 1
 CLEANUP_SCHEMA_KIND: Final = "generation_case_attempt_cleanup"
-CLEANUP_SCHEMA_VERSION: Final = 1
 LICENSE_COMPACTION_SCHEMA_KIND: Final = "generation_license_attempt_compaction"
-LICENSE_COMPACTION_SCHEMA_VERSION: Final = 1
 _CASE_STATES: Final = frozenset(
     {
         "failed",
@@ -94,7 +91,6 @@ _STAGE_STATE_KEYS: Final = (
 _ATTEMPT_RECEIPT_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "campaign_purpose",
         "batch_storage_name",
@@ -148,7 +144,6 @@ _ATTEMPT_RECEIPT_KEYS: Final = frozenset(
 _CLEANUP_RECEIPT_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "case_id",
         "attempt_index",
@@ -161,7 +156,6 @@ _CLEANUP_RECEIPT_KEYS: Final = frozenset(
 _LICENSE_COMPACTION_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "status",
         "campaign_run_id",
         "batch_id",
@@ -687,7 +681,6 @@ def publish_case_attempt(
         stage_states = derive_stage_states(case_state, failure_stage)
         receipt = {
             "schema_kind": ATTEMPT_SCHEMA_KIND,
-            "schema_version": ATTEMPT_SCHEMA_VERSION,
             "campaign_run_id": campaign_run_id,
             "campaign_purpose": purpose,
             "batch_storage_name": config.batch_storage_name,
@@ -780,7 +773,7 @@ def _optional_nonnegative_number(value: Any) -> bool:
 
 
 def _validate_quality_flags(value: Any, *, path: Path) -> None:
-    """Admit complete version-1 advisory diagnostic records."""
+    """Admit complete advisory diagnostic records."""
     if not isinstance(value, list):
         message = f"Attempt quality flags are invalid: {path}"
         raise TypeError(message)
@@ -814,13 +807,12 @@ def _valid_previous_attempt_reference(value: Any, *, attempt_index: int) -> bool
 
 
 def _validate_attempt_receipt(payload: dict[str, Any], *, path: Path) -> None:
-    """Admit the complete exact version-1 attempt receipt header."""
+    """Admit the complete exact attempt receipt header."""
     case_state = payload.get("case_state")
     failure_stage = payload.get("failure_stage")
     if (
         set(payload) != _ATTEMPT_RECEIPT_KEYS
         or payload.get("schema_kind") != ATTEMPT_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), ATTEMPT_SCHEMA_VERSION)
         or case_state not in _CASE_STATES
         or failure_stage not in _FAILURE_STAGES
     ):
@@ -946,7 +938,7 @@ def _validate_cleanup_audit(
     *,
     attempt_payload: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Admit an optional exact version-1 scratch-cleanup audit."""
+    """Admit an optional exact scratch-cleanup audit."""
     path = directory / "cleanup.json"
     if not path.exists():
         return None
@@ -954,7 +946,6 @@ def _validate_cleanup_audit(
     if (
         set(payload) != _CLEANUP_RECEIPT_KEYS
         or payload.get("schema_kind") != CLEANUP_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), CLEANUP_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
         or payload.get("case_id") != attempt_payload["case_id"]
         or payload.get("attempt_index") != attempt_payload["attempt_index"]
@@ -984,7 +975,6 @@ def _license_compaction_audit(
     if (
         set(payload) != _LICENSE_COMPACTION_KEYS
         or payload.get("schema_kind") != LICENSE_COMPACTION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), LICENSE_COMPACTION_SCHEMA_VERSION)
         or payload.get("status") not in {"pending", "complete"}
         or payload.get("campaign_run_id") != attempt_payload["campaign_run_id"]
         or payload.get("batch_id") != attempt_payload["batch_id"]
@@ -1201,7 +1191,6 @@ def compact_license_only_attempt_payload(
     reclaimed_bytes = sum(int(identity["size_bytes"]) for identity in removed_inventory.values())
     audit = {
         "schema_kind": LICENSE_COMPACTION_SCHEMA_KIND,
-        "schema_version": LICENSE_COMPACTION_SCHEMA_VERSION,
         "status": "pending",
         "campaign_run_id": campaign_run_id,
         "batch_id": config.batch_id,
@@ -1285,7 +1274,6 @@ def record_attempt_cleanup(
     target = attempt.directory / "cleanup.json"
     receipt = {
         "schema_kind": CLEANUP_SCHEMA_KIND,
-        "schema_version": CLEANUP_SCHEMA_VERSION,
         "campaign_run_id": attempt.payload["campaign_run_id"],
         "case_id": attempt.payload["case_id"],
         "attempt_index": attempt.payload["attempt_index"],

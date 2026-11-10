@@ -39,14 +39,12 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 CASE_SCHEMA_KIND = "generation_source_case"
-CASE_SCHEMA_VERSION = 1
 _TABLE_RANK = 2
 
 
 _CASE_PAYLOAD_REQUIRED_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "simulation_profile",
         "batch_id",
         "batch_identity",
@@ -54,7 +52,6 @@ _CASE_PAYLOAD_REQUIRED_KEYS: Final = frozenset(
         "case_input_config_digest",
         "case_id",
         "case_index",
-        "generator_version",
         "git_commit",
         "material_family",
         "domain_profile",
@@ -86,8 +83,6 @@ _CASE_PAYLOAD_OPTIONAL_KEYS: Final = frozenset({"schedule_diagnostics", "scalar_
 CASE_CONTRACT_DIGEST: Final = common.serialization.canonical_json_sha256(
     {
         "schema_kind": CASE_SCHEMA_KIND,
-        "schema_version": CASE_SCHEMA_VERSION,
-        "generator_version": seeding.GENERATOR_VERSION,
         "required_case_fields": sorted(_CASE_PAYLOAD_REQUIRED_KEYS),
         "optional_case_fields": sorted(_CASE_PAYLOAD_OPTIONAL_KEYS),
         "transient_only_case_fields": ["scalar_handoff", "scalars", "schedule_diagnostics"],
@@ -112,8 +107,8 @@ def validate_case_payload_schema(payload: dict[str, Any]) -> None:
     if missing or unknown:
         msg = f"case.json schema is invalid: missing={missing}, unknown={unknown}."
         raise ValueError(msg)
-    if payload["schema_kind"] != CASE_SCHEMA_KIND or not common.serialization.is_schema_version(payload["schema_version"], CASE_SCHEMA_VERSION):
-        msg = "case.json schema kind or version is invalid."
+    if payload["schema_kind"] != CASE_SCHEMA_KIND:
+        msg = "case.json schema kind is invalid."
         raise ValueError(msg)
     profile = payload["simulation_profile"]
     profiles.resolve_profile(profile)
@@ -133,7 +128,6 @@ def compute_case_input_id(payload: dict[str, Any]) -> str:
     """Compute the exact generated-input identity from persisted evidence."""
     try:
         identity_payload = {
-            "schema_version": payload["schema_version"],
             "case_input_config_digest": payload["case_input_config_digest"],
             "material_family": payload["material_family"],
             "sampling_regime": payload["sampling_regime"],
@@ -155,7 +149,6 @@ def compute_simulation_case_id(payload: dict[str, Any]) -> str:
     """Compute the profile-, template-, and export-bound simulation identity."""
     try:
         identity_payload = {
-            "schema_version": payload["schema_version"],
             "case_input_id": payload["case_input_id"],
             "simulation_profile": payload["simulation_profile"],
             "template_sha256": payload["template"]["sha256"],
@@ -423,12 +416,11 @@ def generate_case_input_bundle(
             "case_ordinal": case_index,
         },
         "subseed_origins": dict.fromkeys(subseeds, "profile_case"),
-        "derivation": ("sha256(generator_version|seed_namespace|semantic_labels)"),
+        "derivation": "sha256(seed_base|semantic_labels)",
         "subseeds": subseeds,
     }
     case_payload: dict[str, Any] = {
         "schema_kind": CASE_SCHEMA_KIND,
-        "schema_version": CASE_SCHEMA_VERSION,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -436,7 +428,6 @@ def generate_case_input_bundle(
         "case_input_config_digest": config.case_input_config_digest,
         "case_id": case_id,
         "case_index": case_index,
-        "generator_version": seeding.GENERATOR_VERSION,
         "git_commit": source_service.required_git_commit(),
         "material_family": assignment["material_family"],
         "domain_profile": config.scientific_values["domain_profile"],

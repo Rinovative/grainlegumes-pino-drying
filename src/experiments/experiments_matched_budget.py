@@ -31,7 +31,6 @@ from . import experiments_run_identity as run_identity
 
 RECEIPT_NAME = "b_train_budget_receipt.json"
 _SCHEMA_KIND = "matched_a1_b_train_budget"
-_SCHEMA_VERSION = 1
 _SHA256_LENGTH = 64
 _PROTOCOL_MATCHED = "matched_a1_b"
 _CLOCK_SECONDS = "train_seconds"
@@ -70,7 +69,6 @@ def build_b_receipt(
         raise ValueError(msg)
     payload = {
         "schema_kind": _SCHEMA_KIND,
-        "schema_version": _SCHEMA_VERSION,
         "protocol": _PROTOCOL_MATCHED,
         "clock_kind": _CLOCK_SECONDS,
         "budget_value": train_seconds,
@@ -99,11 +97,13 @@ def build_b_receipt(
 
 def validate_b_receipt(value: object) -> dict[str, Any]:
     """Validate an immutable receipt without opening training artifacts."""
-    if not isinstance(value, dict) or not common.serialization.is_schema_version(value.get("schema_version"), _SCHEMA_VERSION):
-        msg = "B train budget receipt schema is unsupported."
-        raise ValueError(msg)
-    if value.get("schema_kind") != _SCHEMA_KIND or value.get("protocol") != _PROTOCOL_MATCHED or value.get("clock_kind") != _CLOCK_SECONDS:
-        msg = "B train budget receipt protocol or clock is unsupported."
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_kind") != _SCHEMA_KIND
+        or value.get("protocol") != _PROTOCOL_MATCHED
+        or value.get("clock_kind") != _CLOCK_SECONDS
+    ):
+        msg = "B train budget receipt schema, protocol or clock is unsupported."
         raise ValueError(msg)
     payload = dict(value)
     digest = payload.pop("receipt_sha256", None)

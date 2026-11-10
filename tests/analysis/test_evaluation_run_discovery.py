@@ -13,6 +13,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -80,10 +81,13 @@ def _write_run(
         "task": task,
         "run": {"name": name, "seed": seed, "layout": layout},
         "paths": {"output_root": str(root)},
-        "model": {"kind": "fno", "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1}},
+        "model": {
+            "kind": "fno",
+            "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1, "positional_embedding": None, "domain_padding": 0.1},
+        },
         "data": {
             "train_dataset": "dataset-id",
-            "additional_evaluation_datasets": [],  # The additional role comes from the saved split, never from these ids.
+            "material_ood_datasets": [],  # The OOD roles come from the saved split, never from these ids.
         },
     }
     if evaluation is not None:
@@ -98,12 +102,12 @@ def _write_run(
     (run_dir / "summary.json").write_text(
         json.dumps(
             {
-                "schema_version": 1,
                 "task": task,
                 "run_name": name,
                 "status": status,
                 "updated_at": updated_at,
                 "effective_config_digest": "e" * 64,
+                "best_checkpoint_sha256": hashlib.sha256(b"best").hexdigest(),
                 "config_sha256": common.serialization.file_sha256(run_dir / "config.yaml"),
                 "checkpoint_identity": {"resume_contract_digest": identity.resolved_config_digest(config)},
                 "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(config)},
@@ -113,10 +117,10 @@ def _write_run(
     )
     (run_dir / "best_checkpoint.pt").write_bytes(b"best")
     if split:
-        payload = synthetic_split_payload(task, train_dataset="dataset-id", additional=(("dataset-ood", ("chickpea__case_0001__00000000000a",)),))
+        payload = synthetic_split_payload(task, train_dataset="dataset-id", material_ood=(("dataset-ood", ("chickpea__case_0001__00000000000a",)),))
         common.serialization.atomic_torch_save(payload, common.paths.resolve_split_indices_path(run_dir))
     if artifact:
-        second_root = run_dir / "analysis" / "additional_evaluation" / "dataset-ood"
+        second_root = run_dir / "analysis" / "material_ood" / "dataset-ood"
         for artifact_root in (run_dir / "analysis" / "id", second_root):
             artifact_root.mkdir(parents=True)
             (artifact_root / "cases.parquet").write_bytes(b"parquet")
@@ -124,12 +128,6 @@ def _write_run(
             payload_root.mkdir()
             (payload_root / "case-0.npz").write_bytes(b"npz")
             marker = {
-                "provenance_schema_version": artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-                "artifact_schema_version": (
-                    discovery.transient_artifact.TRANSIENT_SEQUENCE_SCHEMA_VERSION
-                    if task == "transient_drying"
-                    else artifact_contracts.ARTIFACT_SCHEMA_VERSION
-                ),
                 "artifact_kind": discovery.transient_artifact.TRANSIENT_ARTIFACT_KIND if task == "transient_drying" else "steady_artifact",
                 "task": task,
                 "run": {"task": task},
@@ -156,8 +154,6 @@ def _write_scoped_artifact(
     (payload_root / "case-0.npz").write_bytes(b"npz")
     selected = ["transient_drying__chickpea__natural__case_0001"]
     marker = {
-        "provenance_schema_version": artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": discovery.transient_artifact.TRANSIENT_SEQUENCE_SCHEMA_VERSION,
         "artifact_kind": discovery.transient_artifact.TRANSIENT_ARTIFACT_KIND,
         "task": "transient_drying",
         "run": {
@@ -205,7 +201,6 @@ def _write_parent(
         }
     payload = {
         "schema_kind": identity.EXPERIMENT_RECORD_SCHEMA_KIND,
-        "schema_version": identity.EXPERIMENT_RECORD_SCHEMA_VERSION,
         "topology": "a0_to_b_and_a1",
         "task": "transient_drying",
         "parent_label": label,
@@ -233,21 +228,13 @@ def _write_parent(
     return record["parent_identity_sha256"]
 
 
-def test_dataset_display_projection_preserves_authored_readable_name() -> None:
+def test_dataset_binding_label_preserves_authored_readable_name() -> None:
     """Do not parse or strip a readable Dataset name into guessed scientific identity."""
     id_dataset = "lentil_chickpea_four_hour"
     additional_dataset = "kidney_bean_four_hour"
 
     assert (
-        discovery.dataset_display_projection(
-            "transient_drying",
-            id_dataset,
-        )
-        == "lentil_chickpea_four_hour"
-    )
-    assert (
         workspace._EvaluationWorkspaceController._dataset_binding_label(
-            task="transient_drying",
             dataset_name=id_dataset,
             role="id",
         )
@@ -255,12 +242,11 @@ def test_dataset_display_projection_preserves_authored_readable_name() -> None:
     )
     assert (
         workspace._EvaluationWorkspaceController._dataset_binding_label(
-            task="transient_drying",
             dataset_name=additional_dataset,
-            role="additional_evaluation",
-            declared_role="ood",
+            role="material_ood",
+            declared_role="material_ood",
         )
-        == "kidney_bean_four_hour · OOD"
+        == "kidney_bean_four_hour · Material OOD"
     )
 
 
@@ -313,20 +299,6 @@ def test_failed_runs_remain_visible_and_artifacts_report_missing_or_available(
     )
 
 
-def test_marker_with_boolean_artifact_schema_version_is_invalid(tmp_path: Path) -> None:
-    """Report a marker whose artifact schema version is JSON true as invalid, as the artifact loader refuses it."""
-    run_dir = _write_run(tmp_path, leaf="edited", artifact=True)
-    marker_path = run_dir / "analysis" / "id" / "artifact_provenance.json"
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker["artifact_schema_version"] = True
-    marker_path.write_text(json.dumps(marker), encoding="utf-8")
-
-    catalog = discovery.discover_evaluation_runs(tmp_path)
-
-    record = next(item for item in catalog.runs if item.run_dir == run_dir.resolve())
-    assert record.id_artifact.state == "invalid"
-
-
 def test_marker_discovery_does_not_hash_numerical_payloads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -348,8 +320,8 @@ def test_marker_discovery_does_not_hash_numerical_payloads(
     record = next(item for item in catalog.runs if item.run_dir == run_dir.resolve())
     assert record.id_artifact is not None
     assert record.id_artifact.state == "ready"
-    assert record.additional_artifact is not None
-    assert record.additional_artifact.state == "ready"
+    assert record.ood_artifacts["material_ood"] is not None
+    assert record.ood_artifacts["material_ood"].state == "ready"
     assert record.id_artifact.digest is not None
 
 
@@ -492,11 +464,11 @@ def test_run_overview_uses_material_first_roles_and_shared_protocol_labels(
     controller = workspace._EvaluationWorkspaceController.__new__(workspace._EvaluationWorkspaceController)
     html = controller._status_html(
         record,
-        selected_roles=("id", "additional_evaluation"),
+        selected_roles=("id", "material_ood"),
         material_coverage=(
             ("lentil", "id", "id"),
             ("chickpea", "id", "id"),
-            ("kidney_bean", "ood", "additional_evaluation"),
+            ("kidney_bean", "ood", "material_ood"),
         ),
     )
 
@@ -590,7 +562,7 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     controller.run.value = controller.run.value
     assert len(scans) == 1
     assert controller.run.options
-    assert "ID · missing; Additional evaluation · missing" in controller.status.value
+    assert "ID · missing; Material OOD · missing" in controller.status.value
     assert "slurm_ml.sh" in controller.status.value
     assert "artifacts --run-dir" in controller.status.value
     assert "--one-case" not in controller.status.value
@@ -1039,8 +1011,8 @@ def test_evaluation_notebooks_execute_without_hardcoded_run_lists(
     monkeypatch.setattr(IPython.display, "display", lambda _value: None)
     repository_root = Path(__file__).resolve().parents[2]
     for relative in (
-        "notebooks/04_eval_single_model.ipynb",
-        "notebooks/05_eval_comparison_models.ipynb",
+        "notebooks/05_eval_single_model.ipynb",
+        "notebooks/06_eval_comparison_models.ipynb",
     ):
         notebook = json.loads((repository_root / relative).read_text(encoding="utf-8"))
         source = "\n".join("".join(cell.get("source", ())) for cell in notebook["cells"] if cell["cell_type"] == "code")
@@ -1076,14 +1048,7 @@ def test_optuna_trials_are_skipped_by_recorded_layout_without_hashing_their_chec
     normal = _write_run(experiments_root, leaf="normal")
     study_root = common.paths.resolve_study_dir("transient_drying", "dataset-id", "fno_study", 3, output_root=experiments_root)
     assert kept.parent == removed.parent == study_root / "trials"
-    hashed: list[Path] = []
-    original = common.serialization.file_sha256
-
-    def counted(value: Path | str) -> str:
-        hashed.append(Path(value))
-        return original(value)
-
-    monkeypatch.setattr(common.serialization, "file_sha256", counted)
+    _forbid_checkpoint_hashing(monkeypatch)
 
     from_experiments = discovery.discover_evaluation_runs(experiments_root)
     from_study = discovery.discover_evaluation_runs(study_root)
@@ -1091,7 +1056,6 @@ def test_optuna_trials_are_skipped_by_recorded_layout_without_hashing_their_chec
     assert [run.run_dir for run in from_experiments.runs] == [normal.resolve()]
     assert from_study.runs == ()
     assert from_experiments.issues == from_study.issues == ()
-    assert hashed == [normal.resolve() / "best_checkpoint.pt"]
 
 
 def test_normal_run_without_best_checkpoint_stays_listed_but_not_evaluable(tmp_path: Path) -> None:
@@ -1107,48 +1071,60 @@ def test_normal_run_without_best_checkpoint_stays_listed_but_not_evaluable(tmp_p
     assert not record.action_enabled
 
 
-def test_discovery_hashes_each_checkpoint_once_per_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Reuse a checkpoint digest across repeated discovery runs."""
-    run_dir = _write_run(tmp_path, leaf="hashed-once")
-    monkeypatch.setattr(artifact_contracts, "_FILE_DIGESTS", {})
-    hashed: list[Path] = []
-    original = common.serialization.file_sha256
+def _forbid_checkpoint_hashing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any file hashing during discovery fail the test."""
 
-    def counted(value: Path | str) -> str:
-        hashed.append(Path(value))
-        return original(value)
+    def refuse(value: Path | str) -> str:
+        msg = f"discovery must not hash {value}"
+        raise AssertionError(msg)
 
-    monkeypatch.setattr(common.serialization, "file_sha256", counted)
-
-    digests = {discovery.discover_evaluation_runs(tmp_path).runs[0].checkpoints.best_digest for _ in range(2)}
-    assert hashed == [run_dir.resolve() / "best_checkpoint.pt"]
-    assert len(digests) == 1
+    monkeypatch.setattr(common.serialization, "file_sha256", refuse)
+    monkeypatch.setattr(common.serialization, "cached_file_sha256", refuse)
 
 
-def test_comparison_export_uses_authoritative_common_experiment_without_writing(tmp_path: Path) -> None:
-    """Default to one selected experiment and require a choice across experiments."""
+def test_discovery_reads_no_checkpoint_bytes_and_exposes_the_recorded_best_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the best digest from the summary and leave byte verification to selection."""
+    _write_run(tmp_path, leaf="recorded")
+    _forbid_checkpoint_hashing(monkeypatch)
+
+    record = discovery.discover_evaluation_runs(tmp_path).runs[0]
+
+    assert record.checkpoints.best_digest == hashlib.sha256(b"best").hexdigest()
+    assert record.evaluable
+
+
+@pytest.mark.parametrize("recorded", [None, "", "A" * 64, "a" * 63, 7])
+def test_missing_or_malformed_recorded_best_digest_makes_the_run_not_evaluable(tmp_path: Path, recorded: object) -> None:
+    """Fail closed when the summary carries no lowercase 64-hex best digest."""
+    run_dir = _write_run(tmp_path, leaf="unrecorded")
+    summary_path = run_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["best_checkpoint_sha256"] = recorded
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    record = discovery.discover_evaluation_runs(tmp_path).runs[0]
+
+    assert record.checkpoints.best_digest is None
+    assert not record.evaluable
+    assert not record.action_enabled
+
+
+def test_comparison_labels_carry_seed(tmp_path: Path) -> None:
+    """Label runs of one experiment by seed."""
     _write_run(tmp_path, leaf="first", family="shared", seed=17)
     _write_run(tmp_path, leaf="second", family="shared", seed=18)
-    _write_run(tmp_path, leaf="other", family="other", seed=17)
     runs = discovery.discover_evaluation_runs(tmp_path).runs
     shared_dir = tmp_path / "transient_drying" / "dataset-id" / "shared"
-    shared = tuple(run for run in runs if run.experiment_dir == shared_dir)
+    shared = tuple(run for run in runs if shared_dir in run.run_dir.parents)
     assert len(shared) == 2
-    controller = object.__new__(workspace._EvaluationWorkspaceController)
-    controller.comparison_output_dir = None
-    assert controller._comparison_export_dir(shared) == shared_dir / "comparison"
     assert {run.seed for run in shared} == {17, 18}
-    assert all("seed " in controller._comparison_label(run) for run in shared)
-    assert controller._comparison_export_dir(runs) is None
-    chosen = tmp_path / "chosen-comparison"
-    controller.comparison_output_dir = chosen
-    assert controller._comparison_export_dir(runs) == chosen
-    assert not chosen.exists()
-    assert not (shared_dir / "comparison").exists()
+    labels = workspace._run_labels(shared)
+    assert all("seed " in label for label in labels)
+    assert len(set(labels)) == 2
 
 
-def test_additional_role_follows_the_saved_split_and_an_absent_split_has_none(tmp_path: Path) -> None:
-    """Name the additional artifact folder from the saved split, not config ids, and give a run without a split no role and no issue."""
+def test_ood_role_follows_the_saved_split_and_an_absent_split_has_none(tmp_path: Path) -> None:
+    """Name the material-OOD artifact folder from the saved split, not config ids, and give a run without a split no role and no issue."""
     with_split = _write_run(tmp_path, leaf="with-split", artifact=True)
     without_split = _write_run(tmp_path, leaf="without-split", split=False)
 
@@ -1156,15 +1132,15 @@ def test_additional_role_follows_the_saved_split_and_an_absent_split_has_none(tm
 
     by_dir = {run.run_dir: run for run in catalog.runs}
     split_run = by_dir[with_split.resolve()]
-    assert split_run.additional_dataset_ids == ("dataset-ood",)
-    assert [item["dataset_id"] for item in split_run.evaluation_assignments] == ["dataset-ood"]
-    assert split_run.additional_artifact is not None
-    assert split_run.additional_artifact.root == with_split.resolve() / "analysis" / "additional_evaluation" / "dataset-ood"
-    assert split_run.additional_artifact.state == "ready"
+    assert split_run.ood_dataset_ids == {"material_ood": ("dataset-ood",)}
+    assert [item["dataset_id"] for item in split_run.evaluation_assignments["material_ood"]] == ["dataset-ood"]
+    assert split_run.ood_artifacts["material_ood"] is not None
+    assert split_run.ood_artifacts["material_ood"].root == with_split.resolve() / "analysis" / "material_ood" / "dataset-ood"
+    assert split_run.ood_artifacts["material_ood"].state == "ready"
     bare_run = by_dir[without_split.resolve()]
-    assert bare_run.additional_dataset_ids == ()
-    assert bare_run.evaluation_assignments == ()
-    assert bare_run.additional_artifact is None
+    assert bare_run.ood_dataset_ids == {}
+    assert bare_run.evaluation_assignments == {}
+    assert bare_run.ood_artifacts == {}
     assert catalog.issues == ()
 
 
@@ -1180,7 +1156,7 @@ def test_unreadable_saved_split_remains_visible_and_disables_actions(tmp_path: P
     assert run.run_dir == run_dir
     assert run.metadata_issues
     assert run.metadata_issues[0].startswith("Saved split unavailable: ValueError")
-    assert run.additional_artifact is None
+    assert run.ood_artifacts == {}
     assert not run.action_enabled  # The ID artifact is ready; only the unreadable split blocks the action.
     assert any("Saved split unavailable" in issue.reason for issue in catalog.issues)
 
@@ -1193,7 +1169,6 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
     def prepare(run_dirs: tuple[Path, ...], **kwargs: Any) -> Any:
         labels = kwargs["labels"]
         assert len(set(labels)) == len(labels) == 2
-        assert kwargs["export_dir"] is None
         calls.append((run_dirs, labels))
         return type("SavedComparison", (), {"panel": widgets.Label("saved comparison"), "close": lambda _self: None})()
 
@@ -1203,7 +1178,7 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
     selected, labels = calls[-1]
     assert set(selected) == set(paths)
     for path, label in zip(selected, labels, strict=True):
-        assert path.relative_to(tmp_path).parts[2] in label
+        assert path.relative_to(tmp_path).parts[2].split("-")[0] in label
         assert "fno_m2x2_h4_l1" in label
         assert "seed 17" in label
     controller = prepared._controller
@@ -1213,8 +1188,8 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
     prepared.close()
 
 
-def test_relocated_current_single_bundle_has_no_guessed_experiment_export_root(tmp_path: Path) -> None:
-    """Keep standalone current metadata navigable without inferring its prior experiment location."""
+def test_relocated_current_single_bundle_stays_discoverable(tmp_path: Path) -> None:
+    """Keep standalone current metadata navigable after the bundle left its authored location."""
     original = _write_run(tmp_path, leaf="authored-experiment")
     moved = tmp_path / "relocated-single"
     original.rename(moved)
@@ -1222,8 +1197,4 @@ def test_relocated_current_single_bundle_has_no_guessed_experiment_export_root(t
     assert len(catalog.runs) == 1
     run = catalog.runs[0]
     assert run.run_dir == moved
-    assert run.experiment_dir is None
     assert run.config_label == "authored-experiment/fno_m2x2_h4_l1"
-    controller = object.__new__(workspace._EvaluationWorkspaceController)
-    controller.comparison_output_dir = None
-    assert controller._comparison_export_dir((run,)) is None

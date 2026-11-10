@@ -1,4 +1,4 @@
-"""Verify physics-diagnostic decompositions, variants, perturbations, and balance closures.
+"""Verify component checks: membership, residual diagnostics, derivatives, spectra, strides, increments, timing, and criteria.
 
 Responsibilities:
   - Bind steady per-case reductions and the term decomposition to the domain residual
@@ -6,18 +6,25 @@ Responsibilities:
   - Check float64 coordinate rebuilding, boundary bands, edge profiles, and perturbations
   - Check transient field integrals, global and sorption closures, and validity counts
   - Check the physics-setting inventory of authored steady configurations
+  - Check the Train/validation membership filter, its refusal of test and OOD roles, and that
+    only selected cases reach the steady reference, transient cases, balances, and scaling fit
+  - Check manufactured-field derivative errors, mode truncation, stride views, increment statistics, timing rows, and criteria
 
 Design principles:
   - Small synthetic grids with analytic answers; no published Datasets or solvers
+  - Dataset runtimes are replaced by recording stand-ins at the factory boundary
 
 This module does NOT:
   - Re-test domain derivative operators or Brinkman equations covered in tests/domain
+  - Measure real timings or real reference fields
 """
 
 from __future__ import annotations
 
 import dataclasses
 import math
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import matplotlib as mpl
@@ -25,18 +32,23 @@ import matplotlib as mpl
 mpl.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import yaml
 
-from src import common, domain, experiments, generation
-from src.analysis.physics_diagnostics import physics_diagnostics_plots as plots
-from src.analysis.physics_diagnostics import physics_diagnostics_sources as sources
-from src.analysis.physics_diagnostics import physics_diagnostics_steady as steady
-from src.analysis.physics_diagnostics import physics_diagnostics_transient as transient
+from src import common, datasets, domain, experiments, generation
+from src.analysis.component_checks import component_checks_increments as increments
+from src.analysis.component_checks import component_checks_plots as plots
+from src.analysis.component_checks import component_checks_sources as sources
+from src.analysis.component_checks import component_checks_spectral as spectral
+from src.analysis.component_checks import component_checks_steady as steady
+from src.analysis.component_checks import component_checks_summary as summary
+from src.analysis.component_checks import component_checks_timing as timing
+from src.analysis.component_checks import component_checks_transient as transient
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterator
 
 _VISCOSITY = domain.physics.brinkman.AIR_DYNAMIC_VISCOSITY
 _INLET_PRESSURE = 3.0
@@ -68,6 +80,7 @@ def _reference(height: int = 12, width: int = 16, *, cases: int = 2) -> sources.
     outputs = torch.stack([by_output[name] for name in task.output_names]).expand(cases, -1, -1, -1).clone()
     return sources.SteadyReference(
         dataset_id="synthetic",
+        membership="train",
         case_ids=tuple(f"lentil__case_{index:04d}__digest" for index in range(cases)),
         material_families=("lentil",) * cases,
         input_fields=tuple(task.input_names),
@@ -84,6 +97,7 @@ def _with_outputs(reference: sources.SteadyReference, **fields: torch.Tensor) ->
         outputs[:, reference.output_fields.index(name)] = value
     return sources.SteadyReference(
         dataset_id=reference.dataset_id,
+        membership=reference.membership,
         case_ids=reference.case_ids,
         material_families=reference.material_families,
         input_fields=reference.input_fields,
@@ -254,6 +268,7 @@ def _transient_case(*, phi: float = 0.5, steps: int = 3) -> sources.TransientRef
         dataset_id="synthetic",
         case_id="lentil__case_0001__digest",
         material_family="lentil",
+        membership="train",
         time_hours=times,
         states=states,
         static={
@@ -464,3 +479,266 @@ def test_changed_source_is_refused_with_the_dataset_admission_message(tmp_path: 
     path.write_bytes(b"changed after admission")
     with pytest.raises(ValueError, match=r"^Source HDF5 changed after Dataset admission: "):
         sources._read_source_balances(path, expected_sha256=expected_sha256, admitted_stat=admitted_stat)
+
+
+def test_membership_filter_resolves_roles_before_the_case_limit_and_refuses_test_and_ood() -> None:
+    """Train and validation resolve in stored order and are cut after filtering; test, OOD, unknown and absent roles fail closed."""
+    partition = {"train": ["t1", "t2", "t3"], "validation": ["v1"], "id_test": ["e1"], "parameter_ood": ["p1"], "ood": ["o1"]}
+    assert sources.select_membership_cases(partition, "train", dataset_id="d", max_cases=2) == ("t1", "t2")
+    assert sources.select_membership_cases(partition, "validation", dataset_id="d", max_cases=4) == ("v1",)
+    for role in ("id_test", "ood", "material_ood", "unknown"):
+        with pytest.raises(ValueError, match="test and OOD cases stay unseen"):
+            sources.select_membership_cases(partition, role, dataset_id="d")
+    for absent in (None, {**partition, "validation": []}):
+        with pytest.raises(ValueError, match="has no validation membership"):
+            sources.select_membership_cases(absent, "validation", dataset_id="d")
+
+
+_PARTITION_IDS: dict[str, list[str]] = {
+    role: [f"lentil__case_{role}{index}__digest" for index in range(count)] for role, count in (("train", 3), ("validation", 2), ("id_test", 1))
+}
+_STORED_IDS = tuple(case_id for role in ("validation", "train", "id_test") for case_id in _PARTITION_IDS[role])
+
+
+def test_steady_reference_reads_only_the_leading_membership_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the first two Train cases are read from the Dataset; validation and test rows stay unread."""
+    reference = _reference(cases=len(_STORED_IDS))
+    read: list[str] = []
+
+    class FakeSteady:
+        manifest_binding = SimpleNamespace(case_partition=_PARTITION_IDS)
+        identity = SimpleNamespace(dataset_id="synthetic", sample_ids=_STORED_IDS)
+
+        def __getitem__(self, index: int) -> dict[str, object]:
+            read.append(_STORED_IDS[index])
+            meta = {"case_id": _STORED_IDS[index], "material_family": "lentil"}
+            return {"x": reference.inputs[index], "y": reference.outputs[index], "meta": meta}
+
+    monkeypatch.setattr(datasets.runtime.steady, "SteadyFlowDataset", FakeSteady)
+    monkeypatch.setattr(datasets.runtime.factory, "create_dataset", lambda _request: FakeSteady())
+    loaded = sources.load_steady_reference("synthetic", membership="train", max_cases=2)
+    assert loaded.case_ids == tuple(read) == tuple(_PARTITION_IDS["train"][:2])
+    assert loaded.membership == "train"
+
+
+class _FakeTrajectories:
+    """Canonical-HDF5 runtime stand-in that serves one synthetic case under every stored ID and records reads."""
+
+    def __init__(self) -> None:
+        self.manifest_binding = SimpleNamespace(case_partition=_PARTITION_IDS)
+        self.payload = {
+            "cases": [
+                {"package_case_id": case_id, "source_relative_path": f"{case_id}.h5", "source_hdf5_sha256": "0" * 64, "material_family": "lentil"}
+                for case_id in _STORED_IDS
+            ]
+        }
+        self.source_root = Path("/nonexistent")
+        self.read: list[str] = []
+        self.closed = False
+
+    def read_case_arrays(self, case_id: str) -> SimpleNamespace:
+        self.read.append(case_id)
+        case, step = _transient_case(), datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
+        return SimpleNamespace(
+            time=case.time_hours,
+            states=np.stack([case.states[field.name] for field in step.dynamic_state], axis=1),
+            static=np.stack([case.static[field.name] for field in step.static_spatial_conditioning]),
+            boundary=np.stack([case.boundary.get(field.name, case.time_hours[1:]) for field in step.step_boundary_conditioning], axis=1),
+            scalars=np.array([case.scalars.get(field.name, 0.0) for field in step.scalar_conditioning]),
+            exact_stop_time=None,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("consumer", ["reference_cases", "balances"])
+def test_transient_cases_and_balances_read_only_the_leading_membership_cases(monkeypatch: pytest.MonkeyPatch, consumer: str) -> None:
+    """Reference cases and balance diagnostics read only the first validation case and its source, and close the runtime."""
+    runtime, case = _FakeTrajectories(), _transient_case()
+    balance_sources: list[str] = []
+
+    def read_balances(path: Path, **_kwargs: object) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        balance_sources.append(path.stem)
+        return case.global_series, case.constants
+
+    monkeypatch.setattr(datasets.runtime.factory, "create_hdf5_source_dataset", lambda _request: runtime)
+    monkeypatch.setattr(sources, "_file_stat", lambda _path: (0, 0))
+    monkeypatch.setattr(sources, "_read_source_balances", read_balances)
+    if consumer == "reference_cases":
+        cases = list(sources.iter_transient_reference_cases("synthetic", membership="validation", max_cases=1))
+        assert [item.membership for item in cases] == ["validation"]
+    else:
+        labels = [item.label for item in transient.evaluate_dataset("synthetic", membership="validation", max_cases=1)]
+        assert labels == ["lentil/case_validation0"]
+    assert runtime.read == balance_sources == _PARTITION_IDS["validation"][:1]
+    assert runtime.closed
+
+
+def test_membership_scaling_fits_only_the_leading_membership_cases(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The scaling fit consumes the items of the selected validation cases only, and its digest hashes exactly those IDs."""
+    consumed: list[str] = []
+    fitted: dict[str, object] = {}
+
+    def scaling_items(case_ids: tuple[str, ...]) -> Iterator[dict[str, str]]:
+        return iter([{"case_id": case_id} for case_id in case_ids])
+
+    class FakeShards:
+        manifest_binding = SimpleNamespace(case_partition=_PARTITION_IDS)
+        payload_identity = None
+
+        def iter_scaling_items(self) -> Iterator[dict[str, str]]:
+            """Yield one ID-tagged item per stored case, i.e. the unfiltered runtime."""
+            return scaling_items(_STORED_IDS)
+
+        def close(self) -> None:
+            """Release nothing."""
+
+    def select(_dataset: object, case_ids: tuple[str, ...]) -> SimpleNamespace:
+        return SimpleNamespace(iter_scaling_items=lambda: scaling_items(case_ids), configured_regular_horizon=1, close=lambda: None)
+
+    def fit(items: Iterator[dict[str, str]], **kwargs: object) -> str:
+        consumed.extend(item["case_id"] for item in items)
+        fitted.update(kwargs)
+        return "scaling"
+
+    monkeypatch.setattr(datasets.runtime.transient, "TransientPTShardDataset", FakeShards)
+    monkeypatch.setattr(datasets.runtime.factory, "create_dataset", lambda _request: FakeShards())
+    monkeypatch.setattr(datasets.runtime.transient, "select_transient_cases", select)
+    monkeypatch.setattr(datasets.preprocessing.splits, "split_dataset_identity", lambda _binding, _identity: {})
+    monkeypatch.setattr(increments.transient_contracts.TransientTensorizerSpec, "from_mapping", lambda _mapping: None)
+    monkeypatch.setattr(increments.transient_scaling, "fit_transient_scaling", fit)
+    config = {"data": {"spatial_stride": 1}, "input_profile": None, "temporal": {"temporal_conditioning": None}, "scaling": {"mode": "state_std"}}
+    assert increments.fit_membership_scaling("synthetic", membership="validation", config=config, max_cases=1) == "scaling"
+    assert consumed == _PARTITION_IDS["validation"][:1]
+    assert fitted["train_membership_digest"] == common.serialization.canonical_json_sha256(_PARTITION_IDS["validation"][:1])
+
+
+def test_manufactured_fields_bound_backend_errors_and_crop_removes_edge_bands() -> None:
+    """Float64 does not raise either backend's error, every error is finite, and a crop column keeps only its bands."""
+    errors = steady.manufactured_derivative_errors((0.0, 0.4, 0.0, 0.25), (41, 61))
+    assert np.isfinite(errors["relative_error"]).all()
+    overview = steady.manufactured_overview(errors)
+    crop0 = overview["crop 0"].astype(float)
+    for backend in ("fd", "fc"):
+        assert crop0[(backend, "float64")] <= crop0[(backend, "float32")] * (1 + 1e-3)
+    kept = errors[(errors["backend"] == "fc") & (errors["dtype"] == "float64") & ~errors["band"].isin(["0", "1"])]
+    weighted = kept.assign(weight=kept["relative_error"] ** 2 * kept["points"]).groupby(["field", "direction"])[["weight", "points"]].sum()
+    fc_crop2 = float(overview["crop 2"].astype(float)[("fc", "float64")])
+    assert fc_crop2 == pytest.approx(float(np.sqrt(weighted["weight"] / weighted["points"]).max()))
+    assert fc_crop2 < crop0[("fc", "float64")]
+
+
+def test_mode_truncation_keeps_the_layer_modes_and_never_grows_with_more_modes() -> None:
+    """The kept set matches the probed neuralop mapping, all modes reproduce the field, and more modes never lose more."""
+    assert int(spectral.kept_mode_mask((20, 30), (8, 10)).sum()) == 8 * (10 // 2 + 1)
+    field = torch.randn(1, 2, 24, 36, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    errors = spectral.truncation_errors(field, ("a", "b"), mode_counts=(4, 8, 16, 23), paddings=(0.0,), mode_pairs=[("all", (24, 36))])
+    assert errors.loc[errors["axis"] == "config", ["relative_l2", "edge_relative"]].to_numpy() == pytest.approx(0.0, abs=1e-12)
+    for (_, axis), group in errors[errors["axis"] != "config"].groupby(["field", "axis"]):
+        curve = group.sort_values(f"modes_{axis}")["relative_l2"].to_numpy()
+        assert np.all(np.diff(curve) <= 1e-12)
+    zero = spectral.truncation_errors(torch.zeros(1, 1, 12, 16), ("z",), mode_counts=(4,), paddings=(0.1,))
+    assert (zero[["relative_l2", "edge_relative"]].to_numpy() == 0.0).all()
+
+
+def test_truncation_keeps_each_sample_mean_so_zero_padding_shows_its_jump() -> None:
+    """Constant samples of different values lose energy under zero padding; without padding the kept DC mode reproduces them."""
+    fields = torch.stack([torch.full((1, 12, 16), 1.0), torch.full((1, 12, 16), 3.0)])
+    errors = spectral.truncation_errors(fields, ("c",), mode_counts=(4,), paddings=(0.0, 0.1))
+    assert (errors.loc[errors["padding"] == 0.1, ["relative_l2", "edge_relative"]].to_numpy() > 0.0).all()
+    assert errors.loc[errors["padding"] == 0.0, ["relative_l2", "edge_relative"]].to_numpy() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_stride_views_keep_endpoints_and_rebuild_bilinear_fields_exactly() -> None:
+    """Views keep both endpoints, stride one and linear fields rebuild exactly, and a stride that drops an endpoint is refused."""
+    grid = torch.arange(9 * 13, dtype=torch.float32).reshape(9, 13)
+    view = spectral.stride_view(grid, 2)
+    assert view.shape == (5, 7)
+    assert float(view[0, 0]) == float(grid[0, 0])
+    assert float(view[-1, -1]) == float(grid[-1, -1])
+    y_grid, x_grid = np.meshgrid(np.linspace(0.0, 1.0, 9), np.linspace(0.0, 1.0, 11), indexing="ij")
+    linear = np.stack([(step + 1.0) * x_grid + 2.0 * y_grid for step in range(3)]).astype(np.float32)
+    case = dataclasses.replace(_transient_case(), states={name: linear.copy() for name in ("T", "phi", "w_surf", "w_int")})
+    floor = spectral.stride_floor(case)
+    assert (floor.loc[floor["stride"] == 1, "max_normalized_rmse"] == 0.0).all()
+    assert (floor.loc[floor["stride"] == 2, "max_normalized_rmse"] < 1e-6).all()
+    assert floor.loc[floor["stride"] == 4, "status"].str.startswith("refused").all()
+
+
+def test_increment_statistics_count_beta_exceedance_and_zeros_and_flag_nonuniform_steps() -> None:
+    """Exact zeros, values above beta, the maximum and equal-weight shares are exact; an irregular step is not uniform."""
+    batch = torch.tensor([[[[0.0, 0.5]], [[0.1, 0.1]]], [[[2.0, 0.0]], [[0.1, 0.1]]]])
+    stats = increments.scaled_increment_statistics([batch], channels=("a", "b"), beta=1.0)
+    assert stats.loc["a", "zero_fraction"] == 0.5
+    assert stats.loc["a", "above_beta_fraction"] == 0.25
+    assert stats.loc["b", "above_beta_fraction"] == 0.0
+    assert stats.loc["a", "max"] == 2.0
+    assert stats.loc["b", "q50"] == pytest.approx(0.1, rel=1e-6)
+    assert stats.loc["a", "loss_share"] == pytest.approx((1.625 / 4) / (1.625 / 4 + 0.005), rel=1e-6)
+    steps = increments.time_step_table({"regular": np.array([0.0, 1.0, 2.0]), "irregular": np.array([0.0, 1.0, 2.5])})
+    assert steps["uniform"].to_dict() == {"regular": True, "irregular": False, "all cases": False}
+
+
+def test_timing_without_cuda_reports_unavailable_gpu_rows_and_measured_cpu_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a GPU the CUDA rows say unavailable instead of substituting hardware; CPU rows carry a positive time."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    reference = _reference()
+    frame = timing.time_physics_loss(
+        reference.inputs,
+        reference.outputs,
+        input_fields=reference.input_fields,
+        output_fields=reference.output_fields,
+        backends=steady.DERIVATIVE_BACKENDS,
+        crop=1,
+        warmups=0,
+        repeats=1,
+    )
+    gpu, cpu = frame[frame["device"] == "cuda"], frame[frame["device"] == "cpu"]
+    assert set(gpu["backend"]) == set(cpu["backend"]) == {"fd", "fc"}
+    assert (gpu["status"] == "unavailable").all()
+    assert (cpu["status"] == "measured").all()
+    assert (cpu["median_ms"].astype(float) > 0).all()
+
+
+def test_summary_applies_each_proposed_criterion() -> None:
+    """Each criterion turns constructed tables at or across its threshold into its status; missing tables stay not measured."""
+    index = pd.MultiIndex.from_product([("fd", "fc"), (0, 1, 2)], names=["backend", "crop"])
+    crop = pd.DataFrame(
+        {"momentum_floor_median": [3.0, 2.0, 1.0, 3.0, 2.0, 1.0], "smooth_1pct_ratio_median": [10.0, 100.0, 300.0, 5.0, 50.0, 99.9]}, index=index
+    )
+    timed = pd.DataFrame({"device": ["cpu", "cpu"], "backend": ["fd", "fc"], "status": ["measured"] * 2, "median_ms": [10.0, 20.0]})
+    curves = [
+        {"field": "p", "axis": axis, "config": None, "modes_y": modes if axis == "y" else None, "modes_x": modes if axis == "x" else None}
+        | {"padding": 0.0, "relative_l2": error, "edge_relative": error}
+        for axis in ("y", "x")
+        for modes, error in ((8, 2e-3), (16, 1e-3), (32, 1e-4))
+    ]
+    configured = [
+        {"field": "p", "axis": "config", "config": "fno", "modes_y": 16, "modes_x": 16, "padding": padding, "relative_l2": 0.1, "edge_relative": edge}
+        for padding, edge in ((0.0, 1.0), (0.1, 0.95))
+    ]
+    modes = pd.DataFrame(curves + configured)
+    stride = pd.DataFrame(
+        {"stride": [1, 2, 4], "status": ["admissible", "admissible", "refused: endpoint"], "max_normalized_rmse": [0.0, 1e-3, math.nan]}
+    )
+    tables = increments.TransientComponentTables(
+        spectral=modes, stride=stride, increments=pd.DataFrame({"above_beta_fraction": [0.0, 0.0]}), time_steps=pd.DataFrame()
+    )
+    status = summary.summary_table(crop=crop, timing=timed, steady_modes=modes, transient=tables)["status"]
+    assert status["Derivative backend: FC arm"] == "keep FC arm"
+    assert status["Interior crop"] == "fd: crop 1; fc: none"
+    assert status["n_modes steady, axis y"] == "padding 0: lower bound 16, sufficient 32"
+    assert status["Domain padding steady"] == "no effect"
+    assert status["Spatial stride"] == "stride 1: admissible; stride 2: admissible; stride 4: refused"
+    assert status["Huber regime"] == "Huber = MSE prior"
+    assert (summary.summary_table()["status"] == summary.NOT_MEASURED).all()
+    assert summary.summary_table()["criterion"].str.endswith(f"({summary.CRITERIA_STATE})").all()
+    assert sources.membership_caption("train", ["a", "b"]) == "train membership · 2 cases"
+
+
+def test_padding_with_all_zero_edge_errors_has_no_effect() -> None:
+    """Edge-band errors that are zero for both paddings agree exactly instead of turning 0/0 into an effect."""
+    exact = pd.DataFrame({"padding": [0.0, 0.1], "relative_l2": 0.0, "edge_relative": 0.0})
+    exact = exact.assign(field="p", axis="config", config="fno", modes_y=16, modes_x=16)
+    assert summary.summary_table(steady_modes=exact).loc["Domain padding steady", "status"] == "no effect"

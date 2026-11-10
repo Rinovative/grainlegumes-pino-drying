@@ -61,6 +61,38 @@ def test_colliding_labels_are_disambiguated_without_full_identity() -> None:
     assert not any(dataset.canonical_identity in label for dataset, label in zip(datasets, labels, strict=True))
 
 
+def test_unique_labels_keep_unique_bases_and_pick_facets_in_order() -> None:
+    assert display_labels.unique_display_labels(["a", "b"], [("x",), ("y",)]) == ("a", "b")
+    # The first facet is equal in the group, so the second one separates it.
+    labels = display_labels.unique_display_labels(["m", "m"], [("p", "c1", "d"), ("p", "c2", "d")])
+    assert labels == ("m · c1", "m · c2")
+    # A None value disqualifies the facet for the whole group.
+    labels = display_labels.unique_display_labels(["m", "m"], [(None, "c1"), ("p", "c2")])
+    assert labels == ("m · c1", "m · c2")
+    with pytest.raises(ValueError, match="No facet separates"):
+        display_labels.unique_display_labels(["m", "m"], [("p",), ("p",)])
+
+
+def test_unique_labels_show_only_tokens_that_differ_even_in_the_middle() -> None:
+    first = "exp/fno_h64__lr-1__seed-9__a0ep-2__b-a1__rollout-4"
+    second = "exp/fno_h64__lr-1__seed-9__a0ep-2__rev-wandb-pages__b-a1__rollout-4"
+    labels = display_labels.unique_display_labels(["m", "m"], [(first,), (second,)])
+    assert labels[1] == "m · rev-wandb-pages"
+    labels = display_labels.unique_display_labels(["m", "m"], [("exp/a__seed-1__x",), ("exp/a__seed-2__x",)])
+    assert labels == ("m · seed-1", "m · seed-2")
+
+
+def test_unique_labels_give_the_item_without_distinguishing_token_the_bare_base() -> None:
+    labels = display_labels.unique_display_labels(["m", "m"], [("exp/a__b",), ("exp/a__b__rev-x",)])
+    assert labels == ("m", "m · rev-x")
+
+
+def test_unique_labels_grow_the_ellipsis_until_unique() -> None:
+    first, second = "A" * 15 + "1" + "B" * 25, "A" * 15 + "2" + "B" * 25
+    labels = display_labels.unique_display_labels(["m", "m"], [(first,), (second,)])
+    assert labels == (f"m · {'A' * 15}1…{'B' * 15}", f"m · {'A' * 15}2…{'B' * 15}")
+
+
 def test_channel_order_and_mixed_dataset_intersection_are_semantic() -> None:
     metadata = {
         "Kxx": channel_semantics.ChannelPresentationMetadata("airflow_input", order=0),
@@ -125,7 +157,7 @@ def test_meta_statistics_keep_all_discovered_fields_except_exact_denylist() -> N
 
 
 def test_material_role_labels_are_distinct_per_role() -> None:
-    labels = {role: display_labels.material_role_display_label("red_lentil", role) for role in ("id", "ood", "additional_evaluation")}
+    labels = {role: display_labels.material_role_display_label("red_lentil", role) for role in ("id", "ood", "material_ood")}
     assert len(set(labels.values())) == len(labels)
     assert all("lentil" in label.casefold() for label in labels.values())
 
@@ -148,8 +180,8 @@ def test_field_labels_use_authoritative_display_units() -> None:
     assert capabilities.field_quantity_label(frame, "Kxx").endswith("[-]")
     assert capabilities.field_quantity_label(frame, "p_in_bc").endswith("[Pa]")
     assert capabilities.field_quantity_label(frame, "phi").endswith("[-]")
-    assert capabilities.field_quantity_label(frame, "w_surf").endswith("[kg/m^3]")
-    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True).endswith("[kg/m^3]")
+    assert capabilities.field_quantity_label(frame, "w_surf").endswith("[kg/m³]")
+    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True).endswith("[kg/m³]")
 
 
 def test_meta_statistics_use_parameter_union_without_fit_or_variation_filters() -> None:

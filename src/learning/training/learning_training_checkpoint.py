@@ -51,7 +51,6 @@ if TYPE_CHECKING:
 
 CheckpointRole = Literal["best", "last"]
 CheckpointPayloadKind = Literal["full", "evaluation"]
-CHECKPOINT_SCHEMA_VERSION = 1
 CHECKPOINT_SCHEMA_KIND = "experiment_training_checkpoint"
 _SHA256_LENGTH: Final = 64
 _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
@@ -72,7 +71,6 @@ _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
 )
 _TRAINING_IDENTITY_CONTRACT: Final = {
     "schema_kind": "training_semantic_identity",
-    "schema_version": 1,
     "model_construction": "resolved_model_kind_and_parameters",
     "loss_construction": "resolved_data_and_physics_loss",
     "optimization": "resolved_optimizer_scheduler_and_training",
@@ -97,8 +95,8 @@ _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
 )
 _CONFIG_PROVENANCE_ROOT_KEYS: Final = frozenset({"paths", "tracking"})
 _RUN_SEMANTIC_KEYS: Final = frozenset({"seed", "deterministic"})
-_RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "revision", "layout", "naming_schema_version"})
-_DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "additional_evaluation_datasets", "batch_size"})
+_RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "revision", "layout"})
+_DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "train_subset", "material_ood_datasets", "batch_size"})
 _DATA_EXECUTION_KEYS: Final = frozenset({"num_workers", "pin_memory", "persistent_workers"})
 PRODUCER_KEYS: Final = frozenset({"training_sha256", "model_sha256"})
 _MODEL_DIRECTORIES: Final = ("datasets/contracts", "datasets/preprocessing", "datasets/runtime")
@@ -145,6 +143,7 @@ MODEL_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
             *_MODEL_FILES,
             "datasets/packages/dataset_packages_trajectory.py",
             "datasets/packages/dataset_packages_transient_shards.py",
+            "domain/domain_moisture.py",
             "domain/tasks/domain_task_transient_drying.py",
             "learning/learning_temporal.py",
             "learning/models/learning_models_rno_cell.py",
@@ -204,7 +203,6 @@ _NEURALOPERATOR_PROJECTION: Final = common.code_identity.CodeProjection(name="ne
 _CHECKPOINT_KEYS = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "checkpoint_role",
         "payload_kind",
         "identity",
@@ -351,7 +349,8 @@ def effective_config_identity_payload(
             frozenset(
                 {
                     "train_dataset",
-                    "additional_evaluation_datasets",
+                    "train_subset",
+                    "material_ood_datasets",
                     "batch_size",
                     "spatial_stride",
                 }
@@ -363,7 +362,7 @@ def effective_config_identity_payload(
         label="data",
     )
     task_contract = _required_mapping(config["task_contract"], label="config task_contract")
-    required_task_contract = {"schema_version", "task", "digest", "data_contract_digest"}
+    required_task_contract = {"task", "digest", "data_contract_digest"}
     missing_contract = sorted(required_task_contract.difference(task_contract))
     if missing_contract:
         message = f"Training task contract is missing identity fields {missing_contract}."
@@ -503,9 +502,9 @@ def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
         raise ValueError(message)
     objective = _validate_objective(identity["objective"], label=f"{label}.objective")
     normalized_roles: dict[str, dict[str, Any]] = {}
-    # Both tasks bind the ordered additional Evaluation sources as one digest, an empty list included.
-    membership_roles = {"train", "validation", "id_test", "additional_evaluation"}
-    dataset_roles = {"train", "additional_evaluation"}
+    # Both tasks bind the ordered sources of each OOD Evaluation role as one digest, an empty list included.
+    membership_roles = {"train", "validation", "id_test", "material_ood", "parameter_ood"}
+    dataset_roles = {"train", "material_ood", "parameter_ood"}
     for key, roles in (
         ("dataset_fingerprints", dataset_roles),
         ("split_membership_digests", membership_roles),
@@ -594,7 +593,7 @@ def build_checkpoint_identity(
         raise ValueError(message)
     digest = common.serialization.canonical_json_sha256
     memberships = split.membership_digests()
-    additional = split.additional_evaluation
+    ood_roles = datasets.preprocessing.splits.OOD_SPLIT_ROLES
     persisted = dict(persisted_config or config)
     return _validate_checkpoint_identity(
         {
@@ -603,13 +602,16 @@ def build_checkpoint_identity(
             "task_contract_digest": task_digest,
             "effective_config_digest": config_digest(persisted),
             "resume_contract_digest": resume_contract_digest(persisted),
-            "dataset_ids": {"train": split.train.dataset_id, "additional_evaluation": digest([part.dataset_id for part in additional])},
+            "dataset_ids": {
+                "train": split.train.dataset_id,
+                **{role: digest([part.dataset_id for part in split.ood_parts(role)]) for role in ood_roles},
+            },
             "dataset_fingerprints": {
                 "train": digest(dict(split.train.dataset)),
-                "additional_evaluation": digest([dict(part.dataset) for part in additional]),
+                **{role: digest([dict(part.dataset) for part in split.ood_parts(role)]) for role in ood_roles},
             },
             "split_contract_digest": digest(split.as_payload()),
-            "split_membership_digests": {**memberships, "additional_evaluation": digest(memberships["additional_evaluation"])},
+            "split_membership_digests": {**memberships, **{role: digest(memberships[role]) for role in ood_roles}},
             "normalizer_sha256": normalizer_digest,
             "numerical_environment": numerical_environment_identity(),
             "objective": objective,
@@ -836,7 +838,6 @@ def make_checkpoint(
         adapter_state = dict(raw_adapter_state)
     payload: dict[str, Any] = {
         "schema_kind": CHECKPOINT_SCHEMA_KIND,
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "checkpoint_role": role,
         "payload_kind": payload_kind,
         "identity": validated_identity,
@@ -949,11 +950,10 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     checks; only continuation checks are absent because it has no continuation state.
 
     """
-    schema_version = payload.get("schema_version")
-    if payload.get("schema_kind") != CHECKPOINT_SCHEMA_KIND or not common.serialization.is_schema_version(schema_version, CHECKPOINT_SCHEMA_VERSION):
+    if payload.get("schema_kind") != CHECKPOINT_SCHEMA_KIND:
         msg = (
-            "Malformed or unsupported checkpoint schema_kind/schema_version: "
-            f"got {payload.get('schema_kind')!r}/{schema_version!r}, admitted {CHECKPOINT_SCHEMA_KIND!r}/{CHECKPOINT_SCHEMA_VERSION}. "
+            "Malformed or unsupported checkpoint schema_kind: "
+            f"got {payload.get('schema_kind')!r}, admitted {CHECKPOINT_SCHEMA_KIND!r}. "
             "Regenerate the run."
         )
         raise ValueError(msg)

@@ -3,10 +3,10 @@ Scientific analysis, evaluation, presentation, and notebook interfaces.
 
 Provides:
 - artifacts: artifact schemas, generation, lifecycle, and runtime evidence
+- component_checks: training-free component checks on reference fields
 - eda: exploratory generated-data analysis and visualization
 - evaluation: persisted prediction evaluation and scientific plots
 - generation_inputs: production generation-input discovery and EDA
-- physics_diagnostics: residual, derivative, and balance diagnostics of reference fields
 - presentation: ordered and curated scientific presentation services
 - ui: reusable notebook controls, panels, and viewers
 """
@@ -17,23 +17,23 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import artifacts, eda, evaluation, generation_inputs, physics_diagnostics, presentation, ui
+    from . import artifacts, component_checks, eda, evaluation, generation_inputs, presentation, ui
 
 _MODULES = {
     "artifacts": "artifacts",
+    "component_checks": "component_checks",
     "eda": "eda",
     "evaluation": "evaluation",
     "generation_inputs": "generation_inputs",
-    "physics_diagnostics": "physics_diagnostics",
     "presentation": "presentation",
     "ui": "ui",
 }
 __all__ = [
     "artifacts",
+    "component_checks",
     "eda",
     "evaluation",
     "generation_inputs",
-    "physics_diagnostics",
     "presentation",
     "ui",
 ]

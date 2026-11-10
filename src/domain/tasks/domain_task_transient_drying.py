@@ -19,7 +19,6 @@ This module does NOT:
 from __future__ import annotations
 
 from .domain_task_spec import (
-    TASK_SCHEMA_VERSION,
     FieldSpec,
     InputProfileSpec,
     MetricSpec,
@@ -64,7 +63,6 @@ _COMPLETE_FIELDS = tuple(field.name for field in _TRANSIENT_INPUTS)
 
 TRANSIENT_DRYING = TaskSpec(
     id="transient_drying",
-    schema_version=TASK_SCHEMA_VERSION,
     inputs=_TRANSIENT_INPUTS,
     outputs=(
         FieldSpec("delta_T", "state", "K", "next_state_minus_current_state"),
@@ -141,8 +139,8 @@ TRANSIENT_DRYING = TaskSpec(
         continuity="none",
         boundary="none",
     ),
-    input_profiles=(InputProfileSpec("canonical_physics_complete_v1", _COMPLETE_FIELDS, "explicit_x_y"),),
-    primary_input_profile="canonical_physics_complete_v1",
+    input_profiles=(InputProfileSpec("canonical_physics_complete", _COMPLETE_FIELDS, "explicit_x_y"),),
+    primary_input_profile="canonical_physics_complete",
     temporal_conditioning_kinds=("none", "normalized_current_time"),
     training_airflow_source="comsol_reference",
 )

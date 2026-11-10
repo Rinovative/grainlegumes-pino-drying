@@ -70,20 +70,19 @@ _MAX_EVALUATION_SUMMARY_ENTRIES = 512
 _MAX_EVALUATION_SUMMARY_TEXT = 512
 _TRANSIENT_EVALUATION_HORIZONS = "1|2|4|8|16|32|64|128|full"
 _TRANSIENT_EVALUATION_METRIC_KEY = re.compile(
-    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|additional_evaluation)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
+    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|material_ood|parameter_ood)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
 )
 _TRANSIENT_EVALUATION_PIPELINE_KEY = re.compile(r"^evaluation/pipeline/(?:0|[1-9][0-9]*)/(?P<metric>[A-Za-z0-9_]+)$")
-_STEADY_EVALUATION_METRIC_KEY = re.compile(r"^evaluation/(?:id|additional_evaluation)/(?P<metric>[A-Za-z0-9_]+)$")
-_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|additional_evaluation)/name$")
+_STEADY_EVALUATION_METRIC_KEY = re.compile(r"^evaluation/(?:id|material_ood|parameter_ood)/(?P<metric>[A-Za-z0-9_]+)$")
+_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|material_ood|parameter_ood)/name$")
 _TRANSIENT_EVALUATION_SPEEDUP_KEY = re.compile(
     r"^evaluation/timing/speedup/(?P<name>drying_only_solver_speedup|full_pipeline_solver_speedup|hybrid_component_speedup|comsol_process_speedup|generation_compute_end_to_end_speedup)/(?P<metric>available_count|unavailable_count|ratio_of_sums)$"
 )
 _EVALUATION_COMPONENT_KEY = re.compile(
     r"^evaluation/timing/component/(?P<name>comsol_transient_drying_seconds|drying_no_rollout_model_seconds|dataset_materialization_seconds|batch_amortized_neural_operator_forward_seconds)/(?P<metric>available_count|median_seconds)$"
 )
-_STEADY_EVALUATION_COUNT_METRICS = frozenset(
-    {"valid_case_count", "nonfinite_case_count", "required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count"}
-)
+_SUPPORT_COUNT_METRICS = ("required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count")
+_STEADY_EVALUATION_COUNT_METRICS = frozenset({"valid_case_count", "nonfinite_case_count", *_SUPPORT_COUNT_METRICS})
 _STEADY_EVALUATION_SUMMARY_METRICS = frozenset(
     {
         *_STEADY_EVALUATION_COUNT_METRICS,
@@ -117,6 +116,7 @@ _TRANSIENT_EVALUATION_SUMMARY_METRICS = frozenset(
         "nonfinite_values",
         "negative_moisture_values",
         "abnormal_increment_growth_count",
+        *_SUPPORT_COUNT_METRICS,
         *(f"normalized_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
         *(f"physical_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
         *(f"physical_mae_{field}" for field in ("T", "phi", "w_surf", "w_int")),
@@ -136,6 +136,7 @@ _TRANSIENT_EVALUATION_COUNT_METRICS = frozenset(
         "nonfinite_values",
         "negative_moisture_values",
         "abnormal_increment_growth_count",
+        *_SUPPORT_COUNT_METRICS,
     }
 )
 _TRANSIENT_EVALUATION_PIPELINE_METRICS = frozenset(
@@ -158,24 +159,13 @@ _EVALUATION_HASH_IDENTITIES = frozenset(
     }
 )
 _EVALUATION_EXACT_TEXT_IDENTITIES = {
-    "evaluation/identity/input_profile": frozenset({"canonical_physics_complete_v1"}),
+    "evaluation/identity/input_profile": frozenset({"canonical_physics_complete"}),
     "evaluation/identity/model_kind": frozenset({"fno", "uno", "rno"}),
     "evaluation/timing/precision": frozenset({"float32"}),
 }
 _EVALUATION_LOGICAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,254}$")
 _EVALUATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EVALUATION_DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)(?:\|(?:cpu|cuda(?::[0-9]+)?))*$")
-AUTOMATIC_HISTORY_TOP_LEVEL_PREFIXES = (
-    "Overview",
-    "Accuracy",
-    "Loss",
-    "Optimization",
-    "Curriculum",
-    "Performance",
-    "Physics",
-    "Diagnostics",
-    "Optuna",
-)
 
 
 def _is_nonnegative_int(value: Any) -> bool:
@@ -318,7 +308,7 @@ def automatic_history_metric_definitions(
     optuna_trial: bool = False,
     task_id: str | None = None,
     state_aux_enabled: bool = False,
-    ood_enabled: bool = True,
+    ood_roles: Collection[str] = (),
 ) -> tuple[wandb_schema.MetricProjection, ...]:
     """Return the ordered curated history contract; the schema module owns sections and key names."""
     return wandb_schema.curated_metric_projections(
@@ -328,7 +318,7 @@ def automatic_history_metric_definitions(
         physics_training_enabled=physics_training_enabled,
         physics_monitor_enabled=physics_monitor_enabled,
         state_aux_enabled=state_aux_enabled,
-        ood_enabled=ood_enabled,
+        ood_roles=ood_roles,
         cuda_enabled=cuda_enabled,
         optuna_trial=optuna_trial,
     )
@@ -510,10 +500,9 @@ def _split_semantics(split_indices: Mapping[str, Any], *, split_indices_sha256: 
     payload = split.as_payload()
     split_payload = {
         "schema_kind": payload["schema_kind"],
-        "schema_version": split.schema_version,
         "artifact": "split_indices.pt",
         "artifact_sha256": split_indices_sha256,
-        "split_seed": split.split_seed,
+        "train_subset": split.train_subset,
         "case_partition_digest": split.case_partition_digest,
         "roles": payload["roles"],
         "evaluation_assignments": payload["evaluation_assignments"],
@@ -557,7 +546,7 @@ def _build_transient_semantic_config(
             "datasets": datasets_payload,
             "configured_identity": {
                 "train_dataset": data_config["train_dataset"],
-                "additional_evaluation_datasets": copy.deepcopy(data_config["additional_evaluation_datasets"]),
+                "material_ood_datasets": copy.deepcopy(data_config["material_ood_datasets"]),
             },
             "loader": {
                 key: copy.deepcopy(data_config.get(key))
@@ -671,10 +660,10 @@ def build_semantic_config(
     evaluation_payload["roles"] = {
         "selection": "id",
         "id_interpretation": "in_distribution_validation",
-        "diagnostic": ["additional_evaluation", "physics"],
+        "diagnostic": ["material_ood", "parameter_ood", "physics"],
         "event_model": "completed_epoch_interval_or_terminal",
         "id_interval_epochs": int(training_config["evaluation_interval"]),
-        "additional_evaluation_interval_epochs": int(training_config["additional_evaluation_interval"]),
+        "ood_interval_epochs": int(training_config["ood_evaluation_interval"]),
         "physics_interval_epochs": int(monitor_config["interval"]),
         "epoch_zero_evaluation": False,
     }
@@ -863,11 +852,6 @@ class WandbSession:
         value = getattr(self._run, "url", None)
         return value if isinstance(value, str) and value else None
 
-    @property
-    def history_definition_by_source(self) -> dict[str, wandb_schema.MetricProjection]:
-        """Return complete source projections including presentation-only unit scaling."""
-        return {definition.source_key: definition for definition in self.history_metric_definitions}
-
     def _persist(self, updates: Mapping[str, Any]) -> None:
         """Persist bounded observer state through the authoritative local writer."""
         if self.state_updater is not None:
@@ -913,11 +897,10 @@ class WandbSession:
             return
 
         payload: dict[str, float | int] = {"epoch": epoch}
-        definition_by_source = self.history_definition_by_source
-        for key, value in metrics.items():
-            definition = definition_by_source.get(key)
-            if definition is not None:
-                payload[definition.wandb_key] = float(value) * definition.multiplier
+        # Projection order, not producer order, so first-appearance panel ordering in W&B follows the layout of the sections.
+        for definition in self.history_metric_definitions:
+            if definition.source_key in metrics:
+                payload[definition.wandb_key] = float(metrics[definition.source_key]) * definition.multiplier
 
         if self._run_operation(
             "history",
@@ -1187,7 +1170,13 @@ class WandbSession:
                     summary[target] = result[source]
             selected_metrics = result.get("selected_metrics")
             if isinstance(selected_metrics, Mapping):
-                summary.update({key: value for key, value in selected_metrics.items() if isinstance(key, str) and key.startswith("selected/")})
+                # Only the series the history projects; summary.json keeps every selected metric.
+                projected = {
+                    key
+                    for definition in self.history_metric_definitions
+                    if (key := wandb_schema.selected_summary_key(definition.source_key)) is not None
+                }
+                summary.update({key: value for key, value in selected_metrics.items() if key in projected})
             terminal_metrics = result.get("terminal_metrics")
             if isinstance(terminal_metrics, Mapping):
                 for key, value in terminal_metrics.items():
@@ -1270,8 +1259,13 @@ def initialize_wandb(
     previous_last_logged_epoch: int | None = None,
     previous_evaluation_summary_keys: Collection[str] = (),
     state_updater: TrackingStateUpdater | None = None,
+    ood_roles: Collection[str],
 ) -> WandbSession:
-    """Initialize the configured W&B mode with strict identity and metric rules."""
+    """Initialize the configured W&B mode with strict identity and metric rules.
+
+    ``ood_roles`` names the non-empty OOD Evaluation parts the run was trained with (its split's ``ood_roles``); only those get W&B rows,
+    so every session of one run, including a resumed artifact upload, must pass the same parts.
+    """
     objective = cast("Mapping[str, Any]", config["evaluation"])["objective"]
     objective_mapping = cast("Mapping[str, Any]", objective)
     objective_id = str(objective_mapping["id"])
@@ -1360,7 +1354,7 @@ def initialize_wandb(
         cast("Mapping[str, Any]", config["loss"])["physics"],
     )
     data_config = cast("Mapping[str, Any]", config["data"])
-    ood_datasets = list(data_config["additional_evaluation_datasets"])
+    ood_datasets = list(data_config["material_ood_datasets"])
     runtime_config = semantic_config.get("runtime") if isinstance(semantic_config, Mapping) else None
     runtime_device = runtime_config.get("device") if isinstance(runtime_config, Mapping) else None
     resolved_device = runtime_device.get("resolved_device") if isinstance(runtime_device, Mapping) else None
@@ -1377,7 +1371,7 @@ def initialize_wandb(
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
         state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
-        ood_enabled=bool(ood_datasets),
+        ood_roles=ood_roles,
     )
 
     # Online SDK state lives on the process TMPDIR (node-local, removed at container exit) and is copied into the run folder

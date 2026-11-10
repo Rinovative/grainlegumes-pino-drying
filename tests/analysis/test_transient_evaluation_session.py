@@ -14,6 +14,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import copy
 import warnings
 from dataclasses import asdict
 from inspect import Parameter, signature
@@ -33,6 +34,8 @@ from support.transient_evaluation import production_frame, scaling_state, sequen
 from src import analysis, experiments
 from src.analysis.evaluation import evaluation_transient_session as session
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
+from src.analysis.evaluation import evaluation_workspace as workspace
+from src.analysis.presentation import analysis_compute as compute
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
 from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
@@ -463,7 +466,7 @@ def test_tracking_summary_stays_bounded_for_complete_two_role_horizon_inventory(
             dataset_name=f"{role}_dataset",
             dataset_role=role,
         )
-        for role in ("id", "additional_evaluation")
+        for role in ("id", "material_ood")
     }
     metric_id = "normalized_drying_group_macro_rmse"
     for frame in frames.values():
@@ -494,7 +497,7 @@ def test_tracking_summary_stays_bounded_for_complete_two_role_horizon_inventory(
     validator = experiments.tracking._validate_evaluation_summary_entry
     assert all(validator(key, value) == key for key, value in publication.items())
     assert publication["evaluation/identity/checkpoint_sha256"] == "d" * 64
-    assert publication["evaluation/identity/input_profile"] == "canonical_physics_complete_v1"
+    assert publication["evaluation/identity/input_profile"] == "canonical_physics_complete"
     assert {
         "evaluation/identity/scaling_semantic_digest",
         "evaluation/identity/comparison_arm",
@@ -563,13 +566,14 @@ def test_transient_registry_invokes_every_visible_entry(
 
     assert isinstance(outer, widgets.Label)
     assert captured
+    assert all(label == plot_name for label, _factory, plot_name in captured)
     assert len({plot_name for _label, _factory, plot_name in captured}) == len(captured)
     registered_names = {plot_name for _label, _factory, plot_name in captured}
     assert {
-        "1_3_gt_vs_prediction_mean",
-        "1_4_mean_error_maps",
-        "7_1_sample_gt_vs_prediction",
-        "9_1_reference_prediction_trajectories",
+        "2-3. GT vs Prediction (mean)",
+        "2-4. Mean error maps",
+        "5-1. Sample GT vs Prediction",
+        "4-1. Reference vs prediction trajectories",
     }.issubset(registered_names)
     assert not any(fragment in plot_name for plot_name in registered_names for fragment in ("pressure", "velocity", "divergence", "permeability"))
     results: dict[str, object] = {}
@@ -590,8 +594,8 @@ def test_transient_registry_invokes_every_visible_entry(
         if isinstance(result, Figure):
             plt.close(result)
 
-    sample = results["7_1_sample_gt_vs_prediction"]
-    error_time = results["9_2_error_over_physical_time"]
+    sample = results["5-1. Sample GT vs Prediction"]
+    error_time = results["4-2. Error over physical time"]
     assert isinstance(sample, widgets.VBox)
     assert isinstance(error_time, widgets.VBox)
     assert not any(isinstance(widget, widgets.Play) for widget in _widget_tree(sample))
@@ -618,6 +622,129 @@ def test_transient_controls_expose_admitted_state_and_derived_channels(
     fields = analysis.evaluation.panel._transient_channel_fields(evaluation)
     assert tuple(field.key for field in fields) == (*analysis.evaluation.transient_artifact.STATE_ORDER, "w_gr")
     evaluation.close()
+
+
+def _tab_layout(panel: widgets.Widget) -> tuple[tuple[str, ...], list[list[str]]]:
+    """Return the displayed tab titles and each tab's dropdown labels of one lazy panel."""
+    tabs = cast("Any", panel).tabs
+    return tuple(tabs.titles), [[label for label, _index in section.children[0].options] for section in tabs.children]
+
+
+def _transient_evaluation(tmp_path: Path, *records: SimpleNamespace) -> session.TransientEvaluationSession:
+    """Open one session over a single production-shaped frame of the given records."""
+    return session.TransientEvaluationSession({"id": production_frame(records, artifact_root=str(tmp_path / "artifact"))})
+
+
+def test_transient_tabs_follow_the_decided_order_and_numbers_follow_the_position(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Order the tabs per mode, keep the configuration table in the right tab, and number tabs and views by position."""
+    monkeypatch.setattr(session.TransientEvaluationSession, "require_common_comparison_grids", lambda _self: None)
+    evaluation = _transient_evaluation(
+        tmp_path,
+        sequence_record("teacher_forced_one_step", 1),
+        sequence_record("autonomous_full", "full"),
+        sequence_record("rolling_origin", 2),
+    )
+    titles = analysis.evaluation.panel.EVALUATION_SECTION_TITLES
+    single = ("overview", "global_error", "error_decomposition", "temporal_rollout", "sample_viewer", "outlier_analysis", "runtime", "matched_stages")
+    comparison = (
+        "overview",
+        "global_error",
+        "architecture",
+        "error_decomposition",
+        "temporal_rollout",
+        "sample_viewer",
+        "outlier_analysis",
+        "runtime",
+        "matched_stages",
+    )
+    layouts = {}
+    for keys, is_comparison in ((single, False), (comparison, True)):
+        tabs, views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation, comparison=is_comparison))
+        assert tabs == tuple(f"{number}. {titles[key]}" for number, key in enumerate(keys, start=1))
+        for number, labels in enumerate(views, start=1):
+            assert all(label.startswith(f"{number}-{position}. ") for position, label in enumerate(labels, start=1))
+        layouts[is_comparison] = views
+    assert any("Model-family configuration" in label for label in layouts[False][0])
+    assert not any("Model-family configuration" in label for label in layouts[True][0])
+    assert len(layouts[True][2]) == 1
+    assert "Model-family configuration" in layouts[True][2][0]
+    evaluation.close()
+
+
+def test_transient_numbers_leave_no_gap_for_filtered_or_selected_sections(tmp_path: Path) -> None:
+    """Number the tabs that are displayed: no temporal evidence closes its gap and a sample-only panel starts at one."""
+    evaluation = _transient_evaluation(tmp_path, sequence_record("teacher_forced_one_step", 1))
+    titles = analysis.evaluation.panel.EVALUATION_SECTION_TITLES
+    tabs, _views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation))
+    assert not any(titles["temporal_rollout"] in title for title in tabs)
+    assert [title.partition(".")[0] for title in tabs] == [str(number) for number in range(1, len(tabs) + 1)]
+    sample_tabs, sample_views = _tab_layout(analysis.evaluation.panel.build_transient_panel(session=evaluation, sections=("sample_viewer",)))
+    assert sample_tabs == (f"1. {titles['sample_viewer']}",)
+    assert [label.partition(".")[0] for label in sample_views[0]] == ["1-1"]
+    evaluation.close()
+
+
+def test_closing_a_panel_closes_its_rendered_views_and_silences_compute_callbacks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rendered views sit in output areas: closing the panel must still close them and stop their compute callbacks."""
+    evaluation = _transient_evaluation(tmp_path, sequence_record("autonomous_full", "full"))
+    rendered: list[object] = []
+    monkeypatch.setattr(analysis.ui.viewers, "render_figure", lambda **kwargs: rendered.append(kwargs))
+    built: list[widgets.Widget] = []
+    original = analysis.evaluation.panel._make_transient_aggregate_viewer
+
+    def capture(**kwargs: Any) -> widgets.Widget:
+        built.append(original(**kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(analysis.evaluation.panel, "_make_transient_aggregate_viewer", capture)
+    preference = compute.AnalysisComputePreference("cpu")
+    panel = analysis.evaluation.panel.build_transient_panel(session=evaluation, evaluation_compute_device=preference)
+    tabs = cast("Any", panel).tabs
+    dropdown = tabs.children[1].children[0]
+    dropdown.index = next(index for index, (label, _value) in enumerate(dropdown.options) if "Mean error maps" in label)
+    assert len(built) == 1
+    assert built[0].comm is not None
+    before = len(rendered)
+    preference.set_requested("auto")
+    assert len(rendered) > before
+
+    analysis.evaluation.panel.close_panel(panel)
+    after = len(rendered)
+    preference.set_requested("cpu")
+    assert len(rendered) == after
+    assert built[0].comm is None
+    assert tabs.comm is None
+    assert dropdown.comm is None
+    evaluation.close()
+
+
+def test_replacing_a_workspace_workflow_closes_the_previous_panel_before_its_session() -> None:
+    """Close the replaced panel's widgets first, then its session, and keep the new panel installed."""
+    events: list[str] = []
+
+    class Prepared:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.button = widgets.Button()
+            self.panel = widgets.VBox((self.button,))
+
+        def close(self) -> None:
+            events.append(f"{self.name}: session closed, panel closed {self.panel.comm is None}, child closed {self.button.comm is None}")
+
+    previous, replacement = Prepared("old"), Prepared("new")
+    controller = SimpleNamespace(analysis=widgets.VBox(), _workflow=previous)
+    cast("Any", workspace._EvaluationWorkspaceController)._replace_workflow(controller, replacement)
+
+    assert events == ["old: session closed, panel closed True, child closed True"]
+    assert controller.analysis.children == (replacement.panel,)
+    assert controller._workflow is replacement
+    assert replacement.panel.comm is not None
 
 
 def _widget_tree(widget: object) -> tuple[object, ...]:
@@ -709,6 +836,75 @@ def test_aggregate_spatial_plots_use_exact_values_and_reuse_loaded_records(
     evaluation.close()
 
 
+def _indexed_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, loads: list[str]) -> session.TransientEvaluationSession:
+    """Build a session whose index counts record loads instead of opening bundles."""
+    records = (
+        sequence_record("autonomous_full", "full", case_id="low", offset=1.0),
+        sequence_record("autonomous_full", "full", case_id="high", offset=-3.0),
+    )
+    for number, record in enumerate(records):
+        record.record_id = f"record-{number}"
+        record.chain_id = f"chain-{number}"
+        record.available_horizon = len(record.physical_times) - 1
+    frame = production_frame(records, artifact_root=str(tmp_path / "artifact"))
+    frame.attrs["transient_sequence_index"] = analysis.evaluation.transient_artifact.TransientSequenceArtifactIndex(
+        root=tmp_path / "artifact",
+        dataset_name="transient_dataset",
+        dataset_role="id",
+        summaries=cast("Any", records),
+        unavailable_horizons=(),
+        frame=frame,
+        provenance=frame.attrs["artifact_provenance"],
+        identity_sha256="f" * 64,
+        _rows={record.record_id: {} for record in records},
+    )
+    by_id = {record.record_id: record for record in records}
+
+    def load(_index: object, record_id: str) -> SimpleNamespace:
+        loads.append(record_id)
+        return by_id[record_id]
+
+    monkeypatch.setattr(analysis.evaluation.transient_artifact.TransientSequenceArtifactIndex, "record", load)
+    return session.TransientEvaluationSession({"id": frame})
+
+
+def test_views_of_one_session_share_one_record_load_and_a_new_session_loads_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each case record is opened once per session, however many views ask for it."""
+    loads: list[str] = []
+    first = _indexed_session(tmp_path, monkeypatch, loads)
+    fields = analysis.evaluation.panel._transient_channel_fields(first)
+    for plot_kind in ("mean_error", "std_error"):
+        analysis.evaluation.panel._make_transient_aggregate_viewer(
+            session=first,
+            fields=fields,
+            plot_kind=plot_kind,
+            comparison=False,
+        )
+    analysis.evaluation.panel._make_transient_scope_viewer(
+        session=first,
+        fields=fields,
+        plot_kind="trajectory",
+        comparison=False,
+        selection_state=None,
+    )
+    assert sorted(loads) == ["record-0", "record-1"]
+    first.close()
+
+    second = _indexed_session(tmp_path, monkeypatch, loads)
+    second.record_for_coordinates("id", "low", mode="autonomous_full", origin_index=0, requested_horizon="full")
+    assert loads.count("record-0") == 2
+    second.full_autonomous_records("id")
+    assert loads.count("record-0") == 2
+    frame = second.canonical_frames["id"]
+    frame.attrs["transient_sequence_index"] = copy.copy(frame.attrs["transient_sequence_index"])
+    second.record_for_coordinates("id", "low", mode="autonomous_full", origin_index=0, requested_horizon="full")
+    assert loads.count("record-0") == 3
+    second.close()
+
+
 def test_transient_temporal_union_preserves_short_tails_counts_and_nonfinite_unavailability() -> None:
     """Exact-time cohorts retain late support and never average away invalid predictions."""
     long = sequence_record("autonomous_full", "full", case_id="long", offset=1.0)
@@ -773,7 +969,7 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         if material == "kidney_bean":
             record.identity["evaluation_assignment"] = {
                 "dataset_id": f"dataset_{material}",
-                "role": "ood",
+                "role": "material_ood",
                 "relation": "held-out material family",
                 "assumptions": ["same schedule"],
             }
@@ -806,11 +1002,11 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
                 dataset_name="transient_drying__lentil+chickpea__id",
                 dataset_role="id",
             ),
-            "Model Additional evaluation": production_frame(
+            "Model Material OOD": production_frame(
                 ood_records,
-                artifact_root=str(tmp_path / "additional_evaluation"),
+                artifact_root=str(tmp_path / "material_ood"),
                 dataset_name="kidney_bean_holdout",
-                dataset_role="additional_evaluation",
+                dataset_role="material_ood",
             ),
         }
     )
@@ -856,18 +1052,18 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
     assert not any(isinstance(widget, widgets.Dropdown) and widget.description == "Model / artifact:" for widget in _widget_tree(viewer))
     case_selector.value = 2
     assert routed[-1] == (
-        "Model Additional evaluation",
+        "Model Material OOD",
         "transient_drying__kidney_bean__natural__case_0004",
     )
 
     inventory = evaluation.partitioned_case_inventory()
-    assert tuple(entry.dataset_role for entry in inventory) == ("id", "id", "additional_evaluation")
+    assert tuple(entry.dataset_role for entry in inventory) == ("id", "id", "material_ood")
     assert inventory[-1].evaluation_assignment is not None
-    assert inventory[-1].evaluation_assignment["role"] == "ood"
+    assert inventory[-1].evaluation_assignment["role"] == "material_ood"
     assert tuple(entry.artifact_root for entry in inventory) == (
         (tmp_path / "id").resolve(),
         (tmp_path / "id").resolve(),
-        (tmp_path / "additional_evaluation").resolve(),
+        (tmp_path / "material_ood").resolve(),
     )
     aggregate = evaluation.dataset_dataframe(modes=("autonomous_full",))
     assert set(aggregate["material_family"]) == {
@@ -875,10 +1071,10 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         "lentil",
         "kidney_bean",
     }
-    assert set(aggregate["dataset_role"]) == {"id", "additional_evaluation"}
+    assert set(aggregate["dataset_role"]) == {"id", "material_ood"}
     assert set(aggregate["artifact_root"]) == {
         str((tmp_path / "id").resolve()),
-        str((tmp_path / "additional_evaluation").resolve()),
+        str((tmp_path / "material_ood").resolve()),
     }
 
     routed.clear()
@@ -898,7 +1094,7 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
             "transient_drying__lentil__natural__case_0010",
         ),
         (
-            "Model Additional evaluation",
+            "Model Material OOD",
             "transient_drying__kidney_bean__natural__case_0004",
         ),
     ]
@@ -909,7 +1105,7 @@ def test_partitioned_case_selector_routes_materials_to_owning_artifacts(
         for label in (
             "Chickpea · ID",
             "Lentil · ID",
-            "Kidney bean · OOD",
+            "Kidney bean · Material OOD",
         )
     )
     evaluation.close()
@@ -972,7 +1168,7 @@ def test_outlier_field_view_starts_from_persisted_worst_channel_case(
         outlier=True,
     )
     case_row = viewer.children[0]
-    status = viewer.children[1]
+    status = viewer.children[4]
     assert isinstance(case_row, widgets.HBox)
     assert isinstance(status, widgets.HTML)
     selector = case_row.children[0]
@@ -1154,11 +1350,13 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
         "←",
         "→",
     )
-    channel_row = viewer.children[2].children[1]
+    channel_row = viewer.children[1].children[1]
     assert hasattr(channel_row, "boxes")
     assert all(isinstance(checkbox, widgets.Checkbox) and checkbox.value is True for checkbox in channel_row.boxes.values())
-    time_container = viewer.children[4]
-    navigator_controls = time_container.children[0]
+    time_row = viewer.children[3].children[0]
+    assert isinstance(time_row.children[1], widgets.Button)
+    assert time_row.children[1].description == "Export GIF"
+    navigator_controls = time_row.children[0]
     assert tuple(control.description for control in navigator_controls.children) == (
         "Time [h]:",
         "≪",
@@ -1205,7 +1403,7 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
     assert tuple(axis.get_title() for axis in map_axes[:3]) == (
         "Reference",
         "Prediction",
-        "Signed error",
+        "Signed error · mean |e|/s n/a",
     )
     row_labels = tuple(text.get_text() for axis in map_axes for text in axis.texts if text.get_gid() == "channel-row-label")
     assert len(row_labels) == len(analysis.evaluation.transient_artifact.STATE_ORDER)
@@ -1220,8 +1418,9 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
         ),
     )
     assert set(figure.axes) == {*map_axes, *colorbar_axes}
+    figure.canvas.draw()
     assert all(
-        colorbar_axis.get_position().height == pytest.approx(map_axis.get_position().height)
+        map_axis.get_position().y0 - 1e-6 <= colorbar_axis.get_position().y0 and colorbar_axis.get_position().y1 <= map_axis.get_position().y1 + 1e-6
         for map_axis, colorbar_axis in zip(map_axes, colorbar_axes, strict=True)
     )
     plt.close(figure)
@@ -1262,6 +1461,260 @@ def test_transient_panel_plots_pipeline_and_local_report_remain_sequence_aware(t
     assert set(report.media_files).union(report.tables) == analysis.presentation.curated.TRANSIENT_CURATED_ANALYSIS_KEYS
     assert all(report_path.is_file() for report_path in report.media_files.values())
     assert curated_map_checks == [True]
+    evaluation.close()
+
+
+def _map_record() -> SimpleNamespace:
+    """Return a 6x6 autonomous record with three times whose states vary in space and time."""
+    record = sequence_record("autonomous_full", "full")
+    ramp = np.linspace(0.0, 1.0, 36).reshape(6, 6)
+    base = np.array([300.0, 0.3, 0.5, 0.6]).reshape(1, 4, 1, 1)
+    step = np.array([10.0, 0.1, 0.1, 0.1]).reshape(1, 4, 1, 1)
+    spatial = np.array([10.0, 0.1, 0.2, 0.2]).reshape(1, 4, 1, 1)
+    reference = base + step * np.arange(3).reshape(3, 1, 1, 1) + spatial * ramp
+    record.reference_states = reference.astype(np.float32)
+    record.predicted_states = (reference + 0.3 * spatial * (ramp - 0.5)).astype(np.float32)
+    record.spatial_mask = np.ones((6, 6), dtype=bool)
+    record.static_conditioning = np.zeros((7, 6, 6), dtype=np.float32)
+    record.static_conditioning[0], record.static_conditioning[1] = np.meshgrid(np.arange(6.0), np.arange(6.0))
+    return record
+
+
+def test_state_map_norms_cover_every_given_time_and_the_single_frame_default_uses_its_own_time() -> None:
+    """The fixed scales span all given times; a plot without norms scales to its own time."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    common = {"state_fields": ("T", "w_surf"), "lock_scale": False, "error_mode": "Absolute error"}
+    over_time = transient.state_map_norms(record, time_indices=(0, 2), **common)
+    single = transient.state_map_norms(record, time_indices=(1,), **common)
+    for field, channel in (("T", 0), ("w_surf", 2)):
+        expected = transient._display_state_values(field, record.reference_states[[0, 2], channel], error=False)
+        assert over_time[field].reference.vmin == pytest.approx(expected.min())
+        assert over_time[field].reference.vmax == pytest.approx(expected.max())
+        absolute = np.abs(record.predicted_states[[0, 2], channel] - record.reference_states[[0, 2], channel])
+        shown = transient._display_state_values(field, absolute, error=True)
+        assert over_time[field].error.boundaries[0] <= shown.min()
+        assert over_time[field].error.boundaries[-1] >= shown.max()
+        assert single[field].reference.vmin > over_time[field].reference.vmin
+    figure = transient.plot_state_maps(record, physical_time=1.0, **common)
+    assert figure.axes[0].collections[0].norm.vmin == pytest.approx(single["T"].reference.vmin)
+    assert figure.axes[0].collections[0].norm.vmax == pytest.approx(single["T"].reference.vmax)
+    plt.close(figure)
+
+
+def test_negative_predicted_water_enters_every_grain_moisture_path_as_predicted() -> None:
+    """Negative predicted water is shown and averaged over all cells like the reference; nothing is excluded."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    record.predicted_states[1, 2:4, 2:4, 2] = -0.1
+    figure = transient.plot_state_maps(record, state_fields=("w_gr",), physical_time=1.0, error_mode="Absolute error")
+    shown = figure.axes[1].collections[0].get_array()
+    assert np.ma.count_masked(shown) == 0
+    assert shown.min() < 0.0
+    assert not any("Unavailable" in text.get_text() for text in figure.axes[2].texts)
+    plt.close(figure)
+    trajectory = transient.plot_state_trajectory_summary({"case": [record]}, state_fields=("w_gr",))
+    (line,) = (line for line in trajectory.axes[0].get_lines() if line.get_label() == "case · Prediction")
+    grain = transient._grain_moisture(record, np.asarray(record.predicted_states, dtype=np.float64))
+    assert line.get_ydata()[1] == pytest.approx(transient._display_state_values("w_gr", grain, error=False)[1].mean())
+    plt.close(trajectory)
+    aggregate = transient.plot_aggregate_error_maps([record], state_fields=("w_gr",), physical_time=1.0, statistic="mean")
+    plt.close(aggregate)
+    assert transient.maximum_error_physical_time(record, state_fields=("w_gr",)) in {1.0, 2.0}
+
+
+def test_maximum_error_time_lands_on_a_diverging_state_prediction() -> None:
+    """A non-finite predicted state cell makes its time the worst instead of being averaged away."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    record.predicted_states[2, 0] += 5.0
+    record.predicted_states[1, 0, 3, 3] = np.inf
+    assert transient.maximum_error_physical_time(record, state_fields=("T", "w_gr")) == pytest.approx(float(record.physical_times[1]))
+
+
+def test_a_partly_diverging_prediction_masks_only_its_cells_and_is_named_in_every_pooled_view() -> None:
+    """Diverging cells are masked in error maps and pooled errors and counted in the parity and error-trend plots."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    record.predicted_states[1:, 0, 3, 3] = np.nan
+    maps = transient.plot_state_maps(record, state_fields=("T",), physical_time=1.0, error_mode="Absolute error")
+    assert np.ma.count_masked(maps.axes[2].collections[0].get_array()) == 1
+    plt.close(maps)
+    text = transient._mean_normalized_error_text(record, "T", record.reference_states[1, 0], record.predicted_states[1, 0], None)
+    assert text == "mean |e|/s non-finite"
+    _x, _y, mean_error, std_error, _reference_means, prediction_means = transient._aggregate_snapshot_evidence(
+        [record], state_field="T", physical_time=1.0
+    )
+    assert np.isnan(mean_error[3, 3])
+    assert np.isnan(std_error[3, 3])
+    assert np.count_nonzero(np.isfinite(mean_error)) == mean_error.size - 1
+    assert not np.isfinite(prediction_means).any()
+    plt.close(transient.plot_aggregate_error_maps([record], state_fields=("T",), physical_time=1.0, statistic="mean"))
+    parity = transient.plot_predicted_vs_reference_channels([record], state_fields=("T",), physical_time=1.0)
+    assert any(text.get_text().startswith("1 non-finite") for text in parity.axes[0].texts)
+    plt.close(parity)
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
+    assert trend.axes[0].get_lines()[0].get_label() == "case · 2 of 72 values non-finite, excluded"
+    plt.close(trend)
+    record.predicted_states[1:, 0] = np.nan
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
+    (line,) = trend.axes[0].get_lines()
+    assert line.get_label() == "case · 72 of 72 values non-finite, excluded"
+    assert len(line.get_ydata()) == 0
+    plt.close(trend)
+
+
+def test_thinned_error_trends_name_the_exact_non_finite_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Divergences between the thinning positions are counted exactly and named, while the finite medians stay as they were."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    monkeypatch.setattr(transient, "_TARGET_MAGNITUDE_POINT_LIMIT", 36)  # 72 post-origin elements: stride 2
+    finite_centers, finite_medians, *finite_counts = transient._finite_error_trend([record], "T")
+    odd_cells = (np.arange(36).reshape(6, 6) % 2).astype(bool)
+    record.predicted_states[1:, 0][:, odd_cells] = np.nan  # every odd raveled element, which stride 2 never samples
+    centers, medians, *counts = transient._finite_error_trend([record], "T")
+    assert (finite_counts, counts) == ([0, 72], [36, 72])
+    np.testing.assert_array_equal(centers, finite_centers)
+    np.testing.assert_array_equal(medians, finite_medians)
+    trend = transient.plot_error_vs_target_magnitude({"case": [record]}, state_fields=("T",))
+    assert trend.axes[0].get_lines()[0].get_label() == "case · 36 of 72 values non-finite, excluded"
+    plt.close(trend)
+
+
+def test_panels_without_finite_values_state_so_and_an_out_of_range_prediction_gets_its_own_scale() -> None:
+    """An all-non-finite prediction panel is labelled; a locked scale yields to an unphysical prediction."""
+    transient = analysis.evaluation.plots.transient
+    record = _map_record()
+    record.predicted_states[1, 0] = np.nan
+    figure = transient.plot_state_maps(record, state_fields=("T",), physical_time=1.0)
+    assert [text.get_text() for text in figure.axes[1].texts] == ["unavailable: no finite values"]
+    plt.close(figure)
+    record = _map_record()
+    locked = {"state_fields": ("T",), "time_indices": (1,), "error_mode": "Absolute error"}
+    shared = transient.state_map_norms(record, lock_scale=True, **locked)["T"]
+    assert shared.note is None
+    assert (shared.reference.vmin, shared.reference.vmax) == (shared.prediction.vmin, shared.prediction.vmax)
+    record.predicted_states[1, 0, 3, 3] = 5000.0
+    own = transient.state_map_norms(record, lock_scale=True, **locked)["T"]
+    assert own.note == "prediction outside physical range: own colour scale"
+    assert own.prediction.vmax > own.reference.vmax
+    assert transient.state_map_norms(record, lock_scale=False, **locked)["T"].note is None
+    figure = transient.plot_state_maps(record, state_fields=("T",), physical_time=1.0)
+    assert any(text.get_text() == own.note for text in figure.axes[1].texts)
+    plt.close(figure)
+
+
+def test_error_panel_title_carries_the_mean_normalized_error_with_a_scale_and_na_without() -> None:
+    """The mean |e|/s of the bed is printed with a train-only scale and marked n/a otherwise."""
+    transient = analysis.evaluation.plots.transient
+    record = sequence_record("autonomous_full", "full")
+    scale = error_diagnostics.transient_reference_scale(
+        scaling_state(),
+        field="T",
+        unit="K",
+        state_order=analysis.evaluation.transient_artifact.STATE_ORDER,
+        dataset_identity="a" * 64,
+    )
+    assert isinstance(scale, error_diagnostics.ReferenceScale)
+    with_scale = transient.plot_state_maps(record, state_fields=("T",), error_mode="Signed error", reference_scales={"T": scale})
+    without_scale = transient.plot_state_maps(record, state_fields=("T",), error_mode="Signed error")
+    assert with_scale.axes[2].get_title() == "Signed error · mean |e|/s = 1"
+    assert without_scale.axes[2].get_title() == "Signed error · mean |e|/s n/a"
+    plt.close(with_scale)
+    plt.close(without_scale)
+
+
+def _gif_viewer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[session.TransientEvaluationSession, widgets.Button, Any]:
+    """Return a sample viewer over one case with three varying stored times and an export folder in ``tmp_path``."""
+    record = sequence_record("autonomous_full", "full")
+    values = (0.3 * np.arange(3, dtype=np.float32)).reshape(3, 1, 1, 1) * np.ones((3, 4, 1, 1), dtype=np.float32)
+    record.reference_states = values
+    record.predicted_states = values + 0.1 + 0.05 * np.arange(3, dtype=np.float32).reshape(3, 1, 1, 1)
+    evaluation = session.TransientEvaluationSession({"id": production_frame((record,), artifact_root=str(tmp_path / "artifact"))})
+    monkeypatch.setattr(analysis.ui.notebook, "_export_destination", lambda: tmp_path)
+    viewer = analysis.evaluation.panel._make_transient_sample_viewer(
+        session=evaluation,
+        fields=analysis.evaluation.panel._transient_channel_fields(evaluation),
+        comparison=False,
+    )
+    channel_row = viewer.children[1].children[1]
+    channel_row.boxes["phi"].value = False
+    channel_row.boxes["w_int"].value = False
+    return evaluation, viewer.children[3].children[0].children[1], viewer
+
+
+def test_gif_export_writes_all_stored_times_of_the_active_channels_with_one_frame_size(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two active channels and three stored times give one GIF with three equally sized, looping frames."""
+    from PIL import Image  # noqa: PLC0415 -- Pillow reads the written file back; it is a matplotlib dependency
+
+    evaluation, button, _viewer = _gif_viewer(tmp_path, monkeypatch)
+    button.click()
+    (path,) = tmp_path.glob("*.gif")
+    assert "channel_t-w_surf" in path.name
+    assert "t-all" in path.name
+    assert button.disabled is False
+    width, height = analysis.ui.plot_layout.MAP_LAYOUT.figure_size(rows=2, columns=3)
+    with Image.open(path) as image:
+        assert image.n_frames == 3
+        assert image.info["loop"] == 0
+        assert image.info["duration"] == 200
+        assert image.size[0] == pytest.approx(width * 60, abs=1)
+        assert image.size[1] == pytest.approx(height * 60, abs=1)
+    evaluation.close()
+
+
+def test_gif_export_refuses_above_the_memory_limit_and_reenables_the_button_after_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An oversized GIF creates no file; a failing frame removes the partial file and frees the button."""
+    evaluation, button, _viewer = _gif_viewer(tmp_path, monkeypatch)
+    monkeypatch.setattr(analysis.evaluation.panel, "_GIF_MEMORY_LIMIT_BYTES", 1)
+    capsys.readouterr()
+    button.click()
+    assert "Refused" in capsys.readouterr().out
+    assert not list(tmp_path.glob("*.gif"))
+    assert button.disabled is False
+    monkeypatch.undo()
+    monkeypatch.setattr(analysis.ui.notebook, "_export_destination", lambda: tmp_path)
+
+    def failing(*_args: object, **kwargs: object) -> Figure:
+        if kwargs.get("figure") is None:
+            plt.figure()  # a renderer that allocates its own figure before failing
+        message = "frame failed"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_state_maps", failing)
+    open_figures = plt.get_fignums()
+    button.click()
+    assert not list(tmp_path.glob("*.gif"))
+    assert button.disabled is False
+    assert plt.get_fignums() == open_figures
+    evaluation.close()
+
+
+def test_gif_export_never_writes_through_a_path_replaced_after_its_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A symlink swapped in at the reserved name is neither followed nor reported as the saved GIF."""
+    evaluation, button, _viewer = _gif_viewer(tmp_path, monkeypatch)
+    decoy = tmp_path / "decoy.bin"
+    decoy.write_bytes(b"keep")
+    render = analysis.evaluation.plots.transient.plot_state_maps
+
+    def swap_then_render(*args: object, **kwargs: object) -> Figure:
+        for reserved in tmp_path.glob("*.gif"):
+            if not reserved.is_symlink():
+                reserved.unlink()
+                reserved.symlink_to(decoy)
+        return render(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(analysis.evaluation.plots.transient, "plot_state_maps", swap_then_render)
+    capsys.readouterr()
+    button.click()
+    status = capsys.readouterr().out
+    assert decoy.read_bytes() == b"keep"
+    assert "was replaced during the export" in status
+    assert "Saved" not in status
     evaluation.close()
 
 

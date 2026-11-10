@@ -11,7 +11,7 @@ Design principles:
   - Display labels and figure presentation never participate in numerical keys
   - ID, OOD, run, checkpoint, normalizer, and payload identities remain separate
   - Exact spatial quantiles use bounded session-owned scratch, not case retention
-  - Local-error curves use one versioned bounded empirical-quantile definition
+  - Local-error curves use one bounded empirical-quantile definition
   - Direct plot calls receive a scoped ephemeral session without global state
 
 This module does NOT:
@@ -62,8 +62,7 @@ if TYPE_CHECKING:
 
 SESSION_ATTR = "_evaluation_session"
 SESSION_KEY_ATTR = "_evaluation_artifact_key"
-LOCAL_EMPIRICAL_QUANTILE_DEFINITION = "local_relative_error_empirical_quantiles_v1"
-LOCAL_EMPIRICAL_QUANTILE_VERSION = 1
+LOCAL_EMPIRICAL_QUANTILE_DEFINITION = "local_relative_error_empirical_quantiles"
 _MINIMUM_MAGNITUDE_COMPONENTS = 2
 LOCAL_EMPIRICAL_QUANTILE_GRID_SIZE = 1025
 LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES = np.linspace(
@@ -78,7 +77,6 @@ __all__ = [
     "LOCAL_EMPIRICAL_QUANTILE_DEFINITION",
     "LOCAL_EMPIRICAL_QUANTILE_GRID_SIZE",
     "LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES",
-    "LOCAL_EMPIRICAL_QUANTILE_VERSION",
     "ArtifactKey",
     "BinnedMeanSummary",
     "BinnedMedianSummary",
@@ -143,7 +141,7 @@ class ArtifactKey:
     config_digest, checkpoint_digest, normalizer_digest : str
         Exact completed-run scientific identity digests.
     split_role : str
-        Explicit ``eval`` or ``additional_evaluation`` persisted role.
+        Explicit ``eval``, ``material_ood`` or ``parameter_ood`` persisted role.
     dataset_digest, membership_digest : str
         Digest of the role's source Dataset provenance and effective ordered-membership identity.
     manifest_digest : str
@@ -355,8 +353,6 @@ class EmpiricalQuantileSummary:
     ----------
     definition : str
         Stable named numerical definition.
-    version : int
-        Definition schema version.
     probabilities, quantiles : numpy.ndarray
         Fixed probability grid and aligned linear empirical quantiles.
     source_point_count : int
@@ -367,7 +363,6 @@ class EmpiricalQuantileSummary:
     """
 
     definition: str
-    version: int
     probabilities: np.ndarray
     quantiles: np.ndarray
     source_point_count: int
@@ -1148,7 +1143,7 @@ def _binned_median(x_values: np.ndarray, y_values: np.ndarray, *, bins: int) -> 
 
 def _empirical_quantiles(values: np.ndarray) -> EmpiricalQuantileSummary:
     """
-    Build the versioned bounded local-error quantile representation.
+    Build the bounded local-error quantile representation.
 
     Parameters
     ----------
@@ -1179,7 +1174,6 @@ def _empirical_quantiles(values: np.ndarray) -> EmpiricalQuantileSummary:
     quantiles[-1] = float(np.max(numeric))
     return EmpiricalQuantileSummary(
         definition=LOCAL_EMPIRICAL_QUANTILE_DEFINITION,
-        version=LOCAL_EMPIRICAL_QUANTILE_VERSION,
         probabilities=LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES,
         quantiles=_readonly(quantiles),
         source_point_count=int(numeric.size),
@@ -1315,7 +1309,7 @@ class EvaluationSession:
         ----------
         loaded_runs : Iterable[LoadedRunArtifacts]
             Non-empty strict-loader results. Each canonical run contributes its
-            validated ``eval`` and any ``additional_evaluation`` frame exactly once.
+            validated ``eval`` and any ``material_ood`` and ``parameter_ood`` frame exactly once.
         **limits : int
             Optional resource limits accepted by :class:`EvaluationSession`.
 
@@ -1330,7 +1324,7 @@ class EvaluationSession:
             If an item does not expose the strict loaded-run contract.
         ValueError
             If input is empty, run names repeat, or artifact roles contradict
-            their ``eval`` and ``additional_evaluation`` bindings.
+            their ``eval``, ``material_ood`` and ``parameter_ood`` bindings.
 
         Notes
         -----
@@ -1380,7 +1374,6 @@ class EvaluationSession:
         for loaded in runs:
             run_name = getattr(loaded, "run_name", None)
             id_artifact = getattr(loaded, "id_artifact", None)
-            additional_artifact = getattr(loaded, "additional_artifact", None)
             if not isinstance(run_name, str) or not run_name or id_artifact is None:
                 msg = "loaded_runs items must expose run_name and id_artifact."
                 raise TypeError(msg)
@@ -1388,7 +1381,8 @@ class EvaluationSession:
                 msg = f"Duplicate canonical loaded run name: {run_name!r}."
                 raise ValueError(msg)
             seen_names.add(run_name)
-            role_artifacts = [("eval", id_artifact)] + ([] if additional_artifact is None else [("additional_evaluation", additional_artifact)])
+            # Each loaded role binds under its artifact split: ``eval`` for ID, the OOD role name otherwise.
+            role_artifacts = [("eval" if role == "id" else role, artifact) for role, artifact in loaded.role_artifacts().items()]
             for expected_role, artifact in role_artifacts:
                 split_role = getattr(artifact, "split_role", None)
                 frame = getattr(artifact, "frame", None)

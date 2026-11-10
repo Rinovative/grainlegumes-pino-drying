@@ -1,7 +1,6 @@
 # Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
 # Machine-readable parameter registry: units, transforms, blocks, OOD grouping, applicability, and design order define sampling coordinates.
 schema_kind: generation_parameter_registry
-schema_version: 1
 # Each entry describes a sampled, fixed, derived, or coupled coordinate. A transform controls sampling space; profile_applicability limits where it applies.
 parameters:
   kappa_mean:

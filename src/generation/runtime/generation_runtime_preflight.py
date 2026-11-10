@@ -182,7 +182,6 @@ def reported_version_matches(output: object, expected: str) -> bool:
 def _command_versions(
     commands: dict[str, str],
     *,
-    python_module: str,
     comsol_module: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
@@ -196,17 +195,13 @@ def _command_versions(
     if failures:
         message = f"CPU compute-node prerequisite failed: version checks {failures} (blocks compute)."
         raise RuntimeError(message)
-    expected_versions = {
-        "python": configured_module_version(python_module),
-        "comsol": configured_module_version(comsol_module),
-    }
-    for name, expected in expected_versions.items():
-        if expected is not None and not reported_version_matches(results[name]["output"], expected):
-            message = (
-                f"CPU compute-node prerequisite failed: Configured {name} module expects version {expected}, "
-                f"but the active executable reported {results[name]['output']!r}."
-            )
-            raise RuntimeError(message)
+    expected = configured_module_version(comsol_module)
+    if expected is not None and not reported_version_matches(results["comsol"]["output"], expected):
+        message = (
+            f"CPU compute-node prerequisite failed: Configured comsol module expects version {expected}, "
+            f"but the active executable reported {results['comsol']['output']!r}."
+        )
+        raise RuntimeError(message)
     return results
 
 
@@ -345,22 +340,9 @@ def run_cpu_preflight(
     if only_batch is not None:
         campaign = campaign.select_batches((only_batch,))
     site = campaign.execution_values["site"]
-    if site["scheduler"] != "slurm":
-        message = "Native CPU cluster preflight requires configured scheduler='slurm'."
-        raise ValueError(message)
     modules = tuple(campaign.execution_values["runtime"]["module_initialization"])
     timeout_seconds = float(campaign.execution_values["runtime"]["timeout_seconds"])
 
-    configured_python_version = configured_module_version(str(site["python_module"]))
-    if configured_python_version is not None:
-        expected_python = tuple(int(component) for component in configured_python_version.split("."))
-        active_python = tuple(sys.version_info[: len(expected_python)])
-        if active_python != expected_python:
-            message = (
-                "CPU compute-node prerequisite failed: Configured Python module expects version "
-                f"{configured_python_version}, but the active interpreter is {sys.version}."
-            )
-            raise RuntimeError(message)
     command_names = {
         "python": str(site["python_executable"]),
         "comsol": str(site["comsol_executable"]),
@@ -377,7 +359,6 @@ def run_cpu_preflight(
         commands[label] = executable
     versions = _command_versions(
         commands,
-        python_module=str(site["python_module"]),
         comsol_module=str(site["comsol_module"]),
         timeout_seconds=timeout_seconds,
     )

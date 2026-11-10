@@ -26,7 +26,6 @@ from src.analysis.eda import eda_selection as selection
 from src.analysis.eda import eda_sources as sources
 from src.analysis.eda import eda_workspace as workspace
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
-from src.datasets.packages import dataset_packages_selection
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -332,7 +331,6 @@ def test_published_steady_eda_preserves_encoded_inputs_and_boundary_support(
     result = datasets.packages.build_dataset_selection(
         {
             "schema_kind": "dataset_selection_request",
-            "schema_version": dataset_packages_selection.SELECTION_SCHEMA_VERSION,
             "source_task": "steady_flow",
             "dataset_name": "steady_eda_source",
             "dataset_view": "steady_flow",

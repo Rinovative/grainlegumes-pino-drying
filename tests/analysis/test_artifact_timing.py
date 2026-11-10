@@ -81,7 +81,6 @@ def _neural_cases() -> list[dict[str, Any]]:
 def _comsol_payload(*, digest: str = "a" * 64) -> dict[str, Any]:
     return {
         "schema_kind": analysis.artifacts.timing.SIMULATION_TIMING_SCHEMA_KIND,
-        "schema_version": 1,
         "simulation_profile": "steady_flow",
         "batch_id": "batch-a",
         "batch_manifest_sha256": digest,
@@ -196,24 +195,6 @@ def test_runtime_comparison_rejects_invalid_or_duplicate_cases(mutation: Any) ->
     mutation(payload)
     with pytest.raises((TypeError, ValueError)):
         analysis.artifacts.timing.validate_runtime_comparison(payload)
-
-
-@pytest.mark.parametrize(
-    "schema_version",
-    [True, 1.0, 2],
-    ids=("boolean-one", "floating-one", "unsupported-integer"),
-)
-def test_timing_payloads_require_integer_schema_version_one(schema_version: object) -> None:
-    """Reject alternate representations in both persisted timing payloads."""
-    comsol = _comsol_payload()
-    comsol["schema_version"] = schema_version
-    with pytest.raises(ValueError, match="invalid schema"):
-        analysis.artifacts.timing.validate_simulation_batch_timing(comsol)
-
-    comparison = _comparison()
-    comparison["schema_version"] = schema_version
-    with pytest.raises(ValueError, match="invalid schema"):
-        analysis.artifacts.timing.validate_runtime_comparison(comparison)
 
 
 @pytest.mark.parametrize("measured_case_count", [True, 1.0], ids=("boolean-one", "floating-one"))

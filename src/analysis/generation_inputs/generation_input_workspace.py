@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
     from src.analysis.presentation import analysis_display_grid as display_grid
 
-_GENERATION_DOCUMENTATION_LINK: Final = "../docs/06_generation_reference.md#input-only-generation-and-status"
+_GENERATION_DOCUMENTATION_LINK: Final = "../docs/03_generation.md#input-only-generation-and-status"
 _GENERIC_GENERATION_COMMAND: Final = "../runtime/venvs/native/bin/python -m src.datasets.dataset_packages run configs/02_datasets/<task>/<plan>.yaml"
 _MAXIMUM_DISPLAYED_ISSUES: Final = 5
 

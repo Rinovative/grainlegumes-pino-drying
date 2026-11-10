@@ -144,7 +144,7 @@ def _identity(*, model_kind: str = "rno") -> dict[str, Any]:
         "model_kind": model_kind,
         "model_parameters": {"hidden_channels": 8},
         "checkpoint_identity": {"sha256": "b" * 64},
-        "input_profile": "canonical_physics_complete_v1",
+        "input_profile": "canonical_physics_complete",
         "coordinate_policy": "explicit_x_y",
         "boundary_representation": "both_interval_endpoints_with_startup_support",
         "scaling_identity": {"semantic_digest": "c" * 64},
@@ -469,7 +469,7 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
         "simulation_case_id": "c" * 64,
         "case_hdf5_sha256": "d" * 64,
         "source_batch_id": "batch-1",
-        "case_hdf5_relative": "01_generation/transient_drying/campaign-1/lentil/case_0001/case.h5",
+        "case_hdf5_relative": "01_generation/transient_drying/campaign-1/materials/lentil/case_0001/case.h5",
     }
     design = {"origin": "replacement", "candidate_position": 2}
     manifest = {"source_case_identities": [{"package_case_id": package_case_id, "source": source, "design": design}]}
@@ -717,7 +717,7 @@ def test_protocol_identity_covers_complete_transient_evaluation_configuration() 
 
 
 def _run_plan(run_dir: Path, *, task: str, with_additional: bool) -> artifact_plan.ArtifactPlan:
-    """Return a one-source artifact plan with an optional one-source additional role."""
+    """Return a one-source artifact plan with an optional one-source material-OOD role."""
 
     def role(split: Any, dataset_role: Any, dataset_id: str) -> artifact_plan.ArtifactRolePlan:
         return artifact_plan.ArtifactRolePlan(
@@ -730,9 +730,11 @@ def _run_plan(run_dir: Path, *, task: str, with_additional: bool) -> artifact_pl
             membership_digests=("a" * 64,),
         )
 
-    additional = role("additional_evaluation", "additional_evaluation", "additional_dataset") if with_additional else None
+    ood_roles: dict[artifact_plan.ArtifactSplit, artifact_plan.ArtifactRolePlan] = (
+        {"material_ood": role("material_ood", "material_ood", "material_dataset")} if with_additional else {}
+    )
     id_role = role("eval", "id", "id_dataset")
-    return artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task=task, id_role=id_role, additional_role=additional)
+    return artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task=task, id_role=id_role, ood_roles=ood_roles)
 
 
 def _patch_publication_lifecycle(
@@ -841,7 +843,7 @@ def test_artifact_publication_validates_every_role_before_uploading_its_provenan
 ) -> None:
     """Both tasks bind every role frame to its validated source, reduce and log one bounded summary, then steady adds media."""
     events: list[str] = []
-    frames = {"eval": pd.DataFrame({"value": [1.0]}), "additional_evaluation": pd.DataFrame({"value": [2.0]})}
+    frames = {"eval": pd.DataFrame({"value": [1.0]}), "material_ood": pd.DataFrame({"value": [2.0]})}
     for split, frame in frames.items():
         frame.attrs["artifact_provenance"] = {"split": split}
 
@@ -851,7 +853,7 @@ def test_artifact_publication_validates_every_role_before_uploading_its_provenan
 
     class FakeTransientSession:
         def __init__(self, frames_by_role: dict[str, pd.DataFrame]) -> None:
-            assert list(frames_by_role) == ["id", "additional_evaluation"]
+            assert list(frames_by_role) == ["id", "material_ood"]
 
         def wandb_publication_summary(self) -> dict[str, bool | float | int | str]:
             events.append("reduce_summary")
@@ -861,9 +863,9 @@ def test_artifact_publication_validates_every_role_before_uploading_its_provenan
             pass
 
     def reduce_steady(role_frames: Mapping[str, pd.DataFrame]) -> dict[str, int]:
-        assert list(role_frames) == ["id", "additional_evaluation"]
+        assert list(role_frames) == ["id", "material_ood"]
         assert role_frames["id"] is frames["eval"]
-        assert role_frames["additional_evaluation"] is frames["additional_evaluation"]
+        assert role_frames["material_ood"] is frames["material_ood"]
         events.append("reduce_summary")
         return {"evaluation/id/valid_case_count": 1}
 
@@ -880,42 +882,52 @@ def test_artifact_publication_validates_every_role_before_uploading_its_provenan
     monkeypatch.setattr(artifact_service, "_steady_wandb_summary", reduce_steady)
     monkeypatch.setattr(curated, "render_curated_analysis", lambda **_kwargs: SimpleNamespace(media_files={}, tables={}))
     _patch_publication_lifecycle(monkeypatch, config=config, task_id=task, tracking_session=tracking_session, events=events)
+    patched_initialize = artifact_service.experiments.tracking.initialize_wandb
+    initializations: list[dict[str, Any]] = []
+
+    def record_initialization(*args: Any, **kwargs: Any) -> Any:
+        initializations.append(kwargs)
+        return patched_initialize(*args, **kwargs)
+
+    monkeypatch.setattr(artifact_service.experiments.tracking, "initialize_wandb", record_initialization)
     plan = _run_plan(tmp_path / "run", task=task, with_additional=True)
     artifact_service._upload_published_artifacts(
         plan=plan,
         device_resolution=cast("Any", object()),
         id_frame=frames["eval"],
-        additional_frame=frames["additional_evaluation"],
+        ood_frames={"material_ood": frames["material_ood"]},
     )
 
+    # The resumed session projects the OOD parts the run was trained with, as the training session does.
+    assert [tuple(call["ood_roles"]) for call in initializations] == [("material_ood",)]
     assert events == [
         "validate_eval",
-        "validate_additional_evaluation",
+        "validate_material_ood",
         "reduce_summary",
         "append_runtime_session",
         "initialize_wandb",
         "upload_eval",
-        "upload_additional_evaluation",
+        "upload_material_ood",
         "log_summary",
         *(["media_eval"] if task == "steady_flow" else []),
         "finish_wandb",
     ]
 
-    frames["additional_evaluation"].attrs["artifact_provenance"] = {"split": "stale"}
+    frames["material_ood"].attrs["artifact_provenance"] = {"split": "stale"}
     with pytest.raises(artifact_service.ArtifactCacheError, match="not the validated upload source"):
         artifact_service._upload_published_artifacts(
             plan=plan,
             device_resolution=cast("Any", object()),
             id_frame=frames["eval"],
-            additional_frame=frames["additional_evaluation"],
+            ood_frames={"material_ood": frames["material_ood"]},
         )
 
 
 def test_scoped_role_selection_preserves_saved_order_and_rejects_unknown_cases() -> None:
     """Keep disposable case selection bounded to exact saved role membership."""
     role = artifact_plan.ArtifactRolePlan(
-        split="additional_evaluation",
-        dataset_role="additional_evaluation",
+        split="material_ood",
+        dataset_role="material_ood",
         dataset_name="combined-additional",
         source_dataset_ids=("additional-a", "additional-b"),
         source_identities=(
@@ -1044,13 +1056,13 @@ def test_evaluation_grid_variants_have_disjoint_rebuild_and_lock_targets(tmp_pat
     sampled_ood = artifact_service._artifact_save_root(
         run_dir=run_dir,
         dataset_name="dataset",
-        split="additional_evaluation",
+        split="material_ood",
         evaluation_spatial_stride=2,
     )
 
     assert canonical == run_dir / "analysis" / "id"
     assert sampled == run_dir / "analysis" / "grid_s2" / "id"
-    assert sampled_ood == run_dir / "analysis" / "grid_s2" / "additional_evaluation" / "dataset"
+    assert sampled_ood == run_dir / "analysis" / "grid_s2" / "material_ood" / "dataset"
     assert artifact_service._artifact_lock_path(run_dir=run_dir, save_root=canonical) != artifact_service._artifact_lock_path(
         run_dir=run_dir,
         save_root=sampled,
@@ -1074,7 +1086,7 @@ def test_transient_upload_admission_resolves_exact_grid_variant(
         case_ids_by_source=((_CASE_ID,),),
         membership_digests=("a" * 64,),
     )
-    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task="transient_drying", id_role=role, additional_role=None)
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task="transient_drying", id_role=role, ood_roles={})
     completed = {"config": {"task": "transient_drying"}}
     observed: dict[str, object] = {}
 
@@ -1165,9 +1177,10 @@ def test_default_geometric_horizons_are_exact_transition_contracts() -> None:
 
 
 def test_case_assembly_admits_exactly_the_artifact_dataset_roles() -> None:
-    """The rollout assembly shares the artifact's role vocabulary, so the additional-evaluation set is evaluable."""
-    assert rollout.assemble_transient_evaluation_case(_items(), dataset_role="additional_evaluation").dataset_role == "additional_evaluation"
-    with pytest.raises(ValueError, match="dataset_role must be 'id' or 'additional_evaluation'"):
+    """The rollout assembly shares the artifact's role vocabulary, so both OOD sets are evaluable."""
+    for role in ("material_ood", "parameter_ood"):
+        assert rollout.assemble_transient_evaluation_case(_items(), dataset_role=role).dataset_role == role
+    with pytest.raises(ValueError, match="dataset_role must be one of"):
         rollout.assemble_transient_evaluation_case(_items(), dataset_role=cast("Any", "ood"))
 
 
@@ -1374,7 +1387,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         },
         "dataset": {"name": "transient_dataset", "role": "id", "identity": {"index_digest": "a" * 64}},
         "evaluation": {"config_identity": "d" * 64},
-        "spatial_representation": {"schema_version": 1},
+        "spatial_representation": {"inference_contract": "fixture"},
         "runtime": {"device": "cpu", "precision": "float32"},
         "lineage": {"strategy": "rollout"},
         "timing": {"report": {"cases": []}, "component_availability": {}},
@@ -1418,14 +1431,14 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
         "forward_call_count": 3,
     }
     assert len(tuple((tmp_path / "artifact" / "npz").glob("*.npz"))) == 1
-    persisted_rows = pd.read_parquet(tmp_path / "artifact" / "transient_dataset.parquet")
+    persisted_rows = pd.read_parquet(tmp_path / "artifact" / "artifacts.parquet")
     assert len(set(persisted_rows["payload_path"])) == 1
     for origin in (0, 1, 2):
         rolling = persisted_rows[(persisted_rows["mode"] == "rolling_origin") & (persisted_rows["origin_index"] == origin)]
         assert len(set(rolling["chain_id"])) == 1
 
     artifact_root = tmp_path / "artifact"
-    parquet_path = artifact_root / "transient_dataset.parquet"
+    parquet_path = artifact_root / "artifacts.parquet"
     marker_path = artifact_root / artifact_contracts.ARTIFACT_PROVENANCE_FILENAME
     original_parquet = parquet_path.read_bytes()
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -1446,7 +1459,7 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
     original_np_load = artifact.np.load
 
     def counted_np_load(*args: Any, **kwargs: Any) -> Any:
-        payload_loads.append(str(args[0]))
+        payload_loads.append(args[0].name)
         return original_np_load(*args, **kwargs)
 
     monkeypatch.setattr(artifact.np, "load", counted_np_load)
@@ -1474,10 +1487,41 @@ def test_rollout_modes_origins_horizons_conditioning_and_sequence_roundtrip(  # 
 
     with original_np_load(payload_path, allow_pickle=False) as loaded_payload:
         corrupted_payload = {name: loaded_payload[name] for name in loaded_payload.files}
+
+    # A payload replaced after its digest check must not be parsed: the archive reads the verified handle.
+    sibling = payload_path.with_name("replacement.tmp")
+    with sibling.open("wb") as stream:
+        np.savez_compressed(stream, **corrupted_payload, unexpected=np.asarray([1]))
+    parsed: list[Any] = []
+
+    def replacing_np_load(*args: Any, **kwargs: Any) -> Any:
+        sibling.replace(payload_path)
+        parsed.append(original_np_load(*args, **kwargs))
+        return parsed[-1]
+
+    original_bytes = payload_path.read_bytes()
+    monkeypatch.setattr(artifact.np, "load", replacing_np_load)
+    artifact.load_transient_sequence_artifact_index(artifact_root).records(case_id=_CASE_ID)
+    monkeypatch.setattr(artifact.np, "load", counted_np_load)
+    assert "unexpected" not in parsed[0].files
+    payload_path.write_bytes(original_bytes)
+
+    # An in-place change after the check is refused when a lazily read member would rely on it.
+    lazy_payload = artifact._TransientCasePayload(
+        payload_path, expected_sha256=artifact.common.serialization.file_sha256(payload_path), chain_lengths={}
+    )
+    with payload_path.open("ab") as appended:
+        appended.write(b"\0")
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="cannot be read"):
+        lazy_payload["reference_states"]
+    lazy_payload.close()
+    payload_path.write_bytes(original_bytes)
+
     np.savez_compressed(payload_path, **corrupted_payload, unexpected=np.asarray([1]))
-    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
-        artifact.load_transient_sequence_artifact_index(artifact_root)
-    with pytest.raises(artifact.TransientSequenceArtifactError, match="field inventory"):
+    reloaded = artifact.load_transient_sequence_artifact_index(artifact_root)  # same path set: the index is admitted, the bytes are checked on open
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="digest changed"):
+        reloaded.records(case_id=_CASE_ID)
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="digest changed"):  # checked before the archive is opened
         artifact.validate_transient_sequence_payload_inventory(indexed)
 
     with pytest.raises(ValueError, match="sequence inventory"):
@@ -1788,25 +1832,6 @@ def test_corner_nan_remains_nonfinite() -> None:
     assert _status_of(states) == validity_contract.NONFINITE
 
 
-def test_prediction_validity_rejects_other_schema_version() -> None:
-    """Readers reject a validity document whose schema version is not 1."""
-    states = _validity_states()
-    zeros = np.zeros_like(states)
-    validity = transient_validity.build_prediction_validity(
-        scaled_model_outputs=zeros,
-        decoded_physical_increments=zeros,
-        reconstructed_states=states,
-        prediction_available=np.ones(1, dtype=bool),
-        physical_times=np.asarray([0.0, 1.0]),
-        mode="autonomous_full",
-        origin_index=0,
-    )
-    assert validity["physical_contract"]["excluded_corner_block"] == 2
-    for version in (2, True, 1.0):  # JSON true and 1.0 must not pass as version 1.
-        with pytest.raises(ValueError, match=f"schema_version {version!r} is unsupported"):
-            transient_validity.validate_prediction_validity_document({**validity, "schema_version": version})
-
-
 def test_prediction_validity_classifies_valid_and_complete_nonfinite_fields() -> None:
     """Distinguish all-valid support from one wholly non-finite state field."""
     states = np.ones((1, len(artifact.STATE_ORDER), 2, 2), dtype=np.float32)
@@ -2050,21 +2075,6 @@ def test_load_admission_rejects_step_counts_contradicting_availability(tmp_path:
         replace(loaded, prediction_validity=validity).validated()
 
 
-def test_other_artifact_schema_version_is_rejected(tmp_path: Path) -> None:
-    """Reject a transient sequence artifact whose provenance declares a schema version other than 1."""
-    old_version = 2
-    root = tmp_path / "old-artifact"
-    stager = artifact.TransientSequenceArtifactStager(root, dataset_name="transient_dataset", dataset_role="id")
-    stager.write_case((_cache_test_record(_CASE_ID, mode="autonomous_full"),))
-    stager.finalize(provenance=_cache_test_provenance())
-    marker_path = root / artifact_contracts.ARTIFACT_PROVENANCE_FILENAME
-    marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker["artifact_schema_version"] = old_version
-    common.serialization.atomic_write_json(marker_path, marker)
-    with pytest.raises(artifact.TransientSequenceArtifactError, match=f"schema version {old_version} is unsupported"):
-        artifact.load_transient_sequence_artifact_index(root)
-
-
 def _chain_test_record(
     mode: artifact.EvaluationMode,
     *,
@@ -2134,7 +2144,7 @@ def test_chain_storage_omits_first_states_and_duplicate_chains_and_roundtrips_bi
     chains, records = _chain_test_case()
     root = _write_chain_test_artifact(tmp_path, records)
 
-    rows = pd.read_parquet(root / "transient_dataset.parquet")
+    rows = pd.read_parquet(root / "artifacts.parquet")
     chain_ids = rows.groupby(["mode", "origin_index"])["chain_id"].agg(lambda values: tuple(set(values)))
     assert all(len(values) == 1 for values in chain_ids)
     assert chain_ids["autonomous_full", 0] == chain_ids["rolling_origin", 0]
@@ -2181,7 +2191,7 @@ def _resign_chain_test_artifact(root: Path, *, rows: pd.DataFrame | None = None,
     payload_path = next((root / "npz").glob("*.npz"))
     if payload is not None:
         cast("Any", np.savez)(payload_path, **payload)
-    parquet_path = root / "transient_dataset.parquet"
+    parquet_path = root / "artifacts.parquet"
     table = pd.read_parquet(parquet_path) if rows is None else rows
     table["payload_sha256"] = common.serialization.file_sha256(payload_path)
     table.to_parquet(parquet_path, index=False)
@@ -2205,7 +2215,7 @@ def test_load_rejects_chain_storage_without_a_valid_owner(
     """Admit a stored chain only from an owner of its case with the same origin that covers its longest horizon."""
     _chains, records = _chain_test_case()
     root = _write_chain_test_artifact(tmp_path, records)
-    rows = pd.read_parquet(root / "transient_dataset.parquet")
+    rows = pd.read_parquet(root / "artifacts.parquet")
     owner_chain = "0" * 24 if owner is None else rows.loc[(rows["mode"] == owner[0]) & (rows["origin_index"] == owner[1]), "chain_id"].iloc[0]
     rows.loc[rows["mode"].isin(victims) & (rows["origin_index"] == victim_origin), "chain_id"] = owner_chain
     _resign_chain_test_artifact(root, rows=rows)
@@ -2342,7 +2352,7 @@ def _cache_test_provenance() -> dict[str, Any]:
         },
         "dataset": {"name": "transient_dataset", "role": "id", "identity": {"index_digest": "a" * 64}},
         "evaluation": {"config_identity": "d" * 64},
-        "spatial_representation": {"schema_version": 1},
+        "spatial_representation": {"inference_contract": "fixture"},
         "runtime": {"device": "cpu", "precision": "float32"},
         "lineage": {"strategy": "rollout"},
         "timing": {"report": {"cases": []}, "component_availability": {}},
@@ -2356,15 +2366,15 @@ def test_streaming_stager_writes_cases_before_marker_and_retains_only_compact_ro
     """Persist each case once while keeping private staging incomplete until finalization."""
     root = tmp_path / "streamed"
     observed_hashes: list[Path] = []
-    original_sha256 = artifact.common.serialization.file_sha256
+    original_sha256 = artifact.common.serialization._stream_sha256  # the one hashing primitive behind every file digest
 
-    def counted_sha256(value: Path) -> str:
-        observed_hashes.append(value)
-        return original_sha256(value)
+    def counted_sha256(stream: Any) -> str:
+        observed_hashes.append(Path(stream.name))
+        return original_sha256(stream)
 
     monkeypatch.setattr(
         artifact.common.serialization,
-        "file_sha256",
+        "_stream_sha256",
         counted_sha256,
     )
     stager = artifact.TransientSequenceArtifactStager(
@@ -2420,7 +2430,7 @@ def test_load_rejects_a_case_bundle_named_by_another_case(tmp_path: Path) -> Non
     root = _write_chain_test_artifact(tmp_path, records)
     original = root / "npz" / f"{_CASE_ID}.npz"
     renamed = original.rename(original.with_name(f"{_CASE_B}.npz"))
-    rows = pd.read_parquet(root / "transient_dataset.parquet")
+    rows = pd.read_parquet(root / "artifacts.parquet")
     rows["payload_path"] = f"npz/{renamed.name}"
     _resign_chain_test_artifact(root, rows=rows)
 
@@ -2543,7 +2553,6 @@ def _resume_evidence_with_timing(timing: dict[str, Any]) -> tuple[dict[str, Any]
         json.dumps(
             {
                 "schema_kind": artifact_generator._RESUME_EVIDENCE_SCHEMA_KIND,
-                "schema_version": artifact_generator._RESUME_EVIDENCE_SCHEMA_VERSION,
                 "case_id": case_id,
                 "material_family": "lentil",
                 "identity": identity,
@@ -2988,14 +2997,14 @@ def test_transient_artifact_index_lazily_opens_case_payloads_and_closes_lru_entr
         ),
         provenance=_cache_test_provenance(),
     )
-    original_sha256 = artifact.common.serialization.file_sha256
+    original_sha256 = artifact.common.serialization._stream_sha256  # the one hashing primitive behind file_sha256 and open_verified_file
     digest_paths: list[Path] = []
 
-    def counted_sha256(value: Path) -> str:
-        digest_paths.append(value)
-        return original_sha256(value)
+    def counted_sha256(stream: Any) -> str:
+        digest_paths.append(Path(stream.name))
+        return original_sha256(stream)
 
-    monkeypatch.setattr(artifact.common.serialization, "file_sha256", counted_sha256)
+    monkeypatch.setattr(artifact.common.serialization, "_stream_sha256", counted_sha256)
     index = artifact.load_transient_sequence_artifact_index(artifact_root, cache_limit=1)
     assert digest_paths == []
 
@@ -3016,9 +3025,9 @@ def test_transient_artifact_index_lazily_opens_case_payloads_and_closes_lru_entr
             closed.append(self.path)
             self.archive.close()
 
-    def counted_np_load(value: Path, *args: Any, **kwargs: Any) -> Any:
+    def counted_np_load(value: Any, *args: Any, **kwargs: Any) -> Any:
         archive = original_np_load(value, *args, **kwargs)
-        path = Path(value)
+        path = Path(value.name)
         opened.append(path)
         return TrackedArchive(path, archive)
 
@@ -3043,13 +3052,14 @@ def test_transient_artifact_index_lazily_opens_case_payloads_and_closes_lru_entr
     assert closed == [first_path, second_path, first_path]
 
     first_path.write_bytes(first_path.read_bytes() + b"corrupt")
-    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
-        artifact.load_transient_sequence_artifact_index(artifact_root)
+    changed = artifact.load_transient_sequence_artifact_index(artifact_root)  # same path set: admitted, refused when the case opens
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="digest changed"):
+        changed.record(first_records[0])
+    changed.close()
 
 
-def test_artifact_files_are_hashed_once_across_admission_and_case_opens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Hash the Parquet table and each case bundle once, however often the artifact is admitted and opened."""
-    root = tmp_path / "artifact"
+def _write_two_case_artifact(root: Path) -> None:
+    """Write a small two-case transient artifact for index admission tests."""
     artifact.write_transient_sequence_artifact(
         root,
         dataset_name="transient_dataset",
@@ -3057,34 +3067,81 @@ def test_artifact_files_are_hashed_once_across_admission_and_case_opens(monkeypa
         records=(_cache_test_record(_CASE_ID, mode="autonomous_full"), _cache_test_record(_CASE_B, mode="autonomous_full")),
         provenance=_cache_test_provenance(),
     )
-    monkeypatch.setattr(artifact_contracts, "_FILE_DIGESTS", {})
-    original = common.serialization.file_sha256
+
+
+def test_index_refuses_a_changed_parquet_and_a_missing_or_extra_case_payload(tmp_path: Path) -> None:
+    """Admit the payload set structurally: the table digest and the exact NPZ path set must match the manifest."""
+    root = tmp_path / "artifact"
+    _write_two_case_artifact(root)
+    artifact.load_transient_sequence_artifact_index(root).close()
+    payloads = sorted((root / "npz").glob("*.npz"))
+    missing_bytes = payloads[0].read_bytes()
+
+    payloads[0].unlink()
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
+        artifact.load_transient_sequence_artifact_index(root)
+    payloads[0].write_bytes(missing_bytes)
+
+    extra = root / "npz" / "extra.npz"
+    extra.write_bytes(missing_bytes)
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
+        artifact.load_transient_sequence_artifact_index(root)
+    extra.unlink()
+
+    parquet = root / common.paths.ANALYSIS_ARTIFACTS_FILENAME
+    parquet_bytes = parquet.read_bytes()
+    moved = tmp_path / "elsewhere.parquet"
+    parquet.rename(moved)
+    parquet.symlink_to(moved)
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
+        artifact.load_transient_sequence_artifact_index(root)
+    parquet.unlink()
+    parquet.write_bytes(parquet_bytes)
+
+    (root / "npz").rename(root / "npz_real")
+    (root / "npz").symlink_to(root / "npz_real")
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
+        artifact.load_transient_sequence_artifact_index(root)
+    (root / "npz").unlink()
+    (root / "npz_real").rename(root / "npz")
+
+    parquet.write_bytes(parquet_bytes + b"corrupt")
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="output manifest"):
+        artifact.load_transient_sequence_artifact_index(root)
+
+
+def test_artifact_files_are_hashed_once_across_admission_and_case_opens(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Hash the Parquet table and each case bundle once, however often the artifact is admitted and opened."""
+    root = tmp_path / "artifact"
+    _write_two_case_artifact(root)
+    monkeypatch.setattr(common.serialization, "_FILE_DIGESTS", {})
+    original = common.serialization._stream_sha256  # the one hashing primitive behind file_sha256 and open_verified_file
     hashed: list[Path] = []
 
-    def counted(value: Path | str) -> str:
-        hashed.append(Path(value))
-        return original(value)
+    def counted(stream: Any) -> str:
+        hashed.append(Path(stream.name))
+        return original(stream)
 
-    monkeypatch.setattr(common.serialization, "file_sha256", counted)
+    monkeypatch.setattr(common.serialization, "_stream_sha256", counted)
     for _ in range(2):
         index = artifact.load_transient_sequence_artifact_index(root)
         index.records()
         index.close()
 
-    assert sorted(hashed) == sorted([root / "transient_dataset.parquet", *(root / "npz").glob("*.npz")])
+    assert sorted(hashed) == sorted([root / "artifacts.parquet", *(root / "npz").glob("*.npz")])
 
 
 def test_cached_file_sha256_rehashes_when_path_size_mtime_or_inode_changes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Reuse a digest only while the file identity is unchanged."""
-    monkeypatch.setattr(artifact_contracts, "_FILE_DIGESTS", {})
+    monkeypatch.setattr(common.serialization, "_FILE_DIGESTS", {})
     hashed: list[Path] = []
-    original = common.serialization.file_sha256
+    original = common.serialization._stream_sha256  # the one hashing primitive behind every file digest
 
-    def counted(value: Path | str) -> str:
-        hashed.append(Path(value))
-        return original(value)
+    def counted(stream: Any) -> str:
+        hashed.append(Path(stream.name))
+        return original(stream)
 
-    monkeypatch.setattr(common.serialization, "file_sha256", counted)
+    monkeypatch.setattr(common.serialization, "_stream_sha256", counted)
 
     def rewrite(path: Path, content: bytes, mtime_ns: int) -> None:
         path.write_bytes(content)
@@ -3092,16 +3149,16 @@ def test_cached_file_sha256_rehashes_when_path_size_mtime_or_inode_changes(monke
 
     payload = tmp_path / "payload.bin"
     rewrite(payload, b"aaaa", 1_000_000_000)
-    assert artifact_contracts.cached_file_sha256(payload) == artifact_contracts.cached_file_sha256(payload) == hashlib.sha256(b"aaaa").hexdigest()
+    assert common.serialization.cached_file_sha256(payload) == common.serialization.cached_file_sha256(payload) == hashlib.sha256(b"aaaa").hexdigest()
     assert len(hashed) == 1
     rewrite(payload, b"aaaaa", 1_000_000_000)  # size
-    assert artifact_contracts.cached_file_sha256(payload) == hashlib.sha256(b"aaaaa").hexdigest()
+    assert common.serialization.cached_file_sha256(payload) == hashlib.sha256(b"aaaaa").hexdigest()
     rewrite(payload, b"bbbbb", 2_000_000_000)  # modification time
-    assert artifact_contracts.cached_file_sha256(payload) == hashlib.sha256(b"bbbbb").hexdigest()
+    assert common.serialization.cached_file_sha256(payload) == hashlib.sha256(b"bbbbb").hexdigest()
     replacement = tmp_path / "replacement.bin"
     rewrite(replacement, b"ccccc", 2_000_000_000)
     replacement.replace(payload)  # inode
-    assert artifact_contracts.cached_file_sha256(payload) == hashlib.sha256(b"ccccc").hexdigest()
+    assert common.serialization.cached_file_sha256(payload) == hashlib.sha256(b"ccccc").hexdigest()
     assert len(hashed) == 4
 
 
@@ -3130,7 +3187,7 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
             if role == "id"
             else {
                 "dataset_id": f"dataset_{material}",
-                "role": "ood",
+                "role": "material_ood",
                 "relation": "Dataset-declared material holdout",
                 "assumptions": [],
             }
@@ -3142,7 +3199,7 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
         ).validated()
 
     id_root = tmp_path / "id"
-    ood_root = tmp_path / "additional_evaluation"
+    ood_root = tmp_path / "material_ood"
     id_provenance = _cache_test_provenance()
     id_provenance["dataset"] = {
         "name": "dataset_lentil_chickpea",
@@ -3152,7 +3209,7 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
     ood_provenance = _cache_test_provenance()
     ood_provenance["dataset"] = {
         "name": "dataset_kidney_bean",
-        "role": "additional_evaluation",
+        "role": "material_ood",
         "identity": {"index_digest": "f" * 64},
     }
     artifact.write_transient_sequence_artifact(
@@ -3171,11 +3228,11 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
     artifact.write_transient_sequence_artifact(
         ood_root,
         dataset_name="dataset_kidney_bean",
-        dataset_role="additional_evaluation",
+        dataset_role="material_ood",
         records=(
             role_record(
                 "kidney_bean__case_0004__000000000004",
-                role="additional_evaluation",
+                role="material_ood",
                 material="kidney_bean",
             ),
         ),
@@ -3186,8 +3243,8 @@ def test_separate_artifact_indexes_retain_case_local_caches_across_role_switches
     original_np_load = artifact.np.load
     opened: list[Path] = []
 
-    def counted_np_load(value: Path, *args: Any, **kwargs: Any) -> Any:
-        opened.append(Path(value))
+    def counted_np_load(value: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(Path(value.name))
         return original_np_load(value, *args, **kwargs)
 
     monkeypatch.setattr(artifact.np, "load", counted_np_load)
@@ -3405,7 +3462,7 @@ def test_scoped_transient_artifact_rejects_output_below_run_bundle(
         case_ids_by_source=((_CASE_ID,),),
         membership_digests=("a" * 64,),
     )
-    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, additional_role=None)
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, ood_roles={})
     monkeypatch.setattr(
         artifact_service.transient,
         "load_transient_artifact_plan",
@@ -3442,7 +3499,7 @@ def test_scoped_transient_build_reuses_a_complete_stage_only_for_the_same_select
         case_ids_by_source=((_CASE_ID, _CASE_B),),
         membership_digests=("a" * 64,),
     )
-    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, additional_role=None)
+    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="scientific-run", task="transient_drying", id_role=role, ood_roles={})
     monkeypatch.setattr(artifact_service.transient, "load_transient_artifact_plan", lambda _path: plan)
     monkeypatch.setattr(
         artifact_service.experiments.run, "validate_completed_run", lambda _path: {"scientific_run_name": "scientific-run", "config": {}}
@@ -3614,8 +3671,8 @@ def test_role_validator_binds_exact_package_identity(
 def test_role_validator_binds_each_record_to_its_owning_split_part(foreign: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     """Refuse a record whose Dataset identity differs from the saved split part that owns its case, even when it is self-consistent."""
     role = artifact_plan.ArtifactRolePlan(
-        split="additional_evaluation",
-        dataset_role="additional_evaluation",
+        split="material_ood",
+        dataset_role="material_ood",
         dataset_name="combined",
         source_dataset_ids=("part-a", "part-b"),
         source_identities=(

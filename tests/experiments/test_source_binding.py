@@ -62,7 +62,7 @@ def _write_leaf(run_dir: Path, *sessions: Mapping[str, Any], status: str = "comp
     run_dir.mkdir(parents=True, exist_ok=True)
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "status": status, "runtime_sessions": list(sessions)},
+        {"status": status, "runtime_sessions": list(sessions)},
     )
     return run_dir
 
@@ -115,7 +115,7 @@ def test_malformed_recorded_sessions_fail_closed(tmp_path: Path, sessions: objec
     run_dir.mkdir()
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
-        {"schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION, "runtime_sessions": sessions},
+        {"runtime_sessions": sessions},
     )
 
     with pytest.raises(error):
@@ -488,7 +488,7 @@ def test_study_session_record_binds_a_study_before_its_first_trial(tmp_path: Pat
 
 @pytest.mark.parametrize(
     "payload",
-    ["{", "[]", json.dumps({"schema_version": 1, "sessions": "x"}), json.dumps({"schema_version": 2, "sessions": []})],
+    ["{", "[]", json.dumps({"sessions": "x"})],
 )
 def test_malformed_study_session_record_fails_closed(tmp_path: Path, payload: str) -> None:
     """A study whose binding cannot be read is never treated as unbound."""

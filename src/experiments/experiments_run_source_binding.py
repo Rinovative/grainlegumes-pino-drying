@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 STUDY_SESSIONS_FILENAME: Final = "study_sessions.json"
-_STUDY_SESSIONS_SCHEMA_VERSION: Final = 1
 _RECORDED_SLURM_FIELDS: Final = ("job_id", "source_commit", "source_worktree_sha256", "source_transition")
 
 
@@ -129,18 +128,13 @@ def _read_study_sessions(study: Path) -> dict[str, Any]:
     """Load the study's session record, or an empty one when no job recorded a binding yet."""
     path = study / STUDY_SESSIONS_FILENAME
     if not path.is_file():
-        return {"schema_version": _STUDY_SESSIONS_SCHEMA_VERSION, "sessions": []}
+        return {"sessions": []}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         msg = f"Study session record is invalid JSON: {path}: {error}"
         raise run.RunLifecycleError(msg) from error
-    valid = (
-        isinstance(payload, dict)
-        and common.serialization.is_schema_version(payload.get("schema_version"), _STUDY_SESSIONS_SCHEMA_VERSION)
-        and isinstance(payload.get("sessions"), list)
-    )
-    if not valid:
+    if not (isinstance(payload, dict) and isinstance(payload.get("sessions"), list)):
         msg = f"Unsupported or malformed study session record: {path}"
         raise run.RunLifecycleError(msg)
     return payload

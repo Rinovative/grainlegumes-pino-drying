@@ -188,7 +188,6 @@ def make_campaign(factory: Any, **overrides: Any) -> Any:
     """Return a tiny steady-flow campaign whose node job holds two concurrent one-core cases."""
     values: dict[str, Any] = {
         "simulation_profile": "steady_flow",
-        "scheduler_kind": "slurm",
         "natural_count": 1,
         "max_admission_cases": 8,
         "node_jobs": 2,

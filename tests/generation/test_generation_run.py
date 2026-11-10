@@ -36,14 +36,13 @@ def _campaign(*, profile: str = "steady_flow", purpose: str = "source_generation
         batch_id=f"{profile}-batch",
         case_indices=(0, 1),
         material_family="Lentil",
-        sampling_regime="natural",
+        sampling_regime="test",
         profile=SimpleNamespace(id=profile),
         case_input_config_digest="input-digest",
         case_id=lambda index: f"case_{index:04d}",
         case_seed=lambda index: 100 + index,
     )
     return SimpleNamespace(
-        schema_version=1,
         profile=SimpleNamespace(id=profile),
         campaign_name=f"{profile}-campaign",
         campaign_digest=f"{profile}-campaign-digest",
@@ -58,7 +57,7 @@ def _campaign(*, profile: str = "steady_flow", purpose: str = "source_generation
 
 def test_dispatches_by_schema_kind_and_builds_campaign_units(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve campaign schemas into ordered common work units."""
-    config = _write_yaml(tmp_path / "mutable-name.yaml", "schema_kind: generation_source_campaign\nschema_version: 1\n")
+    config = _write_yaml(tmp_path / "mutable-name.yaml", "schema_kind: generation_source_campaign\n")
     monkeypatch.setattr(run_service.config_service, "load_campaign_config", lambda *_args, **_kwargs: _campaign())
     monkeypatch.setattr(run_service.campaign_service, "campaign_run_id", lambda *_args, **_kwargs: "durable-campaign-run")
 
@@ -73,7 +72,7 @@ def test_dispatches_by_schema_kind_and_builds_campaign_units(tmp_path: Path, mon
 
 def test_rejects_unknown_top_level_schema_without_loader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reject unknown schema kinds before invoking a specialized loader."""
-    config = _write_yaml(tmp_path / "anything.yaml", "schema_kind: unknown\nschema_version: 1\n")
+    config = _write_yaml(tmp_path / "anything.yaml", "schema_kind: unknown\n")
     monkeypatch.setattr(
         run_service.config_service,
         "load_campaign_config",
@@ -91,7 +90,7 @@ def test_authored_campaign_plan_dispatches_mapping_and_preserves_plan_bytes(
     """Actual command parsing resolves an authored campaign from a Dataset plan."""
     path, _ = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
     authored = yaml.safe_load(path.read_text())
-    for key in ("sources_config", "registry_config", "common_config", "operations_config", "profile_config", "execution_config"):
+    for key in ("sources_config", "registry_config", "common_config", "operations_config", "bed_fields_config", "profile_config", "execution_config"):
         authored[key] = str((path.parent / authored[key]).resolve())
     plan_path = common.paths.get_project_root() / "configs/02_datasets/test-plan.yaml"
     plan_path.parent.mkdir(parents=True)

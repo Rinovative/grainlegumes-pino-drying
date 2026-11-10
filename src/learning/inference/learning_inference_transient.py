@@ -351,11 +351,7 @@ def build_transient_inference_context(
         raise RuntimeError(msg)
     model = model_factory.build_model(dict(config), device=resolved_device)
     best_checkpoint = completed.get("best_checkpoint")
-    if (
-        not isinstance(best_checkpoint, Mapping)
-        or not common.serialization.is_schema_version(best_checkpoint.get("schema_version"), learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION)
-        or not isinstance(best_checkpoint.get("model_state_dict"), Mapping)
-    ):
+    if not isinstance(best_checkpoint, Mapping) or not isinstance(best_checkpoint.get("model_state_dict"), Mapping):
         msg = "Completed transient run must provide an admitted best model state dict."
         raise TypeError(msg)
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)

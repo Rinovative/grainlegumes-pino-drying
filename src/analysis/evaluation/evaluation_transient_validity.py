@@ -235,7 +235,6 @@ def build_prediction_validity(
         for name, values in stages
     }
     result = {
-        "schema_version": validity_contract.PREDICTION_VALIDITY_SCHEMA_VERSION,
         "status": status,
         "count_scope": "all_evaluation_grid_cells_in_computed_model_outputs",
         "mode": mode,
@@ -269,7 +268,6 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         raise TypeError(msg)
     document = dict(value)
     required = {
-        "schema_version",
         "status",
         "count_scope",
         "mode",
@@ -286,7 +284,6 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
     if set(document) != required:
         msg = "Prediction validity fields do not match the schema."
         raise ValueError(msg)
-    validity_contract.require_schema_version(document["schema_version"])
     if (
         document["status"] not in validity_contract.PREDICTION_VALIDITY_STATUSES
         or document["count_scope"] != "all_evaluation_grid_cells_in_computed_model_outputs"
@@ -590,7 +587,6 @@ def aggregate_case_prediction_validity(
         )
     )
     result = {
-        "schema_version": validity_contract.PREDICTION_VALIDITY_SCHEMA_VERSION,
         "case_id": case_id,
         "status": status,
         "unique_prediction_chain_count": len(admitted),

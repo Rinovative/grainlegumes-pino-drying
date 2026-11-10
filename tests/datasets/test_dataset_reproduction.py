@@ -273,7 +273,7 @@ def test_inspection_exposes_parameters_and_recovery_without_tensor_loading(
     }
     source = provenance["source_case_identities"][0]["source"]
     source["source_name"] = source["campaign_name"] + "__" + source["campaign_digest"][:16]
-    relative = f"01_generation/steady_flow/{source['source_name']}/lentil/case_0001/result/case.h5"
+    relative = f"01_generation/steady_flow/{source['source_name']}/materials/lentil/case_0001/result/case.h5"
     source["case_hdf5_relative"] = relative
     hdf5 = storage / relative
     hdf5.parent.mkdir(parents=True)
@@ -622,7 +622,7 @@ def test_reuse_validates_changed_ordered_claim_without_reselecting_unchanged_met
     provenance = _provenance()
     # The declared Source must name the campaign the synthetic source cases reference.
     source_name = "physical_synthetic_source"
-    method = {"kind": "design_order", "source_names": [source_name], "target_counts": {"lentil": 1}}
+    method = {"kind": "design_order", "source_names": [source_name], "target_counts": {"lentil": {"test": 1}}}
     provenance["selection"] = method
     dataset_id, digest = identity.package_identity_from_provenance(provenance)
     prefix = {**provenance, "dataset_id": dataset_id, "dataset_digest": digest, "payload_filename": "dataset.pt", "source_case_count": 1}
@@ -630,7 +630,7 @@ def test_reuse_validates_changed_ordered_claim_without_reselecting_unchanged_met
     request = {"selection": method, "source_task": "steady_flow", "source_cases": [reference]}
 
     def ordered(_task: str, names: list[str], counts: dict[str, int], **_kwargs: Any) -> tuple:
-        return (reference,) if names == [source_name] and counts == {"lentil": 1} else ()
+        return (reference,) if names == [source_name] and counts == {"lentil": {"test": 1}} else ()
 
     def payload(path: Path) -> dict[str, int]:
         path.write_bytes(b"immutable fixture")
@@ -648,7 +648,7 @@ def test_reuse_validates_changed_ordered_claim_without_reselecting_unchanged_met
     _payload, manifest_path, reused, _manifest = builder._publish(**args)
     assert reused is False
     before = manifest_path.read_bytes()
-    for changed in ({**method, "source_names": ["source_2"]}, {**method, "target_counts": {"lentil": 2}}):
+    for changed in ({**method, "source_names": ["source_2"]}, {**method, "target_counts": {"lentil": {"test": 2}}}):
         with pytest.raises(ValueError, match="Design-order Dataset source cases disagree"):
             builder._publish(**{**args, "selection_request": {**request, "selection": changed}, "prefix": {**prefix, "selection": changed}})
         assert manifest_path.read_bytes() == before
@@ -663,7 +663,7 @@ def test_reuse_validates_changed_ordered_claim_without_reselecting_unchanged_met
 
 def test_generation_inspection_command_separates_recorded_resources_from_science() -> None:
     run = {"campaign_config": "configs/01_generation/research campaign.yaml"}
-    science = {"materials": ["lentil"], "cases_per_material": 3, "duration_hours": 0.5, "revision": "fix2"}
+    science = {"materials": ["lentil"], "duration_hours": 0.5, "revision": "fix2"}
     execution = {"node_jobs": 1, "max_admission_cases": 4, "cores_per_case": 8, "case_timeout_seconds": 1500, "no_retry": True}
     report = reproduction._generation_invocation(run, {"scientific_overrides": science, "execution_overrides": execution})
     scientific = shlex.split(report["scientific_command"])
@@ -693,69 +693,46 @@ def test_generation_inspection_command_separates_recorded_resources_from_science
     assert "max_admission_cases" in partial["execution_choices_not_recorded"]
 
 
-def test_readable_dataset_name_binds_fixed_roles_membership_and_seed() -> None:
-    provenance = build_synthetic_selection_provenance(dataset_name="readable-physical", sample_ids=("a", "b", "c"))
-    recipe = {"kind": "exact", "train": ["a"], "validation": ["b"], "id_test": ["c"]}
-    provenance["case_partition"] = partition.build_fixed_partition(
-        ("a", "b", "c"),
-        material_by_case=dict.fromkeys(("a", "b", "c"), "lentil"),
-        material_roles={"lentil": "id"},
-        recipe=recipe,
-        seed_input=9,
-        seed=1028622135437308793,
-    )
+def test_dataset_digest_binds_design_kinds_and_generation_seed_but_not_the_name() -> None:
+    """Roles follow the design kinds: another kind or another Generation seed is other content; the name is only a label."""
+    cases = ("a", "b", "c")
+    provenance = build_synthetic_selection_provenance(dataset_name="readable-physical", sample_ids=cases, material_role="id")
     dataset_id, digest = identity.package_identity_from_provenance(provenance)
     assert dataset_id == "readable-physical"
-    changed = copy.deepcopy(provenance)
-    changed["case_partition"]["recipe"] = {"kind": "exact", "train": ["b"], "validation": ["a"], "id_test": ["c"]}
-    changed["case_partition"]["train"] = ["b"]
-    changed["case_partition"]["validation"] = ["a"]
-    assert identity.package_identity_from_provenance(changed)[0] == dataset_id
-    assert identity.package_identity_from_provenance(changed)[1] != digest
+    assert digest == identity.package_content_digest(provenance) == identity.package_content_digest({**provenance, "dataset_name": "renamed"})
+    moved_kinds = {"a": "validation", "b": "train", "c": "test"}
+    moved = copy.deepcopy(provenance)
+    for entry, candidate in zip(moved["source_case_identities"], moved["source_outcomes"][0]["candidates"], strict=True):
+        entry["design"]["design_kind"] = candidate["sampling_regime"] = moved_kinds[entry["package_case_id"]]
+    moved["case_partition"] = partition.build_fixed_partition(
+        cases, material_by_case=dict.fromkeys(cases, "lentil"), design_kind_by_case=moved_kinds, material_roles={"lentil": "id"}
+    )
+    assert identity.package_identity_from_provenance(moved)[1] != digest
+    reseeded = copy.deepcopy(provenance)
+    for entry in reseeded["source_case_identities"]:
+        entry["design"]["root_seed"] = 8
+    assert identity.package_content_digest(reseeded) != digest
     corrupt = copy.deepcopy(provenance)
     corrupt["case_partition"]["train"] = ["b"]
     with pytest.raises(ValueError, match="roles must be disjoint"):
         identity.package_identity_from_provenance(corrupt)
-
-
-def test_content_digest_ignores_split_seeds_but_binds_membership() -> None:
-    """The same ordered membership from other split seeds is the same content; moving a case is not."""
-    provenance = build_synthetic_selection_provenance(dataset_name="content", sample_ids=("a", "b", "c"))
-    provenance["case_partition"] = partition.build_fixed_partition(
-        ("a", "b", "c"),
-        material_by_case=dict.fromkeys(("a", "b", "c"), "lentil"),
-        material_roles={"lentil": "id"},
-        recipe={"kind": "exact", "train": ["a"], "validation": ["b"], "id_test": ["c"]},
-        seed_input=9,
-        seed=1028622135437308793,
-    )
-    baseline = identity.package_content_digest(provenance)
-    reseeded = copy.deepcopy(provenance)
-    reseeded["case_partition"]["seed_input"] = 10
-    reseeded["case_partition"]["seed"] = 77
-    assert identity.package_content_digest(reseeded) == baseline
-    assert identity.package_identity_from_provenance(reseeded)[1] != identity.package_identity_from_provenance(provenance)[1]
-    moved = copy.deepcopy(provenance)
-    moved["case_partition"]["recipe"] = {"kind": "exact", "train": ["b"], "validation": ["a"], "id_test": ["c"]}
-    moved["case_partition"]["train"] = ["b"]
-    moved["case_partition"]["validation"] = ["a"]
-    assert identity.package_content_digest(moved) != baseline
+    with pytest.raises(ValueError, match="membership does not match"):
+        identity.package_identity_from_provenance({**provenance, "case_partition": moved["case_partition"]})
 
 
 def _training_manifest(*, partitioned: bool = True) -> dict[str, Any]:
-    """Return manifest evidence of a training Dataset with three ID cases and one held-out material."""
-    materials = {"a": "lentil", "b": "lentil", "c": "lentil", "primary-ood": "pea"}
+    """Return manifest evidence of a training Dataset with three ID cases, one parameter-OOD case and one held-out material."""
+    materials = {"a": "lentil", "b": "lentil", "c": "lentil", "p": "lentil", "primary-ood": "pea"}
+    kinds = {"a": "train", "b": "validation", "c": "test", "p": "parameter_ood", "primary-ood": "test"}
     fixed = partition.build_fixed_partition(
-        tuple(materials),
-        material_by_case=materials,
-        material_roles={"lentil": "id", "pea": "ood"},
-        recipe={"kind": "exact", "train": ["a"], "validation": ["b"], "id_test": ["c"]},
-        seed_input=1,
-        seed=1,
+        tuple(materials), material_by_case=materials, design_kind_by_case=kinds, material_roles={"lentil": "id", "pea": "ood"}
     )
     return {
         "case_partition": fixed if partitioned else None,
-        "source_case_identities": [{"package_case_id": case, "source": {"material_family": material}} for case, material in materials.items()],
+        "source_case_identities": [
+            {"package_case_id": case, "source": {"material_family": material}, "design": {"design_kind": kinds[case]}}
+            for case, material in materials.items()
+        ],
     }
 
 
@@ -763,10 +740,11 @@ def test_declared_evaluation_assignments_are_metadata_only_and_ordered(monkeypat
 
     manifests_by_id: dict[str, dict[str, Any]] = {
         "train": _training_manifest(),
-        "external-b": {"case_partition": {"ood": ["b-ood"]}},
-        "external-a": {"case_partition": {"ood": ["a-ood"]}},
+        "external-b": {"case_partition": {"parameter_ood": [], "ood": ["b-ood"]}},
+        "external-a": {"case_partition": {"parameter_ood": [], "ood": ["a-ood"]}},
+        "parameter-only": {"case_partition": {"parameter_ood": ["p-pood"], "ood": []}},
         "primary-only": _training_manifest(),
-        "no-ood": {"case_partition": {"ood": []}},
+        "no-ood": {"case_partition": {"parameter_ood": [], "ood": []}},
         "no-partition": _training_manifest(partitioned=False),
     }
     calls: list[tuple[str, Path | str | None]] = []
@@ -776,28 +754,32 @@ def test_declared_evaluation_assignments_are_metadata_only_and_ordered(monkeypat
         calls.append((dataset_id, storage_root))
         return manifests_by_id[dataset_id]
 
+    def assignment(dataset_id: str, role: str, kind: str) -> dict[str, Any]:
+        return {"dataset_id": dataset_id, "role": role, "relation": f"Dataset-declared {kind} holdout", "assumptions": []}
+
     monkeypatch.setattr(manifests, "load_package_manifest_evidence", load_evidence)
     monkeypatch.setattr(torch, "load", lambda *_args, **_kwargs: pytest.fail("Declared assignments must not load tensors"))
     storage = Path("metadata-only-root")
-    expected = [
-        {
-            "dataset_id": dataset_id,
-            "role": "ood",
-            "relation": "Dataset-declared material holdout",
-            "assumptions": [],
-        }
-        for dataset_id in ("external-b", "external-a", "train")
-    ]
+    # Material OOD lists the configured Datasets in order, then the training Dataset's own OOD cases; parameter OOD
+    # holds only the training Dataset's parameter-OOD cases.
+    expected = {
+        "material_ood": [assignment(name, "material_ood", "material") for name in ("external-b", "external-a", "train")],
+        "parameter_ood": [assignment("train", "parameter_ood", "parameter")],
+    }
 
     assert package_facade.declared_evaluation_assignments("steady_flow", "train", ("external-b", "external-a"), storage_root=storage) == expected
     assert calls == [("train", storage), ("external-b", storage), ("external-a", storage)]
-    assert package_facade.declared_evaluation_assignments("steady_flow", "primary-only") == [{**expected[-1], "dataset_id": "primary-only"}]
+    assert package_facade.declared_evaluation_assignments("steady_flow", "primary-only") == {
+        "material_ood": [assignment("primary-only", "material_ood", "material")],
+        "parameter_ood": [assignment("primary-only", "parameter_ood", "parameter")],
+    }
 
     calls.clear()
     with pytest.raises(ValueError, match="has no fixed case partition with Train cases"):
         manifests.declared_evaluation_assignments("steady_flow", "no-partition")
-    with pytest.raises(ValueError, match="non-empty fixed OOD partition"):
-        manifests.declared_evaluation_assignments("steady_flow", "train", ("no-ood",))
+    for material_ood in ("no-ood", "parameter-only"):  # material_ood_datasets contribute only declared material-OOD cases
+        with pytest.raises(ValueError, match="must declare non-empty fixed OOD cases"):
+            manifests.declared_evaluation_assignments("steady_flow", "train", (material_ood,))
     with pytest.raises(ValueError, match="must be unique"):
         manifests.declared_evaluation_assignments("steady_flow", "train", ("external-b", "external-b"))
     with pytest.raises(ValueError, match="must be unique"):

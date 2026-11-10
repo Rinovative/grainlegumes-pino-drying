@@ -32,6 +32,7 @@ from src import domain
 from src.analysis.evaluation import evaluation_transient_artifact as artifact
 from src.analysis.evaluation import evaluation_transient_comparison as comparison
 from src.analysis.evaluation import evaluation_transient_timing as timing
+from src.analysis.evaluation import evaluation_transient_validity as validity
 from src.analysis.presentation import analysis_compute as compute
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_display_labels as display_labels
@@ -44,6 +45,7 @@ from src.analysis.ui import analysis_ui_time as time_axis
 from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
 if TYPE_CHECKING:
+    from matplotlib.colors import Colormap, Normalize
     from matplotlib.figure import Figure
 
 _STATE_ARRAY_RANK = 4
@@ -89,7 +91,7 @@ def _material_role_label(
     material = _material_label(material_family)
     label = (
         display_labels.material_role_display_label(material_family, dataset_role)
-        if isinstance(dataset_role, str) and dataset_role in {"id", "additional_evaluation"}
+        if isinstance(dataset_role, str) and dataset_role in {"id", "material_ood", "parameter_ood"}
         else material
     )
     return f"{label} · {frame_name}" if include_frame else label
@@ -150,7 +152,7 @@ def _display_state_values(
 
 
 def _grain_moisture(record: Any, states: np.ndarray) -> np.ndarray:
-    """Derive exact grain moisture from persisted states and material evidence."""
+    """Derive grain moisture from persisted states and material evidence, unphysical or non-finite water passed through as stored."""
     if states.ndim != _STATE_ARRAY_RANK or states.shape[1] != len(artifact.STATE_ORDER):
         msg = "Grain-moisture trajectories require [time,4,Y,X] state arrays."
         raise ValueError(msg)
@@ -163,7 +165,153 @@ def _grain_moisture(record: Any, states: np.ndarray) -> np.ndarray:
         states[:, artifact.STATE_ORDER.index("w_surf")],
         states[:, artifact.STATE_ORDER.index("w_int")],
         fraction,
+        require_physical_states=False,
     )
+
+
+def _field_snapshots(record: Any, field: str, reference: np.ndarray, prediction: np.ndarray, indices: Sequence[int]) -> tuple[np.ndarray, np.ndarray]:
+    """Return raw reference and prediction values [time,Y,X] of one field at the given time indices."""
+    selected = list(indices)
+    if field == _GRAIN_MOISTURE_FIELD:
+        return _grain_moisture(record, reference[selected]), _grain_moisture(record, prediction[selected])
+    channel = artifact.STATE_ORDER.index(field)
+    return reference[selected, channel], prediction[selected, channel]
+
+
+def _state_arrays(record: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return the validated reference and prediction state arrays of one record."""
+    reference = np.asarray(_value(record, "reference_states"), dtype=np.float64)
+    prediction = np.asarray(_value(record, "predicted_states"), dtype=np.float64)
+    if reference.shape != prediction.shape or reference.ndim != _STATE_ARRAY_RANK or reference.shape[1] != len(artifact.STATE_ORDER):
+        msg = "Transient state maps require matching [time,4,Y,X] arrays."
+        raise ValueError(msg)
+    return reference, prediction
+
+
+def _selected_error(
+    record: Any,
+    field: str,
+    mode: str,
+    raw_reference: np.ndarray,
+    raw_prediction: np.ndarray,
+    scale: error_diagnostics.ReferenceScale | str | None,
+) -> error_diagnostics.SelectedErrorMap:
+    """Compute one displayed error map over the spatial mask, with diverging prediction cells masked."""
+    mask = np.asarray(_value(record, "spatial_mask"), dtype=bool)
+    finite = mask & np.isfinite(raw_prediction)
+    # A fully diverging field keeps the whole mask, so the shared map reports it as non-finite.
+    support = finite if finite.any() else mask
+    return error_diagnostics.selected_error_map(
+        raw_reference,
+        raw_prediction,
+        mode=mode,  # type: ignore[arg-type]
+        field=field,
+        physical_unit=_state_unit(field),
+        scale=scale,
+        support=support,
+    )
+
+
+def _mean_normalized_error_text(
+    record: Any,
+    field: str,
+    raw_reference: np.ndarray,
+    raw_prediction: np.ndarray,
+    scale: error_diagnostics.ReferenceScale | str | None,
+) -> str:
+    """Return the mean normalized absolute error over the whole spatial mask of one field and time as panel text."""
+    if not np.isfinite(raw_prediction[np.asarray(_value(record, "spatial_mask"), dtype=bool)]).all():
+        return "mean |e|/s non-finite"
+    result = _selected_error(record, field, error_diagnostics.NORMALIZED_ABSOLUTE_ERROR, raw_reference, raw_prediction, scale)
+    finite = np.empty(0) if result.map_values is None else result.map_values[np.isfinite(result.map_values)]
+    return f"mean |e|/s = {finite.mean():.3g}" if finite.size else "mean |e|/s n/a"
+
+
+def _error_display(field: str, error_mode: str, error_result: error_diagnostics.SelectedErrorMap) -> np.ndarray | None:
+    """Return the displayed error values of one selected error map."""
+    if error_result.map_values is None or error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
+        return error_result.map_values
+    return _display_state_values(field, error_result.map_values, error=True)
+
+
+def _error_definition(field: str, error_mode: str, finite_errors: np.ndarray) -> field_maps.FieldMapDefinition:
+    """Build the shared error colour scale from the finite displayed errors."""
+    normalized = error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+    return field_maps.build_field_map(
+        np.concatenate((finite_errors, np.array((0.0, 1.0)))) if normalized else finite_errors,
+        semantic=field_maps.FieldMapSemantic.SIGNED_ERROR if error_mode == "Signed error" else field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+        field=field,
+        unit="1" if normalized else field_labels.display_unit(_state_unit(field), quantity_kind="difference"),
+        display_transform=error_mode,
+        locked_boundaries=np.linspace(0.0, 1.0, 12) if normalized else None,
+        bound_policy="fixed 0..1 with extension" if normalized else "full selected field",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StateMapNorm:
+    """Colour scales of one field's panels; ``None`` marks a panel without finite values."""
+
+    reference: Normalize | None
+    prediction: Normalize | None
+    error: field_maps.FieldMapDefinition | None
+    note: str | None = None
+
+
+def state_map_norms(
+    record: Any,
+    *,
+    state_fields: Sequence[str] | None,
+    time_indices: Sequence[int],
+    lock_scale: bool,
+    error_mode: str,
+    reference_scales: Mapping[str, error_diagnostics.ReferenceScale | str] | None = None,
+) -> dict[str, StateMapNorm]:
+    """Return per-field colour scales from the finite values of all given time indices."""
+    fields = _selected_fields(state_fields)
+    indices = tuple(time_indices)
+    if not indices:
+        msg = "State-map colour scales require at least one time index."
+        raise ValueError(msg)
+    if error_mode not in error_diagnostics.TRANSIENT_ERROR_MODES:
+        msg = f"Transient error mode must be one of {error_diagnostics.TRANSIENT_ERROR_MODES}."
+        raise ValueError(msg)
+    reference, prediction = _state_arrays(record)
+    invalid = validity.prediction_physical_invalid_mask(prediction[list(indices)])
+    norms: dict[str, StateMapNorm] = {}
+    for field in fields:
+        raw_reference, raw_prediction = _field_snapshots(record, field, reference, prediction, indices)
+        finite_reference = _display_state_values(field, raw_reference, error=False)
+        finite_prediction = _display_state_values(field, raw_prediction, error=False)
+        finite_reference = finite_reference[np.isfinite(finite_reference)]
+        finite_prediction = finite_prediction[np.isfinite(finite_prediction)]
+        channels = [artifact.STATE_ORDER.index(name) for name in (("w_surf", "w_int") if field == _GRAIN_MOISTURE_FIELD else (field,))]
+        outside = lock_scale and bool(invalid[:, channels].any())
+        reference_norm: Normalize | None
+        prediction_norm: Normalize | None
+        if lock_scale and not outside and finite_reference.size and finite_prediction.size:
+            reference_norm = prediction_norm = layout.linear_norm(finite_reference, finite_prediction)
+        else:
+            reference_norm = layout.linear_norm(finite_reference) if finite_reference.size else None
+            prediction_norm = layout.linear_norm(finite_prediction) if finite_prediction.size else None
+        scale = None if reference_scales is None else reference_scales.get(field)
+        errors = [
+            values[np.isfinite(values)]
+            for position in range(len(indices))
+            if (
+                values := _error_display(
+                    field, error_mode, _selected_error(record, field, error_mode, raw_reference[position], raw_prediction[position], scale)
+                )
+            )
+            is not None
+        ]
+        norms[field] = StateMapNorm(
+            reference_norm,
+            prediction_norm,
+            _error_definition(field, error_mode, np.concatenate(errors)) if errors else None,
+            "prediction outside physical range: own colour scale" if outside else None,
+        )
+    return norms
 
 
 def plot_state_maps(
@@ -175,108 +323,88 @@ def plot_state_maps(
     error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     reference_scales: Mapping[str, error_diagnostics.ReferenceScale | str] | None = None,
     display_spatial_stride: display_grid.DisplayStride = "auto",
+    norms: Mapping[str, StateMapNorm] | None = None,
+    figure: Figure | None = None,
 ) -> Figure:
-    """Plot reference, prediction, and one selected full-grid error mode."""
+    """
+    Plot reference, prediction, and one selected full-grid error mode.
+
+    ``norms`` (from ``state_map_norms``) fixes the colour scales over several times; the default
+    derives them from this time alone. A given ``figure`` is cleared and reused so animation
+    frames keep one size. Panels without finite values state that instead of raising.
+    """
     fields = _selected_fields(state_fields)
     if not isinstance(lock_scale, bool):
         msg = "lock_scale must be boolean."
         raise TypeError(msg)
     index, selected_time = _time_index(record, physical_time)
-    reference = np.asarray(_value(record, "reference_states"), dtype=np.float64)
-    prediction = np.asarray(_value(record, "predicted_states"), dtype=np.float64)
+    reference, prediction = _state_arrays(record)
     static = np.asarray(_value(record, "static_conditioning"), dtype=np.float64)
-    if reference.shape != prediction.shape or reference.ndim != _STATE_ARRAY_RANK or reference.shape[1] != len(artifact.STATE_ORDER):
-        msg = "Transient state maps require matching [time,4,Y,X] arrays."
-        raise ValueError(msg)
     if static.shape != (len(artifact.STATIC_ORDER), *reference.shape[-2:]):
         msg = "Transient state maps require exact [7,Y,X] static conditioning."
         raise ValueError(msg)
+    if norms is None:
+        norms = state_map_norms(
+            record,
+            state_fields=fields,
+            time_indices=(index,),
+            lock_scale=lock_scale,
+            error_mode=error_mode,
+            reference_scales=reference_scales,
+        )
     x_values, y_values = static[0], static[1]
     indices = display_grid.display_indices(reference.shape[-2:], display_spatial_stride)
     x_display = display_grid.display_sample(x_values, indices)
     y_display = display_grid.display_sample(y_values, indices)
-    figure, axes = layout.map_subplots(rows=len(fields), columns=3)
-    column_titles = ("Reference", "Prediction", error_mode)
+    figure, axes = layout.map_subplots(rows=len(fields), columns=3, figure=figure)
     for row, field in enumerate(fields):
-        if field == _GRAIN_MOISTURE_FIELD:
-            raw_reference = _grain_moisture(record, reference)[index]
-            raw_prediction = _grain_moisture(record, prediction)[index]
-        else:
-            channel = artifact.STATE_ORDER.index(field)
-            raw_reference = reference[index, channel]
-            raw_prediction = prediction[index, channel]
-        if error_mode not in error_diagnostics.TRANSIENT_ERROR_MODES:
-            msg = f"Transient error mode must be one of {error_diagnostics.TRANSIENT_ERROR_MODES}."
-            raise ValueError(msg)
+        snapshot_reference, snapshot_prediction = _field_snapshots(record, field, reference, prediction, (index,))
+        raw_reference, raw_prediction = snapshot_reference[0], snapshot_prediction[0]
         physical_unit = _state_unit(field)
         scale = None if reference_scales is None else reference_scales.get(field)
-        error_result = error_diagnostics.selected_error_map(
-            raw_reference,
-            raw_prediction,
-            mode=error_mode,
-            field=field,
-            physical_unit=physical_unit,
-            scale=scale,
-            support=np.asarray(_value(record, "spatial_mask"), dtype=bool),
+        error_result = _selected_error(record, field, error_mode, raw_reference, raw_prediction, scale)
+        norm = norms[field]
+        values = (
+            _display_state_values(field, raw_reference, error=False),
+            _display_state_values(field, raw_prediction, error=False),
+            _error_display(field, error_mode, error_result),
         )
-        reference_display = _display_state_values(field, raw_reference, error=False)
-        prediction_display = _display_state_values(field, raw_prediction, error=False)
-        error_display = (
-            None
-            if error_result.map_values is None
-            else error_result.map_values
-            if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
-            else _display_state_values(field, error_result.map_values, error=True)
+        column_titles = (
+            "Reference" if row == 0 else "",
+            "Prediction" if row == 0 else "",
+            f"{error_mode} · {_mean_normalized_error_text(record, field, raw_reference, raw_prediction, scale)}",
         )
-        values = (reference_display, prediction_display, error_display)
-        finite_reference = reference_display[np.isfinite(reference_display)]
-        finite_prediction = prediction_display[np.isfinite(prediction_display)]
-        if not finite_reference.size:
-            msg = "Transient reference map has no finite support."
-            raise ValueError(msg)
-        reference_norm = (
-            layout.linear_norm(finite_reference, finite_prediction) if lock_scale and finite_prediction.size else layout.linear_norm(finite_reference)
-        )
-        prediction_norm = reference_norm if lock_scale or not finite_prediction.size else layout.linear_norm(finite_prediction)
-        for column, (name, value) in enumerate(zip(column_titles, values, strict=True)):
+        for column, (title, value) in enumerate(zip(column_titles, values, strict=True)):
             axis = axes[row, column]
             is_error = column == _SPATIAL_MAP_ERROR_COLUMN
-            if value is None:
-                axis.text(0.5, 0.5, f"Unavailable: {error_result.reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
-                axis.set_title(name)
-                axis.set_aspect("equal")
+            axis.set_aspect("equal")
+            axis.set_title(title)
+            if value is None or not np.isfinite(value).any():
+                reason = "unavailable: no finite values" if value is not None else f"Unavailable: {error_result.reason}"
+                axis.text(0.5, 0.5, reason, ha="center", va="center", wrap=True, transform=axis.transAxes)
                 continue
+            colormap: Colormap | str
+            normalizer: Normalize | None
             if is_error:
-                semantic = field_maps.FieldMapSemantic.SIGNED_ERROR if error_mode == "Signed error" else field_maps.FieldMapSemantic.ABSOLUTE_ERROR
-                definition_values = np.asarray(value)[np.isfinite(value)]
-                if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
-                    definition_values = np.concatenate((definition_values, np.array((0.0, 1.0))))
-                definition = field_maps.build_field_map(
-                    definition_values,
-                    semantic=semantic,
-                    field=field,
-                    unit=(
-                        "1"
-                        if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
-                        else field_labels.display_unit(physical_unit, quantity_kind="difference")
-                    ),
-                    display_transform=error_mode,
-                    locked_boundaries=np.linspace(0.0, 1.0, 12) if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR else None,
-                    bound_policy="fixed 0..1 with extension" if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR else "full selected field",
-                )
+                if norm.error is None:
+                    msg = "State-map colour scales do not cover this time."
+                    raise ValueError(msg)
+                colormap, normalizer = norm.error.colormap, norm.error.normalizer
+            else:
+                colormap = visual_semantics.field_visual_semantics(field).colormap
+                normalizer = norm.reference if column == 0 else norm.prediction
             image = axis.pcolormesh(
                 x_display,
                 y_display,
                 np.ma.masked_invalid(display_grid.display_sample(np.asarray(value), indices)),
                 shading="auto",
-                cmap=(definition.colormap if is_error else visual_semantics.field_visual_semantics(field).colormap),
-                norm=(definition.normalizer if is_error else (reference_norm if name == "Reference" else prediction_norm)),
+                cmap=colormap,
+                norm=normalizer,
             )
-            axis.set_aspect("equal")
-            if row == 0:
-                axis.set_title(name)
             if not is_error and not np.isfinite(value).all():
                 axis.text(0.02, 0.02, "Non-finite cells masked", transform=axis.transAxes, fontsize=8)
+            if column == 1 and norm.note is not None:
+                axis.text(0.02, 0.97, norm.note, transform=axis.transAxes, fontsize=8, va="top", bbox={"facecolor": "white", "alpha": 0.8, "pad": 1})
             layout.add_map_colorbar(
                 figure,
                 image,
@@ -586,8 +714,7 @@ def plot_central_error_vs_time(
     times = np.asarray(_value(record, "physical_times"), dtype=np.float64)[1:]
     display_time = time_axis.physical_time_display(times, preferred_unit="auto")
     plotted_time = display_time.values(times)
-    figure, axis = plt.subplots(figsize=(9.5, 5.5), layout=None)
-    figure.subplots_adjust(left=0.11, right=0.78, bottom=0.13, top=0.92)
+    figure, axis = plt.subplots(figsize=(9.5, 5.5), layout="constrained")
     axis.plot(
         plotted_time,
         central,
@@ -604,7 +731,7 @@ def plot_central_error_vs_time(
         )
     display_time.configure(axis)
     axis.set_ylabel("Normalized RMSE [1]")
-    axis.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=False)
+    figure.legend(loc="outside right upper", frameon=False)
     axis.grid(axis="y", alpha=0.25)
     return figure
 
@@ -629,6 +756,7 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
     absolute_error_sum: np.ndarray | None = None
     error_square_sum: np.ndarray | None = None
     counts: np.ndarray | None = None
+    divergent: np.ndarray | None = None
     x_values: np.ndarray | None = None
     y_values: np.ndarray | None = None
     reference_means: list[float] = []
@@ -642,7 +770,7 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
 
     def flush_cuda_batch() -> None:
         nonlocal error_sum, absolute_error_sum, error_square_sum, counts, selected_device
-        if not cuda_reference:
+        if not cuda_reference or selected_device is None:
             return
         if error_sum is None or absolute_error_sum is None or error_square_sum is None or counts is None:
             msg = "Aggregate transient snapshot accumulators were not initialized."
@@ -651,7 +779,7 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
             np.stack(cuda_reference),
             np.stack(cuda_prediction),
             np.stack(cuda_masks),
-            requested=compute_device,
+            device=selected_device,
         )
         error_sum += reduced.signed_sum
         absolute_error_sum += reduced.absolute_sum
@@ -692,41 +820,49 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
             absolute_error_sum = np.zeros(mask.shape, dtype=np.float64)
             error_square_sum = np.zeros(mask.shape, dtype=np.float64)
             counts = np.zeros(mask.shape, dtype=np.int64)
+            divergent = np.zeros(mask.shape, dtype=bool)
             batch_cases = max(1, _MAX_ERROR_BATCH_INPUT_BYTES // (mask.size * _ERROR_PAIR_MASK_BYTES))
-            selected_device = compute.resolve_analysis_device(compute_device, elements=min(len(admitted), batch_cases) * mask.size)
+            selected_device = compute.resolve_analysis_device(compute_device)
         elif y_values is None or not np.array_equal(current_x, x_values) or not np.array_equal(current_y, y_values):
             msg = "Aggregate transient spatial maps require one exact shared coordinate grid."
             raise ValueError(msg)
-        if state_field == _GRAIN_MOISTURE_FIELD:
-            reference_snapshot = _grain_moisture(record, reference)[time_index]
-            prediction_snapshot = _grain_moisture(record, prediction)[time_index]
-        else:
-            channel = artifact.STATE_ORDER.index(state_field)
-            reference_snapshot = reference[time_index, channel]
-            prediction_snapshot = prediction[time_index, channel]
-        if not np.isfinite(reference_snapshot[mask]).all() or not np.isfinite(prediction_snapshot[mask]).all():
-            msg = "Aggregate transient snapshots require finite values inside every spatial mask."
+        snapshots = _field_snapshots(record, state_field, reference, prediction, (time_index,))
+        reference_snapshot, prediction_snapshot = snapshots[0][0], snapshots[1][0]
+        if not np.isfinite(reference_snapshot[mask]).all():
+            msg = "Aggregate transient snapshots require finite reference values inside every spatial mask."
             raise ValueError(msg)
-        if error_sum is None or absolute_error_sum is None or error_square_sum is None or counts is None:
+        if error_sum is None or absolute_error_sum is None or error_square_sum is None or counts is None or divergent is None:
             msg = "Aggregate transient snapshot accumulators were not initialized."
             raise RuntimeError(msg)
+        # A diverging prediction cell gets no pooled error; the remaining cells keep their evidence.
+        finite = mask & np.isfinite(prediction_snapshot)
+        divergent |= mask & ~finite
         if selected_device is not None and selected_device.backend == "cuda":
             cuda_reference.append(reference_snapshot)
             cuda_prediction.append(prediction_snapshot)
-            cuda_masks.append(mask)
+            cuda_masks.append(finite)
             if len(cuda_reference) >= batch_cases:
                 flush_cuda_batch()
         else:
             error = prediction_snapshot - reference_snapshot
-            error_sum[mask] += error[mask]
-            absolute_error_sum[mask] += np.abs(error[mask])
-            error_square_sum[mask] += np.square(error[mask], dtype=np.float64)
-            counts[mask] += 1
+            error_sum[finite] += error[finite]
+            absolute_error_sum[finite] += np.abs(error[finite])
+            error_square_sum[finite] += np.square(error[finite], dtype=np.float64)
+            counts[finite] += 1
             if selected_device is not None:
                 routes.add(selected_device.label)
         reference_means.append(float(np.mean(reference_snapshot[mask], dtype=np.float64)))
-        prediction_means.append(float(np.mean(prediction_snapshot[mask], dtype=np.float64)))
-    if x_values is None or y_values is None or error_sum is None or absolute_error_sum is None or error_square_sum is None or counts is None:
+        with np.errstate(invalid="ignore", over="ignore"):
+            prediction_means.append(float(np.mean(prediction_snapshot[mask], dtype=np.float64)))
+    if (
+        x_values is None
+        or y_values is None
+        or error_sum is None
+        or absolute_error_sum is None
+        or error_square_sum is None
+        or counts is None
+        or divergent is None
+    ):
         msg = "Aggregate transient snapshot evidence was not initialized."
         raise RuntimeError(msg)
     flush_cuda_batch()
@@ -742,6 +878,8 @@ def _aggregate_snapshot_evidence(  # noqa: PLR0915 -- one bounded physical snaps
     np.divide(absolute_error_sum, counts, out=mean_absolute_error, where=counts > 0)
     np.divide(error_square_sum, counts, out=mean_square_error, where=counts > 0)
     error_variance = np.maximum(mean_square_error - np.square(mean_error), 0.0)
+    mean_absolute_error[divergent] = np.nan
+    error_variance[divergent] = np.nan
     return (
         x_values,
         y_values,
@@ -829,6 +967,11 @@ def plot_aggregate_error_maps(
             raw_values = mean_error if statistic == "mean" else std_error
             displayed = _display_state_values(field, raw_values, error=True)
             axis = axes[row, column]
+            if not np.isfinite(displayed).any():
+                axis.text(0.5, 0.5, "Prediction non-finite in every cell", ha="center", va="center", transform=axis.transAxes)
+                if row == 0 and context:
+                    axis.set_title(context)
+                continue
             image = axis.pcolormesh(
                 x_values,
                 y_values,
@@ -838,7 +981,7 @@ def plot_aggregate_error_maps(
                     field,
                     role="absolute_error",
                 ).colormap,
-                norm=layout.linear_norm(displayed),
+                norm=layout.linear_norm(displayed[np.isfinite(displayed)]),
             )
             axis.set_aspect("equal")
             if row == 0 and context:
@@ -926,18 +1069,10 @@ def plot_predicted_vs_reference_channels(
                 prediction_means,
                 error=False,
             )
-            lower = float(
-                min(
-                    np.min(reference_display),
-                    np.min(prediction_display),
-                )
-            )
-            upper = float(
-                max(
-                    np.max(reference_display),
-                    np.max(prediction_display),
-                )
-            )
+            finite_prediction = np.isfinite(prediction_display)
+            shown = np.concatenate((reference_display, prediction_display[finite_prediction]))
+            lower = float(np.min(shown))
+            upper = float(np.max(shown))
             if lower == upper:
                 padding = max(abs(lower) * 0.05, 1.0)
                 lower -= padding
@@ -957,6 +1092,9 @@ def plot_predicted_vs_reference_channels(
             )
             axis.set_xlim(lower, upper)
             axis.set_ylim(lower, upper)
+            if not finite_prediction.all():
+                hidden = int(np.count_nonzero(~finite_prediction))
+                axis.text(0.02, 0.98, f"{hidden} non-finite predicted case mean(s) not shown", va="top", fontsize="small", transform=axis.transAxes)
             label = field_labels.field_label_with_unit(
                 field,
                 _state_unit(field),
@@ -1001,6 +1139,52 @@ def plot_error_distributions(
     return figure
 
 
+def _thinned_finite_errors(record: Any, field: str) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Return one record's thinned finite target magnitudes and absolute errors, its element count and its non-finite count.
+
+    Finite errors are kept at fixed element positions up to the point limit; index arrays copy
+    them, so the record's full arrays are released when this returns.
+    """
+    _times, mask, reference, prediction = _trajectory_values(record, field)
+    target = np.abs(_display_state_values(field, reference[1:, mask], error=False).ravel())
+    error = np.abs(_display_state_values(field, prediction[1:, mask] - reference[1:, mask], error=True).ravel())
+    finite = np.isfinite(error)
+    kept = np.arange(0, error.size, max(1, int(np.ceil(error.size / _TARGET_MAGNITUDE_POINT_LIMIT))))
+    kept = kept[finite[kept]]
+    return target[kept], error[kept], error.size, error.size - int(np.count_nonzero(finite))
+
+
+def _finite_error_trend(records: Sequence[Any], field: str) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Return target-magnitude bin centers and median finite absolute errors, plus the exact non-finite and total counts.
+
+    The bins and medians describe the thinned finite errors only. The non-finite (diverging) errors
+    are counted over every element, so the plot names them instead of hiding them.
+    """
+    target_chunks: list[np.ndarray] = []
+    error_chunks: list[np.ndarray] = []
+    total = 0
+    diverging = 0
+    for record in records:
+        target, error, count, non_finite = _thinned_finite_errors(record, field)
+        target_chunks.append(target)
+        error_chunks.append(error)
+        total += count
+        diverging += non_finite
+    targets = np.concatenate(target_chunks)
+    errors = np.concatenate(error_chunks)
+    if not targets.size:
+        return np.empty(0), np.empty(0), diverging, total
+    edges = np.unique(np.quantile(targets, np.linspace(0.0, 1.0, _TARGET_MAGNITUDE_BIN_COUNT + 1)))
+    count = max(1, len(edges) - 1)
+    bins = np.clip(np.digitize(targets, edges[1:-1], right=True), 0, count - 1)
+    present = [index for index in range(count) if np.any(bins == index)]
+    centers = np.asarray([float(np.median(targets[bins == index])) for index in present])
+    medians = np.asarray([float(np.median(errors[bins == index])) for index in present])
+    return centers, medians, diverging, total
+
+
 def plot_error_vs_target_magnitude(
     series: Mapping[str, Sequence[Any]],
     *,
@@ -1023,32 +1207,16 @@ def plot_error_vs_target_magnitude(
     for row, field in enumerate(fields):
         axis = axes[row, 0]
         for series_index, (label, records) in enumerate(admitted.items()):
-            target_chunks: list[np.ndarray] = []
-            error_chunks: list[np.ndarray] = []
-            for record in records:
-                _times, mask, reference, prediction = _trajectory_values(record, field)
-                target = np.abs(_display_state_values(field, reference[1:, mask], error=False).ravel())
-                error = np.abs(_display_state_values(field, prediction[1:, mask] - reference[1:, mask], error=True).ravel())
-                stride = max(1, int(np.ceil(target.size / _TARGET_MAGNITUDE_POINT_LIMIT)))
-                target_chunks.append(target[::stride])
-                error_chunks.append(error[::stride])
-            targets = np.concatenate(target_chunks)
-            errors = np.concatenate(error_chunks)
-            edges = np.unique(np.quantile(targets, np.linspace(0.0, 1.0, _TARGET_MAGNITUDE_BIN_COUNT + 1)))
-            if len(edges) < _MINIMUM_TRAJECTORY_TIMES:
-                centers = np.asarray([float(np.median(targets))])
-                medians = np.asarray([float(np.median(errors))])
-            else:
-                bins = np.clip(np.digitize(targets, edges[1:-1], right=True), 0, len(edges) - 2)
-                centers = np.asarray([float(np.median(targets[bins == index])) for index in range(len(edges) - 1) if np.any(bins == index)])
-                medians = np.asarray([float(np.median(errors[bins == index])) for index in range(len(edges) - 1) if np.any(bins == index)])
+            centers, medians, diverging, total = _finite_error_trend(records, field)
+            # The medians describe finite errors; the exact count of diverging values is named, never hidden.
+            shown = f"{label} · {diverging} of {total} values non-finite, excluded" if diverging else label
             axis.plot(
                 centers,
                 medians,
                 marker="o",
                 linewidth=2.0,
                 color=colors(series_index % colors.N),
-                label=label,
+                label=shown,
             )
         unit = field_labels.display_unit(_state_unit(field), quantity_kind="difference")
         field_name = field_labels.field_label(field, mathtext=True)
@@ -1094,7 +1262,8 @@ def maximum_error_physical_time(
         selected_error = prediction_values[:, mask] - selected_reference
         scale = max(float(np.std(selected_reference, dtype=np.float64)), np.finfo(np.float64).eps)
         scores += np.sqrt(np.mean(np.square(selected_error[1:], dtype=np.float64), axis=1)) / scale
-    return float(times[1 + int(np.argmax(scores))])
+    # A non-finite score is a diverging prediction and counts as the worst time.
+    return float(times[1 + int(np.argmax(np.where(np.isfinite(scores), scores, np.inf)))])
 
 
 def _full_autonomous_cumulative(frame: pd.DataFrame) -> pd.DataFrame:

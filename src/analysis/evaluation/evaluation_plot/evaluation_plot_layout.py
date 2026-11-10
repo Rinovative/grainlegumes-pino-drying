@@ -26,7 +26,8 @@ from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-untyped]
+
+from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sized
@@ -42,8 +43,9 @@ if TYPE_CHECKING:
 class MapLayoutContract:
     """Define one consistent notebook-scale physical-map layout."""
 
-    column_width: float = 5.8
-    row_height: float = 3.6
+    column_width: float = shared_layout.MAP_LAYOUT.column_width
+    row_height: float = shared_layout.MAP_LAYOUT.row_height
+    maximum_width: float = shared_layout.MAP_LAYOUT.maximum_width
     map_column_spacing: float = 0.18
     map_row_spacing: float = 0.10
     colorbar_fraction: float = 0.046
@@ -59,14 +61,14 @@ class MapLayoutContract:
         if rows <= 0 or columns <= 0:
             msg = "Map grids require positive row and column counts."
             raise ValueError(msg)
-        return self.column_width * columns, self.row_height * rows
+        return min(self.column_width * columns, self.maximum_width), self.row_height * rows
 
     def composite_size(self, *, map_columns: int) -> tuple[float, float]:
         """Return size for one line region above one row of maps."""
         if map_columns <= 0:
             msg = "Composite figures require at least one map column."
             raise ValueError(msg)
-        return self.column_width * map_columns, self.composite_line_height + self.composite_vertical_gap + self.row_height
+        return min(self.column_width * map_columns, self.maximum_width), self.composite_line_height + self.composite_vertical_gap + self.row_height
 
 
 MAP_LAYOUT = MapLayoutContract()
@@ -139,7 +141,7 @@ def map_subplots(*, rows: int, columns: int, **kwargs: Any) -> tuple[Figure, Any
         columns,
         figsize=MAP_LAYOUT.figure_size(rows=rows, columns=columns),
         squeeze=False,
-        layout="constrained",
+        layout="compressed",
         gridspec_kw={"wspace": MAP_LAYOUT.map_column_spacing, "hspace": MAP_LAYOUT.map_row_spacing},
         **kwargs,
     )
@@ -155,13 +157,9 @@ def add_map_colorbar(
 ) -> Colorbar:
     """Attach one proportionate colorbar under the shared sizing contract."""
     if colorbar_axis is None:
-        divider = make_axes_locatable(axis)
-        colorbar_axis = divider.append_axes(
-            "right",
-            size=f"{100.0 * MAP_LAYOUT.colorbar_fraction:g}%",
-            pad=f"{100.0 * MAP_LAYOUT.colorbar_pad:g}%",
-        )
-    colorbar = figure.colorbar(image, cax=colorbar_axis)
+        colorbar = figure.colorbar(image, ax=axis, fraction=MAP_LAYOUT.colorbar_fraction, pad=MAP_LAYOUT.colorbar_pad)
+    else:
+        colorbar = figure.colorbar(image, cax=colorbar_axis)
     if label is not None:
         colorbar.set_label(label)
     return colorbar

@@ -58,22 +58,28 @@ _SELECTOR_KEYS = (
     "simulation_case_id",
     "case_hdf5_sha256",
 )
-_CASES = 3
-_THIRDS = {"kind": "seeded_material_fraction", "train_fraction": 1 / 3, "validation_fraction": 1 / 3, "id_test_fraction": 1 / 3}
 _MODEL_SHA256 = "a" * 64
 
 
 def _steady_source(request: pytest.FixtureRequest, root: Path) -> tuple[Path, list[dict[str, str]]]:
-    """Run and catalog one complete fake-solver steady Source of three lentil cases."""
+    """Run and catalog one complete fake-solver steady Source of one Train, one validation and one test lentil case."""
     make_config: Callable[..., tuple[Path, Path]] = request.getfixturevalue("generation_config_factory")
-    config_path, _ = make_config(simulation_profile="steady_flow", executable=request.getfixturevalue("fake_comsol"), natural_count=_CASES)
+    config_path, _ = make_config(
+        simulation_profile="steady_flow", executable=request.getfixturevalue("fake_comsol"), designs={"train": 1, "validation": 1, "test": 1}
+    )
     campaign = generation.cases.config.load_campaign_config(config_path)
     storage = root / "scientific-storage"
     generation.lifecycle.create_campaign(campaign, storage_root=storage)
-    batch = campaign.batches[0]
-    inputs = generation.cases.input_generation.generate_input_cases(batch, _CASES, storage_root=storage)
-    for case_index in batch.case_indices:
-        successful_source_case(campaign.source_name, batch, case_index, storage, root / "work")
+    input_sources: dict[str, dict[str, Any]] = {}
+    for batch in campaign.batches:
+        inputs = generation.cases.input_generation.generate_input_cases(batch, len(batch.case_indices), storage_root=storage)
+        for case_index in batch.case_indices:
+            successful_source_case(campaign.source_name, batch, case_index, storage, root / "work")
+        input_sources[batch.batch_name] = {
+            "input_generation_id": inputs.input_generation_id,
+            "source_git_commit": "a" * 40,
+            "case_indices": list(batch.case_indices),
+        }
     run_id = generation.campaign.campaign_run_id(campaign, git_commit="a" * 40)
     run_dir = generation.publication.campaign_evidence.campaign_run_directory(run_id, storage_root=storage)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -84,13 +90,7 @@ def _steady_source(request: pytest.FixtureRequest, root: Path) -> tuple[Path, li
         run_directory=run_dir,
         scheduler_log_directory=root / "logs",
         storage_root=storage,
-        input_sources={
-            batch.batch_name: {
-                "input_generation_id": inputs.input_generation_id,
-                "source_git_commit": "a" * 40,
-                "case_indices": list(batch.case_indices),
-            }
-        },
+        input_sources=input_sources,
     )
     common.serialization.atomic_write_json(
         generation.publication.campaign_evidence.campaign_run_manifest_path(run_id, storage_root=storage), run_manifest
@@ -101,10 +101,12 @@ def _steady_source(request: pytest.FixtureRequest, root: Path) -> tuple[Path, li
 
 @pytest.fixture(params=["steady_flow", "transient_drying"])
 def source(request: pytest.FixtureRequest, tmp_path: Path) -> dict[str, Any]:
-    """Return the storage root and three successful Source cases of one registered task."""
+    """Return the storage root and one successful Train, validation and test Source case of one registered task."""
     if request.param == "transient_drying":
         package = request.getfixturevalue("transient_package")
-        return {"task": request.param, "storage": package["root"], "selectors": package["source_selectors"][:_CASES]}
+        # The package's Source holds Train, Train, validation, test, test.
+        selectors = [package["source_selectors"][index] for index in (0, 2, 3)]
+        return {"task": request.param, "storage": package["root"], "selectors": selectors}
     storage, selectors = _steady_source(request, tmp_path)
     return {"task": request.param, "storage": storage, "selectors": selectors}
 
@@ -113,15 +115,16 @@ def _publish(source: dict[str, Any], *, role: str = "id") -> dict[str, Any]:
     """Publish the three cases as one Dataset whose single material has ``role``."""
     request = {
         "schema_kind": selection.SELECTION_SCHEMA_KIND,
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": source["task"],
         "dataset_name": "publication",
         "dataset_view": source["task"],
         "selection": {"kind": "exact"},
         "source_cases": source["selectors"],
     }
-    partition_spec = {"seed_input": 5, "seed": 5, "recipe": _THIRDS, "material_roles": {"lentil": role}}
-    return builder.build_dataset_selection(request, storage_root=source["storage"], partition_spec=partition_spec)
+    if role == "ood":
+        # An OOD material contributes only its test design.
+        request["source_cases"] = source["selectors"][-1:]
+    return builder.build_dataset_selection(request, storage_root=source["storage"], material_roles={"lentil": role})
 
 
 def _open_training(
@@ -131,7 +134,8 @@ def _open_training(
     if source["task"] == "steady_flow":
         *_, split, artifact = steady_training.create_dataloaders(
             train_dataset_id=dataset_id,
-            additional_evaluation_dataset_ids=(),
+            material_ood_dataset_ids=(),
+            train_subset=None,
             task=domain.tasks.registry.get_task("steady_flow"),
             model_sha256=model_sha256,
             storage_root=source["storage"],
@@ -141,9 +145,10 @@ def _open_training(
         return split, artifact
     loaders = transient_training.create_transient_training_loaders(
         train_dataset_id=dataset_id,
-        additional_evaluation_dataset_ids=(),
+        material_ood_dataset_ids=(),
+        train_subset=None,
         tensorizer=TransientTensorizerSpec(
-            input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("normalized_current_time")
+            input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("normalized_current_time")
         ),
         train_sampling=TransientSamplingSpec(mode="one_step_transition"),
         loader_settings=factory.LoaderSettings(),
@@ -152,7 +157,7 @@ def _open_training(
         saved_split=saved_split,
         **kwargs,
     )
-    for loader in (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test):
+    for loader in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
         if loader is not None and isinstance(loader.dataset, transient_runtime.TransientPhysicalDataset):
             loader.dataset.close()
     return loaders.split, loaders.scaling_artifact
@@ -301,7 +306,9 @@ def test_runtime_refuses_a_saved_split_of_another_manifest_digest(source: dict[s
         task=split.task,
         train_dataset={**split.train.dataset, "dataset_digest": "0" * 64},
         case_partition=split.case_partition,
-        additional_evaluation=[],
+        train_subset=None,
+        material_by_case=dict.fromkeys(split.train.dataset["case_ids"], "lentil"),
+        ood_parts={},
         extension=split.extension,
     )
     with pytest.raises(ValueError, match="does not match the current Dataset manifests"):

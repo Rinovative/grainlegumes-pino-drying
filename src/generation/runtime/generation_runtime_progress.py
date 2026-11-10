@@ -40,7 +40,6 @@ PROGRESS_HEARTBEAT_SECONDS: Final = 300.0
 PROGRESS_STALE_AFTER_SECONDS: Final = 600.0
 _MAX_COMSOL_PROGRESS_PERCENT: Final = 100
 _PROGRESS_SCHEMA_KIND: Final = "generation_campaign_runtime_progress"
-_PROGRESS_SCHEMA_VERSION: Final = 1
 _TERMINAL_PHASES: Final = frozenset({"completed", "failed"})
 _PHASES: Final = frozenset(
     {
@@ -244,7 +243,6 @@ def _bound_identity(
         raise RuntimeProgressIdentityError(message)
     identity: dict[str, Any] = {
         "schema_kind": _PROGRESS_SCHEMA_KIND,
-        "schema_version": _PROGRESS_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         **expected_case,
         "dispatch_key": dispatch_key,

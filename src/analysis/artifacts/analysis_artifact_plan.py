@@ -1,13 +1,15 @@
 """Resolve which Datasets and cases each artifact role of an evaluable run covers, the same way for both tasks.
 
 Responsibilities:
-  - Project the admitted split of a completed run into its ID-test role and its one additional-evaluation role
-  - Keep every additional Evaluation source in split order with its identity, ordered cases, membership digest and assignment
-  - Name each role's artifact Dataset and project its shared provenance block
+  - Project the admitted split of a completed run into its ID-test role and its non-empty material-OOD and
+    parameter-OOD roles
+  - Keep every OOD Evaluation source in split order with its identity, ordered cases, membership digest and assignment
+  - Name each role's artifact Dataset and folder and project its shared provenance block
 
 Design principles:
   - The persisted split, admitted by the one split loader, is the only membership authority
   - Both tasks share one role plan; task readers only open and check the parts it names
+  - An empty OOD role is not planned, so it gets no folder, artifact or metric
   - Optuna trials are refused before any role is planned
 
 This module does NOT:
@@ -22,12 +24,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from src import datasets
+from src import common, datasets
 
 from . import analysis_artifact_contracts as contracts
 
-ArtifactSplit = Literal["eval", "additional_evaluation"]
-ArtifactDatasetRole = Literal["id", "additional_evaluation"]
+ArtifactSplit = Literal["eval", "material_ood", "parameter_ood"]
+ArtifactDatasetRole = Literal["id", "material_ood", "parameter_ood"]
+# Artifact splits in canonical order; an OOD split names its Dataset role and saved split role alike.
+ARTIFACT_SPLITS: tuple[ArtifactSplit, ...] = ("eval", "material_ood", "parameter_ood")
+ARTIFACT_DATASET_ROLES: tuple[ArtifactDatasetRole, ...] = ("id", "material_ood", "parameter_ood")
+
+
+def dataset_role_of(split: ArtifactSplit) -> ArtifactDatasetRole:
+    """Return the Dataset role of one artifact split: ``id`` for ``eval``, the OOD role itself otherwise."""
+    return "id" if split == "eval" else split
+
+
+def split_of(dataset_role: ArtifactDatasetRole) -> ArtifactSplit:
+    """Return the artifact split of one Dataset role: ``eval`` for ``id``, the OOD role itself otherwise."""
+    return "eval" if dataset_role == "id" else dataset_role
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +61,13 @@ class ArtifactRolePlan:
     @property
     def split_role(self) -> datasets.preprocessing.splits.SplitRole:
         """Return the saved split role this artifact role reopens."""
-        return "id_test" if self.split == "eval" else "additional_evaluation"
+        return "id_test" if self.split == "eval" else self.split
+
+    def root(self, run_dir: Path | str) -> Path:
+        """Return this role's artifact folder: ``analysis/id`` or ``analysis/<OOD role>/<dataset name>``."""
+        if self.split == "eval":
+            return common.paths.resolve_id_analysis_dir(run_dir)
+        return common.paths.resolve_ood_analysis_dir(run_dir, self.split, self.dataset_name)
 
     @property
     def case_ids(self) -> tuple[str, ...]:
@@ -84,25 +105,35 @@ class ArtifactRolePlan:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactPlan:
-    """Bind one completed run of either task to its ID-test role and optional additional-evaluation role."""
+    """Bind one completed run of either task to its ID-test role and its non-empty OOD Evaluation roles."""
 
     run_dir: Path
     run_name: str
     task: str
     id_role: ArtifactRolePlan
-    additional_role: ArtifactRolePlan | None
+    ood_roles: Mapping[ArtifactSplit, ArtifactRolePlan]
+
+    @property
+    def roles(self) -> tuple[ArtifactRolePlan, ...]:
+        """Return the ID-test role and every planned OOD role in canonical order."""
+        return (self.id_role, *self.ood_roles.values())
+
+    @property
+    def dataset_roles(self) -> tuple[ArtifactDatasetRole, ...]:
+        """Return the Dataset roles this run has artifacts for, in canonical order."""
+        return tuple(role.dataset_role for role in self.roles)
 
     def role(self, split: ArtifactSplit) -> ArtifactRolePlan:
-        """Return the role of one artifact split, refusing an additional role the run does not have."""
+        """Return the role of one artifact split, refusing an OOD role the run does not have."""
         if split == "eval":
             return self.id_role
-        if split != "additional_evaluation":
+        if split not in ARTIFACT_SPLITS:
             msg = f"Unknown artifact split {split!r}."
             raise ValueError(msg)
-        if self.additional_role is None:
-            msg = f"Run {self.run_name!r} has no saved additional Evaluation artifact role."
+        if split not in self.ood_roles:
+            msg = f"Run {self.run_name!r} has no saved {split} artifact role."
             raise FileNotFoundError(msg)
-        return self.additional_role
+        return self.ood_roles[split]
 
 
 def _role_plan(
@@ -145,8 +176,8 @@ def artifact_plan_from_completed(completed: Mapping[str, Any], *, run_dir: Path 
     Returns
     -------
     ArtifactPlan
-        ID-test role over the training Dataset and, when the split has additional Evaluation sources, one
-        additional-evaluation role over all of them in split order.
+        ID-test role over the training Dataset and one role per non-empty OOD Evaluation role (``material_ood``,
+        ``parameter_ood``) over its sources in split order.
 
     Raises
     ------
@@ -167,21 +198,20 @@ def artifact_plan_from_completed(completed: Mapping[str, Any], *, run_dir: Path 
     contracts.refuse_optuna_trial(config, label=f"Run {run['name']}")
     split = datasets.preprocessing.splits.admit_split(raw_split)
     id_role = _role_plan(split="eval", dataset_role="id", dataset_name=split.id_test.dataset_id, parts=(split.id_test,), assignments=())
-    additional_role = (
-        None
-        if split.additional_evaluation_name is None
-        else _role_plan(
-            split="additional_evaluation",
-            dataset_role="additional_evaluation",
-            dataset_name=split.additional_evaluation_name,
-            parts=split.additional_evaluation,
-            assignments=split.evaluation_assignments,
+    ood_roles: dict[ArtifactSplit, ArtifactRolePlan] = {
+        role: _role_plan(
+            split=role,
+            dataset_role=role,
+            dataset_name=str(split.ood_name(role)),
+            parts=split.ood_parts(role),
+            assignments=split.evaluation_assignments[role],
         )
-    )
+        for role in split.ood_roles
+    }
     return ArtifactPlan(
         run_dir=Path(run_dir).expanduser().resolve(),
         run_name=str(run["name"]),
         task=split.task,
         id_role=id_role,
-        additional_role=additional_role,
+        ood_roles=ood_roles,
     )

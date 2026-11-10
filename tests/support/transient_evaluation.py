@@ -30,7 +30,7 @@ ANALYSIS_SHA256 = "9" * 64
 
 def scaling_state() -> dict[str, object]:
     """Return one valid synthetic transient scaling state with a two-unit state scale."""
-    spec = TransientTensorizerSpec("canonical_physics_complete_v1", TemporalConditioningSpec("none"))
+    spec = TransientTensorizerSpec("canonical_physics_complete", TemporalConditioningSpec("none"))
     contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
     names = tuple(
         tuple(field.name for field in group)
@@ -121,7 +121,7 @@ def sequence_record(
         scalar_conditioning=np.asarray([0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0]),
         identity={
             "material_family": material_family,
-            "input_profile": "canonical_physics_complete_v1",
+            "input_profile": "canonical_physics_complete",
             "model_kind": "fno",
             "pt_payload_identity": "a" * 64,
             "timing_evidence_identity": "b" * 64,

@@ -85,7 +85,7 @@ def resolve_uno_scalings(
             msg = f"uno_scalings[{index}] must contain exactly two spatial scaling values, got {pair!r}."
             raise ValueError(msg)
         values: list[float] = []
-        for axis, value in zip(("x", "y"), pair, strict=True):
+        for axis, value in zip(("y", "x"), pair, strict=True):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 msg = f"uno_scalings[{index}][{axis}] must be a finite positive number, got {value!r}."
                 raise TypeError(msg)

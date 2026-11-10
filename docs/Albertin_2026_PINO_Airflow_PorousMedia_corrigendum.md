@@ -16,7 +16,7 @@ What the code does: the ID data were split 80/20 into training and validation on
 <details>
 <summary>In VP2</summary>
 
-Each Dataset fixes a Train, validation and ID-test partition per ID material (80/10/10 with seed 9 in the maintained steady plan, whose OOD set is a whole held-out material). The normalisation is fitted on Train only, checkpoints and configurations are selected on validation only, and the ID-test and OOD cases never enter a selection ([Datasets and splits](08_scientific_decisions.md#datasets-and-splits), [Model selection](08_scientific_decisions.md#model-selection)).
+Each Dataset fixes a Train, validation and ID-test partition per ID material by fixed design roles, without a split seed: the maintained steady plans take 512 Train, 64 validation and 128 ID-test cases per ID material, and the OOD set is a whole held-out material ([maintained plans](04_datasets.md#the-maintained-plans)). The normalisation is fitted on Train only, checkpoints and configurations are selected on validation only, and the ID-test and OOD cases never enter a selection ([Datasets and splits](08_scientific_decisions.md#datasets-and-splits), [Model selection](08_scientific_decisions.md#model-selection)).
 
 </details>
 
@@ -32,7 +32,7 @@ The report describes a mirror-symmetric reflection that constructs "a smooth per
 <details>
 <summary>In VP2</summary>
 
-Training computes the physics residuals with finite differences on the physical grid (`physical`); `spectral` always uses Fourier continuation, so VP2 has no periodic spectral derivative ([Steady flow](04_training.md#steady-flow), [Physics diagnostics](05_evaluation.md#physics-diagnostics)).
+Training computes the physics residuals with finite differences on the physical grid (`physical`); `spectral` always uses Fourier continuation, so VP2 has no periodic spectral derivative ([Steady flow](05_training.md#steady-flow), [Component checks](06_evaluation.md#component-checks)).
 
 </details>
 
@@ -48,7 +48,7 @@ The report describes "global, relative error measures computed over the spatial 
 <details>
 <summary>In VP2</summary>
 
-RMSE is reported per field and for the velocity vector in physical units; the dimensionless `rel_l2` and `rel_h1` average ratios computed separately for each field ([Steady case metrics](05_evaluation.md#steady-case-metrics)). Checkpoints, the scheduler and the studies use `normalized_group_macro_rmse`: the mean of the pressure RMSE divided by its Train standard deviation and the velocity-vector RMSE divided by the root of the summed Train variances of u and v, accumulated over the complete validation set, so neither the units nor a partial batch shift the weights ([Model selection](08_scientific_decisions.md#model-selection)).
+RMSE is reported per field and for the velocity vector in physical units; the dimensionless `rel_l2` and `rel_h1` average ratios computed separately for each field ([Steady case metrics](06_evaluation.md#steady-case-metrics)). Checkpoints, the scheduler and the studies use `normalized_group_macro_rmse`: the mean of the pressure RMSE divided by its Train standard deviation and the velocity-vector RMSE divided by the root of the summed Train variances of u and v, accumulated over the complete validation set, so neither the units nor a partial batch shift the weights ([Model selection](08_scientific_decisions.md#model-selection)).
 
 </details>
 
@@ -64,7 +64,7 @@ The figures show the correlations of the generator parameters with the relative 
 <details>
 <summary>In VP2</summary>
 
-The parameter–error views correlate each parameter with named error columns, the normalised RMSE of p, u and v (`normalized_rmse_<field>`) and, as fourth column, the normalised velocity-vector RMSE, which also counts direction errors; no channel is addressed by position ([Views](05_evaluation.md#views)).
+The parameter–error views correlate each parameter with named error columns, the normalised RMSE of p, u and v (`normalized_rmse_<field>`) and, as fourth column, the normalised velocity-vector RMSE, which also counts direction errors; no channel is addressed by position ([Views](06_evaluation.md#views)).
 
 </details>
 
@@ -82,7 +82,7 @@ The report states that the losses "follow the discrete, quadrature-based definit
 <details>
 <summary>In VP2</summary>
 
-The H1 data loss uses one-sided differences at the boundaries (`periodic_in_x` and `periodic_in_y` false), so it no longer joins inlet and outlet, and it differentiates at the physical grid spacing in metres, like the evaluation `rel_h1` ([Steady flow](04_training.md#steady-flow)).
+The H1 data loss uses one-sided differences at the boundaries (`periodic_in_x` and `periodic_in_y` false), so it no longer joins inlet and outlet, and it differentiates at the physical grid spacing in metres, like the evaluation `rel_h1` ([Steady flow](05_training.md#steady-flow)).
 
 </details>
 
@@ -98,7 +98,7 @@ The report introduces the crop of a narrow boundary margin as part of the spectr
 <details>
 <summary>In VP2</summary>
 
-Only the momentum residual is cropped, by two samples, in training (`interior_crop: 2`) and in evaluation (`EVAL_PAD = 2`); the flux balance and the boundary terms use the full grid. The residuals of every run are evaluated with the same finite-difference operator, whatever derivatives the run trained with ([Steady case metrics](05_evaluation.md#steady-case-metrics)).
+Only the momentum residual is cropped, by two samples, in training (`interior_crop: 2`) and in evaluation (`EVAL_PAD = 2`); the flux balance and the boundary terms use the full grid. The residuals of every run are evaluated with the same finite-difference operator, whatever derivatives the run trained with ([Steady case metrics](06_evaluation.md#steady-case-metrics)).
 
 </details>
 
@@ -114,7 +114,7 @@ The report states that the reference curve shows "the same diagnostics computed 
 <details>
 <summary>In VP2</summary>
 
-Predictions and reference fields pass through the same residual function, so drag, crop and boundary terms are identical for both ([Physics diagnostics](05_evaluation.md#physics-diagnostics)).
+Predictions and reference fields pass through the same residual function, so drag, crop and boundary terms are identical for both ([Component checks](06_evaluation.md#component-checks)).
 
 </details>
 
@@ -146,7 +146,7 @@ Eq. (19) penalises the squared mean outlet pressure of a field. The training los
 <details>
 <summary>In VP2</summary>
 
-The outlet term squares the outlet mean of each case and then averages over the batch ([Steady flow](04_training.md#steady-flow)).
+The outlet term squares the outlet mean of each case and then averages over the batch ([Steady flow](05_training.md#steady-flow)).
 
 </details>
 
@@ -191,7 +191,7 @@ Eq. (3) writes the viscous term as μ∇²u, and the sentence below it sets the 
 <details>
 <summary>In VP2</summary>
 
-VP2 uses the same stress, written as such and with the trace term ([Steady flow](04_training.md#steady-flow)).
+VP2 uses the same stress, written as such and with the trace term ([Steady flow](05_training.md#steady-flow)).
 
 </details>
 
@@ -207,7 +207,7 @@ The report calls εu "the mass flux", although u is the superficial velocity: at
 <details>
 <summary>In VP2</summary>
 
-Continuity enters as the flux balance through each row: the deviation of each row's volume flux from the mean row flux, scaled by a reference flow. It is an integral condition that the COMSOL solution nearly satisfies on the grid ([Steady flow](04_training.md#steady-flow)).
+Continuity enters as the flux balance through each row: the deviation of each row's volume flux from the mean row flux, scaled by a reference flow. It is an integral condition that the COMSOL solution nearly satisfies on the grid ([Steady flow](05_training.md#steady-flow)).
 
 </details>
 

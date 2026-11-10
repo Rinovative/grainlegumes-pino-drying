@@ -3,7 +3,7 @@
 Responsibilities:
   - Recursively identify config-and-summary run leaves below an experiments root, skipping Optuna trials by their recorded layout
   - Bind current transient children through validated immutable parent records
-  - Inspect checkpoint and analysis-artifact availability without mutation, hashing each checkpoint file at most once per process
+  - Inspect checkpoint and analysis-artifact availability without mutation, taking the recorded best digest without opening checkpoints
   - Admit available artifacts through exact run, Dataset, and payload evidence
   - Return deterministic catalog evidence and bounded per-candidate issues
 
@@ -24,7 +24,7 @@ import json
 import shlex
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -47,7 +47,7 @@ _SHA256_HEX_LENGTH = 64
 class EvaluationArtifactInspection:
     """Describe one read-only task-specific artifact target."""
 
-    role: Literal["id", "additional_evaluation"]
+    role: transient_artifact.DatasetRole
     root: Path
     state: ArtifactState
     digest: str | None
@@ -69,12 +69,11 @@ class _ScopedArtifactCandidate:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationCheckpointInspection:
-    """Describe exact best and latest checkpoint presence and byte digests."""
+    """Describe the best and latest checkpoint paths and the producer-recorded best digest (verified at selection)."""
 
     best_path: Path
     best_digest: str | None
     latest_path: Path
-    latest_digest: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +93,6 @@ class EvaluationRunDiscovery:
     updated_at: str | None
     run_dir: Path
     dataset_id: str | None
-    dataset_label: str | None
     evaluation_protocol: str | None
     evaluation_config_identity: str | None
     spatial_stride: int | None
@@ -108,13 +106,17 @@ class EvaluationRunDiscovery:
     checkpoints: EvaluationCheckpointInspection
     id_artifact: EvaluationArtifactInspection
     artifact_command: str
-    additional_dataset_ids: tuple[str, ...] = ()
-    additional_artifact: EvaluationArtifactInspection | None = None
-    evaluation_assignments: tuple[Mapping[str, Any], ...] = ()
-    experiment_dir: Path | None = None
+    # Per non-empty OOD role (material_ood, parameter_ood): ordered source Datasets, artifact target and assignments.
+    ood_dataset_ids: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    ood_artifacts: Mapping[str, EvaluationArtifactInspection] = field(default_factory=dict)
+    evaluation_assignments: Mapping[str, tuple[Mapping[str, Any], ...]] = field(default_factory=dict)
     metadata_issues: tuple[str, ...] = ()
     config_label: str | None = None
     pair_label: str | None = None
+
+    def artifacts(self) -> tuple[EvaluationArtifactInspection, ...]:
+        """Return the ID artifact target and every OOD artifact target in canonical role order."""
+        return (self.id_artifact, *self.ood_artifacts.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,23 +220,12 @@ def _manifest_paths_are_present(outputs: object, *, root: Path) -> bool:
 
 
 def _artifact_payload_is_current(payload: Mapping[str, Any], *, root: Path, task: str) -> bool:
-    """Return whether one marker has recognized schema, task, and output paths."""
-    artifact_schema = payload.get("artifact_schema_version")
-    if not common.serialization.is_schema_version(payload.get("provenance_schema_version"), artifact_contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION):
-        return False
+    """Return whether one marker has the recognized task and output paths."""
     run = payload.get("run")
     run_task = _text(run.get("task")) if isinstance(run, Mapping) else None
     if task not in {value for value in (_text(payload.get("task")), run_task) if value is not None}:
         return False
-    expected_schema = (
-        transient_artifact.TRANSIENT_SEQUENCE_SCHEMA_VERSION
-        if payload.get("artifact_kind") == transient_artifact.TRANSIENT_ARTIFACT_KIND
-        else artifact_contracts.ARTIFACT_SCHEMA_VERSION
-    )
-    return common.serialization.is_schema_version(artifact_schema, expected_schema) and _manifest_paths_are_present(
-        payload.get("outputs"),
-        root=root,
-    )
+    return _manifest_paths_are_present(payload.get("outputs"), root=root)
 
 
 def _artifact_writer_active(root: Path) -> bool:
@@ -249,7 +240,7 @@ def _artifact_writer_active(root: Path) -> bool:
         return True
 
 
-def _artifact(root: Path, *, role: Literal["id", "additional_evaluation"], task: str) -> EvaluationArtifactInspection:
+def _artifact(root: Path, *, role: transient_artifact.DatasetRole, task: str) -> EvaluationArtifactInspection:
     """Inspect one canonical marker, staging lease, and payload inventory without arrays."""
     stage = artifact_contracts.artifact_stage_path(root)
     staged = stage.is_dir() and not stage.is_symlink()
@@ -344,7 +335,7 @@ def _scoped_artifact_candidate(marker: Path) -> _ScopedArtifactCandidate:
     selected = scope.get("selected_case_ids")
     if (
         task != "transient_drying"
-        or role not in {"id", "additional_evaluation"}
+        or role not in transient_artifact.DATASET_ROLES
         or scope.get("kind") != "selected_cases"
         or scope.get("canonical_publication_eligible") is not False
         or not isinstance(selected, list)
@@ -420,11 +411,13 @@ def _scoped_artifact_candidates(
     return tuple(candidates), tuple(issues)
 
 
-def _checkpoint(path: Path) -> str | None:
-    """Return a checkpoint byte digest only for an exact regular file."""
+def _recorded_checkpoint_digest(path: Path, recorded: object) -> str | None:
+    """Return the producer-recorded digest only for an exact regular file; selection verifies the bytes."""
     if not path.is_file() or path.is_symlink():
         return None
-    return artifact_contracts.cached_file_sha256(path)
+    if not isinstance(recorded, str) or len(recorded) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in recorded):
+        return None
+    return recorded
 
 
 def _stage_label(training: Mapping[str, Any]) -> str | None:
@@ -446,30 +439,6 @@ def _stage_label(training: Mapping[str, Any]) -> str | None:
 def _independent_group_identity(record: EvaluationRunDiscovery) -> str:
     """Return a stable exact synthetic group identity for one independent leaf."""
     return common.serialization.canonical_json_sha256({"task": record.task, "run_name": record.run_name, "run_dir": str(record.run_dir)})
-
-
-def dataset_display_projection(
-    task: str,
-    dataset_id: str,
-) -> str:
-    """Preserve the explicitly authored readable Dataset name for navigation."""
-    common.paths.validate_logical_name(task, label="Evaluation task display projection")
-    return common.paths.validate_logical_name(dataset_id, label="Evaluation Dataset name")
-
-
-def _dataset_label(
-    task: str,
-    data: Mapping[str, Any],
-) -> str | None:
-    """Return the authored readable Dataset name without inferring its content."""
-    raw_dataset_id = data.get("train_dataset")
-    if raw_dataset_id is None:
-        return None
-    dataset_id = common.paths.validate_logical_name(
-        raw_dataset_id,
-        label="config.yaml data.train_dataset",
-    )
-    return dataset_display_projection(task, dataset_id)
 
 
 def _evaluation_config_identity(task: str, evaluation: Mapping[str, Any]) -> str | None:
@@ -496,13 +465,10 @@ def _run_from_leaf(
     if artifact_contracts.is_optuna_trial_config(config):
         return None  # The validated layout identifies an Optuna trial: search evidence whose checkpoints are not kept.
     try:
-        output_root = common.paths.resolve_config_output_root(config, run_dir)
+        common.paths.resolve_config_output_root(config, run_dir)
     except ValueError:
         if layout["stage"] != "single":
-            raise
-        experiment_dir = None  # A relocated independent bundle has no authoritative current experiment directory.
-    else:
-        experiment_dir = common.paths.resolve_config_family_dir(config, output_root=output_root)
+            raise  # Only a relocated independent bundle may lack a resolvable output root.
     run_name = _text(run.get("name"))
     if task is None or run_name is None:
         message = "config.yaml must define task and run.name."
@@ -515,19 +481,20 @@ def _run_from_leaf(
         message = "summary.json must define status."
         raise ValueError(message)
     data_mapping = _optional_mapping(config.get("data"))
-    additional: tuple[str, ...] = ()
-    assignments: tuple[Mapping[str, Any], ...] = ()
-    additional_identity: str | None = None
+    ood_dataset_ids: dict[str, tuple[str, ...]] = {}
+    assignments: dict[str, tuple[Mapping[str, Any], ...]] = {}
+    ood_names: dict[transient_artifact.DatasetRole, str] = {}
     metadata_issues: tuple[str, ...] = ()
-    if common.paths.resolve_split_indices_path(run_dir).is_file():  # A run that ended before its split was persisted has no additional role.
+    if common.paths.resolve_split_indices_path(run_dir).is_file():  # A run that ended before its split was persisted has no OOD role.
         try:
             split = datasets.preprocessing.splits.read_saved_split(run_dir)
         except (OSError, ValueError, TypeError) as error:
             metadata_issues = (f"Saved split unavailable: {type(error).__name__}: {error}",)
         else:
-            additional = tuple(part.dataset_id for part in split.additional_evaluation)
-            assignments = split.evaluation_assignments
-            additional_identity = split.additional_evaluation_name
+            for ood_role in split.ood_roles:
+                ood_dataset_ids[ood_role] = tuple(part.dataset_id for part in split.ood_parts(ood_role))
+                assignments[ood_role] = split.evaluation_assignments[ood_role]
+                ood_names[ood_role] = str(split.ood_name(ood_role))
     training_mapping = _optional_mapping(config.get("training"))
     model_mapping = _optional_mapping(config.get("model"))
     parameter_mapping = _optional_mapping(model_mapping.get("params"))
@@ -536,21 +503,14 @@ def _run_from_leaf(
     stage = _stage_label(training_mapping)
     best = run_dir / common.paths.RUN_BEST_CHECKPOINT_FILENAME
     latest = run_dir / common.paths.RUN_LAST_CHECKPOINT_FILENAME
-    best_digest = _checkpoint(best)
-    id_root = common.paths.resolve_id_analysis_dir(run_dir)
-    additional_root = (
-        common.paths.resolve_additional_evaluation_analysis_dir(run_dir, additional_identity)
-        if additional_identity is not None
-        else common.paths.resolve_analysis_root(run_dir) / "additional_evaluation"
-    )
-    id_artifact = _artifact(id_root, role="id", task=task)
-    additional_artifact = _artifact(additional_root, role="additional_evaluation", task=task) if additional_identity is not None else None
+    best_digest = _recorded_checkpoint_digest(best, summary.get("best_checkpoint_sha256"))
+    id_artifact = _artifact(common.paths.resolve_id_analysis_dir(run_dir), role="id", task=task)
     run_digest = _text(summary.get("effective_config_digest"))
 
     def scoped_for(
         inspection: EvaluationArtifactInspection,
         *,
-        role: Literal["id", "additional_evaluation"],
+        role: transient_artifact.DatasetRole,
         dataset_name: str | None,
     ) -> EvaluationArtifactInspection:
         """Use one unambiguous exact scoped artifact only when canonical is missing."""
@@ -573,13 +533,15 @@ def _run_from_leaf(
         role="id",
         dataset_name=_text(data_mapping.get("train_dataset")),
     )
-    if additional_artifact is not None:
-        additional_artifact = scoped_for(additional_artifact, role="additional_evaluation", dataset_name=additional_identity)
+    ood_artifacts: dict[str, EvaluationArtifactInspection] = {
+        role: scoped_for(_artifact(common.paths.resolve_ood_analysis_dir(run_dir, role, name), role=role, task=task), role=role, dataset_name=name)
+        for role, name in ood_names.items()
+    }
     evaluable = status == "completed" and best_digest is not None
     action_enabled = (
         evaluable
         and not metadata_issues
-        and any(artifact is not None and artifact.state in {"ready", "scoped_partial"} for artifact in (id_artifact, additional_artifact))
+        and any(artifact.state in {"ready", "scoped_partial"} for artifact in (id_artifact, *ood_artifacts.values()))
     )
     return EvaluationRunDiscovery(
         task=task,
@@ -595,7 +557,6 @@ def _run_from_leaf(
         updated_at=_text(summary.get("updated_at")),
         run_dir=run_dir,
         dataset_id=_text(data_mapping.get("train_dataset")),
-        dataset_label=_dataset_label(task, data_mapping),
         evaluation_protocol=_text(objective_mapping.get("id")),
         evaluation_config_identity=_evaluation_config_identity(task, evaluation_mapping),
         spatial_stride=data_mapping.get("spatial_stride")
@@ -608,12 +569,11 @@ def _run_from_leaf(
         availability="available" if action_enabled else "unavailable",
         evaluable=evaluable,
         action_enabled=action_enabled,
-        checkpoints=EvaluationCheckpointInspection(best, best_digest, latest, _checkpoint(latest)),
+        checkpoints=EvaluationCheckpointInspection(best, best_digest, latest),
         id_artifact=id_artifact,
-        additional_dataset_ids=additional,
-        additional_artifact=additional_artifact,
+        ood_dataset_ids=ood_dataset_ids,
+        ood_artifacts=ood_artifacts,
         evaluation_assignments=assignments,
-        experiment_dir=experiment_dir,
         metadata_issues=metadata_issues,
         config_label=f"{layout['family']}/{layout['config_name']}",
         pair_label=layout["pair"],
@@ -733,9 +693,7 @@ def discover_evaluation_runs(experiments_root: Path | str) -> EvaluationRunCatal
         EvaluationRunGroup(identity, values[0].parent_label or values[0].label, values[0].task, tuple(values))
         for identity, values in sorted(grouped.items())
     )
-    artifact_counts: Counter[str] = Counter(
-        artifact.state for record in runs for artifact in (record.id_artifact, record.additional_artifact) if artifact is not None
-    )
+    artifact_counts: Counter[str] = Counter(artifact.state for record in runs for artifact in record.artifacts())
     return EvaluationRunCatalog(
         runs,
         groups,

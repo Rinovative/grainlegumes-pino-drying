@@ -1,0 +1,24 @@
+# Role: one transient_drying matched A0 -> {B, A1} experiment; states only what differs from base.yaml and the FNO defaults. Edit: freely.
+
+model:
+  kind: fno  # Architecture family; its params below are interpreted by that family.
+  params:
+    n_modes: [64, 80]  # Fourier modes retained along each spatial axis; higher values increase spectral capacity and cost.
+    hidden_channels: 64  # Width of the hidden feature representation.
+    n_layers: 3  # Number of Fourier layers; affects capacity and compute.
+
+optimizer:
+  lr: 3.883614530748613e-4  # Initial learning rate; placeholder until the fno_a0_search study selects it.
+
+training:
+  a0:
+    sampling:
+      mode: one_step_transition  # Teacher-forced single-transition training examples; A0's curriculum stays the one-step default.
+  b:
+    sampling:
+      mode: rollout_window  # Self-fed rollout windows of the base rollout_length.
+      window_stride: 32  # Step between rollout-window starts in the sampled trajectory.
+      window_offset: 0  # Starting offset applied when selecting rollout windows.
+
+task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.
+base: ../../base.yaml  # Shared task settings; every value set in this file overrides them.

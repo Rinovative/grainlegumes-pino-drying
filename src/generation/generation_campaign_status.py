@@ -5,15 +5,14 @@ Responsibilities:
   - Show the fresh admissions against the effective admission cap, marking a derived cap as following the plan rates
   - Derive stable state and solver-advancement render signatures
   - Bound automatic active-case output without hiding explicit status detail
-  - Render the driver's live board: one line per case, counts, and an estimated remaining time from the status the driver already reads
-  - Print one timestamped line for every case that changes its board group, with the reason
+  - Render the driver's live board (one line per case and the counts) at state changes, and one compact line per running case every minute
+  - Print one timestamped line for every case that changes its board group, or its detail while it stays failed, with the reason
 
 Design principles:
   - Presentation consumes canonical status without changing campaign decisions
-  - An estimate is printed only once a case ended and only while it stays below 10 times the elapsed time
   - Partial solver values remain raw evidence rather than convergence claims
   - Missing monitoring evidence is explicit and non-fatal
-  - The board keeps only in-memory observation times, including unverified-failure sightings; estimates say unknown without enough evidence
+  - The board keeps only in-memory observation times, including unverified-failure sightings; it estimates no remaining time
   - Replacement lineage comes only from the status's exact parent link, never from batch names or case order alone
 
 This module does NOT:
@@ -23,10 +22,8 @@ This module does NOT:
 
 from __future__ import annotations
 
-import heapq
 import math
 import re
-import statistics
 from datetime import UTC, datetime
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any
@@ -71,9 +68,8 @@ _PRE_SOLVER_RUNTIME_PHASES = frozenset(
         "starting_solver",
     }
 )
-_BOARD_REPEAT_SECONDS = 300  # the board is repeated this often while nothing changed, so a long solve still shows its progress
+_PROGRESS_LINE_SECONDS = 60  # a running case prints one compact progress line this often while the board stays unchanged
 _BOARD_STALE_SECONDS = 600  # a running case whose solver evidence stayed unchanged this long is marked as stuck
-_ESTIMATE_ELAPSED_FACTOR = 10  # an estimate at least this many times the elapsed time is noise from the first progress readings, not an estimate
 _SLURM_ELAPSED = re.compile(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d{2})\Z")
 _WAITING_WORDS = {
     "scheduler_pending": "queued in Slurm",
@@ -821,17 +817,6 @@ def format_campaign_monitor(
     return f"{header}\n{summary}"
 
 
-def _estimate(seconds: float | None, *, elapsed: float, finished: int) -> str | None:
-    """Return one estimate as ``~<duration>``, or ``None`` before a case ended, when it is unknown or not finite, or at least 10x ``elapsed``.
-
-    The board passes the larger of the driver's elapsed time and the done cases' total run time per seat as ``elapsed``,
-    so the campaign's measured work supports an estimate right after a driver restart.
-    """
-    if not finished or seconds is None or not math.isfinite(seconds) or seconds >= _ESTIMATE_ELAPSED_FACTOR * elapsed:
-        return None
-    return f"~{common.console.format_duration(seconds)}"
-
-
 def _elapsed_seconds(value: object) -> float | None:
     """Return the seconds of one Slurm ``[D-][HH:]MM:SS`` elapsed field."""
     match = _SLURM_ELAPSED.match(value) if isinstance(value, str) else None
@@ -854,50 +839,26 @@ def _board_group(case: Mapping[str, Any]) -> str:
     return {"successful": "done", "failed": "failed"}.get(bucket, "waiting")
 
 
-def _running_parts(case: Mapping[str, Any]) -> tuple[list[str], float | None]:
-    """Return the board fields of one running case and its estimated remaining solving seconds.
+def _running_parts(case: Mapping[str, Any]) -> list[str]:
+    """Return the board fields of one running case: the solver time past its own ``physical_start_hours`` and the solver evidence.
 
-    Progress is the solver time past the case's own ``physical_start_hours`` against its ``physical_horizon_hours``,
-    both from the status. The estimate extrapolates that progress; a drying case that reaches its target moisture
-    earlier ends before the horizon, so the estimate is an upper bound.
+    No percentage: a drying case ends at its target moisture, mostly long before the horizon.
     """
     runtime = _runtime_view(case)
     simulated = _float_value(runtime.get("simulated_time_seconds"))
-    start_hours = _float_value(case.get("physical_start_hours"))
-    horizon_hours = _float_value(case.get("physical_horizon_hours"))
-    eta = None
     if runtime.get("availability") != "available":
-        parts = [f"no runtime report ({_text(runtime.get('reason'))})"]
-    elif runtime.get("parser_state") != "available" or simulated is None or start_hours is None or not horizon_hours:
+        return [f"no runtime report ({_text(runtime.get('reason'))})"]
+    start_hours = _float_value(case.get("physical_start_hours"))
+    if runtime.get("parser_state") != "available" or simulated is None or start_hours is None:
         # A running case's batch always has its persisted time window, so only the solver phase can be missing here.
-        parts = [(_available_text(runtime.get("phase")) or "starting").replace("_", " ")]
-    else:
-        progressed, horizon_seconds = simulated - start_hours * _SECONDS_PER_HOUR, horizon_hours * _SECONDS_PER_HOUR
-        parts = [f"{100.0 * progressed / horizon_seconds:.0f} %", f"{_format_simulated_time(progressed)} / {horizon_hours:g} h"]
-        elapsed = _float_value(runtime.get("elapsed_seconds"))
-        if progressed > 0 and elapsed is not None:
-            eta = max(0.0, elapsed * (horizon_seconds - progressed) / progressed)
-        parts.append(f"step {_format_step_size(runtime.get('step_size_seconds'))}")
-        parts.append(f"Tfail {_text(runtime.get('time_failures'))}  NLfail {_text(runtime.get('nonlinear_failures'))}")
-        parts.append(f"updated {_format_age(runtime)}")
-    return parts, eta
-
-
-def _remaining_seconds(running_etas: Sequence[float | None], waiting: int, finished_seconds: Sequence[float], seats: int) -> float | None:
-    """Estimate the seconds until every case ended, or ``None`` without evidence for each running or waiting case.
-
-    Running cases keep their seats; each waiting case, taking the median duration of the finished cases, goes whole
-    to the seat that frees first, and the estimate is the latest finish.
-    """
-    known = [eta for eta in running_etas if eta is not None]
-    if len(known) < len(running_etas) or (waiting and not finished_seconds):
-        return None
-    typical = statistics.median(finished_seconds) if waiting else 0.0
-    finishes = sorted(known)[-seats:] + [0.0] * max(0, seats - len(known))
-    heapq.heapify(finishes)
-    for _case in range(waiting):
-        heapq.heappush(finishes, heapq.heappop(finishes) + typical)
-    return max(finishes)
+        return [(_available_text(runtime.get("phase")) or "starting").replace("_", " ")]
+    progressed = simulated - start_hours * _SECONDS_PER_HOUR
+    return [
+        f"simulated {_format_simulated_time(progressed)}",
+        f"step {_format_step_size(runtime.get('step_size_seconds'))}",
+        f"Tfail {_text(runtime.get('time_failures'))}  NLfail {_text(runtime.get('nonlinear_failures'))}",
+        f"updated {_format_age(runtime)}",
+    ]
 
 
 def _replacements(cases: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], str]:
@@ -956,17 +917,21 @@ def _is_unverified(case: Mapping[str, Any]) -> bool:
     )
 
 
+def _progress_line(case: Mapping[str, Any], parts: Sequence[str]) -> str:
+    """Return the compact line of one running case: its identity and its progress fields."""
+    return f"{_group_label(case)}/{case.get('case_id')}  {'  '.join(parts)}"
+
+
 class CampaignBoard:
     """Render the live overview of one running campaign from the status payload the driver reads at every poll."""
 
-    def __init__(self, *, started: float, seats: int, verify_seconds: float) -> None:
-        """Observe from clock reading ``started``; ``seats`` is the number of parallel cases.
+    def __init__(self, *, started: float, verify_seconds: float) -> None:
+        """Observe from clock reading ``started``.
 
         ``verify_seconds`` is how long an unverified failure reads as verifying before it reads as failed; the driver passes
         its own failure settle window, so the board and the driver agree on it.
         """
         self._started = started
-        self._seats = max(1, seats)
         self._verify_seconds = verify_seconds
         self._signature: str | None = None
         self._printed_at = started
@@ -978,9 +943,11 @@ class CampaignBoard:
     def observe(self, status: Mapping[str, Any], *, now: float) -> str | None:
         """Record solver-evidence changes and first sightings of unverified failures; return the new text to print, else ``None``.
 
-        The text holds the board when it is due, then one line per case that changed its group since the previous call.
-        The board is due at the first call, when the state signature of the campaign changed, after the repeat interval,
-        and when a case printed as verifying leaves that state because its window expired.
+        The text holds the board when it is due, then one line per case that changed its group (or its detail while it stays
+        failed) since the previous call.
+        The board is due at the first call, when the state signature of the campaign changed, and when a case printed
+        as verifying leaves that state because its window expired. Otherwise, after the progress interval, the text is
+        one compact line per running case.
         """
         cases = _case_inventory(status)
         self._unverified_since = {_case_key(case): self._unverified_since.get(_case_key(case), now) for case in cases if _is_unverified(case)}
@@ -995,11 +962,18 @@ class CampaignBoard:
         blocks: list[str] = []
         signature = campaign_monitor_signatures(status)[0]
         window_closed = self._verifying_until is not None and now >= self._verifying_until
-        if signature != self._signature or now - self._printed_at >= _BOARD_REPEAT_SECONDS or window_closed:
+        if signature != self._signature or window_closed:
             self._signature, self._printed_at = signature, now
             ends = [since + self._verify_seconds for since in self._unverified_since.values()]
             self._verifying_until = min((end for end in ends if end > now), default=None)
             blocks.append(self._render(status, cases, now))
+        elif now - self._printed_at >= _PROGRESS_LINE_SECONDS:
+            self._printed_at = now
+            running = [case for case in cases if self._group(case, now) == "running"]
+            if running:
+                blocks.append(
+                    "\n".join(f"{common.console.format_timestamp()}  {_progress_line(case, self._stale_parts(case, now))}" for case in running)
+                )
         blocks.extend(self._transitions(cases, now))
         return "\n\n".join(blocks) if blocks else None
 
@@ -1011,46 +985,39 @@ class CampaignBoard:
         return _board_group(case)
 
     def _transitions(self, cases: Sequence[Mapping[str, Any]], now: float) -> list[str]:
-        """Return one timestamped line per case whose group changed since the previous call; the first sighting of a case is no change."""
+        """Return one timestamped line per case whose group (or, while failed, detail) changed since the previous call; a first sighting is none."""
         replaced = _replacements(cases)
         lines: list[str] = []
         for case in sorted(cases, key=lambda item: (_group_label(item), str(item.get("case_id")))):
             key, group = _case_key(case), self._group(case, now)
-            detail = _running_parts(case)[0][0] if group == "running" else "; ".join(_case_parts(case, group, replaced))
+            detail = _running_parts(case)[0] if group == "running" else "; ".join(_case_parts(case, group, replaced))
             previous = self._seen.get(key)
             self._seen[key] = (group, detail)
-            if previous is not None and previous[0] != group:
-                was = f"; was {previous[1]}" if previous[0] in {"failed", "verifying"} else ""
-                lines.append(f"{common.console.format_timestamp()}  case {_group_label(case)}/{key[1]}: {previous[0]} -> {group} ({detail}{was})")
+            if previous is None or (previous[0] == group and (group != "failed" or previous[1] == detail)):
+                continue
+            was = f"; was {previous[1]}" if previous[0] in {"failed", "verifying"} else ""
+            change = group if previous[0] == group else f"{previous[0]} -> {group}"
+            lines.append(f"{common.console.format_timestamp()}  case {_group_label(case)}/{key[1]}: {change} ({detail}{was})")
         return ["\n".join(lines)] if lines else []
 
+    def _stale_parts(self, case: Mapping[str, Any], now: float) -> list[str]:
+        """Return the progress fields of one running case and, when its solver evidence stayed unchanged too long, the marker."""
+        parts = _running_parts(case)
+        stale = now - self._evidence[_case_key(case)][1]
+        if stale > _BOARD_STALE_SECONDS:
+            parts.append(f"no progress for {int(stale // _SECONDS_PER_MINUTE)} min")
+        return parts
+
     def _render(self, status: Mapping[str, Any], cases: Sequence[Mapping[str, Any]], now: float) -> str:
-        """Return the header with the counts and the estimate, the node jobs, and one line per case."""
+        """Return the header with the counts, the node jobs, and one line per case."""
         grouped = [(case, self._group(case, now)) for case in cases]
         groups = {name: [case for case, group in grouped if group == name] for name in ("done", "running", "waiting", "failed", "verifying")}
-        running = {_case_key(case): _running_parts(case) for case in groups["running"]}
-        finished = [seconds for case in groups["done"] if (seconds := _elapsed_seconds(case.get("elapsed"))) is not None]
-        elapsed, ended = now - self._started, len(groups["done"])
-        basis = max(elapsed, sum(finished) / self._seats)
-        remaining = _remaining_seconds([eta for _parts, eta in running.values()], len(groups["waiting"]), finished, self._seats)
-        estimate = _estimate(remaining, elapsed=basis, finished=ended)
-        outlook = (
-            "remaining none" if not (running or groups["waiting"]) else "ETA: not yet estimable" if estimate is None else f"remaining {estimate}"
-        )
         counts = "  ".join(f"{name} {len(members)}" for name, members in groups.items() if name != "verifying" or members)
-        lines = [f"Board  {counts}  of {len(cases)}  elapsed {common.console.format_duration(elapsed)}  {outlook}", *_node_job_lines(status)]
+        lines = [f"Board  {counts}  of {len(cases)}  elapsed {common.console.format_duration(now - self._started)}", *_node_job_lines(status)]
         replaced = _replacements(cases)
         width = max((len(_group_label(case)) for case in cases), default=0)
         for case in sorted(cases, key=lambda item: (_group_label(item), str(item.get("case_id")))):
             group = self._group(case, now)
-            key = _case_key(case)
-            parts = _case_parts(case, group, replaced)
-            if group == "running":
-                parts = list(running[key][0])
-                if (eta := _estimate(running[key][1], elapsed=basis, finished=ended)) is not None:
-                    parts.append(f"ETA {eta}")
-                stale = now - self._evidence[key][1]
-                if stale > _BOARD_STALE_SECONDS:
-                    parts.append(f"no progress for {int(stale // _SECONDS_PER_MINUTE)} min")
-            lines.append(f"{_group_label(case):<{width}}  {key[1]}  {group:<7}  {'  '.join(parts)}")
+            parts = self._stale_parts(case, now) if group == "running" else _case_parts(case, group, replaced)
+            lines.append(f"{_group_label(case):<{width}}  {case.get('case_id')}  {group:<7}  {'  '.join(parts)}")
         return "\n".join(lines)

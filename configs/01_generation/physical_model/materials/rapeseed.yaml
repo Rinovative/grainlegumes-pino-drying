@@ -1,7 +1,6 @@
 # Role: reference data of the physical model. Edit: only with new physical evidence or a deliberate model change.
-# Material-specific physical design and provenance. Nominals/supports are parameterization choices, not universal constants; evidence class and applicability remain explicit below.
+# Material-specific physical design in edit order: sampled values, density, Oswin, target, kinetics. Nominals/supports are parameterization choices, not universal constants.
 schema_kind: generation_material
-schema_version: 1
 material_family: rapeseed
 material_scope:
   common_name: Rapeseed / canola
@@ -18,6 +17,11 @@ permeability:
     upper: 9.0e-09
   transform: log
   distribution: uniform_in_log_space
+  ood_supports:
+  - lower: 6.0e-10
+    upper: 1.3e-09
+  - lower: 1.44e-08
+    upper: 2.475e-08
   provenance:
     evidence: engineering_estimate
     source_refs:
@@ -25,17 +29,114 @@ permeability:
     applicability:
       packing: Only for packing bands in each complete density record; generated mean
         eps must pass the material band.
-  ood_supports:
-  - lower: 6.0e-10
-    upper: 1.3e-09
-  - lower: 1.44e-08
-    upper: 2.475e-08
   ood_provenance:
     evidence: synthetic_design
     source_refs: []
     method: Explicit synthetic stress intervals admitted by the registry-wide transformed
       gap and width policy; permeability tails also satisfy fixed Kozeny-Carman guards.
     verification: mathematically_reproduced
+# Granular-phase thermal values: k_gr is conductivity and cp_gr_dry is dry-solid specific heat. Natural and OOD supports are design ranges.
+thermal_properties:
+  k_gr:
+    nominal: 0.2
+    support:
+      lower: 0.15
+      upper: 0.25
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 0.09
+      upper: 0.12
+    - lower: 0.31
+      upper: 0.4
+    provenance:
+      evidence: literature_direct
+      source_refs:
+      - canola_thermal
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  cp_gr_dry:
+    nominal: 1850.0
+    support:
+      lower: 1600.0
+      upper: 2100.0
+    transform: log
+    distribution: uniform_in_log_space
+    ood_supports:
+    - lower: 1200
+      upper: 1450
+    - lower: 2400
+      upper: 2800
+    provenance:
+      evidence: literature_direct
+      source_refs:
+      - canola_thermal
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+# Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
+initial_moisture:
+  mean_db:
+    nominal: 0.13636363636363635
+    support:
+      lower: 0.0989010989010989
+      upper: 0.1904761904761905
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.23
+      upper: 0.3
+    provenance:
+      evidence: engineering_estimate
+      source_refs:
+      - canola_drying
+      note: Natural material-dependent starting moisture in dry basis; range is an
+        explicit engineering envelope around project or product-compatible drying
+        evidence, not a market-target transfer.
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  amplitude_db:
+    nominal: 0.012
+    support:
+      lower: 0.003
+      upper: 0.025
+    transform: linear
+    distribution: uniform
+    ood_supports:
+    - lower: 0.035
+      upper: 0.05
+    provenance:
+      evidence: synthetic_design
+      source_refs:
+      - pino_airflow_project
+    ood_provenance:
+      evidence: synthetic_design
+      source_refs: []
+      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
+        gap and width policy.
+      verification: mathematically_reproduced
+  field_support:
+    lower: 0.0989010989010989
+    upper: 0.1904761904761905
+    unit: kg/kg
+    provenance:
+      evidence: derived
+      source_refs:
+      - canola_drying
+      method: X_db=X_wb/(1-X_wb)
+      verification: mathematically_reproduced
+  margin_above_target_db: 0.01
 # Dimensionless support for generated bed-mean porosity; density calibration stores a compatible paired reference state.
 packing_porosity_mean_support:
   lower: 0.365
@@ -89,124 +190,6 @@ density_calibration:
     method: Complete loose and dense packing records derived at the fixed reference
       inferred dry particle density.
     verification: mathematically_reproduced
-# Granular-phase thermal values: k_gr is conductivity and cp_gr_dry is dry-solid specific heat. Natural and OOD supports are design ranges.
-thermal_properties:
-  k_gr:
-    nominal: 0.2
-    support:
-      lower: 0.15
-      upper: 0.25
-    transform: log
-    distribution: uniform_in_log_space
-    provenance:
-      evidence: literature_direct
-      source_refs:
-      - canola_thermal
-    ood_supports:
-    - lower: 0.09
-      upper: 0.12
-    - lower: 0.31
-      upper: 0.4
-    ood_provenance:
-      evidence: synthetic_design
-      source_refs: []
-      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
-        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
-        guards.
-      verification: mathematically_reproduced
-  cp_gr_dry:
-    nominal: 1850.0
-    support:
-      lower: 1600.0
-      upper: 2100.0
-    transform: log
-    distribution: uniform_in_log_space
-    provenance:
-      evidence: literature_direct
-      source_refs:
-      - canola_thermal
-    ood_supports:
-    - lower: 1200
-      upper: 1450
-    - lower: 2400
-      upper: 2800
-    ood_provenance:
-      evidence: synthetic_design
-      source_refs: []
-      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
-        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
-        guards.
-      verification: mathematically_reproduced
-# Initial moisture is dry basis (kg water/kg dry solids); amplitude controls field variation and field_support bounds generated values.
-initial_moisture:
-  mean_db:
-    nominal: 0.13636363636363635
-    support:
-      lower: 0.0989010989010989
-      upper: 0.1904761904761905
-    transform: linear
-    distribution: uniform
-    provenance:
-      evidence: engineering_estimate
-      source_refs:
-      - canola_drying
-      note: Natural material-dependent starting moisture in dry basis; range is an
-        explicit engineering envelope around project or product-compatible drying
-        evidence, not a market-target transfer.
-    ood_supports:
-    - lower: 0.23
-      upper: 0.3
-    ood_provenance:
-      evidence: synthetic_design
-      source_refs: []
-      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
-        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
-        guards.
-      verification: mathematically_reproduced
-  amplitude_db:
-    nominal: 0.012
-    support:
-      lower: 0.003
-      upper: 0.025
-    transform: linear
-    distribution: uniform
-    provenance:
-      evidence: synthetic_design
-      source_refs:
-      - pino_airflow_project
-    ood_supports:
-    - lower: 0.035
-      upper: 0.05
-    ood_provenance:
-      evidence: synthetic_design
-      source_refs: []
-      method: Explicit synthetic stress intervals admitted by the registry-wide transformed
-        gap and width policy; permeability tails also satisfy fixed Kozeny-Carman
-        guards.
-      verification: mathematically_reproduced
-  field_support:
-    lower: 0.0989010989010989
-    upper: 0.1904761904761905
-    unit: kg/kg
-    provenance:
-      evidence: derived
-      source_refs:
-      - canola_drying
-      method: X_db=X_wb/(1-X_wb)
-      verification: mathematically_reproduced
-  margin_above_target_db: 0.01
-# Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
-target_moisture:
-  target_moisture_wb: 0.06
-  provenance:
-    evidence: official_industry_target
-    source_refs:
-    - swiss_oil
-    method: Exact converted safe-storage reference 0.06542056074766356 wb; retain
-      the stricter source-supported practical target of 0.06 wb rather than round
-      upward to 0.07 wb.
-    note: Single practical safe-storage drying target; market acceptance is not
-      a separate operational target.
 # Coupled Oswin equilibrium-isotherm coefficients; preserve each material record and its stated units/evidence as one parameter set.
 oswin:
   record_id: rapeseed_production_oswin_v1
@@ -230,7 +213,19 @@ oswin:
         by 0.01
       evidence_scope: Whole intact Option 500 canola, desorption, 30-60 degC, aw 0.11-0.81,
         % db
-# Surface/internal moisture-transfer prior. r_surf_0 is a rate, r_int_surf a rate ratio, and f_surf a fraction; OOD entries are complete records.
+# Single operational drying target on a wet basis; it is a material target, not an initial-moisture support.
+target_moisture:
+  target_moisture_wb: 0.06
+  provenance:
+    evidence: official_industry_target
+    source_refs:
+    - swiss_oil
+    method: Exact converted safe-storage reference 0.06542056074766356 wb; retain
+      the stricter source-supported practical target of 0.06 wb rather than round
+      upward to 0.07 wb.
+    note: Single practical safe-storage drying target; market acceptance is not
+      a separate operational target.
+# Surface/internal moisture-transfer prior: r_surf_0 is a rate, r_int_surf a rate ratio, f_surf a fraction; the loader derives the two OOD records from the nominals.
 two_compartment_kinetics:
   record_id: rapeseed_two_compartment_kinetics_v1
   components:
@@ -252,15 +247,6 @@ two_compartment_kinetics:
         lower: 0.3
         upper: 0.68
       transform: logit
-  ood_records:
-  - record_id: slow_internal_limited
-    r_surf_0: 5.0e-06
-    r_int_surf: 0.11
-    f_surf: 0.35
-  - record_id: fast_surface_exposed
-    r_surf_0: 7.0e-05
-    r_int_surf: 0.33
-    f_surf: 0.65
   selection_rule: complete_record_atomic
   provenance:
     evidence: calibration_prior

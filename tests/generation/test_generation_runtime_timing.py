@@ -85,7 +85,6 @@ def _write_sidecars(
 ) -> None:
     timing_payload = {
         "schema_kind": "simulation_case_timing",
-        "schema_version": 1,
         "batch_id": batch_id,
         "case_id": "case_0001",
         "case_input_id": "b" * 64,
@@ -117,7 +116,6 @@ def _write_sidecars(
         timing_payload.update(solver_timing.timing_fields())
     status_payload = {
         "schema_kind": "simulation_case_status",
-        "schema_version": 1,
         "solver_success": True,
         "target_reached": False,
         "t_stop_exact": 96.0,
@@ -219,7 +217,7 @@ def test_load_case_timing_rejects_timing_owned_by_a_different_source_batch(tmp_p
 
 @pytest.mark.parametrize(
     ("path", "field", "value"),
-    [("timing.json", "git_commit", "d" * 40), ("timing.json", "complete_execution_s", float("nan")), ("status.json", "schema_version", 2)],
+    [("timing.json", "git_commit", "d" * 40), ("timing.json", "complete_execution_s", float("nan")), ("status.json", "schema_kind", "other")],
 )
 def test_load_case_timing_rejects_identity_schema_and_nonfinite_evidence(tmp_path: Path, path: str, field: str, value: Any) -> None:
     _write_sidecars(tmp_path)

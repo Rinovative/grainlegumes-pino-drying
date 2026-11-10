@@ -22,7 +22,6 @@ from __future__ import annotations
 from src.domain.physics import domain_physics_contracts as physics_contracts
 
 from .domain_task_spec import (
-    TASK_SCHEMA_VERSION,
     FieldSpec,
     MetricSpec,
     OutputGroupSpec,
@@ -33,7 +32,6 @@ from .domain_task_spec import (
 
 STEADY_FLOW = TaskSpec(
     id="steady_flow",
-    schema_version=TASK_SCHEMA_VERSION,
     inputs=(
         FieldSpec("x", "coordinate", "m", "identity"),
         FieldSpec("y", "coordinate", "m", "identity"),

@@ -115,16 +115,21 @@ def _normalizer_state(inputs: Tensor, outputs: Tensor, indices: Tensor) -> dict[
     }
 
 
+def _design_kinds(source: _SyntheticDataset, *, material: str) -> dict[str, str]:
+    """Return the design kind of each case: Train, Train, validation, test for the ID material, test for the OOD one."""
+    case_ids = list(source.identity.sample_ids)
+    kinds = ["train", "train", "validation", "test"] if material == "lentil" else ["test"] * len(case_ids)
+    return dict(zip(case_ids, kinds, strict=True))
+
+
 def _partition(id_source: _SyntheticDataset) -> dict[str, Any]:
-    """Build the Dataset-owned fixed 2/1/1 partition through the production contract."""
+    """Build the Dataset-owned fixed 2/1/1 partition from the design kinds through the production contract."""
     case_ids = list(id_source.identity.sample_ids)
     return datasets.contracts.partition.build_fixed_partition(
         case_ids,
         material_by_case=dict.fromkeys(case_ids, "lentil"),
+        design_kind_by_case=_design_kinds(id_source, material="lentil"),
         material_roles={"lentil": "id"},
-        recipe={"kind": "exact", "train": case_ids[:2], "validation": case_ids[2:3], "id_test": case_ids[3:]},
-        seed_input=9,
-        seed=common.random.derive_subseed(9, "split"),
     )
 
 
@@ -134,14 +139,12 @@ def _ood_partition(ood_source: _SyntheticDataset) -> dict[str, Any]:
     return datasets.contracts.partition.build_fixed_partition(
         case_ids,
         material_by_case=dict.fromkeys(case_ids, "chickpea"),
+        design_kind_by_case=_design_kinds(ood_source, material="chickpea"),
         material_roles={"chickpea": "ood"},
-        recipe={"kind": "exact", "train": [], "validation": [], "id_test": []},
-        seed_input=9,
-        seed=common.random.derive_subseed(9, "split"),
     )
 
 
-_ASSIGNMENT = {"dataset_id": "ood_data", "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []}
+_ASSIGNMENT = {"dataset_id": "ood_data", "role": "material_ood", "relation": "Dataset-declared material holdout", "assumptions": []}
 _PRODUCER = {"training_sha256": "a" * 64, "model_sha256": "b" * 64}
 
 
@@ -156,8 +159,9 @@ def _bind(source: _SyntheticDataset, *, material: str, partition: Mapping[str, A
             {
                 "package_case_id": case_id,
                 "source": {"material_family": material, "case_input_id": f"input_{case_id}", "simulation_case_id": f"simulation_{case_id}"},
+                "design": {"design_kind": kind},
             }
-            for case_id in source.identity.sample_ids
+            for case_id, kind in _design_kinds(source, material=material).items()
         ],
     }
     source.manifest_binding = datasets.contracts.identity.manifest_binding(manifest)
@@ -179,7 +183,9 @@ def _split_info(*, id_source: _SyntheticDataset, ood_source: _SyntheticDataset) 
         task="steady_flow",
         train_dataset=identity(id_source),
         case_partition=_partition(id_source),
-        additional_evaluation=[(identity(ood_source), ood_cases, _ASSIGNMENT)],
+        train_subset=None,
+        material_by_case=dict.fromkeys(id_source.identity.sample_ids, "lentil"),
+        ood_parts={"material_ood": [(identity(ood_source), ood_cases, _ASSIGNMENT)]},
         extension=None,
     ).as_payload()
 
@@ -215,7 +221,8 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         return manifests[dataset_id]
 
     monkeypatch.setattr(training.package_manifest, "load_package_manifest_evidence", load_evidence)
-    monkeypatch.setattr(training.package_manifest, "declared_evaluation_assignments", lambda *_args, **_kwargs: [_ASSIGNMENT])
+    declared = {"material_ood": [_ASSIGNMENT], "parameter_ood": []}
+    monkeypatch.setattr(training.package_manifest, "declared_evaluation_assignments", lambda *_args, **_kwargs: declared)
     monkeypatch.setattr(training, "_steady_dataset", lambda dataset_id, *, storage_root: {"id_data": train, "ood_data": ood}[dataset_id])  # noqa: ARG005
     events: list[str] = []
     split_path = tmp_path / "run" / "split_indices.pt"
@@ -232,7 +239,7 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         assert persisted.train.index_values == (0, 1)
         assert persisted.validation.index_values == (2,)
         assert persisted.id_test.index_values == (3,)
-        assert [part.index_values for part in persisted.additional_evaluation] == [(0, 1, 2, 3)]
+        assert [part.index_values for part in persisted.material_ood] == [(0, 1, 2, 3)]
         events.append("fit")
         return datasets.preprocessing.normalization.data_processor_from_state(
             _normalizer_state(train.data["inputs"], train.data["outputs"], persisted.train.indices), device="cpu"
@@ -244,7 +251,8 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         "run": {"seed": 9},
         "data": {
             "train_dataset": "id_data",
-            "additional_evaluation_datasets": ["ood_data"],
+            "material_ood_datasets": ["ood_data"],
+            "train_subset": None,
             "batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
@@ -259,7 +267,7 @@ def test_steady_experiment_persists_dataset_partition_before_fitting(
         split_persist_callback=persist,
     )
     assert events == ["persist", "fit"]
-    assert {"train", "eval", "id_test", "additional_evaluation", "scaling_artifact"}.issubset(loaders)
+    assert {"train", "eval", "id_test", "material_ood", "scaling_artifact"}.issubset(loaders)
     assert loaders["split_indices"]["case_partition"] == manifests["id_data"]["case_partition"]
 
 
@@ -277,7 +285,7 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
 
     def create(**kwargs: Any) -> tuple[None, dict[str, None], None, dict[str, Any], dict[str, Any]]:
         seen.update(kwargs)
-        return None, {"eval": None, "id_test": None, "additional_evaluation": None}, None, {}, {}
+        return None, {"eval": None, "id_test": None, "material_ood": None, "parameter_ood": None}, None, {}, {}
 
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: _task())
     monkeypatch.setattr(datasets.runtime.training, "create_dataloaders", create)
@@ -287,7 +295,8 @@ def test_dataloader_workers_never_exceed_the_cpus_available_to_the_process(
         "run": {"seed": 9},
         "data": {
             "train_dataset": "id_data",
-            "additional_evaluation_datasets": [],
+            "material_ood_datasets": [],
+            "train_subset": None,
             "batch_size": 2,
             "num_workers": configured,
             "pin_memory": False,
@@ -331,7 +340,7 @@ def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(mo
         "run": {"seed": 9},
         "data": {
             "train_dataset": "id_data",
-            "additional_evaluation_datasets": ["ood_data"],
+            "material_ood_datasets": ["ood_data"],
         },
     }
     build_calls: list[dict[str, int]] = []
@@ -361,11 +370,12 @@ def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(mo
                 batch_size=2,
                 shuffle=False,
             ),
-            "additional_evaluation": DataLoader(
-                Subset(ood_source, list(contract.additional_evaluation[0].index_values)),
+            "material_ood": DataLoader(
+                Subset(ood_source, list(contract.material_ood[0].index_values)),
                 batch_size=2,
                 shuffle=False,
             ),
+            "parameter_ood": None,
             "data_processor": processor,
             "split_indices": split,
         }
@@ -384,7 +394,7 @@ def test_full_validator_checks_complete_datasets_split_normalizer_and_loaders(mo
     assert {record.result for record in result.dataset_membership} == {"PASS"}
     assert {record.result for record in result.channels} == {"PASS"}
     assert {record.result for record in result.coverage} == {"PASS"}
-    assert {record.loader for record in result.coverage} == {"ID train", "ID validation", "ID test", "Additional evaluation"}
+    assert {record.loader for record in result.coverage} == {"ID train", "ID validation", "ID test", "Material OOD"}
     assert all(record.inverse_checked for record in result.coverage)
     assert [record.result for record in result.overall[-2:]] == ["INFO", "INFO"]
 
@@ -410,22 +420,28 @@ def test_saved_transient_scaling_state_must_repeat_the_envelope_identity(transie
     sampling = datasets.contracts.transient.TransientSamplingSpec(mode="one_step_transition")
     loaders = datasets.runtime.transient_training.create_transient_training_loaders(
         train_dataset_id=transient_package["train_dataset"],
-        additional_evaluation_dataset_ids=[],
-        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none")),
+        material_ood_dataset_ids=[],
+        train_subset=None,
+        tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("none")),
         train_sampling=sampling,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
         model_sha256="a" * 64,
         storage_root=str(transient_package["root"]),
     )
-    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test)
+    owned: tuple[Any, ...] = (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test)
     for loader in owned:
         if loader is not None:
             loader.dataset.close()
     config = {
         "task": "transient_drying",
         "task_contract": domain.tasks.registry.get_task("transient_drying").resolved_contract(),
-        "data": {"train_dataset": transient_package["train_dataset"], "additional_evaluation_datasets": [], "spatial_stride": 1},
-        "input_profile": "canonical_physics_complete_v1",
+        "data": {
+            "train_dataset": transient_package["train_dataset"],
+            "material_ood_datasets": [],
+            "train_subset": None,
+            "spatial_stride": 1,
+        },
+        "input_profile": "canonical_physics_complete",
         "temporal": {"temporal_conditioning": {"kind": "none"}, "sampling": sampling.as_dict()},
         "scaling": {"mode": "state_std"},
     }

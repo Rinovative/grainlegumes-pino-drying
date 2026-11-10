@@ -66,7 +66,7 @@ def _provenance(
     storage_root: Path | str | None = None,
     producer_evidence: Mapping[str, Any] | None = None,
     case_partition: Mapping[str, Any] | None = None,
-    partition_spec: Mapping[str, Any] | None = None,
+    material_roles: Mapping[str, str] | None = None,
     plan_invocation: list[str] | None = None,
 ) -> dict[str, Any]:
     request = prepared.request
@@ -76,16 +76,20 @@ def _provenance(
 
     case_ids = [entry["package_case_id"] for entry in prepared.source_case_identities]
     material_by_case = {entry["package_case_id"]: entry["source"]["material_family"] for entry in prepared.source_case_identities}
-    if partition_spec is not None:
+    kind_by_case = {entry["package_case_id"]: entry["design"]["design_kind"] for entry in prepared.source_case_identities}
+    if material_roles is not None:
         if case_partition is not None:
-            msg = "Supply a partition recipe or fixed membership, never both."
+            msg = "Supply material roles or fixed membership, never both."
             raise ValueError(msg)
-        case_partition = partition_contract.build_fixed_partition(case_ids, material_by_case=material_by_case, **dict(partition_spec))
+        case_partition = partition_contract.build_fixed_partition(
+            case_ids, material_by_case=material_by_case, design_kind_by_case=kind_by_case, material_roles=material_roles
+        )
     if case_partition is not None:
-        case_partition = partition_contract.validate_fixed_partition(case_partition, case_ids=case_ids, material_by_case=material_by_case)
+        case_partition = partition_contract.validate_fixed_partition(
+            case_partition, case_ids=case_ids, material_by_case=material_by_case, design_kind_by_case=kind_by_case
+        )
     return {
         "schema_kind": identity.DATASET_PACKAGE_SCHEMA_KIND,
-        "schema_version": identity.DATASET_PACKAGE_SCHEMA_VERSION,
         "dataset_name": request["dataset_name"],
         "dataset_view": view.id,
         "registered_task_id": view.registered_task_id,
@@ -139,7 +143,6 @@ def _build_steady_payload(
         fingerprints.append(fingerprint)
     selection_identity = {
         "schema_kind": identity.SOURCE_SELECTION_SCHEMA_KIND,
-        "schema_version": identity.SOURCE_SELECTION_SCHEMA_VERSION,
         "source_cases": list(prepared.source_case_identities),
     }
     payload = identity.build_training_dataset_payload(
@@ -311,7 +314,7 @@ def build_dataset_selection(
     storage_root: Path | str | None = None,
     reproduction_manifest: Mapping[str, Any] | None = None,
     output_directory: Path | None = None,
-    partition_spec: Mapping[str, Any] | None = None,
+    material_roles: Mapping[str, str] | None = None,
     plan_invocation: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build one authored ordered Dataset selection from independent source cases."""
@@ -324,7 +327,7 @@ def build_dataset_selection(
         prepared,
         storage_root=storage_root,
         producer_evidence=producer_evidence,
-        partition_spec=partition_spec,
+        material_roles=material_roles,
         case_partition=reproduction_manifest["case_partition"] if reproduction_manifest is not None else None,
         plan_invocation=reproduction_manifest["plan_invocation"] if reproduction_manifest is not None else plan_invocation,
     )

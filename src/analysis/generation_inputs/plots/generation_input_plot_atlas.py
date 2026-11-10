@@ -25,6 +25,7 @@ import numpy as np
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 
 from . import generation_input_plot_layout as layout
@@ -154,6 +155,6 @@ def field_atlas(atlas: GeneratedFieldAtlas, selected: Sequence[str], *, display_
         axis.set_ylabel("y [m]")
         axis.set_title(atlas.labels[name])
         colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(atlas.units[name])
+        colorbar.set_label(f"[{field_labels.display_unit(atlas.units[name])}]")
     figure.suptitle(f"Generated fields — case {atlas.record.case.case_index}")
     return figure

@@ -53,9 +53,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 TRANSIENT_PT_SHARD_SCHEMA_KIND: Final = "transient_dataset_pt_shard_payload"
-TRANSIENT_PT_SHARD_SCHEMA_VERSION: Final = 1
 TRANSIENT_PT_RECEIPT_SCHEMA_KIND: Final = "transient_dataset_pt_shard_receipt"
-TRANSIENT_PT_RECEIPT_SCHEMA_VERSION: Final = 1
 TRANSIENT_PT_SHARD_DIRECTORY: Final = "transient_pt_shards"
 TRANSIENT_PT_RECEIPT_FILENAME: Final = "receipt.json"
 _TASK: Final = "transient_drying"
@@ -368,7 +366,6 @@ def _derived_payload_id(
     """Return the operational identity affected only by derived packing policy."""
     payload = {
         "schema_kind": TRANSIENT_PT_SHARD_SCHEMA_KIND,
-        "schema_version": TRANSIENT_PT_SHARD_SCHEMA_VERSION,
         "dataset_id": manifest["dataset_id"],
         "dataset_digest": manifest["dataset_digest"],
         "index_digest": index["index_digest"],
@@ -425,7 +422,6 @@ def _save_shards(
         case_ids = case_id_groups[shard_index]
         shard_payload = {
             "schema_kind": TRANSIENT_PT_SHARD_SCHEMA_KIND,
-            "schema_version": TRANSIENT_PT_SHARD_SCHEMA_VERSION,
             "dataset_id": manifest["dataset_id"],
             "dataset_digest": manifest["dataset_digest"],
             "index_digest": index["index_digest"],
@@ -649,7 +645,6 @@ def _validate_loaded_shard(
     """Validate one safely loaded shard against receipt and scientific index."""
     required = {
         "schema_kind",
-        "schema_version",
         "dataset_id",
         "dataset_digest",
         "index_digest",
@@ -663,7 +658,6 @@ def _validate_loaded_shard(
     if (
         set(payload) != required
         or payload["schema_kind"] != TRANSIENT_PT_SHARD_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload["schema_version"], TRANSIENT_PT_SHARD_SCHEMA_VERSION)
         or payload["dataset_id"] != manifest["dataset_id"]
         or payload["dataset_digest"] != manifest["dataset_digest"]
         or payload["index_digest"] != index["index_digest"]
@@ -729,7 +723,6 @@ def _validate_receipt_directory(
     """Validate one derived directory against exact current Dataset identity."""
     required = {
         "schema_kind",
-        "schema_version",
         "status",
         "created_at",
         "dataset_id",
@@ -783,7 +776,6 @@ def _validate_receipt_directory(
     )
     if (
         receipt["schema_kind"] != TRANSIENT_PT_RECEIPT_SCHEMA_KIND
-        or not common.serialization.is_schema_version(receipt["schema_version"], TRANSIENT_PT_RECEIPT_SCHEMA_VERSION)
         or receipt["status"] != "complete"
         or not isinstance(receipt["created_at"], str)
         or not receipt["created_at"]
@@ -1107,7 +1099,6 @@ def write_transient_shards(
     )
     receipt = {
         "schema_kind": TRANSIENT_PT_RECEIPT_SCHEMA_KIND,
-        "schema_version": TRANSIENT_PT_RECEIPT_SCHEMA_VERSION,
         "status": "complete",
         "created_at": _utc_now(),
         "dataset_id": manifest["dataset_id"],

@@ -40,7 +40,6 @@ from . import analysis_artifact_performance as artifact_performance
 TIMING_KEY = "timing"
 SIMULATION_TIMING_SCHEMA_KIND = "simulation_batch_timing"
 RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
-SCHEMA_VERSION = 1
 WARMUP_PASSES = 1
 MEASUREMENT_CLOCK = "time.perf_counter_ns"
 CASE_DURATION_ATTRIBUTION = "equal_share_of_observed_batch_forward_duration"
@@ -56,6 +55,7 @@ _RUNTIME_COMPARISON_BOUNDARIES = {
 }
 _SHA256_HEX_LENGTH = 64
 _SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
+_SPLIT_ROLES = ("eval", "material_ood", "parameter_ood")
 
 
 def _duration(value: Any, *, label: str, positive: bool = True) -> float:
@@ -261,18 +261,13 @@ def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
     payload = dict(value)
     required = {
         "schema_kind",
-        "schema_version",
         "simulation_profile",
         "batch_id",
         "batch_manifest_sha256",
         "cases",
         "aggregates",
     }
-    if (
-        set(payload) != required
-        or payload.get("schema_kind") != SIMULATION_TIMING_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
-    ):
+    if set(payload) != required or payload.get("schema_kind") != SIMULATION_TIMING_SCHEMA_KIND:
         msg = "Simulation batch timing has an invalid schema."
         raise ValueError(msg)
     if payload.get("simulation_profile") not in generation.contracts.available_profile_ids():
@@ -373,8 +368,8 @@ def build_runtime_comparison(
     warmup_passes: int = WARMUP_PASSES,
 ) -> dict[str, Any]:
     """Build one case-matched comparison from amortized loader-batch forwards."""
-    if split_role not in {"eval", "additional_evaluation"}:
-        msg = "Runtime comparison split_role must be eval or additional_evaluation."
+    if split_role not in _SPLIT_ROLES:
+        msg = f"Runtime comparison split_role must be one of {list(_SPLIT_ROLES)}."
         raise ValueError(msg)
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         msg = "Runtime comparison batch_size must be positive."
@@ -452,7 +447,6 @@ def build_runtime_comparison(
 
     payload = {
         "schema_kind": RUNTIME_COMPARISON_SCHEMA_KIND,
-        "schema_version": SCHEMA_VERSION,
         "split_role": split_role,
         "dataset_identity": dict(dataset_identity),
         "model_identity": dict(model_identity),
@@ -484,7 +478,6 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     payload = dict(value)
     required = {
         "schema_kind",
-        "schema_version",
         "split_role",
         "dataset_identity",
         "model_identity",
@@ -495,15 +488,11 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
         "cases",
         "aggregates",
     }
-    if (
-        set(payload) != required
-        or payload.get("schema_kind") != RUNTIME_COMPARISON_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), SCHEMA_VERSION)
-    ):
+    if set(payload) != required or payload.get("schema_kind") != RUNTIME_COMPARISON_SCHEMA_KIND:
         msg = "Runtime comparison has an invalid schema."
         raise ValueError(msg)
-    if payload.get("split_role") not in {"eval", "additional_evaluation"}:
-        msg = "Runtime comparison split_role must be eval or additional_evaluation."
+    if payload.get("split_role") not in _SPLIT_ROLES:
+        msg = f"Runtime comparison split_role must be one of {list(_SPLIT_ROLES)}."
         raise ValueError(msg)
     _validate_identity(
         payload.get("dataset_identity"),

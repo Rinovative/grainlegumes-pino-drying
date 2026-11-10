@@ -6,12 +6,12 @@ Responsibilities:
   - Reject incompatible comparison scales
 
 Design principles:
-  - Transient normalization uses saved state_std independently of increment scale mode
+  - Transient normalization uses saved state_std, and for w_gr the saved grain_moisture_std, independently of increment scale mode
   - Missing or invalid scale provenance yields explicit unavailability
   - All required support remains finite before an error map is admitted
 
 This module does NOT:
-  - Fit reference scales or infer scales for derived fields
+  - Fit reference scales or infer scales for derived fields other than the persisted w_gr scale
   - Modify predictions, choose display grids or render figures
 """
 
@@ -118,15 +118,24 @@ def transient_reference_scale(
     dataset_identity: str,
     expected_scaler_identity: str | None = None,
 ) -> ReferenceScale | str:
-    """Use persisted state_std, regardless of the increment training scale mode."""
-    if field not in state_order:
+    """Use persisted state_std (or grain_moisture_std for w_gr), regardless of the increment training scale mode."""
+    shape: tuple[int, ...]
+    if field == "w_gr":
+        raw = scaling_state.get("grain_moisture_std")
+        if raw is None:
+            return "This run's scaling predates the persisted w_gr train scale; normalized w_gr errors are unavailable."
+        shape, source, mismatch = (), "saved_run_normalizer.grain_moisture_std", "Saved transient grain_moisture_std is not one scalar."
+    elif field not in state_order:
         return f"No persisted physical-state scale exists for derived field {field}."
-    raw = scaling_state.get("state_std")
-    if raw is None:
-        return "Saved transient scaling has no state_std."
+    else:
+        raw = scaling_state.get("state_std")
+        if raw is None:
+            return "Saved transient scaling has no state_std."
+        shape, source = (len(state_order),), "saved_run_normalizer.state_std"
+        mismatch = "Saved transient state_std does not match the state field order."
     values = np.asarray(raw.detach().cpu().numpy() if hasattr(raw, "detach") else raw)
-    if values.shape != (len(state_order),):
-        return "Saved transient state_std does not match the state field order."
+    if values.shape != shape:
+        return mismatch
     if not dataset_identity:
         return "Transient Dataset scale identity is missing."
     if scaling_state.get("train_membership_digest") != dataset_identity:
@@ -148,9 +157,8 @@ def transient_reference_scale(
     scaler_identity = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
     if expected_scaler_identity is not None and scaler_identity != expected_scaler_identity:
         return "Saved transient state scale contradicts the evaluated artifact's scaler identity."
-    return _positive_scale(
-        field, unit, values[state_order.index(field)].item(), "saved_run_normalizer.state_std", "train", dataset_identity, scaler_identity
-    )
+    value = values.item() if field == "w_gr" else values[state_order.index(field)].item()
+    return _positive_scale(field, unit, value, source, "train", dataset_identity, scaler_identity)
 
 
 def require_common_reference_scale(scales: Sequence[ReferenceScale]) -> ReferenceScale:

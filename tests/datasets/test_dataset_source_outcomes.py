@@ -107,7 +107,6 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
     rows = catalog.list_campaign_cases("steady_flow", campaign.source_name, storage_root=storage)
     request = {
         "schema_kind": selection.SELECTION_SCHEMA_KIND,
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "steady_flow",
         "dataset_name": "outcomes",
         "dataset_view": "steady_flow",
@@ -117,7 +116,6 @@ def test_dataset_manifest_records_replacement_policy_and_every_candidate_outcome
     published = datasets.packages.build_dataset_selection(request, storage_root=storage)
     manifest = datasets.packages.load_package_manifest("steady_flow", published["dataset_id"], storage_root=storage)
 
-    assert manifest["schema_version"] == manifests.DATASET_PACKAGE_SCHEMA_VERSION
     (outcome,) = manifest["source_outcomes"]
     assert outcome["source_name"] == campaign.source_name
     assert outcome["materials"] == {

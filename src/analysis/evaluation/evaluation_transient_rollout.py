@@ -153,7 +153,7 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
         message = "Transient Evaluation case assembly requires ordered one-step items."
         raise ValueError(message)
     if dataset_role not in get_args(DatasetRole):
-        message = "Transient Evaluation dataset_role must be 'id' or 'additional_evaluation'."
+        message = f"Transient Evaluation dataset_role must be one of {list(get_args(DatasetRole))}."
         raise ValueError(message)
     states: list[np.ndarray] = []
     boundaries: list[np.ndarray] = []

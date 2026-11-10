@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 _MODEL_KINDS = ("fno", "rno", "uno")
 _STRIDE_TWO = 2
-_TEACHER_FORCED_FIELDS = ("evaluation_interval", "additional_evaluation_interval", "gradient_accumulation_steps", "curriculum")
+_TEACHER_FORCED_FIELDS = ("evaluation_interval", "ood_evaluation_interval", "gradient_accumulation_steps", "curriculum")
 
 
 def _resolve(raw: dict[str, Any]) -> plan_service.MatchedA1BPlan:
@@ -67,7 +67,7 @@ def test_plan_derives_ordered_children_with_teacher_and_receipt_binding() -> Non
 def test_a1_inherits_the_teacher_forced_protocol_of_a0(model_kind: str) -> None:
     """A1 continues A0 teacher-forced: only its epoch cap and learning-rate scale are its own."""
     raw = configs.transient_matched_config(model_kind=model_kind)
-    raw["training"]["a0"].update({"evaluation_interval": 2, "additional_evaluation_interval": 3, "gradient_accumulation_steps": 2})
+    raw["training"]["a0"].update({"evaluation_interval": 2, "ood_evaluation_interval": 3, "gradient_accumulation_steps": 2})
     raw["training"]["a1"]["max_epochs"] = 9
     plan = _resolve(raw)
 
@@ -235,13 +235,12 @@ def test_spatial_stride_rejects_non_integer_or_non_positive_values(value: object
     [
         lambda raw: raw["training"]["b"]["curriculum"].update(seed=9),
         lambda raw: raw["data"].update(hdf5_cache_size=0),
-        lambda raw: raw["tracking"]["wandb"].update(metric_schema_version=2),
         lambda raw: raw["training"].update(mixed_precision=False),
     ],
-    ids=["curriculum-seed", "hdf5-cache-size", "metric-schema-version", "mixed-precision"],
+    ids=["curriculum-seed", "hdf5-cache-size", "mixed-precision"],
 )
-def test_removed_keys_and_other_schema_versions_are_rejected(mutate: Callable[[dict[str, Any]], object]) -> None:
-    """Reject the retired curriculum seed, HDF5 cache and mixed-precision keys and any metric schema version other than 1."""
+def test_removed_keys_are_rejected(mutate: Callable[[dict[str, Any]], object]) -> None:
+    """Reject the retired curriculum seed, HDF5 cache and mixed-precision keys."""
     raw = configs.transient_matched_config()
     mutate(raw)
 

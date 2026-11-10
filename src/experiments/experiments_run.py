@@ -385,15 +385,15 @@ def _validated_runtime_device(
     return resolution.device
 
 
-def _steady_grid_spacing(config: Mapping[str, Any], train_loader: Any, additional_loader: Any | None) -> tuple[float, float]:
+def _steady_grid_spacing(config: Mapping[str, Any], train_loader: Any, *ood_loaders: Any | None) -> tuple[float, float]:
     """
     Return the physical steady-grid spacing ``(spacing_y, spacing_x)`` in metres, rows then columns.
 
     The Dataset stores physical coordinate channels before the data processor
     normalizes them; one grid serves every sample of a Dataset, so the first
     training sample defines it. Loss and metric differentiate on this grid, and
-    the same metric objects evaluate the additional Evaluation cases, so every
-    one of them must share the training spacing.
+    the same metric objects evaluate the OOD Evaluation cases (every non-empty
+    OOD loader), so every one of them must share the training spacing.
     """
     task = domain.tasks.registry.get_task(str(config["task"]))
 
@@ -405,16 +405,16 @@ def _steady_grid_spacing(config: Mapping[str, Any], train_loader: Any, additiona
         return float(spacing_y), float(spacing_x)
 
     reference = spacing(train_loader.dataset[0]["x"])
-    evaluation_set = [] if additional_loader is None else additional_loader.dataset
-    for index in range(len(evaluation_set)):
-        case_spacing = spacing(evaluation_set[index]["x"])
-        # Float32 coordinates of one generated grid agree far inside this tolerance.
-        if not all(math.isclose(value, expected, rel_tol=1e-6) for value, expected in zip(case_spacing, reference, strict=True)):
-            msg = (
-                f"Additional Evaluation case {index} has grid spacing {case_spacing} m, but the training grid has {reference} m; "
-                "relative H1 loss and metrics differentiate on the training spacing."
-            )
-            raise ValueError(msg)
+    for evaluation_set in (loader.dataset for loader in ood_loaders if loader is not None):
+        for index in range(len(evaluation_set)):
+            case_spacing = spacing(evaluation_set[index]["x"])
+            # Float32 coordinates of one generated grid agree far inside this tolerance.
+            if not all(math.isclose(value, expected, rel_tol=1e-6) for value, expected in zip(case_spacing, reference, strict=True)):
+                msg = (
+                    f"OOD Evaluation case {index} has grid spacing {case_spacing} m, but the training grid has {reference} m; "
+                    "relative H1 loss and metrics differentiate on the training spacing."
+                )
+                raise ValueError(msg)
     return reference
 
 
@@ -435,7 +435,7 @@ def runtime_session_updates(
     Parameters
     ----------
     run_dir : pathlib.Path
-        Existing run whose versioned summary supplies prior sessions.
+        Existing run whose summary supplies prior sessions.
     resolution : learning.device.DeviceResolution
         Truthful requested-versus-concrete runtime decision.
     started_at : datetime
@@ -712,7 +712,7 @@ def allocate_run_directory(run_dir: Path | str) -> Path:
 
 def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
     """
-    Load one current versioned run summary without mutation.
+    Load one current run summary without mutation.
 
     Parameters
     ----------
@@ -722,14 +722,14 @@ def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
     Returns
     -------
     dict[str, Any]
-        Parsed schema-1 summary mapping.
+        Parsed summary mapping.
 
     Raises
     ------
     FileNotFoundError
         If the summary is absent.
     RunLifecycleError
-        If JSON or the schema version is invalid.
+        If the JSON is invalid or not an object.
 
     """
     path = common.paths.resolve_run_summary_path(run_dir)
@@ -744,9 +744,6 @@ def read_run_summary(run_dir: Path | str) -> dict[str, Any]:
         raise RunLifecycleError(msg) from error
     if not isinstance(payload, dict):
         msg = f"Run summary must contain a JSON object: {path}"
-        raise RunLifecycleError(msg)
-    if not common.serialization.is_schema_version(payload.get("schema_version"), common.paths.RUN_SUMMARY_SCHEMA_VERSION):
-        msg = f"Unsupported or missing run summary schema: {path}"
         raise RunLifecycleError(msg)
     return payload
 
@@ -811,7 +808,6 @@ def _transition_run_status_locked(
     payload = {
         **current,
         **dict(updates or {}),
-        "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
         "status": status,
         "status_history": history,
         "updated_at": now,
@@ -834,7 +830,7 @@ def transition_run_status(
     """
     Publish one allowed summary-state transition under the writer lease.
 
-    ``updates`` are merged with versioned status history and timestamps through
+    ``updates`` are merged with status history and timestamps through
     atomic JSON replacement. Unknown or forbidden transitions raise
     ``RunLifecycleError`` without changing the summary. A trial's terminal
     status deletes its best checkpoint unless ``keep_trial_best`` is set.
@@ -867,19 +863,32 @@ def _validate_saved_data_contract(
     Admit a saved split and scaling artifact against the resolved task config, the same way for both tasks.
 
     The admitted split must belong to the configured task, Datasets and item expansion: its Train Dataset is
-    ``data.train_dataset`` and its additional Evaluation parts are the configured Datasets in order, followed by the
-    training Dataset when that holds fixed OOD cases. The scaling artifact must carry the scaling identity derived from
-    that split and the configured preprocessing. The decoded task state is returned for resume, inference, or artifact
-    consumers.
+    ``data.train_dataset``, its material-OOD parts are ``data.material_ood_datasets`` in order, followed by the
+    training Dataset when that holds fixed OOD cases, and its parameter-OOD part is the training Dataset exactly when
+    that holds fixed parameter-OOD cases; its Train subset is ``data.train_subset``.
+    The scaling artifact must carry the scaling identity derived from that split and the configured preprocessing.
+    The decoded task state is returned for resume, inference, or artifact consumers.
     """
     task = config_loader.validate_resolved_task_contract(config)
     if split.task != task.id:
         msg = "Saved split task identity does not match the resolved config task contract."
         raise RunLifecycleError(msg)
     data = config["data"]
-    expected_additional = (*data["additional_evaluation_datasets"], *((split.train.dataset_id,) if split.case_partition["ood"] else ()))
-    if split.train.dataset_id != data["train_dataset"] or tuple(part.dataset_id for part in split.additional_evaluation) != expected_additional:
-        msg = "Saved split Datasets do not match the configured training and additional Evaluation Datasets."
+    own = {
+        role: (split.train.dataset_id,) if datasets.contracts.partition.evaluation_cases(split.case_partition, role) else ()
+        for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES
+    }
+    expected_ood: dict[datasets.preprocessing.splits.OodRole, tuple[str, ...]] = {
+        "material_ood": (*data["material_ood_datasets"], *own["material_ood"]),
+        "parameter_ood": own["parameter_ood"],
+    }
+    if split.train.dataset_id != data["train_dataset"] or any(
+        tuple(part.dataset_id for part in split.ood_parts(role)) != expected for role, expected in expected_ood.items()
+    ):
+        msg = "Saved split Datasets do not match the configured training and material-OOD Datasets."
+        raise RunLifecycleError(msg)
+    if split.train_subset != data["train_subset"]:
+        msg = f"Saved split Train subset {split.train_subset!r} does not match data.train_subset {data['train_subset']!r}."
         raise RunLifecycleError(msg)
     preprocessing = datasets.preprocessing.normalization.preprocessing_spec(task)
     if task.id == "transient_drying":
@@ -1512,7 +1521,11 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             learning.models.factory.validate_transient_model_spatial_shape(config, data_processor.spatial_shape)
         model = learning.models.factory.build_model(config, device=device)
         console_reporter.startup_phase("model_cuda_ready", {"device": str(device), "seconds": time.perf_counter() - model_started})
-        grid_spacing = None if is_transient else _steady_grid_spacing(config, dataloaders["train"], dataloaders["additional_evaluation"])
+        grid_spacing = (
+            None
+            if is_transient
+            else _steady_grid_spacing(config, dataloaders["train"], *(dataloaders[role] for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES))
+        )
         train_loss = learning.losses.factory.build_training_loss(config, device=device, grid_spacing=grid_spacing)
         set_normalizers = getattr(train_loss, "set_normalizers", None)
         if callable(set_normalizers):
@@ -1608,7 +1621,6 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 key: copy.deepcopy(scaling_state[key])
                 for key in (
                     "schema_kind",
-                    "schema_version",
                     "task_contract_digest",
                     "data_contract_digest",
                     "tensorizer",
@@ -1662,6 +1674,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             persisted_run_id=persisted_run_id,
             previous_last_logged_epoch=previous_last_logged_epoch,
             state_updater=state_updater,
+            ood_roles=tuple(role for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES if dataloaders[role] is not None),
         )
 
         if handoff_manifest is not None and handoff_directory is not None:
@@ -1701,7 +1714,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
             eval_loader=dataloaders["eval"],
             train_loss=train_loss,
             eval_metrics=eval_metrics,
-            additional_evaluation_loader=dataloaders["additional_evaluation"],
+            ood_loaders={role: dataloaders[role] for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES},
             data_processor=loop_data_processor,
             scheduler=scheduler,
             save_dir=run_dir,
@@ -1755,7 +1768,7 @@ def _execute_prepared_run_locked(  # noqa: C901, PLR0912, PLR0915
                 model=model,
                 train_loss=train_loss,
                 eval_loader=dataloaders["eval"],
-                additional_evaluation_loader=dataloaders["additional_evaluation"],
+                ood_loaders={role: dataloaders[role] for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES},
                 eval_metrics=eval_metrics,
                 device=device,
                 data_processor=loop_data_processor,
@@ -2320,6 +2333,17 @@ def _validate_completed_run(
         msg = f"Run is incomplete and not loadable: {path}. Missing: {names}."
         raise RunLifecycleError(msg)
     summary = read_run_summary(path)
+    # Checkpoints are deserialized with full pickle support, so their recorded digests are compared before any load.
+    if trial:
+        # A kill between the completed summary and the best deletion leaves the best behind; it must be the recorded one.
+        if checkpoints[0].exists() and summary.get("best_checkpoint_sha256") != common.serialization.cached_file_sha256(checkpoints[0]):
+            msg = "Completed trial best checkpoint digest mismatch."
+            raise RunLifecycleError(msg)
+    else:
+        for role, checkpoint in zip(("best", "last"), checkpoints, strict=True):
+            if summary.get(f"{role}_checkpoint_sha256") != common.serialization.cached_file_sha256(checkpoint):
+                msg = f"Completed run {role} checkpoint digest mismatch."
+                raise RunLifecycleError(msg)
     config_path = common.paths.resolve_run_config_path(path)
     split_path = common.paths.resolve_split_indices_path(path)
     normalizer_path = common.paths.resolve_normalizer_path(path)
@@ -2345,10 +2369,6 @@ def _validate_completed_run(
             raise RunLifecycleError(msg)
     if trial:
         _validate_trial_summary_evidence(summary, config)
-        # A kill between the completed summary and the best deletion leaves the best behind; it must be the recorded one.
-        if checkpoints[0].exists() and summary.get("best_checkpoint_sha256") != common.serialization.file_sha256(checkpoints[0]):
-            msg = "Completed trial best checkpoint digest mismatch."
-            raise RunLifecycleError(msg)
         if config["task"] == "transient_drying":
             _validate_transient_summary_evidence(
                 path,
@@ -2393,12 +2413,6 @@ def _validate_completed_run(
     if saved_identities[0] != saved_identities[1] or summary.get("effective_config_digest") != saved_identities[0]["effective_config_digest"]:
         message = "Completed run summary/config/checkpoint identity mismatch."
         raise RunLifecycleError(message)
-    if summary.get("best_checkpoint_sha256") != common.serialization.file_sha256(common.paths.resolve_best_checkpoint_file(path)):
-        msg = "Completed run best checkpoint digest mismatch."
-        raise RunLifecycleError(msg)
-    if summary.get("last_checkpoint_sha256") != common.serialization.file_sha256(common.paths.resolve_last_checkpoint_file(path)):
-        msg = "Completed run last checkpoint digest mismatch."
-        raise RunLifecycleError(msg)
     if summary.get("best_metric") != best["best_metric"] or summary.get("best_epoch") != best["best_epoch"]:
         msg = "Completed run summary disagrees with best checkpoint objective state."
         raise RunLifecycleError(msg)

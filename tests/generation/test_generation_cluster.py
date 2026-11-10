@@ -47,21 +47,13 @@ from src.generation.cli import cli_generation
 from src.generation.contracts import generation_contracts_source as source_service
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_cluster as cluster
+from src.generation.runtime import generation_runtime_license as license_service
 from src.generation.runtime import generation_runtime_node as node
 
 
-def _synthetic_retry_policy(
-    *,
-    initial_delay_seconds: float = 20.0,
-    maximum_delay_seconds: float = 30.0,
-) -> dict[str, Any]:
-    """Return one test-owned bounded node licence-wait policy."""
-    return {
-        "enabled": True,
-        "initial_delay_seconds": initial_delay_seconds,
-        "maximum_delay_seconds": maximum_delay_seconds,
-        "maximum_wait_seconds": 3600.0,
-    }
+def _synthetic_retry_policy() -> dict[str, Any]:
+    """Return one test-owned bounded licence-wait policy."""
+    return {"enabled": True, "maximum_wait_seconds": 3600.0}
 
 
 def _scheduler(*, allocations: dict[str, list[str]] | None = None) -> dict[str, Any]:
@@ -177,7 +169,6 @@ def test_canonical_active_resume_rebinds_source_and_resources_without_changing_s
             json.dumps(
                 {
                     "schema_kind": "generation_source_snapshot",
-                    "schema_version": 1,
                     "git_commit": commit,
                     "source_fingerprint_sha256": fingerprint,
                     "tracked_diff_sha256": common.serialization.file_sha256(tracked_diff),
@@ -218,7 +209,7 @@ def test_canonical_active_resume_rebinds_source_and_resources_without_changing_s
     world.set_state("7001", "COMPLETED")  # a new operational epoch is admitted only once every previous node job has ended
     execution_path = canonical_path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["cluster"]["cores_per_case"] = 2
+    execution["run"]["cores_per_case"] = 2
     execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
     updated = generation.cases.config.load_campaign_config(canonical_path)
     assert updated.campaign_digest == campaign.campaign_digest
@@ -380,7 +371,7 @@ def _synthetic_input_references(campaign: Any) -> dict[str, dict[int, Any]]:
 
 def test_campaign_tasks_are_unique(generation_config_factory: Any) -> None:
     """Every planned case has one exact identity."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     assert len(tasks) == campaign.total_case_count
@@ -601,7 +592,6 @@ def test_invalid_current_inputs_abort_before_campaign_persistence_or_sbatch(
 ) -> None:
     """Reject invalid current evidence before any scientific job is submitted."""
     config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
         natural_count=1,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -710,7 +700,7 @@ def test_campaign_resume_matrix_never_silently_retries_solver_failures(
     monkeypatch.setattr(lifecycle, "campaign_from_frozen_run", lambda *_args, **_kwargs: campaign)
     records = [
         {
-            "reservation": {"batch_id": task.batch_id, "case_id": task.case_id, "origin": "primary"},
+            "reservation": {"batch_id": task.batch_id, "material_family": "lentil", "case_id": task.case_id, "origin": "primary"},
             "decision": {"outcome": "successful"} if task != target or case_state == "successful" else None,
             "attempts": [],
         }
@@ -828,7 +818,6 @@ def test_conversion_failures_do_not_starve_normal_admission(
 ) -> None:
     """Keep canonical admission independent of recorded conversion failures, which hold no admission."""
     config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
         natural_count=12,
         max_admission_cases=2,
     )
@@ -1011,9 +1000,7 @@ def test_settled_admission_cap_persists_staged_only_for_a_failure_free_subset(
 ) -> None:
     """Persist an honest capped success state without relabeling failure or uncertainty; a settled state drains the node job."""
     admitted = sum(state != "never_started" for state in states)
-    config_path, _template = generation_config_factory(
-        simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=len(states), max_admission_cases=admitted
-    )
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=len(states), max_admission_cases=admitted)
     campaign = generation.cases.config.load_campaign_config(config_path)
     tasks = cluster.campaign_tasks(campaign)
     storage = tmp_path / "storage"
@@ -1064,7 +1051,6 @@ def test_only_a_stopped_batch_loses_fresh_admission_while_its_running_case_conti
     """A stopped batch admits no fresh case while its running case keeps the node job; another batch's stop leaves it admitting."""
     failure_count = 2
     config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
         natural_count=failure_count + 3,
         max_admission_cases=failure_count + 3,
     )
@@ -1158,7 +1144,6 @@ def test_admission_reservations_are_exact_unsent_plan_members(
 ) -> None:
     """Reject foreign or already-submitted operational reservations."""
     config_path, _template = generation_config_factory(
-        scheduler_kind="slurm",
         natural_count=2,
     )
     campaign = generation.cases.config.load_campaign_config(config_path)
@@ -1315,6 +1300,60 @@ def test_canonical_attempt_uses_persisted_dispatch_identity_for_exact_ownership(
             generation.campaign._admitted_case_attempt(manifest, batch, task, input_reference=reference, storage_root=storage)
 
 
+@pytest.mark.parametrize("entry_path", ["authored_rule", "no_retry_flag"])
+def test_capacity_failure_with_disabled_license_protection_is_a_recorded_case_failure(
+    entry_path: str,
+    generation_config_factory: Any,
+    world: FakeSlurm,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the licence protection a capacity error is an ordinary solver failure, not an unreadable licence block."""
+    campaign = make_campaign(generation_config_factory, license_retry_enabled=entry_path != "authored_rule")
+    if entry_path == "no_retry_flag":
+        campaign = generation.cases.config.load_campaign_config(campaign.source_path, execution_overrides={"no_retry": True})
+    assert campaign.execution_values["runtime"]["license_wait"]["enabled"] is False
+    manifest = submit(campaign, world)
+    task = cluster.campaign_tasks(campaign)[0]
+    batch = campaign.batch(task.batch_name)
+    bind_worker(monkeypatch, manifest)
+    evidence = license_service.TemporaryLicenseCapacityClassification(
+        classification=license_service.TEMPORARY_LICENSE_CAPACITY,
+        feature="COMSOL license acquisition",
+        license_code=None,
+        matched_signatures=("synthetic",),
+        raw_excerpt="synthetic",
+    )
+    error = license_service.TemporaryLicenseCapacityError(
+        "COMSOL could not obtain temporary floating-license capacity.",
+        work_directory=tmp_path,
+        command=("comsol",),
+        exit_code=1,
+        evidence=evidence,
+    )
+    generation.runtime.record_case_failure(
+        batch,
+        task.case_index,
+        error,
+        worker_slot=0,
+        scheduler_kind="slurm",
+        allocated_node="node-a",
+        work_directory=None,
+        storage_root=world.storage,
+        scratch_cleanup_status="not_created",
+        failure_stage="solver",
+    )
+
+    assert generation.runtime.case_failure_is_recorded(
+        batch, task.case_index, storage_root=world.storage, execution_run_id=manifest["campaign_run_id"], git_commit=COMMIT
+    )
+    world.add_step("7001", 0, manifest["submissions"][0]["step_name"], "FAILED", "1:0")
+    world.set_state("7001", "COMPLETED")
+    status = generation.campaign.campaign_status(manifest["campaign_run_id"], storage_root=world.storage)
+    (case,) = status["cases"]
+    assert (case["state"], case["failure_stage"]) == ("failed", "solver")
+
+
 def test_resume_recovers_next_case_intent_while_first_case_is_pending(
     generation_config_factory: Any,
     world: FakeSlurm,
@@ -1354,7 +1393,7 @@ def test_config_owned_plan_is_machine_parseable_and_read_only(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Expose configured resources as JSON without allocating campaign state."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     campaign = generation.cases.config.load_campaign_config(config_path)
     commit = "d" * 40
     _set_native_launch_evidence(monkeypatch, commit)
@@ -1385,11 +1424,11 @@ def test_submission_policy_changes_execution_but_not_scientific_case_identity(
     generation_config_factory: Any,
 ) -> None:
     """Keep feeder cadence out of case inputs while binding run provenance."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     original = generation.cases.config.load_campaign_config(config_path)
     execution_path = config_path.parent / "execution.yaml"
     execution = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
-    execution["submission"]["max_admission_cases"] = 2
+    execution["run"]["max_admission_cases"] = 2
     execution_path.write_text(yaml.safe_dump(execution, sort_keys=False), encoding="utf-8")
     changed = generation.cases.config.load_campaign_config(config_path)
 
@@ -1409,7 +1448,7 @@ def test_validate_config_exposes_resolved_campaign_ownership(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Expose resolved counts, seeds, packages, and purpose scope without mutation."""
-    config_path, _template = generation_config_factory(scheduler_kind="slurm")
+    config_path, _template = generation_config_factory()
     campaign = generation.cases.config.load_campaign_config(config_path, require_executable=False)
     monkeypatch.setattr(
         cli_generation.readiness_service,

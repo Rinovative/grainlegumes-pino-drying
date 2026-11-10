@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import argparse
 import collections
+import copy
 import json
 import os
 import shlex
 import signal
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -40,12 +40,10 @@ from src.generation import generation_run as run_service
 from src.generation.cases import generation_cases_case as case_service
 from src.generation.cases import generation_cases_config as config_service
 from src.generation.cases import generation_cases_input as input_service
-from src.generation.contracts import generation_contracts_profiles as profiles
-from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
+from src.generation.contracts import generation_contracts_vocabulary as vocabulary
 from src.generation.publication import generation_publication_campaign_evidence as campaign_evidence
 from src.generation.runtime import generation_runtime_batch as runtime_service
 from src.generation.runtime import generation_runtime_cluster as cluster_service
-from src.generation.runtime import generation_runtime_comsol as comsol_service
 from src.generation.runtime import generation_runtime_host as host_service
 from src.generation.runtime import generation_runtime_node as node_service
 from src.generation.runtime import generation_runtime_preflight as preflight_service
@@ -163,9 +161,8 @@ def _add_batch_selection(parser: argparse.ArgumentParser, *, required: bool = Tr
 
 
 def _add_scientific_overrides(parser: argparse.ArgumentParser) -> None:
-    """Expose finite original-design and physical-duration overrides and the Source revision."""
+    """Expose the material-subset and physical-duration overrides and the Source revision."""
     parser.add_argument("--materials", nargs="+")
-    parser.add_argument("--cases-per-material", type=int)
     parser.add_argument("--duration-hours", type=float)
     parser.add_argument("--revision")
 
@@ -193,9 +190,7 @@ def _execution_overrides(args: argparse.Namespace) -> dict[str, Any]:
 
 def _scientific_overrides(args: argparse.Namespace) -> dict[str, Any]:
     """Return explicitly supplied scientific values without inventing defaults."""
-    return {
-        key: getattr(args, key) for key in ("materials", "cases_per_material", "duration_hours", "revision") if getattr(args, key, None) is not None
-    }
+    return {key: getattr(args, key) for key in ("materials", "duration_hours", "revision") if getattr(args, key, None) is not None}
 
 
 def _add_campaign_execution_arguments(parser: argparse.ArgumentParser) -> None:
@@ -274,13 +269,9 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
         help="generate canonical batch-oriented input-only cases",
     )
     input_cases.add_argument("config", type=Path)
-    input_batch_selection = input_cases.add_mutually_exclusive_group(required=True)
-    input_batch_selection.add_argument("--only-batch")
-    input_batch_selection.add_argument("--all-batches", action="store_true")
-    input_cases.add_argument("--only-regime", choices=("natural",))
-    input_case_selection = input_cases.add_mutually_exclusive_group(required=True)
-    input_case_selection.add_argument("--case-count", type=int)
-    input_case_selection.add_argument("--all-cases", action="store_true")
+    input_cases.add_argument("--only-batch")
+    input_cases.add_argument("--only-regime", choices=vocabulary.DESIGN_KINDS)
+    input_cases.add_argument("--case-count", type=int)
     input_cases.add_argument("--case-start", type=int)
     input_cases.add_argument("--dry-run", action="store_true")
     input_cases.add_argument("--git-commit", required=True)
@@ -291,21 +282,6 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
     _add_batch_selection(prepare, required=True)
     prepare.add_argument("case_index", type=int)
     _add_storage_arguments(prepare, include_work=True)
-
-    command = subparsers.add_parser("print-command", help="print one COMSOL argument vector without execution")
-    command.add_argument("config", type=Path)
-    _add_batch_selection(command, required=True)
-    command.add_argument("case_index", type=int)
-    command.add_argument("--cores-per-case", type=int, required=True)
-    command.add_argument("--scheduler-kind", choices=("local", "slurm"), default="local")
-
-    run_case = subparsers.add_parser("run-case", help="run, validate, and publish one case")
-    run_case.add_argument("config", type=Path)
-    _add_batch_selection(run_case, required=True)
-    run_case.add_argument("case_index", type=int)
-    run_case.add_argument("--cores-per-case", type=int, required=True)
-    run_case.add_argument("--scheduler-kind", choices=("local", "slurm"), default="local")
-    _add_storage_arguments(run_case, include_work=True)
 
     validate_case = subparsers.add_parser("validate-case", help="validate one completed case")
     validate_case.add_argument("config", type=Path)
@@ -388,11 +364,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 -- one centrali
 
     amend_replacements = subparsers.add_parser(
         "amend-replacement-pool",
-        help="explicitly lower one original batch's minimum success rate, with its reason",
+        help="explicitly lower one material's minimum success rate for all its original batches, with its reason",
     )
     amend_replacements.add_argument("campaign_run_id")
     amend_replacements.add_argument("--material", required=True)
-    amend_replacements.add_argument("--regime", required=True)
     amend_replacements.add_argument("--minimum-success-rate", type=float, required=True, help="new rate s, 0 < s <= 1, below the current one")
     amend_replacements.add_argument("--reason", required=True)
     _add_storage_arguments(amend_replacements)
@@ -473,25 +448,10 @@ def _campaign_case_counts(campaign: config_service.CampaignConfig) -> dict[str, 
 
 def _campaign_seed_plan(campaign: config_service.CampaignConfig) -> dict[str, Any]:
     """Return every authored and derived campaign-level sampling seed."""
-    first_batch = campaign.batches[0]
-    batch_seeds: dict[str, Any] = {}
-    for batch in campaign.batches:
-        blocks = batch.scientific_values["sampling"]["blocks"]
-        batch_seeds[batch.batch_name] = {
-            "batch_seed": batch.seed_base,
-            "block_seeds": {
-                name: {
-                    "seed_origin": plan["seed_origin"],
-                    "design_seed": plan["design_seed"],
-                    "permutation_seed": plan["permutation_seed"],
-                }
-                for name, plan in blocks.items()
-            },
-        }
     return {
-        "campaign_seed": first_batch.scientific_values["campaign_seed"],
-        "batches": batch_seeds,
-        "case_seed_derivation": "batch_seed_and_case_identity",
+        "campaign_seed": campaign.root_seed,
+        "batches": {batch.batch_name: {"design_seed": batch.seed_base} for batch in campaign.batches},
+        "case_seed_derivation": "design_seed_and_design_index",
     }
 
 
@@ -540,13 +500,13 @@ def _campaign_summary(
         "source_path": str(campaign.source_path),
         "material_inventory": material_inventory,
         "domain_profile": campaign.domain_profile,
-        "original_design_sizes": dict(campaign.selected_targets),
+        "original_design_sizes": copy.deepcopy(campaign.designs),
         "case_counts": case_counts,
         "total_case_count": campaign.total_case_count,
         "counts": case_counts["by_batch"],
         "seed_plan": _campaign_seed_plan(campaign),
         "seeds": {batch.batch_name: batch.seed_base for batch in campaign.batches},
-        "sampling_method": campaign.batches[0].scientific_values["sampling"]["method"],
+        "design_recipe": campaign.batches[0].scientific_values["sampling"]["recipe"],
         "parameter_ood": _parameter_ood_summary(campaign),
         "selected_batches": [_summary(batch) for batch in campaign.batches],
         "profile": {
@@ -572,7 +532,7 @@ def _campaign_summary(
     return summary
 
 
-def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912, PLR0915 -- thin CLI command dispatch
+def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912 -- thin CLI command dispatch
     """Dispatch one parsed command to its authoritative service."""
     if args.command == "resolve-generation-run":
         run_plan = run_service.resolve_generation_run(
@@ -687,7 +647,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         amendment = campaign_runtime.amend_minimum_success_rate(
             args.campaign_run_id,
             args.material,
-            args.regime,
             minimum_success_rate=args.minimum_success_rate,
             reason=args.reason,
             storage_root=args.storage_root,
@@ -714,10 +673,7 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
         print(path)
         return 0
     if args.command == "run-node-worker":
-        campaign_directory = campaign_evidence.node_job_campaign_directory(args.node_directory)
-        if campaign_directory is not None:
-            templates = cluster_service.node_job_log_templates(common.paths.get_runtime_root().resolve())
-            host_service.link_job_logs(campaign_directory, host_service.job_log_files(templates))
+        _link_node_job_logs(args)
         node_result = node_service.run_node_worker(args.node_directory, cores=args.cores)
         print(f"Node worker ended: {node_result.detail} ({node_result.reason}); steps started {node_result.started}, finished {node_result.finished}")
         return node_result.exit_code
@@ -775,11 +731,9 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
                 storage_root=args.storage_root,
                 action=action,
                 only_batch=args.only_batch,
-                all_batches=args.all_batches,
                 only_regime=args.only_regime,
                 case_start=args.case_start,
                 case_count=args.case_count,
-                all_cases=args.all_cases,
                 git_commit=args.git_commit,
             )
         )
@@ -801,45 +755,6 @@ def _dispatch(args: argparse.Namespace) -> int:  # noqa: C901, PLR0911, PLR0912,
             work_root=args.work_root,
         )
         print(prepared.work_directory)
-        return 0
-    if args.command == "print-command":
-        if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-            with tempfile.TemporaryDirectory(prefix="generation-print-command-") as temporary_directory:
-                bundle = case_service.generate_case_input_bundle(
-                    config,
-                    args.case_index,
-                    Path(temporary_directory),
-                )
-                scalar_handoff = bundle.scalar_handoff
-                if scalar_handoff is None:
-                    message = "Transient print-command generation produced no scalar handoff."
-                    raise RuntimeError(message)
-                scalar_handoff_contract.validate_transient_scalar_source(scalar_handoff)
-                command = comsol_service.build_comsol_command(
-                    config,
-                    cores_per_case=args.cores_per_case,
-                    scalar_handoff=scalar_handoff,
-                    scheduler_kind=args.scheduler_kind,
-                )
-        else:
-            config.case_id(args.case_index)
-            command = comsol_service.build_comsol_command(
-                config,
-                cores_per_case=args.cores_per_case,
-                scheduler_kind=args.scheduler_kind,
-            )
-        print(shlex.join(command))
-        return 0
-    if args.command == "run-case":
-        outcome = runtime_service.run_case(
-            config,
-            args.case_index,
-            cores_per_case=args.cores_per_case,
-            scheduler_kind=args.scheduler_kind,
-            storage_root=args.storage_root,
-            work_root=args.work_root,
-        )
-        print(json.dumps({"status": outcome.status, "case_id": outcome.case_id, "directory": str(outcome.processed_directory)}, sort_keys=True))
         return 0
     if args.command == "validate-case":
         provenance = runtime_service.validate_completed_case(config, args.case_index, storage_root=args.storage_root)
@@ -896,6 +811,17 @@ def _cli_error_payload(
     }
 
 
+def _link_node_job_logs(args: argparse.Namespace) -> None:
+    """Hard-link this node job's own logs into its campaign, when the node directory belongs to one."""
+    try:
+        campaign_directory = campaign_evidence.node_job_campaign_directory(args.node_directory)
+        if campaign_directory is not None:
+            templates = cluster_service.node_job_log_templates(common.paths.get_runtime_root().resolve())
+            host_service.link_job_logs(campaign_directory, host_service.job_log_files(templates))
+    except Exception as error:  # noqa: BLE001 -- a log link never fails a job
+        print(f"Warning: could not link the node job logs: {error}", file=sys.stderr, flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one generation command and translate failures to process status two."""
     args = _build_parser().parse_args(argv)
@@ -932,6 +858,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
         return 2
     finally:
+        if args.command == "run-node-worker":
+            _link_node_job_logs(args)  # last, after this process's own failure report: the .err is empty at the start link
         if previous_term is not None:
             signal.signal(signal.SIGTERM, previous_term)
 

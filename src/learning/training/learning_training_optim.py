@@ -43,11 +43,11 @@ def build_optimizer(
         Model to optimize
     config : dict[str, Any]
         Optimizer config with keys:
-        - optimizer.kind: optimizer type (default: "adamw")
+        - optimizer.kind: optimizer type
         - optimizer.lr: learning rate
         - optimizer.weight_decay: weight decay
-        - optimizer.betas: betas for AdamW (optional)
-        - optimizer.second_moment_floor: Adam second-moment denominator floor (optional)
+        - optimizer.betas: betas for AdamW
+        - optimizer.second_moment_floor: Adam second-moment denominator floor
 
     Returns
     -------
@@ -62,8 +62,8 @@ def build_optimizer(
     """
     from neuralop.training import AdamW  # noqa: PLC0415
 
-    opt_config = config.get("optimizer", {})
-    opt_type = opt_config.get("kind", "adamw").lower()
+    opt_config = config["optimizer"]
+    opt_type = opt_config["kind"].lower()
 
     if opt_type != "adamw":
         msg = f"Only 'adamw' optimizer is supported, got: {opt_type}"
@@ -74,13 +74,13 @@ def build_optimizer(
         msg = "Missing required 'optimizer.lr' in config"
         raise ValueError(msg)
 
-    weight_decay = opt_config.get("weight_decay", 0.0)
-    betas_config = opt_config.get("betas", [0.9, 0.999])
+    weight_decay = opt_config["weight_decay"]
+    betas_config = opt_config["betas"]
     if not isinstance(betas_config, Sequence) or isinstance(betas_config, (str, bytes)) or len(betas_config) != _ADAM_BETA_COUNT:
         msg = f"optimizer.betas must contain exactly two numeric values, got: {betas_config!r}"
         raise ValueError(msg)
     betas = (float(betas_config[0]), float(betas_config[1]))
-    second_moment_floor = opt_config.get("second_moment_floor", 1e-6)
+    second_moment_floor = opt_config["second_moment_floor"]
 
     return AdamW(
         model.parameters(),
@@ -104,10 +104,10 @@ def build_scheduler(
         Optimizer to schedule
     config : dict[str, Any]
         Scheduler config with keys:
-        - scheduler.kind: scheduler type (default: "reduce_on_plateau")
-        - scheduler.factor: LR reduction factor (default: 0.5)
-        - scheduler.patience: epochs before reduction (default: 20)
-        - scheduler.min_lr: minimum LR (default: 1e-8)
+        - scheduler.kind: scheduler type
+        - scheduler.factor: LR reduction factor
+        - scheduler.patience: validation checks before reduction
+        - scheduler.min_lr: minimum LR
 
     Returns
     -------
@@ -124,7 +124,7 @@ def build_scheduler(
     if sched_config is None:
         return None
 
-    sched_type = sched_config.get("kind", "reduce_on_plateau").lower()
+    sched_type = sched_config["kind"].lower()
 
     if sched_type == "reduce_on_plateau":
         from torch.optim.lr_scheduler import ReduceLROnPlateau  # noqa: PLC0415

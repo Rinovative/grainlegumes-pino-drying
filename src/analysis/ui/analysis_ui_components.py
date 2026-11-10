@@ -3,6 +3,7 @@
 Responsibilities:
   - Define checkbox group protocols and constructors
   - Build dropdown, radio and step-control widgets
+  - Arrange controls in one uniformly spaced wrapping row
   - Provide output containers
 
 Design principles:
@@ -30,6 +31,8 @@ COMPACT_CASE_STEP_WIDTH_PX = 40
 COMPACT_CASE_VALUE_WIDTH_PX = COMPACT_CONTROL_WIDTH_PX - 2 * COMPACT_CASE_STEP_WIDTH_PX
 
 _COMPACT_CONTROL_WIDTH = f"{COMPACT_CONTROL_WIDTH_PX}px"
+_CONTROL_ROW_MARGIN = "0 0 6px 0"
+_CONTROL_ROW_CHILD_MARGIN = "0 12px 6px 0"
 _WIDGET_DEFAULT_MARGIN_PX = 2.0
 _SCOPE_BUTTON_INCREMENT_POINTS = 1.0
 _CSS_PIXELS_PER_POINT = 96.0 / 72.0
@@ -524,6 +527,27 @@ def ui_compact_case_row(
             min_width=_COMPACT_CONTROL_WIDTH,
             max_width=_COMPACT_CONTROL_WIDTH,
             flex=f"0 0 {_COMPACT_CONTROL_WIDTH}",
+        ),
+    )
+
+
+def ui_control_row(*children: widgets.Widget) -> widgets.HBox:
+    """
+    Arrange controls in one wrapping row with the shared notebook spacing.
+
+    ipywidgets has no ``Layout.gap``, so every child receives the margin
+    ``0 12px 6px 0``; the row itself adds ``0 0 6px 0`` below. Child order and
+    child widths are preserved.
+    """
+    for child in children:
+        child.layout.margin = _CONTROL_ROW_CHILD_MARGIN
+    return widgets.HBox(
+        children,
+        layout=widgets.Layout(
+            flex_flow="row wrap",
+            align_items="center",
+            width="100%",
+            margin=_CONTROL_ROW_MARGIN,
         ),
     )
 

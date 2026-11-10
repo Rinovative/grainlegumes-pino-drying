@@ -25,6 +25,7 @@ import yaml
 
 from src import common, generation
 from src.generation.contracts import generation_contracts_profiles as profiles
+from src.generation.runtime import generation_runtime_license as license_service
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -33,55 +34,16 @@ pytest_plugins = ("support.fake_slurm",)
 
 _DEFAULT_CASE_COUNT = 2
 _TEST_MATERIAL_FAMILY = "lentil"
+FIXTURE_DESIGN_KIND = "test"  # The design kind of the fixture campaign's single natural-support batch.
 _TEST_STEADY_SEED = 41001
 _TEST_TRANSIENT_SEED = 41002
 _TEST_GRID = {"nx": 17, "ny": 11}
-
-
-def _steady_flow_conditioning(
-    fixed_values: Mapping[str, Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Return one synthetic stationary-airflow dependency audit."""
-    dependencies = [
-        {
-            "name": name,
-            "affects_stationary_solution": True,
-            "owner": "model_input",
-            "unit": unit,
-        }
-        for name, unit in (
-            ("Kxx", "m^2"),
-            ("Kxy", "m^2"),
-            ("Kyy", "m^2"),
-            ("eps_bed", "1"),
-            ("p_in_bc", "Pa"),
-        )
-    ]
-    dependencies.extend(
-        {
-            "name": name,
-            "affects_stationary_solution": True,
-            "owner": "package_fixed",
-            "unit": unit,
-            "fixed_value": value,
-        }
-        for name, unit, value in ((name, str(fixed_values[name]["unit"]), fixed_values[name]["value"]) for name in ("T_flow_ref", "p_ref", "p_out"))
-    )
-    return {
-        "schema_kind": "steady_flow_conditioning",
-        "schema_version": 1,
-        "exhaustive": True,
-        "stationary_solution_contract_id": "vp2_stationary_airflow_v1",
-        "dependencies": dependencies,
-        "additional_case_varying_solver_scalars": [],
-    }
 
 
 def _profile_configuration(
     simulation_profile: str,
     *,
     repeated_airflow_times: bool,
-    fixed_values: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Return complete test-owned mappings without inspecting template binaries."""
     del repeated_airflow_times
@@ -112,9 +74,7 @@ def _profile_configuration(
         )
     return {
         "schema_kind": "generation_profile",
-        "schema_version": 1,
         "simulation_profile": simulation_profile,
-        "steady_flow_conditioning": _steady_flow_conditioning(fixed_values),
         "exports": exports,
     }
 
@@ -176,7 +136,6 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             encoding="utf-8",
         )
 
-    catalog_common = _production_yaml("physical_model/common.yaml")
     profiles_root = project_root / "configs/01_generation/physical_model/profiles"
     profiles_root.mkdir(parents=True, exist_ok=True)
     for profile_id in profiles.available_profiles():
@@ -188,11 +147,7 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             f"{hashlib.sha256(template_path.read_bytes()).hexdigest()}\n",
             encoding="utf-8",
         )
-        profile = _profile_configuration(
-            profile_id,
-            repeated_airflow_times=False,
-            fixed_values=catalog_common["scientific_fixed_values"],
-        )
+        profile = _profile_configuration(profile_id, repeated_airflow_times=False)
         profile["template"] = template_relative_path
         (profiles_root / f"{profile_id}.yaml").write_text(
             yaml.safe_dump(profile, sort_keys=False),
@@ -205,12 +160,12 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
         material_families: tuple[str, ...] = (_TEST_MATERIAL_FAMILY,),
         executable: Path | None = None,
         timeout: float = 5.0,
-        scheduler_kind: str = "local",
         retain_solved_model: bool | None = None,
         retain_raw_csv: bool | None = None,
         repeated_airflow_times: bool = False,
         extra_arguments: tuple[str, ...] = (),
         natural_count: int = _DEFAULT_CASE_COUNT,
+        designs: Mapping[str, int] | None = None,
         parameter_ood_count: int = 0,
         startup_ramp_enabled: bool = True,
         startup_ramp_duration_h: float = 0.25,
@@ -221,12 +176,7 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
         cores_per_node: int = 24,
         node_job_wall_time: str | None = None,
         license_retry_enabled: bool = True,
-        license_initial_delay_seconds: float = 2.0,
-        license_maximum_delay_seconds: float = 5.0,
         license_maximum_wait_seconds: float = 12.0,
-        in_allocation_retry_enabled: bool = True,
-        in_allocation_maximum_window_seconds: float = 0.08,
-        in_allocation_pause_after_capacity_failure_seconds: float = 0.01,
         grid_overrides: Mapping[str, int | float] | None = None,
         campaign_purpose: str = "source_generation",
     ) -> tuple[Path, Path]:
@@ -255,49 +205,39 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             f"{hashlib.sha256(template_path.read_bytes()).hexdigest()}\n",
             encoding="utf-8",
         )
-        profile = _profile_configuration(
-            simulation_profile,
-            repeated_airflow_times=repeated_airflow_times,
-            fixed_values=common["scientific_fixed_values"],
-        )
+        profile = _profile_configuration(simulation_profile, repeated_airflow_times=repeated_airflow_times)
         profile["template"] = template_relative_path
         execution = _production_yaml("execution.yaml")
-        execution["runtime"].update(
-            {
-                "timeout_seconds": timeout,
-                "graceful_stop_reserve_seconds": float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0,
-                "extra_arguments": list(extra_arguments),
-                "license_wait": {
-                    "enabled": license_retry_enabled,
-                    "initial_delay_seconds": license_initial_delay_seconds,
-                    "maximum_delay_seconds": license_maximum_delay_seconds,
-                    "maximum_wait_seconds": license_maximum_wait_seconds,
-                    "in_allocation_retry": {
-                        "enabled": in_allocation_retry_enabled,
-                        "maximum_window_seconds": in_allocation_maximum_window_seconds,
-                        "pause_after_capacity_failure_seconds": in_allocation_pause_after_capacity_failure_seconds,
-                    },
-                },
-            }
-        )
         if retain_raw_csv is None and retain_solved_model is None:
             retention_policy = "compact"
         else:
             retention_policy = "full" if retain_raw_csv or retain_solved_model else "compact"
-        execution["retention"] = retention_policy
-        execution["submission"].update(
+        execution["run"].update(
             {
+                "timeout_seconds": timeout,
+                "retention": retention_policy,
                 "max_admission_cases": max_admission_cases,
+                "cores_per_case": cores_per_case,
+                "node_jobs": node_jobs,
+            }
+        )
+        execution["rules"].update(
+            {
+                "extra_arguments": list(extra_arguments),
+                "license_wait": {"enabled": license_retry_enabled, "maximum_wait_seconds": license_maximum_wait_seconds},
+            }
+        )
+        execution["internals"].update(
+            {
+                "graceful_stop_reserve_seconds": float(timeout) / 2.0 if float(timeout) > 0.0 else 1.0,
                 "poll_interval_seconds": poll_interval_seconds,
             }
         )
         # One case plus the 600 s publication margin and a test-owned reserve must fit into a fresh node job.
         wall_seconds = max(1, int(float(timeout))) + 900
         derived_wall_time = f"{wall_seconds // 3600:02d}:{(wall_seconds % 3600) // 60:02d}:{wall_seconds % 60:02d}"
-        execution["cluster"].update(
+        execution["node_job"].update(
             {
-                "cores_per_case": cores_per_case,
-                "node_jobs": node_jobs,
                 "memory_per_case": "1G",
                 "node_memory_overhead": "1G",
                 "node_memory_limit": "100G",
@@ -307,11 +247,8 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
         )
         execution["site"].update(
             {
-                "cpu_host": "synthetic-cpu.example",
-                "scheduler": scheduler_kind,
                 "partition": "test",
                 "cores_per_node": cores_per_node,
-                "python_module": "Python/test-fixture",
                 "comsol_module": "Comsol/test-fixture",
                 "python_executable": "python3",
                 "comsol_executable": "comsol" if executable is None else str(executable),
@@ -322,6 +259,7 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             "registry.yaml": registry,
             "common.yaml": common,
             "operations.yaml": operations,
+            "bed_fields.yaml": _production_yaml("physical_model/bed_fields.yaml"),
             "profile.yaml": profile,
             "execution.yaml": execution,
         }
@@ -341,29 +279,35 @@ def make_generation_config_factory(project_root: Path) -> Callable[..., tuple[Pa
             message = "Synthetic fixtures support ordinary source generation."
             raise ValueError(message)
         campaign_seed = _TEST_STEADY_SEED if simulation_profile == "steady_flow" else _TEST_TRANSIENT_SEED
-        campaign_name = f"lentil-{natural_count}__ref-range__lhs-seed-{campaign_seed}"
+        # One natural-support design (the test design kind) keeps a single batch of natural_count cases unless designs are given.
+        material_designs = {FIXTURE_DESIGN_KIND: natural_count} if designs is None else dict(designs)
+        campaign_name = f"lentil-{'-'.join(map(str, material_designs.values()))}__ref-range__sobol-seed-{campaign_seed}"
         campaign = {
             "schema_kind": "generation_source_campaign",
-            "schema_version": 1,
             "sources_config": "sources.yaml",
             "registry_config": "registry.yaml",
             "common_config": "common.yaml",
             "operations_config": "operations.yaml",
+            "bed_fields_config": "bed_fields.yaml",
             "profile_config": "profile.yaml",
             "execution_config": "execution.yaml",
             "materials": [_TEST_MATERIAL_FAMILY],
-            "domain_profile": "reference_range",
-            "sampling": {
-                "method": "lhs",
-                "seed_base": campaign_seed,
-                "counts": {"natural": {_TEST_MATERIAL_FAMILY: natural_count}},
-            },
+            "sampling": {"seed_base": campaign_seed, "designs": {_TEST_MATERIAL_FAMILY: material_designs}},
         }
         config_path = directory / f"{campaign_name}.yaml"
         config_path.write_text(yaml.safe_dump(campaign, sort_keys=False), encoding="utf-8")
         return config_path, template_path
 
     return build
+
+
+@pytest.fixture(autouse=True)
+def short_license_timing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the pipeline-owned licence backoff and in-allocation window to test scale."""
+    monkeypatch.setattr(license_service, "INITIAL_BACKOFF_SECONDS", 2.0)
+    monkeypatch.setattr(license_service, "MAXIMUM_BACKOFF_SECONDS", 5.0)
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_WINDOW_SECONDS", 0.08)
+    monkeypatch.setattr(license_service, "IN_ALLOCATION_PAUSE_SECONDS", 0.01)
 
 
 @pytest.fixture
@@ -394,13 +338,13 @@ def lentil_generation_config(
         generation.lifecycle.create_campaign(generation.cases.config.load_campaign_config(path), storage_root=storage_root)
     return generation.cases.config.load_generation_config(
         path,
-        only_batch=generation.cases.config.build_batch_name(profile_id, _TEST_MATERIAL_FAMILY, "natural"),
+        only_batch=generation.cases.config.build_batch_name(profile_id, _TEST_MATERIAL_FAMILY, FIXTURE_DESIGN_KIND),
     )
 
 
 def successful_source_case(campaign_name: str, batch: Any, case_index: int, storage: Path, work_root: Path) -> dict[str, Any]:
     """Run, validate, and decide one exact fake-boundary Source candidate; return its provenance."""
-    outcome = generation.runtime.run_case(batch, case_index, cores_per_case=1, storage_root=storage, work_root=work_root)
+    outcome = generation.runtime.run_case(batch, case_index, cores_per_case=1, scheduler_kind="local", storage_root=storage, work_root=work_root)
     assert outcome.status == "completed"
     provenance = generation.runtime.validate_completed_case(batch, case_index, storage_root=storage, validation_depth="routine")
     artifact = outcome.processed_directory / "case.h5"

@@ -4,12 +4,12 @@ Responsibilities:
   - Check that membership follows Generation's design order whatever order the catalog lists the rows in
   - Check that design order admits exactly one Source and names exact selection for several
   - Check that a design-order request admits only source cases of its declared Source, whoever reads it
-  - Check that the fixed split depends on the split seed and that ordered membership alone
+  - Check that each design kind is pooled on its own and the roles follow the design kinds of the ordered membership alone
   - Check that a transient Dataset is read from its PT shards only, while the source HDF5 reader stays an explicit opt-in
 
 Design principles:
   - A test-owned catalog and the compact published transient package replace Generation and publication
-  - No selection seed exists, so nothing but the Source and the split seed can change a Dataset
+  - No selection or split seed exists, so nothing but the Source and the requested counts can change a Dataset
 
 This module does NOT:
   - Publish Datasets or exercise the Dataset plan, which have their own tests
@@ -34,15 +34,15 @@ if TYPE_CHECKING:
 _ORIGINAL_POSITIONS = (1, 2, 3, 4, 5)
 _FAILED_POSITION = 2
 _REPLACEMENT_POSITION = 6
-_RECIPE = {"kind": "seeded_material_fraction", "train_fraction": 0.6, "validation_fraction": 0.2, "id_test_fraction": 0.2}
 
 
-def _row(position: int, *, origin: str, outcome: str = "successful", campaign: str = "source_a") -> dict[str, Any]:
+def _row(position: int, *, origin: str, outcome: str = "successful", campaign: str = "source_a", kind: str = "train") -> dict[str, Any]:
     """Return one catalog row of the fake Source with the exact reference keys."""
     return {
         "campaign_name": campaign,
         "campaign_digest": "a" * 64,
         "material_family": "lentil",
+        "sampling_regime": kind,
         "case_id": f"case_{position:04d}",
         "case_input_id": f"input_{position}",
         "simulation_case_id": f"simulation_{position}",
@@ -65,7 +65,7 @@ def _source_rows() -> list[dict[str, Any]]:
 def _select(rows: Sequence[dict[str, Any]], monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Return the selected case IDs when the catalog lists ``rows`` in the given order."""
     monkeypatch.setattr(selection.catalog, "list_campaign_cases", lambda *_args, **_kwargs: tuple(rows))
-    picks = selection.select_ordered_cases("steady_flow", ["source_a"], {"lentil": 5})
+    picks = selection.select_ordered_cases("steady_flow", ["source_a"], {"lentil": {"train": 5}})
     return [pick["case_id"] for pick in picks]
 
 
@@ -79,8 +79,8 @@ def test_membership_follows_design_order_not_catalog_order(monkeypatch: pytest.M
     assert _select([*rows[3:], *rows[:3]], monkeypatch) == expected
 
     monkeypatch.setattr(selection.catalog, "list_campaign_cases", lambda *_args, **_kwargs: tuple(rows[:-1]))
-    with pytest.raises(ValueError, match="lacks 5 successful lentil"):
-        selection.select_ordered_cases("steady_flow", ["source_a"], {"lentil": 5})
+    with pytest.raises(ValueError, match="lacks 5 successful lentil train"):
+        selection.select_ordered_cases("steady_flow", ["source_a"], {"lentil": {"train": 5}})
 
 
 def test_design_order_admits_exactly_one_source(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -88,8 +88,8 @@ def test_design_order_admits_exactly_one_source(monkeypatch: pytest.MonkeyPatch)
     assert len(_select(_source_rows(), monkeypatch)) == len(_ORIGINAL_POSITIONS)
 
     with pytest.raises(ValueError, match=r"exactly one Source.*exact selection"):
-        selection.select_ordered_cases("steady_flow", ["source_a", "source_b"], {"lentil": 5})
-    declared = {"kind": "design_order", "source_names": ["source_a", "source_b"], "target_counts": {"lentil": 5}}
+        selection.select_ordered_cases("steady_flow", ["source_a", "source_b"], {"lentil": {"train": 5}})
+    declared = {"kind": "design_order", "source_names": ["source_a", "source_b"], "target_counts": {"lentil": {"train": 5}}}
     with pytest.raises(ValueError, match=r"exactly one Source.*exact selection"):
         selection.materialize_selection_request({"source_task": "steady_flow", "selection": declared, "source_cases": []})
 
@@ -101,11 +101,10 @@ def test_design_order_request_admits_only_cases_of_its_declared_source() -> None
         rows = [_row(position, origin="primary", campaign=campaign) for position, campaign in enumerate(campaigns, start=1)]
         return {
             "schema_kind": selection.SELECTION_SCHEMA_KIND,
-            "schema_version": selection.SELECTION_SCHEMA_VERSION,
             "source_task": "steady_flow",
             "dataset_name": "ordered",
             "dataset_view": "steady_flow",
-            "selection": {"kind": "design_order", "source_names": [source], "target_counts": {"lentil": len(rows)}},
+            "selection": {"kind": "design_order", "source_names": [source], "target_counts": {"lentil": {"train": len(rows)}}},
             "source_cases": [{key: row[key] for key in selection.SOURCE_REFERENCE_ORDER} for row in rows],
         }
 
@@ -116,19 +115,24 @@ def test_design_order_request_admits_only_cases_of_its_declared_source() -> None
             selection.validate_selection_request(request(source, campaigns))
 
 
-def test_split_depends_on_split_seed_and_membership_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The same ordered membership and split seed give one split; another split seed gives another."""
-    rows = _source_rows()
-    material_by_case = dict.fromkeys(_select(rows, monkeypatch), "lentil")
+def test_each_design_kind_is_pooled_alone_and_roles_follow_the_kinds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Train replacement fills the Train design, not the test design; the roles follow the kinds whatever the catalog order."""
+    rows = [*_source_rows()[:-1], _row(6, origin="primary", kind="test"), _row(7, origin="primary", kind="test"), _row(8, origin="replacement")]
+    kinds = {row["case_id"]: row["sampling_regime"] for row in rows}
 
-    def split(case_ids: Sequence[str], seed: int) -> dict[str, Any]:
+    def roles(listed: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        monkeypatch.setattr(selection.catalog, "list_campaign_cases", lambda *_args, **_kwargs: tuple(listed))
+        picks = [pick["case_id"] for pick in selection.select_ordered_cases("steady_flow", ["source_a"], {"lentil": {"train": 4, "test": 2}})]
         return partition.build_fixed_partition(
-            case_ids, material_by_case=material_by_case, material_roles={"lentil": "id"}, recipe=_RECIPE, seed_input=seed, seed=seed
+            picks,
+            material_by_case=dict.fromkeys(picks, "lentil"),
+            design_kind_by_case={case: kinds[case] for case in picks},
+            material_roles={"lentil": "id"},
         )
 
-    first = split(_select(rows, monkeypatch), 9)
-    assert split(_select(rows[::-1], monkeypatch), 9) == first
-    assert len({tuple(split(_select(rows, monkeypatch), seed)["train"]) for seed in range(8)}) > 1
+    first = roles(rows)
+    assert (first["train"], first["id_test"]) == (["case_0001", "case_0003", "case_0004", "case_0005"], ["case_0006", "case_0007"])
+    assert roles(rows[::-1]) == first
 
 
 def test_transient_dataset_reads_pt_shards_only(transient_package: dict[str, Any]) -> None:

@@ -19,7 +19,7 @@ def test_transient_drying_registers_authoritative_profiles_and_metrics() -> None
     """Keep transient channels, reconstructions, and objective semantics distinct."""
     task = domain.tasks.registry.get_task("transient_drying")
 
-    complete = task.input_profile("canonical_physics_complete_v1")
+    complete = task.input_profile("canonical_physics_complete")
     assert complete.fields == task.input_names
     assert len(complete.fields) == _COMPLETE_CHANNEL_COUNT
     assert complete.coordinate_policy == "explicit_x_y"

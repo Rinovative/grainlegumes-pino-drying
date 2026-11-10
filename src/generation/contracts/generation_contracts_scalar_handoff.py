@@ -40,7 +40,6 @@ from src import common
 from . import generation_contracts_profiles as profiles
 
 SCALAR_HANDOFF_CONTRACT_SCHEMA_KIND: Final = "transient_scalar_handoff_contract"
-SCALAR_HANDOFF_CONTRACT_SCHEMA_VERSION: Final = 1
 _ENTRY_KEYS = frozenset({"name", "value", "unit", "owner"})
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _UNSAFE_LIST_CHARACTERS = frozenset({",", "\n", "\r", "\x00"})
@@ -48,7 +47,6 @@ _SCALAR_COLUMN_COUNT = 3
 _CANONICAL_OWNERSHIP: Final = tuple("case_dependent" for _name in profiles.TRANSIENT_SCALAR_INPUT_FIELDS)
 _TRANSIENT_CONTRACT_PAYLOAD: Final = {
     "schema_kind": SCALAR_HANDOFF_CONTRACT_SCHEMA_KIND,
-    "schema_version": SCALAR_HANDOFF_CONTRACT_SCHEMA_VERSION,
     "simulation_profile": profiles.TRANSIENT_DRYING_PROFILE,
     "field_names": list(profiles.TRANSIENT_SCALAR_INPUT_FIELDS),
     "units": list(profiles.TRANSIENT_SCALAR_INPUT_UNITS),

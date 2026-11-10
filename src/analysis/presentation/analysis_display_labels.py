@@ -4,6 +4,7 @@ Responsibilities:
   - Humanize maintained task, material, physical domain, and run role identifiers
   - Hold the authoritative metadata required for one visible dataset label
   - Disambiguate colliding dataset labels with the shortest stable identity prefix
+  - Make short run and Dataset labels unique with one separating facet, shortened by common affixes and a middle ellipsis
   - Preserve canonical identities as metadata rather than parsing presentation text
 
 Design principles:
@@ -18,16 +19,19 @@ This module does NOT:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from textwrap import fill
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from src.analysis import generation_inputs
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
 _COLLISION_MINIMUM_SIZE = 2
+_FACET_MINIMUM_WIDTH = 24
+_FACET_TOKEN_SEPARATOR = re.compile(r"/|__")
 _TASK_LABELS = {
     "steady_flow": "Airflow",
     "transient_drying": "Drying",
@@ -35,7 +39,8 @@ _TASK_LABELS = {
 _EVALUATION_ROLE_LABELS = {
     "id": "ID",
     "ood": "OOD",
-    "additional_evaluation": "Additional evaluation",
+    "material_ood": "Material OOD",
+    "parameter_ood": "Parameter OOD",
 }
 _EVALUATION_PROTOCOL_LABELS = {
     "normalized_drying_group_macro_rmse": "Drying group macro RMSE",
@@ -243,6 +248,71 @@ def dataset_display_labels(datasets: Iterable[DatasetDisplayMetadata]) -> tuple[
         for position, prefix in zip(positions, prefixes, strict=True):
             labels[position] = f"{base} · {prefix}"
     return tuple(labels)
+
+
+def unique_display_labels(bases: Sequence[str], facets: Sequence[Sequence[str | None]]) -> tuple[str, ...]:
+    """
+    Make equal base labels unique by appending the first separating facet.
+
+    Parameters
+    ----------
+    bases : Sequence[str]
+        One short label per item.
+    facets : Sequence[Sequence[str | None]]
+        One tuple per item with its facet values in priority order; ``None``
+        disqualifies the facet for the whole collision group.
+
+    Returns
+    -------
+    tuple[str, ...]
+        ``base`` alone when unique, otherwise ``base · facet`` with the facet
+        reduced to the ``/``- and ``__``-separated tokens that not all items of
+        its group share and, beyond 24 characters, shown as ``head…tail`` with
+        the smallest unique length. An item without a distinguishing token keeps
+        the bare ``base``.
+
+    Raises
+    ------
+    ValueError
+        If the inputs differ in length or no facet separates a collision group.
+
+    """
+    if len(bases) != len(facets):
+        message = "bases and facets must have one entry per item."
+        raise ValueError(message)
+    labels = list(bases)
+    for base in dict.fromkeys(bases):
+        group = tuple(index for index, candidate in enumerate(bases) if candidate == base)
+        if len(group) < _COLLISION_MINIMUM_SIZE:
+            continue
+        for facet_index in range(max(len(facets[index]) for index in group)):
+            values = tuple(facets[index][facet_index] if facet_index < len(facets[index]) else None for index in group)
+            if None in values:
+                continue
+            shown_values = _shorten_facet_values(cast("tuple[str, ...]", values))
+            if shown_values is not None:
+                for index, shown in zip(group, shown_values, strict=True):
+                    labels[index] = f"{base} · {shown}" if shown else base
+                break
+        else:
+            message = f"No facet separates the items labelled {base!r}."
+            raise ValueError(message)
+    return tuple(labels)
+
+
+def _shorten_facet_values(values: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Keep the tokens not shared by all values, ellipsize to the smallest unique length; ``None`` if not separating."""
+    tokens = tuple(_FACET_TOKEN_SEPARATOR.split(value) for value in values)
+    shared = set.intersection(*(set(item) for item in tokens))
+    cores = tuple(" ".join(token for token in item if token not in shared) for item in tokens)
+    if len(set(cores)) != len(cores):
+        return None
+    for width in range(_FACET_MINIMUM_WIDTH, max(len(core) for core in cores) + 1):
+        head = width // 2
+        shown = tuple(core if len(core) <= width else f"{core[:head]}…{core[len(core) - (width - head - 1) :]}" for core in cores)
+        if len(set(shown)) == len(shown):
+            return shown
+    return cores
 
 
 def _unique_identity_prefixes(identities: tuple[str, ...]) -> tuple[str, ...]:

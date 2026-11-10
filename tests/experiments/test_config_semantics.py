@@ -17,12 +17,14 @@ import copy
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import yaml
 from support import configs
 
-from src import domain, experiments, learning
+from src import common, domain, experiments, learning
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 _SYNTHETIC_BATCH_SIZE = 3
 
@@ -43,7 +45,7 @@ def test_minimal_direct_config_resolves_and_preserves_user_values(
     assert resolved["model"]["params"]["in_channels"] == task.in_channels
     assert resolved["model"]["params"]["out_channels"] == task.out_channels
     assert resolved["data"]["train_dataset"] == "synthetic_train"
-    assert resolved["data"]["additional_evaluation_datasets"] == ["synthetic_ood"]
+    assert resolved["data"]["material_ood_datasets"] == ["synthetic_ood"]
     assert resolved["data"]["batch_size"] == _SYNTHETIC_BATCH_SIZE
     assert resolved["optimizer"]["lr"] == pytest.approx(4.321e-3)
     assert resolved["evaluation"]["objective"]["id"] == "normalized_group_macro_rmse"
@@ -206,8 +208,14 @@ def test_transient_training_states_its_cadence_without_code_defaults() -> None:
         (configs.direct_config, ("scheduler", "min_lr"), r"scheduler must state scheduler\.min_lr"),
         (configs.direct_config, ("model", "params", "positional_embedding"), r"model\.params is missing required key.*positional_embedding"),
         (configs.direct_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
+        (configs.direct_config, ("data", "train_subset"), r"data\.train_subset is required"),
         (configs.transient_stage_a_only_config, ("data", "spatial_stride"), r"data\.spatial_stride is required"),
+        (configs.transient_stage_a_only_config, ("data", "train_subset"), r"data\.train_subset"),
         (configs.transient_stage_a_only_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
+        (configs.direct_config, ("optimizer", "betas"), r"Config must state optimizer\.betas;"),
+        (configs.direct_config, ("tracking", "wandb", "monitor", "interval"), r"Config must state tracking\.wandb\.monitor\.interval;"),
+        (configs.transient_stage_a_only_config, ("loss", "data", "beta"), r"Config must state loss\.data\.beta;"),
+        (configs.transient_stage_a_only_config, ("loss", "physics"), r"Config must state loss\.physics\.enabled;"),
     ],
 )
 def test_values_without_a_code_default_are_required_and_named_by_path(
@@ -226,6 +234,47 @@ def test_values_without_a_code_default_are_required_and_named_by_path(
         configs.resolve(raw)
 
 
+def test_an_explicit_null_scheduler_trains_without_one() -> None:
+    """A null scheduler states the whole section and disables it, while an omitted one is rejected."""
+    raw = configs.direct_config()
+    raw["scheduler"] = None
+    assert configs.resolve(raw)["scheduler"] is None
+
+    del raw["scheduler"]
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"Config must state scheduler\.kind;"):
+        configs.resolve(raw)
+
+
+def test_a_saved_config_without_a_base_owned_key_is_refused() -> None:
+    """A saved resolved config that lacks a key the code leaves to the base is refused instead of read with a fallback."""
+    saved = configs.resolve(configs.direct_config())
+    del saved["optimizer"]["weight_decay"]
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"Config must state optimizer\.weight_decay;"):
+        experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
+
+
+@pytest.mark.parametrize("value", [3, 0, True, 2.0])
+def test_a_train_subset_is_null_or_a_power_of_two(value: object) -> None:
+    """A learning-curve point is a power-of-two Train prefix per material; any other value is refused."""
+    raw = configs.direct_config()
+    raw["data"]["train_subset"] = value
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"data\.train_subset must be null or a power of two"):
+        configs.resolve(raw)
+
+
+def test_a_train_subset_runs_in_its_own_dataset_directory(tmp_path: Path) -> None:
+    """Runs on a Train subset of one Dataset never share a directory with the full Dataset or another subset."""
+    raw = configs.direct_config()
+    raw["data"]["train_subset"] = 4
+    subset = configs.resolve(raw)
+    full = configs.resolve(configs.direct_config())
+    assert subset["run"]["layout"]["dataset"] == "synthetic_train__train-4"
+    assert full["run"]["layout"]["dataset"] == "synthetic_train"
+    run_dir = common.paths.resolve_config_run_dir
+    assert run_dir(subset, output_root=tmp_path) != run_dir(full, output_root=tmp_path)
+
+
 @pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
 def test_mixed_precision_is_an_unknown_training_key(build: Callable[[], dict[str, Any]]) -> None:
     """Refuse the removed mixed-precision switch instead of ignoring it."""
@@ -233,6 +282,25 @@ def test_mixed_precision_is_an_unknown_training_key(build: Callable[[], dict[str
     raw["training"]["mixed_precision"] = False
 
     with pytest.raises(experiments.config.loader.ConfigError, match=r"training contains unknown key.*mixed_precision"):
+        configs.resolve(raw)
+
+
+# The retired single-role names, built from parts so that the repository search for them stays empty.
+_RETIRED_ROLE = "additional" + "_evaluation"
+
+
+@pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
+@pytest.mark.parametrize(
+    ("section", "old", "new"),
+    [("data", f"{_RETIRED_ROLE}_datasets", "material_ood_datasets"), ("training", f"{_RETIRED_ROLE}_interval", "ood_evaluation_interval")],
+    ids=["datasets", "interval"],
+)
+def test_renamed_ood_keys_are_refused_under_their_old_names(build: Callable[[], dict[str, Any]], section: str, old: str, new: str) -> None:
+    """Refuse the former OOD key names instead of reading them as aliases."""
+    raw = build()
+    raw[section][old] = raw[section].pop(new, [] if section == "data" else 1)
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=rf"{section} contains unknown key.*{old}"):
         configs.resolve(raw)
 
 
@@ -320,13 +388,29 @@ def test_duplicate_metric_identifier_is_rejected() -> None:
         configs.resolve(raw)
 
 
-def test_resolved_task_contract_rejects_an_unsupported_schema() -> None:
-    """Fail closed when persisted task semantics use another schema version."""
+def test_resolved_task_contract_rejects_a_drifted_contract() -> None:
+    """Fail closed when persisted task semantics differ from the registered task."""
     resolved = configs.resolve(configs.direct_config())
-    resolved["task_contract"]["schema_version"] += 1
+    resolved["task_contract"]["digest"] = "0" * 64
 
     with pytest.raises(
         experiments.config.loader.ConfigError,
         match="does not exactly match registered task",
     ):
         experiments.config.loader.validate_resolved_task_contract(resolved)
+
+
+def test_saved_run_config_lists_choices_first_and_contract_blocks_last(tmp_path: Path) -> None:
+    """The saved order is presentation only: the same config reloads, validates and keeps its digest."""
+    resolved = configs.resolve(configs.direct_config())
+    path = tmp_path / "config.yaml"
+
+    experiments.config.loader.save_yaml(resolved, path)
+
+    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    keys = list(saved)
+    assert keys[:7] == ["task", "model", "data", "loss", "optimizer", "scheduler", "training"]
+    assert keys[-2:] == ["task_contract", "evaluation"]
+    assert sorted(keys) == sorted(resolved)
+    assert common.serialization.canonical_json_sha256(saved) == common.serialization.canonical_json_sha256(resolved)
+    experiments.config.loader.validate_resolved_config(saved)

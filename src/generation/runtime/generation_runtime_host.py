@@ -12,7 +12,7 @@ Design principles:
   - A log link never creates its campaign folder and never fails a job: every problem is one warning on stderr
   - A job finds its own logs from the sbatch templates that submitted it and keeps a link only to the file it checked
   - Keep source identity checks ahead of scheduled worker execution
-  - A scheduled operation's runtime log summarizes a JSON result the driver receives whole; other output and failures stay raw
+  - A successful operation returning one JSON result prints a summary line to the driver log and leaves no file; other output stays raw
   - Every scheduled worker command, launcher, and child environment names the tree, never the live checkout
   - Uncommitted changes are always admitted: the snapshot captures them and the admission reports whether it carries any
   - Read-only commands never capture snapshots or trees, so inspection leaves no durable evidence behind
@@ -610,24 +610,26 @@ def current_job_log_files() -> tuple[Path, ...]:
 
 def link_job_logs(owner_directory: Path, files: Sequence[Path]) -> None:
     """
-    Hard-link job log files into ``<owner>/logs/`` under their own names.
+    Hard-link job log files into ``<owner>/_record/logs/`` under their own names.
 
-    The owner, a campaign folder, must already exist and is
-    never created here. A link to the same file is kept, a different existing file is
+    An ``.err`` file that is empty when it is linked tells nothing and is not linked. The owner, a campaign folder,
+    must already exist and is never created here. A link to the same file is kept, a different existing file is
     left alone with a warning, a new link whose inode differs from the file checked
     before linking is removed again, and any failure is one warning on stderr, never an error.
     """
     if not files:
         return
-    logs = common.paths.resolve_job_logs_directory(owner_directory)
-    if owner_directory.is_symlink() or logs.is_symlink():
-        print(f"Warning: could not link job logs into {logs}: the log owner or its logs/ is a symbolic link", file=sys.stderr, flush=True)
+    logs = common.paths.resolve_generation_campaign_logs_directory(owner_directory)
+    if owner_directory.is_symlink() or logs.parent.is_symlink() or logs.is_symlink():
+        print(f"Warning: could not link job logs into {logs}: the owner, its _record/ or logs/ is a symbolic link", file=sys.stderr, flush=True)
         return
     try:
         logs.mkdir(exist_ok=True)
         for source in files:
             target = logs / source.name
             checked = source.lstat()
+            if source.suffix == ".err" and checked.st_size == 0:
+                continue
             try:
                 target.hardlink_to(source)
             except FileExistsError:
@@ -677,8 +679,9 @@ def _run_scheduled(
     """
     Stream worker stdout into its runtime log and report long silent work.
 
-    A successful run whose stdout is one JSON object leaves only a summary line in the log, because the driver receives
-    the object itself; any other output, and every failed run, keeps its raw stdout in the log.
+    A successful run whose stdout is one JSON object prints only a summary line to the driver's own log and leaves no
+    runtime log file, because the driver receives the object itself; any other output, and every failed run, keeps its
+    raw stdout in the runtime log file.
     """
     interval = int(environment.get("GENERATION_CONSOLE_HEARTBEAT_SECONDS", "120"))
     if interval < 1:
@@ -724,9 +727,8 @@ def _run_scheduled(
             status = process.wait()
             summary = _json_result_summary(operation, bytes(stdout)) if status == 0 else None
             if summary is not None:
-                log.seek(0)
-                log.truncate()
-                log.write(summary.encode())
+                print(summary, end="", file=sys.stderr, flush=True)  # stdout belongs to the step's result; the driver's log takes both streams
+                Path(output_path).unlink(missing_ok=True)
             return status, stdout.decode(errors="replace"), stderr.decode(errors="replace")
     except OSError as error:
         message = f"Could not execute Generation {operation}: {error}"
@@ -908,6 +910,8 @@ class GenerationHost:
             status, stdout, stderr = result.returncode, result.stdout, result.stderr
         if status and error_path is not None and Path(error_path).exists():
             stderr += "\n" + "\n".join(Path(error_path).read_text(encoding="utf-8").splitlines()[-80:])
+        if error_path is not None and Path(error_path).is_file() and Path(error_path).stat().st_size == 0:
+            Path(error_path).unlink()  # srun creates it for every step; an empty one tells nothing
         if output_path is not None:
             produced = [Path(path) for path in (output_path, error_path) if path is not None and Path(path).is_file()]
             if self._log_campaign is None:

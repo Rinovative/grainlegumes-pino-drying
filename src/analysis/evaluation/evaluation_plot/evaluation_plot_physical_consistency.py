@@ -36,6 +36,7 @@ from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_session as sessions
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.presentation import analysis_field_labels as field_labels
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_CASE_LIMIT = 100
 _POSITIVE_FLOOR = np.finfo(float).tiny
+_RESIDUAL_COLORBAR_LABEL = rf"mean $\sqrt{{R_x^2+R_y^2}}/G$ [{field_labels.display_unit('1')}]"
 _RESIDUAL_LABELS = {
     "momentum_residual_mse": (r"MSE of Brinkman momentum residual $(R_x^2+R_y^2)/G^2$", "1"),
     "flux_balance_mse": (r"MSE of cross-section flux deviation $(q(y)-\bar{q})/Q$", "1"),
@@ -181,7 +183,7 @@ def plot_brinkman_residual(
         metric="momentum_residual_mse",
         attribute="momentum_mean",
         title="Darcy–Brinkman momentum residual",  # noqa: RUF001
-        colorbar_label=r"mean $\sqrt{R_x^2+R_y^2}/G$ [1]",
+        colorbar_label=_RESIDUAL_COLORBAR_LABEL,
     )
 
 
@@ -386,7 +388,7 @@ def plot_spatial_residuals(
         axes[row, 0].set_title(f"{heading} — momentum")
         axes[row, 0].set_xlabel(f"x [{summary.grid.coordinate_units[0]}]")
         axes[row, 0].set_ylabel(f"y [{summary.grid.coordinate_units[1]}]")
-        layout.add_map_colorbar(figure, image, axes[row, 0], label=r"mean $\sqrt{R_x^2+R_y^2}/G$ [1]")
+        layout.add_map_colorbar(figure, image, axes[row, 0], label=_RESIDUAL_COLORBAR_LABEL)
         rows = summary.grid.coordinates[1, :, 0]
         axes[row, 1].plot(np.maximum(cast("np.ndarray", summary.flux_balance_mean), _POSITIVE_FLOOR), rows, linewidth=2)
         axes[row, 1].set_xscale("log")

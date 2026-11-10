@@ -36,7 +36,7 @@ def with_configured_identities(config: OptunaStudyConfig) -> OptunaStudyConfig:
     data = config.base_config["data"]
     identities = {
         "train": {"dataset_id": data["train_dataset"]},
-        "additional_evaluation": [{"dataset_id": dataset_id} for dataset_id in data["additional_evaluation_datasets"]],
+        "material_ood": [{"dataset_id": dataset_id} for dataset_id in data["material_ood_datasets"]],
     }
     return replace(config, dataset_identities=identities)
 
@@ -44,6 +44,11 @@ def with_configured_identities(config: OptunaStudyConfig) -> OptunaStudyConfig:
 def run_one_trial_study(request: Mapping[str, Any], *, directory: Path) -> dict[str, Any]:
     """Run trial 0 of ``request`` on the CPU below ``directory`` and return its admitted completed run."""
     optuna_runtime = experiments.tuning.optuna
+    # The best config is built against the task's maintained base.yaml, which a synthetic project root lacks.
+    task_base = experiments.tuning.optuna._task_base_path(request["experiment"]["task"])
+    if not task_base.is_file():
+        task_base.parent.mkdir(parents=True, exist_ok=True)
+        task_base.write_text("{}\n", encoding="utf-8")
     path = configs.write_yaml(directory / "trial_lifecycle_study.yaml", request)
     study_config = optuna_runtime.with_runtime_overrides(
         optuna_runtime.load_optuna_study_config(path), device="cpu", output_root=directory / "outputs"

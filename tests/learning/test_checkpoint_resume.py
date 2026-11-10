@@ -219,7 +219,7 @@ def _config(epochs: int, *, direction: str = "minimize", evaluation_interval: in
         "training": {
             "epochs": epochs,
             "evaluation_interval": evaluation_interval,
-            "additional_evaluation_interval": evaluation_interval,
+            "ood_evaluation_interval": evaluation_interval,
         },
         "evaluation": {"objective": _objective(direction=direction)},
         "tracking": {
@@ -247,14 +247,15 @@ def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[st
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
         "resume_contract_digest": digest("resume"),
-        "dataset_ids": {"train": f"{run}-train-dataset", "additional_evaluation": f"{run}-ood-dataset"},
-        "dataset_fingerprints": {"train": digest("train"), "additional_evaluation": digest("ood")},
+        "dataset_ids": {"train": f"{run}-train-dataset", "material_ood": f"{run}-ood-dataset", "parameter_ood": f"{run}-pood-dataset"},
+        "dataset_fingerprints": {"train": digest("train"), "material_ood": digest("ood"), "parameter_ood": digest("pood")},
         "split_contract_digest": digest("split-contract"),
         "split_membership_digests": {
             "train": digest("train-membership"),
             "validation": digest("validation-membership"),
             "id_test": digest("id-test-membership"),
-            "additional_evaluation": digest("ood-membership"),
+            "material_ood": digest("ood-membership"),
+            "parameter_ood": digest("pood-membership"),
         },
         "normalizer_sha256": digest("normalizer"),
         "numerical_environment": learning.training.checkpoint.numerical_environment_identity(),
@@ -1046,7 +1047,7 @@ def test_non_finite_objective_never_creates_a_loadable_best(tmp_path: Path) -> N
             config={
                 "task": "steady_flow",
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "additional_evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
                 "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },
@@ -1122,24 +1123,15 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
     assert payload["identity"]["objective"] == objective
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    [1.0, 2],
-    ids=("floating-current", "other-version"),
-)
-def test_checkpoint_requires_integer_current_version(
-    schema_version: object,
-    tmp_path: Path,
-) -> None:
-    """Reject alternate runtime representations and any other checkpoint version."""
+def test_checkpoint_requires_its_schema_kind(tmp_path: Path) -> None:
+    """Reject a payload that is not a training checkpoint."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _run(run_dir, epochs=2, seed=42)
     payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    assert payload["schema_version"] == learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION == 1
-    payload["schema_version"] = schema_version
+    payload["schema_kind"] = "other_payload"
 
-    with pytest.raises(ValueError, match="unsupported checkpoint schema_kind/schema_version"):
+    with pytest.raises(ValueError, match="unsupported checkpoint schema_kind"):
         learning.training.checkpoint.validate_checkpoint(
             payload,
             expected_identity=_identity(),
@@ -1290,7 +1282,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(101)
     ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
     config = _config(6, evaluation_interval=2)
-    config["training"]["additional_evaluation_interval"] = 3
+    config["training"]["ood_evaluation_interval"] = 3
     config["tracking"]["wandb"]["monitor"] = {
         "enabled": True,
         "interval": 4,
@@ -1337,7 +1329,7 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
         optimizer=optimizer,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        additional_evaluation_loader=ood_loader,
+        ood_loaders={"material_ood": ood_loader, "parameter_ood": None},
         train_loss=loss,
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
@@ -1350,14 +1342,16 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
     assert ood_epochs == [3, 6]
     assert physics_calls == 2
     assert [epoch for epoch, payload in observed.items() if "id/mse" in payload] == [2, 4, 6]
-    assert [epoch for epoch, payload in observed.items() if "additional_evaluation/mse" in payload] == [3, 6]
+    assert [epoch for epoch, payload in observed.items() if "material_ood/mse" in payload] == [3, 6]
+    # An empty part is not evaluated: no metric, objective difference or duration key of it.
+    assert not any("parameter_ood" in key for payload in observed.values() for key in payload)
     assert [epoch for epoch, payload in observed.items() if "physics/id/momentum_residual_mse" in payload] == [4, 6]
     assert observed[4]["physics/id/momentum_residual_mse"] == 1.0
     assert observed[6]["physics/id/momentum_residual_mse"] == 2.0
 
 
 def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) -> None:
-    """Evaluate ID then OOD while retaining ID as the sole objective source."""
+    """Evaluate ID, then material and parameter OOD as separate parts, while retaining ID as the sole objective source."""
     run_dir = tmp_path / "id-ood-selection"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(41)
@@ -1369,9 +1363,9 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
         optimizer=optimizer,
         train_loader=train_loader,
         eval_loader=eval_loader,
-        additional_evaluation_loader=eval_loader,
+        ood_loaders={"parameter_ood": eval_loader, "material_ood": eval_loader},
         train_loss=loss,
-        eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.3, 0.9])},
+        eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.7, 0.3, 0.9, 0.2])},
         scheduler=scheduler,
         save_dir=run_dir,
         epoch_end_callback=lambda _epoch, values: observed.append(dict(values)),
@@ -1382,8 +1376,10 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
     assert result["best_epoch"] == 2
     assert result["best_metric"] == 0.3
     assert [values["id/mse"] for values in observed] == [0.4, 0.3]
-    assert [values["additional_evaluation/mse"] for values in observed] == [0.1, 0.9]
-    assert [values["additional_evaluation/objective_difference"] for values in observed] == pytest.approx([-0.3, 0.6])
+    assert [values["material_ood/mse"] for values in observed] == [0.1, 0.9]
+    assert [values["material_ood/objective_difference"] for values in observed] == pytest.approx([-0.3, 0.6])
+    assert [values["parameter_ood/mse"] for values in observed] == [0.7, 0.2]
+    assert [values["parameter_ood/objective_difference"] for values in observed] == pytest.approx([0.3, -0.1])
     assert result["terminal_epoch"] == 2
     assert set(result["terminal_metrics"]) == {"train/loss_total", "train/loss_data"}
 
@@ -1476,7 +1472,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        additional_evaluation_loader=ood_loader,
+        ood_loaders={"material_ood": ood_loader},
         eval_metrics={
             "mse": _DatasetMSE(),
             **{metric_id: _DatasetMSE() for metric_id in science_metric_ids},
@@ -1491,10 +1487,10 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     assert selected["selected_epoch"] == 1
     metrics = selected["selected_metrics"]
     assert metrics["selected/id/mse"] == 0.2
-    assert metrics["selected/additional_evaluation/mse"] == 0.6
+    assert metrics["selected/material_ood/mse"] == 0.6
     assert {metric_id: metrics[f"selected/id/{metric_id}"] for metric_id in science_metric_ids} == id_science_metrics
-    assert {metric_id: metrics[f"selected/additional_evaluation/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
-    assert metrics["selected/additional_evaluation/objective_difference"] == pytest.approx(0.4)
+    assert {metric_id: metrics[f"selected/material_ood/{metric_id}"] for metric_id in science_metric_ids} == ood_science_metrics
+    assert metrics["selected/material_ood/objective_difference"] == pytest.approx(0.4)
     assert metrics["selected/physics/flux_balance_mse"] == 2.0
     for term in ("momentum", "continuity", "boundary"):
         assert metrics[f"selected/training/{term}_weight"] == 0.0
@@ -1507,7 +1503,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         model=model,
         train_loss=train_loss,
         eval_loader=eval_loader,
-        additional_evaluation_loader=ood_loader,
+        ood_loaders={"material_ood": ood_loader},
         eval_metrics={"mse": _DatasetMSE()},
         device=torch.device("cpu"),
         data_processor=None,
@@ -1613,7 +1609,7 @@ def test_missing_best_prevents_successful_loop_completion(
             config={
                 "task": "steady_flow",
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "additional_evaluation_interval": 1},
+                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
                 "evaluation": {"objective": _objective()},
                 "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
             },

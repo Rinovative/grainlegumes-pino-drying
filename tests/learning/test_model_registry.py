@@ -343,10 +343,8 @@ def test_one_architecture_label_is_reused_across_config_run_and_display(kind: st
     raw = configs.direct_config(model_kind=kind)
     config = configs.resolve(raw)
     label = learning.models.naming.architecture_label(config)
-    core = learning.models.naming.core_architecture_label(config)
-    assert label == core  # The synthetic model carries no non-default switches.
-    assert config["run"]["layout"]["model_label"] == core
-    assert core in config["run"]["name"]
+    assert config["run"]["layout"]["model_label"] == label  # Without physics the model label is the architecture label.
+    assert label in config["run"]["name"]
     assert experiments.config.loader.resolved_model_variant(config) == label
     config["run"]["seed"] += 1
     config["optimizer"]["lr"] *= 2
@@ -453,7 +451,7 @@ def test_rno_production_step_carry_equals_the_full_sequence_recurrence() -> None
 def test_rno_label_omits_the_single_admitted_candidate_activation() -> None:
     """The required tanh candidate names no alternative, so it is no label switch."""
     config = {"model": {"kind": "rno", "params": _rno_params()}}
-    assert learning.models.naming.architecture_label(config) == learning.models.naming.core_architecture_label(config)
+    assert learning.models.naming.architecture_label(config) == "rno_m2x2_h4_l2_p0p1"
 
 
 @pytest.mark.parametrize("candidate_activation", ["selu", None])

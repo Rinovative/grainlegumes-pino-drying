@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Check that the spacing comes from the physical coordinate channels as (rows, columns) in metres
-  - Check that an additional Evaluation case on another grid spacing is refused
+  - Check that an OOD Evaluation case on another grid spacing is refused
 
 Design principles:
   - Synthetic samples on a small anisotropic grid replace published Datasets
@@ -34,13 +34,13 @@ def _loader(*, spacing_y: float = _SPACING_Y, spacing_x: float = _SPACING_X) -> 
 
 
 def test_spacing_is_rows_then_columns_in_metres() -> None:
-    """Return the y spacing first and the x spacing second, also when additional Evaluation shares the grid."""
+    """Return the y spacing first and the x spacing second, also when OOD Evaluation shares the grid."""
     spacing = experiments.run._steady_grid_spacing(_CONFIG, _loader(), _loader())
 
     assert spacing == pytest.approx((_SPACING_Y, _SPACING_X))
 
 
-def test_additional_evaluation_on_another_spacing_is_refused() -> None:
-    """Refuse an additional Evaluation case whose grid spacing differs from the training grid."""
+def test_ood_evaluation_on_another_spacing_is_refused() -> None:
+    """Refuse an OOD Evaluation case whose grid spacing differs from the training grid."""
     with pytest.raises(ValueError, match="training spacing"):
         experiments.run._steady_grid_spacing(_CONFIG, _loader(), _loader(spacing_x=2 * _SPACING_X))

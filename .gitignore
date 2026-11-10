@@ -32,6 +32,8 @@ htmlcov/
 # Jupyter notebook checkpoints
 # ================================
 .ipynb_checkpoints/
+/notebooks/*.pdf
+/notebooks/*.gif
 
 # ================================
 # Environment files

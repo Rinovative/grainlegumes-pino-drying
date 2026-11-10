@@ -38,7 +38,7 @@ def _natural_batch_name() -> str:
     return generation.cases.config.build_batch_name(
         "transient_drying",
         "lentil",
-        "natural",
+        "test",
     )
 
 
@@ -106,7 +106,6 @@ def _populate_attempt_artifacts(config: Any, prepared: Any) -> tuple[str, ...]:
         runtime / "status.json",
         {
             "schema_kind": "simulation_case_status",
-            "schema_version": generation.publication.storage.STATUS_SCHEMA_VERSION,
             "case_state": "successful",
             "quality_flags": [],
         },
@@ -339,11 +338,11 @@ def test_license_cleanup_refuses_unique_scientific_output(
     assert (attempt.directory / "payload/runtime/case.h5").read_bytes() == b"unique scientific output"
 
 
-def test_attempt_admission_requires_exact_version_one_schema(
+def test_attempt_admission_requires_exact_schema(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Reject unsupported versions, unknown fields, and false stage claims."""
+    """Reject unknown fields and false stage claims."""
     config, storage, prepared = _configured_case(
         generation_config_factory,
         tmp_path,
@@ -359,14 +358,7 @@ def test_attempt_admission_requires_exact_version_one_schema(
     )
     original = json.loads(attempt.receipt_path.read_text(encoding="utf-8"))
 
-    assert {
-        attempt_service.ATTEMPT_SCHEMA_VERSION,
-        attempt_service.CLEANUP_SCHEMA_VERSION,
-        generation.publication.storage.STATUS_SCHEMA_VERSION,
-    } == {1}
-
     malformed_receipts = (
-        {**original, "schema_version": 0},
         {**original, "unexpected_field": "not admitted"},
         {**original, "solver_state": "succeeded"},
     )

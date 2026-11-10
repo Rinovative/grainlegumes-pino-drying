@@ -49,12 +49,25 @@ def _campaign_inventory(campaign: config_service.CampaignConfig) -> tuple[str, .
     return inventory
 
 
+def _natural_batch(campaign: config_service.CampaignConfig, material_family: str) -> config_service.GenerationConfig:
+    """Return the material's first original batch with natural support (any design kind except parameter OOD)."""
+    for batch in campaign.batches:
+        if (
+            batch.material_family == material_family
+            and batch.sampling_regime != "parameter_ood"
+            and "replacement_design" not in batch.scientific_values
+        ):
+            return batch
+    message = f"Static sentinel campaign lacks a natural-support batch for configured material {material_family!r}."
+    raise ValueError(message)
+
+
 def _parameter_ood_source(
     natural_batch: config_service.GenerationConfig,
 ) -> config_service.GenerationConfig:
     """Return a sentinel-only parameter-OOD source independent of production counts."""
-    if natural_batch.sampling_regime != "natural":
-        message = "Parameter-OOD sentinels require one natural source batch."
+    if natural_batch.sampling_regime == "parameter_ood":
+        message = "Parameter-OOD sentinels require one natural-support source batch."
         raise ValueError(message)
     scientific = copy.deepcopy(natural_batch.scientific_values)
     scientific["sampling_regime"] = "parameter_ood"
@@ -77,18 +90,8 @@ def _validate_campaign(
         message = f"Static sentinel input is not a Source campaign for {profile_id!r}."
         raise ValueError(message)
     inventory = _campaign_inventory(campaign)
-    missing_natural = [
-        material_family
-        for material_family in inventory
-        if campaign.find_batch(
-            material_family=material_family,
-            sampling_regime="natural",
-        )
-        is None
-    ]
-    if missing_natural:
-        message = f"Static sentinel campaign lacks natural batches for configured materials {missing_natural}."
-        raise ValueError(message)
+    for material_family in inventory:
+        _natural_batch(campaign, material_family)
     return inventory
 
 
@@ -99,10 +102,7 @@ def inspect_sentinel_workload(
     inventory = _validate_campaign(campaign, campaign.profile.id)
     parameter_ood: dict[str, Any] = {}
     for material_family in inventory:
-        natural = campaign.require_batch(
-            material_family=material_family,
-            sampling_regime="natural",
-        )
+        natural = _natural_batch(campaign, material_family)
         source = campaign.find_batch(
             material_family=material_family,
             sampling_regime="parameter_ood",

@@ -1,7 +1,7 @@
 """Define lightweight persisted contracts for generated analysis artifacts.
 
 Responsibilities:
-  - Declare artifact, provenance, residual, and derivative schema constants
+  - Declare artifact, provenance, residual, and derivative contract constants
   - Own the steady-Brinkman residual diagnostic provenance contract
   - Name physical and normalized sufficient-statistic columns
   - Finalize the equal physical-output-group selection objective
@@ -32,10 +32,11 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, BinaryIO, Final
 
 import numpy as np
 
@@ -52,9 +53,6 @@ if TYPE_CHECKING:
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 
-ARTIFACT_SCHEMA_VERSION = 1
-ARTIFACT_PROVENANCE_SCHEMA_VERSION = 1
-RESIDUAL_SCHEMA_VERSION = 1
 ARTIFACT_PROVENANCE_FILENAME = "artifact_provenance.json"
 STEADY_ARTIFACT_KIND = "steady_field"
 INFERENCE_PRECISION = "float32"
@@ -70,7 +68,6 @@ EVAL_PAD = 2
 ARTIFACT_DERIVATIVE_KIND = "physical"
 _ARTIFACT_IDENTITY_CONTRACT = {
     "schema_kind": "evaluation_artifact_semantic_identity",
-    "schema_version": 1,
     "checkpoint_semantics": "exact_best_checkpoint_bytes",
     "dataset_semantics": "exact_dataset_and_ordered_split_membership",
     "evaluation_semantics": "resolved_metric_evaluator_and_physics_contracts",
@@ -87,6 +84,7 @@ ARTIFACT_IDENTITY_CONTRACT_DIGEST = hashlib.sha256(
 ).hexdigest()
 _PACKAGE_CASE_ID = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*__case_[0-9]{4,}__[0-9a-f]{12}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_SHA256_HEX_LENGTH: Final = 64
 _REBUILD_REMEDY: Final = "rerun only this exact target with --rebuild"
 _ANALYSIS_FILES: Final = (
     "analysis/artifacts/analysis_artifact_contracts.py",
@@ -99,6 +97,7 @@ _ANALYSIS_EXEMPTIONS: Final = {
     "analysis/artifacts/analysis_artifact_performance.py": "operational progress and performance reporting, outside scientific identity",
     "analysis/evaluation/evaluation_artifact_loader.py": "admission reads persisted artifacts and produces none",
     "analysis/presentation/analysis_presentation_curated.py": "curated figures rendered for tracking upload, never persisted evidence",
+    "analysis/presentation/analysis_display_labels.py": "role labels of the curated tracking upload, never persisted evidence",
     "experiments/config/experiments_config_loader.py": "admission of the saved resolved config, whose recorded identities bind the run",
     "experiments/experiments_run.py": "admission of the completed run and its checkpoints, bound by their recorded identities",
     "learning/losses/learning_losses_factory.py": "training H1 loss constructor of the metric module, never reached by artifact metrics",
@@ -179,8 +178,6 @@ def _selected_identity_fields(
 def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
     """Return positive model, Dataset, split, evaluator, and physics dependencies."""
     required_top_level = (
-        "provenance_schema_version",
-        "artifact_schema_version",
         "producer",
         "run",
         "model",
@@ -216,8 +213,6 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
         model["parameter_counts"] = deepcopy(model_mapping["parameter_counts"])
     payload = {
         "identity_contract_sha256": ARTIFACT_IDENTITY_CONTRACT_DIGEST,
-        "provenance_schema_version": deepcopy(provenance["provenance_schema_version"]),
-        "artifact_schema_version": deepcopy(provenance["artifact_schema_version"]),
         "producer": validate_analysis_producer(provenance["producer"]),
         "run": run,
         "model": model,
@@ -275,7 +270,6 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
         payload["physics"] = _selected_identity_fields(
             provenance["physics"],
             fields=(
-                "residual_schema_version",
                 "task_id",
                 "task_contract_digest",
                 "equation_kind",
@@ -374,26 +368,6 @@ def dataset_case_payload_filenames(sample_ids: Sequence[str]) -> tuple[str, ...]
         msg = "Dataset sample IDs map to duplicate case payload names."
         raise ValueError(msg)
     return names
-
-
-_FILE_DIGESTS: dict[str, tuple[tuple[int, int, int], str]] = {}
-
-
-def cached_file_sha256(path: Path | str) -> str:
-    """Return a file's SHA-256 digest, hashing each file identity at most once per process.
-
-    The digest is reused while the path, size, modification time and inode are unchanged.
-    A same-size in-place edit that restores the modification time would evade this; no writer does that.
-    """
-    file = Path(path)
-    status = file.stat()
-    identity = (status.st_size, status.st_mtime_ns, status.st_ino)
-    cached = _FILE_DIGESTS.get(str(file))
-    if cached is not None and cached[0] == identity:
-        return cached[1]
-    digest = common.serialization.file_sha256(file)
-    _FILE_DIGESTS[str(file)] = (identity, digest)
-    return digest
 
 
 def is_optuna_trial_config(config: object) -> bool:
@@ -933,7 +907,6 @@ def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:
     """
     brinkman = domain.physics.brinkman
     return {
-        "residual_schema_version": RESIDUAL_SCHEMA_VERSION,
         "task_id": task.id,
         "task_contract_digest": task.contract_digest,
         "equation_kind": task.physics.kind,
@@ -1019,6 +992,83 @@ def artifact_provenance_path(save_root: str | Path) -> Path:
     return Path(save_root) / ARTIFACT_PROVENANCE_FILENAME
 
 
+def manifest_npz_digests(outputs: Any) -> dict[str, str]:
+    """Return the recorded SHA-256 digest of each NPZ payload, keyed by artifact-relative path."""
+    if not isinstance(outputs, Mapping) or set(outputs) != {"parquet", "npz"} or not isinstance(outputs["npz"], list):
+        msg = "Artifact output manifest has an unsupported schema."
+        raise ValueError(msg)
+    digests: dict[str, str] = {}
+    for entry in outputs["npz"]:
+        path, digest = (entry.get("path"), entry.get("sha256")) if isinstance(entry, Mapping) and set(entry) == {"path", "sha256"} else (None, None)
+        if (
+            not isinstance(path, str)
+            or not isinstance(digest, str)
+            or len(digest) != _SHA256_HEX_LENGTH
+            or any(character not in "0123456789abcdef" for character in digest)
+            or path in digests
+        ):
+            msg = "Artifact output manifest NPZ entry is unsafe."
+            raise ValueError(msg)
+        digests[path] = digest
+    return digests
+
+
+def require_output_structure(save_root: str | Path, outputs: Any) -> None:
+    """Bind the on-disk payload set to the recorded manifest; NPZ digests are verified when a case opens."""
+    root = Path(save_root)
+    recorded_npz = manifest_npz_digests(outputs)
+    msg = "Artifact output manifest does not match the payload files."
+    npz_directory = root / "npz"
+    try:
+        parquet_files = sorted(root.glob("*.parquet"))
+        if (
+            len(parquet_files) != 1
+            or parquet_files[0].is_symlink()
+            or not parquet_files[0].is_file()
+            or npz_directory.is_symlink()
+            or not npz_directory.is_dir()
+        ):
+            raise ValueError(msg)
+        on_disk_npz = sorted(path.relative_to(root).as_posix() for path in npz_directory.glob("*.npz"))
+        parquet_entry = {"path": parquet_files[0].relative_to(root).as_posix(), "sha256": common.serialization.cached_file_sha256(parquet_files[0])}
+        if (
+            outputs["parquet"] != parquet_entry
+            or on_disk_npz != sorted(recorded_npz)
+            or any(not (root / relative).is_file() or (root / relative).is_symlink() for relative in on_disk_npz)
+        ):
+            raise ValueError(msg)
+    except OSError as error:
+        raise ValueError(msg) from error
+
+
+@contextmanager
+def open_verified_case_payload(artifact_root: str | Path, provenance: Mapping[str, Any], path: Path) -> Iterator[BinaryIO]:
+    """Yield a case payload handle whose complete-file digest equals the one recorded in the artifact provenance; parse only from this handle."""
+    root = Path(artifact_root).resolve()
+    unreadable = f"Steady case payload has no recorded digest or is unreadable: {path}"
+    try:
+        recorded = manifest_npz_digests(provenance["outputs"]).get(path.resolve().relative_to(root).as_posix())
+    except (KeyError, OSError, ValueError) as error:
+        msg = f"{unreadable}: {error}"
+        raise ValueError(msg) from error
+    changed = ValueError(f"Steady case payload digest changed: {path}")
+    if recorded is None:
+        raise changed
+    with ExitStack() as stack:
+        try:
+            verified = stack.enter_context(common.serialization.open_verified_file(path, recorded, changed))
+        except OSError as error:
+            msg = f"{unreadable}: {error}"
+            raise ValueError(msg) from error
+        yield verified.stream
+        # The caller has read everything it uses; an in-place rewrite meanwhile would have fed it unverified bytes.
+        try:
+            verified.require_unchanged()
+        except OSError as error:
+            msg = f"Steady case payload changed while it was read: {path}"
+            raise ValueError(msg) from error
+
+
 def artifact_output_manifest(save_root: str | Path) -> dict[str, Any]:
     """
     Build the exact digest manifest for one complete artifact payload.
@@ -1054,7 +1104,7 @@ def artifact_output_manifest(save_root: str | Path) -> dict[str, Any]:
         """Bind one artifact-relative payload path to its complete-file digest."""
         return {
             "path": payload_path.relative_to(root).as_posix(),
-            "sha256": cached_file_sha256(payload_path),
+            "sha256": common.serialization.cached_file_sha256(payload_path),
         }
 
     return {

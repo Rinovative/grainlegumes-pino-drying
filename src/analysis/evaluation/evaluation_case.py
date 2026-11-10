@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
+from src.analysis.artifacts import contracts
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -402,7 +404,10 @@ def _load_case_uncached(frame: pd.DataFrame, row_position: int) -> EvaluationCas
     expected_names = set(_COMMON_ARRAY_NAMES)
     if task_id == "steady_flow":
         expected_names.update(_STEADY_ARRAY_NAMES)
-    with np.load(path, allow_pickle=False) as stored:
+    with (
+        contracts.open_verified_case_payload(str(frame.attrs.get("artifact_root", "")), frame.attrs.get("artifact_provenance") or {}, path) as handle,
+        np.load(handle, allow_pickle=False) as stored,
+    ):
         names = set(stored.files)
         missing = sorted(expected_names.difference(names))
         unexpected = sorted(names.difference(expected_names))

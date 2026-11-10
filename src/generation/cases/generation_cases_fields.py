@@ -700,7 +700,6 @@ def _generate_spatial_fields_once(
         "p_in_bc": pressure,
     }
     metadata: dict[str, Any] = {
-        "generator_version": seeding.GENERATOR_VERSION,
         "simulation_profile": simulation_profile,
         "random_stream": "numpy.default_rng",
         "seeds": dict(seeds),

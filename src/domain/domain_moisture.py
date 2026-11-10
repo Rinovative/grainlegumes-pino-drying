@@ -205,8 +205,13 @@ def oswin_equilibrium_relative_humidity(
     return result
 
 
-def granular_water_content(w_surf: Any, w_int: Any, f_surf: Any) -> np.ndarray:
-    """Return weighted granular water f_surf*w_surf + (1-f_surf)*w_int."""
+def granular_water_content(w_surf: Any, w_int: Any, f_surf: Any, *, require_physical_states: bool = True) -> np.ndarray:
+    """
+    Return weighted granular water f_surf*w_surf + (1-f_surf)*w_int.
+
+    With ``require_physical_states=False`` the same weighting is applied to model output whose
+    water states may be negative or non-finite; ``f_surf`` is checked in both cases.
+    """
     surface = np.asarray(w_surf)
     internal = np.asarray(w_int)
     fraction = np.asarray(f_surf)
@@ -215,15 +220,11 @@ def granular_water_content(w_surf: Any, w_int: Any, f_surf: Any) -> np.ndarray:
     except ValueError as error:
         message = "w_surf, w_int, and f_surf must be broadcast-compatible."
         raise ValueError(message) from error
-    if (
-        not np.isfinite(surface).all()
-        or not np.isfinite(internal).all()
-        or not np.isfinite(fraction).all()
-        or np.any(surface < 0)
-        or np.any(internal < 0)
-        or np.any((fraction <= 0) | (fraction >= 1))
-    ):
-        message = "Water states must be finite and non-negative and f_surf must lie strictly inside (0, 1)."
+    if not np.isfinite(fraction).all() or np.any((fraction <= 0) | (fraction >= 1)):
+        message = "f_surf must be finite and lie strictly inside (0, 1)."
+        raise ValueError(message)
+    if require_physical_states and (not np.isfinite(surface).all() or not np.isfinite(internal).all() or np.any(surface < 0) or np.any(internal < 0)):
+        message = "Water states must be finite and non-negative."
         raise ValueError(message)
     return fraction * surface + (1.0 - fraction) * internal
 

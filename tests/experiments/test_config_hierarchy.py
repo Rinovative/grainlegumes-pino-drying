@@ -26,22 +26,17 @@ if TYPE_CHECKING:
 
 
 def _without_family(config: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy whose layout no longer names the family folder that held the YAML."""
+    """Return a copy whose layout and run name no longer name the family folder and file stem that held the YAML."""
     copied = copy.deepcopy(config)
-    copied["run"]["layout"]["family"] = None
+    copied["run"]["layout"].update({"family": None, "config_name": None})
+    copied["run"]["name"] = None
     return copied
 
 
 def test_family_folder_is_layout_only_and_does_not_change_resolved_semantics(tmp_path: Path) -> None:
     """Resolve identical test-owned requests from two arbitrary family folders."""
     raw = configs.direct_config()
-    label = configs.source_for(raw).name
-    paths = (
-        tmp_path / f"configs/03_learning/steady_flow/experiments/category_a/{label}.yaml",
-        tmp_path / f"configs/03_learning/steady_flow/experiments/renamed_category/{label}.yaml",
-    )
-    for path in paths:
-        configs.write_yaml(path, raw)
+    paths = [configs.write_config(tmp_path, raw, canonical_root=tmp_path, family=family) for family in ("category_a", "renamed_category")]
 
     resolved = [experiments.config.loader.load_and_resolve_config(path) for path in paths]
 
@@ -50,34 +45,44 @@ def test_family_folder_is_layout_only_and_does_not_change_resolved_semantics(tmp
     assert resolved[0]["run"]["name"] == resolved[1]["run"]["name"]
 
 
-_SHARED_SECTIONS = ("optimizer", "scheduler", "training")
+def _authored_path(root: Path, full: dict[str, Any], authored: dict[str, Any]) -> Path:
+    """Return the path of an experiment file that sets ``authored``, named after its leaves as the loader requires."""
+    effective = experiments.config.loader.deep_merge(experiments.config.defaults.get_task_defaults("steady_flow"), full)
+    name = experiments.config.naming.config_name(effective, authored)
+    return root / f"configs/03_learning/steady_flow/experiments/group/{name}.yaml"
 
 
 def _split_request(root: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    """Write the shared sections of one test-owned request as its task base; return full and authored mappings."""
+    """Write all but model and rate as the task base (with a batch size the file overrides); return the request, the file's mapping and path."""
     full = configs.direct_config()
-    shared = {key: full[key] for key in _SHARED_SECTIONS}
-    authored = {key: value for key, value in full.items() if key not in _SHARED_SECTIONS}
+    shared = {key: value for key, value in full.items() if key not in {"task", "model"}}
+    shared["optimizer"] = {key: value for key, value in full["optimizer"].items() if key != "lr"}
+    shared["data"] = {**full["data"], "batch_size": 99}
     configs.write_yaml(root / "configs/03_learning/steady_flow/base.yaml", shared)
-    return full, authored, root / f"configs/03_learning/steady_flow/experiments/group/{configs.source_for(full).name}.yaml"
+    authored = {
+        "task": "steady_flow",
+        "model": full["model"],
+        "optimizer": {"lr": full["optimizer"]["lr"]},
+        "data": {"batch_size": full["data"]["batch_size"]},
+    }
+    return full, authored, _authored_path(root, full, {key: value for key, value in authored.items() if key != "task"})
 
 
 def test_task_base_supplies_shared_values_and_authored_values_override(tmp_path: Path) -> None:
     """Resolve a request split into base and authored file exactly like the combined request."""
     full, authored, path = _split_request(tmp_path)
     configs.write_yaml(path, {**authored, "base": "../../base.yaml"})
-    combined = tmp_path / f"combined/{configs.source_for(full).name}.yaml"
-    configs.write_yaml(combined, full)
+    combined = configs.resolve(copy.deepcopy(full))  # in memory: a YAML holding the whole request would need the name of all its leaves
 
-    assert _without_family(experiments.config.loader.load_and_resolve_config(path)) == _without_family(
-        experiments.config.loader.load_and_resolve_config(combined)
-    )
+    assert _without_family(experiments.config.loader.load_and_resolve_config(path)) == _without_family(combined)
 
     learning_rate = float(full["optimizer"]["lr"]) / 2.0
-    configs.write_yaml(path, {**authored, "base": "../../base.yaml", "optimizer": {"lr": learning_rate}})
-    resolved = experiments.config.loader.load_and_resolve_config(path)
+    halved = {**authored, "optimizer": {"lr": learning_rate}}
+    halved_path = _authored_path(tmp_path, full, {key: value for key, value in halved.items() if key != "task"})
+    configs.write_yaml(halved_path, {**halved, "base": "../../base.yaml"})
+    resolved = experiments.config.loader.load_and_resolve_config(halved_path)
     assert resolved["optimizer"]["lr"] == learning_rate
-    assert resolved["scheduler"] == experiments.config.loader.load_and_resolve_config(combined)["scheduler"]
+    assert resolved["scheduler"] == combined["scheduler"]
 
 
 @pytest.mark.parametrize(

@@ -199,8 +199,6 @@ class ExecutionResources:
     """Validated execution fields from one campaign config."""
 
     partition: str
-    scheduler: str
-    python_module: str
     comsol_module: str
     python_executable: str
     comsol_executable: str
@@ -224,8 +222,6 @@ class ExecutionResources:
         node_jobs = _positive(cluster["node_jobs"], "node_jobs")
         return cls(
             partition=str(site["partition"]),
-            scheduler=str(site["scheduler"]),
-            python_module=str(site["python_module"]),
             comsol_module=str(site["comsol_module"]),
             python_executable=str(site["python_executable"]),
             comsol_executable=str(site["comsol_executable"]),
@@ -546,7 +542,7 @@ class GenerationController:
         return resources
 
     def _validate_site(self, resources: ExecutionResources) -> None:
-        if resources.scheduler != "slurm" or resources.partition not in {"standard", "long"}:
+        if resources.partition not in {"standard", "long"}:
             _fail("Generation requires configured native Slurm CPU execution")
 
     def _storage(self) -> tuple[str, str]:
@@ -640,7 +636,7 @@ class GenerationController:
             if manifest.get("campaign_run_id") != run_id:
                 _fail("Canonical campaign continuation identity changed")
         unsettled_since: float | None = None
-        board = status_service.CampaignBoard(started=self.clock(), seats=resources.parallel_cases, verify_seconds=_FAILURE_SETTLE_SECONDS)
+        board = status_service.CampaignBoard(started=self.clock(), verify_seconds=_FAILURE_SETTLE_SECONDS)
         while manifest.get("state") != "complete":
             state = manifest.get("state")
             if self._cancellation_settling(run_id, state):

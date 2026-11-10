@@ -1,0 +1,27 @@
+# Role: one transient_drying matched A0 -> {B, A1} experiment; states only what differs from base.yaml and the RNO defaults. Edit: freely.
+
+model:
+  kind: rno  # Architecture family; its params below are interpreted by that family.
+  params:
+    n_modes: [24, 24]  # Fourier modes retained along each spatial axis; higher values increase spectral capacity and cost.
+    hidden_channels: 16  # Width of the hidden feature representation.
+    n_layers: 3  # Number of recurrent layers; affects capacity and compute.
+    candidate_activation: tanh  # Recurrent candidate activation; tanh bounds the hidden state (project deviation from neuraloperator's SELU, docs/05_training.md).
+
+optimizer:
+  lr: 3.883614530748613e-4  # Initial learning rate; placeholder until the rno_a0_search study selects it.
+
+training:
+  a0:
+    sampling:
+      mode: trajectory  # RNO trains on whole trajectories cut into consecutive windows in temporal order.
+      rollout_length: 32  # Window length; the hidden state carries across windows while gradients stop at each boundary.
+    curriculum:
+      lengths: [2, 4, 8, 16, 32]  # Self-fed rollout lengths of this stage's curriculum; they must fit the sampling rollout length.
+      milestone_fractions: [0.0, 0.2, 0.4, 0.6, 0.8]  # Fractions of the stage budget at which curriculum lengths advance.
+  b:
+    sampling:
+      mode: trajectory  # RNO trains on whole trajectories cut into consecutive windows in temporal order.
+
+task: transient_drying  # Selects the task contract and its compatible data, model and loss validation.
+base: ../../base.yaml  # Shared task settings; every value set in this file overrides them.

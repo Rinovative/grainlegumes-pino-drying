@@ -370,9 +370,7 @@ class TransientTrainingAdapter:
 
 def _clone_controller(controller: MatchedComputeController) -> MatchedComputeController:
     """Return one independently mutable controller with matching current state."""
-    saved = controller.state_dict()
-    payload = dict(saved)
-    payload.pop("schema_version")
+    payload = dict(controller.state_dict())
     handoff = payload["teacher_handoff"]
     if handoff is not None:
         payload["teacher_handoff"] = TeacherHandoffIdentity.from_mapping(handoff)

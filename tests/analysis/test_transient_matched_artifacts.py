@@ -76,7 +76,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
             "data": {
                 "train_dataset": "dataset",
                 "spatial_stride": 1,
-                "additional_evaluation_datasets": [],
+                "material_ood_datasets": [],
             },
             "input_profile": "profile",
             "temporal": {"temporal_conditioning": "time"},
@@ -94,7 +94,6 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
     monkeypatch.setattr(run_identity.config_loader, "validate_resolved_config", lambda config: config)
     payload: dict[str, Any] = {
         "schema_kind": run_identity.EXPERIMENT_RECORD_SCHEMA_KIND,
-        "schema_version": run_identity.EXPERIMENT_RECORD_SCHEMA_VERSION,
         "task": "transient_drying",
         "parent_label": "matched-parent",
         "layout": configs["b"]["run"]["layout"],
@@ -297,7 +296,6 @@ def _portable_matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         common.serialization.atomic_write_json(
             run / "summary.json",
             {
-                "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
                 "status": "completed",
                 "config_sha256": common.serialization.file_sha256(run / "config.yaml"),
                 "checkpoint_identity": {"resume_contract_digest": artifact.learning.training.checkpoint.resume_contract_digest(config)},

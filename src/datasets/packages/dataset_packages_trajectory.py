@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 TRANSIENT_INDEX_SCHEMA_KIND: Final = "dataset_transient_transition_index"
-TRANSIENT_INDEX_SCHEMA_VERSION: Final = 1
 _SOURCE_PROFILE: Final = generation.contracts.get_profile_contract(
     transient_contract.TRANSIENT_PROFILE_ID,
 )
@@ -507,11 +506,7 @@ def _status_evidence(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         message = f"Transient status sidecar is unreadable: {status_path}."
         raise TransientDataContractError(message) from error
-    if (
-        not isinstance(status, dict)
-        or status.get("schema_kind") != "simulation_case_status"
-        or not common.serialization.is_schema_version(status.get("schema_version"), generation.publication.storage.STATUS_SCHEMA_VERSION)
-    ):
+    if not isinstance(status, dict) or status.get("schema_kind") != "simulation_case_status":
         message = f"Transient status sidecar schema is invalid: {status_path}."
         raise TransientDataContractError(message)
     if (
@@ -813,7 +808,6 @@ def build_transient_index(
             samples.append({"case_index": case_index, **sample})
     payload: dict[str, Any] = {
         "schema_kind": TRANSIENT_INDEX_SCHEMA_KIND,
-        "schema_version": TRANSIENT_INDEX_SCHEMA_VERSION,
         "dataset_name": dataset_name,
         "dataset_id": dataset_id,
         "dataset_view": "transient_drying",
@@ -854,7 +848,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
         raise TransientDataContractError(message) from error
     required = {
         "schema_kind",
-        "schema_version",
         "dataset_name",
         "dataset_id",
         "dataset_view",
@@ -875,7 +868,6 @@ def load_transient_index(path: Path) -> dict[str, Any]:
     horizon = payload["configured_regular_horizon"]
     if (
         payload["schema_kind"] != TRANSIENT_INDEX_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload["schema_version"], TRANSIENT_INDEX_SCHEMA_VERSION)
         or payload["dataset_view"] != "transient_drying"
         or not isinstance(payload["dataset_name"], str)
         or not payload["dataset_name"]

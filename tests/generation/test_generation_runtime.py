@@ -26,7 +26,6 @@ import pytest
 
 from src import common, generation
 from src.generation import generation_campaign_lifecycle as lifecycle
-from src.generation.cli import cli_generation as cli_service
 from src.generation.contracts import generation_contracts_profiles as profile_contract
 from src.generation.contracts import generation_contracts_scalar_handoff as scalar_handoff_contract
 from src.generation.runtime import generation_runtime_batch as runtime_service
@@ -98,7 +97,7 @@ def _natural_batch_name(simulation_profile: str) -> str:
     return generation.cases.config.build_batch_name(
         simulation_profile,
         "lentil",
-        "natural",
+        "test",
     )
 
 
@@ -500,7 +499,7 @@ def test_resolved_batch_science_preserves_campaign_execution_provenance(
     assert scientific_path.name == "resolved_generation_config.json"
     scientific = json.loads(scientific_path.read_text(encoding="utf-8"))
     serialized = json.dumps(scientific, sort_keys=True)
-    assert all(term not in serialized for term in ("max_nodes", "cores_per_case", "partition", "timeout_seconds", "wall_time", "cpu_host"))
+    assert all(term not in serialized for term in ("max_nodes", "cores_per_case", "partition", "timeout_seconds", "wall_time"))
     plan = json.loads(common.paths.resolve_generation_campaign_plan_path(root).read_text(encoding="utf-8"))
     assert plan["execution_values"] == config.execution_values
     assert not (scientific_path.parent / "execution_configs").exists()
@@ -550,9 +549,8 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
     generation_config_factory: Any,
     fake_comsol: Path,
     tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Protect exact runtime injection, local/Slurm order, and CLI parity."""
+    """Protect exact runtime injection and parameter order."""
     config_path, _template = generation_config_factory(
         executable=fake_comsol,
         extra_arguments=("-recover",),
@@ -601,31 +599,9 @@ def test_comsol_commands_use_the_exact_admitted_runtime_scalar_vector(
         "-recover",
     ]
 
-    slurm = comsol_service.build_comsol_command(
-        config,
-        cores_per_case=2,
-        scalar_handoff=admission,
-        scheduler_kind="slurm",
-    )
-    assert slurm == local
     assert local.count("-usebatchlic") == 1
-    assert slurm.count("-usebatchlic") == 1
-    assert "srun" not in slurm
-    assert "--exclusive" not in slurm
-
-    status = cli_service.main(
-        [
-            "print-command",
-            str(config_path),
-            "--only-batch",
-            batch_name,
-            "1",
-            "--cores-per-case",
-            "2",
-        ]
-    )
-    assert status == 0
-    assert shlex.split(capsys.readouterr().out.strip()) == local
+    assert "srun" not in local
+    assert "--exclusive" not in local
 
 
 def test_comsol_builder_owns_fixed_job_and_controlled_stop_output(
@@ -759,6 +735,7 @@ def test_scalar_source_validation_precedes_evidence_and_process_start(
             prepared,
             cores_per_case=1,
             worker_slot=0,
+            scheduler_kind="local",
         )
     assert process_started is False
     assert not (prepared.runtime_directory / "execution_provenance.json").exists()
@@ -865,7 +842,13 @@ def test_solver_provenance_tracks_current_source_while_reusing_older_canonical_i
     reference = generation.cases.input_generation.admit_configured_input_references(config, storage_root=storage, git_commit=input_commit)
     monkeypatch.setenv("GENERATION_GIT_COMMIT", solver_commit)
     outcome = generation.runtime.run_case(
-        config, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work", input_reference=reference[1]
+        config,
+        1,
+        cores_per_case=1,
+        storage_root=storage,
+        work_root=tmp_path / "work",
+        input_reference=reference[1],
+        scheduler_kind="local",
     )
     assert outcome.status == "completed"
     directory = outcome.processed_directory
@@ -911,6 +894,7 @@ def test_preparation_failure_is_recorded_without_a_work_directory(
             cores_per_case=1,
             storage_root=storage,
             work_root=tmp_path / "work",
+            scheduler_kind="local",
         )
 
     assert generation.runtime.case_failure_is_recorded(config, 1, storage_root=storage)
@@ -971,6 +955,7 @@ def test_attempt_history_is_append_only_across_failure_and_success(
                 cores_per_case=1,
                 storage_root=failed_storage,
                 work_root=tmp_path / "new failure work",
+                scheduler_kind="local",
             )
     assert source_path.read_bytes() == source_bytes
     current_attempt = generation.publication.attempt.latest_case_attempt(config, 1, storage_root=failed_storage)
@@ -993,6 +978,7 @@ def test_attempt_history_is_append_only_across_failure_and_success(
         cores_per_case=1,
         storage_root=success_storage,
         work_root=tmp_path / "recovery work",
+        scheduler_kind="local",
     )
     assert outcome.status == "completed"
     assert success_path.read_bytes() == success_bytes
@@ -1031,7 +1017,7 @@ def test_failure_timeout_missing_export_and_case_lock(
 
     monkeypatch.setenv("FAKE_COMSOL_MODE", "failure")
     with pytest.raises(generation.runtime.CaseExecutionError) as failed:
-        generation.runtime.run_case(config, 1, cores_per_case=1, storage_root=storage, work_root=work)
+        generation.runtime.run_case(config, 1, cores_per_case=1, storage_root=storage, work_root=work, scheduler_kind="local")
     assert not failed.value.work_directory.exists()
     failed_attempt = _latest_attempt(config, storage)
     assert failed_attempt.payload["case_state"] == "failed"
@@ -1054,6 +1040,7 @@ def test_failure_timeout_missing_export_and_case_lock(
             cores_per_case=1,
             storage_root=tmp_path / "timeout-storage",
             work_root=tmp_path / "timeout-work",
+            scheduler_kind="local",
         )
     assert not timed_out.value.work_directory.exists()
     assert timed_out.value.runtime_reason == "timed_out"
@@ -1086,6 +1073,7 @@ def test_failure_timeout_missing_export_and_case_lock(
             config,
             1,
             cores_per_case=1,
+            scheduler_kind="local",
             storage_root=tmp_path / "locked",
             work_root=tmp_path / "locked-work",
             blocking_lock=False,
@@ -1124,7 +1112,7 @@ def test_signal_exit_is_unclassified_and_other_statuses_stay_solver_error(
     monkeypatch.setenv("FAKE_COMSOL_MODE", mode)
 
     with pytest.raises(generation.runtime.CaseExecutionError) as failed:
-        generation.runtime.run_case(config, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work")
+        generation.runtime.run_case(config, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work", scheduler_kind="local")
 
     assert failed.value.exit_code == expected_status
     assert failed.value.runtime_reason == expected_reason
@@ -1155,6 +1143,7 @@ def test_transient_case_publishes_structural_solver_timing(
         cores_per_case=8,
         storage_root=storage,
         work_root=tmp_path / "transient timing work",
+        scheduler_kind="local",
     )
 
     assert outcome.status == "completed"
@@ -1196,6 +1185,7 @@ def test_successful_transient_case_keeps_missing_timing_nonfatal(
         cores_per_case=1,
         storage_root=storage,
         work_root=tmp_path / "missing transient timing work",
+        scheduler_kind="local",
     )
 
     assert outcome.status == "completed"
@@ -1233,6 +1223,7 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         cores_per_case=16,
         storage_root=storage,
         work_root=tmp_path / "no-save work",
+        scheduler_kind="local",
     )
 
     assert outcome.status == "completed"
@@ -1390,6 +1381,7 @@ def test_suffixed_solver_output_is_published_canonically_before_cleanup(
         cores_per_case=1,
         storage_root=storage,
         work_root=tmp_path / "work with spaces",
+        scheduler_kind="local",
     )
 
     assert outcome.status == "completed"
@@ -1450,6 +1442,7 @@ def test_solver_rejects_unchanged_stale_and_ambiguous_solved_outputs(
                 prepared,
                 cores_per_case=1,
                 worker_slot=worker_slot,
+                scheduler_kind="local",
             )
         assert caught.value.exit_code == 0
         assert caught.value.missing_or_invalid_artifacts == artifacts
@@ -1503,6 +1496,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
                 config,
                 case_index,
                 cores_per_case=1,
+                scheduler_kind="local",
                 storage_root=storage,
                 work_root=work,
             )
@@ -1589,6 +1583,7 @@ def test_publication_failure_records_evidence_before_scratch_cleanup(
             cores_per_case=1,
             storage_root=storage,
             work_root=tmp_path / "publication failure work",
+            scheduler_kind="local",
         )
     assert observed == {
         "publication_called": True,
@@ -1641,6 +1636,7 @@ def test_runtime_cancellation_terminates_solver_and_persists_cancelled_case(
                 config,
                 1,
                 cores_per_case=1,
+                scheduler_kind="local",
                 storage_root=storage,
                 work_root=tmp_path / "cancelled work",
             )

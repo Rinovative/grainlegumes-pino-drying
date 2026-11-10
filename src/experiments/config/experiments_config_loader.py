@@ -62,21 +62,24 @@ class ConfigError(ValueError):
     """
 
 
+# The one section order of every written config: the user's choices first, ``evaluation`` last (a saved run config lists
+# ``task_contract`` just before it), any other key between; see ``ordered_sections``.
 CANONICAL_EXPERIMENT_SECTION_ORDER = (
     "task",
-    "run",
-    "data",
-    "input_profile",
-    "temporal",
-    "scaling",
     "model",
+    "data",
     "loss",
-    "evaluation",
     "optimizer",
     "scheduler",
     "training",
+    "run",
     "tracking",
+    "input_profile",
+    "temporal",
+    "scaling",
+    "evaluation",
 )
+_LAST_SECTIONS = ("task_contract", "evaluation")
 _ROOT_KEYS = frozenset(CANONICAL_EXPERIMENT_SECTION_ORDER)
 EXPERIMENT_ROOT_KEYS = _ROOT_KEYS
 # An authored experiment may name its task's shared base; the base owns values every maintained file shares.
@@ -98,8 +101,10 @@ _TASK_FIXED_KEYS = frozenset(
 _PRODUCER_KEY = "producer"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ADAM_BETA_COUNT = 2
-_STEADY_DATA_KEYS = frozenset({"train_dataset", "additional_evaluation_datasets", "batch_size", "num_workers", "pin_memory", "persistent_workers"})
-_REQUIRED_TRAINING_KEYS = ("epochs", "evaluation_interval", "additional_evaluation_interval")
+_STEADY_DATA_KEYS = frozenset(
+    {"train_dataset", "material_ood_datasets", "train_subset", "batch_size", "num_workers", "pin_memory", "persistent_workers"}
+)
+_REQUIRED_TRAINING_KEYS = ("epochs", "evaluation_interval", "ood_evaluation_interval")
 _REQUIRED_SCHEDULER_KEYS = frozenset({"factor", "patience", "min_lr"})
 _PHYSICS_WEIGHT_NAMES = ("momentum_weight", "continuity_weight", "boundary_weight")
 _RESOLVED_PATH_KEYS = frozenset(
@@ -111,11 +116,12 @@ _RESOLVED_PATH_KEYS = frozenset(
     }
 )
 _SECTION_KEYS = {
-    "run": frozenset({"seed", "revision", "deterministic", "device", "name", "naming_schema_version", "layout"}),
+    "run": frozenset({"seed", "revision", "deterministic", "device", "name", "layout"}),
     "data": frozenset(
         {
             "train_dataset",
-            "additional_evaluation_datasets",
+            "material_ood_datasets",
+            "train_subset",
             "batch_size",
             "num_workers",
             "pin_memory",
@@ -133,7 +139,7 @@ _SECTION_KEYS = {
             "epochs",
             "stage_schedule",
             "evaluation_interval",
-            "additional_evaluation_interval",
+            "ood_evaluation_interval",
             "stage",
             "comparison_arm",
             "gradient_accumulation_steps",
@@ -208,7 +214,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         _reject_unknown(section_mapping, allowed, path=section)
 
     raw_run = _as_mapping(user_config.get("run"), path="run")
-    derived_run_keys = sorted({"name", "naming_schema_version", "layout"}.intersection(raw_run))
+    derived_run_keys = sorted({"name", "layout"}.intersection(raw_run))
     if derived_run_keys:
         msg = f"Derived run key(s) must not be supplied by an executable request: {derived_run_keys}."
         raise ConfigError(msg)
@@ -278,7 +284,6 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                         "study",
                         "monitor",
                         "upload",
-                        "metric_schema_version",
                     }
                 ),
                 path="tracking.wandb",
@@ -383,13 +388,25 @@ def save_yaml(config: dict[str, Any], path: Path | str) -> None:
     Notes
     -----
     Serialization is assembled in memory and published through atomic text
-    replacement. Callers never observe a partially written config.
+    replacement. Callers never observe a partially written config. The file
+    lists the user's choices first and the contract-derived blocks last. Every
+    semantic digest sorts keys and is unaffected, but the byte digest
+    ``config_sha256`` of a new run's file differs from one in the earlier order;
+    existing files are never rewritten.
 
     """
     destination = Path(path)
     stream = StringIO()
-    yaml.dump(config, stream, default_flow_style=False, sort_keys=False)
+    yaml.dump(ordered_sections(config), stream, default_flow_style=False, sort_keys=False)
     common.serialization.atomic_write_text(destination, stream.getvalue())
+
+
+def ordered_sections(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``config`` with its top-level keys in the canonical written order; no key is dropped or changed."""
+    first = [key for key in CANONICAL_EXPERIMENT_SECTION_ORDER if key in config and key not in _LAST_SECTIONS]
+    last = [key for key in _LAST_SECTIONS if key in config]
+    middle = [key for key in config if key not in first and key not in last]
+    return {key: config[key] for key in (*first, *middle, *last)}
 
 
 def apply_authored_base(mapping: Mapping[str, Any], *, origin: Path | str) -> dict[str, Any]:
@@ -741,7 +758,7 @@ def get_resolved_objective(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _configured_dataset_list(data: Mapping[str, Any], *, path: str, key: str, allow_empty: bool = False) -> tuple[str, ...]:
     """Return distinct configured Dataset IDs for one task-owned selection key."""
-    value = data.get(key, [] if allow_empty else None)
+    value = data.get(key)
     if not isinstance(value, list) or (not value and not allow_empty):
         msg = f"{path}.{key} must contain one or more logical dataset ids."
         raise ConfigError(msg)
@@ -762,7 +779,7 @@ def _resolve_dataset_selections(config: dict[str, Any], *, authored_data: Mappin
         data["train_dataset"] = common.paths.validate_logical_name(authored_data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    key = "additional_evaluation_datasets"
+    key = "material_ood_datasets"
     data[key] = list(_configured_dataset_list(authored_data, path="data", key=key, allow_empty=True))
     config["data"] = data
 
@@ -816,20 +833,10 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
                 "tags",
                 "monitor",
                 "upload",
-                "metric_schema_version",
             }
         ),
         path="tracking.wandb",
     )
-    metric_schema_version = wandb.get("metric_schema_version")
-    if metric_schema_version is None:
-        if require_derived:
-            msg = "Current resolved configs must persist tracking.wandb.metric_schema_version."
-            raise ConfigError(msg)
-        wandb["metric_schema_version"] = config_defaults.WANDB_METRIC_SCHEMA_VERSION
-    elif not common.serialization.is_schema_version(metric_schema_version, config_defaults.WANDB_METRIC_SCHEMA_VERSION):
-        msg = "tracking.wandb.metric_schema_version is unsupported."
-        raise ConfigError(msg)
 
     mode = wandb.get("mode")
     if mode not in {"online", "offline", "disabled"}:
@@ -868,16 +875,23 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
 
 
 def _validate_current_run_identity_schema(run: Mapping[str, Any]) -> None:
-    """Validate the persisted run-naming schema and its required identity evidence."""
-    if not common.serialization.is_schema_version(run.get("naming_schema_version"), RUN_NAMING_SCHEMA_VERSION):
-        msg = "run.naming_schema_version is unsupported."
-        raise ConfigError(msg)
-
+    """Validate the persisted run identity evidence."""
     if type(run.get("seed")) is not int or run["seed"] < 0:
         msg = "run.seed must be a non-negative integer."
         raise ConfigError(msg)
     if type(run.get("deterministic")) is not bool:
         msg = "run.deterministic must be boolean."
+        raise ConfigError(msg)
+
+
+def _validate_train_subset(data: Mapping[str, Any]) -> None:
+    """Require ``data.train_subset``: null (every Train case) or a power of two N (the first N Train cases per ID material)."""
+    if "train_subset" not in data:
+        msg = "data.train_subset is required (null or a power of two); the task's base config owns it."
+        raise ConfigError(msg)
+    subset = data["train_subset"]
+    if subset is not None and (isinstance(subset, bool) or not isinstance(subset, int) or subset < 1 or subset & (subset - 1)):
+        msg = f"data.train_subset must be null or a power of two >= 1 (1, 2, 4, ...), got {subset!r}."
         raise ConfigError(msg)
 
 
@@ -919,7 +933,7 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
     if missing_training:
         msg = f"training must state {', '.join(f'training.{key}' for key in missing_training)}; the task's base config owns these values."
         raise ConfigError(msg)
-    for key in ("epochs", "evaluation_interval", "additional_evaluation_interval"):
+    for key in ("epochs", "evaluation_interval", "ood_evaluation_interval"):
         if int(training[key]) <= 0:
             msg = f"training.{key} must be positive."
             raise ConfigError(msg)
@@ -942,7 +956,8 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
         common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
     except ValueError as error:
         raise ConfigError(str(error)) from error
-    _configured_dataset_list(data, path="data", key="additional_evaluation_datasets", allow_empty=True)
+    _configured_dataset_list(data, path="data", key="material_ood_datasets", allow_empty=True)
+    _validate_train_subset(data)
     if config.get("task") == "steady_flow" and set(data) != _STEADY_DATA_KEYS:
         msg = f"Steady data keys must be exactly {sorted(_STEADY_DATA_KEYS)}; membership comes from the Dataset partition."
         raise ConfigError(msg)
@@ -968,7 +983,6 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
             raise ConfigError(str(error)) from error
 
 
-RUN_NAMING_SCHEMA_VERSION = 1
 # One refusal for the matched-only training flags, whichever workflow or plan received them.
 MATCHED_TRAINING_FLAGS_MESSAGE = "--rollout-length, --train-seconds and --lr-scale require a transient matched_a1_b plan."
 _EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
@@ -1040,6 +1054,13 @@ def allocation_digest(config: Mapping[str, Any], *, stage: str | None = None) ->
     return common.serialization.canonical_json_sha256(payload)
 
 
+def layout_dataset(config: Mapping[str, Any]) -> str:
+    """Return the run layout's Dataset directory: ``data.train_dataset``, plus ``__train-<N>`` for a ``data.train_subset`` N."""
+    data = config["data"]
+    subset = data["train_subset"]
+    return str(data["train_dataset"]) if subset is None else f"{data['train_dataset']}__train-{subset}"
+
+
 def _derive_layout(
     config: Mapping[str, Any],
     source: config_naming.ConfigSource,
@@ -1059,7 +1080,7 @@ def _derive_layout(
         trial = config_naming.trial_leaf(0, resolved, {})
     run["layout"] = {
         "task": resolved["task"],
-        "dataset": resolved["data"]["train_dataset"],
+        "dataset": layout_dataset(resolved),
         "family": source.family,
         "config_name": source.name,
         "model_label": config_naming.model_label(resolved),
@@ -1075,6 +1096,10 @@ def _derive_layout(
     if a0_id is None:
         run["layout"]["a0_id"] = allocation_digest(resolved)[:16]
     run["name"] = config_naming.run_name(run["layout"])
+    try:
+        common.paths.validate_logical_name(run["name"], label="run.name")  # every layout finalisation, including a matched stage's pair key and stage
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     return resolved
 
 
@@ -1125,7 +1150,7 @@ def _validate_run_layout(config: Mapping[str, Any], *, verify_identity: bool) ->
     common.paths.resolve_config_run_dir(config)
     if (
         layout["task"] != config["task"]
-        or layout["dataset"] != config["data"]["train_dataset"]
+        or layout["dataset"] != layout_dataset(config)
         or layout["seed"] != run["seed"]
         or layout["revision"] != run.get("revision")
         or layout["budget_epochs"] != layout_budget_epochs(config, family=layout["family"])
@@ -1257,7 +1282,8 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         _raise_config_error("data.spatial_stride is required for transient configs; the task's base config owns it.")
     required_data = {
         "train_dataset",
-        "additional_evaluation_datasets",
+        "material_ood_datasets",
+        "train_subset",
         "batch_size",
         "num_workers",
         "pin_memory",
@@ -1265,7 +1291,8 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         "spatial_stride",
     }
     if set(data) != required_data:
-        _raise_config_error("Transient data keys do not match the loader contract.")
+        missing = sorted(f"data.{key}" for key in required_data - set(data))
+        _raise_config_error(f"Transient data keys do not match the loader contract; missing {missing}, unknown {sorted(set(data) - required_data)}.")
     try:
         data["spatial_stride"] = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
     except (TypeError, ValueError) as error:
@@ -1277,7 +1304,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         "epochs",
         "stage_schedule",
         "evaluation_interval",
-        "additional_evaluation_interval",
+        "ood_evaluation_interval",
         "stage",
         "comparison_arm",
         "gradient_accumulation_steps",
@@ -1480,13 +1507,29 @@ def apply_training_overrides(
     return apply_epoch_budget(requested, epochs)
 
 
+def _require_stated_paths(user_config: Mapping[str, Any], task_id: str) -> None:
+    """Reject a config chain that omits a path the task's base owns without code default; ``scheduler: null`` trains without a scheduler."""
+    missing = []
+    for path in config_defaults.REQUIRED_PATHS[task_id]:
+        if path.startswith("scheduler.") and "scheduler" in user_config and user_config["scheduler"] is None:
+            continue
+        node: Any = user_config
+        for token in path.split("."):
+            if not isinstance(node, Mapping) or token not in node:
+                missing.append(path)
+                break
+            node = node[token]
+    if missing:
+        msg = f"Config must state {', '.join(missing)}; the task's base config owns these values and the code holds no default."
+        raise ConfigError(msg)
+
+
 def resolve_config(
     user_config: dict[str, Any],
     *,
     source: config_naming.ConfigSource,
     storage_root: Path | str | None = None,
     output_root: Path | str | None = None,
-    naming_schema_version: int = RUN_NAMING_SCHEMA_VERSION,
 ) -> dict[str, Any]:
     """
     Strictly resolve one semantic experiment configuration.
@@ -1497,13 +1540,11 @@ def resolve_config(
         Raw semantic experiment mapping.
     source : config_naming.ConfigSource
         Task, family and name of the YAML the mapping came from. The task must equal
-        the config task, and an experiment family's name must extend the model label.
+        the config task, and an experiment family's name must be the name its settings derive.
     storage_root : Path or str or None, optional
         Explicit Dataset-reference and resolved-path root for controlled callers.
     output_root : Path or str or None, optional
         Override the experiments root that run destinations descend from.
-    naming_schema_version : int, optional
-        Sole current derived run-label schema.
 
     Returns
     -------
@@ -1549,15 +1590,10 @@ def resolve_config(
     if missing_dataset_ids:
         msg = f"Experiment data must explicitly select Dataset identities; missing={missing_dataset_ids}."
         raise ConfigError(msg)
-    if not common.serialization.is_schema_version(naming_schema_version, RUN_NAMING_SCHEMA_VERSION):
-        msg = f"Unsupported requested run naming schema version: {naming_schema_version!r}."
-        raise ConfigError(msg)
+    _require_stated_paths(user_config, task_id)
 
     effective = deep_merge(config_defaults.get_task_defaults(task_id), user_config)
     effective["task"] = task_id
-    run = _as_mapping(effective["run"], path="run")
-    run["naming_schema_version"] = naming_schema_version
-    effective["run"] = run
     _resolve_dataset_selections(
         effective,
         authored_data=authored_data,
@@ -1598,22 +1634,6 @@ def resolve_config(
     model["params"] = params
     effective["model"] = model
 
-    optimizer = _as_mapping(effective["optimizer"], path="optimizer")
-    optimizer_kind = str(optimizer.get("kind"))
-    if optimizer_kind not in config_defaults.OPTIMIZER_DEFAULTS:
-        msg = f"Unknown optimizer identifier {optimizer_kind!r}. Available optimizers: {sorted(config_defaults.OPTIMIZER_DEFAULTS)}."
-        raise ConfigError(msg)
-    effective["optimizer"] = deep_merge(config_defaults.OPTIMIZER_DEFAULTS[optimizer_kind], optimizer)
-
-    scheduler = effective.get("scheduler")
-    if scheduler is not None:
-        scheduler_mapping = _as_mapping(scheduler, path="scheduler")
-        scheduler_kind = str(scheduler_mapping.get("kind"))
-        if scheduler_kind not in config_defaults.SCHEDULER_DEFAULTS:
-            msg = f"Unknown scheduler identifier {scheduler_kind!r}. Available schedulers: {sorted(config_defaults.SCHEDULER_DEFAULTS)}."
-            raise ConfigError(msg)
-        effective["scheduler"] = deep_merge(config_defaults.SCHEDULER_DEFAULTS[scheduler_kind], scheduler_mapping)
-
     if is_transient:
         _validate_transient_loss(effective)
     else:
@@ -1635,14 +1655,7 @@ def resolve_config(
         "model_sha256": learning.training.checkpoint.model_implementation_digest(task_id),
     }
     config_naming.validate_config_name(source, effective)
-    effective = _derive_layout(effective, source, a0_id=None, branch_id=None, stage=None, pair=None, trial=None)
-    run = effective["run"]
-    try:
-        common.paths.validate_logical_name(run["name"], label="run.name")
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-    effective["run"] = run
-    return effective
+    return _derive_layout(effective, source, a0_id=None, branch_id=None, stage=None, pair=None, trial=None)
 
 
 def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.spec.TaskSpec:
@@ -1677,12 +1690,6 @@ def validate_resolved_task_contract(config: Mapping[str, Any]) -> domain.tasks.s
         msg = "Resolved config must contain the current task_contract."
         raise ConfigError(msg)
     expected_contract = task.resolved_contract()
-    if not common.serialization.is_schema_version(contract.get("schema_version"), domain.tasks.spec.TASK_SCHEMA_VERSION):
-        msg = (
-            f"Resolved task contract does not exactly match registered task {task_id!r}: "
-            f"schema_version must be integer {domain.tasks.spec.TASK_SCHEMA_VERSION}."
-        )
-        raise ConfigError(msg)
     if dict(contract) != expected_contract:
         msg = f"Resolved task contract does not exactly match registered task {task_id!r}."
         raise ConfigError(msg)
@@ -1752,6 +1759,7 @@ def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identi
         raise ConfigError(msg)
 
     task = validate_resolved_task_contract(effective)
+    _require_stated_paths(effective, task.id)
     is_transient = task.id == "transient_drying"
     if is_transient:
         _validate_transient_extensions(effective)
@@ -1909,7 +1917,8 @@ def create_dataloaders_from_config(
         )
         loaders = datasets.runtime.transient_training.create_transient_training_loaders(
             train_dataset_id=data_cfg["train_dataset"],
-            additional_evaluation_dataset_ids=data_cfg["additional_evaluation_datasets"],
+            material_ood_dataset_ids=data_cfg["material_ood_datasets"],
+            train_subset=data_cfg["train_subset"],
             tensorizer=tensorizer,
             train_sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
             loader_settings=settings,
@@ -1927,7 +1936,8 @@ def create_dataloaders_from_config(
         return {
             "train": loaders.train,
             "eval": loaders.evaluation,
-            "additional_evaluation": loaders.additional_evaluation,
+            "material_ood": loaders.material_ood,
+            "parameter_ood": loaders.parameter_ood,
             "id_test": loaders.id_test,
             "data_processor": loaders.data_processor,
             "scaling_artifact": loaders.scaling_artifact,
@@ -1937,7 +1947,8 @@ def create_dataloaders_from_config(
         }
     train_loader, evaluation_loaders, normalizer, split_indices, envelope = datasets.runtime.training.create_dataloaders(
         train_dataset_id=common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset"),
-        additional_evaluation_dataset_ids=tuple(data_cfg["additional_evaluation_datasets"]),
+        material_ood_dataset_ids=tuple(data_cfg["material_ood_datasets"]),
+        train_subset=data_cfg["train_subset"],
         task=task,
         model_sha256=model_sha256,
         storage_root=common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]),
@@ -1956,7 +1967,8 @@ def create_dataloaders_from_config(
         "train": train_loader,
         "eval": evaluation_loaders["eval"],
         "id_test": evaluation_loaders["id_test"],
-        "additional_evaluation": evaluation_loaders["additional_evaluation"],
+        "material_ood": evaluation_loaders["material_ood"],
+        "parameter_ood": evaluation_loaders["parameter_ood"],
         "data_processor": normalizer,
         "scaling_artifact": envelope,
         "split_indices": split_indices,

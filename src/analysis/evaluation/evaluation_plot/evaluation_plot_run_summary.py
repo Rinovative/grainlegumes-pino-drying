@@ -429,7 +429,7 @@ def _add_data_configuration(
             data,
             (
                 ("train_dataset", "Data · Training dataset"),
-                ("additional_evaluation_datasets", "Data · Additional evaluation datasets"),
+                ("material_ood_datasets", "Data · Material-OOD datasets"),
                 ("batch_size", "Data · Batch size"),
             ),
         )

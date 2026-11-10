@@ -38,8 +38,6 @@ if TYPE_CHECKING:
 
 _MATERIAL_FAMILY_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
 _MATERIAL_CONFIG_PARTS: Final = ("configs", "01_generation", "physical_model", "materials")
-_MATERIAL_SCHEMA_VERSION: Final = 1
-_PARAMETER_REGISTRY_SCHEMA_VERSION: Final = 1
 POROSITY_GENERATOR_PARAMETERS: Final = (
     "porosity.smooth_len_rel",
     "porosity.texture_amp",
@@ -48,6 +46,8 @@ INITIAL_MOISTURE_LEVEL_PARAMETERS: Final = (
     "initial_moisture.mean_db",
     "initial_moisture.amplitude_db",
 )
+# Common kinetics stress design: each complete OOD record is (r_surf_0 factor, r_int_surf factor, f_surf shift) applied to the nominals.
+_KINETICS_OOD_DESIGN: Final = MappingProxyType({"slow_internal_limited": (0.25, 0.5, -0.15), "fast_surface_exposed": (3.5, 1.5, 0.15)})
 
 
 _REGISTRY_METADATA_KEYS: Final = frozenset({"report_symbol", "description"})
@@ -98,9 +98,7 @@ def available_material_families() -> tuple[str, ...]:
             message = f"Generation material configuration must be a mapping: {path}."
             raise TypeError(message)
         family = validate_material_family(payload.get("material_family"))
-        if payload.get("schema_kind") != "generation_material" or not common.serialization.is_schema_version(
-            payload.get("schema_version"), _MATERIAL_SCHEMA_VERSION
-        ):
+        if payload.get("schema_kind") != "generation_material":
             message = f"Unsupported generation material schema: {path}."
             raise ValueError(message)
         if family != path.stem:
@@ -284,12 +282,10 @@ def validate_semantic_registry(
     config = _mapping(value, label="generation parameter registry")
     _exact_keys(
         config,
-        {"schema_kind", "schema_version", "parameters"},
+        {"schema_kind", "parameters"},
         label="generation parameter registry",
     )
-    if config["schema_kind"] != "generation_parameter_registry" or not common.serialization.is_schema_version(
-        config["schema_version"], _PARAMETER_REGISTRY_SCHEMA_VERSION
-    ):
+    if config["schema_kind"] != "generation_parameter_registry":
         message = "Unsupported generation parameter-registry schema."
         raise ValueError(message)
     raw = _mapping(config["parameters"], label="generation parameter registry.parameters")
@@ -608,13 +604,13 @@ def _validate_kinetics_record(
     sources: Mapping[str, Mapping[str, Any]],
     label: str,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, Any]]:
-    """Validate natural component supports and complete kinetics OOD records."""
+    """Validate natural component supports and derive the two complete kinetics OOD records from the nominals."""
     kinetics = resolve_value_record(value, sources=sources, label=label)
     if "ood_provenance" not in kinetics:
         message = f"{label}.ood_provenance is required."
         raise ValueError(message)
     kinetics["ood_provenance"] = _resolve_synthetic_ood_provenance(kinetics["ood_provenance"], sources=sources, label=f"{label}.ood_provenance")
-    _exact_keys(kinetics, {"record_id", "components", "ood_records", "selection_rule", "provenance", "ood_provenance"}, label=label)
+    _exact_keys(kinetics, {"record_id", "components", "selection_rule", "provenance", "ood_provenance"}, label=label)
     if kinetics["selection_rule"] != "complete_record_atomic":
         message = f"{label}.selection_rule must be complete_record_atomic."
         raise ValueError(message)
@@ -644,40 +640,15 @@ def _validate_kinetics_record(
             "distribution": f"uniform_in_{component['transform']}_transform_space",
             "provenance": copy.deepcopy(kinetics["provenance"]),
         }
-    raw_records = kinetics["ood_records"]
-    if not isinstance(raw_records, list):
-        message = f"{label}.ood_records must be a list."
-        raise TypeError(message)
     records: list[dict[str, Any]] = []
-    expected_ids = ("slow_internal_limited", "fast_surface_exposed")
-    if len(raw_records) != len(expected_ids):
-        message = f"{label}.ood_records must contain exactly {list(expected_ids)}."
-        raise ValueError(message)
-    identities: set[str] = set()
-    for index, raw in enumerate(raw_records):
-        item_label = f"{label}.ood_records[{index}]"
-        item = _mapping(raw, label=item_label)
-        _exact_keys(item, {"record_id", *expected}, label=item_label)
-        identity = item.pop("record_id")
-        if identity != expected_ids[index]:
-            message = f"{item_label}.record_id must be {expected_ids[index]!r}."
-            raise ValueError(message)
-        if not isinstance(identity, str) or not identity or identity in identities:
-            message = f"{item_label}.record_id must be unique non-empty text."
-            raise ValueError(message)
-        identities.add(identity)
-        values = {name: _finite(item[name], label=f"{item_label}.{name}") for name in expected}
-        if normalized_components["r_surf_0"]["support"]["lower"] <= values["r_surf_0"] <= normalized_components["r_surf_0"]["support"]["upper"]:
-            message = f"{item_label}.r_surf_0 must be disjoint from its natural support."
-            raise ValueError(message)
-        multipliers = (0.25, 0.5, -0.15) if index == 0 else (3.5, 1.5, 0.15)
-        expected_values = {
-            "r_surf_0": multipliers[0] * normalized_components["r_surf_0"]["nominal"],
-            "r_int_surf": multipliers[1] * normalized_components["r_int_surf"]["nominal"],
-            "f_surf": normalized_components["f_surf"]["nominal"] + multipliers[2],
+    for identity, (rate_factor, ratio_factor, fraction_shift) in _KINETICS_OOD_DESIGN.items():
+        values = {
+            "r_surf_0": rate_factor * normalized_components["r_surf_0"]["nominal"],
+            "r_int_surf": ratio_factor * normalized_components["r_int_surf"]["nominal"],
+            "f_surf": normalized_components["f_surf"]["nominal"] + fraction_shift,
         }
-        if any(not math.isclose(values[name], expected_values[name], rel_tol=0.0, abs_tol=1e-14) for name in expected):
-            message = f"{item_label} violates the required common kinetics OOD design equation."
+        if normalized_components["r_surf_0"]["support"]["lower"] <= values["r_surf_0"] <= normalized_components["r_surf_0"]["support"]["upper"]:
+            message = f"{label} OOD record {identity!r}: r_surf_0 must be disjoint from its natural support."
             raise ValueError(message)
         records.append({"id": identity, "values": values, "metadata": {}})
     kinetics["components"] = normalized_components
@@ -982,7 +953,6 @@ def resolve_material_definition(
     material = _mapping(material_config, label="material configuration")
     expected = {
         "schema_kind",
-        "schema_version",
         "material_family",
         "material_scope",
         "permeability",
@@ -996,9 +966,7 @@ def resolve_material_definition(
     }
     _exact_keys(material, expected, label="material configuration")
     family = validate_material_family(material["material_family"])
-    if material["schema_kind"] != "generation_material" or not common.serialization.is_schema_version(
-        material["schema_version"], _MATERIAL_SCHEMA_VERSION
-    ):
+    if material["schema_kind"] != "generation_material":
         message = "Unsupported role-neutral material configuration schema."
         raise ValueError(message)
     scope = _validate_material_scope(material["material_scope"], label=f"material {family}.material_scope")

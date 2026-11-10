@@ -6,7 +6,9 @@ Responsibilities:
   - Evaluate the pointwise divergence variants removed from the loss
   - Reduce residuals per case over interior crops, boundary bands, and edge profiles
   - Compare finite-difference and spectral derivatives of the same reference fields
+  - Measure each backend against exact derivatives of manufactured non-periodic fields
   - Measure term sensitivity to controlled smooth, noisy, scaling, and offset errors
+  - Join the momentum floor and its sensitivity per crop candidate
   - Inventory the physics-loss settings of the maintained steady configurations
   - Condense per-case tables into case-statistic overviews
 
@@ -19,7 +21,7 @@ Design principles:
 This module does NOT:
   - Change loss equations, weights, crops, or derivative defaults
   - Load Datasets, render figures, or persist results
-  - Decide whether a variant matches COMSOL; it reports magnitudes only
+  - Decide whether a variant matches COMSOL or which crop to train with; it reports magnitudes only
 
 Notes:
   Momentum terms, each divided by G = dp / L_y:
@@ -39,7 +41,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
@@ -47,16 +48,21 @@ import pandas as pd
 import torch
 from torch import Tensor
 
-from src import common, domain, experiments
+from src import domain
+
+from . import component_checks_sources as sources
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
+    from pathlib import Path
 
-    from .physics_diagnostics_sources import SteadyReference
+    from .component_checks_sources import SteadyReference
 
 PerturbationKind = Literal["smooth", "noise", "velocity_scale", "pressure_offset"]
 
+_STEADY_TASK_ID: Final = "steady_flow"
 DEFAULT_CROPS: Final = (0, 1, 2, 4, 8)
+CROP_CANDIDATES: Final = (0, 1, 2)
 BAND_EDGES: Final = (0, 1, 2, 3, 5, 9, 17)
 BAND_LABELS: Final = ("0", "1", "2", "3-4", "5-8", "9-16", ">=17")
 EDGES: Final = ("inlet", "outlet", "wall_x_min", "wall_x_max")
@@ -213,6 +219,23 @@ DEFAULT_PERTURBATIONS: Final = (
     Perturbation("velocity_scale", (), 0.01),
     Perturbation("pressure_offset", (), 0.01),
 )
+# The crop prior compares crops by their momentum response to this error.
+CROP_PERTURBATION: Final = DEFAULT_PERTURBATIONS[1]
+CROP_SETTINGS: Final = tuple((backend.label, crop) for backend in DERIVATIVE_BACKENDS for crop in CROP_CANDIDATES)
+
+
+def _unit(coordinate: Tensor) -> Tensor:
+    """Map one coordinate grid linearly onto [0, 1]; the endpoints are constants, not differentiated."""
+    low, high = coordinate.min().detach(), coordinate.max().detach()
+    return (coordinate - low) / (high - low)
+
+
+# Smooth non-periodic fields of the unit coordinates; exact derivatives come from autograd.
+MANUFACTURED_FIELDS: Final[dict[str, Callable[[Tensor, Tensor], Tensor]]] = {
+    "polynomial_exponential": lambda x, y: (_unit(x) ** 3 - 0.5 * _unit(x) + 0.2) * torch.exp(0.8 * _unit(y)),
+    "noninteger_sine": lambda x, y: torch.sin(2.0 * math.pi * 1.37 * _unit(x) + 0.3) * torch.cos(2.0 * math.pi * 0.73 * _unit(y) + 0.1),
+    "mixed": lambda x, y: torch.exp(-1.5 * _unit(x)) * (_unit(y) ** 2 + 0.2) + 0.3 * torch.sin(3.3 * _unit(x) * _unit(y)),
+}
 
 
 def backend_by_label(label: str) -> DerivativeBackend:
@@ -627,6 +650,122 @@ def compare_derivatives(
     return pd.DataFrame(rows)
 
 
+def manufactured_derivative_errors(extent: tuple[float, float, float, float], shape: tuple[int, int]) -> pd.DataFrame:
+    """
+    Measure each backend in float32 and float64 against exact derivatives of smooth non-periodic fields.
+
+    Parameters
+    ----------
+    extent : tuple[float, float, float, float]
+        Physical ``(x_min, x_max, y_min, y_max)`` in m, e.g. of a reference case.
+    shape : tuple[int, int]
+        Grid ``(y, x)`` point counts.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Rows with ``field``, ``backend``, ``dtype``, ``direction``, ``band``,
+        ``points`` and ``relative_error``: the band RMS of the derivative
+        error divided by the full-grid RMS of the exact derivative.
+
+    Notes
+    -----
+    The fields of :data:`MANUFACTURED_FIELDS` are evaluated on an exact float64
+    grid; their exact derivatives come from autograd in float64. Unlike the
+    reference residual, these errors tell which backend is accurate.
+
+    """
+    x_min, x_max, y_min, y_max = extent
+    y_axis = torch.linspace(y_min, y_max, shape[0], dtype=torch.float64)
+    x_axis = torch.linspace(x_min, x_max, shape[1], dtype=torch.float64)
+    y_grid, x_grid = (grid[None].clone().requires_grad_() for grid in torch.meshgrid(y_axis, x_axis, indexing="ij"))
+    bands = band_index(shape)
+    rows: list[dict[str, object]] = []
+    for name, formula in MANUFACTURED_FIELDS.items():
+        values = formula(x_grid, y_grid)
+        exact_x, exact_y = torch.autograd.grad(values.sum(), (x_grid, y_grid))
+        exact = {"x": exact_x.detach()[0].numpy(), "y": exact_y.detach()[0].numpy()}
+        for dtype in (torch.float32, torch.float64):
+            spacing_x, spacing_y = domain.physics.derivatives.infer_uniform_spacing(x_grid.detach().to(dtype), y_grid.detach().to(dtype))
+            for backend in DERIVATIVE_BACKENDS:
+                derivative_x, derivative_y = backend.build().gradient(values.detach().to(dtype), spacing_x, spacing_y)
+                numeric = {"x": derivative_x[0].to(torch.float64).numpy(), "y": derivative_y[0].to(torch.float64).numpy()}
+                for direction, reference in exact.items():
+                    scale = math.sqrt(float(np.square(reference).mean()))
+                    squared = np.square(numeric[direction] - reference)
+                    rows.extend(
+                        {
+                            "field": name,
+                            "backend": backend.label,
+                            "dtype": str(dtype).removeprefix("torch."),
+                            "direction": direction,
+                            "band": label,
+                            "points": int((bands == position).sum()),
+                            "relative_error": math.sqrt(float(squared[bands == position].mean())) / scale,
+                        }
+                        for position, label in enumerate(BAND_LABELS)
+                        if bool((bands == position).any())
+                    )
+    return pd.DataFrame(rows)
+
+
+def manufactured_overview(errors: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return the worst manufactured-field error per backend and precision, by band and after each crop.
+
+    Parameters
+    ----------
+    errors : pandas.DataFrame
+        Output of :func:`manufactured_derivative_errors`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Index ``(backend, dtype)``; one column per band and one ``crop c``
+        column per crop of :data:`CROP_CANDIDATES`, each the maximum over
+        fields and directions. A crop column is the RMS over the bands it
+        keeps, weighted by their points.
+
+    """
+    table = errors.pivot_table(index=["backend", "dtype"], columns="band", values="relative_error", aggfunc="max")
+    table = table.reindex(columns=[label for label in BAND_LABELS if label in table.columns])
+    lower = dict(zip(BAND_LABELS, BAND_EDGES, strict=False))
+    for crop in CROP_CANDIDATES:
+        kept = errors[errors["band"].map(lower).astype(int) >= crop]
+        weighted = kept.assign(weight=kept["relative_error"].pow(2) * kept["points"])
+        grouped = weighted.groupby(["backend", "dtype", "field", "direction"])[["weight", "points"]].sum()
+        table[f"crop {crop}"] = (grouped["weight"] / grouped["points"]).pow(0.5).groupby(["backend", "dtype"]).max()
+    return table
+
+
+def crop_overview(residuals: pd.DataFrame, sensitivity: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join the reference momentum floor and the momentum sensitivity per backend and crop.
+
+    Parameters
+    ----------
+    residuals : pandas.DataFrame
+        Output of :func:`summarize_reference_residuals`.
+    sensitivity : pandas.DataFrame
+        Output of :func:`evaluate_sensitivity`, e.g. with :data:`CROP_SETTINGS`.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Index ``(backend, crop)`` over the crops of both tables: the median and
+        maximum float32 momentum floor over cases (the training and sensitivity
+        precision) and the median and minimum momentum ratio of
+        :data:`CROP_PERTURBATION` over cases and seeds.
+
+    """
+    floors = residuals[residuals["dtype"] == "float32"].groupby(["backend", "crop"])["momentum"].agg(["median", "max"])
+    floors.columns = ["momentum_floor_median", "momentum_floor_max"]
+    selected = sensitivity[sensitivity["perturbation"] == CROP_PERTURBATION.label]
+    ratios = selected.groupby(["backend", "crop"])["momentum_ratio"].agg(["median", "min"])
+    ratios.columns = ["smooth_1pct_ratio_median", "smooth_1pct_ratio_min"]
+    return floors.join(ratios, how="inner")
+
+
 def smooth_shape(x: Tensor, y: Tensor, *, generator: np.random.Generator, max_mode: int = SMOOTH_MAX_MODE) -> Tensor:
     """
     Return a unit-RMS low-mode cosine field on one Cartesian grid.
@@ -748,8 +887,9 @@ def evaluate_sensitivity(
     reference : SteadyReference
         Published reference cases.
     settings : Sequence[tuple[str, int]], optional
-        ``(backend label, interior crop)`` pairs; the defaults are the two
-        maintained steady physics configurations plus FD with crop two.
+        ``(backend label, interior crop)`` pairs; the defaults are FD without
+        crop, FD with crop two (the maintained setting) and Fourier continuation
+        with crop two.
     perturbations : Sequence[Perturbation], optional
         Controlled errors.
     seeds : Sequence[int], optional
@@ -867,31 +1007,17 @@ def maintained_physics_settings(config_root: Path | str | None = None) -> pd.Dat
         derivative kind, interior crop, the three target weights,
         and whether the study search space varies any physics setting.
 
-    Notes
-    -----
-    Experiments are merged with their task base through the authoritative
-    authored-config loader and then over the task defaults with the loader's
-    merge; run-time values such as Dataset identities are not resolved because
-    the physics block does not depend on them.
-
     """
-    root = Path(config_root) if config_root is not None else common.paths.get_project_root() / "configs" / "03_learning" / "steady_flow"
     rows: list[dict[str, object]] = []
-    for path in sorted(root.rglob("*.yaml")):
-        if path.name == experiments.config.loader.AUTHORED_BASE_FILENAME:
-            continue
-        raw = experiments.config.loader.load_yaml(path)
-        is_study = "experiment" in raw
-        authored = experiments.config.loader.apply_authored_base(raw["experiment"] if is_study else raw, origin=path)
-        config = experiments.config.loader.deep_merge(experiments.config.defaults.get_task_defaults("steady_flow"), authored)
-        physics = config["loss"]["physics"]
+    for item in sources.iter_maintained_configs(_STEADY_TASK_ID, config_root=config_root):
+        physics = item.config["loss"]["physics"]
         if not physics.get("enabled"):
             continue
-        searched = sorted(key for key in raw.get("search_space", {}) if str(key).startswith("loss.physics"))
+        searched = sorted(key for key in item.search_space if str(key).startswith("loss.physics"))
         rows.append(
             {
-                "config": str(path.relative_to(root)),
-                "kind": "optuna" if is_study else "experiment",
+                "config": item.name,
+                "kind": item.kind,
                 "derivative": physics["derivatives"]["kind"],
                 "interior_crop": int(physics["interior_crop"]),
                 "momentum_weight": float(physics["momentum_weight"]["target"]),

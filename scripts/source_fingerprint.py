@@ -5,7 +5,8 @@ Responsibilities:
   - Capture immutable source snapshots of clean or dirty trees and restore them for reproduction
   - Materialize and verify read-only source trees restored from snapshots
   - Record job leases on source trees and prune trees that no queued or running job uses
-  - Expose fingerprint, restore, materialize, materialize-snapshot, verify-tree, lease, and prune command-line operations
+  - Report orphan source snapshots and delete them only with --apply, on a quiet cluster and under each tree lock
+  - Expose fingerprint, restore, materialize, materialize-snapshot, verify-tree, lease, prune, and prune-snapshots command-line operations
 
 Design principles:
   - Preserve the established source fingerprint and bind snapshots to Git HEAD
@@ -31,12 +32,15 @@ Notes:
     .staging-<tree_id>-<suffix>/ is an unpublished restore. Files and
     directories lose all write bits, and verification compares their modes
     with write bits masked.
+  Snapshot store (storage_root/source_snapshots, --prune-snapshots):
+    an orphan has no storage reference, no tree, no job queued or run within 24 h, no change within 24 h and a valid snapshot.json.
 
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -53,18 +57,18 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Final, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
-_SNAPSHOT_SCHEMA_VERSION: Final = 1
 _FINGERPRINT_ARGUMENT_COUNT = 2
 _RESTORE_ARGUMENT_COUNT = 5
 _MATERIALIZE_ARGUMENT_COUNT = 5
 _VERIFY_TREE_ARGUMENT_COUNT = 4
 _LEASE_ARGUMENT_COUNT = 5
 _PRUNE_ARGUMENT_COUNT = 3
+_PRUNE_SNAPSHOTS_ARGUMENT_COUNT = 4
 _CHUNK_SIZE = 1024 * 1024
 _GIT_OBJECT_ID_LENGTH = 40
 _SHA256_LENGTH = 64
@@ -78,6 +82,45 @@ _STAGING_PREFIX = ".staging-"
 _ALL_WRITE_BITS = 0o222
 _PRUNE_MINIMUM_AGE_SECONDS = 86400.0
 _SQUEUE_TIMEOUT_SECONDS = 60
+_SNAPSHOTS_DIRNAME = "source_snapshots"
+_SNAPSHOT_RECORD = "snapshot.json"
+_SNAPSHOT_RECORD_MAX_BYTES = 8 * 1024 * 1024
+_SNAPSHOT_QUIET_SECONDS = 86400.0  # nothing under a snapshot or the trees root may have changed this recently
+_REMOVAL_PREFIX = ".prune-"  # source_snapshots/.prune-<name>-<token>/ is a snapshot under removal
+_REFERENCE_SUFFIXES = (".json", ".jsonl", ".yaml", ".yml")  # storage records searched for a snapshot's name or fingerprint
+_REFERENCE_MAX_BYTES = 64 * 1024 * 1024
+_SCAN_MAX_ENTRIES = 200_000  # one budget of directory entries, bytes read and seconds shared by a whole snapshot prune
+_SCAN_MAX_TOTAL_BYTES = 2 * 1024**3
+_SCAN_SECONDS = 30.0
+_EntryPlan = dict[str, tuple[int, int, int, int]]  # path below a root ("." for the root) -> file type, inode, size, mtime_ns
+
+
+class _SnapshotPruneStopError(Exception):
+    """Stop snapshot deletion: routine (busy scheduler, recent activity) or blocking (a check that cannot be made)."""
+
+    def __init__(self, reason: str, *, routine: bool = False) -> None:
+        super().__init__(reason)
+        self.routine = routine
+
+
+class _LockHeldError(Exception):
+    """A non-blocking tree lock that another process holds."""
+
+
+class _Budget:
+    """The one allowance of directory entries, bytes read and seconds that a whole snapshot prune shares."""
+
+    def __init__(self) -> None:
+        self.entries = 0
+        self.size = 0
+        self.deadline = time.monotonic() + _SCAN_SECONDS
+
+    def spend(self, *, entries: int = 0, size: int = 0) -> None:
+        """Charge entries and bytes; beyond any limit, the deadline included, the run deletes nothing more."""
+        self.entries += entries
+        self.size += size
+        if self.entries > _SCAN_MAX_ENTRIES or self.size > _SCAN_MAX_TOTAL_BYTES or time.monotonic() > self.deadline:
+            _stop(f"reference check over budget ({_SCAN_MAX_ENTRIES} entries, {_SCAN_MAX_TOTAL_BYTES} bytes, {_SCAN_SECONDS:g} s)")
 
 
 def _invalid(message: str) -> NoReturn:
@@ -86,6 +129,10 @@ def _invalid(message: str) -> NoReturn:
 
 def _conflict(message: str) -> NoReturn:
     raise FileExistsError(message)
+
+
+def _stop(reason: str, *, routine: bool = False) -> NoReturn:
+    raise _SnapshotPruneStopError(reason, routine=routine)
 
 
 def _git(root: Path, *arguments: str, **kwargs: Any) -> subprocess.CompletedProcess:
@@ -221,7 +268,6 @@ def capture_source_snapshot(root: Path, destination_root: Path) -> dict[str, str
             raise RuntimeError(message)
         manifest = {
             "schema_kind": "generation_source_snapshot",
-            "schema_version": _SNAPSHOT_SCHEMA_VERSION,
             "git_commit": head,
             "source_fingerprint_sha256": before,
             "tracked_diff_sha256": hashlib.sha256(diff).hexdigest(),
@@ -417,13 +463,10 @@ def _load_snapshot(snapshot_path: Path) -> tuple[Path, str, bytes, list[dict[str
         _invalid("Snapshot manifest must be a regular non-symlink file.")
     snapshot_path = snapshot_path.resolve(strict=True)
     manifest = json.loads(snapshot_path.read_bytes())
-    version = manifest.get("schema_version")
-    # Strict like common.serialization.is_schema_version, which this stdlib-only script cannot import: JSON true or 1.0 is no version 1.
-    if manifest.get("schema_kind") != "generation_source_snapshot" or type(version) is not int or version != _SNAPSHOT_SCHEMA_VERSION:
+    if manifest.get("schema_kind") != "generation_source_snapshot":
         _invalid("Unsupported Generation source snapshot schema.")
     commit = manifest.get("git_commit")
-    if not isinstance(commit, str) or len(commit) != _GIT_OBJECT_ID_LENGTH or any(character not in "0123456789abcdef" for character in commit):
-        _invalid("Snapshot Git commit must be a full 40-character object ID.")
+    _validate_commit(commit)
     snapshot_dir = snapshot_path.parent
     diff_path = snapshot_dir / "tracked.diff"
     if diff_path.is_symlink() or not diff_path.is_file():
@@ -635,6 +678,11 @@ def _validate_sha256(value: Any, label: str) -> None:
         _invalid(f"Snapshot {label} SHA256 is invalid.")
 
 
+def _validate_commit(value: Any) -> None:
+    if not isinstance(value, str) or len(value) != _GIT_OBJECT_ID_LENGTH or any(character not in "0123456789abcdef" for character in value):
+        _invalid("Snapshot Git commit must be a full 40-character object ID.")
+
+
 def _patch_paths(diff: bytes) -> list[Path]:
     paths = []
     for line in diff.splitlines():
@@ -651,28 +699,69 @@ def _validate_tree_id(tree_id: str) -> None:
 
 
 def _set_tree_write(root: Path, *, writable: bool) -> None:
-    """Grant owner write to, or strip every write bit from, root and each real directory and file below it."""
-    entries = [root]
-    for current, names, files in os.walk(root, followlinks=False):
-        entries.extend(path for path in (Path(current) / name for name in (*names, *files)) if not path.is_symlink())
-    for entry in entries:
-        mode = stat.S_IMODE(entry.stat().st_mode)
-        entry.chmod(mode | stat.S_IWUSR if writable else mode & ~_ALL_WRITE_BITS)
+    """Grant owner write to, or strip every write bit from, root and each real directory and file below it.
+
+    Every mode is set through a descriptor opened relative to its parent's descriptor without following a link, so an
+    entry swapped for a symlink meanwhile is skipped and nothing outside the tree changes.
+    """
+
+    def apply(descriptor: int) -> None:
+        mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+        os.fchmod(descriptor, mode | stat.S_IWUSR if writable else mode & ~_ALL_WRITE_BITS)
+
+    def visit(directory: int) -> None:
+        apply(directory)
+        with os.scandir(directory) as entries:
+            children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries if not entry.is_symlink()]
+        for name, is_directory in children:
+            try:
+                child = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | (os.O_DIRECTORY if is_directory else 0), dir_fd=directory
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    continue  # swapped for a symlink since it was listed
+                raise
+            try:
+                if is_directory:
+                    visit(child)
+                else:
+                    apply(child)
+            finally:
+                os.close(child)
+
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        visit(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @contextlib.contextmanager
-def _tree_lock(trees_root: Path, tree_id: str, *, exclusive: bool) -> Iterator[None]:
-    """Hold the per-tree lock: shared while a tree is reused or leased, exclusive while pruning decides and deletes."""
+def _tree_lock(trees_root: Path, tree_id: str, *, exclusive: bool, blocking: bool = True) -> Iterator[None]:
+    """Hold the per-tree lock: shared while a tree is reused or leased, exclusive while pruning decides and deletes.
+
+    Without ``blocking`` a lock held elsewhere raises _LockHeldError instead of waiting; a symlinked lock file or
+    ``.locks`` raises OSError.
+    """
     directory = trees_root / _LOCKS_DIRNAME
     directory.mkdir(parents=True, exist_ok=True)
+    locks = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)  # held while the lock is held
     # Readable on purpose: on the NFS mounts of the compute nodes flock becomes a POSIX lock, and a shared POSIX lock on a
     # write-only descriptor fails with EBADF (probe 873129, 2026-10-28).
-    with (directory / f"{tree_id}.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        with os.fdopen(os.open(f"{tree_id}.lock", flags, 0o666, dir_fd=locks), "a+") as handle:
+            try:
+                fcntl.flock(handle.fileno(), (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError as error:  # only the flock itself means contention; any other EAGAIN stays an OSError
+                raise _LockHeldError(tree_id) from error
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        os.close(locks)
 
 
 def _discard_directory(path: Path) -> None:
@@ -950,25 +1039,305 @@ def prune_source_trees(
     return {"removed": removed, "kept": kept}
 
 
-def _active_slurm_job_ids() -> set[str] | None:
-    """Return the current user's queued or running job IDs, or None when the queue cannot be read."""
+def _slurm_output(command: Callable[[str], list[str]]) -> str | None:
+    """Return what a Slurm query for the current user prints, or None when it cannot run, fails or times out."""
     try:
-        result = subprocess.run(  # noqa: S603 -- fixed executable and argument vector
-            ["squeue", "-h", "-u", getpass.getuser(), "-o", "%i"],  # noqa: S607 -- scheduler client resolved from PATH
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=_SQUEUE_TIMEOUT_SECONDS,
-        )
+        result = subprocess.run(command(getpass.getuser()), check=True, capture_output=True, text=True, timeout=_SQUEUE_TIMEOUT_SECONDS)  # noqa: S603 -- fixed scheduler clients resolved from PATH
     except (OSError, subprocess.SubprocessError, KeyError):
         return None
+    return result.stdout
+
+
+def _slurm_quiet_evidence() -> tuple[bool | None, bool | None]:
+    """Return whether the user's queue is empty in all states and whether sacct lists no job of the last 24 h."""
+    queue = _slurm_output(lambda user: ["squeue", "-h", "-t", "all", "-u", user])
+    recent = _slurm_output(lambda user: ["sacct", "-X", "-n", "-P", "-u", user, "-S", "now-24hours", "-o", "JobID"])
+    return (None if queue is None else not queue.strip()), (None if recent is None else not recent.strip())
+
+
+def _active_slurm_job_ids() -> set[str] | None:
+    """Return the current user's queued or running job IDs, or None when the queue cannot be read."""
+    output = _slurm_output(lambda user: ["squeue", "-h", "-u", user, "-o", "%i"])
+    if output is None:
+        return None
     identifiers: set[str] = set()
-    for line in result.stdout.splitlines():
+    for line in output.splitlines():
         job_id = line.strip()
         if job_id:
             identifiers.add(job_id)
             identifiers.add(job_id.split("_", 1)[0])
     return identifiers
+
+
+def _walk(root: Path, budget: _Budget, *, skip: Path | None = None) -> Iterator[tuple[Path, os.stat_result]]:
+    """Yield root and every entry below it with its lstat, charging each listed name; enters no symlink and not ``skip``."""
+    pending = [root]
+    while pending:
+        path = pending.pop()
+        status = path.lstat()
+        yield path, status
+        if stat.S_ISDIR(status.st_mode) and path != skip:
+            children = list(path.iterdir())
+            budget.spend(entries=len(children))
+            pending.extend(children)
+
+
+def _entry_plan(root: Path, budget: _Budget) -> _EntryPlan:
+    """Return the type, inode, size and mtime of root and of every entry below it, following no symlink."""
+    return {
+        path.relative_to(root).as_posix(): (stat.S_IFMT(item.st_mode), item.st_ino, item.st_size, item.st_mtime_ns)
+        for path, item in _walk(root, budget)
+    }
+
+
+def _plan_bytes(plan: _EntryPlan) -> int:
+    return sum(size for kind, _inode, size, _mtime in plan.values() if kind == stat.S_IFREG)
+
+
+def _read_record(path: Path, limit: int) -> bytes:
+    """Read a regular file of at most ``limit`` bytes without following it (else ValueError); a change while read stops the run."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)  # a FIFO must not block the open
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            _invalid(f"{path} is not a regular file of at most {limit} bytes")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(before.st_size + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    keys = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if len(content) != before.st_size or any(getattr(before, key) != getattr(after, key) for key in keys):
+        _stop(f"{path} changed while it was read")
+    return content
+
+
+def _snapshot_digest(snapshot: Path, budget: _Budget) -> str:
+    """Return the fingerprint of a snapshot whose snapshot.json names exactly its folder (condition e), else ValueError."""
+    try:
+        raw = _read_record(snapshot / _SNAPSHOT_RECORD, _SNAPSHOT_RECORD_MAX_BYTES)
+    except OSError as error:
+        if error.errno not in {errno.ENOENT, errno.ELOOP}:
+            raise  # an unreadable record cannot be checked, which blocks the run
+        _invalid(f"{_SNAPSHOT_RECORD} is missing or a symlink")
+    budget.spend(size=len(raw))
+    record = json.loads(raw.decode("utf-8"))
+    if not isinstance(record, dict):
+        _invalid(f"{_SNAPSHOT_RECORD} is not a JSON object")
+    commit, digest = record.get("git_commit"), record.get("source_fingerprint_sha256")
+    _validate_commit(commit)
+    _validate_sha256(digest, "source fingerprint")
+    if snapshot.name != f"{commit[:_SNAPSHOT_NAME_PART_LENGTH]}-{digest[:_SNAPSHOT_NAME_PART_LENGTH]}":
+        _invalid("git_commit and source_fingerprint_sha256 do not give the folder name")
+    return digest
+
+
+def _trees_state(trees_root: Path, budget: _Budget) -> tuple[set[str], int]:
+    """Return the names in the trees root and its newest mtime (conditions b and d); a symlinked root or .locks stops."""
+    if not os.path.lexists(trees_root):
+        return set(), 0
+    plan = _entry_plan(trees_root, budget)
+    if plan["."][0] != stat.S_IFDIR or plan.get(_LOCKS_DIRNAME, (stat.S_IFDIR,))[0] != stat.S_IFDIR:
+        _stop(f"{trees_root} or its {_LOCKS_DIRNAME} is not a real directory")
+    return {name for name in plan if name != "." and "/" not in name}, max(entry[3] for entry in plan.values())
+
+
+def _require_quiet_scheduler(scheduler: Callable[[], tuple[bool | None, bool | None]]) -> None:
+    """Conditions c and c2: a busy queue or a job within 24 h stops routinely, an unanswered query blocks."""
+    queue_empty, no_recent_job = scheduler()
+    if queue_empty is None:
+        _stop("squeue gave no answer")
+    if not queue_empty:
+        _stop("Slurm queue not empty", routine=True)
+    if no_recent_job is None:
+        _stop("sacct gave no answer")
+    if not no_recent_job:
+        _stop("Slurm jobs within the last 24 h", routine=True)
+
+
+def _referenced(storage_root: Path, needles: dict[str, tuple[bytes, bytes]], budget: _Budget) -> set[str]:
+    """Return the snapshots whose name or fingerprint occurs in a storage record (condition a); each record is read once."""
+    found: set[str] = set()
+    for path, status in _walk(storage_root, budget, skip=storage_root / _SNAPSHOTS_DIRNAME):
+        if len(found) == len(needles):
+            break
+        if stat.S_ISLNK(status.st_mode):
+            _stop(f"symlink in the storage tree: {path}")
+        if not stat.S_ISDIR(status.st_mode) and path.name.lower().endswith(_REFERENCE_SUFFIXES):
+            content = _read_record(path, _REFERENCE_MAX_BYTES).lower()
+            found.update(name for name, keys in needles.items() if name not in found and any(key in content for key in keys))
+            budget.spend(size=len(content))
+    return found
+
+
+def _remove_snapshot(snapshots_root: Path, name: str, inode: int) -> None:
+    """Remove the planned snapshot by descriptors that follow no swapped link: snapshot.json, then the folder under a private name."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    with contextlib.ExitStack() as descriptors:
+        parent = os.open(snapshots_root, flags)
+        descriptors.callback(os.close, parent)
+        folder = os.open(name, flags, dir_fd=parent)
+        descriptors.callback(os.close, folder)
+        planned = os.fstat(folder)
+        if planned.st_ino != inode:
+            _invalid("snapshot changed since the scan")
+        os.unlink(_SNAPSHOT_RECORD, dir_fd=folder)  # a partly removed remainder is defective, never a valid snapshot
+        private = f"{_REMOVAL_PREFIX}{name}-{secrets.token_hex(8)}"  # nobody else knows this name, so a path is safe below
+        os.rename(name, private, src_dir_fd=parent, dst_dir_fd=parent)
+        moved = os.stat(private, dir_fd=parent, follow_symlinks=False)
+        if (moved.st_dev, moved.st_ino) != (planned.st_dev, planned.st_ino):
+            os.rename(private, name, src_dir_fd=parent, dst_dir_fd=parent)
+            _invalid("another folder took the snapshot's name before its removal")
+        _discard_directory(snapshots_root / private)
+        if os.path.lexists(snapshots_root / private):
+            _invalid("snapshot was not removed")
+
+
+def _delete_orphans(
+    outcome: dict[str, Any],
+    snapshots_root: Path,
+    trees_root: Path,
+    plans: dict[str, _EntryPlan],
+    scheduler: Callable[[], tuple[bool | None, bool | None]],
+    cutoff_ns: int,
+    budget: _Budget,
+) -> None:
+    """Delete each orphan under its exclusive tree lock after conditions b to e and its scanned plan hold again."""
+    locks = trees_root / _LOCKS_DIRNAME
+    missing = [name for name in plans if not os.path.lexists(locks / f"{name}.lock")]
+    if missing:  # created like a launcher creates them; as recent activity (d) they defer the deletion to a later quiet run
+        try:
+            locks.mkdir(parents=True, exist_ok=True)
+            directory = os.open(locks, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                for name in missing:
+                    os.close(os.open(f"{name}.lock", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666, dir_fd=directory))
+            finally:
+                os.close(directory)
+        except OSError as error:
+            outcome["blocked"] = f"lock files: {error}"
+        else:
+            outcome["skipped"] = "lock files created; deletion in a later quiet run"
+        return
+    for name, plan in plans.items():
+        snapshot = snapshots_root / name
+        try:
+            with _tree_lock(trees_root, name, exclusive=True, blocking=False):
+                _require_quiet_scheduler(scheduler)
+                trees, newest = _trees_state(trees_root, budget)
+                if newest > cutoff_ns:
+                    _stop(f"{trees_root} changed within the last 24 h", routine=True)
+                if name in trees:
+                    _invalid(f"a tree of this name exists in {trees_root}")
+                _snapshot_digest(snapshot, budget)
+                if _entry_plan(snapshot, budget) != plan:
+                    _invalid("snapshot changed since the scan")
+                budget.spend()  # no removal starts after the deadline
+                _remove_snapshot(snapshots_root, name, plan["."][1])
+        except _LockHeldError:
+            outcome["refused"][name] = "tree lock held by a launcher or a prune"
+        except ValueError as error:  # this snapshot changed since the scan, or a tree of its name appeared
+            outcome["refused"][name] = str(error)
+        except (OSError, _SnapshotPruneStopError) as stop:  # a check that cannot be made, or a routine reason, ends the run
+            outcome["skipped" if isinstance(stop, _SnapshotPruneStopError) and stop.routine else "blocked"] = str(stop)
+            break
+        else:
+            outcome["orphans"].append(name)
+            outcome["bytes"] += _plan_bytes(plan)
+
+
+def prune_source_snapshots(
+    storage_root: Path,
+    trees_root: Path,
+    *,
+    scheduler: Callable[[], tuple[bool | None, bool | None]],
+    now: float,
+    apply: bool,
+) -> dict[str, Any]:
+    """
+    Report orphan source snapshots and delete them only with ``apply``.
+
+    Parameters
+    ----------
+    storage_root : Path
+        Storage root holding ``source_snapshots`` and the records that refer to them.
+    trees_root : Path
+        Root of the source trees with their ``.locks``.
+    scheduler : Callable[[], tuple[bool | None, bool | None]]
+        Evidence of (c, c2): whether the queue is empty and whether no job ran
+        within 24 hours, each ``None`` when its query failed. Asked again before
+        every deletion.
+    now : float
+        Current time in seconds since the epoch.
+    apply : bool
+        Delete the orphans; otherwise only report them and write nothing.
+
+    Returns
+    -------
+    dict[str, Any]
+        ``orphans`` (deletable, or deleted with ``apply``) with their total
+        ``bytes``, ``defective`` and ``refused`` (name to reason), ``blocked``
+        (a failed check that stopped all deletion) and ``skipped`` (a routine
+        reason to delete nothing), each ``None`` when absent.
+
+    Notes
+    -----
+    With ``apply`` a missing lock file is created and nothing is deleted in that
+    run; each deletion takes the exclusive tree lock without waiting and checks
+    the tree, scheduler, recency and ``snapshot.json`` conditions and the scanned
+    plan again. An entry replaced inside the snapshot between that check and the
+    removal is removed with it: a window under the exclusive lock, on a quiet
+    cluster, after 24 hours without change. The folder is removed under a private
+    name ``.prune-<name>-<token>``; one left by a crash is reported as defective.
+    Not covered: ``source_snapshots`` replaced by a symlink, or ``.locks`` by
+    another directory, during a run; both need deliberate tampering.
+
+    """
+    outcome: dict[str, Any] = {"orphans": [], "defective": {}, "blocked": None, "refused": {}, "skipped": None, "bytes": 0}
+    snapshots_root = storage_root / _SNAPSHOTS_DIRNAME
+    if not os.path.lexists(snapshots_root):
+        return outcome
+    budget = _Budget()
+    cutoff_ns = int((now - _SNAPSHOT_QUIET_SECONDS) * 1_000_000_000)
+    plans: dict[str, _EntryPlan] = {}
+    digests: dict[str, str] = {}
+    orphans: list[str] = []
+    try:
+        if storage_root.is_symlink() or snapshots_root.is_symlink() or not snapshots_root.is_dir():
+            _stop(f"{snapshots_root} is not a real directory below a real storage root")
+        names = [path.name for path in snapshots_root.iterdir()]
+        budget.spend(entries=len(names))  # every listed name is charged, snapshot or not
+        outcome["defective"].update({name: "interrupted removal" for name in names if name.startswith(_REMOVAL_PREFIX)})
+        for name in sorted(filter(_TREE_ID_PATTERN.fullmatch, names)):
+            plans[name] = _entry_plan(snapshots_root / name, budget)
+            try:
+                if plans[name]["."][0] != stat.S_IFDIR:
+                    _invalid("not a real directory")
+                digests[name] = _snapshot_digest(snapshots_root / name, budget)
+            except ValueError as error:  # condition e fails; an OSError cannot be checked and blocks the run below
+                outcome["defective"][name] = str(error)
+        trees, newest = _trees_state(trees_root, budget)  # the cheap checks b and d first
+        candidates = {
+            name: digest for name, digest in digests.items() if name not in trees and max(item[3] for item in plans[name].values()) <= cutoff_ns
+        }
+        if candidates:
+            if newest > cutoff_ns:
+                _stop(f"{trees_root} changed within the last 24 h", routine=True)
+            _require_quiet_scheduler(scheduler)
+            referenced = _referenced(storage_root, {name: (name.encode(), digest.encode()) for name, digest in candidates.items()}, budget)
+            budget.spend()  # the deadline once more before the result is accepted
+            orphans = sorted(set(candidates) - referenced)
+    except _SnapshotPruneStopError as stop:
+        outcome["skipped" if stop.routine else "blocked"] = str(stop)
+        return outcome
+    except (OSError, ValueError) as error:  # an unreadable folder, or a storage record that is no regular file or too large
+        outcome["blocked"] = str(error)
+        return outcome
+    if apply:
+        _delete_orphans(outcome, snapshots_root, trees_root, {name: plans[name] for name in orphans}, scheduler, cutoff_ns, budget)
+    else:
+        outcome.update(orphans=orphans, bytes=sum(_plan_bytes(plans[name]) for name in orphans))
+    return outcome
 
 
 if __name__ == "__main__":
@@ -986,10 +1355,25 @@ if __name__ == "__main__":
         print(lease_source_tree(Path(sys.argv[2]), sys.argv[3], sys.argv[4]))
     elif len(sys.argv) == _PRUNE_ARGUMENT_COUNT and sys.argv[1] == "--prune":
         print(json.dumps(prune_source_trees(Path(sys.argv[2]), _active_slurm_job_ids(), now=time.time()), sort_keys=True))
+    elif (
+        len(sys.argv) >= _PRUNE_SNAPSHOTS_ARGUMENT_COUNT
+        and sys.argv[1] == "--prune-snapshots"
+        and sys.argv[_PRUNE_SNAPSHOTS_ARGUMENT_COUNT:] in ([], ["--apply"])
+    ):
+        outcome = prune_source_snapshots(
+            Path(sys.argv[2]),
+            Path(sys.argv[3]),
+            scheduler=_slurm_quiet_evidence,
+            now=time.time(),
+            apply=len(sys.argv) > _PRUNE_SNAPSHOTS_ARGUMENT_COUNT,
+        )
+        print(json.dumps(outcome, sort_keys=True))
+        sys.exit(2 if outcome["defective"] or outcome["blocked"] or outcome["refused"] else 0)
     else:
         usage = (
             f"Usage: {sys.argv[0]} REPOSITORY [--restore SNAPSHOT_JSON DESTINATION"
             " | --materialize SNAPSHOT_ROOT TREES_ROOT | --materialize-snapshot SNAPSHOT_JSON TREES_ROOT]\n"
-            f"       {sys.argv[0]} --verify-tree TREE SNAPSHOT_ROOT | --lease TREES_ROOT TREE_ID LEASE_ID | --prune TREES_ROOT"
+            f"       {sys.argv[0]} --verify-tree TREE SNAPSHOT_ROOT | --lease TREES_ROOT TREE_ID LEASE_ID | --prune TREES_ROOT\n"
+            f"       {sys.argv[0]} --prune-snapshots STORAGE_ROOT TREES_ROOT [--apply]"
         )
         raise SystemExit(usage)

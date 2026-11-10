@@ -31,12 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 _DATASETS_ANCESTOR = 2  # manifest.parents[2] is the 02_datasets area: <dataset>, <task>, 02_datasets
 _LOGIN_INTERPRETER = "../runtime/venvs/native/bin/python"  # project layout: the command runs from the repo/ checkout
-_SCHEMA_EXPORTS = frozenset(
-    {
-        "DATASET_PACKAGE_SCHEMA_KIND",
-        "DATASET_PACKAGE_SCHEMA_VERSION",
-    }
-)
+_SCHEMA_EXPORTS = frozenset({"DATASET_PACKAGE_SCHEMA_KIND"})
 
 
 def __getattr__(name: str) -> object:
@@ -53,7 +48,6 @@ def __getattr__(name: str) -> object:
 
 if TYPE_CHECKING:
     DATASET_PACKAGE_SCHEMA_KIND: str
-    DATASET_PACKAGE_SCHEMA_VERSION: int
 
 
 def build_dataset_selection(
@@ -103,6 +97,7 @@ def _source_outcome_lines(outcomes: list[Mapping[str, Any]]) -> list[str]:
 
 def format_dataset_inspection(report: Mapping[str, Any]) -> str:
     """Present existing inspection evidence and exact reconstruction steps for a researcher."""
+    from .contracts import dataset_contracts_partition as partition_contract  # noqa: PLC0415
 
     def availability(value: object) -> str:
         return "available" if value is True else "unavailable" if value is False else "unknown"
@@ -131,7 +126,9 @@ def format_dataset_inspection(report: Mapping[str, Any]) -> str:
     def named_counts(values: object) -> str:
         if not isinstance(values, Mapping):
             return evidence(values)
-        return ", ".join(f"{name}={count}" for name, count in values.items()) or "none recorded"
+        return ", ".join(
+            f"{name}=({named_counts(count)})" if isinstance(count, Mapping) else f"{name}={count}" for name, count in values.items()
+        ) or ("none recorded")
 
     producer = report["producer"]
     recovery = producer["source_recovery"]
@@ -188,8 +185,7 @@ def format_dataset_inspection(report: Mapping[str, Any]) -> str:
     else:
         position = lines.index("Sources, in Dataset order:")
         lines[position:position] = [
-            f"Fixed split: seed input {fixed['seed_input']}; effective seed {fixed['seed']}; "
-            + ", ".join(f"{role}={len(fixed[role])}" for role in ("train", "validation", "id_test", "ood")),
+            "Fixed roles (from the design kinds): " + ", ".join(f"{role}={len(fixed[role])}" for role in partition_contract.CASE_ROLES),
             f"Material roles: {', '.join(f'{material}={role}' for material, role in fixed['material_roles'].items())}",
         ]
     position = lines.index("Sources, in Dataset order:")
@@ -311,6 +307,7 @@ def format_run_summary(result: Mapping[str, Any], *, seconds: float) -> str:
     """Present the outcome of one Dataset plan run in the driver: the published Dataset, its split, the failures and the time taken."""
     from src import common  # noqa: PLC0415
 
+    from .contracts import dataset_contracts_partition as partition_contract  # noqa: PLC0415
     from .packages import dataset_packages_manifest as manifests  # noqa: PLC0415
 
     duration = common.console.format_duration(seconds)
@@ -329,7 +326,7 @@ def format_run_summary(result: Mapping[str, Any], *, seconds: float) -> str:
     split = (
         "unavailable"
         if fixed is None
-        else "  ".join(f"{role} {len(fixed[role])}" for role in ("train", "validation", "id_test", "ood"))
+        else "  ".join(f"{role} {len(fixed[role])}" for role in partition_contract.CASE_ROLES)
         + f"  ({', '.join(f'{material}={role}' for material, role in fixed['material_roles'].items())})"
     )
     candidates = [candidate for outcome in manifest["source_outcomes"] for candidate in outcome["candidates"]]
@@ -369,7 +366,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="run/reuse one normal Dataset plan through Generation, fixed split and PT")
     run.add_argument("plan", type=Path)
-    run.add_argument("--preview", action="store_true", help="read-only effective plan; no Source admission or scientific writes")
+    run.add_argument("--dry-run", action="store_true", help="read-only effective plan; no Source admission or scientific writes")
     run.add_argument(
         "--revision",
         metavar="LABEL",
@@ -380,8 +377,6 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --revision: also simulate the Source afresh as <default Source name>__rev-LABEL instead of reusing the default Source",
     )
-    run.add_argument("--count", action="append", metavar="MATERIAL=COUNT")
-    run.add_argument("--split-fractions", metavar="TRAIN,VALIDATION,TEST", help="explicit recorded temporary split; fractions such as 1/3 accepted")
     run.add_argument("--duration-hours", type=float)
     run.add_argument(
         "--continue-with-current-code",
@@ -418,8 +413,6 @@ def _run_plan(parser: argparse.ArgumentParser, arguments: argparse.Namespace) ->
     try:
         plan = dataset_plan.load_dataset_plan(
             arguments.plan,
-            counts=arguments.count,
-            split_fractions=arguments.split_fractions,
             revision=arguments.revision,
             new_source=arguments.new_source,
             duration_hours=arguments.duration_hours,
@@ -433,7 +426,7 @@ def _run_plan(parser: argparse.ArgumentParser, arguments: argparse.Namespace) ->
         if getattr(arguments, key) is not None
     }
     try:
-        if arguments.preview:
+        if arguments.dry_run:
             # First stdout line: the Source run identity and the Slurm footprint of a run; the effective plan follows.
             footprint = dataset_plan.preview_scheduler_footprint(
                 plan, execution_overrides=execution, driver_time=arguments.driver_time, driver_partition=arguments.driver_partition

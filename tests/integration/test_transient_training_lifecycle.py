@@ -26,6 +26,7 @@ from torch.optim.adamw import AdamW
 
 from src import analysis, common, datasets, domain, experiments, generation, learning
 from src.datasets.packages import dataset_packages_selection as selection
+from src.experiments import experiments_wandb_schema as wandb_schema
 from src.learning.inference import learning_inference_transient as transient_inference
 from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient import learning_transient_adapter as transient_adapter
@@ -113,7 +114,6 @@ def test_steady_selection_reuses_matching_sources_and_rejects_fixed_conditioning
     def request(name: str, sources: list[dict[str, str]]) -> dict[str, Any]:
         return {
             "schema_kind": "dataset_selection_request",
-            "schema_version": selection.SELECTION_SCHEMA_VERSION,
             "source_task": "steady_flow",
             "dataset_name": name,
             "dataset_view": "steady_flow",
@@ -211,24 +211,25 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
     receipt_path = datasets.packages.transient_shards.transient_shard_directory(id_dataset_id, storage_root=root) / "receipt.json"
     assert manifest["derived_payload_sha256"] == common.serialization.file_sha256(receipt_path)
     assert receipt["transition_count"] >= 2
-    tensorizer = TransientTensorizerSpec(input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("none"))
+    tensorizer = TransientTensorizerSpec(input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("none"))
     loaders = datasets.runtime.transient_training.create_transient_training_loaders(
         train_dataset_id=id_dataset_id,
-        additional_evaluation_dataset_ids=[],
+        material_ood_dataset_ids=[],
         tensorizer=tensorizer,
         train_sampling=one_step,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
         model_sha256="a" * 64,
         storage_root=str(root),
+        train_subset=None,
     )
     try:
         assert loaders.data_processor.spatial_shape == (16, 16)
         assert loaders.split["roles"]["train"]["case_ids"] == transient_package["case_partition"]["train"]
         assert loaders.split["roles"]["id_test"]["case_ids"] == transient_package["case_partition"]["id_test"]
-        assert loaders.additional_evaluation is None
+        assert loaders.material_ood is None
         assert loaders.split["dataset_identity"]["train"]["dataset_id"] == id_dataset_id
     finally:
-        for value in (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test):
+        for value in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
             if value is not None:
                 _close_loader_dataset(value)
     curriculum = RolloutCurriculum(lengths=(2, 4), milestone_fractions=(0.0, 0.2))
@@ -242,11 +243,11 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
 
     campaign = transient_package["source_campaign"]
     selectors = transient_package["source_selectors"]
-    ranked = list(selection.select_ordered_cases("transient_drying", [campaign], {"lentil": 4}, storage_root=root))
-    method = {"kind": "design_order", "source_names": [campaign], "target_counts": {"lentil": 4}}
+    target_counts = {"lentil": {"train": 2, "validation": 1, "test": 1}}  # one of the two test cases stays out
+    ranked = list(selection.select_ordered_cases("transient_drying", [campaign], target_counts, storage_root=root))
+    method = {"kind": "design_order", "source_names": [campaign], "target_counts": target_counts}
     ranked_request = {
         "schema_kind": "dataset_selection_request",
-        "schema_version": selection.SELECTION_SCHEMA_VERSION,
         "source_task": "transient_drying",
         "dataset_name": "transient_ranked_lifecycle",
         "dataset_view": "transient_drying",
@@ -262,7 +263,7 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
         (
             {"source_cases": list(reversed(ranked))},
             {"source_cases": substituted},
-            {"selection": {**method, "target_counts": {"lentil": 3}}},
+            {"selection": {**method, "target_counts": {"lentil": {"train": 1, "validation": 1, "test": 1}}}},
         )
     ):
         # A fresh name reaches the ordered-claim check instead of the name-binding guard.
@@ -292,7 +293,7 @@ def _authored_fno_plan(
     raw["data"].update(
         {
             "train_dataset": train_dataset,
-            "additional_evaluation_datasets": [],
+            "material_ood_datasets": [],
             "batch_size": 2,
         }
     )
@@ -311,9 +312,29 @@ def _authored_fno_plan(
         }
     )
     raw["training"]["a1"].update({"max_epochs": 64, "lr_scale": lr_scale})
-    destination = destination.with_name(f"{configs.source_for(raw).name}__{destination.name}")
-    experiments.config.loader.save_yaml(raw, destination)
-    return destination
+    return configs.write_config(destination.parent / destination.stem, raw)  # a canonical tree below the destination stem
+
+
+def _assert_curated_series_are_produced(run_dir: Path, *, cuda: bool) -> None:
+    """Find every curated W&B source key in the stage's local history and every projected ``selected/`` key in its selected metrics."""
+    config = experiments.run.validate_completed_run(run_dir)["config"]
+    evaluation = config["evaluation"]
+    definitions = experiments.tracking.automatic_history_metric_definitions(
+        evaluation["metrics"],
+        objective_id=str(evaluation["objective"]["id"]),
+        physics_training_enabled=False,
+        physics_monitor_enabled=False,
+        cuda_enabled=cuda,
+        task_id="transient_drying",
+        state_aux_enabled=float(config["loss"]["data"].get("state_aux_weight", 0.0)) > 0.0,
+        ood_roles=datasets.preprocessing.splits.read_saved_split(run_dir).ood_roles,
+    )
+    records = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))["epochs"]
+    produced = set().union(*records)
+    selected = experiments.run.read_run_summary(run_dir)["selected_metrics"]
+    assert {definition.source_key for definition in definitions} <= produced
+    selected_keys = {wandb_schema.selected_summary_key(definition.source_key) for definition in definitions} - {None}
+    assert selected_keys <= set(selected)
 
 
 @_CUDA_REQUIRED
@@ -341,7 +362,6 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     assert outcome["run_dir"] == a1_dir
     # Each stage is its own leaf below the shared branch directory.
     assert (a0_dir.name, b_dir.name, a1_dir.name) == ("a0", "b", "a1")
-    assert a0["best_checkpoint"]["schema_version"] == learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
     assert (a0["best_checkpoint"]["payload_kind"], b["best_checkpoint"]["payload_kind"], a1["best_checkpoint"]["payload_kind"]) == (
         "full",
         "evaluation",
@@ -378,6 +398,8 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     assert a1_summary["terminal_controller"]["budget_complete"] is True
     assert a1_summary["terminal_controller"]["train_seconds"] >= b_summary["terminal_controller"]["train_seconds"]
     assert a1_summary["terminal_controller"]["matched_receipt_sha256"] is not None
+    for stage_dir in (a0_dir, b_dir, a1_dir):
+        _assert_curated_series_are_produced(stage_dir, cuda=True)
     assert a1["config"]["training"]["teacher_handoff"]["source_run_name"] == a0["config"]["run"]["name"]
     assert b["config"]["training"]["teacher_handoff"]["source_run_name"] == a0["config"]["run"]["name"]
     _assert_completed_inference_and_tracking_lifecycle(
@@ -454,6 +476,7 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
     teacher = torch.load(a0_dir / handoff.HANDOFF_DIRECTORY / "best_checkpoint.pt", map_location="cpu", weights_only=False)
     assert teacher["payload_kind"] == "full"
     restored_rate = float(teacher["optimizer_state_dict"]["param_groups"][0]["lr"])
+    _assert_curated_series_are_produced(a0_dir, cuda=False)  # the CPU run of a real A0 checks the producers where no GPU is needed
 
     first = experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("b",), max_steps=1)
     b_dir = first["run_dir"]
@@ -508,7 +531,7 @@ def _resolved_direct_model_config(
     resolved["data"].update(
         {
             "train_dataset": train_dataset,
-            "additional_evaluation_datasets": [],
+            "material_ood_datasets": [],
             "batch_size": 1,
         }
     )
@@ -547,13 +570,14 @@ def _resolved_direct_model_config(
 
 def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.Module:
     tensorizer = TransientTensorizerSpec(
-        input_profile="canonical_physics_complete_v1",
+        input_profile="canonical_physics_complete",
         temporal_conditioning=TemporalConditioningSpec("none"),
     )
     sampling = datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"])
     loaders = datasets.runtime.transient_training.create_transient_training_loaders(
         train_dataset_id=str(config["data"]["train_dataset"]),
-        additional_evaluation_dataset_ids=config["data"]["additional_evaluation_datasets"],
+        material_ood_dataset_ids=config["data"]["material_ood_datasets"],
+        train_subset=None,
         tensorizer=tensorizer,
         train_sampling=sampling,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
@@ -584,7 +608,7 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
         assert any(not torch.equal(previous, current.detach()) for previous, current in zip(before, model.parameters(), strict=False))
         return model
     finally:
-        for value in (loaders.train, loaders.evaluation, loaders.additional_evaluation, loaders.id_test):
+        for value in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):
             if value is not None:
                 _close_loader_dataset(value)
 
@@ -636,7 +660,7 @@ def _assert_completed_inference_and_tracking_lifecycle(
     assert rollout.states.shape == (1, 2, 4, 16, 16)
 
     monkeypatch.setattr(experiments.tracking.importlib, "import_module", lambda _name: pytest.fail("disabled observer imported SDK"))
-    disabled = experiments.tracking.initialize_wandb(config, run_dir=root / "disabled_tracking")
+    disabled = experiments.tracking.initialize_wandb(config, run_dir=root / "disabled_tracking", ood_roles=())
     disabled.log_epoch(1, {"train/loss_total": 1.0})
     assert not disabled.enabled
     assert not (root / "disabled_tracking").exists()
@@ -674,8 +698,8 @@ def _assert_completed_inference_and_tracking_lifecycle(
     observer.log_epoch(1, {"train/loss_total": 1.25, "transient/curriculum_max_horizon": 4.0, "ignored": 9.0})
     payload, epoch = fake_run.logged[0]
     assert epoch == 1
-    assert payload["Overview/train_loss"] == 1.25
-    assert payload["Curriculum/horizon"] == 4.0
+    assert payload["Overview/train-loss_total"] == 1.25
+    assert payload["Training/curriculum-horizon"] == 4.0
     assert "ignored" not in payload
 
 

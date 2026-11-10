@@ -56,7 +56,7 @@ _OTHER_ANALYSIS = "0" * 64
 def _write_artifact(root: Path, _reporter: Any = None, *, analysis_sha256: str = _RUNNING_ANALYSIS) -> None:
     """Write one tiny artifact whose completion marker binds its producer and payload digests."""
     (root / "npz").mkdir(parents=True)
-    (root / "dataset.parquet").write_bytes(b"table")
+    (root / "artifacts.parquet").write_bytes(b"table")
     (root / "npz" / "case.npz").write_bytes(b"payload")
     marker = {"producer": {"analysis_sha256": analysis_sha256}, "outputs": contracts.artifact_output_manifest(root)}
     contracts.artifact_provenance_path(root).write_text(json.dumps(marker), encoding="utf-8")
@@ -68,9 +68,9 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
 
 
 def _corrupted_artifact(root: Path, _reporter: Any = None) -> None:
-    """Write the tiny artifact, then change one payload behind its marker."""
+    """Write the tiny artifact, then change its table behind its marker (case payloads are verified when a case opens)."""
     _write_artifact(root)
-    (root / "npz" / "case.npz").write_bytes(b"corrupted")
+    (root / "artifacts.parquet").write_bytes(b"corrupted")
 
 
 def _fake_task(
@@ -83,7 +83,7 @@ def _fake_task(
     completed = {"config": {}, "summary": {}, "scientific_run_name": "run"}
     monkeypatch.setattr(service.experiments.run, "validate_completed_run", lambda _run_dir: completed)
     monkeypatch.setattr(experiments.config.loader, "validate_resolved_task_contract", lambda _config: SimpleNamespace(id=task))
-    plan = SimpleNamespace(role=lambda _split: _ID_ROLE, additional_role=None)
+    plan = SimpleNamespace(role=lambda _split: _ID_ROLE, ood_roles={}, roles=(_ID_ROLE,))
     monkeypatch.setattr(service.artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
     build = service._TargetBuild(case_ids=(_CASE_ID,), generate=generate, finish_stage=lambda _stage: None)
     monkeypatch.setattr(service, "_transient_target_build" if task == "transient_drying" else "_steady_target_build", lambda **_kwargs: build)
@@ -244,7 +244,7 @@ def test_one_validator_refuses_a_corrupted_steady_payload(monkeypatch: pytest.Mo
         "task_spec": SimpleNamespace(id="steady_flow"),
         "evaluation": {},
     }
-    monkeypatch.setattr(loader, "_steady_role_context", lambda *_args: (context, role, None))
+    monkeypatch.setattr(loader, "_steady_role_context", lambda *_args: (context, {"id": role}))
     _fake_task(monkeypatch, "steady_flow", _corrupted_artifact)
     if path != "write":
         _corrupted_artifact(target)
@@ -279,10 +279,12 @@ def test_a_missing_target_beside_a_role_of_other_analysis_code_is_generated_only
         _write_artifact(stage, reporter)
 
     _fake_task(monkeypatch, task, generate)
-    other_role = SimpleNamespace(dataset_name="other")
-    plan = SimpleNamespace(additional_role=other_role, role=lambda split: _ID_ROLE if split == "eval" else other_role)
+    other_role = SimpleNamespace(dataset_name="other", split="material_ood")
+    plan = SimpleNamespace(
+        ood_roles={"material_ood": other_role}, roles=(_ID_ROLE, other_role), role=lambda split: _ID_ROLE if split == "eval" else other_role
+    )
     monkeypatch.setattr(service.artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
-    sibling_root = service._artifact_save_root(run_dir=run_dir, dataset_name="other", split="additional_evaluation")
+    sibling_root = service._artifact_save_root(run_dir=run_dir, dataset_name="other", split="material_ood")
     _write_artifact(sibling_root, analysis_sha256=_OTHER_ANALYSIS)
     _recording_admission(monkeypatch)
     before = _tree_bytes(run_dir)
@@ -331,40 +333,40 @@ def test_the_sibling_check_and_publication_hold_the_run_wide_artifact_lock(monke
     assert not common.locking.file_lock_is_active(run_lock)
 
 
-_ROLE_SPLITS = {"id": "eval", "additional_evaluation": "additional_evaluation"}
+_ROLE_SPLITS = {"id": "eval", "material_ood": "material_ood"}
 
 
 @pytest.mark.parametrize(
     ("recorded", "rebuild_incompatible", "expected_builds", "expected_actions"),
     [
         pytest.param(
-            {"id": _OTHER_ANALYSIS, "additional_evaluation": _OTHER_ANALYSIS},
+            {"id": _OTHER_ANALYSIS, "material_ood": _OTHER_ANALYSIS},
             False,
             [],
-            {"id": "reused", "additional_evaluation": "reused"},
+            {"id": "reused", "material_ood": "reused"},
             id="one-older-producer-is-read",
         ),
-        pytest.param({"id": _RUNNING_ANALYSIS, "additional_evaluation": _OTHER_ANALYSIS}, False, [], None, id="mixed-refused"),
+        pytest.param({"id": _RUNNING_ANALYSIS, "material_ood": _OTHER_ANALYSIS}, False, [], None, id="mixed-refused"),
         pytest.param(
-            {"id": _RUNNING_ANALYSIS, "additional_evaluation": _OTHER_ANALYSIS},
+            {"id": _RUNNING_ANALYSIS, "material_ood": _OTHER_ANALYSIS},
             True,
-            [("additional_evaluation", True)],
-            {"id": "reused", "additional_evaluation": "rebuilt"},
+            [("material_ood", True)],
+            {"id": "reused", "material_ood": "rebuilt"},
             id="mixed-rebuilt",
         ),
-        pytest.param({"id": _OTHER_ANALYSIS, "additional_evaluation": None}, False, [], None, id="missing-beside-older-refused"),
+        pytest.param({"id": _OTHER_ANALYSIS, "material_ood": None}, False, [], None, id="missing-beside-older-refused"),
         pytest.param(
-            {"id": _OTHER_ANALYSIS, "additional_evaluation": None},
+            {"id": _OTHER_ANALYSIS, "material_ood": None},
             True,
-            [("id", True), ("additional_evaluation", False)],
-            {"id": "rebuilt", "additional_evaluation": "generated"},
+            [("id", True), ("material_ood", False)],
+            {"id": "rebuilt", "material_ood": "generated"},
             id="missing-beside-older-rebuilds-it-first",
         ),
         pytest.param(
-            {"id": None, "additional_evaluation": _RUNNING_ANALYSIS},
+            {"id": None, "material_ood": _RUNNING_ANALYSIS},
             False,
             [("id", False)],
-            {"id": "generated", "additional_evaluation": "reused"},
+            {"id": "generated", "material_ood": "reused"},
             id="missing-beside-running-is-generated",
         ),
     ],
@@ -381,7 +383,12 @@ def test_prepared_run_artifacts_share_one_analysis_producer(
     """Roles of one producer are read as evidence; a preparation that would leave two producers rebuilds on request, else refuses before a build."""
     run_dir = tmp_path.resolve()
     monkeypatch.setitem(contracts.ANALYSIS_PROJECTIONS, "steady_flow", SimpleNamespace(name="analysis_steady_flow", sha256=lambda: _RUNNING_ANALYSIS))
-    plan = SimpleNamespace(task="steady_flow", additional_role=object(), role=lambda split: SimpleNamespace(dataset_name=f"{split}-dataset"))
+    plan = SimpleNamespace(
+        task="steady_flow",
+        dataset_roles=("id", "material_ood"),
+        roles=tuple(SimpleNamespace(split=split, dataset_name=f"{split}-dataset") for split in ("eval", "material_ood")),
+        role=lambda split: SimpleNamespace(dataset_name=f"{split}-dataset"),
+    )
     monkeypatch.setattr(service, "load_run_artifact_plan", lambda _path: plan)
 
     def publish(role: str, digest: str) -> None:
@@ -400,18 +407,24 @@ def test_prepared_run_artifacts_share_one_analysis_producer(
         frame.attrs["artifact_provenance"] = {"producer": {"analysis_sha256": recorded[role]}}
         return SimpleNamespace(frame=frame)
 
-    def load(_path: Path, **_kwargs: Any) -> SimpleNamespace:
+    def load(_path: Path, **_kwargs: Any) -> loader.LoadedRunArtifacts:
         for role, digest in recorded.items():
             if digest is None:
                 msg = f"{role} is missing"
                 raise loader.MissingEvaluationArtifactsError(msg, role=cast("Any", _ROLE_SPLITS[role]))
-        return SimpleNamespace(id_artifact=artifact("id"), additional_artifact=artifact("additional_evaluation"))
+        return loader.LoadedRunArtifacts(
+            task="steady_flow",
+            run_name="run",
+            run_dir=run_dir,
+            id_artifact=cast("Any", artifact("id")),
+            material_ood_artifact=cast("Any", artifact("material_ood")),
+        )
 
     monkeypatch.setattr(loader, "load_run_artifacts", load)
     builds: list[tuple[str, bool]] = []
 
     def build(**kwargs: Any) -> None:
-        role = "id" if kwargs["split"] == "eval" else "additional_evaluation"
+        role = "id" if kwargs["split"] == "eval" else "material_ood"
         builds.append((role, kwargs["rebuild"]))
         publish(role, _RUNNING_ANALYSIS)
 

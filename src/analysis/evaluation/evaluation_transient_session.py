@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass, replace
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -124,7 +124,7 @@ class TransientCaseInventoryEntry:
     case_id: str
     case_label: str
     material_family: str
-    dataset_role: Literal["id", "additional_evaluation"]
+    dataset_role: sequence_artifact.DatasetRole
     dataset_name: str
     source_dataset_ids: tuple[str, ...]
     membership_digests: tuple[str, ...]
@@ -533,6 +533,7 @@ class TransientEvaluationSession:
         self._case_dataframe_cache: dict[tuple[str, ...], pd.DataFrame] = {}
         self._summary_cache: dict[tuple[str, ...], tuple[TransientSessionSummary, ...]] = {}
         self._dataset_dataframe_cache: dict[tuple[str, ...], pd.DataFrame] = {}
+        self._coordinate_records: dict[tuple[str, str], tuple[sequence_artifact.TransientSequenceArtifactIndex, Any]] = {}
 
     @property
     def frame_names(self) -> tuple[str, ...]:
@@ -610,7 +611,7 @@ class TransientEvaluationSession:
             raise KeyError(msg) from error
         return tuple(dict.fromkeys(_material_family(record) for record in _sequence_records(frame)))
 
-    def dataset_role(self, frame_name: str) -> Literal["id", "additional_evaluation"]:
+    def dataset_role(self, frame_name: str) -> sequence_artifact.DatasetRole:
         """Return the exact run-relative Dataset role for one artifact frame."""
         try:
             frame, _artifact = self._frames[frame_name]
@@ -623,13 +624,11 @@ class TransientEvaluationSession:
         provenance = frame.attrs.get("artifact_provenance")
         dataset = provenance.get("dataset") if isinstance(provenance, Mapping) else None
         role = dataset.get("role") if isinstance(dataset, Mapping) else None
-        if role in {"id", "additional_evaluation"}:
-            return cast("Literal['id', 'additional_evaluation']", role)
+        if role in sequence_artifact.DATASET_ROLES:
+            return cast("sequence_artifact.DatasetRole", role)
         roles = {_record_value(record, "dataset_role") for record in _sequence_records(frame)}
-        if roles == {"id"}:
-            return "id"
-        if roles == {"additional_evaluation"}:
-            return "additional_evaluation"
+        if len(roles) == 1 and (only := next(iter(roles))) in sequence_artifact.DATASET_ROLES:
+            return cast("sequence_artifact.DatasetRole", only)
         msg = f"Transient artifact frame {frame_name!r} has inconsistent Dataset roles."
         raise ValueError(msg)
 
@@ -747,7 +746,7 @@ class TransientEvaluationSession:
             if (
                 not isinstance(provenance, Mapping)
                 or not isinstance(dataset_value, Mapping)
-                or dataset_value.get("role") not in {"id", "additional_evaluation"}
+                or dataset_value.get("role") not in sequence_artifact.DATASET_ROLES
                 or not isinstance(artifact_root, str)
                 or not artifact_root
             ):
@@ -863,8 +862,20 @@ class TransientEvaluationSession:
             raise KeyError(msg) from error
         index = frame.attrs.get("transient_sequence_index")
         if isinstance(index, sequence_artifact.TransientSequenceArtifactIndex):
-            return index.record(str(_record_value(summary, "record_id")))
+            return self._shared_record(frame_name, index, str(_record_value(summary, "record_id")))
         return summary
+
+    def _shared_record(self, frame_name: str, index: sequence_artifact.TransientSequenceArtifactIndex, record_id: str) -> Any:
+        """Return one record opened at most once per session for the index object that loaded it."""
+        # Views of this session share each opened record; the index evicts per case and would reload it per view.
+        # A replaced index on the frame never serves a record opened from its predecessor.
+        key = (frame_name, record_id)
+        cached = self._coordinate_records.get(key)
+        if cached is not None and cached[0] is index:
+            return cached[1]
+        record = index.record(record_id)
+        self._coordinate_records[key] = (index, record)
+        return record
 
     def full_autonomous_summaries(
         self,
@@ -935,7 +946,7 @@ class TransientEvaluationSession:
                     raise ValueError(msg)
                 case_keys.add(key)
                 selected.append(
-                    index.record(str(_record_value(summary, "record_id")))
+                    self._shared_record(name, index, str(_record_value(summary, "record_id")))
                     if isinstance(index, sequence_artifact.TransientSequenceArtifactIndex)
                     else summary
                 )
@@ -1038,6 +1049,7 @@ class TransientEvaluationSession:
         self._case_dataframe_cache.clear()
         self._summary_cache.clear()
         self._dataset_dataframe_cache.clear()
+        self._coordinate_records.clear()
 
     def case_dataframe(self, *, modes: Sequence[str] = _DEFAULT_MODES) -> pd.DataFrame:
         """Return cached cumulative and endpoint rows for every available sequence."""
@@ -1231,8 +1243,8 @@ class TransientEvaluationSession:
 
     def _wandb_publication_metadata(self) -> dict[str, bool | float | int | str]:
         """Reduce validated role provenance and raw clocks to bounded identities."""
-        if "id" not in self._frames or set(self._frames).difference({"id", "additional_evaluation"}):
-            msg = "Transient W&B publication requires an ID frame and at most one additional Evaluation frame."
+        if "id" not in self._frames or set(self._frames).difference(sequence_artifact.DATASET_ROLES):
+            msg = "Transient W&B publication requires an ID frame and at most one material-OOD and one parameter-OOD frame."
             raise ValueError(msg)
 
         run_evidence: list[Mapping[str, Any]] = []

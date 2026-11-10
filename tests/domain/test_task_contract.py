@@ -24,7 +24,6 @@ def test_steady_flow_contract_is_task_owned_and_scientifically_complete() -> Non
 
     assert task.in_channels == len(task.input_names)
     assert task.out_channels == len(task.output_names)
-    assert task.schema_version == domain.tasks.spec.TASK_SCHEMA_VERSION
     assert task.preprocessing.fit_split == "train"
     assert task.operator_dimensionality == len(task.operator_axes)
 
@@ -55,14 +54,6 @@ def test_steady_flow_contract_is_task_owned_and_scientifically_complete() -> Non
     data_contract = task.data_contract_payload()
     assert "default_metrics" not in data_contract
     assert "output_groups" not in data_contract
-
-
-def test_task_schema_rejects_an_unsupported_version() -> None:
-    """Reject a contract version other than the public current schema."""
-    task = domain.tasks.registry.get_task("steady_flow")
-
-    with pytest.raises(ValueError, match="schema_version must be integer"):
-        replace(task, schema_version=task.schema_version + 1)
 
 
 def test_ordered_contract_validator_rejects_drift() -> None:

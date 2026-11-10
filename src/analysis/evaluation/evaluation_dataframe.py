@@ -32,7 +32,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src import common
 from src.analysis.artifacts import contracts
 from src.analysis.presentation import analysis_display_grid as display_grid
 
@@ -60,7 +59,6 @@ PRESSURE_BOUNDARY_METRICS = (
 )
 _BASE_ARTIFACT_COLUMNS = frozenset(
     {
-        "artifact_schema_version",
         "task_id",
         "output_fields",
         "output_units",
@@ -279,14 +277,6 @@ def _validate_artifact_table(
         msg = f"Evaluation artifact table is missing required schema columns: {missing_base}."
         raise ValueError(msg)
 
-    schema_values = frame["artifact_schema_version"].tolist()
-    if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in schema_values):
-        msg = "artifact_schema_version must contain integer values."
-        raise TypeError(msg)
-    if not all(common.serialization.is_schema_version(int(value), contracts.ARTIFACT_SCHEMA_VERSION) for value in schema_values):
-        msg = f"Evaluation artifact table requires schema version {contracts.ARTIFACT_SCHEMA_VERSION}."
-        raise ValueError(msg)
-
     task_values = frame["task_id"].tolist()
     if any(not isinstance(value, str) or not value for value in task_values) or len(set(task_values)) != 1:
         msg = "Evaluation artifact table must contain one non-empty task_id."
@@ -468,20 +458,12 @@ def _validated_provenance(
     """
     Admit the provenance fields consumed by the public analysis surface.
 
-    Current schema versions, task/field/unit contracts, group objective,
-    aggregate evidence, split role, dataset fingerprint, and positive model
-    counts must agree with the already validated Parquet table. Scientific
-    contradictions raise :class:`ComparisonCompatibilityError`.
+    Task/field/unit contracts, group objective, aggregate evidence, split
+    role, dataset fingerprint, and positive model counts must agree with the
+    already validated Parquet table. Scientific contradictions raise
+    :class:`ComparisonCompatibilityError`.
     """
     payload = dict(provenance)
-    for field, expected in (
-        ("provenance_schema_version", contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
-        ("artifact_schema_version", contracts.ARTIFACT_SCHEMA_VERSION),
-    ):
-        if not common.serialization.is_schema_version(payload.get(field), expected):
-            msg = f"Evaluation provenance requires integer {field}={expected}."
-            raise ValueError(msg)
-
     run = _mapping(payload.get("run"), label="provenance.run")
     evaluator = _mapping(payload.get("evaluator"), label="provenance.evaluator")
     if run.get("task") != task_id:
@@ -529,8 +511,8 @@ def _validated_provenance(
         raise ComparisonCompatibilityError(msg)
 
     split_role = payload.get("split_role")
-    if split_role not in {"eval", "additional_evaluation"}:
-        msg = f"Artifact split_role must be explicit eval or additional_evaluation, got {split_role!r}."
+    if split_role not in {"eval", "material_ood", "parameter_ood"}:
+        msg = f"Artifact split_role must be explicit eval, material_ood or parameter_ood, got {split_role!r}."
         raise ComparisonCompatibilityError(msg)
     selection = _mapping(payload.get("selection"), label="provenance.selection")
     effective_count = selection.get("effective_case_count")
@@ -541,12 +523,8 @@ def _validated_provenance(
     if not isinstance(dataset.get("source_identities"), list) or not dataset["source_identities"]:
         msg = "Artifact provenance dataset must bind at least one source Dataset identity."
         raise TypeError(msg)
-    raw_physics = payload.get("physics")
-    if raw_physics is not None:
-        physics = _mapping(raw_physics, label="provenance.physics")
-        if not common.serialization.is_schema_version(physics.get("residual_schema_version"), contracts.RESIDUAL_SCHEMA_VERSION):
-            msg = f"Artifact physics requires integer residual_schema_version={contracts.RESIDUAL_SCHEMA_VERSION}."
-            raise ValueError(msg)
+    if payload.get("physics") is not None:
+        _mapping(payload["physics"], label="provenance.physics")
 
     model = _mapping(payload.get("model"), label="provenance.model")
     counts = _mapping(model.get("parameter_counts"), label="provenance.model.parameter_counts")
@@ -574,12 +552,11 @@ def _apply_contract_attrs(
     """
     Attach the authoritative analysis contract to a DataFrame in place.
 
-    Table-only frames receive schema/task/field attrs and an explicit
+    Table-only frames receive task/field attrs and an explicit
     ``provenance_complete=False`` marker. Complete provenance additionally binds
-    input fields/units, split role, artifact root, and residual schema after
-    validation. No row values are changed here.
+    input fields/units, split role, and artifact root after validation. No row
+    values are changed here.
     """
-    frame.attrs["artifact_schema_version"] = contracts.ARTIFACT_SCHEMA_VERSION
     frame.attrs["task_id"] = task_id
     frame.attrs["output_fields"] = output_fields
     frame.attrs["output_units"] = output_units
@@ -603,7 +580,6 @@ def _apply_contract_attrs(
     )
     frame.attrs["provenance_complete"] = True
     frame.attrs["artifact_provenance"] = validated
-    frame.attrs["provenance_schema_version"] = validated["provenance_schema_version"]
     evaluator = _mapping(validated["evaluator"], label="provenance.evaluator")
     input_fields = _string_sequence(evaluator["input_fields"], label="provenance.evaluator.input_fields", require_unique=True)
     input_units = _mapping(evaluator["input_units"], label="provenance.evaluator.input_units")
@@ -617,9 +593,6 @@ def _apply_contract_attrs(
     frame.attrs["train_standard_deviations"] = dict(train_standard_deviations)
     frame.attrs["normalization_denominator_floor"] = denominator_floor
     frame.attrs["dataset_role"] = validated["split_role"]
-    frame.attrs["residual_schema_version"] = (
-        validated.get("physics", {}).get("residual_schema_version") if isinstance(validated.get("physics"), Mapping) else None
-    )
 
 
 def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
@@ -756,17 +729,13 @@ def field_units(frame: pd.DataFrame) -> dict[str, str]:
 
 def dataset_role(frame: pd.DataFrame) -> str:
     """
-    Return ``ID`` or ``OOD`` from the explicit saved split role.
+    Return ``ID``, ``Material OOD`` or ``Parameter OOD`` from the explicit saved split role.
 
     Unknown roles are disclosed as ``unspecified`` rather than inferred from a
     dataset or run name.
     """
-    role = frame.attrs.get("dataset_role")
-    if role == "eval":
-        return "ID"
-    if role == "additional_evaluation":
-        return "Additional evaluation"
-    return "unspecified"
+    labels = {"eval": "ID", "material_ood": "Material OOD", "parameter_ood": "Parameter OOD"}
+    return labels.get(str(frame.attrs.get("dataset_role")), "unspecified")
 
 
 def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dict[str, Any]:
@@ -782,8 +751,6 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
     identity: dict[str, Any] = {
         "task": provenance.get("run", {}).get("task"),
         "task_contract_digest": provenance.get("run", {}).get("task_contract_digest"),
-        "artifact_schema_version": provenance.get("artifact_schema_version"),
-        "provenance_schema_version": provenance.get("provenance_schema_version"),
         "objective": evaluator.get("objective"),
         "input_fields": evaluator.get("input_fields"),
         "input_units": evaluator.get("input_units"),
@@ -798,7 +765,6 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
     if physics:
         raw_physics = _mapping(provenance.get("physics"), label="provenance.physics")
         identity["physics"] = {
-            "residual_schema_version": raw_physics.get("residual_schema_version"),
             "equation_kind": raw_physics.get("equation_kind"),
             "continuity_kind": raw_physics.get("continuity_kind"),
             "boundary_condition_kind": raw_physics.get("boundary_condition_kind"),
@@ -851,9 +817,13 @@ def _exact_comparison_grids(frame: pd.DataFrame) -> tuple[tuple[tuple[int, int, 
     grids: list[display_grid.SpatialGridIdentity] = []
     coordinate_units = cases._coordinate_units(frame)  # noqa: SLF001
     field_order = tuple(frame.attrs["output_fields"])
+    artifact_root = str(frame.attrs.get("artifact_root", ""))
     for path, witness in zip(paths, witnesses, strict=True):
         try:
-            with np.load(path, allow_pickle=False) as payload:
+            with (
+                contracts.open_verified_case_payload(artifact_root, frame.attrs.get("artifact_provenance") or {}, path) as handle,
+                np.load(handle, allow_pickle=False) as payload,
+            ):
                 if "coordinates" not in payload.files:
                     msg = f"Current Evaluation artifact {path} lacks its exact coordinate member; rebuild the artifact."
                     raise ComparisonCompatibilityError(msg)
@@ -890,7 +860,7 @@ def validate_comparison(
     datasets : Mapping[str, pandas.DataFrame]
         Non-empty labelled frames with complete admitted provenance.
     require_physics : bool, optional
-        Also require the maintained steady-flow residual schema and exact physics
+        Also require the maintained steady-flow task and exact physics
         equation, derivative, crop, boundary, and array definitions.
     verify_grid : bool, optional
         Compare every matched steady case's exact coordinate member before a
@@ -924,13 +894,9 @@ def validate_comparison(
             msg = "Evaluation dataset labels must be non-empty strings."
             raise TypeError(msg)
         provenance = provenances[label] = require_complete_provenance(frame)
-        if require_physics:
-            if frame.attrs.get("task_id") != "steady_flow":
-                msg = f"Physics plots are unavailable for task {frame.attrs.get('task_id')!r}."
-                raise ComparisonCompatibilityError(msg)
-            if not common.serialization.is_schema_version(frame.attrs.get("residual_schema_version"), contracts.RESIDUAL_SCHEMA_VERSION):
-                msg = f"Physics plots require integer residual schema {contracts.RESIDUAL_SCHEMA_VERSION}."
-                raise ComparisonCompatibilityError(msg)
+        if require_physics and frame.attrs.get("task_id") != "steady_flow":
+            msg = f"Physics plots are unavailable for task {frame.attrs.get('task_id')!r}."
+            raise ComparisonCompatibilityError(msg)
         role = str(provenance.get("split_role"))
         grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))
         frames_by_role.setdefault(role, []).append((label, frame))
@@ -954,8 +920,6 @@ def validate_comparison(
             for key in (
                 "task",
                 "task_contract_digest",
-                "artifact_schema_version",
-                "provenance_schema_version",
                 "objective",
                 "input_fields",
                 "input_units",

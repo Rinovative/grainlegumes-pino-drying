@@ -1,0 +1,17 @@
+# Role: Dataset plan of the acceptance smoke: the first points of the fixed designs; run after every infrastructure change. Edit: never; the acceptance binds this file by hash.
+schema_kind: dataset_plan
+task: transient_drying
+materials:  # Plan order = name order. Counts per design kind, each a power of two; an OOD material draws from its own test design.
+  lentil: {role: id, train: 1, validation: 1, test: 1, parameter_ood: 1}
+  chickpea: {role: id, train: 1, validation: 1, test: 1, parameter_ood: 1}
+  kidney_bean: {role: ood, test: 2}
+generation:
+  seed_base: 9200  # Generation root of the transient task; every design seed derives from it, the material and the design kind.
+  minimum_success_rate: 0.6  # Per material: stop replacing once the one-sided 95 % upper bound of the success rate falls below this value.
+  sources_config: configs/01_generation/physical_model/sources.yaml
+  registry_config: configs/01_generation/physical_model/registry.yaml
+  common_config: configs/01_generation/physical_model/common.yaml
+  operations_config: configs/01_generation/physical_model/fixed_bed.yaml
+  bed_fields_config: configs/01_generation/physical_model/bed_fields.yaml
+  profile_config: configs/01_generation/physical_model/profiles/transient_drying.yaml
+  execution_config: configs/01_generation/execution.yaml

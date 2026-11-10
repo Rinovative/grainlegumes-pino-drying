@@ -30,7 +30,7 @@ from src.generation.publication import generation_publication_catalog as catalog
 @pytest.fixture
 def relocated_run(generation_config_factory: Any, tmp_path: Path) -> dict[str, Any]:
     """Keep frozen origin locators while publishing tiny evidence under a read root."""
-    config, template = generation_config_factory(simulation_profile="steady_flow", scheduler_kind="slurm", natural_count=1)
+    config, template = generation_config_factory(simulation_profile="steady_flow", natural_count=1)
     campaign = generation.cases.config.load_campaign_config(config)
     storage = tmp_path / "read-storage"
     origin = tmp_path / "unmounted-origin"
@@ -163,7 +163,7 @@ def test_raw_case_reader_admits_relocated_frozen_source_and_checks_exact_identit
     root = lifecycle.create_campaign(campaign, storage_root=storage)
     batch = campaign.batches[0]
     inputs = generation.cases.input_generation.generate_input_cases(batch, 1, storage_root=storage)
-    outcome = generation.runtime.run_case(batch, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work")
+    outcome = generation.runtime.run_case(batch, 1, cores_per_case=1, storage_root=storage, work_root=tmp_path / "work", scheduler_kind="local")
     assert outcome.status == "completed"
     validated = generation.runtime.validate_completed_case(batch, 1, storage_root=storage, validation_depth="routine")
     artifact = outcome.processed_directory / "case.h5"

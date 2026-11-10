@@ -27,6 +27,7 @@ import json
 import math
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from numbers import Integral, Real
 from pathlib import Path
@@ -42,7 +43,6 @@ from src.analysis.evaluation import evaluation_transient_validity as transient_v
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "evaluation_transient_sequence"
-TRANSIENT_SEQUENCE_SCHEMA_VERSION: Final = 1
 TRANSIENT_ARTIFACT_KIND: Final = "transient_sequence"
 _STEP_CONTRACT: Final = transient_contract.TRANSIENT_STEP_CONTRACT
 STATE_ORDER: Final = tuple(field.name for field in _STEP_CONTRACT.dynamic_state)
@@ -61,7 +61,8 @@ _RESUME_DESCRIPTOR_NAME: Final = ".transient-resume.json"
 _CASE_MANIFEST_DIRECTORY_NAME: Final = ".transient-cases"
 
 EvaluationMode = Literal["teacher_forced_one_step", "autonomous_full", "rolling_origin"]
-DatasetRole = Literal["id", "additional_evaluation"]
+DatasetRole = Literal["id", "material_ood", "parameter_ood"]
+DATASET_ROLES: Final[tuple[DatasetRole, ...]] = ("id", "material_ood", "parameter_ood")
 RequestedHorizon = int | Literal["full"]
 EVALUATION_MODES: Final[tuple[EvaluationMode, ...]] = (
     "teacher_forced_one_step",
@@ -123,7 +124,6 @@ _TARGET_KEYS: Final = {
 }
 _EXCLUSION_KEYS: Final = {"excluded", "reason"}
 _SPATIAL_IDENTITY_KEYS: Final = {
-    "schema_version",
     "source_shape",
     "evaluation_spatial_stride",
     "evaluation_shape",
@@ -323,8 +323,7 @@ def _validate_spatial_representation_identity(
         raise TransientSequenceArtifactError(message) from error
     serialized = representation.as_dict()
     if (
-        not common.serialization.is_schema_version(result["schema_version"], serialized["schema_version"])
-        or evaluation != serialized["represented_shape"]
+        evaluation != serialized["represented_shape"]
         or result["axis_indices"] != serialized["axis_indices"]
         or result["index_identity_sha256"] != serialized["index_identity_sha256"]
         or result["representation_transformation"] != serialized["representation_transformation"]
@@ -428,7 +427,6 @@ def build_transient_spatial_identity(
     }
     serialized = representation.as_dict()
     core = {
-        "schema_version": serialized["schema_version"],
         "source_shape": serialized["source_shape"],
         "evaluation_spatial_stride": serialized["spatial_stride"],
         "evaluation_shape": serialized["represented_shape"],
@@ -485,19 +483,19 @@ def validate_sequence_identity(value: Mapping[str, Any], *, case_id: str, datase
     assignment = identity["evaluation_assignment"]
     if dataset_role == "id":
         if assignment is not None:
-            message = "ID-test sequence cannot claim an additional Evaluation assignment."
+            message = "ID-test sequence cannot claim an OOD Evaluation assignment."
             raise TransientSequenceArtifactError(message)
     elif (
         not isinstance(assignment, dict)
         or set(assignment) != {"dataset_id", "role", "relation", "assumptions"}
         or assignment.get("dataset_id") != dataset_identity.get("source_dataset_id")
-        or assignment.get("role") != "ood"
+        or assignment.get("role") != dataset_role
         or not isinstance(assignment.get("relation"), str)
         or not assignment["relation"].strip()
         or not isinstance(assignment.get("assumptions"), list)
         or any(not isinstance(item, str) or not item.strip() for item in assignment["assumptions"])
     ):
-        message = "Additional Evaluation sequence lacks its exact Dataset-declared assignment."
+        message = "OOD Evaluation sequence lacks its exact Dataset-declared assignment."
         raise TransientSequenceArtifactError(message)
     if identity["model_kind"] not in {"fno", "uno", "rno"}:
         message = "Sequence model kind must be exactly 'fno', 'uno', or 'rno'."
@@ -703,7 +701,6 @@ class TransientSequenceRecord:
     def record_id(self) -> str:
         """Return a stable content-independent semantic record identifier."""
         payload = {
-            "schema": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
             "mode": self.mode,
             "case_id": self.case_id,
             "dataset_role": self.dataset_role,
@@ -726,8 +723,8 @@ class TransientSequenceRecord:
             message = f"Unsupported transient Evaluation mode {self.mode!r}."
             raise TransientSequenceArtifactError(message)
         case_id = _nonempty_text(self.case_id, label="case_id")
-        if self.dataset_role not in {"id", "additional_evaluation"}:
-            message = "Dataset role must be 'id' or 'additional_evaluation'."
+        if self.dataset_role not in DATASET_ROLES:
+            message = f"Dataset role must be one of {list(DATASET_ROLES)}."
             raise TransientSequenceArtifactError(message)
         origin_index = _nonnegative_int(self.origin_index, label="origin_index")
         available = _nonnegative_int(self.available_horizon, label="available_horizon")
@@ -964,7 +961,7 @@ class UnavailableHorizon:
         requested = _nonnegative_int(self.requested_horizon, label="unavailable requested_horizon")
         available = _nonnegative_int(self.available_transitions, label="unavailable available_transitions")
         reason = _nonempty_text(self.reason, label="unavailable reason")
-        if self.dataset_role not in {"id", "additional_evaluation"} or requested < 1 or available >= requested:
+        if self.dataset_role not in DATASET_ROLES or requested < 1 or available >= requested:
             message = "Unavailable horizon evidence must identify a genuinely unsupported fixed horizon."
             raise TransientSequenceArtifactError(message)
         return {
@@ -1021,7 +1018,6 @@ def _record_row(
     target = record.target
     return {
         "schema_kind": TRANSIENT_SEQUENCE_SCHEMA_KIND,
-        "schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
         "record_id": record.record_id,
         "case_id": record.case_id,
         "dataset_role": record.dataset_role,
@@ -1308,8 +1304,8 @@ class TransientSequenceArtifactStager:
             message = f"Transient artifact staging root must not be symbolic: {artifact_root}"
             raise ValueError(message)
         self.dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
-        if dataset_role not in {"id", "additional_evaluation"}:
-            message = "dataset_role must be 'id' or 'additional_evaluation'."
+        if dataset_role not in DATASET_ROLES:
+            message = f"dataset_role must be one of {list(DATASET_ROLES)}."
             raise ValueError(message)
         self.dataset_role: DatasetRole = dataset_role
         self.root = artifact_root.resolve()
@@ -1349,7 +1345,6 @@ class TransientSequenceArtifactStager:
     def _open_or_create_resumable_stage(self) -> None:
         descriptor_path = self._resume_descriptor_path()
         expected = {
-            "schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
             "dataset_name": self.dataset_name,
             "dataset_role": self.dataset_role,
             "resume_identity": self._resume_identity,
@@ -1371,7 +1366,7 @@ class TransientSequenceArtifactStager:
         except (OSError, json.JSONDecodeError) as error:
             message = f"Transient partial artifact is corrupt; rerun with --rebuild: {self.root}"
             raise TransientSequenceArtifactError(message) from error
-        if descriptor != expected or not common.serialization.is_schema_version(descriptor["schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION):
+        if descriptor != expected:
             message = f"Transient partial artifact is incompatible; rerun with --rebuild: {self.root}"
             raise TransientSequenceArtifactError(message)
         manifest_directory = self.root / self._CASE_MANIFEST_DIRECTORY
@@ -1539,7 +1534,7 @@ class TransientSequenceArtifactStager:
         temporary_path = payload_path.with_name(f".{payload_path.stem}.partial{payload_path.suffix}")
         stored_chain = _write_case_bundle(temporary_path, admitted)
         temporary_path.replace(payload_path)
-        payload_digest = contracts.cached_file_sha256(payload_path)
+        payload_digest = common.serialization.cached_file_sha256(payload_path)
         payload = (relative.as_posix(), payload_digest)
         rows = [
             _record_row(
@@ -1588,7 +1583,7 @@ class TransientSequenceArtifactStager:
             message = "Transient sequence artifacts require at least one staged case."
             raise ValueError(message)
         frame = pd.DataFrame.from_records(self._rows)
-        parquet_path = self.root / f"{self.dataset_name}.parquet"
+        parquet_path = self.root / common.paths.ANALYSIS_ARTIFACTS_FILENAME
         frame.to_parquet(parquet_path, index=False)
         admitted_provenance = _json_copy(
             provenance,
@@ -1620,13 +1615,11 @@ class TransientSequenceArtifactStager:
         outputs = {
             "parquet": {
                 "path": parquet_path.relative_to(self.root).as_posix(),
-                "sha256": contracts.cached_file_sha256(parquet_path),
+                "sha256": common.serialization.cached_file_sha256(parquet_path),
             },
             "npz": [{"path": relative, "sha256": digest} for relative, digest in sorted(self._case_payloads.values())],
         }
         document = {
-            "provenance_schema_version": (contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION),
-            "artifact_schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
             "artifact_kind": TRANSIENT_ARTIFACT_KIND,
             "task": "transient_drying",
             **admitted_provenance,
@@ -1769,20 +1762,23 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
     """
 
     def __init__(self, path: Path, *, expected_sha256: str, chain_lengths: Mapping[str, int]) -> None:
-        if contracts.cached_file_sha256(path) != expected_sha256:
-            message = f"Transient case payload digest changed: {path}"
-            raise TransientSequenceArtifactError(message)
-        try:
-            archive = np.load(path, allow_pickle=False)
-        except (OSError, ValueError) as error:
-            message = f"Transient case payload cannot be opened: {path}"
-            raise TransientSequenceArtifactError(message) from error
-        if not hasattr(archive, "files") or not hasattr(archive, "close"):
-            close = getattr(archive, "close", None)
-            if callable(close):
-                close()
-            message = f"Transient case payload is not one NPZ archive: {path}"
-            raise TransientSequenceArtifactError(message)
+        changed = TransientSequenceArtifactError(f"Transient case payload digest changed: {path}")
+        with ExitStack() as stack:
+            verified = stack.enter_context(common.serialization.open_verified_file(path, expected_sha256, changed))
+            try:
+                archive = np.load(verified.stream, allow_pickle=False)
+                verified.require_unchanged()
+            except (OSError, ValueError) as error:
+                message = f"Transient case payload cannot be opened: {path}"
+                raise TransientSequenceArtifactError(message) from error
+            if not hasattr(archive, "files") or not hasattr(archive, "close"):
+                close = getattr(archive, "close", None)
+                if callable(close):
+                    close()
+                message = f"Transient case payload is not one NPZ archive: {path}"
+                raise TransientSequenceArtifactError(message)
+            self._handle = stack.pop_all()
+        self._verified = verified
         self._archive: Any = archive
         self._fields = frozenset(str(name) for name in archive.files)
         self._arrays: dict[str, np.ndarray] = {}
@@ -1819,6 +1815,8 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
             return cached
         try:
             value = np.asarray(self._archive[key])
+            # The archive reads lazily from the verified file; an in-place rewrite since the check would feed unverified bytes.
+            self._verified.require_unchanged()
         except (OSError, ValueError, KeyError) as error:
             message = f"Transient case payload member cannot be read: {key!r}"
             raise TransientSequenceArtifactError(message) from error
@@ -1843,6 +1841,7 @@ class _TransientCasePayload(Mapping[str, np.ndarray]):
         if self._closed:
             return
         self._archive.close()
+        self._handle.close()
         self._arrays.clear()
         self._chains.clear()
         self._closed = True
@@ -2066,7 +2065,6 @@ class TransientSequenceArtifactIndex:
 _SUMMARY_COLUMNS = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "record_id",
         "case_id",
         "dataset_role",
@@ -2106,12 +2104,8 @@ def _summary_from_row(  # noqa: C901
     if set(row) != _SUMMARY_COLUMNS:
         message = "Transient sequence summary columns do not match the current schema."
         raise TransientSequenceArtifactError(message)
-    if (
-        row["schema_kind"] != TRANSIENT_SEQUENCE_SCHEMA_KIND
-        or not common.serialization.is_schema_version(row["schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION)
-        or row["dataset_role"] != dataset_role
-    ):
-        message = "Transient sequence summary schema or Dataset role is incompatible."
+    if row["schema_kind"] != TRANSIENT_SEQUENCE_SCHEMA_KIND or row["dataset_role"] != dataset_role:
+        message = "Transient sequence summary schema kind or Dataset role is incompatible."
         raise TransientSequenceArtifactError(message)
     mode = row["mode"]
     if mode not in {"teacher_forced_one_step", "autonomous_full", "rolling_origin"}:
@@ -2150,7 +2144,6 @@ def _summary_from_row(  # noqa: C901
     record_id = _nonempty_text(row["record_id"], label="summary record_id")
     expected = common.serialization.canonical_json_sha256(
         {
-            "schema": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
             "mode": mode,
             "case_id": case_id,
             "dataset_role": dataset_role,
@@ -2345,40 +2338,36 @@ def validate_transient_sequence_payload_inventory(
         summaries = tuple(summary for summary in index.summaries if summary.case_id == case_id)
         path = _require_relative_payload(index.root, summaries[0].payload_path)
         chain_fields = {f"chain_{summary.chain_id}_{suffix}" for summary in summaries for suffix in _CHAIN_FIELDS}
-        with np.load(path, allow_pickle=False) as loaded:
+        changed = TransientSequenceArtifactError(f"Transient case payload digest changed: {path}")
+        with (
+            common.serialization.open_verified_file(path, summaries[0].payload_sha256, changed) as verified,
+            np.load(verified.stream, allow_pickle=False) as loaded,
+        ):
             actual = set(loaded.files)
+            try:
+                verified.require_unchanged()
+            except OSError as error:
+                message = f"Transient case payload changed while it was read: {path}"
+                raise TransientSequenceArtifactError(message) from error
         if actual != common_fields.union(chain_fields):
             message = f"Transient case payload field inventory contradicts its summary for case {case_id!r}."
             raise TransientSequenceArtifactError(message)
 
 
 def _manifest_npz_digests(outputs: Any) -> dict[str, str]:
-    """Return the already-verified output-manifest digest for each NPZ payload."""
-    if not isinstance(outputs, Mapping) or set(outputs) != {"parquet", "npz"}:
-        message = "Transient artifact output manifest has an unsupported schema."
-        raise TransientSequenceArtifactError(message)
-    npz_entries = outputs["npz"]
-    if not isinstance(npz_entries, list):
-        message = "Transient artifact output manifest NPZ entries must be a list."
-        raise TransientSequenceArtifactError(message)
-    digests: dict[str, str] = {}
-    for entry in npz_entries:
-        if not isinstance(entry, Mapping) or set(entry) != {"path", "sha256"}:
-            message = "Transient artifact output manifest NPZ entry is invalid."
-            raise TransientSequenceArtifactError(message)
-        path = entry["path"]
-        digest = entry["sha256"]
-        if (
-            not isinstance(path, str)
-            or not isinstance(digest, str)
-            or len(digest) != _SHA256_HEX_LENGTH
-            or any(character not in "0123456789abcdef" for character in digest)
-            or path in digests
-        ):
-            message = "Transient artifact output manifest NPZ entry is unsafe."
-            raise TransientSequenceArtifactError(message)
-        digests[path] = digest
-    return digests
+    """Return the recorded digest for each NPZ payload through the shared manifest contract."""
+    try:
+        return contracts.manifest_npz_digests(outputs)
+    except ValueError as error:
+        raise TransientSequenceArtifactError(str(error)) from error
+
+
+def _require_output_structure(artifact_root: Path, outputs: Any) -> None:
+    """Bind the on-disk payload set to the recorded manifest through the shared structure check."""
+    try:
+        contracts.require_output_structure(artifact_root, outputs)
+    except ValueError as error:
+        raise TransientSequenceArtifactError(str(error)) from error
 
 
 def _validate_case_payload_manifest(
@@ -2420,8 +2409,8 @@ def _index_from_admitted_frame(
         label="artifact dataset.name",
     )
     dataset_role = dataset.get("role")
-    if dataset_role not in {"id", "additional_evaluation"}:
-        message = "Transient artifact Dataset role must be id or additional_evaluation."
+    if dataset_role not in DATASET_ROLES:
+        message = f"Transient artifact Dataset role must be one of {list(DATASET_ROLES)}."
         raise TransientSequenceArtifactError(message)
     if frame.empty or "record_id" not in frame or frame["record_id"].duplicated().any():
         message = "Transient artifact summary must contain unique non-empty records."
@@ -2508,8 +2497,6 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
     with marker.open("r", encoding="utf-8") as handle:
         provenance = json.load(handle)
     required = {
-        "provenance_schema_version",
-        "artifact_schema_version",
         "artifact_kind",
         "task",
         "producer",
@@ -2530,25 +2517,13 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
     # Recorded evidence only: a historical artifact is never compared with the running analysis code here.
     contracts.validate_analysis_producer(provenance["producer"])
     expected_static = {
-        "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": TRANSIENT_SEQUENCE_SCHEMA_VERSION,
         "artifact_kind": TRANSIENT_ARTIFACT_KIND,
         "task": "transient_drying",
     }
-    if not common.serialization.is_schema_version(provenance["artifact_schema_version"], TRANSIENT_SEQUENCE_SCHEMA_VERSION):
-        message = (
-            f"Transient artifact schema version {provenance['artifact_schema_version']!r} is unsupported; "
-            f"expected {TRANSIENT_SEQUENCE_SCHEMA_VERSION}. Regenerate the artifact."
-        )
+    if any(provenance[key] != value for key, value in expected_static.items()):
+        message = "Transient artifact kind or task identity is unsupported."
         raise TransientSequenceArtifactError(message)
-    if any(provenance[key] != value for key, value in expected_static.items()) or not common.serialization.is_schema_version(
-        provenance["provenance_schema_version"], contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION
-    ):
-        message = "Transient artifact schema or task identity is unsupported."
-        raise TransientSequenceArtifactError(message)
-    if provenance["outputs"] != contracts.artifact_output_manifest(artifact_root):
-        message = "Transient artifact output manifest does not match current payload bytes."
-        raise TransientSequenceArtifactError(message)
+    _require_output_structure(artifact_root, provenance["outputs"])
     identity_document = _scientific_identity_document(provenance)
     if provenance["identity_sha256"] != common.serialization.canonical_json_sha256(identity_document):
         message = "Transient artifact identity digest is invalid."
@@ -2565,14 +2540,13 @@ def load_transient_sequence_artifact_index(root: Path | str, *, cache_limit: int
     if not isinstance(dataset, dict):
         message = "Transient artifact Dataset provenance must be a mapping."
         raise TypeError(message)
-    dataset_name = common.paths.validate_logical_name(dataset.get("name"), label="artifact dataset.name")
-    dataset_role = dataset.get("role")
-    if dataset_role not in {"id", "additional_evaluation"}:
-        message = "Transient artifact Dataset role must be id or additional_evaluation."
+    common.paths.validate_logical_name(dataset.get("name"), label="artifact dataset.name")
+    if dataset.get("role") not in DATASET_ROLES:
+        message = f"Transient artifact Dataset role must be one of {list(DATASET_ROLES)}."
         raise TransientSequenceArtifactError(message)
     parquet_files = sorted(artifact_root.glob("*.parquet"))
-    if len(parquet_files) != 1 or parquet_files[0].name != f"{dataset_name}.parquet":
-        message = "Transient artifact Parquet filename contradicts its Dataset identity."
+    if len(parquet_files) != 1 or parquet_files[0].name != common.paths.ANALYSIS_ARTIFACTS_FILENAME:
+        message = f"Transient artifact Parquet must be exactly {common.paths.ANALYSIS_ARTIFACTS_FILENAME}."
         raise TransientSequenceArtifactError(message)
     frame = pd.read_parquet(parquet_files[0])
     return _index_from_admitted_frame(

@@ -2,9 +2,11 @@
 
 Responsibilities:
   - Resolve verified steady package runtimes for training and evaluation Datasets
-  - Bind Train/validation/ID-test to the Dataset-owned fixed case partition and each additional source to its declared OOD cases
+  - Bind Train (or its ``train_subset``), validation and ID-test to the Dataset-owned fixed case partition, material OOD to
+    the declared OOD cases of the training and material-OOD Datasets and parameter OOD to the training Dataset's
+    parameter-OOD cases
   - Report the startup phases both tasks share and obtain Train-only scaling through the shared scaling service
-  - Seed workers and construct train, validation, ID-test and additional evaluation loaders
+  - Seed workers and construct train, validation, ID-test, material-OOD and parameter-OOD loaders (none for an empty part)
 
 Design principles:
   - Membership comes from Dataset manifests; run seeds never repartition data
@@ -105,25 +107,24 @@ def _split_identity(dataset: steady.SteadyFlowDataset) -> dict[str, Any]:
     return splits.split_dataset_identity(_binding(dataset), dataset.payload_identity)
 
 
-def _additional_evaluation_dataset(
-    parts: Sequence[tuple[steady.SteadyFlowDataset, Sequence[str]]],
-) -> tuple[Dataset[Any] | None, tuple[int, ...]]:
-    """Combine the evaluation packages in split order and locate their declared OOD cases."""
+def _ood_dataset(parts: Sequence[tuple[steady.SteadyFlowDataset, Sequence[str]]], *, role: str) -> Dataset[Any] | None:
+    """Combine one OOD role's evaluation packages in split order and select their declared cases; ``None`` when empty."""
     if not parts:
-        return None, ()
+        return None
     combined = splits.combine_identity_datasets([dataset for dataset, _ in parts])
     positions: list[int] = []
     offset = 0
     for dataset, case_ids in parts:
-        positions.extend(offset + position for position in splits.role_positions(dataset.identity, case_ids, label="additional_evaluation"))
+        positions.extend(offset + position for position in splits.role_positions(dataset.identity, case_ids, label=role))
         offset += dataset.identity.sample_count
-    return combined, tuple(positions)
+    return Subset(combined, positions)
 
 
 def create_dataloaders(
     *,
     train_dataset_id: str,
-    additional_evaluation_dataset_ids: Sequence[str],
+    material_ood_dataset_ids: Sequence[str],
+    train_subset: int | None,
     task: TaskSpec,
     model_sha256: str,
     storage_root: Path | str | None = None,
@@ -145,8 +146,10 @@ def create_dataloaders(
     ----------
     train_dataset_id : str
         Published steady Dataset with a fixed Train/validation/ID-test partition.
-    additional_evaluation_dataset_ids : Sequence[str]
-        Published Datasets whose declared OOD cases are evaluated in addition.
+    material_ood_dataset_ids : Sequence[str]
+        Published Datasets whose declared OOD cases join the training Dataset's in the material-OOD part.
+    train_subset : int | None
+        ``data.train_subset``: ``None`` trains on every Train case, N on the first N per ID material; scalers fit on it.
     task : TaskSpec
         Authoritative task contract.
     model_sha256 : str
@@ -180,8 +183,8 @@ def create_dataloaders(
     Returns
     -------
     tuple[DataLoader, dict[str, DataLoader | None], DefaultDataProcessor, dict[str, Any], dict[str, Any]]
-        A shuffled train loader, the ``eval`` (validation), ``id_test`` and
-        ``additional_evaluation`` loaders, the processor, the split payload and the scaling artifact.
+        A shuffled train loader, the ``eval`` (validation), ``id_test``, ``material_ood`` and ``parameter_ood`` loaders
+        (``None`` for an empty OOD part), the processor, the split payload and the scaling artifact.
 
     Raises
     ------
@@ -203,24 +206,39 @@ def create_dataloaders(
         msg = f"Training Dataset {train_dataset_id!r} does not belong to task {task.id!r}."
         raise ValueError(msg)
     fixed = partition_contract.validate_training_partition(
-        binding.case_partition, dataset_id=train_dataset_id, case_ids=binding.case_ids, material_by_case=binding.materials
+        binding.case_partition,
+        dataset_id=train_dataset_id,
+        case_ids=binding.case_ids,
+        material_by_case=binding.materials,
+        design_kind_by_case=binding.design_kinds,
     )
     assignments = package_manifest.declared_evaluation_assignments(
-        _STEADY_TASK, train_dataset_id, tuple(additional_evaluation_dataset_ids), storage_root=storage_root
+        _STEADY_TASK, train_dataset_id, tuple(material_ood_dataset_ids), storage_root=storage_root
     )
-    sources = [_steady_dataset(dataset_id, storage_root=storage_root) for dataset_id in additional_evaluation_dataset_ids]
-    if fixed["ood"]:
-        sources.append(full_train)
-    parts = [(source, tuple(cast("Mapping[str, Any]", _binding(source).case_partition)["ood"])) for source in sources]
-    splits.reject_role_leakage(binding, fixed, [(_binding(source), case_ids) for source, case_ids in parts])
-    additional_dataset, additional_positions = _additional_evaluation_dataset(parts)
+    loaded = {dataset_id: _steady_dataset(dataset_id, storage_root=storage_root) for dataset_id in material_ood_dataset_ids}
+    loaded[train_dataset_id] = full_train
+    parts = {
+        role: [
+            (source, partition_contract.evaluation_cases(cast("Mapping[str, Any]", _binding(source).case_partition), role))
+            for source in (loaded[assignment["dataset_id"]] for assignment in assignments[role])
+        ]
+        for role in splits.OOD_SPLIT_ROLES
+    }
+    splits.reject_role_leakage(
+        binding, fixed, {role: [(_binding(source), case_ids) for source, case_ids in parts[role]] for role in splits.OOD_SPLIT_ROLES}
+    )
     rebuilt = splits.build_split(
         task=task.id,
         train_dataset=_split_identity(full_train),
         case_partition=fixed,
-        additional_evaluation=[
-            (_split_identity(source), case_ids, assignment) for (source, case_ids), assignment in zip(parts, assignments, strict=True)
-        ],
+        train_subset=train_subset,
+        material_by_case=binding.materials,
+        ood_parts={
+            role: [
+                (_split_identity(source), case_ids, assignment) for (source, case_ids), assignment in zip(parts[role], assignments[role], strict=True)
+            ]
+            for role in splits.OOD_SPLIT_ROLES
+        },
         extension=None,
     )
     split_contract = splits.resolve_split(rebuilt, split_indices)
@@ -266,10 +284,10 @@ def create_dataloaders(
     evaluation_loaders: dict[str, DataLoader[Any] | None] = {
         "eval": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.validation.index_values)), evaluation_settings),
         "id_test": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.id_test.index_values)), evaluation_settings),
-        "additional_evaluation": None
-        if additional_dataset is None
-        else runtime_factory.make_data_loader(Subset(additional_dataset, list(additional_positions)), evaluation_settings),
     }
+    for role in splits.OOD_SPLIT_ROLES:
+        ood_dataset = _ood_dataset(parts[role], role=role)
+        evaluation_loaders[role] = None if ood_dataset is None else runtime_factory.make_data_loader(ood_dataset, evaluation_settings)
     if startup_callback is not None:
         startup_callback("dataloader_ready", {"workers": num_workers, "seconds": time.perf_counter() - loader_started})
     return train_loader, evaluation_loaders, data_processor, split_info, artifact

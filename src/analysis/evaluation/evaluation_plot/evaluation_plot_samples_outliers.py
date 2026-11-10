@@ -37,6 +37,7 @@ from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 
 if TYPE_CHECKING:
@@ -267,10 +268,11 @@ def _contour(
     levels: np.ndarray,
     cmap: str,
     title: str,
+    unit: str,
     case: cases.EvaluationCase,
     display_indices: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> Any:
-    """Draw one filled-contour panel and colorbar."""
+    """Draw one filled-contour panel and its unit-labelled colorbar."""
     displayed = _clip_to_levels(values, levels)
     if display_indices is not None:
         x_grid = display_grid.display_sample(x_grid, display_indices)
@@ -278,7 +280,7 @@ def _contour(
         displayed = np.ma.asarray(display_grid.display_sample(displayed, display_indices))
     image = axis.contourf(x_grid, y_grid, displayed, levels=levels, cmap=cmap)
     axis.set_title(title)
-    layout.add_map_colorbar(figure, image, axis)
+    layout.add_map_colorbar(figure, image, axis, label=f"[{field_labels.display_unit(unit)}]")
     _format_axes(axis, case)
     return image
 
@@ -373,8 +375,7 @@ def _error_contour(
     display_indices: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> None:
     """Render one selected 11-band error or its reason in the existing axis."""
-    title = f"{field.matplotlib_label} {result.label} [{result.unit}]"
-    axis.set_title(title)
+    axis.set_title(f"{field.matplotlib_label} {result.label.removesuffix(' [%]')}")
     if result.map_values is None:
         axis.text(0.5, 0.5, f"Unavailable: {result.reason}", ha="center", va="center", wrap=True, transform=axis.transAxes)
         _format_axes(axis, case)
@@ -396,8 +397,8 @@ def _error_contour(
         y_grid = display_grid.display_sample(y_grid, display_indices)
         map_values = display_grid.display_sample(map_values, display_indices)
     image = axis.contourf(x_grid, y_grid, map_values, **definition.contourf_kwargs())
-    label = "1 (train state std; >1 extended)" if result.scale is not None else result.unit
-    layout.add_map_colorbar(figure, image, axis, label=label)
+    unit = f"[{field_labels.display_unit(result.unit, quantity_kind='difference')}]"
+    layout.add_map_colorbar(figure, image, axis, label=f"|e|/s_train {unit}" if result.scale is not None else unit)
     _format_axes(axis, case)
 
 
@@ -463,7 +464,8 @@ def _plot_prediction_overview(
             prediction_plot,
             levels=prediction_levels,
             cmap="turbo",
-            title=f"{field.matplotlib_label} pred [{field.unit}]",
+            title=f"{field.matplotlib_label} pred",
+            unit=field.unit,
             case=case,
             display_indices=display_indices,
         )
@@ -475,7 +477,8 @@ def _plot_prediction_overview(
             reference,
             levels=reference_levels,
             cmap="turbo",
-            title=f"{field.matplotlib_label} true [{field.unit}]",
+            title=f"{field.matplotlib_label} true",
+            unit=field.unit,
             case=case,
             display_indices=display_indices,
         )
@@ -501,7 +504,8 @@ def _plot_prediction_overview(
                 permeability,
                 levels=_levels(permeability),
                 cmap="viridis",
-                title="kappa [m²]",
+                title="kappa",
+                unit="m²",
                 case=case,
                 display_indices=display_indices,
             )
@@ -515,6 +519,7 @@ def _plot_prediction_overview(
                 levels=_levels(permeability_log),
                 cmap="viridis",
                 title="log10(kappa / 1 m²)",
+                unit="1",
                 case=case,
                 display_indices=display_indices,
             )
@@ -590,7 +595,8 @@ def plot_permeability_error_overlay(
     for index, (name, values) in enumerate(components):
         row, column = divmod(index, 2)
         shown = values
-        title = f"{name} [m²]"
+        title = name
+        unit = "m²"
         if kappa_scale == "log10(kappa)" and name in {"Kxx", "Kyy"}:
             positive = values[values > 0.0]
             if positive.size == 0:
@@ -598,6 +604,7 @@ def plot_permeability_error_overlay(
                 raise ValueError(msg)
             shown = np.log10(np.maximum(values, float(np.min(positive))))
             title = f"log10({name} / 1 m²)"
+            unit = "1"
         _contour(
             figure,
             axes[row, column],
@@ -607,6 +614,7 @@ def plot_permeability_error_overlay(
             levels=_levels(shown, count=11),
             cmap="viridis",
             title=title,
+            unit=unit,
             case=case,
             display_indices=display_indices,
         )
@@ -620,7 +628,8 @@ def plot_permeability_error_overlay(
         reference,
         levels=_levels(reference, count=11),
         cmap="turbo",
-        title=f"{selected.matplotlib_label} true [{selected.unit}]",
+        title=f"{selected.matplotlib_label} true",
+        unit=selected.unit,
         case=case,
         display_indices=display_indices,
     )
@@ -706,7 +715,8 @@ def plot_pressure_velocity_comparison(
             pressure_values[row],
             levels=pressure_levels,
             cmap="turbo",
-            title=f"{row_label} p [{pressure.unit}]",
+            title=f"{row_label} p",
+            unit=pressure.unit,
             case=first_case,
             display_indices=display_indices,
         )
@@ -718,7 +728,8 @@ def plot_pressure_velocity_comparison(
             speed_values[row],
             levels=speed_levels,
             cmap="turbo",
-            title=f"{row_label} {speed.matplotlib_label} [{speed.unit}]",
+            title=f"{row_label} {speed.matplotlib_label}",
+            unit=speed.unit,
             case=first_case,
             display_indices=display_indices,
         )

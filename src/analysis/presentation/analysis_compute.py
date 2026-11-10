@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 ComputeBackend = Literal["cpu", "cuda"]
-_AUTO_MIN_ELEMENTS = 3_200_000  # 8 cases x 4 fields x 251 x 401 in the bounded profile.
 _MAX_CHUNK_INPUT_BYTES = 64 * 1024 * 1024
 _BATCH_RANK = 3
 
@@ -53,18 +52,17 @@ class AnalysisComputePreference:
 
     def __init__(self, requested: str = "auto") -> None:
         """Admit the initial route without changing artifact or metric identity."""
-        resolve_analysis_device(requested)
+        admit_analysis_request(requested)
         self.requested = requested
         self._listeners: WeakSet[Callable[[], None]] = WeakSet()
 
-    def set_requested(self, requested: str) -> AnalysisDevice:
+    def set_requested(self, requested: str) -> None:
         """Validate and publish one change without remounting field selectors."""
-        resolved = resolve_analysis_device(requested)
+        admit_analysis_request(requested)
         if requested != self.requested:
             self.requested = requested
             for listener in tuple(self._listeners):
                 listener()
-        return resolved
 
     def subscribe(self, callback: Callable[[], None]) -> None:
         """Observe the selected device while the owning viewer remains alive."""
@@ -102,22 +100,30 @@ def visible_cuda_options() -> tuple[str, ...]:
 def selection_status(requested: str) -> str:
     """Report a provisional auto choice or an admitted explicit route."""
     if requested == "auto":
-        return "requested auto; resolved per eligible workload (CPU below threshold, CUDA for large allocated batches)"
+        return "requested auto; resolved per workload (CUDA when a Slurm-allocated device is visible, otherwise CPU)"
     return resolve_analysis_device(requested).label
 
 
-def resolve_analysis_device(requested: str, *, elements: int = 0) -> AnalysisDevice:
-    """Resolve cpu/auto/cuda/visible cuda:N without changing device visibility."""
-    if requested == "cpu":
-        return AnalysisDevice(requested, "cpu", "cpu", "explicit CPU")
-    if requested not in {"auto", "cuda"} and not (requested.startswith("cuda:") and requested[5:].isdigit()):
+def _validate_request(requested: str) -> None:
+    """Reject anything but cpu, auto, cuda or cuda:N."""
+    if requested not in {"cpu", "auto", "cuda"} and not (requested.startswith("cuda:") and requested[5:].isdigit()):
         msg = "Evaluation compute device must be cpu, auto, cuda, or a visible cuda:N."
         raise ValueError(msg)
-    if isinstance(elements, bool) or not isinstance(elements, int) or elements < 0:
-        msg = "Evaluation workload elements must be a nonnegative integer."
-        raise ValueError(msg)
-    if requested == "auto" and elements < _AUTO_MIN_ELEMENTS:
-        return AnalysisDevice(requested, "cpu", "cpu", f"below measured {_AUTO_MIN_ELEMENTS}-element GPU batch threshold")
+
+
+def admit_analysis_request(requested: str) -> None:
+    """Admit a request early; auto is only validated so that CUDA stays untouched until a workload resolves it."""
+    if requested == "auto":
+        _validate_request(requested)
+    else:
+        resolve_analysis_device(requested)
+
+
+def resolve_analysis_device(requested: str) -> AnalysisDevice:
+    """Resolve cpu/auto/cuda/visible cuda:N without changing device visibility."""
+    _validate_request(requested)
+    if requested == "cpu":
+        return AnalysisDevice(requested, "cpu", "cpu", "explicit CPU")
     if "SLURM_JOB_ID" not in os.environ:
         if requested == "auto":
             return AnalysisDevice(requested, "cpu", "cpu", "no Slurm GPU allocation in this process")
@@ -224,16 +230,15 @@ def _recoverable_cuda_resource_error(error: RuntimeError) -> bool:
     return "out of memory" in str(error).lower() or "cuda error: allocation" in str(error).lower()
 
 
-def reduce_error_batch(reference: np.ndarray, prediction: np.ndarray, support: np.ndarray, *, requested: str = "auto") -> ErrorBatchSummary:
-    """Return exact-support full-grid sums; auto resource fallback is visible."""
+def reduce_error_batch(reference: np.ndarray, prediction: np.ndarray, support: np.ndarray, *, device: AnalysisDevice) -> ErrorBatchSummary:
+    """Return exact-support full-grid sums on one resolved route; auto resource fallback is visible."""
     actual, predicted, admitted = _validate_batch(reference, prediction, support)
-    device = resolve_analysis_device(requested, elements=actual.size)
     if device.backend == "cpu":
         return _cpu_error_batch(actual, predicted, admitted, device)
     try:
         return _cuda_error_batch(actual, predicted, admitted, device)
     except RuntimeError as error:
-        if requested != "auto" or not _recoverable_cuda_resource_error(error):
+        if device.requested != "auto" or not _recoverable_cuda_resource_error(error):
             raise
-        fallback = AnalysisDevice(requested, "cpu", "cpu", f"visible fallback after CUDA resource failure: {type(error).__name__}")
+        fallback = AnalysisDevice(device.requested, "cpu", "cpu", f"visible fallback after CUDA resource failure: {type(error).__name__}")
         return _cpu_error_batch(actual, predicted, admitted, fallback)

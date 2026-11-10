@@ -19,7 +19,8 @@ This module does NOT:
 
 Notes:
   Success-rate stop:
-    - k is the number of successful and n the number of decided (successful or failed) candidates of one original batch.
+    - k is the number of successful and n the number of decided (successful or failed) candidates of one material,
+      pooled over all its designs; the campaign lifecycle passes that material's records.
     - The bound is the one-sided Clopper-Pearson upper bound at SUCCESS_RATE_CONFIDENCE: Beta quantile (k + 1, n - k), 1 for k == n.
     - A batch is stopped while n >= 1 and the bound is below its minimum success rate s.
 
@@ -40,7 +41,7 @@ MAXIMUM_TOLERATED_FAILURES_BRACKET: Final = 2**20
 
 
 def _design_order(record: Mapping[str, Any]) -> tuple[int, int, str]:
-    """Order original design before supplemental candidates."""
+    """Order the original design points before their replacements, each by candidate position."""
     reservation = record["reservation"]
     return (
         0 if reservation["origin"] == "primary" else 1,

@@ -70,7 +70,7 @@ class TransientTensorizerSpec:
             contract.scalar_conditioning,
         )
         expected = tuple(field.name for group in groups for field in group)
-        complete = task.input_profile("canonical_physics_complete_v1")
+        complete = task.input_profile("canonical_physics_complete")
         if complete.fields != expected:
             message = "Transient task profile disagrees with TRANSIENT_STEP_CONTRACT field ordering."
             raise RuntimeError(message)

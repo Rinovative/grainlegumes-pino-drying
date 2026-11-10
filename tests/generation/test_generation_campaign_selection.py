@@ -4,6 +4,7 @@ Responsibilities:
   - Check complete candidate publication, idempotent reuse, and frozen-input admission
   - Check the success-rate bound, the stop rule and the tolerated failures that size admission
   - Check that a plan's minimum success rate is pre-registered once, reproduced exactly on rerun and only lowered explicitly
+  - Check that each rate record is one atomic record per material, read by every design of it, and absent after a failed publication
   - Check that only a plan campaign without an explicit cap records its admission cap as derived (null)
 
 Design principles:
@@ -50,15 +51,15 @@ def test_current_source_inputs_require_complete_plan_and_publish_exact_candidate
         patch("subprocess.run", side_effect=AssertionError("input generation started a process")),
     ):
         inputs = generation.cases.input_generation.generate_input_cases(batch, 2, storage_root=storage)
-    assert inputs.metadata_directory == root / "lentil" / "_record" / "natural"
-    assert inputs.raw_directory == root / "lentil"
+    assert inputs.metadata_directory == root / "materials" / "lentil" / "_record" / "test"
+    assert inputs.raw_directory == root / "materials" / "lentil"
     assert inputs.generated_case_count == 2
     assert not list(root.rglob("input_generations"))
     references = generation.cases.input_generation.admit_configured_input_references(batch, storage_root=storage)
     assert sorted(references) == [1, 2]
     assert [references[index].case_payload()["case_id"] for index in (1, 2)] == ["case_0001", "case_0002"]
     plan = lifecycle.load_campaign_plan("steady_flow", campaign.source_name, storage_root=storage)
-    assert plan["original_design_sizes"] == {"lentil": 2}
+    assert plan["original_design_sizes"] == {"lentil": {"test": 2}}
     rows = catalog.list_campaign_cases("steady_flow", campaign.source_name, storage_root=storage)
     assert [(row["case_id"], row["outcome"]) for row in rows] == [("case_0001", "pending"), ("case_0002", "pending")]
 
@@ -248,12 +249,13 @@ def test_a_plan_rate_is_preregistered_once_reproduced_exactly_and_only_lowered_e
     with pytest.raises(ValueError, match=r"records 0\.8.*requests None"):
         lifecycle.create_campaign(plain, storage_root=storage)
 
+    material = batch.material_family
     lowered = lifecycle.amend_minimum_success_rate(
-        "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.6, reason="Known hard corner", storage_root=storage
+        "steady_flow", campaign.source_name, material, minimum_success_rate=0.6, reason="Known hard corner", storage_root=storage
     )
     assert lowered == (0.8, 0.6)
     assert lifecycle.amend_minimum_success_rate(
-        "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.6, reason="Repeat", storage_root=storage
+        "steady_flow", campaign.source_name, material, minimum_success_rate=0.6, reason="Repeat", storage_root=storage
     ) == (0.6, 0.6)
     lifecycle.create_campaign(campaign, storage_root=storage)
     assert policy()["minimum_success_rate"] == 0.6
@@ -263,16 +265,16 @@ def test_a_plan_rate_is_preregistered_once_reproduced_exactly_and_only_lowered_e
     ]
     with pytest.raises(ValueError, match="can only be lowered"):
         lifecycle.amend_minimum_success_rate(
-            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.7, reason="Raise", storage_root=storage
+            "steady_flow", campaign.source_name, material, minimum_success_rate=0.7, reason="Raise", storage_root=storage
         )
     with pytest.raises(ValueError, match="non-empty reason"):
         lifecycle.amend_minimum_success_rate(
-            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.5, reason=" ", storage_root=storage
+            "steady_flow", campaign.source_name, material, minimum_success_rate=0.5, reason=" ", storage_root=storage
         )
     common.paths.resolve_generation_selected_pool_path(root).write_text("{}", encoding="utf-8")
     with pytest.raises(RuntimeError, match="sealed selected-success pool"):
         lifecycle.amend_minimum_success_rate(
-            "steady_flow", campaign.source_name, batch.batch_id, minimum_success_rate=0.5, reason="After sealing", storage_root=storage
+            "steady_flow", campaign.source_name, material, minimum_success_rate=0.5, reason="After sealing", storage_root=storage
         )
 
 
@@ -304,7 +306,7 @@ def test_a_source_without_a_plan_starts_at_one_and_is_lowered_through_its_campai
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """A plain Source records nothing and uses s = 1; amend-replacements lowers one original batch and a late plan rate is refused."""
+    """A plain Source records nothing and uses s = 1; amend-replacements lowers one material and a late plan rate is refused."""
     config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
     campaign = generation.cases.config.load_campaign_config(config_path)
     storage = tmp_path / "scientific-storage"
@@ -314,21 +316,143 @@ def test_a_source_without_a_plan_starts_at_one_and_is_lowered_through_its_campai
     assert (entry["minimum_success_rate"], entry["amendments"]) == (1.0, [])
     run_id = f"source~steady_flow~{campaign.source_name}"
     amended = generation.campaign.amend_minimum_success_rate(
-        run_id, "lentil", "natural", minimum_success_rate=0.5, reason="Accept a known failure", storage_root=storage
+        run_id, "lentil", minimum_success_rate=0.5, reason="Accept a known failure", storage_root=storage
     )
     assert (amended["previous_minimum_success_rate"], amended["minimum_success_rate"]) == (1.0, 0.5)
     lifecycle.create_campaign(campaign, storage_root=storage)
     late = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.9))
     with pytest.raises(ValueError, match=r"records None.*requests 0\.9"):
         lifecycle.create_campaign(late, storage_root=storage)
-    with pytest.raises(ValueError, match="no unique original batch"):
-        generation.campaign.amend_minimum_success_rate(
-            run_id, "lentil", "parameter_ood", minimum_success_rate=0.5, reason="No such batch", storage_root=storage
-        )
+    with pytest.raises(ValueError, match="no original batch of material"):
+        generation.campaign.amend_minimum_success_rate(run_id, "faba", minimum_success_rate=0.5, reason="No such material", storage_root=storage)
     with pytest.raises(ValueError, match="canonical source campaign"):
-        generation.campaign.amend_minimum_success_rate(
-            "legacy-run", "lentil", "natural", minimum_success_rate=0.5, reason="No handle", storage_root=storage
+        generation.campaign.amend_minimum_success_rate("legacy-run", "lentil", minimum_success_rate=0.5, reason="No handle", storage_root=storage)
+
+
+def _three_design_campaign(generation_config_factory: Any, tmp_path: Path) -> tuple[Any, Path, Path]:
+    """Create a plan campaign (s = 0.9) whose one material has a train, a validation and a test design."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow", designs={"train": 1, "validation": 1, "test": 1})
+    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.9))
+    storage = tmp_path / "scientific-storage"
+    return campaign, storage, lifecycle.create_campaign(campaign, storage_root=storage)
+
+
+def _material_policy(campaign: Any, storage: Path) -> list[tuple[float, bool]]:
+    """Return (s, stopped) of every original batch after two failures of the material (k/n 0/2: bound 0.776)."""
+    failed = [{"reservation": {"material_family": "lentil"}, "decision": {"outcome": "failed"}}] * 2
+    entries = lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage, records=failed)
+    return [(entry["minimum_success_rate"], entry["stopped"]) for entry in entries]
+
+
+def test_an_amendment_is_one_record_of_the_material_that_every_design_reads(generation_config_factory: Any, tmp_path: Path) -> None:
+    """The plan rate and each lowering are one numbered record per material, so all designs of the material switch at once."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    assert _material_policy(campaign, storage) == [(0.9, True)] * 3
+    run_id = f"source~steady_flow~{campaign.source_name}"
+    amended = generation.campaign.amend_minimum_success_rate(run_id, "lentil", minimum_success_rate=0.5, reason="Known corner", storage_root=storage)
+    assert (amended["previous_minimum_success_rate"], amended["minimum_success_rate"]) == (0.9, 0.5)
+    assert len(amended["batch_ids"]) == 3
+    assert sorted(path.relative_to(root).as_posix() for path in root.rglob("amendment_*.json")) == [
+        "materials/lentil/_record/amendments/amendment_0001.json",
+        "materials/lentil/_record/amendments/amendment_0002.json",
+    ]
+    assert _material_policy(campaign, storage) == [(0.5, False)] * 3
+
+
+def test_a_crash_before_the_amendment_record_is_published_keeps_the_old_rate_everywhere(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An amendment whose atomic publication fails leaves no record, so every design of the material keeps the old rate."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    before = {path: path.read_bytes() for path in root.rglob("amendment_*.json")}
+    publish = common.serialization.atomic_write_bytes
+
+    def crash_on_amendment(path: Path, payload: bytes) -> Path:
+        if path.name.startswith("amendment_"):
+            msg = "Synthetic crash before publication"
+            raise OSError(msg)
+        return publish(path, payload)
+
+    monkeypatch.setattr(common.serialization, "atomic_write_bytes", crash_on_amendment)
+    with pytest.raises(OSError, match="Synthetic crash"):
+        lifecycle.amend_minimum_success_rate(
+            "steady_flow", campaign.source_name, "lentil", minimum_success_rate=0.5, reason="Lost", storage_root=storage
         )
+    assert {path: path.read_bytes() for path in root.rglob("amendment_*.json")} == before
+    assert _material_policy(campaign, storage) == [(0.9, True)] * 3
+
+
+def test_a_plan_campaign_without_its_plan_record_fails_closed_instead_of_reading_s_1(generation_config_factory: Any, tmp_path: Path) -> None:
+    """The frozen plan records s, so a missing record 1 is lost evidence, never the plan-less default of 1."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    (root / "materials/lentil/_record/amendments/amendment_0001.json").unlink()
+    with pytest.raises(ValueError, match=r"'lentil'.*pre-registered plan rate 0\.9"):
+        lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage)
+
+
+@pytest.mark.parametrize("requested", [None, 0.7, 0.9])
+def test_a_reattachment_repeats_the_frozen_rate_and_finds_its_plan_record(
+    generation_config_factory: Any, tmp_path: Path, requested: float | None
+) -> None:
+    """The rate is outside the campaign digest: with record 1 lost, another rate is refused by the frozen plan, the same by the history."""
+    config_path, _template = generation_config_factory(simulation_profile="steady_flow", natural_count=2)
+    campaign = generation.cases.config.load_campaign_config(config_path, authored_value=_authored(config_path, 0.9))
+    storage = tmp_path / "scientific-storage"
+    root = lifecycle.create_campaign(campaign, storage_root=storage)
+    (root / "materials/lentil/_record/amendments/amendment_0001.json").unlink()
+    authored = None if requested is None else _authored(config_path, requested)
+    reattached = generation.cases.config.load_campaign_config(config_path, authored_value=authored)
+    message = r"'lentil'.*pre-registered plan rate 0\.9" if requested == 0.9 else rf"records 0\.9.*requests {requested}"
+    with pytest.raises(ValueError, match=message):
+        lifecycle.create_campaign(reattached, storage_root=storage)
+
+
+@pytest.mark.parametrize("requested", [None, 0.7, 0.9])
+def test_partial_input_preparation_refuses_a_lost_plan_record_before_writing_inputs(
+    generation_config_factory: Any, tmp_path: Path, requested: float | None
+) -> None:
+    """Partial preparation reopens the frozen campaign, so the rate and every history are checked before any input exists."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    (root / "materials/lentil/_record/amendments/amendment_0001.json").unlink()
+    authored = None if requested is None else _authored(campaign.source_path, requested)
+    reopened = generation.cases.config.load_campaign_config(campaign.source_path, authored_value=authored)
+    partial = reopened.select_batches((reopened.batches[0].batch_name,))
+    before = sorted(storage.rglob("*"))
+    message = r"'lentil'.*pre-registered plan rate 0\.9" if requested == 0.9 else rf"records 0\.9.*requests {requested}"
+    with pytest.raises(ValueError, match=message):
+        generation.cases.input_generation.prepare_campaign_inputs(partial, git_commit="a" * 40, storage_root=storage)
+    assert sorted(storage.rglob("*")) == before
+
+
+@pytest.mark.parametrize(("source", "target"), [("amendment_0001.json", "amendment_0002.json"), ("amendment_0002.json", "amendment_0003.json")])
+def test_an_amendment_file_name_must_carry_its_contiguous_index(generation_config_factory: Any, tmp_path: Path, source: str, target: str) -> None:
+    """A lone ``amendment_0002.json`` holding index 1, or a gap before a renamed record, is malformed history."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    lifecycle.amend_minimum_success_rate(
+        "steady_flow", campaign.source_name, "lentil", minimum_success_rate=0.5, reason="Lower", storage_root=storage
+    )
+    directory = root / "materials/lentil/_record/amendments"
+    if source == "amendment_0001.json":
+        (directory / "amendment_0002.json").unlink()
+    (directory / source).rename(directory / target)
+    with pytest.raises(ValueError, match=r"amendments are malformed.*'lentil'"):
+        lifecycle.replacement_policy("steady_flow", campaign.source_name, storage_root=storage)
+
+
+def test_sealing_validates_every_material_history_and_writes_no_receipt_for_an_invalid_one(
+    generation_config_factory: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sealing freezes the population evidence, so it refuses a material whose rate history is invalid before writing the pool."""
+    campaign, storage, root = _three_design_campaign(generation_config_factory, tmp_path)
+    monkeypatch.setattr(lifecycle, "selected_successes", lambda *_args, **_kwargs: ())  # a met target without solving cases
+    (root / "materials/lentil/_record/amendments/amendment_0001.json").unlink()
+    with pytest.raises(ValueError, match="pre-registered plan rate"):
+        lifecycle.seal_selected_pool("steady_flow", campaign.source_name, storage_root=storage)
+    assert not common.paths.resolve_generation_selected_pool_path(root).exists()
 
 
 @pytest.mark.parametrize("rate", [0, 1.5, True, {"lentil": 0.9}])

@@ -48,7 +48,6 @@ def _parser() -> argparse.ArgumentParser:
     run = subcommands.add_parser("run", help="start or resume a campaign as a Slurm driver job")
     run.add_argument("config")
     run.add_argument("--materials", nargs="+", help="select configured materials for this original design")
-    run.add_argument("--cases-per-material", type=int, help="set natural original-design size per selected material")
     run.add_argument("--duration-hours", type=float, help="set the physical transient horizon in hours; preserve the original boundary schedule")
     run.add_argument(
         "--revision",
@@ -94,10 +93,11 @@ def _parser() -> argparse.ArgumentParser:
     fail_case.add_argument("case_id")
     fail_case.add_argument("--reason-code", required=True)
     fail_case.add_argument("--detail", required=True)
-    amend = subcommands.add_parser("amend-replacements", help="explicitly lower the minimum success rate of one original batch of a campaign run")
+    amend = subcommands.add_parser(
+        "amend-replacements", help="explicitly lower the minimum success rate of one material, for all its original batches, of a campaign run"
+    )
     amend.add_argument("run_id")
     amend.add_argument("--material", required=True)
-    amend.add_argument("--regime", required=True, help="sampling regime of the original batch, for example natural")
     amend.add_argument(
         "--minimum-success-rate", type=float, required=True, help="new rate s with 0 < s <= 1; it can only be lowered (the current value is a no-op)"
     )
@@ -157,8 +157,6 @@ def _run_record_command(port: host_service.GenerationHost, layout: host_service.
         operands = (
             "--material",
             args.material,
-            "--regime",
-            args.regime,
             "--minimum-success-rate",
             str(args.minimum_success_rate),
             "--reason",
@@ -173,7 +171,6 @@ def _scientific_arguments(args: argparse.Namespace) -> tuple[str, ...]:
     scientific_arguments: list[str] = []
     for key in (
         "materials",
-        "cases_per_material",
         "duration_hours",
         "revision",
         "node_jobs",

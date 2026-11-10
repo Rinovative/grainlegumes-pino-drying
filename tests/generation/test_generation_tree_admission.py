@@ -217,10 +217,10 @@ def test_host_commands_run_from_the_tree_not_the_live_checkout(
     # Helper logs written before the campaign exists follow it once attached; later ones are linked as they finish.
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     campaign = tmp_path / "campaign"
-    campaign.mkdir()
+    (campaign / "_record").mkdir(parents=True)
     host.attach_logs(campaign)
     host.call("prepare-campaign-inputs", "plan.yaml", scheduled=True)
-    linked = sorted((campaign / "logs").iterdir())
+    linked = sorted((campaign / "_record/logs").iterdir())
     assert [path.name.startswith("python-prepare-campaign-inputs.") and path.suffix == ".out" for path in linked] == [True, True]
     assert all(path.samefile(layout.logs / path.name) for path in linked)
 

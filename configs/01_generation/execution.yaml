@@ -1,45 +1,33 @@
 # Role: Slurm resources, timeouts, retries and retention of Generation node jobs. Edit: when cluster use or limits change.
-# These fields do not set the physical simulation duration.
+# Measurements behind the values: docs/03_generation.md. These fields do not set the physical simulation duration.
+# Derived, not authored: concurrent_cases_per_node = site.cores_per_node // run.cores_per_case; node job memory = concurrent_cases_per_node * node_job.memory_per_case + node_job.node_memory_overhead.
 schema_kind: generation_execution
-schema_version: 1
-runtime:
-  timeout_seconds: 3600  # Per-case wrapper limit in seconds; the orderly stop starts graceful_stop_reserve_seconds earlier (at 55 min). Measured on 2026-10-28 at k=4 (core scaling, two sweeps): longest success 29.8 min, one case took 20.0 and 29.8 min in the two sweeps, no timeout; the generous limit costs time only for cases that progress but never finish and keeps slow converging cases in the data. Physical simulation hours are set elsewhere.
-  graceful_stop_reserve_seconds: 300  # Part of the timeout reserved for an orderly stop.
-  stall_stop:  # Transient cases only (a stationary steady solve reports no simulated time, so the rule never applies to it and the timeout alone bounds a steady case): stops a case whose simulated time is still below the minimum after check_after_seconds of solving (reason stalled); the timeout stays the backstop.
-    check_after_seconds: 900  # 15 min, kept low on purpose so cases that never converge stop early; on 2026-10-26 one successful case was still at 25 s simulated after 5 min, all were far beyond 1 h by 10 min; at k=4 the core-scaling measurement of 2026-10-28 stopped one case (50-61 s simulated). Each case records when it reached the minimum (timing.json stall_progress) to recalibrate this after the first production campaign.
-    minimum_simulated_seconds: 3600  # 1 h of the 168 h horizon; the stuck case reached under 1 min in 45 min.
-  extra_arguments: []  # Additional COMSOL arguments; the pipeline owns the batch, parameter, log and licence arguments (-usebatchlic, -ckl and -keeplicenses included) and rejects them here.
-  license_wait:  # Inside a node job, when the node's batch licence seat is unavailable, the worker waits with this backoff up to maximum_wait_seconds in total, then stops with an explicit licence-wait-exhausted reason; the in-allocation retry stays per case start.
-    enabled: true  # Wait for the seat instead of failing the node job's cases at once; false (also --no-retry) turns the node wait and the in-allocation retry off.
-    initial_delay_seconds: 60  # The wait backoff starts here (a seat frees when another user's job ends) and grows no further than maximum_delay_seconds.
-    maximum_delay_seconds: 300  # Upper bound of the wait backoff.
-    maximum_wait_seconds: 3600  # Total wait per node job, positive and never unbounded: 1 h limits how long an idle node stays allocated.
-    in_allocation_retry:
-      enabled: true  # Retry licence-capacity failures at one case start inside the running allocation.
-      maximum_window_seconds: 300  # Retry temporary licence-capacity failures within this in-allocation window.
-      pause_after_capacity_failure_seconds: 5  # Seconds to pause after a licence-capacity failure before retrying.
-retention: compact  # Compact keeps canonical outputs and essential evidence, omits large exports/models, and retains recovery exceptions when needed.
-# Controller admission and polling controls.
-submission:
-  max_admission_cases: 4  # Caps the cumulative distinct fresh cases admitted, a stage and safety limit, not concurrency; a Dataset run without --max-admission-cases records null instead and derives the cap from each material's count plus the most failures it can complete with at its current minimum_success_rate.
-  poll_interval_seconds: 15  # Controller polling interval.
-# Node-job Slurm resources: one node job holds a whole node and runs concurrent_cases_per_node case steps of cores_per_case cores each.
-# Derived and validated, not authored: concurrent_cases_per_node = site.cores_per_node // cores_per_case; node_job_memory = concurrent_cases_per_node * memory_per_case + node_memory_overhead (rejected above node_memory_limit, the concurrency is never reduced silently).
-cluster:
-  cores_per_case: 4  # k: CPU cores of one case step; must not exceed the site's cores_per_node. Chosen on 2026-10-28 from node throughput per core count (k = 2 to 32): about 15 successful cases per node-hour at k=4 against about 11 at k=8 (8 concurrent cases per node).
-  node_jobs: 2  # Concurrent node jobs across all Generation runs, 1 to 4 (default 2): a per-user cap that leaves the five shared 32-core standard nodes to others too; raise it per run with --node-jobs 3 or 4 only when they are quiet (the batch licence counts once per user, not per node); enforced at submission through the fixed job names gen-seat-<n> with Slurm singleton.
-  memory_per_case: 20G  # Memory limit of one case step (<int>M|G|T); provisional, the observed transient peak is 15.8 GB.
+run:  # What changes per Generation run; node_jobs, cores_per_case, timeout_seconds and max_admission_cases also have CLI flags.
+  node_jobs: 2  # Concurrent node jobs across all runs, 1 to 4 (per-user cap on the shared standard nodes).
+  cores_per_case: 4  # CPU cores of one case step (k); concurrency per node job is site.cores_per_node // k.
+  timeout_seconds: 3600  # Per-case wrapper limit in seconds; the orderly stop starts internals.graceful_stop_reserve_seconds earlier.
+  retention: compact  # compact keeps canonical outputs and essential evidence; full also keeps the solved model and raw exports.
+  max_admission_cases: 4  # Cap on the cumulative distinct fresh cases admitted (a stage and safety limit, not concurrency); a Dataset run without the flag derives it from its plan.
+rules:  # Failure and wait policies.
+  stall_stop:  # Transient cases only; stops a case whose simulated time is still below the minimum after the check time (reason stalled).
+    check_after_seconds: 900  # Solving time after which the simulated time is checked.
+    minimum_simulated_seconds: 3600  # Simulated time a case must have reached at the check.
+  license_wait:  # A licence-capacity failure (batch seat unavailable) waits and is redispatched instead of counting as a case failure.
+    enabled: true  # false (also --no-retry) turns off the wait and the retry inside the allocation; a capacity failure then fails the case.
+    maximum_wait_seconds: 3600  # Cumulative wait per case, positive and never unbounded; the pipeline fixes the backoff and the in-allocation window.
+  extra_arguments: []  # Additional COMSOL arguments; the pipeline owns the batch, parameter, log and licence arguments and rejects them here.
+node_job:  # Slurm resources of one node job (one whole node, concurrent case steps of run.cores_per_case cores each).
+  node_job_wall_time: "08:00:00"  # Slurm time of one node job, at most 24:00:00; must exceed run.timeout_seconds plus 600 s.
+  memory_per_case: 20G  # Memory limit of one case step (<int>M|G|T).
   node_memory_overhead: 8G  # Node-job memory on top of the case steps for the worker and its shell.
-  node_memory_limit: 500G  # Upper bound of one node job's memory; below the 514 GB nodes, a larger need is rejected.
-  node_job_wall_time: "08:00:00"  # Slurm time of one node job (at most 24:00:00), separate from the campaign's physical horizon; it must exceed timeout_seconds plus a 600 s publication margin so one case fits into a fresh node job.
-  scheduler_options: []  # Extra long sbatch flags; memory, dependency, comment, node selection, GPUs and the allocation shape are pipeline-owned and rejected here.
-# Site-specific scheduler, partition, modules, and executable names used to prepare node jobs.
-site:
-  cpu_host: shared-filesystem
-  scheduler: slurm  # Scheduler used for the node jobs.
+  node_memory_limit: 500G  # Upper bound of one node job's memory; a larger need is rejected, the concurrency is never reduced.
+  scheduler_options: []  # Extra long sbatch flags; memory, dependency, comment, node selection, GPUs and the allocation shape are pipeline-owned.
+site:  # The cluster; rarely changes.
   partition: standard  # Slurm partition of the node jobs.
-  cores_per_node: 32  # CPUs of one node job: it requests exactly this many CPUs and runs on any standard node with at least this many (not exclusive: the remaining CPUs of a larger node stay available to other jobs); caps cores_per_case.
-  python_module: Python/3.12  # Environment module loaded for Python in the node jobs.
+  cores_per_node: 32  # CPUs one node job requests (not exclusive); caps run.cores_per_case.
   comsol_module: Comsol/v6.4  # Environment module loaded for COMSOL in the node jobs.
-  python_executable: /usr/bin/python3.12  # Python executable used in the node jobs.
   comsol_executable: comsol  # COMSOL executable used in the node jobs.
+  python_executable: /usr/bin/python3.12  # Python executable used in the node jobs.
+internals:  # Pipeline internals.
+  poll_interval_seconds: 15  # Controller polling interval in seconds.
+  graceful_stop_reserve_seconds: 300  # Part of run.timeout_seconds reserved for an orderly stop.

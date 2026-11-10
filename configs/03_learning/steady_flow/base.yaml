@@ -1,39 +1,25 @@
-# Role: shared defaults of every steady_flow experiment and Optuna study. Edit: rarely; any config overrides them.
-# A config names this file with base: and overrides any value by setting it itself.
+# Role: shared defaults of every steady_flow experiment and Optuna study. Edit: rarely; a config that sets a value overrides it.
+# The code holds no default for what this file states; configs/README.md lists every key a config chain must state.
 
-run:
-  seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
-  deterministic: false  # Request deterministic kernels where supported; false keeps the faster non-deterministic kernels.
-  device: auto  # Requested compute device; auto selects an available supported device.
+training:
+  epochs: 600  # Maximum training epochs for steady-flow runs.
+  evaluation_interval: 2  # Validate every this many epochs; validation selects the checkpoint and drives the scheduler.
+  ood_evaluation_interval: 2  # Evaluate the material-OOD and parameter-OOD roles every this many epochs.
 
 data:
-  train_dataset: null  # Select the exact built Dataset ID, or pass --train-dataset.
-  additional_evaluation_datasets: []  # Optional built Datasets whose declared OOD cases are evaluated in addition to validation and ID-test.
+  train_dataset: null  # Exact built Dataset ID; null needs --train-dataset.
+  train_subset: null  # null trains on every Train case; a power of two N trains on the first N Train cases per ID material (learning curve).
   batch_size: 32  # Cases per optimizer batch; larger values use more memory and change gradient averaging.
+  material_ood_datasets: []  # Optional built Datasets whose declared OOD cases join the training Dataset's in the material-OOD role.
   num_workers: 8  # Data-loader worker processes; the loader benchmark measured 893 items/s with 8 workers against 763 with 0.
   pin_memory: true  # Page-locked host memory for faster host-to-GPU copies.
   persistent_workers: true  # Keep the worker processes alive across epochs.
 
-model:
-  params:
-    positional_embedding: null  # No positional embedding: x and y are explicit input channels, and an embedding grid would give one physical point different coordinates at different strides.
-    domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; the fields are not periodic, and padding keeps the FFT wrap-around away from the boundaries.
-
-loss:
-  data:
-    kind: relative_h1  # Select the supervised error formulation; valid choices depend on the task contract.
-    space: normalized  # Space in which supervised error is measured, such as normalized state or scaled increment.
-    weight: 1.0  # Multiplier on the supervised data-loss term.
-
-evaluation:
-  objective:
-    id: normalized_group_macro_rmse  # Metric used to compare trials/checkpoints and drive the scheduler or study objective.
-
 optimizer:
-  kind: adamw  # Optimizer implementation; current training contract supports AdamW.
+  kind: adamw  # Optimizer implementation; the training contract supports AdamW.
   weight_decay: 1.0e-4  # AdamW decoupled weight-decay coefficient.
   betas: [0.9, 0.999]  # AdamW first- and second-moment decay coefficients.
-  second_moment_floor: 1.0e-6  # Lower bound used for AdamW’s second-moment denominator epsilon.
+  second_moment_floor: 1.0e-6  # Lower bound used for AdamW's second-moment denominator epsilon.
 
 scheduler:
   kind: reduce_on_plateau  # Learning-rate schedule policy.
@@ -41,10 +27,25 @@ scheduler:
   patience: 20  # Validation checks without improvement before reducing the learning rate; at evaluation_interval 2 this is 40 epochs.
   min_lr: 1.0e-5  # Lower bound for the scheduled learning rate.
 
-training:
-  epochs: 600  # Maximum training epochs for steady-flow runs.
-  evaluation_interval: 2  # Validate every this many epochs; validation selects the checkpoint and drives the scheduler.
-  additional_evaluation_interval: 2  # Evaluate the additional evaluation Datasets every this many epochs.
+loss:
+  data:
+    kind: relative_h1  # Supervised error formulation; valid choices depend on the task contract.
+    space: normalized  # Space in which the supervised error is measured.
+    weight: 1.0  # Multiplier on the supervised data-loss term.
+
+evaluation:
+  objective:
+    id: normalized_group_macro_rmse  # Metric that compares trials and checkpoints and drives the scheduler and the study objective.
+
+model:
+  params:
+    positional_embedding: null  # No positional embedding: x and y are explicit input channels, and an embedding grid would give one physical point different coordinates at different strides.
+    domain_padding: 0.1  # Symmetric zero padding of 10 % per side of the lifted field; the fields are not periodic, and padding keeps the FFT wrap-around away from the boundaries.
+
+run:
+  seed: 9  # Base seed for derived data-loader, initialization, and training randomness.
+  deterministic: false  # Request deterministic kernels where supported; false keeps the faster non-deterministic kernels.
+  device: auto  # Requested compute device; auto selects an available supported device.
 
 tracking:
   wandb:

@@ -1,14 +1,14 @@
 """Define shared notebook-scale physical-map and colorbar presentation.
 
 Responsibilities:
-  - Create equal-sized physical-map subplot grids
+  - Create equal-sized, width-capped physical-map subplot grids under constrained layout
   - Attach proportionate axes-coupled colorbars
-  - Reserve a dedicated legend column without constrained-layout coupling
+  - Reserve a dedicated legend column inside the same constrained layout
   - Normalize finite constant and varying physical fields predictably
 
 Design principles:
   - Layout never changes scientific arrays or their physical coordinates
-  - One immutable sizing contract serves EDA and Evaluation snapshot maps
+  - One immutable sizing contract serves EDA, Evaluation and generation-input maps
   - Every colorbar remains explicitly bound to its map axis
 
 This module does NOT:
@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Normalize
-from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-untyped]
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -42,6 +41,7 @@ class MapLayoutContract:
 
     column_width: float = 5.8
     row_height: float = 3.6
+    maximum_width: float = 17.4
     column_spacing: float = 0.18
     row_spacing: float = 0.10
     colorbar_fraction: float = 0.046
@@ -50,15 +50,14 @@ class MapLayoutContract:
     tick_size: float = 10.0
 
     def figure_size(self, *, rows: int, columns: int) -> tuple[float, float]:
-        """Return the shared positive map-grid dimensions."""
+        """Return the shared positive map-grid dimensions, shrinking columns to the width cap."""
         if rows <= 0 or columns <= 0:
             message = "Physical map grids require positive row and column counts."
             raise ValueError(message)
-        return self.column_width * columns, self.row_height * rows
+        return min(self.column_width * columns, self.maximum_width), self.row_height * rows
 
 
 MAP_LAYOUT = MapLayoutContract()
-_MINIMUM_GRID_TOP = 0.10
 
 
 @contextmanager
@@ -99,29 +98,32 @@ def map_subplots(
     *,
     rows: int,
     columns: int,
+    figure: Figure | None = None,
     **kwargs: Any,
 ) -> tuple[Figure, np.ndarray]:
-    """Create one equal-column map grid under the shared layout contract."""
+    """
+    Create one equal-column map grid under the shared layout contract.
+
+    A given ``figure`` (created here) is cleared and reused with its current size and
+    layout engine, so animation frames keep identical pixel dimensions.
+    """
     owned = {"figsize", "squeeze", "layout", "gridspec_kw"}
     overlap = owned.intersection(kwargs)
     if overlap:
         message = f"Shared map grids own figure size, squeezing, layout, and spacing; received {sorted(overlap)}."
         raise ValueError(message)
+    spacing = {"wspace": MAP_LAYOUT.column_spacing, "hspace": MAP_LAYOUT.row_spacing}
+    if figure is not None:
+        figure.clear()
+        return figure, figure.subplots(rows, columns, squeeze=False, gridspec_kw=spacing, **kwargs)
     figure, axes = plt.subplots(
         rows,
         columns,
         figsize=MAP_LAYOUT.figure_size(rows=rows, columns=columns),
         squeeze=False,
-        layout=None,
+        layout="compressed",
+        gridspec_kw=spacing,
         **kwargs,
-    )
-    figure.subplots_adjust(
-        left=0.08,
-        right=0.93,
-        bottom=0.09,
-        top=0.91,
-        wspace=MAP_LAYOUT.column_spacing + 0.18,
-        hspace=MAP_LAYOUT.row_spacing + 0.18,
     )
     return figure, axes
 
@@ -134,31 +136,26 @@ def subplots_with_legend_column(
     row_height: float = 3.6,
     legend_width: float = 2.4,
     sharex: bool = False,
-    top: float = 0.90,
     hspace: float = 0.34,
 ) -> tuple[Figure, np.ndarray, Axes]:
-    """Create a manually spaced subplot grid with one reserved legend rail."""
+    """Create a constrained subplot grid with one reserved legend rail."""
     if rows <= 0 or columns <= 0:
         message = "Legend-column grids require positive row and column counts."
         raise ValueError(message)
     if min(column_width, row_height, legend_width) <= 0.0:
         message = "Legend-column grid dimensions must be positive."
         raise ValueError(message)
-    if not _MINIMUM_GRID_TOP < top < 1.0 or hspace < 0.0:
-        message = "Legend-column grid top and row spacing are invalid."
+    if hspace < 0.0:
+        message = "Legend-column grid row spacing is invalid."
         raise ValueError(message)
     figure = plt.figure(
         figsize=(column_width * columns + legend_width, row_height * rows),
-        layout=None,
+        layout="constrained",
     )
     grid = figure.add_gridspec(
         rows,
         columns + 1,
         width_ratios=(*([1.0] * columns), legend_width / column_width),
-        left=0.08,
-        right=0.98,
-        bottom=0.10,
-        top=top,
         wspace=0.34,
         hspace=hspace,
     )
@@ -219,7 +216,13 @@ def set_suptitle_over_axes(
     axes: Iterable[Axes],
     **kwargs: Any,
 ) -> Any:
-    """Centre one title over explicit scientific axes, excluding side rails."""
+    """
+    Title one figure over its scientific axes.
+
+    A manually laid-out figure centres the title over the given axes, excluding
+    side rails. A constrained figure positions the title itself, so ``y`` is
+    dropped and the title is centred on the figure.
+    """
     scientific_axes = tuple(axis for axis in axes if axis.get_visible())
     if not scientific_axes:
         message = "A scientific-block title requires at least one visible axis."
@@ -227,6 +230,9 @@ def set_suptitle_over_axes(
     if not isinstance(title, str) or not title.strip():
         message = "Scientific-block titles must be non-empty text."
         raise ValueError(message)
+    if figure.get_layout_engine() is not None:
+        kwargs.pop("y", None)
+        return figure.suptitle(title, **kwargs)
     left = min(axis.get_position().x0 for axis in scientific_axes)
     right = max(axis.get_position().x1 for axis in scientific_axes)
     return figure.suptitle(title, x=(left + right) / 2.0, **kwargs)
@@ -273,13 +279,7 @@ def add_map_colorbar(
     label: str = "",
 ) -> Colorbar:
     """Attach one proportionate colorbar and record its map-axis ownership."""
-    divider = make_axes_locatable(map_axis)
-    colorbar_axis = divider.append_axes(
-        "right",
-        size=f"{100.0 * MAP_LAYOUT.colorbar_fraction:g}%",
-        pad=f"{100.0 * MAP_LAYOUT.colorbar_pad:g}%",
-    )
-    colorbar = figure.colorbar(image, cax=colorbar_axis)
+    colorbar = figure.colorbar(image, ax=map_axis, fraction=MAP_LAYOUT.colorbar_fraction, pad=MAP_LAYOUT.colorbar_pad)
     colorbar.set_label(label, fontsize=MAP_LAYOUT.label_size)
     colorbar.ax.tick_params(labelsize=MAP_LAYOUT.tick_size)
     return colorbar

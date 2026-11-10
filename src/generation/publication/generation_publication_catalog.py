@@ -38,12 +38,11 @@ if TYPE_CHECKING:
 
 from src import common
 from src.generation import generation_campaign_lifecycle as lifecycle
-from src.generation.cases import generation_cases_input as input_service
 from src.generation.contracts import generation_contracts_campaign_identity as identity
 
 from . import generation_publication_campaign_evidence as campaign_evidence
 
-# Fixed leading columns of a campaign's derived cases.csv; sampled parameters and the failed solver log follow.
+# Fixed leading columns of a campaign's derived cases.csv; the task's result columns, its sampled parameters and the failed solver log follow.
 _CASES_VIEW_COLUMNS: Final = (
     "material",
     "case_id",
@@ -52,9 +51,9 @@ _CASES_VIEW_COLUMNS: Final = (
     "reason_code",
     "detail",
     "duration_s",
-    "simulated_end_h",
-    "final_bulk_moisture_wb",
 )
+# A stationary solve has no time axis, so only the transient task shows these result columns.
+_TRANSIENT_RESULT_COLUMNS: Final = ("simulated_end_h", "final_bulk_moisture_wb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +74,7 @@ class AdmittedRawCase:
 
     @property
     def design_provenance(self) -> dict[str, Any]:
-        """Return independent JSON-ready original and supplemental design evidence."""
+        """Return independent JSON-ready original and replacement design evidence."""
         return json.loads(self._design_provenance_json)
 
     def load_timing(self) -> CaseTimingEvidence:
@@ -148,7 +147,7 @@ def list_campaigns(
                 "campaign_purpose": plan["campaign_purpose"],
                 "domain_profile": plan["domain_profile"],
                 "root_seed": plan["root_seed"],
-                "sampling_mode": plan["sampling_mode"],
+                "design_recipe": plan["design_recipe"],
                 "materials": plan["materials"],
                 "original_design_sizes": plan["original_design_sizes"],
                 "selected_targets": plan["selected_targets"],
@@ -218,11 +217,7 @@ def list_campaign_cases(
                 raise ValueError(msg)
             input_reference_relative = input_reference.relative_to(storage).as_posix()
             reference = json.loads(input_reference.read_text(encoding="utf-8"))
-            if (
-                not isinstance(reference, dict)
-                or reference.get("schema_kind") != "generation_campaign_input_reference"
-                or not common.serialization.is_schema_version(reference.get("schema_version"), input_service.INPUT_REFERENCE_SCHEMA_VERSION)
-            ):
+            if not isinstance(reference, dict) or reference.get("schema_kind") != "generation_campaign_input_reference":
                 msg = "Canonical candidate input reference schema is malformed."
                 raise ValueError(msg)
             input_generation_id = reference.get("input_generation_id")
@@ -394,7 +389,7 @@ def _case_measurements(task: str, row: Mapping[str, Any], *, campaign_directory:
     from src.generation.publication import generation_publication_storage as storage_service  # noqa: PLC0415 -- HDF5 reader for the cases view
 
     case_id = str(row["case_id"])
-    case_directory = campaign_directory / str(row["material_family"]) / case_id
+    case_directory = common.paths.resolve_generation_campaign_material_directory(campaign_directory, str(row["material_family"])) / case_id
     measured: dict[str, object] = {}
     if row["outcome"] == "successful":
         result = common.paths.resolve_generation_case_result_directory(case_directory)
@@ -432,21 +427,31 @@ def campaign_cases_csv(
 ) -> str:
     """Render the derived ``cases.csv`` view of one campaign: one row per candidate in material and case order.
 
-    Columns are the outcome and typed reason, runtime, simulated end and final bulk
-    moisture where recorded, every sampled parameter its decision recorded and, for
-    a failed case, its last failure bundle's ``stdout.log`` relative to the campaign.
-    The text depends only on immutable records, so re-rendering a settled campaign is
-    byte-identical; it never decides, selects, or validates anything.
+    Columns are the outcome and typed reason, runtime, for the transient task its
+    simulated end and final bulk moisture where recorded, every parameter the
+    frozen plan's registry classifies as sampled for the task (no constants,
+    derived or coupled values) and, for a failed case, its last failure bundle's
+    ``stdout.log`` relative to the campaign. The text depends only on immutable
+    records, so re-rendering a settled campaign is byte-identical; it never
+    decides, selects, or validates anything.
     """
     storage = common.paths.get_storage_root(storage_root=storage_root).expanduser().resolve()
     campaign_directory = common.paths.resolve_generation_campaign_directory(task, campaign_name, storage_root=storage)
     rows = list_campaign_cases(task, campaign_name, storage_root=storage)
-    sampled_values = [dict(row["parameters"]) if isinstance(row["parameters"], dict) else {} for row in rows]
-    parameters = sorted({name for sampled in sampled_values for name in sampled})
+    results = _TRANSIENT_RESULT_COLUMNS if task == "transient_drying" else ()
+    batches = lifecycle.load_campaign_plan(task, campaign_name, storage_root=storage)["batches"]
+    sampled_by_material: dict[str, set[str]] = {}
+    ordered: dict[str, None] = {}
+    for batch in batches:
+        names = [name for name, entry in batch["scientific_values"]["material"]["parameter_registry"].items() if entry["classification"] == "sampled"]
+        sampled_by_material.setdefault(batch["material_family"], set()).update(names)
+        ordered.update(dict.fromkeys(names))
+    parameters = list(ordered)
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow((*_CASES_VIEW_COLUMNS, *parameters, "solver_log"))
-    for row, sampled in zip(rows, sampled_values, strict=True):
+    writer.writerow((*_CASES_VIEW_COLUMNS, *results, *parameters, "solver_log"))
+    for row in rows:
+        sampled = row["parameters"] if isinstance(row["parameters"], dict) else {}
         failure = row["failure"] or {}
         values = _case_measurements(task, row, campaign_directory=campaign_directory)
         cells = (
@@ -457,9 +462,8 @@ def campaign_cases_csv(
             failure.get("reason_code"),
             failure.get("detail"),
             values.get("duration_s"),
-            values.get("simulated_end_h"),
-            values.get("final_bulk_moisture_wb"),
-            *(sampled.get(name) for name in parameters),
+            *(values.get(name) for name in results),
+            *(sampled.get(name) if name in sampled_by_material.get(row["material_family"], ()) else None for name in parameters),
             values.get("solver_log"),
         )
         writer.writerow(tuple(_view_cell(cell) for cell in cells))
@@ -605,7 +609,8 @@ def resolve_raw_case_reference(
         "selected_pool_sha256": pool_sha,
     }
     design_provenance = {
-        "sampling_method": plan["sampling_mode"],
+        "design_recipe": plan["design_recipe"],
+        "design_kind": reservation["sampling_regime"],
         "original_design_size": len(design["case_indices"]),
         "candidate_position": reservation["candidate_position"],
         "origin": reservation["origin"],

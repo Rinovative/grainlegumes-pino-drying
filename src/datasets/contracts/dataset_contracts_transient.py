@@ -31,8 +31,6 @@ TransientSampleMode: TypeAlias = Literal["one_step_transition", "rollout_window"
 
 TRANSIENT_PROFILE_ID: Final = "transient_drying"
 TRANSIENT_VIEW_ID: Final = "transient_drying"
-TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION: Final = 1
-TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION: Final = 1
 TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "one_step_transition",
     "rollout_window",
@@ -126,7 +124,6 @@ class TransientSpatialRepresentation:
         """Compute the immutable exact source-index-map identity once."""
         encoded = json.dumps(
             {
-                "schema_version": TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION,
                 "source_shape": list(self.source_shape),
                 "spatial_stride": self.spatial_stride,
                 "represented_shape": list(self.represented_shape),
@@ -143,7 +140,6 @@ class TransientSpatialRepresentation:
     def as_dict(self) -> dict[str, Any]:
         """Serialize the exact index-based spatial representation."""
         return {
-            "schema_version": TRANSIENT_SPATIAL_REPRESENTATION_SCHEMA_VERSION,
             "source_shape": list(self.source_shape),
             "spatial_stride": self.spatial_stride,
             "represented_shape": list(self.represented_shape),
@@ -492,7 +488,6 @@ def transient_contract_payload() -> dict[str, Any]:
 def transient_contract_digest() -> str:
     """Return the exact path-independent transient Dataset contract digest."""
     payload = {
-        "schema_version": TRANSIENT_VIEW_CONTRACT_SCHEMA_VERSION,
         "view": TRANSIENT_VIEW_ID,
         "contract": transient_contract_payload(),
     }

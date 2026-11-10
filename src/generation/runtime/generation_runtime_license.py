@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Recognize conservative floating-license capacity signatures in captured logs
-  - Derive capped exponential retry delays from resolved execution policy
+  - Own the licence backoff and in-allocation window timing and derive capped exponential retry delays from it
   - Persist and validate compact controller wait records and immutable in-allocation window receipts
   - Record exact checkout status-artifact recovery evidence before and after cleanup
 
@@ -41,6 +41,11 @@ if TYPE_CHECKING:
     from src.generation.cases import generation_cases_config as config_contract
 
 TEMPORARY_LICENSE_CAPACITY: Final = "temporary_license_capacity"
+# Pipeline-owned timing of the licence protection (execution.rules.license_wait only enables it and caps the cumulative wait per case).
+INITIAL_BACKOFF_SECONDS: Final = 60.0  # First controller redispatch delay; a seat frees when another user's job ends.
+MAXIMUM_BACKOFF_SECONDS: Final = 300.0  # The doubling redispatch delay grows no further than this.
+IN_ALLOCATION_WINDOW_SECONDS: Final = 300.0  # Window in which one case start retries licence-capacity failures inside its running allocation.
+IN_ALLOCATION_PAUSE_SECONDS: Final = 5.0  # Pause after a licence-capacity failure before the next checkout attempt in that window.
 _FEATURE_PATTERN: Final = re.compile(
     r"Could\s+not\s+obtain\s+license\s+for\s+['\"](?P<feature>[^'\"\r\n]+)['\"]",
     flags=re.IGNORECASE,
@@ -67,14 +72,12 @@ _SOLVER_PROGRESS_PATTERN: Final = re.compile(
     flags=re.IGNORECASE | re.MULTILINE,
 )
 _WAIT_SCHEMA_KIND: Final = "generation_temporary_license_wait"
-_WAIT_SCHEMA_VERSION: Final = 1
 _WAIT_FILENAME: Final = "wait.json"
 _MAX_RAW_EXCERPT_CHARACTERS: Final = 4096
 _MAX_RECENT_DISPATCH_KEYS: Final = 16
 _WAIT_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "batch_id",
         "case_id",
@@ -136,6 +139,7 @@ class TemporaryLicenseCapacityError(RuntimeError):
         self.timed_out = False
         self.missing_or_invalid_artifacts: tuple[str, ...] = ()
         self.failure_stage = "solver"
+        self.runtime_reason: str | None = None  # set to "solver_error" when no licence protection takes the error
         self.evidence = evidence
         self.solver_progress_started = solver_progress_started
         self.expected_exports_exist = expected_exports_exist
@@ -222,14 +226,12 @@ def bounded_retry_delay_seconds(
     if not 0.0 <= cumulative < float("inf"):
         message = "License retry cumulative wait must be a finite non-negative number."
         raise ValueError(message)
-    initial = float(policy["initial_delay_seconds"])
-    maximum = float(policy["maximum_delay_seconds"])
-    delay = initial
+    delay = INITIAL_BACKOFF_SECONDS
     for _index in range(1, attempt_index):
-        if delay >= maximum:
-            delay = maximum
+        if delay >= MAXIMUM_BACKOFF_SECONDS:
+            delay = MAXIMUM_BACKOFF_SECONDS
             break
-        delay = min(maximum, delay * 2.0)
+        delay = min(MAXIMUM_BACKOFF_SECONDS, delay * 2.0)
     maximum_wait = policy["maximum_wait_seconds"]
     if maximum_wait is None:
         return delay
@@ -281,7 +283,6 @@ def _validate_wait_record(
         not isinstance(payload, dict)
         or set(payload) != _WAIT_KEYS
         or payload.get("schema_kind") != _WAIT_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), _WAIT_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != campaign_run_id
         or payload.get("batch_id") != config.batch_id
         or payload.get("case_id") != case_id
@@ -490,7 +491,6 @@ def record_temporary_license_wait(
     case_id = config.case_id(case_index)
     payload = {
         "schema_kind": _WAIT_SCHEMA_KIND,
-        "schema_version": _WAIT_SCHEMA_VERSION,
         "campaign_run_id": campaign_run_id,
         "batch_id": config.batch_id,
         "case_id": case_id,
@@ -577,7 +577,6 @@ def wait_record_is_eligible(
 
 
 _WINDOW_SCHEMA_KIND: Final = "generation_in_allocation_license_window"
-_WINDOW_SCHEMA_VERSION: Final = 1
 _WINDOW_DIRECTORY_NAME: Final = "windows"
 _MAX_RECENT_CHECKOUT_SUMMARIES: Final = 8
 _MAX_CHECKOUT_EXCERPT_CHARACTERS: Final = 512
@@ -764,7 +763,6 @@ def in_allocation_license_window_result(
     outcome: str,
 ) -> InAllocationLicenseWindowResult:
     """Build one validated final result from injected worker lifecycle evidence."""
-    policy = config.execution_values["runtime"]["license_wait"]["in_allocation_retry"]
     case_id = config.case_id(case_index)
     exhausted = outcome == "window_exhausted"
     return InAllocationLicenseWindowResult(
@@ -779,7 +777,7 @@ def in_allocation_license_window_result(
         window_ended_at=window_ended_at,
         window_started_monotonic_seconds=window_started_monotonic_seconds,
         window_ended_monotonic_seconds=window_ended_monotonic_seconds,
-        configured_window_seconds=float(policy["maximum_window_seconds"]),
+        configured_window_seconds=IN_ALLOCATION_WINDOW_SECONDS,
         checkout_summaries=checkout_summaries,
         solver_progress_started=solver_progress_started,
         outcome=outcome,
@@ -801,7 +799,6 @@ def _window_payload(result: InAllocationLicenseWindowResult) -> dict[str, Any]:
     )
     return {
         "schema_kind": _WINDOW_SCHEMA_KIND,
-        "schema_version": _WINDOW_SCHEMA_VERSION,
         "campaign_run_id": result.campaign_run_id,
         "batch_id": result.batch_id,
         "case_id": result.case_id,
@@ -932,7 +929,6 @@ def load_in_allocation_license_window(
         raise ValueError(message) from error
     required = {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "batch_id",
         "case_id",
@@ -962,7 +958,6 @@ def load_in_allocation_license_window(
         raise ValueError(message)
     if (
         payload["schema_kind"] != _WINDOW_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload["schema_version"], _WINDOW_SCHEMA_VERSION)
         or payload["campaign_run_id"] != campaign_run_id
         or payload["batch_id"] != config.batch_id
         or payload["case_id"] != case_id
@@ -986,8 +981,7 @@ def load_in_allocation_license_window(
     if any(isinstance(payload[key], bool) or not isinstance(payload[key], (int, float)) or float(payload[key]) < 0.0 for key in numeric_keys):
         message = f"In-allocation license window durations are malformed for {case_id}."
         raise ValueError(message)
-    expected_window = config.execution_values["runtime"]["license_wait"]["in_allocation_retry"]["maximum_window_seconds"]
-    if float(payload["configured_window_seconds"]) != float(expected_window):
+    if float(payload["configured_window_seconds"]) != IN_ALLOCATION_WINDOW_SECONDS:
         message = f"In-allocation license window policy is inconsistent for {case_id}."
         raise ValueError(message)
     summaries = payload["recent_checkout_summaries"]
@@ -1086,7 +1080,6 @@ def record_in_allocation_license_window(
 
 
 _STATUS_RECOVERY_SCHEMA_KIND: Final = "generation_in_allocation_status_artifact_recovery"
-_STATUS_RECOVERY_SCHEMA_VERSION: Final = 1
 _STATUS_RECOVERY_DIRECTORY_NAME: Final = "status_recoveries"
 _CASE_RECORD_DIRECTORIES: Final = frozenset({_WINDOW_DIRECTORY_NAME, _STATUS_RECOVERY_DIRECTORY_NAME})
 _STATUS_RECOVERY_FILENAME_PATTERN: Final = re.compile(r"checkout_(?P<index>[0-9]{4,})[.]json")
@@ -1095,7 +1088,6 @@ _MAX_STATUS_RECOVERY_EXCERPT_BYTES: Final = 160
 _STATUS_RECOVERY_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "batch_id",
         "case_id",
@@ -1176,7 +1168,6 @@ def _status_recovery_payload(
     }
     return {
         "schema_kind": _STATUS_RECOVERY_SCHEMA_KIND,
-        "schema_version": _STATUS_RECOVERY_SCHEMA_VERSION,
         "campaign_run_id": common.paths.validate_logical_name(campaign_run_id, label="campaign_run_id"),
         "batch_id": config.batch_id,
         "case_id": case_id,
@@ -1224,7 +1215,7 @@ def _validate_status_recovery_payload(
     dispatch_key: str,
     path: Path,
 ) -> dict[str, Any]:
-    """Validate one exact schema-version-1 status-artifact recovery receipt."""
+    """Validate one exact status-artifact recovery receipt."""
     case_id = config.case_id(case_index)
     if not isinstance(payload, dict) or set(payload) != _STATUS_RECOVERY_KEYS:
         message = f"Status-artifact recovery receipt is malformed: {path}"
@@ -1241,7 +1232,6 @@ def _validate_status_recovery_payload(
     )
     if (
         payload.get("schema_kind") != _STATUS_RECOVERY_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), _STATUS_RECOVERY_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != campaign_run_id
         or payload.get("batch_id") != config.batch_id
         or payload.get("case_id") != case_id

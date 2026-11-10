@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Render case-by-case Matplotlib figures inside widgets
+  - Show a failing view in place instead of raising it into the notebook
   - Manage dataset and case navigation controls
   - Store current figures for notebook export
 
@@ -17,13 +18,16 @@ This module does NOT:
 
 from __future__ import annotations
 
+import logging
+import traceback
+from html import escape
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakKeyDictionary
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
-from IPython.display import display
+from IPython.display import HTML, display
 from matplotlib.figure import Figure
 
 from . import analysis_ui_components as components
@@ -38,8 +42,19 @@ if TYPE_CHECKING:
 # INTERNAL HELPERS (viewer-agnostic, no semantics)
 # =============================================================================
 
+_LOGGER = logging.getLogger(__name__)
 _RENDER_LOCK = Lock()
 _RENDER_GENERATIONS: WeakKeyDictionary[widgets.Output, int] = WeakKeyDictionary()
+
+
+def show_render_failure(out: widgets.Output, error: BaseException) -> None:
+    """Replace the output content with one visible failure line and a collapsed traceback."""
+    _LOGGER.exception("View failed: %s", error, exc_info=error)
+    detail = escape("".join(traceback.format_exception(error)))
+    summary = escape(f"View failed — {type(error).__name__}: {error}")
+    with out:
+        out.clear_output(wait=True)
+        display(HTML(f"<p><b>{summary}</b></p><details><summary>Traceback</summary><pre>{detail}</pre></details>"))
 
 
 def clear_rendered_figure(
@@ -103,6 +118,8 @@ def render_figure(
     Recognized figures update only the explicitly supplied panel state, are
     displayed, and are then closed to release GUI resources. A newer request
     supersedes an older result before either display or export publication.
+    A failing callable is shown in place of its figure and clears the export
+    target; a later successful render replaces the failure.
 
     """
     with _RENDER_LOCK:
@@ -110,7 +127,7 @@ def render_figure(
         _RENDER_GENERATIONS[out] = generation
     try:
         result = plot_func(*args, **(kwargs or {}))
-    except Exception:
+    except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
         with _RENDER_LOCK:
             if _RENDER_GENERATIONS.get(out) == generation:
                 if export_state is not None:
@@ -118,9 +135,8 @@ def render_figure(
                     if isinstance(previous, Figure):
                         plt.close(previous)
                     export_state.update(fig=None, figures=(), plot_name=export_plot_name, title=export_title)
-                with out:
-                    out.clear_output(wait=True)
-        raise
+                show_render_failure(out, error)
+        return
 
     fig: Figure | None = None
     if isinstance(result, Figure):

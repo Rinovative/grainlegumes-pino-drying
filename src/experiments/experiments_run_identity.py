@@ -53,7 +53,6 @@ from .config import experiments_config_loader as config_loader
 from .config import experiments_config_naming as config_naming
 
 EXPERIMENT_RECORD_SCHEMA_KIND: Final = "experiment_transient_parent"
-EXPERIMENT_RECORD_SCHEMA_VERSION: Final = 1
 SLURM_PROVENANCE_VARIABLE: Final = "ML_SLURM_PROVENANCE"
 _SNAPSHOT_MANIFEST_FILENAME: Final = "snapshot.json"
 _EMPTY_DIFF_SHA256: Final = hashlib.sha256(b"").hexdigest()
@@ -62,7 +61,6 @@ _SHARED_A0_PATH: Final = "../a0"
 _RECORD_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "topology",
         "task",
         "parent_label",
@@ -232,7 +230,7 @@ def dataset_identity_evidence(config: Mapping[str, Any]) -> dict[str, Any]:
         msg = "Resolved experiment config must contain data identity."
         raise TypeError(msg)
     train = common.paths.validate_logical_name(data.get("train_dataset"), label="data.train_dataset")
-    selection_key = "additional_evaluation_datasets"
+    selection_key = "material_ood_datasets"
     raw_selected = data.get(selection_key)
     if not isinstance(raw_selected, list):
         msg = f"Resolved data.{selection_key} must be a list."
@@ -293,7 +291,6 @@ def _parent_record_payload(
     b_digest = training_checkpoint.resume_contract_digest(stage_b)
     return {
         "schema_kind": EXPERIMENT_RECORD_SCHEMA_KIND,
-        "schema_version": EXPERIMENT_RECORD_SCHEMA_VERSION,
         "topology": "a0_to_b",
         "task": task,
         "parent_label": parent_a,
@@ -371,9 +368,7 @@ def validate_transient_experiment_record(value: object) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _RECORD_KEYS:
         msg = "Transient experiment record keys do not match the current schema."
         raise ValueError(msg)
-    if value["schema_kind"] != EXPERIMENT_RECORD_SCHEMA_KIND or not common.serialization.is_schema_version(
-        value["schema_version"], EXPERIMENT_RECORD_SCHEMA_VERSION
-    ):
+    if value["schema_kind"] != EXPERIMENT_RECORD_SCHEMA_KIND:
         msg = "Transient experiment record schema is unsupported."
         raise ValueError(msg)
     if value["topology"] != "a0_to_b_and_a1" or set(value["children"]) != {"stage_a0", "stage_b", "stage_a1"}:

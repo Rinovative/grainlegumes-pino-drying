@@ -251,21 +251,48 @@ def test_job_logs_link_only_into_an_existing_owner_and_never_replace_another_fil
     log = tmp_path / "runtime/logs/datasets/dataset-steady_flow-4711.log"
     log.parent.mkdir(parents=True)
     log.write_text("[1/4] plan\n", encoding="utf-8")
-    owner = tmp_path / "storage/02_datasets/steady_flow/dataset"
+    owner = tmp_path / "storage/01_generation/steady_flow/campaign"
     host_service.link_job_logs(owner, [log])
     assert not owner.exists()
     assert "Warning:" in capsys.readouterr().err
-    owner.mkdir(parents=True)
+    (owner / "_record").mkdir(parents=True)
     host_service.link_job_logs(owner, [log])
     host_service.link_job_logs(owner, [log])
-    assert (owner / "logs" / log.name).samefile(log)
+    assert (owner / "_record/logs" / log.name).samefile(log)
     assert not capsys.readouterr().err
     stranger = tmp_path / "other" / log.name
     stranger.parent.mkdir()
     stranger.write_text("other\n", encoding="utf-8")
     host_service.link_job_logs(owner, [stranger])
-    assert (owner / "logs" / log.name).samefile(log)
+    assert (owner / "_record/logs" / log.name).samefile(log)
     assert "Warning:" in capsys.readouterr().err
+
+
+def test_an_empty_err_file_is_not_linked_but_a_filled_one_and_an_empty_out_are(tmp_path: Path) -> None:
+    """An .err that tells nothing stays out of the campaign's logs; the same file once it holds text, and an empty .out, are linked."""
+    owner = tmp_path / "campaign"
+    (owner / "_record").mkdir(parents=True)
+    err, out = tmp_path / "node-4711.err", tmp_path / "node-4711.out"
+    err.write_text("", encoding="utf-8")
+    out.write_text("", encoding="utf-8")
+    host_service.link_job_logs(owner, [err, out])
+    assert sorted(path.name for path in (owner / "_record/logs").iterdir()) == ["node-4711.out"]
+    err.write_text("boom\n", encoding="utf-8")
+    host_service.link_job_logs(owner, [err])
+    assert (owner / "_record/logs" / err.name).samefile(err)
+
+
+def test_job_logs_are_not_linked_through_a_symlinked_record_folder(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A campaign whose _record/ is a symbolic link gets no links, so nothing is written outside the campaign."""
+    owner, outside = tmp_path / "campaign", tmp_path / "outside"
+    owner.mkdir()
+    outside.mkdir()
+    (owner / "_record").symlink_to(outside, target_is_directory=True)
+    log = tmp_path / "node-4711.out"
+    log.write_text("preflight\n", encoding="utf-8")
+    host_service.link_job_logs(owner, [log])
+    assert not any(outside.iterdir())
+    assert "symbolic link" in capsys.readouterr().err
 
 
 def test_job_logs_come_from_the_submission_templates_and_a_file_swapped_while_linking_is_unlinked(
@@ -286,7 +313,7 @@ def test_job_logs_come_from_the_submission_templates_and_a_file_swapped_while_li
     assert host_service.current_job_log_files() == (launcher_log,)
     assert host_service.job_log_files(cluster_service.node_job_log_templates(runtime)) == node_logs
     owner = tmp_path / "campaign"
-    owner.mkdir()
+    (owner / "_record").mkdir(parents=True)
     link = Path.hardlink_to
 
     def swap_then_link(target: Path, source: Path) -> None:
@@ -297,7 +324,7 @@ def test_job_logs_come_from_the_submission_templates_and_a_file_swapped_while_li
 
     monkeypatch.setattr(Path, "hardlink_to", swap_then_link)
     host_service.link_job_logs(owner, [launcher_log])
-    assert not (owner / "logs" / launcher_log.name).exists()
+    assert not (owner / "_record/logs" / launcher_log.name).exists()
     assert "changed while it was linked" in capsys.readouterr().err
 
 

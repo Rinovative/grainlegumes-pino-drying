@@ -29,8 +29,6 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
 from src.learning.transient.learning_transient_tensorizer import TransientTensorizer
 
-_CHECKPOINT_SCHEMA_VERSION = learning.training.checkpoint.CHECKPOINT_SCHEMA_VERSION
-
 
 class _IncrementModel(nn.Module):
     def __init__(self, *, use_airflow: bool = False, output_dtype: torch.dtype = torch.float32) -> None:
@@ -79,7 +77,7 @@ class _SecondStepNonfiniteModel(_IncrementModel):
 
 def _scaling() -> TransientScalingArtifact:
     spec = TransientTensorizerSpec(
-        input_profile="canonical_physics_complete_v1",
+        input_profile="canonical_physics_complete",
         temporal_conditioning=TemporalConditioningSpec("none"),
     )
     contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
@@ -182,7 +180,7 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
     config: dict[str, Any] = {
         "task": "transient_drying",
         "producer": _producer(),
-        "input_profile": "canonical_physics_complete_v1",
+        "input_profile": "canonical_physics_complete",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {"kind": "fno", "params": {}},
     }
@@ -190,7 +188,7 @@ def test_completed_loader_uses_admitted_scaling_and_best_checkpoint(monkeypatch:
         "scientific_run_name": "run",
         "config": config,
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"model_state_dict": model.state_dict()},
     }
     observed: list[tuple[dict[str, Any], tuple[int, int]]] = []
     monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed)
@@ -247,7 +245,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
     config: dict[str, Any] = {
         "task": "transient_drying",
         "producer": _producer(),
-        "input_profile": "canonical_physics_complete_v1",
+        "input_profile": "canonical_physics_complete",
         "temporal": {"temporal_conditioning": {"kind": "none"}},
         "model": {
             "kind": "rno",
@@ -258,7 +256,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
         "scientific_run_name": "run",
         "config": config,
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"model_state_dict": model.state_dict()},
         "checkpoint_identity": {"epoch": 7},
         "selected_checkpoint_sha256": "b" * 64,
         "selected_checkpoint_epoch": 7,
@@ -304,12 +302,12 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
             "task": "transient_drying",
             "producer": _producer(),
             "data": {"spatial_stride": 2},
-            "input_profile": "canonical_physics_complete_v1",
+            "input_profile": "canonical_physics_complete",
             "temporal": {"temporal_conditioning": {"kind": "none"}},
             "model": {"kind": "rno", "params": {"in_channels": 20, "n_modes": [64, 64]}},
         },
         "normalizer_state": scaling.state_dict(),
-        "best_checkpoint": {"schema_version": _CHECKPOINT_SCHEMA_VERSION, "model_state_dict": model.state_dict()},
+        "best_checkpoint": {"model_state_dict": model.state_dict()},
         "checkpoint_identity": {"epoch": 7},
         "selected_checkpoint_sha256": "b" * 64,
         "selected_checkpoint_epoch": 7,

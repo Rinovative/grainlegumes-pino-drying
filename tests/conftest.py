@@ -135,7 +135,6 @@ def training_dataset_payload_factory(
             sample_ids=sample_ids,
             source_selection_identity={
                 "schema_kind": "dataset_source_selection",
-                "schema_version": 1,
                 "source_cases": provenance["source_case_identities"],
             },
             source_identities=identities,

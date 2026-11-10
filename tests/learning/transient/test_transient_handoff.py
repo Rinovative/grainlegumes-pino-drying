@@ -41,7 +41,7 @@ def _config() -> dict[str, Any]:
         "scheduler": None,
         "scaling": {},
         "run": {"deterministic": True, "seed": 1},
-        "data": {"train_dataset": "train", "additional_evaluation_datasets": []},
+        "data": {"train_dataset": "train", "material_ood_datasets": []},
         "training": {},
     }
 

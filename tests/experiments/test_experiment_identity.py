@@ -117,7 +117,6 @@ def test_readonly_child_navigation_binds_saved_identity_and_admits_training_drif
     run_dir = common.paths.resolve_config_run_dir(stage_a)
     config_path = configs.write_yaml(run_dir / "config.yaml", stage_a)
     summary = {
-        "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
         "status": "completed",
         "config_sha256": common.serialization.file_sha256(config_path),
         "checkpoint_identity": {"resume_contract_digest": child["semantic_config_sha256"]},
@@ -158,7 +157,6 @@ def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path:
     common.serialization.atomic_write_json(
         run_dir / "summary.json",
         {
-            "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "status": "budget_unmet",
             "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(stage_b)},
         },

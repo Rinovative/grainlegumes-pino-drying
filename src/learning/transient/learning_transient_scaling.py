@@ -1,7 +1,7 @@
 """Fit and admit train-only transient scaling evidence.
 
 Responsibilities:
-  - Fit deduplicated absolute-state and zero-preserving increment statistics
+  - Fit deduplicated absolute-state, derived grain-moisture and zero-preserving increment statistics
   - Persist task, Dataset, membership, profile, and channel identities
   - Encode state, spatial, scalar, and boundary values and encode or decode increments
   - Produce device-independent serialized evidence and identity digests
@@ -24,6 +24,8 @@ Notes:
     - Cases remain grouped and hourly transitions consecutive; an adjacent duplicate is collapsed only when its direct state and target tensors match
       exactly.
     - State population moments and zero-centered target RMS use unique transition evidence, with one reconstructed terminal state added per case.
+    - ``grain_moisture_std`` is the population std of ``w_gr`` over the same states, each with the ``f_surf`` of its own item; it is
+      serialized only when fitted, so earlier saved states keep their digest.
     - Static, scalar, and selected omega-boundary moments accumulate from every admitted Train item.
     - ``increment_scale`` selects ``state_std`` or ``delta_rms`` by ``scale_mode`` and then applies the positive numerical floor.
 
@@ -40,12 +42,11 @@ from typing import Any, Final, Literal
 
 import torch
 
-from src import common, datasets, domain
+from src import datasets, domain
 
 from .learning_transient_contracts import TransientTensorizerSpec
 
 SCALING_SCHEMA_KIND: Final = "transient_drying_scaling"
-SCALING_SCHEMA_VERSION: Final = 1
 SCALE_FLOOR: Final = 1.0e-7
 _SHA256_LENGTH: Final = 64
 _STATE_CHANNELS: Final = 4
@@ -70,6 +71,7 @@ _TENSOR_NAMES: Final = (
     "omega_boundary_mean",
     "omega_boundary_std",
 )
+_GRAIN_MOISTURE_STD: Final = "grain_moisture_std"
 
 
 def _require_sha256(value: Any, *, label: str) -> str:
@@ -196,17 +198,26 @@ class _StreamingChannelRMS:
         return torch.sqrt(self._square_sum / self._count).to(dtype=torch.float32)
 
 
+def _grain_moisture(state: torch.Tensor, f_surf: float) -> torch.Tensor:
+    """Return the derived float64 grain moisture of one [4,Y,X] state as one channel."""
+    names = tuple(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.dynamic_state)
+    surface, internal = state[names.index("w_surf")], state[names.index("w_int")]
+    return torch.from_numpy(domain.moisture.granular_water_content(surface.numpy(), internal.numpy(), f_surf)).unsqueeze(0)
+
+
 class _OrderedStateEvidence:
     """Validate canonical state chains while accumulating bounded moments."""
 
     def __init__(self) -> None:
         """Initialize empty ordered Train-state evidence."""
         self._state_moments = _StreamingChannelMoments(_STATE_CHANNELS)
+        self._grain_moments = _StreamingChannelMoments(1)
         self._delta_rms = _StreamingChannelRMS(_STATE_CHANNELS)
         self._seen_simulations: set[str] = set()
         self._active_simulation: str | None = None
         self._previous_state: torch.Tensor | None = None
         self._previous_target: torch.Tensor | None = None
+        self._previous_f_surf: float | None = None
         self._previous_index_n: int | None = None
         self._previous_index_next: int | None = None
         self._previous_t_next: float | None = None
@@ -231,9 +242,11 @@ class _OrderedStateEvidence:
 
     def _finish_active_simulation(self) -> None:
         """Admit one reconstructed terminal state and release its tensors."""
-        if self._previous_state is None or self._previous_target is None:
+        if self._previous_state is None or self._previous_target is None or self._previous_f_surf is None:
             return
-        self._state_moments.update(self._previous_state + self._previous_target)
+        terminal = self._previous_state + self._previous_target
+        self._state_moments.update(terminal)
+        self._grain_moments.update(_grain_moisture(terminal, self._previous_f_surf))
         self._unique_state_count += 1
         self._previous_state = None
         self._previous_target = None
@@ -270,6 +283,7 @@ class _OrderedStateEvidence:
         state: torch.Tensor,
         target: torch.Tensor,
         *,
+        f_surf: float,
         index_n: int,
         index_next: int,
         t_n: float,
@@ -296,11 +310,13 @@ class _OrderedStateEvidence:
                 message = "Direct transient state evidence disagrees with its exact transition target."
                 raise ValueError(message)
         self._state_moments.update(state)
+        self._grain_moments.update(_grain_moisture(state, f_surf))
         self._delta_rms.update(target)
         self._unique_state_count += 1
         self._unique_transition_count += 1
         self._previous_state = state
         self._previous_target = target
+        self._previous_f_surf = f_surf
         self._previous_index_n = index_n
         self._previous_index_next = index_next
         self._previous_t_next = t_next
@@ -310,6 +326,7 @@ class _OrderedStateEvidence:
         state: torch.Tensor,
         target: torch.Tensor,
         *,
+        f_surf: float,
         simulation: str,
         index_n: int,
         index_next: int,
@@ -326,6 +343,7 @@ class _OrderedStateEvidence:
             self._admit_unique(
                 state,
                 target,
+                f_surf=f_surf,
                 index_n=index_n,
                 index_next=index_next,
                 t_n=t_n,
@@ -333,14 +351,15 @@ class _OrderedStateEvidence:
             )
         self._transition_count += 1
 
-    def finish(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Finalize the terminal state and return state statistics plus delta RMS."""
+    def finish(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Finalize the terminal state and return state statistics, delta RMS and the grain-moisture std."""
         if self._transition_count < 1:
             message = "Transient scaling fit requires at least one Train item."
             raise ValueError(message)
         self._finish_active_simulation()
         state_mean, state_std = self._state_moments.population_statistics()
-        return state_mean, state_std, self._delta_rms.population_rms()
+        _, grain_moisture_std = self._grain_moments.population_statistics()
+        return state_mean, state_std, self._delta_rms.population_rms(), grain_moisture_std.squeeze(0)
 
 
 def _operational_scale(values: torch.Tensor, *, floor: float) -> torch.Tensor:
@@ -424,6 +443,7 @@ class TransientScalingArtifact:
     omega_boundary_mean: torch.Tensor
     omega_boundary_std: torch.Tensor
     horizon: float
+    grain_moisture_std: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Isolate values and reject identity, field, shape, or device drift."""
@@ -545,6 +565,9 @@ class TransientScalingArtifact:
             "omega_boundary_mean": (),
             "omega_boundary_std": (),
         }
+        if self.grain_moisture_std is not None:
+            expected_shapes["grain_moisture_std"] = ()
+        non_negative = {"state_std", "delta_rms", "grain_moisture_std"}
         reference_device: torch.device | None = None
         reference_dtype: torch.dtype | None = None
         for name, shape in expected_shapes.items():
@@ -552,10 +575,10 @@ class TransientScalingArtifact:
             if tuple(tensor.shape) != shape:
                 message = f"{name} must have shape {shape}, got {tuple(tensor.shape)}."
                 raise ValueError(message)
-            if name in {"state_std", "delta_rms"} and not bool((tensor >= 0).all().item()):
+            if name in non_negative and not bool((tensor >= 0).all().item()):
                 message = f"{name} must contain only non-negative values."
                 raise ValueError(message)
-            if name not in {"state_std", "delta_rms"} and name.endswith(("std", "rms", "scale")) and not bool((tensor > 0).all().item()):
+            if name not in non_negative and name.endswith(("std", "rms", "scale")) and not bool((tensor > 0).all().item()):
                 message = f"{name} must contain only positive values."
                 raise ValueError(message)
             if reference_device is None:
@@ -620,12 +643,15 @@ class TransientScalingArtifact:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def _tensor_names(self) -> tuple[str, ...]:
+        """Return the persisted tensor names; the optional grain-moisture scale exists only when fitted."""
+        return (*_TENSOR_NAMES, *(() if self.grain_moisture_std is None else (_GRAIN_MOISTURE_STD,)))
+
     def state_dict(self) -> dict[str, Any]:
         """Serialize exact identity and detached CPU numeric evidence."""
-        tensor_values = {name: getattr(self, name).detach().to(device="cpu").tolist() for name in _TENSOR_NAMES}
+        tensor_values = {name: getattr(self, name).detach().to(device="cpu").tolist() for name in self._tensor_names()}
         return {
             "schema_kind": SCALING_SCHEMA_KIND,
-            "schema_version": SCALING_SCHEMA_VERSION,
             "task_contract_digest": self.task_contract_digest,
             "data_contract_digest": self.data_contract_digest,
             "tensorizer": self.tensorizer.as_dict(),
@@ -656,7 +682,6 @@ class TransientScalingArtifact:
             raise TypeError(message)
         identity_keys = {
             "schema_kind",
-            "schema_version",
             "task_contract_digest",
             "data_contract_digest",
             "tensorizer",
@@ -675,10 +700,10 @@ class TransientScalingArtifact:
             "horizon",
         }
         required = identity_keys.union(_TENSOR_NAMES)
-        if set(state) != required:
+        if set(state) not in (required, required | {_GRAIN_MOISTURE_STD}):
             message = "Transient scaling state keys do not match the current schema."
             raise ValueError(message)
-        if state["schema_kind"] != SCALING_SCHEMA_KIND or not common.serialization.is_schema_version(state["schema_version"], SCALING_SCHEMA_VERSION):
+        if state["schema_kind"] != SCALING_SCHEMA_KIND:
             message = "Transient scaling state has an unsupported schema."
             raise ValueError(message)
         raw_tensorizer = state["tensorizer"]
@@ -693,7 +718,7 @@ class TransientScalingArtifact:
         if dict(raw_tensorizer) != tensorizer.as_dict():
             message = "Saved tensorizer identity does not match its resolved contract."
             raise ValueError(message)
-        tensors = {name: torch.as_tensor(state[name], dtype=torch.float32) for name in _TENSOR_NAMES}
+        tensors = {name: torch.as_tensor(state[name], dtype=torch.float32) for name in (*_TENSOR_NAMES, _GRAIN_MOISTURE_STD) if name in state}
         return cls(
             task_contract_digest=state["task_contract_digest"],
             data_contract_digest=state["data_contract_digest"],
@@ -717,7 +742,7 @@ class TransientScalingArtifact:
     def to(self, device: torch.device | str) -> TransientScalingArtifact:
         """Return an equivalent runtime artifact on one concrete device."""
         target = _concrete_device(device)
-        changes = {name: getattr(self, name).to(device=target) for name in _TENSOR_NAMES}
+        changes = {name: getattr(self, name).to(device=target) for name in self._tensor_names()}
         return replace(self, **changes)
 
     def encode_state(self, value: torch.Tensor) -> torch.Tensor:
@@ -1039,6 +1064,8 @@ def fit_transient_scaling(
     scalar_moments = _StreamingChannelMoments(_SCALAR_CHANNELS)
     omega_moments = _StreamingChannelMoments(1)
     spatial_shape: tuple[int, int] | None = None
+    contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
+    f_surf_index = tuple(field.name for field in contract.scalar_conditioning).index("f_surf")
 
     for item in items:
         if not isinstance(item, Mapping):
@@ -1081,6 +1108,7 @@ def fit_transient_scaling(
         state_evidence.admit(
             state,
             target,
+            f_surf=float(scalar_values[f_surf_index].item()),
             simulation=simulation,
             index_n=index_n,
             index_next=index_next,
@@ -1096,7 +1124,7 @@ def fit_transient_scaling(
     if spatial_shape is None:
         message = "Transient scaling fit requires at least one Train item."
         raise ValueError(message)
-    state_mean, state_std, delta_rms = state_evidence.finish()
+    state_mean, state_std, delta_rms, grain_moisture_std = state_evidence.finish()
     selected_increment_statistic = state_std if scale_mode == "state_std" else delta_rms
     increment_scale = _operational_scale(selected_increment_statistic, floor=SCALE_FLOOR)
     static_mean, static_std = static_moments.population_statistics()
@@ -1106,7 +1134,6 @@ def fit_transient_scaling(
     scalar_std = _operational_scale(scalar_std, floor=SCALE_FLOOR)
     omega_std = _operational_scale(omega_std, floor=SCALE_FLOOR)
 
-    contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
     task = domain.tasks.registry.get_task("transient_drying")
     return TransientScalingArtifact(
         task_contract_digest=task.contract_digest,
@@ -1135,4 +1162,5 @@ def fit_transient_scaling(
         omega_boundary_mean=omega_mean.squeeze(0),
         omega_boundary_std=omega_std.squeeze(0),
         horizon=resolved_horizon,
+        grain_moisture_std=grain_moisture_std,
     )

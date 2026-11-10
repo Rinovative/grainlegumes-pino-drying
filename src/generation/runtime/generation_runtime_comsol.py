@@ -125,7 +125,6 @@ def build_comsol_command(
     *,
     cores_per_case: int,
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None = None,
-    scheduler_kind: str = "local",
     batch_log_path: str = comsol_timing.COMSOL_BATCH_LOG_FILENAME,
     scratch_directory: str = SCRATCH_DIRNAME,
 ) -> list[str]:
@@ -137,9 +136,6 @@ def build_comsol_command(
     """
     if isinstance(cores_per_case, bool) or not isinstance(cores_per_case, int) or cores_per_case < 1:
         message = f"cores_per_case must be a positive integer, got {cores_per_case!r}."
-        raise ValueError(message)
-    if scheduler_kind not in {"local", "slurm"}:
-        message = f"Unsupported scheduler kind for case execution: {scheduler_kind!r}."
         raise ValueError(message)
     extra_arguments = config.execution_values["runtime"]["extra_arguments"]
     for label, value in (("batch_log_path", batch_log_path), ("scratch_directory", scratch_directory)):

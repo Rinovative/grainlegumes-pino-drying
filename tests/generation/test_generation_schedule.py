@@ -598,7 +598,6 @@ def test_comsol_startup_handoff_uses_cold_initial_equilibrium_state() -> None:
     assert startup["startup_humidity_ratio_kg_per_kg"] == expected_omega
     assert startup["realized_minimum_initial_cell_to_inlet_rh_margin"] >= (0.05 - schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
     assert startup["continuous_startup_relative_humidity_maximum"] <= (expected_target + schedule_service.STARTUP_RELATIVE_HUMIDITY_TOLERANCE)
-    assert handoff.metadata["boundary_handoff"]["handoff_version"] == 1
 
 
 def test_comsol_startup_handoff_rejects_supersaturated_source_air() -> None:

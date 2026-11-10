@@ -7,7 +7,7 @@ Responsibilities:
   - Resolve Dataset bundles, config-named runs, Optuna studies and trials, and artifacts
   - Compose and invert run directories from the saved ``run.layout`` contract
   - Identify completed and evaluable saved-run directories by required local files
-  - Name the logs/ folder of a campaign, Dataset, run or study and record which folders an ML job wrote for its log links
+  - Name the logs/ folder of a campaign and record which folders an ML job wrote for its log links
 
 Design principles:
   - Durable scientific paths descend from one explicitly resolved storage root
@@ -37,19 +37,24 @@ Notes:
     PROJECT_ROOT == RUNTIME_ROOT/sources/<SOURCE_TREE_ID>; no sibling default applies.
   Generation layout (relative to the generation root):
     Human files come first and machine records sit in reserved _record/ folders.
-    <task>/<campaign>/ owns one <material>/ directory per material, logs/ with hard
-    links of the campaign's job logs, cases.csv (a derived per-candidate view written
-    when the campaign completes), .state/ for locks and staging, and
-    _record/ with campaign_plan.json, selected_pool.json and execution/ (operational
-    records keyed by <material>-<regime>). A material owns _record/<regime>/ (batch
-    design and replacements/) beside its case_NNNN/ directories; a case owns inputs/
+    <task>/<campaign>/ holds exactly cases.csv (a derived per-candidate view written
+    when the campaign completes), materials/ with one <material>/ directory per
+    material, and _record/ with campaign_plan.json, selected_pool.json, logs/ (hard
+    links of the campaign's job logs) and execution/ (operational records keyed by
+    <material>-<regime>). A material owns _record/<regime>/ (batch
+    design) and _record/amendments/ (its minimum-success-rate amendments) beside
+    its case_NNNN/ directories; a case owns inputs/
     (the immutable case definition), result/ (the published HDF5, provenance,
     success marker and evidence/ with the retained runtime evidence) and _record/
     with reservation.json (the only reservation copy), decision.json and attempts/
-    (classified attempt records attempt_NNNN.json beside failure bundles run_NNNN/).
-    _record, logs and cases.csv are the only reserved names; every enumeration
-    recognizes them explicitly and rejects any other non-case entry. .state/ (raw-input
-    transactions, workflow sessions) also sits beside the campaigns.
+    (classified attempt records attempt_NNNN.json beside failure bundles run_NNNN/);
+    every enumeration of a material rejects any other non-case entry.
+    The single Generation .state/ sits beside the task folders: locks/ holds empty
+    lock anchors named <task>~<campaign>~<kind>.lock for campaign locks (kind controller
+    or submission) and <task>~<campaign>~<material>~<regime>~<kind>.lock for batch locks
+    (kind inputs or case_NNNN), and staging/<task>~<campaign>/ holds reservation,
+    publication and input-transaction staging by material and regime. No task or
+    campaign folder holds state of its own.
   Dataset layout (relative to the datasets root):
     <task>/<dataset>/ owns dataset_manifest.json and one fixed-name payload, namely
     dataset.pt for steady flow, or dataset.json plus transient_pt_shards/ for transient
@@ -84,15 +89,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import common_serialization as serialization
-
 RUN_CONFIG_FILENAME = "config.yaml"
 RUN_NORMALIZER_FILENAME = "normalizer.pt"
 RUN_BEST_CHECKPOINT_FILENAME = "best_checkpoint.pt"
 RUN_LAST_CHECKPOINT_FILENAME = "last_checkpoint.pt"
 RUN_SPLIT_INDICES_FILENAME = "split_indices.pt"
 RUN_SUMMARY_FILENAME = "summary.json"
-RUN_SUMMARY_SCHEMA_VERSION = 1
+# Every analysis role folder holds its per-case table under this one name; the folder carries the Dataset name.
+ANALYSIS_ARTIFACTS_FILENAME = "artifacts.parquet"
+ANALYSIS_OOD_ROLES = ("material_ood", "parameter_ood")
 DATASET_MANIFEST_FILENAME = "dataset_manifest.json"
 DATASET_PAYLOAD_FILENAME = "dataset.pt"
 DATASET_INDEX_FILENAME = "dataset.json"
@@ -103,6 +108,9 @@ SOURCE_TREE_ID_ENVIRONMENT_VARIABLE = "SOURCE_TREE_ID"
 _SOURCE_TREE_ID_PATTERN = re.compile(r"[0-9a-f]{12}-[0-9a-f]{12}")
 GENERATION_AREA_NAME = "01_generation"
 GENERATION_STATE_DIRNAME = ".state"
+GENERATION_LOCKS_DIRNAME = "locks"
+GENERATION_STAGING_DIRNAME = "staging"
+GENERATION_MATERIALS_DIRNAME = "materials"
 GENERATION_RECORD_DIRNAME = "_record"
 JOB_LOGS_DIRNAME = "logs"
 JOB_LOG_OWNERS_ENVIRONMENT_VARIABLE = "JOB_LOG_OWNERS_FILE"
@@ -112,7 +120,7 @@ GENERATION_CANCELLATIONS_FILENAME = "cancellations.json"
 GENERATION_CAMPAIGN_PLAN_FILENAME = "campaign_plan.json"
 GENERATION_SELECTED_POOL_FILENAME = "selected_pool.json"
 GENERATION_CASES_VIEW_FILENAME = "cases.csv"
-GENERATION_REPLACEMENTS_DIRNAME = "replacements"
+GENERATION_AMENDMENTS_DIRNAME = "amendments"
 GENERATION_RESERVATION_FILENAME = "reservation.json"
 GENERATION_DECISION_FILENAME = "decision.json"
 GENERATION_INPUTS_DIRNAME = "inputs"
@@ -123,17 +131,14 @@ GENERATION_CASE_PAYLOAD_FILENAME = "case.json"
 GENERATION_INPUT_REFERENCE_FILENAME = "input_reference.json"
 GENERATION_RESULT_HDF5_FILENAME = "case.h5"
 GENERATION_RESERVATION_STAGING_DIRNAME = "reservation-staging"
-GENERATION_CONTROLLER_LOCK_FILENAME = "controller.lock"
-GENERATION_SUBMISSION_LOCK_FILENAME = "submission.lock"
+GENERATION_INPUT_TRANSACTIONS_DIRNAME = "input-transactions"
+_GENERATION_STATE_NAME_SEPARATOR = "~"
 _CAMPAIGN_BATCH_PART_COUNT = 5
 _CAMPAIGN_RUN_PART_COUNT = 3
-_CASE_DIRECTORY_DEPTH = 5  # 01_generation/<task>/<campaign>/<material>/<case>
+_CAMPAIGN_DIRECTORY_DEPTH = 3  # 01_generation/<task>/<campaign>
+_CASE_DIRECTORY_DEPTH = 6  # 01_generation/<task>/<campaign>/materials/<material>/<case>
 _GENERATION_CASE_ID = re.compile(r"case_[0-9]{4,}")
 _GENERATION_ATTEMPT_RUN = re.compile(r"run_[0-9]{4,}")
-# Campaign entries that are never materials; a material holds only its _record/ beside its cases.
-_GENERATION_CAMPAIGN_RESERVED_NAMES = frozenset(
-    {GENERATION_STATE_DIRNAME, GENERATION_RECORD_DIRNAME, JOB_LOGS_DIRNAME, GENERATION_CASES_VIEW_FILENAME}
-)
 DATASETS_AREA_NAME = "02_datasets"
 EXPERIMENTS_AREA_NAME = "03_experiments"
 OPTUNA_FAMILY = "optuna"
@@ -419,23 +424,51 @@ def generation_execution_key(batch_storage_name: str) -> str:
     return f"{material}-{regime}"
 
 
-def resolve_generation_state_directory(campaign_directory: Path | str) -> Path:
-    """Return a campaign's private coordination-state directory."""
-    return Path(campaign_directory) / GENERATION_STATE_DIRNAME
+def _generation_state_name(*parts: str) -> str:
+    """Join identity parts into one state entry name within one path component; no part may hold the separator, so names stay injective."""
+    for part in parts:
+        validate_logical_name(part, label="generation_state_name_part")
+        if _GENERATION_STATE_NAME_SEPARATOR in part:
+            message = f"Generation state name part must not contain {_GENERATION_STATE_NAME_SEPARATOR!r}: {part!r}"
+            raise ValueError(message)
+    return validate_logical_name(_GENERATION_STATE_NAME_SEPARATOR.join(parts), label="generation_state_name")
+
+
+def _generation_lock_path(state_root: Path, *parts: str) -> Path:
+    """Return the lock anchor ``locks/<part>~<part>….lock`` below one Generation state root, within one path component."""
+    name = validate_logical_name(f"{_generation_state_name(*parts)}.lock", label="generation_lock_name")
+    return state_root / GENERATION_LOCKS_DIRNAME / name
+
+
+def _generation_staging_directory(state_root: Path, task: str, campaign_name: str) -> Path:
+    """Return the staging area of one campaign below one Generation state root."""
+    return state_root / GENERATION_STAGING_DIRNAME / _generation_state_name(task, campaign_name)
+
+
+def _campaign_state_location(campaign_directory: Path | str) -> tuple[Path, str, str]:
+    """Invert ``<storage>/01_generation/<task>/<campaign>`` to its Generation state root, task, and campaign name."""
+    parts = Path(campaign_directory).parts
+    if len(parts) < _CAMPAIGN_DIRECTORY_DEPTH or parts[-_CAMPAIGN_DIRECTORY_DEPTH] != GENERATION_AREA_NAME:
+        message = f"Path is not a canonical Generation campaign directory: {campaign_directory}"
+        raise ValueError(message)
+    *storage_parts, area, task, campaign_name = parts
+    return Path(*storage_parts, area, GENERATION_STATE_DIRNAME), task, campaign_name
 
 
 def resolve_generation_controller_lock_path(campaign_directory: Path | str) -> Path:
     """Return the lock anchor that serializes campaign-plan and reservation writers."""
-    return resolve_generation_state_directory(campaign_directory) / GENERATION_CONTROLLER_LOCK_FILENAME
+    state_root, task, campaign_name = _campaign_state_location(campaign_directory)
+    return _generation_lock_path(state_root, task, campaign_name, "controller")
 
 
 def resolve_generation_submission_lock_path(campaign_directory: Path | str) -> Path:
     """Return the lock anchor that serializes the campaign's scheduler submission and cancellation."""
-    return resolve_generation_state_directory(campaign_directory) / GENERATION_SUBMISSION_LOCK_FILENAME
+    state_root, task, campaign_name = _campaign_state_location(campaign_directory)
+    return _generation_lock_path(state_root, task, campaign_name, "submission")
 
 
 def resolve_generation_campaign_record_directory(campaign_directory: Path | str) -> Path:
-    """Return the reserved machine-record directory of a campaign: plan, selected pool, and execution ledger."""
+    """Return the reserved machine-record directory of a campaign: plan, selected pool, job logs, and execution ledger."""
     return Path(campaign_directory) / GENERATION_RECORD_DIRNAME
 
 
@@ -472,9 +505,9 @@ def resolve_generation_selected_pool_path(campaign_directory: Path | str) -> Pat
     return resolve_generation_campaign_record_directory(campaign_directory) / GENERATION_SELECTED_POOL_FILENAME
 
 
-def resolve_job_logs_directory(owner_directory: Path | str) -> Path:
-    """Return the ``logs/`` directory that holds hard links of the job logs of one campaign or published Dataset."""
-    return Path(owner_directory) / JOB_LOGS_DIRNAME
+def resolve_generation_campaign_logs_directory(campaign_directory: Path | str) -> Path:
+    """Return the ``_record/logs/`` directory that holds hard links of the job logs of one campaign."""
+    return resolve_generation_campaign_record_directory(campaign_directory) / JOB_LOGS_DIRNAME
 
 
 def record_job_log_owner(owner: Path | str) -> None:
@@ -556,6 +589,35 @@ def resolve_generation_reconciliation_failures_directory(execution_directory: Pa
     )
 
 
+def _refuse_symlinks(*paths: Path) -> None:
+    """Fail closed when any of ``paths`` is a symbolic link, present or dangling, so nothing leaves its campaign through it."""
+    for path in paths:
+        if path.is_symlink():
+            message = f"Generation material namespace contains a symbolic link: {path}"
+            raise ValueError(message)
+
+
+def resolve_generation_campaign_material_directory(campaign_directory: Path | str, material: str) -> Path:
+    """
+    Locate the directory that owns one material's designs and cases, ``<campaign>/materials/<material>``.
+
+    This is the one place every reader and writer of the material namespace obtains its path from (the other
+    resolvers below it call this one), so the invariant holds for each of them: ``materials/``, the material
+    folder and its ``_record/`` are never symbolic links, whether they exist yet or not, and every path below the
+    returned directory stays inside the campaign.
+
+    Raises
+    ------
+    ValueError
+        If ``materials/``, the material folder or its ``_record/`` is a symbolic link.
+
+    """
+    materials = Path(campaign_directory) / GENERATION_MATERIALS_DIRNAME
+    directory = materials / validate_logical_name(material, label="material")
+    _refuse_symlinks(materials, directory, directory / GENERATION_RECORD_DIRNAME)
+    return directory
+
+
 def resolve_generation_material_directory(
     task: str,
     campaign_name: str,
@@ -564,11 +626,8 @@ def resolve_generation_material_directory(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Locate the directory that owns one material's designs and cases inside a campaign."""
-    material = validate_logical_name(material, label="material")
-    if material in _GENERATION_CAMPAIGN_RESERVED_NAMES:
-        message = f"Material name {material!r} is a reserved campaign entry."
-        raise ValueError(message)
-    return resolve_generation_campaign_directory(task, campaign_name, storage_root=storage_root) / material
+    campaign_directory = resolve_generation_campaign_directory(task, campaign_name, storage_root=storage_root)
+    return resolve_generation_campaign_material_directory(campaign_directory, material)
 
 
 def resolve_generation_campaign_case_directory(
@@ -624,18 +683,25 @@ def resolve_generation_batch_metadata_directory(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve one canonical batch-owned design directory ``<material>/_record/<regime>``."""
+    """Resolve one canonical batch-owned design directory ``<material>/_record/<regime>``, never a symbolic link."""
     material_directory, regime = _campaign_batch_material_directory(batch_storage_name, storage_root=storage_root)
-    return material_directory / GENERATION_RECORD_DIRNAME / regime
+    directory = material_directory / GENERATION_RECORD_DIRNAME / regime
+    _refuse_symlinks(directory)
+    return directory
 
 
-def resolve_generation_replacements_directory(
-    batch_storage_name: str,
+def resolve_generation_material_amendments_directory(
+    task: str,
+    campaign_name: str,
+    material: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve the append-only minimum-success-rate amendments of one original batch."""
-    return resolve_generation_batch_metadata_directory(batch_storage_name, storage_root=storage_root) / GENERATION_REPLACEMENTS_DIRNAME
+    """Resolve the append-only minimum-success-rate amendments of one campaign material, ``<material>/_record/amendments``."""
+    material_directory = resolve_generation_material_directory(task, campaign_name, material, storage_root=storage_root)
+    directory = material_directory / GENERATION_RECORD_DIRNAME / GENERATION_AMENDMENTS_DIRNAME
+    _refuse_symlinks(directory)
+    return directory
 
 
 def resolve_generation_cases_directory(
@@ -768,8 +834,9 @@ def resolve_generation_attempt_run_directory(
 
 def resolve_generation_reservation_staging_directory(campaign_directory: Path | str, material: str) -> Path:
     """Return the private area where a case directory is prepared before its atomic publication."""
+    state_root, task, campaign_name = _campaign_state_location(campaign_directory)
     return (
-        resolve_generation_state_directory(campaign_directory)
+        _generation_staging_directory(state_root, task, campaign_name)
         / validate_logical_name(material, label="material")
         / GENERATION_RESERVATION_STAGING_DIRNAME
     )
@@ -787,11 +854,11 @@ class GenerationCaseLocation:
 
 
 def _case_location_parts(parts: tuple[str, ...]) -> tuple[str, str, str, str] | None:
-    """Return task, campaign, material, and case of ``01_generation/<task>/<campaign>/<material>/<case>``, else ``None``."""
+    """Return task, campaign, material, and case of ``01_generation/<task>/<campaign>/materials/<material>/<case>``, else ``None``."""
     if len(parts) != _CASE_DIRECTORY_DEPTH or parts[0] != GENERATION_AREA_NAME:
         return None
-    _area, task, campaign_name, material, case_id = parts
-    if material in _GENERATION_CAMPAIGN_RESERVED_NAMES or _GENERATION_CASE_ID.fullmatch(case_id) is None:
+    _area, task, campaign_name, materials, material, case_id = parts
+    if materials != GENERATION_MATERIALS_DIRNAME or _GENERATION_CASE_ID.fullmatch(case_id) is None:
         return None
     for label, value in (("generation_task", task), ("campaign_name", campaign_name), ("material", material), ("case_id", case_id)):
         validate_logical_name(value, label=label)
@@ -799,7 +866,7 @@ def _case_location_parts(parts: tuple[str, ...]) -> tuple[str, str, str, str] | 
 
 
 def locate_generation_case_directory(case_directory: Path | str) -> GenerationCaseLocation:
-    """Invert ``<storage>/01_generation/<task>/<campaign>/<material>/<case>`` to its parts."""
+    """Invert ``<storage>/01_generation/<task>/<campaign>/materials/<material>/<case>`` to its parts."""
     path = Path(case_directory)
     parts = path.parts
     located = _case_location_parts(parts[-_CASE_DIRECTORY_DEPTH:])
@@ -810,7 +877,7 @@ def locate_generation_case_directory(case_directory: Path | str) -> GenerationCa
 
 
 def locate_generation_case_result_file(relative_path: str, filename: str) -> GenerationCaseLocation:
-    """Invert a storage-relative ``01_generation/<task>/<campaign>/<material>/<case>/result/<filename>`` locator to its case parts.
+    """Invert a storage-relative ``01_generation/<task>/<campaign>/materials/<material>/<case>/result/<filename>`` locator to its case parts.
 
     The returned ``storage_root`` is empty because the locator is storage-relative.
     """
@@ -836,23 +903,14 @@ def resolve_generation_input_metadata_storage_root(directory: Path | str, batch_
     """Invert the exact canonical or staged-transaction design location of an input generation to its storage root."""
     generation_id = validate_logical_name(input_generation_id, label="input_generation_id")
     batch = validate_logical_name(batch_storage_name, label="batch_storage_name")
-    parts = _campaign_batch_parts(batch)
-    if parts is None:
+    if _campaign_batch_parts(batch) is None:
         message = f"Input-generation batch locator is not a campaign locator: {batch!r}"
         raise ValueError(message)
-    task, campaign, material, regime = parts
-    transaction_suffix = (
-        Path(GENERATION_AREA_NAME)
-        / GENERATION_STATE_DIRNAME
-        / "raw-inputs"
-        / "transactions"
-        / generation_id
-        / "meta"
-        / batch
-        / "input_generations"
-        / generation_id
-    )
-    for suffix in (transaction_suffix, Path(GENERATION_AREA_NAME) / task / campaign / material / GENERATION_RECORD_DIRNAME / regime):
+    transaction = resolve_generation_input_transaction_directory(batch, generation_id, storage_root=Path())
+    for suffix in (
+        transaction / "meta" / batch / "input_generations" / generation_id,
+        resolve_generation_batch_metadata_directory(batch, storage_root=Path()),
+    ):
         try:
             return _physical_layout_root(directory, suffix)
         except ValueError:
@@ -862,14 +920,12 @@ def resolve_generation_input_metadata_storage_root(directory: Path | str, batch_
 
 
 def generation_design_directories(task: str, *, storage_root: Path | str | None = None) -> tuple[Path, ...]:
-    """List every ``<campaign>/<material>/_record/<regime>`` directory of a task in a deterministic order.
+    """List every ``<campaign>/materials/<material>/_record/<regime>`` directory of a task in a deterministic order.
 
-    These are discovery candidates only; the reserved campaign entries (``.state``,
-    ``_record``, ``logs``, ``cases.csv``) are never materials, and admission validates each candidate.
+    These are discovery candidates only; admission validates each candidate.
     """
     task_root = get_generation_root(storage_root=storage_root) / validate_logical_name(task, label="generation_task")
-    candidates = task_root.glob(f"*/*/{GENERATION_RECORD_DIRNAME}/*")
-    return tuple(sorted(path for path in candidates if path.parent.parent.name not in _GENERATION_CAMPAIGN_RESERVED_NAMES))
+    return tuple(sorted(task_root.glob(f"*/{GENERATION_MATERIALS_DIRNAME}/*/{GENERATION_RECORD_DIRNAME}/*")))
 
 
 def get_datasets_root(*, storage_root: Path | str | None = None) -> Path:
@@ -892,18 +948,8 @@ def get_experiments_root(*, storage_root: Path | str | None = None) -> Path:
 
 
 def get_generation_state_root(*, storage_root: Path | str | None = None) -> Path:
-    """Return the transient generation-coordination state root."""
+    """Return the single Generation coordination-state root: lock anchors and staging of every campaign."""
     return get_generation_root(storage_root=storage_root) / GENERATION_STATE_DIRNAME
-
-
-def get_generation_input_locks_root(*, storage_root: Path | str | None = None) -> Path:
-    """Return canonical raw-input batch lock anchors."""
-    return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "locks"
-
-
-def get_generation_input_transactions_root(*, storage_root: Path | str | None = None) -> Path:
-    """Return canonical raw-input batch publication transactions."""
-    return get_generation_state_root(storage_root=storage_root) / "raw-inputs" / "transactions"
 
 
 def get_dataset_state_root(*, storage_root: Path | str | None = None) -> Path:
@@ -962,13 +1008,22 @@ def resolve_generation_state_batch_directory(
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve flat private runtime coordination state for one generation batch."""
+    """Resolve the private staging area of one generation batch, ``.state/staging/<task>~<campaign>/<material>/<regime>``."""
     parts = _campaign_batch_parts(batch_storage_name)
     if parts is None:
         message = "Canonical source batch locator is required."
         raise ValueError(message)
     task, campaign, material, regime = parts
-    return resolve_generation_state_directory(resolve_generation_campaign_directory(task, campaign, storage_root=storage_root)) / material / regime
+    return _generation_staging_directory(get_generation_state_root(storage_root=storage_root), task, campaign) / material / regime
+
+
+def _batch_lock_path(batch_storage_name: str, kind: str, *, storage_root: Path | str | None) -> Path:
+    """Return the lock anchor ``.state/locks/<task>~<campaign>~<material>~<regime>~<kind>.lock`` of one batch."""
+    parts = _campaign_batch_parts(batch_storage_name)
+    if parts is None:
+        message = "Canonical source batch locator is required."
+        raise ValueError(message)
+    return _generation_lock_path(get_generation_state_root(storage_root=storage_root), *parts, kind)
 
 
 def resolve_generation_case_lock_path(
@@ -978,12 +1033,10 @@ def resolve_generation_case_lock_path(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Resolve one persistent case-level execution lock anchor."""
-    state = resolve_generation_state_batch_directory(
-        batch_storage_name,
-        storage_root=storage_root,
-    )
-    case_id = validate_logical_name(case_id, label="case_id")
-    return state / "locks" / f"{case_id}.lock"
+    if _GENERATION_CASE_ID.fullmatch(validate_logical_name(case_id, label="case_id")) is None:
+        message = f"case_id must match case_NNNN, got {case_id!r}."
+        raise ValueError(message)
+    return _batch_lock_path(batch_storage_name, case_id, storage_root=storage_root)
 
 
 def resolve_generation_case_publications_directory(
@@ -1007,21 +1060,22 @@ def resolve_generation_input_lock_path(
     storage_root: Path | str | None = None,
 ) -> Path:
     """Resolve the sole publisher lock for one canonical input batch."""
-    name = validate_logical_name(batch_storage_name, label="batch_storage_name")
-    return get_generation_input_locks_root(storage_root=storage_root) / f"{name}.lock"
+    return _batch_lock_path(batch_storage_name, "inputs", storage_root=storage_root)
 
 
 def resolve_generation_input_transaction_directory(
+    batch_storage_name: str,
     input_generation_id: str,
     *,
     storage_root: Path | str | None = None,
 ) -> Path:
-    """Resolve one deterministic canonical input-generation transaction."""
+    """Resolve one deterministic input-generation transaction below the staging area of its batch."""
     input_generation_id = validate_logical_name(
         input_generation_id,
         label="input_generation_id",
     )
-    return get_generation_input_transactions_root(storage_root=storage_root) / input_generation_id
+    batch_state = resolve_generation_state_batch_directory(batch_storage_name, storage_root=storage_root)
+    return batch_state / GENERATION_INPUT_TRANSACTIONS_DIRNAME / input_generation_id
 
 
 def dataset_state_key(task: str, dataset_id: str) -> str:
@@ -1593,7 +1647,7 @@ def is_evaluable_run_dir(run_dir: Path | str) -> bool:
         return False
     if not isinstance(summary, dict):
         return False
-    return serialization.is_schema_version(summary.get("schema_version"), RUN_SUMMARY_SCHEMA_VERSION) and summary.get("status") == "completed"
+    return summary.get("status") == "completed"
 
 
 def resolve_analysis_root(run_dir: Path | str) -> Path:
@@ -1632,27 +1686,32 @@ def resolve_id_analysis_dir(run_dir: Path | str) -> Path:
     return resolve_analysis_root(run_dir) / "id"
 
 
-def resolve_additional_evaluation_analysis_dir(run_dir: Path | str, dataset_name: str) -> Path:
+def resolve_ood_analysis_dir(run_dir: Path | str, role: str, dataset_name: str) -> Path:
     """
-    Resolve the additional evaluation artifact directory for a run and dataset.
+    Resolve the artifact directory of one OOD Evaluation role for a run and dataset.
 
     Parameters
     ----------
     run_dir : Path | str
         Run output directory path.
+    role : {"material_ood", "parameter_ood"}
+        OOD Evaluation role.
     dataset_name : str
-        Logical (possibly combined) additional evaluation dataset name.
+        Logical (possibly combined) Dataset name of the role's sources.
 
     Returns
     -------
     Path
-        Path to ``analysis/additional_evaluation/<dataset_name>``.
+        Path to ``analysis/<role>/<dataset_name>``.
 
     Raises
     ------
     ValueError
-        If ``dataset_name`` is not one safe logical path component.
+        If ``role`` is not an OOD Evaluation role or ``dataset_name`` is not one safe logical path component.
 
     """
+    if role not in ANALYSIS_OOD_ROLES:
+        msg = f"OOD analysis role must be one of {list(ANALYSIS_OOD_ROLES)}, got {role!r}."
+        raise ValueError(msg)
     dataset_name = validate_logical_name(dataset_name, label="dataset_name")
-    return resolve_analysis_root(run_dir) / "additional_evaluation" / dataset_name
+    return resolve_analysis_root(run_dir) / role / dataset_name

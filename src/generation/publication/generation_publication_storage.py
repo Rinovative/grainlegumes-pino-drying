@@ -53,8 +53,6 @@ if TYPE_CHECKING:
     from src.generation.cases.generation_cases_config import GenerationConfig
 
 HDF5_SCHEMA_KIND = "generation_source_case_hdf5"
-HDF5_SCHEMA_VERSION = config_contract.CANONICAL_HDF5_SCHEMA_VERSION
-HDF5_CONVERTER_VERSION = config_contract.CANONICAL_HDF5_CONVERTER_VERSION
 _MINIMUM_AXIS_POINTS = 2
 _TABLE_RANK = 2
 _COORDINATE_ATOL = 1e-12
@@ -65,10 +63,7 @@ _MASS_BALANCE_PREFERRED_RELATIVE_TOLERANCE = 1.0e-6
 _FLOAT32_VALIDATION_CHUNK_VALUES = 1_000_000
 _SHA256_HEX_LENGTH = 64
 _SHA256_CHARACTERS = frozenset("0123456789abcdef")
-STATUS_SCHEMA_VERSION = 1
-PUBLICATION_SCHEMA_VERSION = 1  # case publication, success, timing and provenance records
 _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND = "vp2_case_scientific_provenance"
-_CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -1201,7 +1196,6 @@ def _status(
         }
     return {
         "schema_kind": "simulation_case_status",
-        "schema_version": STATUS_SCHEMA_VERSION,
         "solver_success": True,
         "target_reached": target_reached,
         "hit_t_max": hit_t_max,
@@ -1273,7 +1267,6 @@ def _case_scientific_provenance(case_payload: Mapping[str, Any]) -> dict[str, An
         raise ValueError(message)
     result = {
         "schema_kind": _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND,
-        "schema_version": _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION,
         **{name: case_payload[name] for name in required},
     }
     for name in ("schedule_diagnostics",):
@@ -1317,7 +1310,7 @@ def _write_hdf5(
     final_status: np.ndarray | None,
     source_hashes: Mapping[str, Any],
 ) -> None:
-    """Write one complete schema-v1 case payload to a private temporary path."""
+    """Write one complete case payload to a private temporary path."""
     storage = config.scientific_values["storage"]
     static_float32 = validate_float32_conversion(
         static_fields,
@@ -1354,8 +1347,6 @@ def _write_hdf5(
     )
     with h5py.File(path, "w") as handle:
         handle.attrs["schema_kind"] = HDF5_SCHEMA_KIND
-        handle.attrs["schema_version"] = HDF5_SCHEMA_VERSION
-        handle.attrs["converter_version"] = storage["converter_version"]
         handle.attrs["retention_policy"] = config.execution_values["retention_policy"]
         for key in (
             "simulation_profile",
@@ -1707,17 +1698,11 @@ def _validate_hdf5_provenance(
             strict=True,
         )
     }
-    if (
-        not isinstance(scientific, dict)
-        or not common.serialization.is_schema_version(scientific.get("schema_version"), config_contract.CONFIG_SCHEMA_VERSION)
-        or scientific.get("simulation_profile") != profile
-        or fixed_ownership != expected_fixed
-    ):
+    if not isinstance(scientific, dict) or scientific.get("simulation_profile") != profile or fixed_ownership != expected_fixed:
         msg = "Canonical HDF5 scientific or stationary-conditioning provenance is invalid."
         raise ValueError(msg)
     required_case_keys = {
         "schema_kind",
-        "schema_version",
         "case_id",
         "case_index",
         "case_input_id",
@@ -1740,7 +1725,6 @@ def _validate_hdf5_provenance(
         or not required_case_keys.issubset(case_scientific)
         or set(case_scientific).difference(required_case_keys | optional_case_keys)
         or case_scientific.get("schema_kind") != _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_KIND
-        or not common.serialization.is_schema_version(case_scientific.get("schema_version"), _CASE_SCIENTIFIC_PROVENANCE_SCHEMA_VERSION)
     ):
         msg = "Canonical HDF5 realized case-scientific provenance schema is invalid."
         raise ValueError(msg)
@@ -2282,7 +2266,7 @@ def _validate_hdf5_transient(
     handle: h5py.File,
     scientific: Mapping[str, Any],
 ) -> None:
-    """Validate all transient-only schema-v1 members."""
+    """Validate all transient-only members."""
     regular_time = _validate_hdf5_regular_trajectory(handle, scientific)
     _validate_hdf5_schedule(handle, scientific)
     complete_time = _complete_hdf5_time(handle, regular_time, scientific)
@@ -2295,7 +2279,7 @@ def validate_case_hdf5(
     expected_profile: str | None = None,
     include_reuse_evidence: bool = False,
 ) -> dict[str, Any]:
-    """Validate exact schema-v1 layout, provenance, units, shapes, and identities."""
+    """Validate exact layout, provenance, units, shapes, and identities."""
     if not isinstance(include_reuse_evidence, bool):
         message = "include_reuse_evidence must be boolean."
         raise TypeError(message)
@@ -2303,14 +2287,8 @@ def validate_case_hdf5(
         msg = f"Canonical case HDF5 is missing or unsafe: {path}"
         raise FileNotFoundError(msg)
     with h5py.File(path, "r") as handle:
-        stored_schema_version = handle.attrs.get("schema_version")
-        if (
-            handle.attrs.get("schema_kind") != HDF5_SCHEMA_KIND
-            or not isinstance(stored_schema_version, np.integer)
-            or not common.serialization.is_schema_version(int(stored_schema_version), HDF5_SCHEMA_VERSION)
-            or handle.attrs.get("converter_version") != HDF5_CONVERTER_VERSION
-        ):
-            msg = f"Unsupported canonical case HDF5 schema or converter identity: {path}"
+        if handle.attrs.get("schema_kind") != HDF5_SCHEMA_KIND:
+            msg = f"Unsupported canonical case HDF5 schema: {path}"
             raise ValueError(msg)
         profile = _hdf5_text_attribute(handle.attrs.get("simulation_profile", ""), label="simulation_profile")
         if expected_profile is not None and profile != expected_profile:

@@ -71,14 +71,15 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
         "resume_contract_digest": digest("resume"),
-        "dataset_ids": {"train": "synthetic-train", "additional_evaluation": "synthetic-additional-evaluation"},
-        "dataset_fingerprints": {"train": digest("train"), "additional_evaluation": digest("additional-evaluation")},
+        "dataset_ids": {"train": "synthetic-train", "material_ood": "synthetic-material-ood", "parameter_ood": "synthetic-parameter-ood"},
+        "dataset_fingerprints": {"train": digest("train"), "material_ood": digest("material-ood"), "parameter_ood": digest("parameter-ood")},
         "split_contract_digest": digest("split"),
         "split_membership_digests": {
             "train": digest("train-membership"),
             "validation": digest("validation-membership"),
             "id_test": digest("id-test-membership"),
-            "additional_evaluation": digest("additional-evaluation-membership"),
+            "material_ood": digest("material-ood-membership"),
+            "parameter_ood": digest("parameter-ood-membership"),
         },
         "normalizer_sha256": digest("normalizer"),
         "numerical_environment": learning.training.checkpoint.numerical_environment_identity(),
@@ -89,7 +90,6 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
 def _history_payload(identity: dict[str, Any], *, epochs: int, task: str = "transient_drying", run_name: str = "run") -> dict[str, Any]:
     """Build one strict contiguous history payload."""
     return {
-        "schema_version": 1,
         "task": task,
         "run_name": run_name,
         "checkpoint_identity_digest": common.serialization.canonical_json_sha256(identity),

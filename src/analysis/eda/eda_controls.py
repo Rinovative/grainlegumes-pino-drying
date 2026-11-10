@@ -119,10 +119,7 @@ class GeneratedOutputControls:
             layout=widgets.Layout(display="none"),
         )
         navigation_children: tuple[widgets.Widget, ...] = (self.case_row, *tuple(case_companions)) if include_case else ()
-        self.navigation_row = widgets.HBox(
-            navigation_children,
-            layout=widgets.Layout(align_items="center", flex_flow="row wrap"),
-        )
+        self.navigation_row = ui.components.ui_control_row(*navigation_children)
         children: list[widgets.Widget] = []
         if navigation_children:
             children.append(self.navigation_row)

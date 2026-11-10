@@ -116,7 +116,7 @@ def test_transient_plan_preview_preserves_roles_and_stage_dependencies(
     assert context.official_config["training"]["comparison_arm"] == "b"
     assert tuple(preview.role for preview in context.dataset_previews) == (
         "ID train / validation / test source",
-        "Dataset-declared OOD",
+        "Dataset-declared material OOD",
     )
     assert context.stage_configs[1]["training"]["teacher_handoff"]["source_run_name"] == context.stage_configs[0]["run"]["name"]
     tables = support.prepare_configuration_tables(context)
@@ -134,14 +134,14 @@ def test_transient_plan_preview_preserves_roles_and_stage_dependencies(
         support.prepare_notebook_context(path, stage="a2")
 
 
-def test_matched_plan_preview_requires_no_additional_evaluation_dataset(
+def test_matched_plan_preview_requires_no_material_ood_dataset(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bind A1 to measured B evidence while preserving explicit empty additional roles."""
+    """Bind A1 to measured B evidence while preserving explicit empty OOD roles."""
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "absent_storage"))
     raw = configs.transient_matched_config()
-    raw["data"]["additional_evaluation_datasets"] = []
+    raw["data"]["material_ood_datasets"] = []
     path = configs.write_config(tmp_path, raw)
     context = support.prepare_notebook_context(path, stage="a1")
     assert context.protocol == "matched_a1_b"
@@ -166,13 +166,12 @@ def test_saved_transient_run_inspection_uses_its_own_config(
     saved_ood = split_state == "ood"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "storage"))
     raw = configs.transient_matched_config()
-    raw["data"]["additional_evaluation_datasets"] = []
+    raw["data"]["material_ood_datasets"] = []
     path = configs.write_config(tmp_path, raw)
     config = support.prepare_notebook_context(path).official_config
     run_dir = tmp_path / "saved_run"
     configs.write_yaml(run_dir / "config.yaml", config)
     summary = {
-        "schema_version": 1,
         "task": "transient_drying",
         "run_name": config["run"]["name"],
         "status": "failed",
@@ -180,7 +179,7 @@ def test_saved_transient_run_inspection_uses_its_own_config(
     }
     (run_dir / "summary.json").write_text(json.dumps(summary))
     if saved_ood:
-        split = synthetic_split_payload("transient_drying", additional=(("synthetic_ood", ("chickpea__case_0001__00000000000a",)),))
+        split = synthetic_split_payload("transient_drying", material_ood=(("synthetic_ood", ("chickpea__case_0001__00000000000a",)),))
         common.serialization.atomic_torch_save(split, common.paths.resolve_split_indices_path(run_dir))
     if split_state == "corrupt":
         common.paths.resolve_split_indices_path(run_dir).write_bytes(b"not a torch archive")
@@ -193,8 +192,8 @@ def test_saved_transient_run_inspection_uses_its_own_config(
     paths = dict(inspection.existence_rows)
     assert "history.json" in paths
     assert paths["history.json"] is False
-    additional_labels = [label for label in paths if "additional_evaluation" in label]
-    assert additional_labels == (["analysis/additional_evaluation/synthetic_ood/"] if saved_ood else [])
+    additional_labels = [label for label in paths if "material_ood" in label]
+    assert additional_labels == (["analysis/material_ood/synthetic_ood/"] if saved_ood else [])
     summary["run_name"] = "mismatched"
     (run_dir / "summary.json").write_text(json.dumps(summary))
     with pytest.raises(ValueError, match="identity disagree"):
@@ -210,16 +209,16 @@ def test_training_notebook_executes_inspection_only_for_a_test_owned_experiment(
     monkeypatch.setenv("PROJECT_ROOT", str(project))
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "storage"))
     raw = configs.transient_matched_config()
-    raw["data"]["additional_evaluation_datasets"] = []
+    raw["data"]["material_ood_datasets"] = []
     configs.write_config(project, raw, canonical_root=project)
     monkeypatch.setattr(support, "list_built_datasets", lambda _config_path: ("selected_dataset",))
-    notebook = json.loads((Path(__file__).resolve().parents[2] / "notebooks/03_training_pipeline.ipynb").read_text(encoding="utf-8"))
+    notebook = json.loads((Path(__file__).resolve().parents[2] / "notebooks/04_training_pipeline.ipynb").read_text(encoding="utf-8"))
     namespace: dict[str, Any] = {}
 
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] == "code":
             source = "".join(cell["source"]).replace("TRAIN_SECONDS = None", "TRAIN_SECONDS = 7.0")
-            exec(compile(source, f"03_training_pipeline:cell{index}", "exec"), namespace)  # noqa: S102 -- execute only maintained notebook code
+            exec(compile(source, f"04_training_pipeline:cell{index}", "exec"), namespace)  # noqa: S102 -- execute only maintained notebook code
 
     assert namespace["CONTEXT"].task.id == "transient_drying"
     assert namespace["CONTEXT"].protocol == "matched_a1_b"

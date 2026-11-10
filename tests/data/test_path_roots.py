@@ -139,7 +139,7 @@ def test_dataset_directory_is_task_qualified_and_root_independent(tmp_path: Path
     """A Dataset is one directory below its task, below the selected Dataset root."""
     first_root = common.paths.get_datasets_root(storage_root=tmp_path / "first")
     second_root = common.paths.get_datasets_root(storage_root=tmp_path / "second")
-    dataset_id = "lentil-train1-val1-test1__ref-range__lhs-seed-9300"
+    dataset_id = "lentil-train1-val1-test1__ref-range__sobol-seed-9300"
 
     first_path = common.paths.resolve_dataset_dir("steady_flow", dataset_id, dataset_root=first_root)
     second_path = common.paths.resolve_dataset_dir("steady_flow", dataset_id, dataset_root=second_root)
@@ -154,7 +154,7 @@ def test_dataset_directory_is_task_qualified_and_root_independent(tmp_path: Path
 
 def test_dataset_payload_and_manifest_names_are_fixed_per_task(tmp_path: Path) -> None:
     """The payload file is dataset.pt for steady flow and the dataset.json index for transient drying, whatever the Dataset name."""
-    dataset_id = "lentil-train1-val1-test1__ref-range__lhs-seed-9300"
+    dataset_id = "lentil-train1-val1-test1__ref-range__sobol-seed-9300"
     steady = common.paths.resolve_dataset_dir("steady_flow", dataset_id, dataset_root=tmp_path)
     transient = common.paths.resolve_dataset_dir("transient_drying", dataset_id, dataset_root=tmp_path)
 

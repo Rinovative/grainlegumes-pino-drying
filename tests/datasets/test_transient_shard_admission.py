@@ -179,7 +179,6 @@ def receipt_fixture(tmp_path: Path) -> dict[str, Any]:
     }
     receipt = {
         "schema_kind": owner.TRANSIENT_PT_RECEIPT_SCHEMA_KIND,
-        "schema_version": owner.TRANSIENT_PT_RECEIPT_SCHEMA_VERSION,
         "status": "complete",
         "created_at": "fixture",
         "dataset_id": manifest["dataset_id"],

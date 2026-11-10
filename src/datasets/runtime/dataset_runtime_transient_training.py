@@ -1,7 +1,8 @@
 """Construct storage-neutral transient training loaders from published packages.
 
 Responsibilities:
-  - Resolve the Dataset-owned case roles and each additional source's declared OOD cases before expanding items
+  - Resolve the Dataset-owned case roles, the run's Train subset and the declared material-OOD and parameter-OOD cases
+    before expanding items
   - Build the run split through the shared split builder, with the transient item expansion as its task extension
   - Obtain one-step Train scaling through the shared scaling service
   - Build deterministically seeded training and evaluation DataLoaders
@@ -56,7 +57,8 @@ class TransientTrainingLoaders:
 
     train: DataLoader[Any]
     evaluation: DataLoader[Any]
-    additional_evaluation: DataLoader[Any] | None
+    material_ood: DataLoader[Any] | None
+    parameter_ood: DataLoader[Any] | None
     id_test: DataLoader[Any]
     data_processor: scaling.TransientScalingArtifact
     scaling_artifact: dict[str, Any]
@@ -218,7 +220,8 @@ def _fit_state(
 def create_transient_training_loaders(
     *,
     train_dataset_id: str,
-    additional_evaluation_dataset_ids: Sequence[str],
+    material_ood_dataset_ids: Sequence[str],
+    train_subset: int | None,
     tensorizer: TransientTensorizerSpec,
     train_sampling: transient_contract.TransientSamplingSpec,
     loader_settings: factory.LoaderSettings,
@@ -237,8 +240,9 @@ def create_transient_training_loaders(
     Create experiment-role loaders and exact reusable Train-only scaling evidence.
 
     The Train, validation, and ID-test roles use immutable Dataset cases before
-    their items are expanded. Train items follow ``train_sampling``; validation,
-    ID-test, and additional-evaluation items are whole trajectories
+    their items are expanded; Train is the whole Train role or, with ``train_subset`` N, the first N Train cases
+    per ID material, and scaling fits on exactly those cases. Train items follow ``train_sampling``; validation,
+    ID-test, material-OOD and parameter-OOD items are whole trajectories
     (``transient_contract.EVALUATION_SAMPLING``), so checkpoint selection does not depend on the
     training sample shape. A saved split is replayed only when it equals the
     rebuilt one. A restored scaling artifact or a cache hit under the same
@@ -284,9 +288,14 @@ def create_transient_training_loaders(
     full_evaluation_dataset = dataset_for(train_dataset_id, sampling=transient_contract.EVALUATION_SAMPLING)
     binding = _binding(full_training_dataset)
     fixed = partition_contract.validate_training_partition(
-        binding.case_partition, dataset_id=train_dataset_id, case_ids=binding.case_ids, material_by_case=binding.materials
+        binding.case_partition,
+        dataset_id=train_dataset_id,
+        case_ids=binding.case_ids,
+        material_by_case=binding.materials,
+        design_kind_by_case=binding.design_kinds,
     )
-    train_dataset = _select_cases(full_training_dataset, fixed["train"])
+    train_cases = partition_contract.train_subset_cases(fixed, material_by_case=binding.materials, train_subset=train_subset)
+    train_dataset = _select_cases(full_training_dataset, train_cases)
     # A Train case without any item would stay declared Train while never being trained on.
     uncovered = train_dataset.cases_without_items()
     if uncovered:
@@ -297,27 +306,36 @@ def create_transient_training_loaders(
         raise ValueError(msg)
     evaluation_dataset = _select_cases(full_evaluation_dataset, fixed["validation"])
     id_test_dataset = _select_cases(full_evaluation_dataset, fixed["id_test"])
-    additional_evaluation_ids = tuple(additional_evaluation_dataset_ids)
-    assignments = packages.declared_evaluation_assignments(_TASK, train_dataset_id, additional_evaluation_ids, storage_root=storage_root)
-    sources = [dataset_for(dataset_id, sampling=transient_contract.EVALUATION_SAMPLING) for dataset_id in additional_evaluation_ids]
-    if fixed["ood"]:
-        sources.append(full_evaluation_dataset)
-    declared_parts = [(source, tuple(cast("Mapping[str, Any]", _binding(source).case_partition)["ood"])) for source in sources]
-    splits.reject_role_leakage(binding, fixed, [(_binding(source), case_ids) for source, case_ids in declared_parts])
-    parts = [_select_cases(source, case_ids) for source, case_ids in declared_parts]
-    additional_evaluation_dataset: Dataset[Any] | None = parts[0] if len(parts) == 1 else ConcatDataset(parts) if parts else None
+    material_ood_ids = tuple(material_ood_dataset_ids)
+    assignments = packages.declared_evaluation_assignments(_TASK, train_dataset_id, material_ood_ids, storage_root=storage_root)
+    loaded = {dataset_id: dataset_for(dataset_id, sampling=transient_contract.EVALUATION_SAMPLING) for dataset_id in material_ood_ids}
+    loaded[train_dataset_id] = full_evaluation_dataset
+    declared_parts = {
+        role: [
+            (source, partition_contract.evaluation_cases(cast("Mapping[str, Any]", _binding(source).case_partition), role))
+            for source in (loaded[assignment["dataset_id"]] for assignment in assignments[role])
+        ]
+        for role in splits.OOD_SPLIT_ROLES
+    }
+    splits.reject_role_leakage(
+        binding, fixed, {role: [(_binding(source), case_ids) for source, case_ids in declared_parts[role]] for role in splits.OOD_SPLIT_ROLES}
+    )
+    parts = {role: [_select_cases(source, case_ids) for source, case_ids in declared_parts[role]] for role in declared_parts}
+    ood_datasets: dict[str, Dataset[Any] | None] = {
+        role: role_parts[0] if len(role_parts) == 1 else ConcatDataset(role_parts) if role_parts else None for role, role_parts in parts.items()
+    }
 
     fitting_dataset = (
         train_dataset
         if train_sampling.mode == _SCALING_SAMPLING.mode
-        else _select_cases(dataset_for(train_dataset_id, sampling=_SCALING_SAMPLING), fixed["train"])
+        else _select_cases(dataset_for(train_dataset_id, sampling=_SCALING_SAMPLING), train_cases)
     )
     spatial_view = _spatial_view_evidence(train_dataset)
     view_datasets = (
         ("validation", evaluation_dataset),
         ("id_test", id_test_dataset),
         ("scaling", fitting_dataset),
-        *((f"additional_evaluation[{index}]", part) for index, part in enumerate(parts)),
+        *((f"{role}[{index}]", part) for role, role_parts in parts.items() for index, part in enumerate(role_parts)),
     )
     for label, dataset in view_datasets:
         if _spatial_view_evidence(dataset) != spatial_view:
@@ -328,9 +346,15 @@ def create_transient_training_loaders(
         task=_TASK,
         train_dataset=_split_identity(full_training_dataset),
         case_partition=fixed,
-        additional_evaluation=[
-            (_split_identity(source), case_ids, assignment) for (source, case_ids), assignment in zip(declared_parts, assignments, strict=True)
-        ],
+        train_subset=train_subset,
+        material_by_case=binding.materials,
+        ood_parts={
+            role: [
+                (_split_identity(source), case_ids, assignment)
+                for (source, case_ids), assignment in zip(declared_parts[role], assignments[role], strict=True)
+            ]
+            for role in splits.OOD_SPLIT_ROLES
+        },
         extension={
             "tensorizer": tensorizer.selection_dict(),
             "sampling": train_sampling.as_dict(),
@@ -367,13 +391,12 @@ def create_transient_training_loaders(
     evaluation_loader = _loader(
         evaluation_dataset, loader_settings, shuffle=False, loader_seed=resolved_loader_seed + 1, worker_seed=resolved_worker_seed + 1
     )
-    additional_evaluation_loader = (
-        _loader(
-            additional_evaluation_dataset, loader_settings, shuffle=False, loader_seed=resolved_loader_seed + 2, worker_seed=resolved_worker_seed + 2
-        )
-        if additional_evaluation_dataset is not None
-        else None
-    )
+    ood_loaders = {
+        role: None
+        if dataset is None
+        else _loader(dataset, loader_settings, shuffle=False, loader_seed=resolved_loader_seed + offset, worker_seed=resolved_worker_seed + offset)
+        for (role, dataset), offset in zip(ood_datasets.items(), (2, 4), strict=True)
+    }
     id_test_loader = _loader(
         id_test_dataset, loader_settings, shuffle=False, loader_seed=resolved_loader_seed + 3, worker_seed=resolved_worker_seed + 3
     )
@@ -381,7 +404,8 @@ def create_transient_training_loaders(
     return TransientTrainingLoaders(
         train=train_loader,
         evaluation=evaluation_loader,
-        additional_evaluation=additional_evaluation_loader,
+        material_ood=ood_loaders["material_ood"],
+        parameter_ood=ood_loaders["parameter_ood"],
         id_test=id_test_loader,
         data_processor=scaling.admit_transient_scaling_state(envelope["state"], identity=scaling_identity),
         scaling_artifact=envelope,

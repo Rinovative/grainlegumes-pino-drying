@@ -21,9 +21,6 @@ import copy
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
-from src import common
-
-SOURCE_REGISTRY_SCHEMA_VERSION: Final = 1
 EVIDENCE_CLASSES: Final = (
     "literature_direct",
     "literature_fit",
@@ -123,13 +120,11 @@ def validate_source_registry(value: Any) -> dict[str, dict[str, Any]]:
     config = _mapping(value, label="generation source registry")
     _exact_keys(
         config,
-        required={"schema_kind", "schema_version", "sources"},
+        required={"schema_kind", "sources"},
         optional=set(),
         label="generation source registry",
     )
-    if config["schema_kind"] != "generation_sources" or not common.serialization.is_schema_version(
-        config["schema_version"], SOURCE_REGISTRY_SCHEMA_VERSION
-    ):
+    if config["schema_kind"] != "generation_sources":
         message = "Unsupported generation source-registry schema."
         raise ValueError(message)
     raw_sources = config["sources"]

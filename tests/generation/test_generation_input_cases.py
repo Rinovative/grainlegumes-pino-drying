@@ -52,7 +52,7 @@ def _load_config(
         only_batch=generation.cases.config.build_batch_name(
             profile_id,
             "lentil",
-            "natural",
+            "test",
         ),
     )
 
@@ -285,6 +285,18 @@ def test_clean_repository_source_identity_fails_closed_on_dirty_evidence() -> No
         source_service.clean_repository_git_commit()
 
 
+def test_case_start_without_case_count_is_refused(tmp_path: Path) -> None:
+    """Refuse a start position that has no count to bound it."""
+    service = generation.cases.input_generation
+    request = service.CampaignInputGenerationRequest(
+        campaign_config=tmp_path / "campaign.yaml",
+        storage_root=tmp_path / "storage",
+        case_start=2,
+    )
+    with pytest.raises(ValueError, match="case_start requires case_count"):
+        service._resolve_campaign_request(request)
+
+
 def test_all_batch_request_preserves_canonical_campaign_order(
     tmp_path: Path,
 ) -> None:
@@ -297,8 +309,6 @@ def test_all_batch_request_preserves_canonical_campaign_order(
         campaign_config=tmp_path / "campaign.yaml",
         storage_root=tmp_path / "storage",
         action="dry_run",
-        all_batches=True,
-        all_cases=True,
     )
     with patch.object(
         service.config_service,
@@ -353,7 +363,7 @@ def test_campaign_input_generation_rejects_actions_and_reports_source_blocker(
     batch_name = generation.cases.config.build_batch_name(
         "steady_flow",
         "lentil",
-        "natural",
+        "test",
     )
     storage = tmp_path / "blocked"
     request = service.CampaignInputGenerationRequest(
@@ -398,10 +408,8 @@ def test_generate_input_cases_cli_dry_run_selects_campaign_without_writes(
     arguments = [
         "generate-input-cases",
         str(config_path),
-        "--all-batches",
         "--only-regime",
-        "natural",
-        "--all-cases",
+        "test",
         "--dry-run",
         "--git-commit",
         _FAKE_GIT_COMMIT,
@@ -420,10 +428,6 @@ def test_generate_input_cases_cli_dry_run_selects_campaign_without_writes(
     assert result["input_generation_id"] is None
     assert result["input_only"] is True
     assert not storage.exists()
-
-    conflicting = [*arguments, "--only-batch", "unused"]
-    with pytest.raises(SystemExit):
-        cli_generation.main(conflicting)
 
 
 def test_generation_cli_renders_context_for_unexpected_key_errors(
@@ -450,14 +454,23 @@ def test_generation_cli_renders_context_for_unexpected_key_errors(
     }
 
 
-def test_latin_hypercube_membership_is_not_a_prefix_contract() -> None:
-    """Protect case identity assignment without assuming SciPy prefix stability."""
+def test_sobol_design_points_are_a_prefix_of_every_longer_request() -> None:
+    """Point i of a design is the same coordinate vector whatever the requested count, including counts that are no power of two."""
     sampler = generation.cases.sampling
-    first = sampler._lhs_design(count=160, dimensions=3, seed=17)
-    second = sampler._lhs_design(count=50, dimensions=3, seed=17)
-    assert first.shape == (160, first.shape[1])
-    assert second.shape == (50, second.shape[1])
-    assert not (first[:50] == second).all()
+    first = sampler.design_points(seed=17, dimensions=3, count=160)
+    second = sampler.design_points(seed=17, dimensions=3, count=50)
+    assert first.shape == (160, 3)
+    assert (first[:50] == second).all()
+    assert not (sampler.design_points(seed=18, dimensions=3, count=50) == second).all()
+
+
+def test_sobol_design_points_match_the_recorded_reference_values() -> None:
+    """Pin ``qmc.Sobol(d=3, scramble=True, rng=17)``: a SciPy change of the scrambled sequence would silently change every case."""
+    reference = [
+        [0.0012595346197485924, 0.05887088272720575, 0.7843553442507982],
+        [0.5836238339543343, 0.6985737215727568, 0.4059986397624016],
+    ]
+    assert generation.cases.sampling.design_points(seed=17, dimensions=3, count=2).tolist() == reference
 
 
 def test_campaign_requires_complete_persisted_input_sources(

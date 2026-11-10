@@ -29,7 +29,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable  # type: ignore[import-u
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -45,11 +47,11 @@ if TYPE_CHECKING:
 class GenerationInputMapLayout:
     """Define one centrally configured generation-input notebook layout."""
 
-    notebook_width: float = 17.4
-    minimum_width: float = 5.8
-    map_column_width: float = 5.8
-    map_row_height: float = 3.6
-    composite_map_row_height: float = 3.6
+    notebook_width: float = shared_layout.MAP_LAYOUT.maximum_width
+    minimum_width: float = shared_layout.MAP_LAYOUT.column_width
+    map_column_width: float = shared_layout.MAP_LAYOUT.column_width
+    map_row_height: float = shared_layout.MAP_LAYOUT.row_height
+    composite_map_row_height: float = shared_layout.MAP_LAYOUT.row_height
     distribution_row_height: float = 2.75
     schedule_row_height: float = 2.75
     table_row_height: float = 2.2
@@ -335,9 +337,9 @@ def quantity_axis_label(quantity: str) -> str:
 
 
 def quantity_colorbar_label(quantity: str) -> str:
-    """Return only the canonical unit because each map title owns the quantity."""
+    """Return only the display unit because each map title owns the quantity."""
     unit = diagnostics.FIELD_UNITS[quantity]
-    return f"[{unit}]" if unit else ""
+    return f"[{field_labels.display_unit(unit)}]" if unit else ""
 
 
 def align_axis_to_references(

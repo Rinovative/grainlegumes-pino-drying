@@ -1,7 +1,8 @@
-"""Exact modified-Oswin moisture-equilibrium contracts.
+"""Exact modified-Oswin moisture-equilibrium and granular-water contracts.
 
 Responsibilities:
   - Check modified-Oswin forward/inverse round trips and explicit clipping
+  - Check that granular water rejects unphysical states except for model-output evaluation
 
 Design principles:
   - Equilibrium values are compared numerically and invalid clipping contracts fail
@@ -59,3 +60,16 @@ def test_modified_oswin_clipping_is_explicit() -> None:
             b_osw=-0.05,
             c_osw=0.4,
         )
+
+
+def test_granular_water_content_rejects_unphysical_states_unless_evaluating_model_output() -> None:
+    """Physical callers reject negative water; model-output evaluation applies the same weighting and keeps NaN."""
+    surface = np.asarray([0.2, -0.1, np.nan])
+    internal = np.asarray([0.4, -0.1, 0.4])
+    with pytest.raises(ValueError, match="non-negative"):
+        domain.moisture.granular_water_content(surface, internal, 0.25)
+    weighted = domain.moisture.granular_water_content(surface, internal, 0.25, require_physical_states=False)
+    np.testing.assert_allclose(weighted[:2], [0.35, -0.1])
+    assert np.isnan(weighted[2])
+    with pytest.raises(ValueError, match="f_surf"):
+        domain.moisture.granular_water_content(surface, internal, 1.0, require_physical_states=False)

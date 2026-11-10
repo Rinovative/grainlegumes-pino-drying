@@ -39,7 +39,6 @@ _MINIMUM_ROWS = 2
 _SCALAR_COLUMNS = 3
 _SHA256_LENGTH = 64
 INPUT_BATCH_SCHEMA_KIND = "generation_input_batch"
-INPUT_BATCH_SCHEMA_VERSION = 1
 _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
     {
         "_SUCCESS",
@@ -54,7 +53,6 @@ _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
 )
 INPUT_GENERATION_IDENTITY_FIELDS = (
     "schema_kind",
-    "schema_version",
     "campaign_id",
     "campaign_purpose",
     "batch_name",
@@ -65,9 +63,7 @@ INPUT_GENERATION_IDENTITY_FIELDS = (
     "sampling_regime",
     "case_input_config_digest",
     "scientific_config_digest",
-    "generator_version",
     "producer_identity",
-    "case_schema_version",
     "case_contract_digest",
     "template_relative_path",
     "template_sha256",
@@ -569,7 +565,6 @@ def _validate_input_manifest_shape(
     if (
         set(manifest) != INPUT_MANIFEST_KEYS
         or manifest.get("schema_kind") != INPUT_BATCH_SCHEMA_KIND
-        or not common.serialization.is_schema_version(manifest.get("schema_version"), INPUT_BATCH_SCHEMA_VERSION)
         or manifest.get("status") != "ready"
         or not isinstance(generation_id, str)
         or (expected_input_generation_id is not None and generation_id != expected_input_generation_id)
@@ -674,8 +669,6 @@ def _load_input_batch_envelope(
         or resolved.get("campaign_id") != manifest["campaign_id"]
         or resolved.get("campaign_purpose") != manifest["campaign_purpose"]
         or resolved.get("sampling_regime") != manifest["sampling_regime"]
-        or resolved.get("generator_version") != manifest["generator_version"]
-        or not common.serialization.is_schema_version(manifest.get("case_schema_version"), case_service.CASE_SCHEMA_VERSION)
         or manifest.get("case_contract_digest") != case_service.CASE_CONTRACT_DIGEST
         or not isinstance(resolved.get("reference_template"), Mapping)
         or resolved["reference_template"].get("sha256") != manifest["template_sha256"]
@@ -695,8 +688,8 @@ def _load_input_batch_envelope(
         str(manifest["sampling_regime"]),
         resolved,
     )
-    supplemental = resolved.get("supplemental_design")
-    stored_locator_regime = supplemental.get("batch_locator_regime") if isinstance(supplemental, Mapping) else None
+    replacement_design = resolved.get("replacement_design")
+    stored_locator_regime = replacement_design.get("batch_locator_regime") if isinstance(replacement_design, Mapping) else None
     storage_parts = common.paths.campaign_batch_parts(batch_storage_name)
     if storage_parts is None:
         message = f"Input manifest batch locator is not a campaign locator: {batch_storage_name!r}."
@@ -807,7 +800,6 @@ def _validate_input_case_record(
         "case_input_config_digest": manifest["case_input_config_digest"],
         "material_family": manifest["material_family"],
         "sampling_regime": manifest["sampling_regime"],
-        "generator_version": manifest["generator_version"],
     }
     template = case_payload.get("template")
     if (

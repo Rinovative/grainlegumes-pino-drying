@@ -189,7 +189,6 @@ assert dataset_package_services.planning.prepare_dataset_selection is dataset_pa
 assert dataset_package_services.transient_shards is dataset_packages_transient_shards
 assert dataset_package_services.inspect_dataset_package is dataset_packages.inspect_dataset_package
 assert dataset_packages.DATASET_PACKAGE_SCHEMA_KIND == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_KIND
-assert dataset_packages.DATASET_PACKAGE_SCHEMA_VERSION == dataset_packages_manifest.DATASET_PACKAGE_SCHEMA_VERSION
 assert dataset_packages.build_dataset_selection.__module__ == "src.datasets.dataset_packages"
 assert datasets.contracts.views.inspect_contract("steady_flow").contract_digest
 assert generation.contracts.get_profile_contract("transient_drying").id == "transient_drying"

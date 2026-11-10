@@ -45,11 +45,9 @@ _MAGNUS_BASE_PRESSURE_PA = 610.94
 _MAGNUS_EXPONENT = 17.625
 _MAGNUS_TEMPERATURE_OFFSET_C = 243.04
 _RELATIVE_HUMIDITY_ROOT_TOLERANCE = 256.0 * np.finfo(np.float64).eps
-SCHEDULE_GENERATOR_VERSION: Final = 1
-COMSOL_BOUNDARY_HANDOFF_VERSION: Final = 1
 SEPARATE_OUTPUT_TIME_POLICY: Final = "common.time.regular_times_with_separate_schedule_time_support"
 STARTUP_RELATIVE_HUMIDITY_TOLERANCE: Final = 1.0e-12
-STARTUP_POLICY_ID: Final = "coupled_temperature_humidity_equilibrium_minimum_margin_v1"
+STARTUP_POLICY_ID: Final = "coupled_temperature_humidity_equilibrium_minimum_margin"
 _STARTUP_HUMIDITY_START_POLICY: Final = "select_strictest_startup_rh_upper_bound_from_minimum_equilibrium_margin"
 STARTUP_RELATIVE_HUMIDITY_MAX_BASIS: Final = "synthetic_startup_design_bound"
 CORRELATION_TOLERANCE: Final = 2.0e-12
@@ -501,7 +499,6 @@ def _boundary_handoff_metadata(
     """Describe how the canonical schedule becomes the COMSOL interpolation table."""
     canonical_values = np.asarray(canonical.values, dtype=np.float64)
     result: dict[str, Any] = {
-        "handoff_version": COMSOL_BOUNDARY_HANDOFF_VERSION,
         "representation": "comsol_linear_interpolation_table",
         "startup_ramp": dict(startup_metadata),
         "canonical_regular_grid": {
@@ -602,7 +599,6 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
         msg = "COMSOL boundary schedule lacks handoff provenance."
         raise TypeError(msg)
     expected_handoff_keys = {
-        "handoff_version",
         "representation",
         "startup_ramp",
         "canonical_regular_grid",
@@ -624,8 +620,7 @@ def validate_comsol_boundary_schedule(  # noqa: C901, PLR0912, PLR0915 -- centra
     }
     canonical_start = np.asarray(handoff["canonical_start_row"], dtype=np.float64)
     if (
-        handoff["handoff_version"] != COMSOL_BOUNDARY_HANDOFF_VERSION
-        or handoff["representation"] != "comsol_linear_interpolation_table"
+        handoff["representation"] != "comsol_linear_interpolation_table"
         or handoff["canonical_regular_grid"] != expected_grid_metadata
         or canonical_start.shape != (len(profiles.SCHEDULE_FIELDS),)
         or not np.isfinite(canonical_start).all()
@@ -1524,16 +1519,10 @@ def _schedule_class(
 
 
 def _attempt_seed(seed: int, *, attempt: int) -> int:
-    """Return the original seed first, then schedule-version-bound retry streams."""
+    """Return the original seed first, then independent retry streams."""
     if attempt == 1:
         return seed
-    return seeding.derive_seed(
-        seed,
-        "schedule_algorithm",
-        str(SCHEDULE_GENERATOR_VERSION),
-        "retry",
-        str(attempt),
-    )
+    return seeding.derive_seed(seed, "schedule_algorithm", "retry", str(attempt))
 
 
 def _candidate_schedule(
@@ -1915,7 +1904,6 @@ def generate_schedule(
         values=values_array,
         metadata={
             "generator_kind": "grid_resolved_correlated_temporal_composition",
-            "generator_version": SCHEDULE_GENERATOR_VERSION,
             "interpolation": "linear",
             "schedule_class": _schedule_class(
                 available,

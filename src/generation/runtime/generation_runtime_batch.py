@@ -73,9 +73,6 @@ from .generation_runtime_preparation import PreparedCase, prepare_case_work_dire
 if TYPE_CHECKING:
     from src.generation.validation.generation_validation_policy import DiagnosticRecord
 
-BATCH_MANIFEST_SCHEMA_VERSION = 1
-_EXECUTION_PROVENANCE_SCHEMA_VERSION: Final = 1
-_PROCESSING_PROVENANCE_SCHEMA_VERSION: Final = 1
 # The stall rule needs minutes-scale freshness; rereading the solver stdout every poll would only cost I/O.
 _STALL_PROBE_REFRESH_SECONDS: Final = 15.0
 _BATCH_MANIFEST_SCHEMA_KIND: Final = "simulation_batch_manifest"
@@ -90,7 +87,6 @@ ValidationDepth = Literal["routine", "full", "deep"]
 _BATCH_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "status",
         "simulation_profile",
         "available_learning_views",
@@ -114,7 +110,6 @@ _BATCH_MANIFEST_KEYS: Final = frozenset(
 _BATCH_SUCCESS_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "simulation_profile",
         "batch_id",
         "batch_identity",
@@ -136,7 +131,6 @@ _CASE_RECORD_KEYS: Final = frozenset(
 _CASE_PUBLICATION_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "stage",
         "simulation_profile",
         "batch_id",
@@ -159,7 +153,6 @@ _CASE_PUBLICATION_KEYS: Final = frozenset(
 _CASE_SUCCESS_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "stage",
         "batch_id",
         "case_id",
@@ -578,7 +571,6 @@ class TerminalBatchEvidence:
         """Return the exact terminal-manifest payload represented by this evidence."""
         return {
             "schema_kind": _BATCH_MANIFEST_SCHEMA_KIND,
-            "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
             "status": "complete",
             "simulation_profile": self.simulation_profile,
             "available_learning_views": list(self.available_learning_views),
@@ -1121,7 +1113,6 @@ def _execution_provenance(
     execution_digest = common.serialization.canonical_json_sha256(config.execution_values)
     payload = {
         "schema_kind": "simulation_execution_provenance",
-        "schema_version": _EXECUTION_PROVENANCE_SCHEMA_VERSION,
         "case_id": prepared.bundle.case_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
         "execution_config_digest": execution_digest,
@@ -1201,7 +1192,6 @@ def _write_processing_provenance(
     processing_commit = source_service.required_git_commit()
     payload = {
         "schema_kind": "generation_processing_provenance",
-        "schema_version": _PROCESSING_PROVENANCE_SCHEMA_VERSION,
         "case_id": prepared.bundle.case_id,
         "case_input_id": prepared.bundle.case_input_id,
         "simulation_case_id": prepared.bundle.simulation_case_id,
@@ -1415,7 +1405,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     *,
     cores_per_case: int,
     worker_slot: int,
-    scheduler_kind: str = "local",
+    scheduler_kind: str,
     allocated_node: str | None = None,
     progress_reporter: progress_service.RuntimeProgressReporter | None = None,
 ) -> ExecutionResult:
@@ -1428,7 +1418,6 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         config,
         cores_per_case=cores_per_case,
         scalar_handoff=scalar_handoff,
-        scheduler_kind=scheduler_kind,
         batch_log_path=str(batch_log),
         scratch_directory=str(prepared.comsol_directory),
     )
@@ -1472,11 +1461,10 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
     stderr_path = prepared.runtime_directory / "stderr.log"
     _bind_runtime_progress_stdout(progress_reporter, stdout_path)
     retry_policy = config.execution_values["runtime"]["license_wait"]
-    in_allocation_policy = retry_policy["in_allocation_retry"]
-    in_allocation_enabled = bool(scheduler_kind == "slurm" and retry_policy["enabled"] and in_allocation_policy["enabled"])
+    in_allocation_enabled = bool(scheduler_kind == "slurm" and retry_policy["enabled"])
     window_started_at = datetime.now(UTC)
     window_started_monotonic = time.monotonic()
-    window_deadline = window_started_monotonic + float(in_allocation_policy["maximum_window_seconds"]) if in_allocation_enabled else None
+    window_deadline = window_started_monotonic + license_service.IN_ALLOCATION_WINDOW_SECONDS if in_allocation_enabled else None
     checkout_summaries: list[license_service.InAllocationLicenseCheckoutSummary] = []
     in_allocation_license_window_seconds = 0.0
     in_allocation_pause_seconds = 0.0
@@ -1543,7 +1531,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                 _update_license_acquisition_progress(
                     progress_reporter,
                     window_started_monotonic=window_started_monotonic,
-                    window_limit_seconds=float(in_allocation_policy["maximum_window_seconds"]),
+                    window_limit_seconds=license_service.IN_ALLOCATION_WINDOW_SECONDS,
                     checkout_attempt_count=len(checkout_summaries) + 1,
                     last_result=(None if not checkout_summaries else license_service.TEMPORARY_LICENSE_CAPACITY),
                     force=True,
@@ -1601,7 +1589,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                     prepared,
                     deadline=window_deadline,
                     window_started_monotonic=window_started_monotonic,
-                    window_limit_seconds=float(in_allocation_policy["maximum_window_seconds"]),
+                    window_limit_seconds=license_service.IN_ALLOCATION_WINDOW_SECONDS,
                     checkout_attempt_count=len(checkout_summaries) + 1,
                     last_result=(None if not checkout_summaries else license_service.TEMPORARY_LICENSE_CAPACITY),
                     progress_reporter=progress_reporter,
@@ -1822,7 +1810,7 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
                 message = "Enabled in-allocation retry requires a monotonic deadline."
                 raise RuntimeError(message)
             remaining = max(0.0, window_deadline - time.monotonic())
-            pause_seconds = min(float(in_allocation_policy["pause_after_capacity_failure_seconds"]), remaining)
+            pause_seconds = min(license_service.IN_ALLOCATION_PAUSE_SECONDS, remaining)
             if pause_seconds > 0.0:
                 time.sleep(pause_seconds)
                 in_allocation_pause_seconds += pause_seconds
@@ -1863,7 +1851,6 @@ def execute_prepared_case(  # noqa: C901, PLR0912, PLR0915 -- centralized COMSOL
         )
     timing = {
         "schema_kind": "simulation_case_timing",
-        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "batch_id": config.batch_id,
         "case_id": prepared.bundle.case_id,
         "case_input_id": prepared.bundle.case_input_id,
@@ -2117,7 +2104,6 @@ def _complete_stage(
     )
     provenance = {
         "schema_kind": "simulation_case_publication",
-        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "stage": stage,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
@@ -2139,7 +2125,6 @@ def _complete_stage(
     provenance_path = common.serialization.atomic_write_json(directory / "provenance.json", provenance)
     success = {
         "schema_kind": "simulation_case_success",
-        "schema_version": storage_service.PUBLICATION_SCHEMA_VERSION,
         "stage": stage,
         "batch_id": config.batch_id,
         "case_id": case_payload["case_id"],
@@ -2341,9 +2326,10 @@ def _attempt_case_state(
     error: BaseException,
     *,
     failure_stage: str,
+    license_wait_enabled: bool,
 ) -> attempt_service.AttemptCaseState:
-    """Classify one precise unsuccessful attempt state without collapsing stages."""
-    if isinstance(error, license_service.TemporaryLicenseCapacityError):
+    """Classify one precise unsuccessful attempt state without collapsing stages; a capacity error blocks only under the licence protection."""
+    if license_wait_enabled and isinstance(error, license_service.TemporaryLicenseCapacityError):
         return "license_blocked"
     if bool(getattr(error, "timed_out", False)):
         return "timed_out"
@@ -2408,7 +2394,11 @@ def record_case_failure(
         config,
         case_index,
         campaign_run_id=run_id,
-        case_state=_attempt_case_state(error, failure_stage=failure_stage),
+        case_state=_attempt_case_state(
+            error,
+            failure_stage=failure_stage,
+            license_wait_enabled=bool(config.execution_values["runtime"]["license_wait"]["enabled"]),
+        ),
         failure_stage=failure_stage,
         reason=str(error) or type(error).__name__,
         solver_git_commit=source_service.required_git_commit(),
@@ -2790,11 +2780,7 @@ def _admit_processed_raw_publication(
     validation_depth: ValidationDepth,
 ) -> tuple[str, _PublicationEvidence]:
     """Resolve and admit the exact raw input named by processed evidence."""
-    if (
-        set(provenance) != _CASE_PUBLICATION_KEYS
-        or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(provenance.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
-    ):
+    if set(provenance) != _CASE_PUBLICATION_KEYS or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND:
         message = f"Case publication schema is not current: {directory}"
         raise RuntimeError(message)
     input_generation_id = common.paths.validate_logical_name(
@@ -2861,11 +2847,7 @@ def _admit_processed_case_payload(
         if raw_evidence is not None:
             message = "Processed-only admission cannot also receive raw publication evidence."
             raise TypeError(message)
-        if (
-            set(provenance) != _CASE_PUBLICATION_KEYS
-            or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND
-            or not common.serialization.is_schema_version(provenance.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
-        ):
+        if set(provenance) != _CASE_PUBLICATION_KEYS or provenance.get("schema_kind") != _CASE_PUBLICATION_SCHEMA_KIND:
             message = f"Case publication schema is not current: {directory}"
             raise RuntimeError(message)
         input_generation_id = common.paths.validate_logical_name(
@@ -2895,7 +2877,6 @@ def _require_processed_success_evidence(
     successful_stages = ("solver", "exports", "conversion", "publication")
     if (
         status.get("schema_kind") != "simulation_case_status"
-        or not common.serialization.is_schema_version(status.get("schema_version"), storage_service.STATUS_SCHEMA_VERSION)
         or status.get("case_state") != "successful"
         or status.get("solver_success") is not True
         or status.get("contains_nan_or_inf") is not False
@@ -2903,7 +2884,6 @@ def _require_processed_success_evidence(
         or not isinstance(stages, dict)
         or any(stages.get(name) != "succeeded" for name in successful_stages)
         or execution.get("schema_kind") != "simulation_execution_provenance"
-        or not common.serialization.is_schema_version(execution.get("schema_version"), _EXECUTION_PROVENANCE_SCHEMA_VERSION)
         or execution.get("case_id") != case_id
         or execution.get("simulation_case_id") != simulation_case_id
         or not isinstance(result, dict)
@@ -2951,9 +2931,7 @@ def _admit_publication_directory(
     if (
         set(success) != _CASE_SUCCESS_KEYS
         or success.get("schema_kind") != _CASE_SUCCESS_SCHEMA_KIND
-        or not common.serialization.is_schema_version(success.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION)
         or case_payload.get("schema_kind") != case_service.CASE_SCHEMA_KIND
-        or not common.serialization.is_schema_version(case_payload.get("schema_version"), case_service.CASE_SCHEMA_VERSION)
     ):
         msg = f"Case publication schema is not current: {directory}"
         raise RuntimeError(msg)
@@ -3095,7 +3073,6 @@ def _admit_publication_directory(
     )
     processing_keys = {
         "schema_kind",
-        "schema_version",
         "case_id",
         "case_input_id",
         "simulation_case_id",
@@ -3111,7 +3088,6 @@ def _admit_publication_directory(
         or execution.get("git_commit") != processing.get("solver_git_commit")
         or set(processing) != processing_keys
         or processing.get("schema_kind") != "generation_processing_provenance"
-        or not common.serialization.is_schema_version(processing.get("schema_version"), _PROCESSING_PROVENANCE_SCHEMA_VERSION)
         or processing.get("case_id") != case_id
         or processing.get("case_input_id") != case_input_id
         or processing.get("simulation_case_id") != simulation_case_id
@@ -3561,7 +3537,7 @@ def run_case(
     *,
     cores_per_case: int,
     worker_slot: int = 0,
-    scheduler_kind: str = "local",
+    scheduler_kind: str,
     allocated_node: str | None = None,
     storage_root: Path | str | None = None,
     work_root: Path | str | None = None,
@@ -3647,6 +3623,8 @@ def run_case(
                 else None
             )
             retry_enabled = scheduler_kind == "slurm" and bool(config.execution_values["runtime"]["license_wait"]["enabled"])
+            if temporary_license_error is not None and not retry_enabled:
+                temporary_license_error.runtime_reason = "solver_error"  # decided like any COMSOL solver error
             if publication_complete:
                 _record_case_cleanup_failure(
                     config,
@@ -3867,7 +3845,6 @@ def finalize_batch(
     git_commit = next(iter(git_commits))
     manifest = {
         "schema_kind": "simulation_batch_manifest",
-        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "status": "complete",
         "simulation_profile": config.profile.id,
         "available_learning_views": list(config.profile.available_learning_views),
@@ -3891,7 +3868,6 @@ def finalize_batch(
     manifest_path = _immutable_json(meta_directory / "batch_manifest.json", manifest, label="terminal batch manifest")
     success = {
         "schema_kind": "simulation_batch_success",
-        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "simulation_profile": config.profile.id,
         "batch_id": config.batch_id,
         "batch_identity": config.batch_identity,
@@ -3932,7 +3908,6 @@ def _validate_terminal_scientific_config(
     if (
         not reference_template_matches
         or scientific.get("schema_kind") != "resolved_generation_batch"
-        or not common.serialization.is_schema_version(scientific.get("schema_version"), config_contract.CONFIG_SCHEMA_VERSION)
         or scientific.get("simulation_profile") != manifest["simulation_profile"]
         or scientific.get("campaign_purpose") != manifest["campaign_purpose"]
         or scientific.get("sampling_regime") != manifest["sampling_regime"]
@@ -3976,7 +3951,6 @@ def _require_case_matches_terminal(
         "case_index": record["case_index"],
         "case_input_id": record["case_input_id"],
         "simulation_case_id": record["simulation_case_id"],
-        "generator_version": scientific.get("generator_version"),
         "git_commit": manifest["git_commit"],
         "material_family": record["material_family"],
         "domain_profile": scientific.get("domain_profile"),
@@ -4166,7 +4140,6 @@ def admit_terminal_batch(
     if (
         set(manifest) != _BATCH_MANIFEST_KEYS
         or manifest.get("schema_kind") != _BATCH_MANIFEST_SCHEMA_KIND
-        or not common.serialization.is_schema_version(manifest.get("schema_version"), BATCH_MANIFEST_SCHEMA_VERSION)
         or manifest.get("status") != "complete"
         or manifest.get("batch_storage_name") != safe_storage_name
     ):
@@ -4237,17 +4210,12 @@ def admit_terminal_batch(
     )
     expected_success = {
         "schema_kind": _BATCH_SUCCESS_SCHEMA_KIND,
-        "schema_version": BATCH_MANIFEST_SCHEMA_VERSION,
         "simulation_profile": profile.id,
         "batch_id": safe_batch_id,
         "batch_identity": batch_identity,
         "manifest_sha256": manifest_sha256,
     }
-    if (
-        set(success) != _BATCH_SUCCESS_KEYS
-        or not common.serialization.is_schema_version(success["schema_version"], BATCH_MANIFEST_SCHEMA_VERSION)
-        or success != expected_success
-    ):
+    if set(success) != _BATCH_SUCCESS_KEYS or success != expected_success:
         msg = f"Terminal success marker does not bind the manifest: {success_path}"
         raise RuntimeError(msg)
     indices = manifest.get("intended_case_indices")

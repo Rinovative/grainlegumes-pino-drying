@@ -52,17 +52,15 @@ def _primary_missing(path: Path, *, authored_value: Mapping[str, Any] | None = N
         return [f"{prefix}:sampling"]
     if sampling.get("seed_base") is None:
         missing.append(f"{prefix}:sampling.seed_base")
-    counts = sampling.get("counts")
-    if not isinstance(counts, dict):
-        missing.append(f"{prefix}:sampling.counts")
+    designs = sampling.get("designs")
+    if not isinstance(designs, dict):
+        missing.append(f"{prefix}:sampling.designs")
     else:
-        for regime, by_material in counts.items():
-            if not isinstance(by_material, dict):
-                missing.append(f"{prefix}:sampling.counts.{regime}")
+        for family, by_kind in designs.items():
+            if not isinstance(by_kind, dict):
+                missing.append(f"{prefix}:sampling.designs.{family}")
                 continue
-            for family, count in by_material.items():
-                if count is None:
-                    missing.append(f"{prefix}:sampling.counts.{regime}.{family}")
+            missing.extend(f"{prefix}:sampling.designs.{family}.{kind}" for kind, count in by_kind.items() if count is None)
     return missing
 
 

@@ -43,7 +43,6 @@ HANDOFF_DIRECTORY = "handoff"
 _MANIFEST_FILENAME = "manifest.json"
 _CHECKPOINT_FILENAME = "best_checkpoint.pt"
 _SCALING_FILENAME = "normalizer.pt"
-_SCHEMA_VERSION = 1
 
 
 def _canonical_digest(value: Mapping[str, Any]) -> str:
@@ -92,7 +91,7 @@ def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
         "seed": copy.deepcopy(run.get("seed")),
         "datasets": {
             "train_dataset": copy.deepcopy(data.get("train_dataset")),
-            "additional_evaluation_datasets": copy.deepcopy(data.get("additional_evaluation_datasets")),
+            "material_ood_datasets": copy.deepcopy(data.get("material_ood_datasets")),
         },
     }
 
@@ -127,7 +126,6 @@ def publish_stage_a_handoff(
         raise ValueError(msg)
     compatibility = compatibility_payload(config)
     manifest = {
-        "schema_version": _SCHEMA_VERSION,
         "source_run_name": source_run_name,
         "files": {
             "checkpoint": {"filename": _CHECKPOINT_FILENAME, "sha256": common.serialization.file_sha256(checkpoint)},
@@ -185,7 +183,6 @@ def validate_local_teacher_handoff(
         msg = "Local teacher handoff manifest is invalid JSON."
         raise ValueError(msg) from error
     required = {
-        "schema_version",
         "source_run_name",
         "files",
         "scaling_semantic_digest",
@@ -201,11 +198,7 @@ def validate_local_teacher_handoff(
         "compatibility_digest",
         "target_reset_policy",
     }
-    if (
-        not isinstance(manifest, Mapping)
-        or set(manifest) != required
-        or not common.serialization.is_schema_version(manifest["schema_version"], _SCHEMA_VERSION)
-    ):
+    if not isinstance(manifest, Mapping) or set(manifest) != required:
         msg = "Local teacher handoff manifest schema is invalid."
         raise ValueError(msg)
     files = manifest["files"]
@@ -258,7 +251,6 @@ def validate_stage_a_handoff(
         msg = "Transient handoff manifest is invalid JSON."
         raise ValueError(msg) from error
     required = {
-        "schema_version",
         "source_run_name",
         "files",
         "scaling_semantic_digest",
@@ -274,11 +266,7 @@ def validate_stage_a_handoff(
         "compatibility_digest",
         "target_reset_policy",
     }
-    if (
-        not isinstance(manifest, Mapping)
-        or set(manifest) != required
-        or not common.serialization.is_schema_version(manifest["schema_version"], _SCHEMA_VERSION)
-    ):
+    if not isinstance(manifest, Mapping) or set(manifest) != required:
         msg = "Transient handoff manifest schema is invalid."
         raise ValueError(msg)
     if expected_source_run_name is not None and manifest["source_run_name"] != expected_source_run_name:

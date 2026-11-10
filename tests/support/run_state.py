@@ -45,7 +45,6 @@ def write_lightweight_run_state(
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
         {
-            "schema_version": common.paths.RUN_SUMMARY_SCHEMA_VERSION,
             "status": status,
             "completed_epoch": completed_epoch,
         },

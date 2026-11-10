@@ -19,9 +19,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from html import escape
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import ipywidgets as widgets
@@ -40,14 +38,6 @@ from src.analysis.presentation import registry as shared_presentation
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-
-_HANDLED_VIEW_ERRORS = (
-    OSError,
-    TypeError,
-    ValueError,
-    RuntimeError,
-    KeyError,
-)
 
 
 class _LocalControls(Protocol):
@@ -103,9 +93,9 @@ def _live_view(
             try:
                 with ui.plot_layout.eda_typography():
                     items = _result_items(render())
-            except _HANDLED_VIEW_ERRORS as error:
+            except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
                 if request == generation and (export_state is None or export_state.get("plot_name") == export_plot_name):
-                    display(widgets.HTML(f"<p><b>View unavailable for the current selection.</b> {escape(str(error))}</p>"))
+                    ui.viewers.show_render_failure(output, error)
                 return
             if request != generation or (export_state is not None and export_state.get("plot_name") != export_plot_name):
                 for item in items:
@@ -437,7 +427,6 @@ class _GenerationInputPanelShell:
         catalog: source_service.GenerationInputDatasetCatalog,
         *,
         title: str,
-        export_dir: Path | str,
         selection_state: selection_service.GenerationInputSelectionState | None,
         display_spatial_stride: display_grid.DisplayStride,
     ) -> None:
@@ -445,7 +434,6 @@ class _GenerationInputPanelShell:
         self._display_spatial_stride: display_grid.DisplayStride = display_spatial_stride
         self._catalog = catalog
         self._selection_state = selection_state
-        self._export_dir = Path(export_dir)
         self._export_state: dict[str, Any] = {
             "fig": None,
             "plot_name": None,
@@ -458,20 +446,12 @@ class _GenerationInputPanelShell:
             button_style="primary",
             layout=widgets.Layout(width="auto"),
         )
-        self._close_button = widgets.Button(
-            description="Close",
-            button_style="danger",
-            layout=widgets.Layout(width="145px"),
-        )
-        self._export_button = widgets.Button(
-            description="Export PDF",
-            button_style="success",
-            layout=widgets.Layout(width="145px"),
-        )
+        self._close_button = widgets.Button(description="Close", button_style="danger")
+        self._export_button = widgets.Button(description="Export PDF", button_style="success")
         self._tabs = widgets.Tab()
-        header = widgets.HBox((self._close_button, self._export_button))
+        header = ui.notebook.panel_header(self._close_button, self._export_button, self._status_output)
         self._panel = widgets.VBox(
-            (header, self._status_output, self._tabs),
+            (header, self._tabs),
             layout=widgets.Layout(width="100%"),
         )
         self._initialized_tabs: set[int] = set()
@@ -587,19 +567,8 @@ class _GenerationInputPanelShell:
         self._tabs.selected_index = 0
 
     def _export_current(self, _button: object = None) -> None:
-        """Write the current view's primary figure to a timestamped PDF."""
-        with self._status_output:
-            self._status_output.clear_output(wait=True)
-            figure = self._export_state.get("fig")
-            if not isinstance(figure, Figure):
-                print("[Export] The current view has no rendered figure.")
-                return
-            self._export_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-            stem = str(self._export_state.get("plot_name") or "generation_input_view")
-            destination = self._export_dir / f"{stem}_{timestamp}.pdf"
-            figure.savefig(destination, bbox_inches="tight")
-            print(f"[Export] Saved: {destination}")
+        """Write the current view's primary figure through the shared notebooks-folder export."""
+        ui.notebook.export_pdf(self._status_output, self._export_state)
 
     def _show_panel(self, _button: object = None) -> None:
         """Open the panel with the first current view already rendered."""
@@ -631,7 +600,6 @@ def build_generation_input_eda_panel(
     initial_selection: selection_service.GenerationInputSelection | None = None,
     selection_state: selection_service.GenerationInputSelectionState | None = None,
     title: str = "Generation-input EDA",
-    export_dir: Path | str = "",
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> widgets.Output:
     """Build one collapsible panel with session-scoped shared A/B state."""
@@ -654,7 +622,6 @@ def build_generation_input_eda_panel(
     return _GenerationInputPanelShell(
         datasets,
         title=title,
-        export_dir=export_dir,
         selection_state=resolved_state,
         display_spatial_stride=display_spatial_stride,
     ).output

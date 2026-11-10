@@ -60,8 +60,6 @@ _SCALAR_MATERIAL_KEYS = frozenset(field.name for field in _SCALAR_MATERIAL_FIELD
 _SCALAR_MATERIAL_NORMALIZED_KEYS = frozenset(key.casefold() for key in _SCALAR_MATERIAL_KEYS)
 _SCALAR_MATERIAL_UNITS = {field.name: field.unit for field in _SCALAR_MATERIAL_FIELDS}
 _HISTOGRAM_SUPTITLE_Y = 0.98
-_SCALAR_MATERIAL_TITLE_GAP = 3.0 * 1.75 * (_HISTOGRAM_SUPTITLE_Y - 0.97)
-_SCALAR_MATERIAL_GRID_TOP = _HISTOGRAM_SUPTITLE_Y - _SCALAR_MATERIAL_TITLE_GAP
 _SPATIAL_DIMENSIONS = 2
 
 
@@ -86,7 +84,7 @@ def plot_published_tensor(
         axis.set_xlabel("x [m]")
         axis.set_ylabel("y [m]")
         colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(value.unit)
+        colorbar.set_label(f"[{field_labels.display_unit(value.unit)}]")
     elif values.ndim == 1 and value.support == "inlet boundary":
         boundary_y = y[x == np.min(x)]
         order = np.argsort(boundary_y)
@@ -100,7 +98,7 @@ def plot_published_tensor(
         plt.close(figure)
         message = f"Unsupported published tensor support for {value.name}: {values.shape}."
         raise ValueError(message)
-    axis.set_title(f"{value.group}: {value.name} [{value.unit}]")
+    axis.set_title(f"{value.group}: {value.name}")
     figure.text(0.02, 0.02, f"{value.representation}; full support min={float(np.min(values)):g}, max={float(np.max(values)):g}")
     return figure
 
@@ -449,7 +447,6 @@ def _hist_grid(
     columns: list[str],
     title: str,
     units_by_column: Mapping[str, str] | None = None,
-    grid_top: float = 0.90,
     row_spacing: float = 0.34,
 ) -> Figure:
     """
@@ -467,8 +464,6 @@ def _hist_grid(
         Title for the entire figure.
     units_by_column : Mapping[str, str] | None, optional
         Authoritative units used for unit-bearing subplot headings.
-    grid_top : float, optional
-        Explicit upper GridSpec boundary.
     row_spacing : float, optional
         Explicit GridSpec spacing between histogram rows.
 
@@ -508,7 +503,6 @@ def _hist_grid(
         column_width=4.0,
         row_height=2.8,
         legend_width=3.6,
-        top=grid_top,
         hspace=row_spacing,
     )
 
@@ -697,7 +691,6 @@ def plot_meta_statistics(
             columns=_visible_metadata_statistic_keys(keys),
             title=f"Generated case parameters — {max_cases} cases",
             units_by_column=units_by_column,
-            grid_top=0.96,
             row_spacing=0.425,
         )
 
@@ -817,7 +810,6 @@ def plot_meta_parameters(
             columns=_scalar_material_parameter_keys(keys),
             title=f"Scalar material conditioning — {max_cases} cases",
             units_by_column=_SCALAR_MATERIAL_UNITS,
-            grid_top=_SCALAR_MATERIAL_GRID_TOP,
             row_spacing=0.50,
         )
 
@@ -943,7 +935,6 @@ def plot_field_value_distributions(
             column_width=4.0,
             row_height=2.4,
             legend_width=3.6,
-            top=0.97,
         )
 
         legend_handles = [Line2D([], [], lw=6, color=dataset_colors[name], alpha=0.6) for name in active]
@@ -1012,13 +1003,7 @@ def plot_field_value_distributions(
             axes.ravel(),
         )
         if availability:
-            fig.text(0.06, 0.012, availability, ha="left", va="bottom", fontsize=8)
-        fig.subplots_adjust(
-            top=0.96,
-            bottom=0.08 if availability else 0.06,
-            left=0.06,
-            right=0.97,
-        )
+            fig.supxlabel(availability, x=0.06, ha="left", fontsize=8)
 
         return fig
 

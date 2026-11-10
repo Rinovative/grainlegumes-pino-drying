@@ -196,7 +196,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
         case_ids=("sample-0",),
         membership_digest="e" * 64,
     )
-    selection = context.SplitSelection(role="id_test", evidence=(evidence,))
+    selection = context.SplitSelection(role="id_test", evidence=(evidence,), train_subset=None)
     dataset = _SyntheticDataset()
 
     monkeypatch.setattr(experiments.run, "validate_evaluable_run", lambda _run_dir: completed_run)

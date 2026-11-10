@@ -192,7 +192,7 @@ def prepare_notebook_context(
     data = official_config["data"]
     roles = [
         ("ID train / validation / test source", data["train_dataset"]),
-        *(("Dataset-declared OOD", dataset_id) for dataset_id in data["additional_evaluation_datasets"]),
+        *(("Dataset-declared material OOD", dataset_id) for dataset_id in data["material_ood_datasets"]),
     ]
     previews = tuple(
         _dataset_preview(
@@ -257,24 +257,21 @@ def prepare_run_inspection(run_dir: Path | str) -> RunInspection:
     )
     if config["task"] == "transient_drying":
         expected_paths.append(("history.json", selected_run / "history.json"))
-    identity = None
     if not common.paths.resolve_split_indices_path(selected_run).is_file():
-        split_state = "not saved"  # A run that ended before its split was persisted has no additional role.
+        split_state = "not saved"  # A run that ended before its split was persisted has no OOD role.
     else:
         try:
-            identity = datasets.preprocessing.splits.read_saved_split(selected_run).additional_evaluation_name
+            split = datasets.preprocessing.splits.read_saved_split(selected_run)
         except (TypeError, ValueError) as error:
             split_state = f"unavailable: {type(error).__name__}: {error}"
         else:
             split_state = "admitted"
-    summary_rows = (*summary_rows, ("Saved split", split_state))
-    if identity is not None:
-        expected_paths.append(
-            (
-                f"analysis/additional_evaluation/{identity}/",
-                common.paths.resolve_additional_evaluation_analysis_dir(selected_run, identity),
+            expected_paths.extend(
+                (f"analysis/{role}/{name}/", common.paths.resolve_ood_analysis_dir(selected_run, role, name))
+                for role in split.ood_roles
+                if (name := split.ood_name(role)) is not None
             )
-        )
+    summary_rows = (*summary_rows, ("Saved split", split_state))
     return RunInspection(
         run_dir=selected_run,
         summary_rows=summary_rows,
@@ -385,7 +382,7 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Task ID", context.task.id, "Registered scientific task"),
                 ("ID dataset", data["train_dataset"], "Disjoint train, validation, and untouched ID-test cases"),
                 ("Case partition", "Dataset manifest", "Fixed case membership independent of training seed"),
-                ("Additional Evaluation datasets", data["additional_evaluation_datasets"], "Optional explicitly assigned scientific roles"),
+                ("Material-OOD datasets", data["material_ood_datasets"], "Optional explicitly assigned scientific roles"),
                 ("Input profile", config["input_profile"], "Resolved transient input semantics"),
                 ("Output fields", context.task.output_names, "Ordered physical state channels"),
                 ("Spatial stride", data["spatial_stride"], "Declared model spatial support"),
@@ -411,7 +408,7 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Teacher handoff", training["teacher_handoff"], "Common Stage-A checkpoint dependency"),
                 ("Matched protocol", training.get("matched_a1_b"), "A1 consumes B measured train-time receipt"),
                 ("ID evaluation interval", training["evaluation_interval"], "Validation cadence for model selection"),
-                ("Additional evaluation interval", training["additional_evaluation_interval"], "Diagnostic cadence"),
+                ("OOD evaluation interval", training["ood_evaluation_interval"], "Diagnostic cadence"),
             ),
         ),
         _settings_table(
@@ -542,10 +539,9 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
             "Task and data",
             (
                 ("Task ID", task.id, "Registered scientific task"),
-                ("Task schema", task.schema_version, "Task contract schema version"),
                 ("Task digest", _short_digest(task.contract_digest), "Short display of the full TaskSpec digest"),
                 ("ID dataset", data["train_dataset"], "Fixed Train/validation/ID-test partition"),
-                ("Additional evaluation", data["additional_evaluation_datasets"], "Dataset-declared OOD holdouts"),
+                ("Material-OOD datasets", data["material_ood_datasets"], "Dataset-declared material holdouts"),
                 ("Input fields", task.input_names, "Ordered model input channels"),
                 ("Output fields", task.output_names, "Ordered prediction channels"),
                 ("Tensor layout", task.tensor_layout, "Saved tensor dimension order"),
@@ -569,9 +565,9 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                     "Completed-epoch cadence for objective, scheduler, and checkpoint selection",
                 ),
                 (
-                    "Additional evaluation interval",
-                    training["additional_evaluation_interval"],
-                    "Completed-epoch cadence for additional evaluation",
+                    "OOD evaluation interval",
+                    training["ood_evaluation_interval"],
+                    "Completed-epoch cadence for material-OOD and parameter-OOD evaluation",
                 ),
                 ("Seed", config["run"]["seed"], "Root deterministic seed"),
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
@@ -696,8 +692,8 @@ def prepare_run_preview_table(
         ("Target epochs", config["training"]["epochs"], "Official training duration"),
         ("ID dataset", config["data"]["train_dataset"], "Train and evaluation source"),
         (
-            "Additional evaluation",
-            config["data"]["additional_evaluation_datasets"],
+            "Material-OOD datasets",
+            config["data"]["material_ood_datasets"],
             "Optional saved diagnostic datasets",
         ),
         (
@@ -742,7 +738,7 @@ _RUN_OUTPUT_ROWS = (
     ),
     (
         "split_indices.pt",
-        "Exact train, validation, ID-test, and additional evaluation membership",
+        "Exact train, validation, ID-test, material-OOD and parameter-OOD membership",
         "yes",
         "Resume, inference, and artifacts",
     ),
@@ -762,8 +758,8 @@ _RUN_OUTPUT_ROWS = (
     ("wandb/", "Local SDK state for online or offline tracking", "no", "W&B SDK and local diagnostics"),
     ("analysis/id/", "ID evaluation artifacts", "no", "Single-model and comparison evaluation"),
     (
-        "analysis/additional_evaluation/<combined dataset ID>/",
-        "Optional additional evaluation artifacts",
+        "analysis/<material_ood|parameter_ood>/<dataset ID>/",
+        "Optional OOD evaluation artifacts (artifacts.parquet, npz/)",
         "no",
         "Single-model and comparison evaluation",
     ),

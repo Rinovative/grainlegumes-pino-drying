@@ -48,7 +48,6 @@ if TYPE_CHECKING:
 
 TensorBatch = dict[str, torch.Tensor]
 _TRANSIENT_VIEW_RANK = 5
-_SAMPLER_STATE_SCHEMA_VERSION = 1
 LAST_CHECKPOINT_INTERVAL_SECONDS = 30 * 60  # bounds training lost to a crash; a multi-GB full-state write per epoch costs more
 EpochEndCallback = Callable[[int, dict[str, float]], None]
 EpochStateCallback = Callable[[int, dict[str, float]], None]
@@ -112,7 +111,6 @@ class MatchedPermutationSampler(Sampler[list[int]]):
     def state_dict(self) -> dict[str, Any]:
         """Return the exact mid-epoch continuation contract."""
         return {
-            "schema_version": _SAMPLER_STATE_SCHEMA_VERSION,
             "size": self.size,
             "epoch": self.epoch,
             "permutation": list(self.permutation),
@@ -121,12 +119,8 @@ class MatchedPermutationSampler(Sampler[list[int]]):
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Reject missing, duplicated, or out-of-range sample positions."""
-        keys = {"schema_version", "size", "epoch", "permutation", "cursor"}
-        if (
-            set(state) != keys
-            or not common.serialization.is_schema_version(state["schema_version"], _SAMPLER_STATE_SCHEMA_VERSION)
-            or state["size"] != self.size
-        ):
+        keys = {"size", "epoch", "permutation", "cursor"}
+        if set(state) != keys or state["size"] != self.size:
             msg = "Matched sampler state schema or Dataset length differs."
             raise ValueError(msg)
         permutation = state["permutation"]
@@ -192,6 +186,16 @@ def _loader_case_count(loader: Any) -> int:
         return len(dataset)
     except TypeError:
         return 0
+
+
+def _configured_ood_loaders(ood_loaders: Mapping[str, DataLoader | None] | None) -> dict[str, DataLoader]:
+    """Return the non-empty OOD Evaluation loaders in canonical role order; an empty part is never evaluated."""
+    supplied = dict(ood_loaders or {})
+    unknown = set(supplied).difference(datasets.preprocessing.splits.OOD_SPLIT_ROLES)
+    if unknown:
+        msg = f"OOD Evaluation loaders name unknown roles {sorted(unknown)}."
+        raise ValueError(msg)
+    return {role: loader for role in datasets.preprocessing.splits.OOD_SPLIT_ROLES if (loader := supplied.get(role)) is not None}
 
 
 @contextmanager
@@ -977,7 +981,7 @@ def evaluate_selected_checkpoint(
     model: nn.Module,
     train_loss: nn.Module,
     eval_loader: DataLoader,
-    additional_evaluation_loader: DataLoader | None = None,
+    ood_loaders: Mapping[str, DataLoader | None] | None = None,
     eval_metrics: dict[str, Any],
     device: torch.device,
     data_processor: Any | None,
@@ -1004,25 +1008,21 @@ def evaluate_selected_checkpoint(
     if selected_epoch != int(payload["best_epoch"]):
         msg = "Selected best checkpoint epoch disagrees with its best-objective epoch."
         raise RuntimeError(msg)
-    diagnostic_loader = additional_evaluation_loader
-    diagnostic_role = "additional_evaluation"
-    if adapter is None:
-        id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor)
-        diagnostic_metrics = eval_one_epoch(model, diagnostic_loader, eval_metrics, device, data_processor) if diagnostic_loader is not None else {}
-    else:
-        id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor, adapter)
-        diagnostic_metrics = (
-            eval_one_epoch(model, diagnostic_loader, eval_metrics, device, data_processor, adapter) if diagnostic_loader is not None else {}
-        )
+    extra = () if adapter is None else (adapter,)
+    id_metrics = eval_one_epoch(model, eval_loader, eval_metrics, device, data_processor, *extra)
+    diagnostic_metrics = {
+        role: eval_one_epoch(model, loader, eval_metrics, device, data_processor, *extra)
+        for role, loader in _configured_ood_loaders(ood_loaders).items()
+    }
     objective_id = str(cast("Mapping[str, Any]", config["evaluation"])["objective"]["id"])
-    if objective_id not in id_metrics or (diagnostic_loader is not None and objective_id not in diagnostic_metrics):
+    if objective_id not in id_metrics or any(objective_id not in metrics for metrics in diagnostic_metrics.values()):
         msg = f"Selected checkpoint evaluation did not produce objective {objective_id!r} for its configured loaders."
         raise KeyError(msg)
 
     selected: dict[str, float] = {f"selected/id/{name}": float(value) for name, value in id_metrics.items()}
-    selected.update({f"selected/{diagnostic_role}/{name}": float(value) for name, value in diagnostic_metrics.items()})
-    if diagnostic_loader is not None:
-        selected["selected/additional_evaluation/objective_difference"] = float(diagnostic_metrics[objective_id]) - float(id_metrics[objective_id])
+    for role, metrics in diagnostic_metrics.items():
+        selected.update({f"selected/{role}/{name}": float(value) for name, value in metrics.items()})
+        selected[f"selected/{role}/objective_difference"] = float(metrics[objective_id]) - float(id_metrics[objective_id])
     if adapter is None:
         physics = evaluate_physics_monitor(
             model,
@@ -1073,7 +1073,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     eval_loader: DataLoader,
     train_loss: nn.Module,
     eval_metrics: dict[str, Any],
-    additional_evaluation_loader: DataLoader | None = None,
+    ood_loaders: Mapping[str, DataLoader | None] | None = None,
     data_processor: Any | None = None,
     scheduler: ReduceLROnPlateau | None = None,
     save_dir: Path | str | None = None,
@@ -1116,8 +1116,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
     model, optimizer, train_loader, eval_loader, train_loss, eval_metrics : Any
         Already constructed runtime components. Fresh-run seeding must occur
         before their construction.
-    additional_evaluation_loader : torch.utils.data.DataLoader | None, optional
-        Saved additional-evaluation membership, absent when no evaluation Dataset declares OOD cases.
+    ood_loaders : Mapping[str, torch.utils.data.DataLoader | None] | None, optional
+        Saved ``material_ood`` and ``parameter_ood`` memberships; an absent or ``None`` part is not evaluated.
     data_processor : Any | None, optional
         Saved/fitted normalization processor.
     scheduler : ReduceLROnPlateau | None, optional
@@ -1221,9 +1221,8 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
 
     n_epochs = int(config["training"]["epochs"])
     eval_interval = int(config["training"]["evaluation_interval"])
-    diagnostic_role = "additional_evaluation"
-    diagnostic_loader = additional_evaluation_loader
-    diagnostic_interval = int(config["training"]["additional_evaluation_interval"])
+    diagnostic_loaders = _configured_ood_loaders(ood_loaders)
+    diagnostic_interval = int(config["training"]["ood_evaluation_interval"])
     monitor_settings = config["tracking"]["wandb"]["monitor"]
     physics_monitor_enabled = bool(monitor_settings["enabled"])
     physics_monitor_interval = int(monitor_settings["interval"])
@@ -1233,7 +1232,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         raise ValueError(msg)
     for label, interval in (
         ("training.evaluation_interval", eval_interval),
-        ("training.additional_evaluation_interval", diagnostic_interval),
+        ("training.ood_evaluation_interval", diagnostic_interval),
         ("tracking.wandb.monitor.interval", physics_monitor_interval),
     ):
         if interval <= 0:
@@ -1383,7 +1382,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
         )
         should_evaluate_diagnostic = (
             not operational_partial
-            and diagnostic_loader is not None
+            and bool(diagnostic_loaders)
             and training_events.is_completed_epoch_event(
                 completed_epoch,
                 interval=diagnostic_interval,
@@ -1472,7 +1471,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
                         adapter=adapter,
                     )
 
-        if should_evaluate_diagnostic and diagnostic_loader is not None:
+        for diagnostic_role, diagnostic_loader in (diagnostic_loaders if should_evaluate_diagnostic else {}).items():
             _synchronize_device(device)
             diagnostic_started = time.perf_counter()
             with _training_phase(f"{diagnostic_role}_evaluation", completed_epoch):
@@ -1486,7 +1485,7 @@ def train_loop(  # noqa: C901, PLR0912, PLR0915
             evaluated.update({f"{diagnostic_role}/{name}": value for name, value in diagnostic_metrics.items()})
             diagnostic_objective = diagnostic_metrics.get(objective_id)
             if diagnostic_objective is not None and current_metric is not None:
-                evaluated["additional_evaluation/objective_difference"] = float(diagnostic_objective) - current_metric
+                evaluated[f"{diagnostic_role}/objective_difference"] = float(diagnostic_objective) - current_metric
 
         if should_monitor_physics:
             _synchronize_device(device)

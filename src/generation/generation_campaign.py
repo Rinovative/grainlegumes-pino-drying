@@ -108,7 +108,6 @@ _TERMINAL_FAILURE_STATES: Final = frozenset(
 _TERMINAL_ACCOUNTING_STATES: Final = frozenset({"COMPLETED", *_TERMINAL_FAILURE_STATES})
 _ACTIVE_PENDING_STATE: Final = "PENDING"
 _ATTEMPT_INDEX_ENVIRONMENT: Final = "GENERATION_ATTEMPT_INDEX"
-_CANCELLATION_SCHEMA_VERSION: Final = 1
 _CANCEL_STATES: Final = frozenset({"cancel_requested", "force_cancel_requested"})
 _DISPATCH_BINDING_WAIT_SECONDS: Final = 120.0  # NFS visibility of the dispatch record to a step that starts right after its ticket
 _DISPATCH_BINDING_POLL_SECONDS: Final = 2.0
@@ -282,10 +281,8 @@ def _node_ticket_capacity(submission_config: Mapping[str, Any]) -> int:
 
 
 _EXECUTION_RESOURCE_PATHS = (
-    ("site", "cpu_host"),
     ("site", "partition"),
     ("site", "cores_per_node"),
-    ("site", "python_module"),
     ("site", "comsol_module"),
     ("site", "python_executable"),
     ("site", "comsol_executable"),
@@ -507,7 +504,6 @@ def _new_campaign_manifest(
     storage = common.paths.get_storage_root(storage_root=storage_root).resolve()
     manifest = {
         "schema_kind": "generation_campaign_run",
-        "schema_version": campaign_evidence.RUN_MANIFEST_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         "campaign_name": campaign.campaign_name,
         "source_name": campaign.source_name,
@@ -766,13 +762,6 @@ def _require_scheduler_evidence(evidence: Mapping[str, Any]) -> None:
             raise RuntimeError(message)
 
 
-def _require_slurm_scheduler(campaign: config_service.CampaignConfig) -> None:
-    """Require the Slurm scheduler for node-job submission."""
-    if campaign.execution_values["cluster"]["scheduler_kind"] != "slurm":
-        message = "Campaign node-job submission requires scheduler_kind='slurm'."
-        raise ValueError(message)
-
-
 def _persist_manifest(manifest: Mapping[str, Any], *, storage_root: Path | str | None) -> None:
     """Persist the feeder state atomically; the single feeder writer holds the submission lock."""
     common.serialization.atomic_write_json(
@@ -959,7 +948,6 @@ def _submit_node_job(
 
     Order: intent, node directory, sbatch, submitted record with the job id, tree lease with a persisted result.
     """
-    _require_slurm_scheduler(campaign)
     cluster_service.executing_tree_id()
     binding = _execution_binding(manifest)
     _validate_binding_source(binding)
@@ -1881,11 +1869,9 @@ def _successful_completion_at(
 
 
 _TERMINAL_TIMESTAMP_SCHEMA_KIND: Final = "generation_terminal_timestamp_projection"
-_TERMINAL_TIMESTAMP_SCHEMA_VERSION: Final = 1
 _TERMINAL_TIMESTAMP_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "batch_id",
         "case_id",
@@ -1932,7 +1918,6 @@ def _validate_terminal_timestamp_evidence(
         not isinstance(payload, dict)
         or set(payload) != _TERMINAL_TIMESTAMP_KEYS
         or payload.get("schema_kind") != _TERMINAL_TIMESTAMP_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), _TERMINAL_TIMESTAMP_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != manifest["campaign_run_id"]
         or payload.get("batch_id") != task.batch_id
         or payload.get("case_id") != task.case_id
@@ -2043,7 +2028,6 @@ def _record_terminal_timestamp_evidence(
     )
     payload = {
         "schema_kind": _TERMINAL_TIMESTAMP_SCHEMA_KIND,
-        "schema_version": _TERMINAL_TIMESTAMP_SCHEMA_VERSION,
         "campaign_run_id": manifest["campaign_run_id"],
         "batch_id": task.batch_id,
         "case_id": task.case_id,
@@ -2095,11 +2079,9 @@ def _record_terminal_timestamp_evidence(
 
 
 _CASE_RECONCILIATION_SCHEMA_KIND: Final = "generation_case_reconciliation"
-_CASE_RECONCILIATION_SCHEMA_VERSION: Final = 1
 _CASE_RECONCILIATION_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "batch_id",
         "case_id",
@@ -2123,7 +2105,6 @@ def _case_reconciliation_dependency_sha256() -> str:
     return common.serialization.canonical_json_sha256(
         {
             "owner": _CASE_RECONCILIATION_OWNER,
-            "schema_version": _CASE_RECONCILIATION_SCHEMA_VERSION,
             "categories": ["successful_case_presentation_metadata"],
             "states": ["successful", "case_reconciliation_failed"],
         }
@@ -2193,7 +2174,6 @@ def _case_reconciliation_payload(
     resulting_state = "successful" if error.scientific_success_valid else "case_reconciliation_failed"
     return {
         "schema_kind": _CASE_RECONCILIATION_SCHEMA_KIND,
-        "schema_version": _CASE_RECONCILIATION_SCHEMA_VERSION,
         "campaign_run_id": manifest["campaign_run_id"],
         "batch_id": task.batch_id,
         "case_id": task.case_id,
@@ -2225,7 +2205,6 @@ def _validate_case_reconciliation_evidence(
         not isinstance(payload, dict)
         or set(payload) != _CASE_RECONCILIATION_KEYS
         or payload.get("schema_kind") != _CASE_RECONCILIATION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(payload.get("schema_version"), _CASE_RECONCILIATION_SCHEMA_VERSION)
         or payload.get("campaign_run_id") != manifest["campaign_run_id"]
         or payload.get("batch_id") != task.batch_id
         or payload.get("case_id") != task.case_id
@@ -2877,7 +2856,7 @@ def _campaign_input_references(
     admitted: Mapping[str, Mapping[int, admission_service.InputCaseReference]] | None = None,
 ) -> dict[str, dict[int, admission_service.InputCaseReference]]:
     """Admit each immutable input batch once for one campaign operation, reusing the references already ``admitted``."""
-    expected_batches = {batch.batch_name for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict)}
+    expected_batches = {batch.batch_name for batch in campaign.batches if not isinstance(batch.scientific_values.get("replacement_design"), dict)}
     if set(input_sources) != expected_batches:
         message = "Campaign input-source batch membership disagrees with the active campaign."
         raise RuntimeError(message)
@@ -3155,7 +3134,7 @@ def _compute_required_continuation(manifest: Mapping[str, Any], *, reason: str) 
     return {**manifest, "continuation_requires_compute": True, "continuation_reason": reason}
 
 
-def _prepare_supplemental_inputs(
+def _prepare_replacement_inputs(
     manifest: Mapping[str, Any],
     campaign: config_service.CampaignConfig,
     *,
@@ -3164,8 +3143,9 @@ def _prepare_supplemental_inputs(
 ) -> str | None:
     """Admit prepared replacements or defer their spatial input generation; return the reason a compute feed is required.
 
-    A batch gets one replacement per failed slot once all its originals are decided, unless its minimum success rate
-    stops it. A decision recorded meanwhile that closes the deficit or stops the batch ends planning for that batch only.
+    A batch gets one replacement per failed slot once all originals of its material are decided, unless its material's
+    minimum success rate stops it. A decision recorded meanwhile that closes the deficit or stops the material ends
+    planning for that batch only.
     """
     from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- canonical feeder boundary
     from src.generation.cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- replacement deficit owner
@@ -3175,7 +3155,7 @@ def _prepare_supplemental_inputs(
         for item in lifecycle_service.replacement_policy(campaign.profile.id, campaign.source_name, storage_root=storage_root)
         if item["stopped"]
     )
-    for replacement in (batch for batch in campaign.batches if isinstance(batch.scientific_values.get("supplemental_design"), dict)):
+    for replacement in (batch for batch in campaign.batches if isinstance(batch.scientific_values.get("replacement_design"), dict)):
         if metadata_only:
             try:
                 input_service.admit_configured_input_references(
@@ -3185,20 +3165,21 @@ def _prepare_supplemental_inputs(
                     git_commit=str(manifest["git_commit"]),
                 )
             except FileNotFoundError:
-                return "supplemental_inputs_missing"
+                return "replacement_inputs_missing"
         else:
             input_service.generate_input_cases(replacement, len(replacement.case_indices), storage_root=storage_root)
-    originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+    originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("replacement_design"), dict))
     for original in (batch for batch in originals if batch.batch_id not in stopped):
         while True:
-            records = [
+            material_records = [
                 row
                 for row in lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
-                if row["reservation"]["batch_id"] == original.batch_id
+                if row["reservation"]["material_family"] == original.material_family
             ]
-            primaries = [row for row in records if row["reservation"]["origin"] == "primary"]
-            if len(primaries) != len(original.case_indices) or any(row["decision"] is None for row in primaries):
+            primaries = [row for row in material_records if row["reservation"]["origin"] == "primary"]
+            if len(primaries) != campaign.selected_targets[original.material_family] or any(row["decision"] is None for row in primaries):
                 break
+            records = [row for row in material_records if row["reservation"]["batch_id"] == original.batch_id]
             if selection_service.replacement_deficit(records, target=len(original.case_indices)) < 1:
                 break
             if metadata_only:
@@ -3213,7 +3194,7 @@ def _prepare_supplemental_inputs(
 
 def _original_batch_ids(campaign: config_service.CampaignConfig) -> dict[str, str]:
     """Map every execution batch to its original batch: a replacement to its parent, an original to itself."""
-    designs = {batch.batch_id: batch.scientific_values.get("supplemental_design") for batch in campaign.batches}
+    designs = {batch.batch_id: batch.scientific_values.get("replacement_design") for batch in campaign.batches}
     return {batch_id: str(design["parent_batch_id"]) if isinstance(design, dict) else batch_id for batch_id, design in designs.items()}
 
 
@@ -3422,7 +3403,7 @@ def feed_campaign(
         )
         from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- append-only feeder boundary
 
-        compute_reason = _prepare_supplemental_inputs(
+        compute_reason = _prepare_replacement_inputs(
             manifest,
             campaign,
             storage_root=storage_root,
@@ -3485,7 +3466,7 @@ def feed_campaign(
         if _reconcile_runtime_failure_decisions(manifest, campaign, reconciled, scheduler, storage_root=storage_root):
             return manifest
         candidate_records = reconciled
-        originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+        originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("replacement_design"), dict))
         complete = all(row["decision"] is not None for row in candidate_records) and all(
             sum(row["reservation"]["origin"] == "primary" and row["reservation"]["batch_id"] == batch.batch_id for row in candidate_records)
             == len(batch.case_indices)
@@ -4314,16 +4295,15 @@ def _record_failure_decision(
 def amend_minimum_success_rate(
     run_id: str,
     material: str,
-    regime: str,
     *,
     minimum_success_rate: float,
     reason: str,
     storage_root: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Explicitly lower one original batch's minimum success rate for a campaign run and record why.
+    """Explicitly lower one material's minimum success rate for a campaign run, for all its original batches, and record why.
 
     Dataset plans pre-register their rate at campaign creation, other campaigns start at 1; this operation records
-    every later lowering as explicit, so a stopped batch admits candidates again while its bound reaches the new rate.
+    every later lowering as explicit, so a stopped material admits candidates again while its bound reaches the new rate.
     """
     parts = common.paths.campaign_run_parts(run_id)
     if parts is None:
@@ -4332,20 +4312,14 @@ def amend_minimum_success_rate(
     from src.generation import generation_campaign_lifecycle as lifecycle_service  # noqa: PLC0415 -- rate amendment owner
 
     task, campaign_name = parts
-    plan = lifecycle_service.load_campaign_plan(task, campaign_name, storage_root=storage_root)
-    matches = [batch for batch in plan["batches"] if batch["material_family"] == material and batch["sampling_regime"] == regime]
-    if len(matches) != 1:
-        message = f"Campaign {campaign_name!r} has no unique original batch for material {material!r} and regime {regime!r}."
-        raise ValueError(message)
-    batch_id = str(matches[0]["batch_id"])
     previous, current = lifecycle_service.amend_minimum_success_rate(
-        task, campaign_name, batch_id, minimum_success_rate=minimum_success_rate, reason=reason, storage_root=storage_root
+        task, campaign_name, material, minimum_success_rate=minimum_success_rate, reason=reason, storage_root=storage_root
     )
+    plan = lifecycle_service.load_campaign_plan(task, campaign_name, storage_root=storage_root)
     return {
         "campaign_run_id": run_id,
         "material_family": material,
-        "sampling_regime": regime,
-        "batch_id": batch_id,
+        "batch_ids": [str(batch["batch_id"]) for batch in plan["batches"] if batch["material_family"] == material],
         "previous_minimum_success_rate": previous,
         "minimum_success_rate": current,
     }
@@ -4362,7 +4336,6 @@ def _load_cancellation_receipt(run_id: str, *, storage_root: Path | str | None) 
     )
     if (
         raw.get("schema_kind") != "generation_campaign_cancellations"
-        or not common.serialization.is_schema_version(raw.get("schema_version"), _CANCELLATION_SCHEMA_VERSION)
         or raw.get("campaign_run_id") != run_id
         or not isinstance(raw.get("attempts"), list)
     ):
@@ -4435,7 +4408,6 @@ def _apply_cancellation(
     }
     receipt = {
         "schema_kind": "generation_campaign_cancellations",
-        "schema_version": _CANCELLATION_SCHEMA_VERSION,
         "campaign_run_id": run_id,
         "attempts": [*existing, attempt],
     }
@@ -4644,24 +4616,27 @@ def _success_rate_stop(
     run_id: str,
     originals: Sequence[config_service.GenerationConfig],
     policy: Sequence[Mapping[str, Any]],
+    by_batch: Mapping[str, Mapping[str, Any]],
 ) -> str | None:
-    """Name every stopped original batch below its count with k/n, its bound and s, and both ways out; ``None`` without one."""
+    """Name every stopped material with an original batch below its count, its k/n, bound and s, and both ways out; ``None`` without one."""
     from .cases import generation_cases_selection as selection_service  # noqa: PLC0415 -- success-rate bound owner
 
     targets = {batch.batch_id: len(batch.case_indices) for batch in originals}
-    stopped = [item for item in policy if item["stopped"] and item["successful"] < targets[item["batch_id"]]]
+    stopped = {
+        item["material_family"]: item for item in policy if item["stopped"] and by_batch[item["batch_id"]]["successful"] < targets[item["batch_id"]]
+    }
     if not stopped:
         return None
     batches = "; ".join(
-        f"{item['material_family']} ({item['sampling_regime']}): k/n {item['successful']}/{item['decided']}, upper bound "
+        f"{material}: k/n {item['successful']}/{item['decided']}, upper bound "
         f"{selection_service.success_rate_upper_bound(item['successful'], item['decided']):.3f} < s {item['minimum_success_rate']:g}"
-        for item in stopped
+        for material, item in stopped.items()
     )
     return (
         f"Stopped by the minimum success rate s (one-sided {selection_service.SUCCESS_RATE_CONFIDENCE:.0%} Clopper-Pearson upper bound "
         f"of the success rate below s), so no fresh candidate is admitted: {batches}. Either fix the cause and start a new Source "
         "(`--revision LABEL`; a Dataset plan with `--new-source --revision LABEL`), or lower s with "
-        f"`./scripts/generation amend-replacements {run_id} --material MATERIAL --regime REGIME --minimum-success-rate S --reason TEXT` "
+        f"`./scripts/generation amend-replacements {run_id} --material MATERIAL --minimum-success-rate S --reason TEXT` "
         "and rerun the same command."
     )
 
@@ -4712,7 +4687,7 @@ def campaign_status(
 
     records = lifecycle_service.candidate_records(campaign.profile.id, campaign.source_name, storage_root=storage_root)
     by_case = {(row["reservation"]["material_family"], row["reservation"]["case_id"]): row for row in records}
-    originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("supplemental_design"), dict))
+    originals = tuple(batch for batch in campaign.batches if not isinstance(batch.scientific_values.get("replacement_design"), dict))
     by_batch = {
         batch.batch_id: selection_service.candidate_summary(
             [row for row in records if row["reservation"]["batch_id"] == batch.batch_id], target=len(batch.case_indices)
@@ -4754,7 +4729,7 @@ def campaign_status(
         "counts": counts,
         "batches": by_batch,
         "replacement_policy": policy,
-        "success_rate_stop": _success_rate_stop(run_id, originals, policy),
+        "success_rate_stop": _success_rate_stop(run_id, originals, policy, by_batch),
         "admission_cap_stop": _admission_cap_stop(manifest, campaign, records, policy, cap),
         "cases": [
             {

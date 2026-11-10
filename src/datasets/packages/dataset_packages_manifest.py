@@ -34,7 +34,7 @@ from src import common
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.contracts import dataset_contracts_views as views
-from src.datasets.contracts.dataset_contracts_identity import DATASET_PACKAGE_SCHEMA_KIND, DATASET_PACKAGE_SCHEMA_VERSION
+from src.datasets.contracts.dataset_contracts_identity import DATASET_PACKAGE_SCHEMA_KIND
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -43,7 +43,6 @@ _SHA256_PATTERN: Final = re.compile(r"[0-9a-f]{64}")
 PACKAGE_PROVENANCE_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "dataset_name",
         "dataset_view",
         "registered_task_id",
@@ -145,10 +144,8 @@ def validate_manifest_content(
     if not isinstance(manifest, dict) or set(manifest) != PACKAGE_MANIFEST_KEYS:
         msg = f"Dataset manifest keys do not match current contract for {dataset_id!r}."
         raise ValueError(msg)
-    if manifest["schema_kind"] != DATASET_PACKAGE_SCHEMA_KIND or not common.serialization.is_schema_version(
-        manifest["schema_version"], DATASET_PACKAGE_SCHEMA_VERSION
-    ):
-        msg = "Dataset manifest schema_kind or schema_version does not match the current contract."
+    if manifest["schema_kind"] != DATASET_PACKAGE_SCHEMA_KIND:
+        msg = "Dataset manifest schema_kind does not match the current contract."
         raise ValueError(msg)
     invocation = manifest["plan_invocation"]
     if invocation is not None and (
@@ -294,7 +291,6 @@ def validate_steady_payload_identity(manifest: Mapping[str, Any], dataset_identi
         dataset_identity.source_provenance != {key: manifest[key] for key in PACKAGE_PROVENANCE_KEYS}
         or not isinstance(selection, dict)
         or selection.get("schema_kind") != identity.SOURCE_SELECTION_SCHEMA_KIND
-        or not common.serialization.is_schema_version(selection.get("schema_version"), identity.SOURCE_SELECTION_SCHEMA_VERSION)
         or selection.get("source_cases") != manifest["source_case_identities"]
     ):
         msg = "Steady Dataset payload provenance disagrees with its manifest."
@@ -332,43 +328,52 @@ def load_package_manifest_evidence(task: str, dataset_id: str, *, storage_root: 
 def declared_evaluation_assignments(
     task: str,
     train_dataset_id: str,
-    additional_dataset_ids: Sequence[str] = (),
+    material_ood_dataset_ids: Sequence[str] = (),
     *,
     storage_root: Path | str | None = None,
-) -> list[dict[str, Any]]:
-    """Project declared OOD Dataset membership, without asserting artifact availability or admissibility.
+) -> dict[str, list[dict[str, Any]]]:
+    """Project declared OOD Dataset membership per OOD Evaluation role, without asserting artifact availability.
 
-    The result describes only material-holdout membership declared in fixed Dataset
-    partitions. It does not establish that saved predictions or any other outputs
-    exist, nor that such artifacts are admissible for evaluation.
+    ``material_ood`` lists every configured material-OOD Dataset in order, then the training Dataset when it declares
+    material-OOD cases; ``parameter_ood`` lists the training Dataset when it declares parameter-OOD cases. The result
+    describes only membership declared in fixed Dataset partitions. It does not establish that saved predictions or
+    any other outputs exist, nor that such artifacts are admissible for evaluation.
     """
-    if isinstance(additional_dataset_ids, (str, bytes)) or not isinstance(additional_dataset_ids, Sequence):
-        msg = "Additional Dataset IDs must be provided as an ordered sequence."
+    if isinstance(material_ood_dataset_ids, (str, bytes)) or not isinstance(material_ood_dataset_ids, Sequence):
+        msg = "Material-OOD Dataset IDs must be provided as an ordered sequence."
         raise TypeError(msg)
-    dataset_ids = [train_dataset_id, *additional_dataset_ids]
+    dataset_ids = [train_dataset_id, *material_ood_dataset_ids]
     if any(not isinstance(dataset_id, str) or not dataset_id for dataset_id in dataset_ids):
         msg = "Dataset IDs must be non-empty strings."
         raise ValueError(msg)
     if len(dataset_ids) != len(set(dataset_ids)):
-        msg = "Training and additional Dataset IDs must be unique."
+        msg = "Training and material-OOD Dataset IDs must be unique."
         raise ValueError(msg)
 
     primary_manifest = load_package_manifest_evidence(task, train_dataset_id, storage_root=storage_root)
-    materials = {entry["package_case_id"]: entry["source"]["material_family"] for entry in primary_manifest["source_case_identities"]}
+    entries = primary_manifest["source_case_identities"]
+    materials = {entry["package_case_id"]: entry["source"]["material_family"] for entry in entries}
     primary_partition = partition_contract.validate_training_partition(
-        primary_manifest["case_partition"], dataset_id=train_dataset_id, case_ids=tuple(materials), material_by_case=materials
+        primary_manifest["case_partition"],
+        dataset_id=train_dataset_id,
+        case_ids=tuple(materials),
+        material_by_case=materials,
+        design_kind_by_case={entry["package_case_id"]: entry["design"]["design_kind"] for entry in entries},
     )
 
-    declared_ids: list[str] = []
-    for dataset_id in additional_dataset_ids:
-        manifest = load_package_manifest_evidence(task, dataset_id, storage_root=storage_root)
-        fixed_partition = manifest["case_partition"]
-        if fixed_partition is None or not fixed_partition["ood"]:
-            msg = f"Additional Dataset {dataset_id!r} must declare a non-empty fixed OOD partition."
+    material: list[str] = []
+    for dataset_id in material_ood_dataset_ids:
+        fixed_partition = load_package_manifest_evidence(task, dataset_id, storage_root=storage_root)["case_partition"]
+        if fixed_partition is None or not partition_contract.evaluation_cases(fixed_partition, "material_ood"):
+            msg = f"Material-OOD Dataset {dataset_id!r} must declare non-empty fixed OOD cases."
             raise ValueError(msg)
-        declared_ids.append(dataset_id)
-    if primary_partition["ood"]:
-        declared_ids.append(train_dataset_id)
-    return [
-        {"dataset_id": dataset_id, "role": "ood", "relation": "Dataset-declared material holdout", "assumptions": []} for dataset_id in declared_ids
-    ]
+        material.append(dataset_id)
+    declared = {
+        "material_ood": [*material, *([train_dataset_id] if partition_contract.evaluation_cases(primary_partition, "material_ood") else [])],
+        "parameter_ood": [train_dataset_id] if partition_contract.evaluation_cases(primary_partition, "parameter_ood") else [],
+    }
+    relation = {"material_ood": "Dataset-declared material holdout", "parameter_ood": "Dataset-declared parameter holdout"}
+    return {
+        role: [{"dataset_id": dataset_id, "role": role, "relation": relation[role], "assumptions": []} for dataset_id in dataset_ids]
+        for role, dataset_ids in declared.items()
+    }

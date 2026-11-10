@@ -27,7 +27,6 @@ from numbers import Real
 from typing import TYPE_CHECKING, Any, Protocol
 
 from src import common
-from src.generation.publication import generation_publication_storage as storage_service
 
 from . import generation_runtime_comsol_timing as comsol_timing
 
@@ -276,9 +275,7 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
     _validate_batch_binding(case, batch)
     timing = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/timing.json")
     status = _load_artifact_payload(case, f"{common.paths.GENERATION_EVIDENCE_DIRNAME}/status.json")
-    if timing.get("schema_kind") != _TIMING_SCHEMA_KIND or not common.serialization.is_schema_version(
-        timing.get("schema_version"), storage_service.PUBLICATION_SCHEMA_VERSION
-    ):
+    if timing.get("schema_kind") != _TIMING_SCHEMA_KIND:
         msg = "Case timing does not use the current simulation_case_timing schema."
         raise ValueError(msg)
     expected = {
@@ -295,9 +292,7 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
     if timing.get("exit_code") != 0 or timing.get("timed_out") is not False:
         msg = "Case timing does not represent a successful completed COMSOL process."
         raise ValueError(msg)
-    if status.get("schema_kind") != _STATUS_SCHEMA_KIND or not common.serialization.is_schema_version(
-        status.get("schema_version"), storage_service.STATUS_SCHEMA_VERSION
-    ):
+    if status.get("schema_kind") != _STATUS_SCHEMA_KIND:
         msg = "Case status does not use the current simulation_case_status schema."
         raise ValueError(msg)
     physical_duration, time_to_target, target_reached, right_censored, final_wet, physical_availability, status_runtime = _physical_status(

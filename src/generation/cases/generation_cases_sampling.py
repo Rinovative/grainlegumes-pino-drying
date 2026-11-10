@@ -1,12 +1,13 @@
-"""Generate deterministic blockwise design-of-experiments values.
+"""Generate deterministic design-of-experiments values from one fixed scrambled Sobol design per batch.
 
 Responsibilities:
-  - Build independent Latin-hypercube or Sobol designs for four physical blocks
+  - Draw the points of one scrambled Sobol sequence over all profile-active block dimensions of a design
   - Apply typed registry transforms, coupled selections, and parameter OOD tails
-  - Persist block seeds, row permutations, row indices, and selection evidence
+  - Persist the design seed, digest, block columns, point index, and selection evidence
 
 Design principles:
-  - Each block owns an independent label-derived stream and row permutation
+  - Point i of a design is the i-th point of its sequence (no skip, leap or row permutation), so designs are prefix-stable
+  - Every per-case random stream derives from the design seed and the point index, never from the batch or campaign position
   - Coupled sets, family identity, and seeds are metadata rather than dimensions
   - Case values are independent of process ordering, concurrency, and resume
 
@@ -22,14 +23,12 @@ import hashlib
 import math
 import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import numpy as np
-from scipy.spatial import cKDTree  # pyright: ignore[reportAttributeAccessIssue] -- SciPy typing omits the public export
 from scipy.stats import beta as beta_distribution
 from scipy.stats import qmc
 
-from src import common
 from src.generation.contracts import generation_contracts_materials as materials
 from src.generation.contracts import generation_contracts_registry as registry_service
 
@@ -37,41 +36,10 @@ from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
-LHS_MAXIMIN_CANDIDATES = 50
-SOBOL_SKIP = 1000
-SOBOL_LEAP = 200
-SUPPLEMENTAL_DESIGN_SCHEMA_VERSION = 1
-_NEAREST_NEIGHBOR_COUNT = 2
-
-
-def supplemental_unit_point(
-    *,
-    registry: Mapping[str, Mapping[str, Any]],
-    blocks: Sequence[str],
-    block_parameters: Mapping[str, Sequence[str]],
-    seed: int,
-    ordinal: int,
-) -> dict[str, list[float]]:
-    """Return a prefix-stable Sobol point for one source replacement ordinal."""
-    if type(ordinal) is not int or ordinal < 1:
-        message = "Supplemental candidate ordinal must be positive."
-        raise ValueError(message)
-    dimensions = materials.sampling_block_dimensions(
-        registry,
-        blocks=tuple(blocks),
-        block_parameters={key: tuple(value) for key, value in block_parameters.items()},
-    )
-    return {
-        block: unit_design(
-            "sobol",
-            count=ordinal,
-            dimensions=dimensions[block],
-            seed=seeding.derive_seed(seed, "supplemental_replacement", block),
-        )[ordinal - 1].tolist()
-        for block in blocks
-    }
+# The one design recipe: scrambled Sobol, one sequence over all block dimensions in block order, point i is the i-th point.
+DESIGN_RECIPE: Final = "scrambled_sobol_single_sequence"
 
 
 class _SamplingConfig(Protocol):
@@ -117,57 +85,21 @@ class CaseSample:
     ood_provenance: dict[str, Any]
 
 
-def _lhs_design(*, count: int, dimensions: int, seed: int) -> np.ndarray:
-    """Select the most separated of the maintained deterministic LHS candidates."""
-    best: np.ndarray | None = None
-    best_separation = -math.inf
-    for iteration in range(LHS_MAXIMIN_CANDIDATES):
-        candidate_rng = np.random.default_rng(np.random.SeedSequence([seed, iteration]))
-        candidate = qmc.LatinHypercube(d=dimensions, scramble=True, rng=candidate_rng).random(count)
-        if count < _NEAREST_NEIGHBOR_COUNT:
-            separation = math.inf
-        else:
-            distances, _indices = cKDTree(candidate).query(candidate, k=_NEAREST_NEIGHBOR_COUNT)
-            separation = float(np.min(distances[:, 1]))
-        if separation > best_separation:
-            best = candidate
-            best_separation = separation
-    if best is None:
-        msg = "Latin-hypercube generation produced no candidate design."
-        raise RuntimeError(msg)
-    return best
+def design_points(*, seed: int, dimensions: int, count: int) -> np.ndarray:
+    """Return the first ``count`` points of one fixed scrambled Sobol design, ``(count, dimensions)``.
 
-
-def _sobol_design(*, count: int, dimensions: int, seed: int) -> np.ndarray:
-    """Return the maintained scrambled, skipped, and leaped Sobol design."""
-    sampler = qmc.Sobol(d=dimensions, scramble=True, rng=seed)
-    sampler.fast_forward(SOBOL_SKIP)
-    design: np.ndarray = np.empty((count, dimensions), dtype=np.float64)
+    Scrambled Sobol balance holds for power-of-two prefixes; a plan count is one, while replacements may extend a design
+    by any number of points, so SciPy's balance warning is silenced here.
+    """
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        msg = "Design point count must be a positive integer."
+        raise ValueError(msg)
+    if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 1:
+        msg = "Design dimensions must be a positive integer."
+        raise ValueError(msg)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        for row in range(count):
-            design[row] = sampler.random(1)[0]
-            if row + 1 < count:
-                sampler.fast_forward(SOBOL_LEAP)
-    return design
-
-
-def unit_design(method: str, *, count: int, dimensions: int, seed: int) -> np.ndarray:
-    """Return one deterministic unit design for an authoritative physical block."""
-    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-        msg = "Design count must be a non-negative integer."
-        raise ValueError(msg)
-    if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions < 0:
-        msg = "Design dimensions must be a non-negative integer."
-        raise ValueError(msg)
-    if count == 0 or dimensions == 0:
-        return np.empty((count, dimensions), dtype=np.float64)
-    if method == "lhs":
-        return _lhs_design(count=count, dimensions=dimensions, seed=seed)
-    if method == "sobol":
-        return _sobol_design(count=count, dimensions=dimensions, seed=seed)
-    msg = f"Unsupported blockwise sampling method: {method!r}."
-    raise ValueError(msg)
+        return qmc.Sobol(d=dimensions, scramble=True, rng=seed).random(count)
 
 
 def _array_sha256(value: np.ndarray) -> str:
@@ -186,49 +118,33 @@ def build_sampling_plan(
     *,
     registry: Mapping[str, Mapping[str, Any]],
     case_count: int,
-    seed_base: int,
-    method: str,
+    design_seed: int,
     blocks: tuple[str, ...],
     block_parameters: Mapping[str, tuple[str, ...]],
-) -> dict[str, dict[str, Any]]:
-    """Build serializable designs for only the profile-active blocks."""
+) -> dict[str, Any]:
+    """Bind one design over the profile-active blocks: its recipe, seed, block columns and the digest of its first points."""
     dimensions = materials.sampling_block_dimensions(
         registry,
         blocks=blocks,
         block_parameters=block_parameters,
     )
-    plan: dict[str, dict[str, Any]] = {}
+    columns: dict[str, dict[str, Any]] = {}
+    start = 0
     for block in blocks:
-        parameters = block_parameters[block]
-        dimension = dimensions[block]
-        block_seed_base = seed_base
-        namespace = "sampling_block"
-        design_seed = seeding.derive_seed(block_seed_base, namespace, block, "design")
-        permutation_seed = seeding.derive_seed(
-            block_seed_base,
-            namespace,
-            block,
-            "permutation",
-        )
-        permutation = np.random.default_rng(permutation_seed).permutation(case_count).astype(np.int64)
-        design = unit_design(
-            method,
-            count=case_count,
-            dimensions=dimension,
-            seed=design_seed,
-        )
-        plan[block] = {
-            "label": block,
-            "parameters": list(parameters),
-            "effective_dimension": dimension,
-            "seed_origin": "profile_batch",
-            "design_seed": design_seed,
-            "design_sha256": _array_sha256(design),
-            "permutation_seed": permutation_seed,
-            "permutation": permutation.tolist(),
-            "permutation_sha256": _array_sha256(permutation),
+        columns[block] = {
+            "parameters": list(block_parameters[block]),
+            "effective_dimension": dimensions[block],
+            "columns": [start, start + dimensions[block]],
         }
-    return plan
+        start += dimensions[block]
+    return {
+        "recipe": DESIGN_RECIPE,
+        "design_seed": design_seed,
+        "dimensions": start,
+        "digest_point_count": case_count,
+        "design_sha256": _array_sha256(design_points(seed=design_seed, dimensions=start, count=case_count)),
+        "blocks": columns,
+    }
 
 
 def _interval_value(entry: Mapping[str, Any], coordinate: float, *, bounds: Mapping[str, Any]) -> float:
@@ -265,7 +181,7 @@ def _selected_interval(
     *,
     use_ood: bool,
     seed_base: int,
-    case_index: int,
+    point_index: int,
 ) -> tuple[Mapping[str, Any], dict[str, Any] | None]:
     """Select one deterministic scalar OOD tail and report its separation."""
     if not use_ood:
@@ -274,7 +190,7 @@ def _selected_interval(
     if not intervals:
         msg = f"Selected scalar OOD unit {name!r} has no configured tails."
         raise ValueError(msg)
-    index = seeding.derive_seed(seed_base, "scalar_ood_tail", name, str(case_index)) % len(intervals)
+    index = seeding.derive_seed(seed_base, "scalar_ood_tail", name, str(point_index)) % len(intervals)
     bounds = intervals[index]
     transform = str(entry.get("transform", "linear"))
     id_lower = registry_service.transformed_coordinate(float(entry["lower"]), entry)
@@ -559,7 +475,7 @@ def _select_coupled(
     entry: Mapping[str, Any],
     *,
     seed_base: int,
-    case_index: int,
+    point_index: int,
     use_ood: bool,
 ) -> dict[str, Any]:
     """Select one complete coupled record from a label-derived stream."""
@@ -570,7 +486,7 @@ def _select_coupled(
     if not candidates:
         msg = f"Selected coupled unit {name!r} has no {'OOD' if use_ood else 'ID'} records."
         raise ValueError(msg)
-    rng = np.random.default_rng(seeding.derive_seed(seed_base, "coupled_selection", name, str(case_index), "ood" if use_ood else "id"))
+    rng = np.random.default_rng(seeding.derive_seed(seed_base, "coupled_selection", name, str(point_index), "ood" if use_ood else "id"))
     return copy.deepcopy(candidates[int(rng.integers(0, len(candidates)))])
 
 
@@ -625,15 +541,16 @@ def allocate_ood_units(
     eligible_units: tuple[Mapping[str, str], ...],
     *,
     case_count: int,
+    first_point: int = 0,
 ) -> tuple[dict[str, str], ...]:
-    """Allocate cases approximately evenly over every eligible atomic unit."""
+    """Allocate design points ``first_point`` onwards round-robin over every eligible atomic unit, so point i always gets unit i mod n."""
     if isinstance(case_count, bool) or not isinstance(case_count, int) or case_count < 1:
         message = "Parameter-OOD allocation requires a positive integer case count."
         raise ValueError(message)
     if not eligible_units:
         message = "Parameter-OOD allocation has no profile-eligible configured units."
         raise ValueError(message)
-    return tuple(copy.deepcopy(dict(eligible_units[index % len(eligible_units)])) for index in range(case_count))
+    return tuple(copy.deepcopy(dict(eligible_units[index % len(eligible_units)])) for index in range(first_point, first_point + case_count))
 
 
 def _ood_selections(
@@ -673,7 +590,7 @@ def _non_numerical_values(
     *,
     selected_ood: frozenset[str],
     seed_base: int,
-    case_index: int,
+    point_index: int,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Resolve fixed, categorical, and complete coupled registry values."""
     values: dict[str, Any] = {}
@@ -687,10 +604,10 @@ def _non_numerical_values(
             if not choices:
                 msg = f"Categorical parameter {name!r} has no selectable values."
                 raise ValueError(msg)
-            rng = np.random.default_rng(seeding.derive_seed(seed_base, "categorical_selection", name, str(case_index)))
+            rng = np.random.default_rng(seeding.derive_seed(seed_base, "categorical_selection", name, str(point_index)))
             values[name] = copy.deepcopy(choices[int(rng.integers(0, len(choices)))])
         elif kind == "parameter_set":
-            record = _select_coupled(name, entry, seed_base=seed_base, case_index=case_index, use_ood=name in selected_ood)
+            record = _select_coupled(name, entry, seed_base=seed_base, point_index=point_index, use_ood=name in selected_ood)
             selections[name] = str(record["id"])
             overlap = set(values).intersection(record["values"])
             if overlap:
@@ -708,7 +625,7 @@ def _block_values(
     parameters: tuple[str, ...],
     selected_ood: frozenset[str],
     seed_base: int,
-    case_index: int,
+    point_index: int,
     fixed: Mapping[str, Any],
     family_bounds: Mapping[str, float],
     initial_moisture_field_constraint: Mapping[str, Any],
@@ -731,7 +648,7 @@ def _block_values(
                 entry,
                 use_ood=name in selected_ood,
                 seed_base=seed_base,
-                case_index=case_index,
+                point_index=point_index,
             )
             coordinates_by_name[name] = coordinate
             bounds_by_name[name] = bounds
@@ -745,12 +662,12 @@ def _block_values(
             ood_index = None
             if name in selected_ood:
                 count = len(entry.get("ood_values", []))
-                ood_index = 0 if count == 0 else seeding.derive_seed(seed_base, "simplex_ood", name, str(case_index)) % count
+                ood_index = 0 if count == 0 else seeding.derive_seed(seed_base, "simplex_ood", name, str(point_index)) % count
             simplex_values, transform_space_distance = _simplex_value(
                 entry,
                 coordinates,
                 ood_index=ood_index,
-                seed=seeding.derive_seed(seed_base, "truncated_dirichlet", name, str(case_index)),
+                seed=seeding.derive_seed(seed_base, "truncated_dirichlet", name, str(point_index)),
             )
             values[name] = simplex_values
             if ood_index is not None:
@@ -827,7 +744,7 @@ def _apply_coupled_ood_records(
     values: dict[str, Any],
     selections: dict[str, str],
     seed_base: int,
-    case_index: int,
+    point_index: int,
 ) -> dict[str, dict[str, Any]]:
     """Apply selected complete density or kinetics records atomically."""
     details: dict[str, dict[str, Any]] = {}
@@ -838,7 +755,7 @@ def _apply_coupled_ood_records(
         if not records:
             msg = f"Selected coupled OOD unit {name!r} has no records."
             raise ValueError(msg)
-        index = seeding.derive_seed(seed_base, "coupled_ood_record", name, str(case_index)) % len(records)
+        index = seeding.derive_seed(seed_base, "coupled_ood_record", name, str(point_index)) % len(records)
         record = records[index]
         components = tuple(contract["components"])
         before = {component: copy.deepcopy(values[component]) for component in components}
@@ -874,121 +791,30 @@ def _units(registry: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
     return units
 
 
-def _supplemental_design(config: _SamplingConfig) -> dict[str, Any] | None:
-    """Validate one persisted prefix-stable replacement design, when present."""
-    value = config.scientific_values.get("supplemental_design")
-    if value is None:
-        return None
-    canonical_required = {
-        "schema_kind",
-        "schema_version",
-        "campaign_plan_sha256",
-        "parent_campaign_digest",
-        "parent_batch_id",
-        "parent_scientific_config_digest",
-        "parent_failed_case_id",
-        "candidate_id",
-        "candidate_ordinal",
-        "batch_ordinal",
-        "round",
-        "population",
-        "target_slot",
-        "material_case_index",
-        "root_seed",
-        "seed_derivation_version",
-        "batch_locator_regime",
-        "sampling_algorithm",
-        "sampling_seed",
-        "block_seeds",
-        "unit_point",
-        "unit_point_sha256",
-        "physical_values",
-        "physical_values_sha256",
-    }
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_kind") != "generation_source_supplemental_design"
-        or value.get("sampling_algorithm") != "sobol"
-        or not common.serialization.is_schema_version(value.get("schema_version"), SUPPLEMENTAL_DESIGN_SCHEMA_VERSION)
-        or set(value) != canonical_required
-    ):
-        message = "Supplemental replacement design has an unsupported schema."
+def _design_row(sampling: Mapping[str, Any], *, point_index: int) -> np.ndarray:
+    """Return point ``point_index`` of a batch's design after checking the digest of its plan's points."""
+    if sampling["recipe"] != DESIGN_RECIPE:
+        message = f"Batch design recipe {sampling['recipe']!r} is not the maintained {DESIGN_RECIPE!r}."
         raise ValueError(message)
-    if (
-        any(
-            isinstance(value[key], bool) or not isinstance(value[key], int) or value[key] < 1
-            for key in ("round", "population", "target_slot", "material_case_index", "seed_derivation_version")
-        )
-        or isinstance(value["root_seed"], bool)
-        or not isinstance(value["root_seed"], int)
-        or value["root_seed"] < 0
-        or not isinstance(value["batch_locator_regime"], str)
-        or not value["batch_locator_regime"]
-        or not isinstance(value["candidate_id"], str)
-        or not value["candidate_id"].startswith("replacement__")
-    ):
-        message = "Canonical replacement design identity is malformed."
+    if isinstance(point_index, bool) or not isinstance(point_index, int) or point_index < 0:
+        message = "Design point index must be a non-negative integer."
         raise ValueError(message)
-    ordinal = value["candidate_ordinal"]
-    batch_ordinal = value["batch_ordinal"]
-    seed = value["sampling_seed"]
-    if (
-        isinstance(ordinal, bool)
-        or not isinstance(ordinal, int)
-        or ordinal < 1
-        or isinstance(batch_ordinal, bool)
-        or not isinstance(batch_ordinal, int)
-        or batch_ordinal < 1
-        or isinstance(seed, bool)
-        or not isinstance(seed, int)
-        or seed < 0
-    ):
-        message = "Supplemental replacement ordinal and sampling seed are invalid."
-        raise ValueError(message)
-    plans = config.scientific_values["sampling"]["blocks"]
-    points = value["unit_point"]
-    block_seeds = value["block_seeds"]
-    if not isinstance(points, dict) or set(points) != set(plans) or not isinstance(block_seeds, dict) or set(block_seeds) != set(plans):
-        message = "Supplemental replacement blocks disagree with the authoritative sampling plan."
-        raise ValueError(message)
-    for block, plan in plans.items():
-        point = points[block]
-        block_seed = block_seeds[block]
-        if (
-            not isinstance(point, list)
-            or len(point) != int(plan["effective_dimension"])
-            or any(
-                isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) or not 0.0 <= float(item) <= 1.0
-                for item in point
-            )
-            or isinstance(block_seed, bool)
-            or not isinstance(block_seed, int)
-            or block_seed < 0
-        ):
-            message = f"Supplemental replacement point for block {block!r} is invalid."
-            raise ValueError(message)
-    if common.serialization.canonical_json_sha256({"unit_point": points}) != value["unit_point_sha256"]:
-        message = "Supplemental replacement unit-point digest changed."
+    digest_count = int(sampling["digest_point_count"])
+    points = design_points(seed=int(sampling["design_seed"]), dimensions=int(sampling["dimensions"]), count=max(digest_count, point_index + 1))
+    if _array_sha256(points[:digest_count]) != sampling["design_sha256"]:
+        message = "Sampling design digest changed; the Sobol implementation no longer reproduces the frozen design."
         raise RuntimeError(message)
-    physical = value["physical_values"]
-    if physical is not None and (
-        not isinstance(physical, dict) or common.serialization.canonical_json_sha256({"physical_values": physical}) != value["physical_values_sha256"]
-    ):
-        message = "Supplemental replacement physical-value evidence changed."
-        raise RuntimeError(message)
-    if physical is None and value["physical_values_sha256"] is not None:
-        message = "Unresolved supplemental physical values cannot declare a digest."
-        raise ValueError(message)
-    return copy.deepcopy(value)
+    return points[point_index]
 
 
 def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
-    """Resolve one deterministic case from profile-active block designs."""
+    """Resolve one deterministic case from point ``design_index`` of its batch's design."""
     config.case_id(case_index)
     assignment = config.case_assignment(case_index)
     if config.seed_base is None:
         message = f"Batch {config.batch_name!r} has no executable sampling seed."
         raise ValueError(message)
+    point_index = int(assignment["design_index"])
     family_contract = config.scientific_values["material"]
     registry = family_contract["parameter_registry"]
     policy = config.scientific_values["parameter_ood"]
@@ -1005,30 +831,17 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
         registry,
         selected_ood=selected,
         seed_base=config.seed_base,
-        case_index=case_index,
+        point_index=point_index,
     )
-    position = config.case_indices.index(case_index)
-    supplemental = _supplemental_design(config)
+    sampling = config.scientific_values["sampling"]
+    point = _design_row(sampling, point_index=point_index)
     block_provenance: dict[str, dict[str, Any]] = {}
     ood_details: dict[str, dict[str, Any]] = {}
     family_bounds = family_contract.get("initial_moisture_bounds", {})
     initial_moisture_field_constraint = family_contract.get("initial_moisture_field_constraint", {})
-    for block, plan in config.scientific_values["sampling"]["blocks"].items():
-        if supplemental is None:
-            row_index = int(plan["permutation"][position])
-            design = unit_design(
-                config.scientific_values["sampling"]["method"],
-                count=len(config.case_indices),
-                dimensions=int(plan["effective_dimension"]),
-                seed=int(plan["design_seed"]),
-            )
-            if _array_sha256(design) != plan["design_sha256"]:
-                message = f"Sampling design digest changed for block {block!r}."
-                raise RuntimeError(message)
-            row = design[row_index]
-        else:
-            row_index = int(supplemental["candidate_ordinal"]) - 1
-            row = np.asarray(supplemental["unit_point"][block], dtype=float)
+    for block, plan in sampling["blocks"].items():
+        start, stop = (int(column) for column in plan["columns"])
+        row = point[start:stop]
         parameters = tuple(str(name) for name in plan["parameters"])
         numerical_block_parameters = {name for name in parameters if registry_service.effective_dimension(registry[name]) > 0}
         overlap = set(values).intersection(numerical_block_parameters)
@@ -1042,42 +855,28 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
             parameters=parameters,
             selected_ood=selected,
             seed_base=config.seed_base,
-            case_index=case_index,
+            point_index=point_index,
             fixed=config.scientific_values["scientific_fixed_values"],
             family_bounds=family_bounds,
             initial_moisture_field_constraint=initial_moisture_field_constraint,
         )
         values.update(block_values)
         ood_details.update(block_ood_details)
-        if supplemental is None:
-            block_provenance[block] = {
-                "seed_origin": plan["seed_origin"],
-                "design_seed": plan["design_seed"],
-                "design_sha256": plan["design_sha256"],
-                "permutation_seed": plan["permutation_seed"],
-                "permutation_sha256": plan["permutation_sha256"],
-                "case_position": position,
-                "block_row_index": row_index,
-            }
-        else:
-            block_provenance[block] = {
-                "sampling_kind": "supplemental_replacement_sobol",
-                "candidate_id": supplemental["candidate_id"],
-                "candidate_ordinal": supplemental["candidate_ordinal"],
-                "sampling_seed": supplemental["sampling_seed"],
-                "block_seed": supplemental["block_seeds"][block],
-                "unit_point": list(supplemental["unit_point"][block]),
-                "unit_point_sha256": supplemental["unit_point_sha256"],
-                "case_position": position,
-                "block_row_index": row_index,
-            }
+        block_provenance[block] = {
+            "design_recipe": sampling["recipe"],
+            "design_seed": sampling["design_seed"],
+            "design_sha256": sampling["design_sha256"],
+            "design_index": point_index,
+            "columns": [start, stop],
+            "unit_point": row.tolist(),
+        }
     coupled_ood_details = _apply_coupled_ood_records(
         family_contract,
         selected_ood=selected,
         values=values,
         selections=coupled_selections,
         seed_base=config.seed_base,
-        case_index=case_index,
+        point_index=point_index,
     )
     ood_details.update(coupled_ood_details)
     if "schedule.component_weights" in values:
@@ -1096,11 +895,6 @@ def sample_case(config: _SamplingConfig, case_index: int) -> CaseSample:
             values,
             active_ood_unit=next(iter(selected), None),
         )
-    if supplemental is not None and supplemental["physical_values"] is not None:
-        observed_digest = common.serialization.canonical_json_sha256({"physical_values": values})
-        if observed_digest != supplemental["physical_values_sha256"] or values != supplemental["physical_values"]:
-            message = "Supplemental replacement physical values no longer match their persisted unit point."
-            raise RuntimeError(message)
     selected_units = sorted(selected)
     if selected_units:
         if len(selected_units) != 1:

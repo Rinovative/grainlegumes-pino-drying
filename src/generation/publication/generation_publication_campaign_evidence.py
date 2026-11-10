@@ -15,7 +15,7 @@ This module does NOT:
   - Publish Dataset membership or execute solver work
 
 Notes:
-  Persisted contract (run.json schema version 1):
+  Persisted contract (run.json):
     - ``node_jobs`` records one Slurm node job each; ``slurm_job_ids`` lists their allocation ids in record order.
     - ``submissions`` records one dispatch (one ticket for one case step) each and references a node job by token.
     - ``node_job_intent`` names the single unresolved ``submitting`` node job; ``submission_intent`` the single ``dispatching`` record.
@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 _JOB_ID_PATTERN: Final = re.compile(r"[0-9]+")
-RUN_MANIFEST_SCHEMA_VERSION: Final = 1
 NODE_JOBS_DIRNAME: Final = "node_jobs"
 NODE_JOB_TOKEN_PATTERN: Final = re.compile(r"[a-z0-9]{16}")
 _NODE_SEATS: Final = tuple(range(1, config_service.MAXIMUM_NODE_JOBS + 1))
@@ -82,7 +81,6 @@ MAX_STEP_NAME_LENGTH: Final = 48
 _RUN_MANIFEST_KEYS: Final = frozenset(
     {
         "schema_kind",
-        "schema_version",
         "campaign_run_id",
         "campaign_name",
         "source_name",
@@ -254,7 +252,6 @@ def _validate_campaign_run_header(
         not set(manifest) >= _RUN_MANIFEST_KEYS
         or bool(set(manifest).difference(_RUN_MANIFEST_KEYS | _RUN_MANIFEST_OPTIONAL_KEYS))
         or manifest.get("schema_kind") != "generation_campaign_run"
-        or not common.serialization.is_schema_version(manifest.get("schema_version"), RUN_MANIFEST_SCHEMA_VERSION)
         or manifest.get("campaign_run_id") != run_id
     ):
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
@@ -342,41 +339,11 @@ def _validate_submission_configuration(
     except config_service.GenerationConfigError as error:
         message = f"Campaign-run submission configuration node-job resources are malformed: {run_id}."
         raise ValueError(message) from error
-    wait = submission["license_wait"]
-    in_allocation = wait.get("in_allocation_retry") if isinstance(wait, dict) else None
-    if (
-        not isinstance(wait, dict)
-        or set(wait)
-        != {
-            "enabled",
-            "initial_delay_seconds",
-            "maximum_delay_seconds",
-            "maximum_wait_seconds",
-            "in_allocation_retry",
-        }
-        or not isinstance(wait.get("enabled"), bool)
-        or any(
-            isinstance(wait.get(key), bool) or not isinstance(wait.get(key), (int, float)) or not 0.0 < float(wait[key]) < float("inf")
-            for key in (
-                "initial_delay_seconds",
-                "maximum_delay_seconds",
-                "maximum_wait_seconds",
-            )
-        )
-        or wait["maximum_delay_seconds"] < wait["initial_delay_seconds"]
-        or wait["maximum_wait_seconds"] < wait["initial_delay_seconds"]
-        or not isinstance(in_allocation, dict)
-        or set(in_allocation) != {"enabled", "maximum_window_seconds", "pause_after_capacity_failure_seconds"}
-        or not isinstance(in_allocation.get("enabled"), bool)
-        or any(
-            isinstance(in_allocation.get(key), bool)
-            or not isinstance(in_allocation.get(key), (int, float))
-            or not 0.0 < float(in_allocation[key]) < float("inf")
-            for key in ("maximum_window_seconds", "pause_after_capacity_failure_seconds")
-        )
-    ):
+    try:
+        config_service.validated_license_wait(submission["license_wait"], label="license_wait")
+    except (config_service.GenerationConfigError, TypeError) as error:
         message = f"Campaign-run license-wait configuration is malformed: {run_id}."
-        raise ValueError(message)
+        raise ValueError(message) from error
     options = submission["scheduler_options"]
     if not isinstance(options, list) or not all(isinstance(option, str) and option.startswith("--") for option in options):
         message = f"Campaign-run scheduler options are malformed: {run_id}."
@@ -669,11 +636,7 @@ def load_campaign_scheduler_job_ids(
         message = f"Campaign-run manifest is missing or unsafe: {path}"
         raise FileNotFoundError(message)
     manifest = load_json_object(path, label="campaign-run manifest")
-    if (
-        manifest.get("schema_kind") != "generation_campaign_run"
-        or not common.serialization.is_schema_version(manifest.get("schema_version"), RUN_MANIFEST_SCHEMA_VERSION)
-        or manifest.get("campaign_run_id") != run_id
-    ):
+    if manifest.get("schema_kind") != "generation_campaign_run" or manifest.get("campaign_run_id") != run_id:
         message = f"Unsupported or malformed campaign-run manifest: {run_id}."
         raise ValueError(message)
     job_ids = _validate_campaign_scheduler_job_ids(

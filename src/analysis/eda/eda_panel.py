@@ -14,7 +14,7 @@ Design principles:
 This module does NOT:
   - Discover or materialize generated data directly
   - Define scientific plots, channel widgets, or stored-time navigation
-  - Catch programming errors from incorrectly registered factories
+  - Catch programming errors such as an incorrectly registered factory; they raise
 """
 
 from __future__ import annotations
@@ -243,6 +243,23 @@ def _view_factories(
     return factories
 
 
+def _numbered_section(
+    numbered_plots: Sequence[tuple[Any, str]],
+    factories: Mapping[str, Callable[..., widgets.Widget]],
+    export_state: dict[str, Any],
+) -> widgets.Widget:
+    """Build one lazy dropdown section from numbered registry plots."""
+    entries = []
+    for plot, plot_label in numbered_plots:
+        try:
+            factory = factories[plot.key]
+        except KeyError as error:
+            message = f"EDA presentation view {plot.key!r} has no registered factory."
+            raise ValueError(message) from error
+        entries.append((plot_label, factory, plot.key))
+    return ui.notebook.make_dropdown_section(entries, export_state=export_state, select_first=True)
+
+
 def _sections_for_capabilities(
     *,
     capabilities: Sequence[selection.GeneratedOutputCapability],
@@ -253,31 +270,12 @@ def _sections_for_capabilities(
     sections: list[widgets.Widget] = []
     titles: list[str] = []
     if "published_tensors" in factories:
-        sections.append(
-            ui.notebook.make_dropdown_section(
-                [("Model inputs and targets", factories["published_tensors"], "published_tensors")],
-                export_state=export_state,
-                select_first=True,
-            )
-        )
+        entries = [("Model inputs and targets", factories["published_tensors"], "published_tensors")]
+        sections.append(ui.notebook.make_dropdown_section(entries, export_state=export_state, select_first=True))
         titles.append("Model inputs and targets")
     visible = presentation.eda_sections_for_capabilities(capabilities)
     for _section, section_label, numbered_plots in presentation.numbered_registry(visible):
-        entries = []
-        for plot, plot_label in numbered_plots:
-            try:
-                factory = factories[plot.key]
-            except KeyError as error:
-                message = f"EDA presentation view {plot.key!r} has no registered factory."
-                raise ValueError(message) from error
-            entries.append((plot_label, factory, plot.key))
-        sections.append(
-            ui.notebook.make_dropdown_section(
-                entries,
-                export_state=export_state,
-                select_first=True,
-            )
-        )
+        sections.append(_numbered_section(numbered_plots, factories, export_state))
         titles.append(section_label)
     if not sections:
         message = "Selected generated-output datasets expose no maintained EDA views."
@@ -337,7 +335,6 @@ def build_eda_panel(
         close_btn_text="Close",
         panel_controls=(dataset_control.widget, widgets.HTML(f"Map display stride: {display_spatial_stride}; full-grid statistics.")),
         export_state=export_state,
-        export_dir="",
         export_btn_text="Export PDF",
     )
     displayed_capabilities = {"value": capabilities}

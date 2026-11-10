@@ -3,7 +3,7 @@
 Responsibilities:
   - Check which settings the allocation digest covers and which it ignores
   - Check that the registry adapter binds the allocation digest to the run directory
-  - Check that an identical experiment is refused under another config name or revision
+  - Check that an identical experiment is refused under another config family or revision
   - Check that the train command and service refuse an authored config combined with --resume
 
 Design principles:
@@ -34,11 +34,11 @@ if TYPE_CHECKING:
 _IdenticalExperimentError = experiments.registry.IdenticalExperimentError
 
 
-def _resolved(raw: dict[str, Any], output_root: Path, *, name_suffix: str | None = None) -> dict[str, Any]:
-    """Resolve one request under the test family, optionally as another config file name."""
+def _resolved(raw: dict[str, Any], output_root: Path, *, name: str | None = None) -> dict[str, Any]:
+    """Resolve one request under the in-memory test source, optionally under another config name."""
     source = configs.source_for(raw)
-    if name_suffix is not None:
-        source = replace(source, name=f"{source.name}__{name_suffix}")
+    if name is not None:
+        source = replace(source, name=name)
     return loader.resolve_config(copy.deepcopy(raw), source=source, output_root=output_root)
 
 
@@ -101,12 +101,12 @@ def test_resume_admission_refuses_another_a0_epoch_budget(tmp_path: Path) -> Non
 
 
 def test_allocation_digest_ignores_the_config_name_and_output_root(tmp_path: Path) -> None:
-    """The same science is the same experiment under another config file name or output root."""
+    """The same science is the same experiment under another config name or output root: a name never enters the identity."""
     raw = configs.direct_config()
 
     baseline = loader.allocation_digest(_resolved(raw, tmp_path / "first"))
 
-    assert loader.allocation_digest(_resolved(raw, tmp_path / "second", name_suffix="copy")) == baseline
+    assert loader.allocation_digest(_resolved(raw, tmp_path / "second", name="renamed")) == baseline
 
 
 def test_registry_binds_the_allocation_digest_and_reports_an_identical_experiment(tmp_path: Path) -> None:
@@ -129,14 +129,9 @@ def test_registry_binds_the_allocation_digest_and_reports_an_identical_experimen
         pytest.fail("a directory outside the output root must never be admitted")
 
 
-def _write_request(tmp_path: Path, raw: dict[str, Any], *, name_suffix: str | None = None) -> Path:
-    """Write the request under its canonical test-family path, optionally as another config file name."""
-    source = configs.source_for(raw)
-    name = source.name if name_suffix is None else f"{source.name}__{name_suffix}"
-    return configs.write_yaml(
-        tmp_path / "configs" / "03_learning" / source.task / "experiments" / source.family / f"{name}.yaml",
-        raw,
-    )
+def _write_request(tmp_path: Path, raw: dict[str, Any], *, family: str | None = None) -> Path:
+    """Write the request as a maintained-style config under the test family, optionally in another family folder."""
+    return configs.write_config(tmp_path, raw, canonical_root=tmp_path, **({} if family is None else {"family": family}))
 
 
 def _tree(root: Path) -> dict[str, bytes]:
@@ -144,14 +139,14 @@ def _tree(root: Path) -> dict[str, bytes]:
     return {str(path.relative_to(root)): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
 
 
-@pytest.mark.parametrize("variant", ["config_name", "revision"])
-def test_identical_experiment_is_rejected_under_another_config_name_or_revision(tmp_path: Path, variant: str) -> None:
+@pytest.mark.parametrize("variant", ["family", "revision"])
+def test_identical_experiment_is_rejected_under_another_family_or_revision(tmp_path: Path, variant: str) -> None:
     """A copy of an existing experiment is refused before any allocation; --revision does not bypass it."""
     raw = configs.direct_config()
     output_root = tmp_path / "outputs"
     first = experiments.run.prepare_fresh_run(_resolved(raw, output_root))
     before = _tree(output_root)
-    request = _write_request(tmp_path, raw, name_suffix="copy" if variant == "config_name" else None)
+    request = _write_request(tmp_path, raw, family="copy" if variant == "family" else None)
 
     with pytest.raises(_IdenticalExperimentError, match="identical experiment already exists") as rejected:
         experiments.run.run_experiment(
@@ -168,7 +163,7 @@ def test_train_cli_reports_an_identical_experiment_as_a_rejected_admission(tmp_p
     """The command fails with a clear admission message instead of a training traceback."""
     raw = configs.direct_config()
     experiments.run.prepare_fresh_run(configs.resolve(raw))
-    request = _write_request(tmp_path, raw, name_suffix="copy")
+    request = _write_request(tmp_path, raw, family="copy")
 
     assert cli_train.main([str(request), "--artifacts", "none"]) == 1
 

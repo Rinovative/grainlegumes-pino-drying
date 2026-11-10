@@ -23,8 +23,6 @@ import json
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-TASK_SCHEMA_VERSION = 1
-
 FieldRole = Literal[
     "airflow",
     "boundary",
@@ -117,7 +115,7 @@ class FieldSpec:
 @dataclass(frozen=True, slots=True)
 class InputProfileSpec:
     """
-    Describe one versioned task-owned model input profile.
+    Describe one task-owned model input profile.
 
     Attributes
     ----------
@@ -413,8 +411,6 @@ class TaskSpec:
     ----------
     id : str
         Canonical task identifier.
-    schema_version : int
-        Task-contract schema version.
     inputs : tuple[FieldSpec, ...]
         Exact ordered learned input fields.
     outputs : tuple[FieldSpec, ...]
@@ -466,7 +462,6 @@ class TaskSpec:
     """
 
     id: str
-    schema_version: int
     inputs: tuple[FieldSpec, ...]
     outputs: tuple[FieldSpec, ...]
     tensor_layout: tuple[str, ...]
@@ -492,12 +487,9 @@ class TaskSpec:
         self._validate_output_groups_and_metric_references()
 
     def _validate_identity_and_axes(self) -> None:
-        """Validate the task identifier, schema version, and fixed 2D axes."""
+        """Validate the task identifier and fixed 2D axes."""
         if not isinstance(self.id, str) or not self.id:
             msg = "Task id must be a non-empty string."
-            raise ValueError(msg)
-        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version != TASK_SCHEMA_VERSION:
-            msg = f"Task {self.id!r} schema_version must be integer {TASK_SCHEMA_VERSION}."
             raise ValueError(msg)
         if self.tensor_layout != _SUPPORTED_TENSOR_LAYOUT:
             msg = f"Task {self.id!r} tensor_layout must be the current 2D layout {_SUPPORTED_TENSOR_LAYOUT!r}."
@@ -798,7 +790,6 @@ class TaskSpec:
         """
         payload: dict[str, object] = {
             "task": self.id,
-            "schema_version": self.schema_version,
             "inputs": [field.as_dict() for field in self.inputs],
             "outputs": [field.as_dict() for field in self.outputs],
             "output_groups": [group.as_dict() for group in self.output_groups],

@@ -39,14 +39,13 @@ def _handoff() -> TeacherHandoffIdentity:
         task_contract_sha256=_digest("task"),
         tensorizer_sha256=_digest("tensorizer"),
         model_kind="fno",
-        input_profile="canonical_physics_complete_v1",
+        input_profile="canonical_physics_complete",
     )
 
 
 def test_curriculum_retains_shorter_horizons_and_resumes_exact_draws() -> None:
     """Use compute progress and private RNG state for reproducible valid windows."""
     curriculum = RolloutCurriculum()
-    assert curriculum.as_dict()["schema_version"] == 1
     state = RolloutCurriculumState.create(curriculum, seed=17)
     first_horizon, first_origins = state.select(progress=0.85, available_length=32, batch_size=9)
     assert first_horizon in curriculum.eligible_lengths(0.85)
@@ -125,8 +124,8 @@ def test_controller_accounts_device_seconds_only_on_the_cuda_clock() -> None:
         cpu.record_completed_work(**_work(optimizer_device_seconds=0.1))
 
 
-def test_controller_state_rejects_semantic_drift_and_superseded_schemas() -> None:
-    """Require immutable controller identity and the current schema during continuation."""
+def test_controller_state_rejects_semantic_drift_and_foreign_keys() -> None:
+    """Require immutable controller identity and the exact key set during continuation."""
     controller = MatchedComputeController(
         arm="A1",
         stage="stage_a_teacher_forcing",
@@ -141,9 +140,8 @@ def test_controller_state_rejects_semantic_drift_and_superseded_schemas() -> Non
     drifted = dict(saved, config_digest=_digest("other"))
     with pytest.raises(ValueError, match="conflicts"):
         controller.load_state_dict(drifted)
-    for version in (2, True, 1.0):  # Superseded, JSON true and 1.0 must not pass as version 1.
-        with pytest.raises(ValueError, match="strict schema"):
-            controller.load_state_dict(dict(saved, schema_version=version))
+    with pytest.raises(ValueError, match="strict schema"):
+        controller.load_state_dict(dict(saved, unexpected_key=1))
 
 
 def test_controller_rejects_mismatched_budget_and_clock() -> None:

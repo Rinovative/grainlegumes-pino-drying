@@ -1,18 +1,22 @@
-"""Load published reference cases for physics diagnostics without changing them.
+"""Load membership-filtered published reference cases and maintained settings without changing them.
 
 Responsibilities:
+  - Resolve the Train or validation membership of a Dataset from its manifest partition
   - Materialize steady-flow Dataset cases as task-ordered physical tensors
   - Rebuild exact float64 Cartesian coordinates from float32 Dataset grids
   - Read transient Dataset trajectories through the canonical HDF5 runtime
   - Read COMSOL global balance series and case constants from admitted sources
+  - Merge maintained learning configurations over the task defaults for read-only inspection
 
 Design principles:
   - Dataset runtimes own membership, conversion, and source admission
+  - Only Train or validation membership is admitted, filtered before any case limit
   - Source HDF5 files are re-hashed against the Dataset index before any read
   - Field and unit order of every persisted array is checked, never assumed
 
 This module does NOT:
-  - Build, publish, repair, or delete Datasets, sources, or artifacts
+  - Build, publish, repair, or delete Datasets, sources, artifacts, or configurations
+  - Admit ID-test or OOD cases
   - Evaluate residuals or balances, or render figures
 """
 
@@ -20,24 +24,51 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 import h5py
 import numpy as np
 import torch
 
-from src import datasets, domain, generation
+from src import common, datasets, domain, experiments, generation
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
-    from pathlib import Path
+    from collections.abc import Iterator, Mapping, Sequence
 
     from torch import Tensor
 
+Membership = Literal["train", "validation"]
+MEMBERSHIPS: Final[tuple[str, ...]] = get_args(Membership)
 _STEADY_TASK_ID: Final = "steady_flow"
 _TRANSIENT_TASK_ID: Final = "transient_drying"
 _COORDINATE_ULP_TOLERANCE = 1.0
 _CASE_CONSTANTS = ("Lz", "M_v", "p_ref", "phi_clip_min", "phi_clip_max")
+
+
+@dataclass(frozen=True, slots=True)
+class MaintainedConfig:
+    """
+    Hold one maintained learning configuration merged over its task defaults.
+
+    Attributes
+    ----------
+    name : str
+        Path relative to the task configuration directory.
+    kind : {"experiment", "optuna"}
+        Authored experiment or Optuna study.
+    config : dict[str, Any]
+        Authored values merged over the task defaults; run-time values such as
+        Dataset identities stay unresolved.
+    search_space : dict[str, Any]
+        The study search space; empty for experiments.
+
+    """
+
+    name: str
+    kind: str
+    config: dict[str, Any]
+    search_space: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +80,8 @@ class SteadyReference:
     ----------
     dataset_id : str
         Immutable published Dataset identifier.
+    membership : {"train", "validation"}
+        Dataset partition role of every case.
     case_ids, material_families : tuple[str, ...]
         Package case identifiers and their material families, in tensor order.
     input_fields, output_fields : tuple[str, ...]
@@ -60,6 +93,7 @@ class SteadyReference:
     """
 
     dataset_id: str
+    membership: Membership
     case_ids: tuple[str, ...]
     material_families: tuple[str, ...]
     input_fields: tuple[str, ...]
@@ -125,6 +159,8 @@ class TransientReferenceCase:
     ----------
     dataset_id, case_id, material_family : str
         Dataset, package case, and material identity.
+    membership : {"train", "validation"}
+        Dataset partition role of the case.
     time_hours : numpy.ndarray
         Regular stored-state times ``[T]`` in h.
     states : dict[str, numpy.ndarray]
@@ -149,6 +185,7 @@ class TransientReferenceCase:
     dataset_id: str
     case_id: str
     material_family: str
+    membership: Membership
     time_hours: np.ndarray
     states: dict[str, np.ndarray]
     static: dict[str, np.ndarray]
@@ -212,23 +249,116 @@ def uniform_float64_coordinate(coordinate: Tensor, *, axis: int) -> Tensor:
     return rebuilt
 
 
+def select_membership_cases(
+    partition: Mapping[str, Any] | None,
+    membership: str,
+    *,
+    dataset_id: str,
+    max_cases: int | None = None,
+) -> tuple[str, ...]:
+    """
+    Return the leading case IDs of one Train or validation membership.
+
+    Parameters
+    ----------
+    partition : Mapping[str, Any] or None
+        The Dataset manifest's ``case_partition``.
+    membership : str
+        ``"train"`` or ``"validation"``; ID-test and OOD roles are refused.
+    dataset_id : str
+        Dataset identifier for error messages.
+    max_cases : int, optional
+        Leading cases kept after the membership filter; all when omitted.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Case IDs in stored partition order.
+
+    Raises
+    ------
+    ValueError
+        If the role is not admitted, ``max_cases`` is not positive, or the
+        Dataset has no partition or no case of that membership.
+
+    """
+    if membership not in MEMBERSHIPS:
+        msg = f"Component checks read only {list(MEMBERSHIPS)} membership, got {membership!r}; test and OOD cases stay unseen."
+        raise ValueError(msg)
+    if max_cases is not None and max_cases < 1:
+        msg = "max_cases must be positive when given."
+        raise ValueError(msg)
+    cases = None if partition is None else partition.get(membership)
+    if not cases:
+        msg = f"Dataset {dataset_id!r} has no {membership} membership in its case partition."
+        raise ValueError(msg)
+    return tuple(str(case) for case in cases)[:max_cases]
+
+
+def membership_caption(membership: str, labels: Sequence[str]) -> str:
+    """Return a table caption naming the membership and its case count; the notebook shows the Dataset id once."""
+    return f"{membership} membership · {len(labels)} cases"
+
+
+def _learning_config_root(task: str, config_root: Path | str | None) -> Path:
+    """Return the maintained learning configuration directory of one task."""
+    return Path(config_root) if config_root is not None else common.paths.get_project_root() / "configs" / "03_learning" / task
+
+
+def maintained_base_config(task: str) -> dict[str, Any]:
+    """Return the task's shared ``base.yaml`` merged over the task defaults."""
+    loader = experiments.config.loader
+    base = loader.load_yaml(_learning_config_root(task, None) / loader.AUTHORED_BASE_FILENAME)
+    return loader.deep_merge(experiments.config.defaults.get_task_defaults(task), base)
+
+
+def iter_maintained_configs(task: str, *, config_root: Path | str | None = None) -> Iterator[MaintainedConfig]:
+    """
+    Yield every maintained experiment and Optuna study of one task, merged over the task defaults.
+
+    Notes
+    -----
+    Experiments are merged with their task base through the authoritative
+    authored-config loader and then over the task defaults with the loader's
+    merge; run-time values such as Dataset identities are not resolved.
+
+    """
+    loader = experiments.config.loader
+    root = _learning_config_root(task, config_root)
+    for path in sorted(root.rglob("*.yaml")):
+        if path.name == loader.AUTHORED_BASE_FILENAME:
+            continue
+        raw = loader.load_yaml(path)
+        is_study = "experiment" in raw
+        authored = loader.apply_authored_base(raw["experiment"] if is_study else raw, origin=path)
+        yield MaintainedConfig(
+            name=str(path.relative_to(root)),
+            kind="optuna" if is_study else "experiment",
+            config=loader.deep_merge(experiments.config.defaults.get_task_defaults(task), authored),
+            search_space=dict(raw.get("search_space", {})),
+        )
+
+
 def load_steady_reference(
     dataset_id: str,
     *,
+    membership: Membership,
     storage_root: Path | str | None = None,
     max_cases: int | None = None,
 ) -> SteadyReference:
     """
-    Load published steady-flow cases through the Dataset runtime.
+    Load published steady-flow cases of one membership through the Dataset runtime.
 
     Parameters
     ----------
     dataset_id : str
         Published steady-flow Dataset identifier.
+    membership : {"train", "validation"}
+        Partition role whose cases are loaded.
     storage_root : pathlib.Path or str, optional
         Scientific storage root; defaults to the canonical resolution.
     max_cases : int, optional
-        Leading package cases to keep; all cases when omitted.
+        Leading membership cases to keep; all when omitted.
 
     Returns
     -------
@@ -238,28 +368,26 @@ def load_steady_reference(
     Raises
     ------
     ValueError
-        If ``max_cases`` is not positive or the Dataset is empty.
+        If the membership is not admitted or absent, or ``max_cases`` is not positive.
 
     """
-    if max_cases is not None and max_cases < 1:
-        msg = "max_cases must be positive when given."
-        raise ValueError(msg)
     factory = datasets.runtime.factory
     dataset = factory.create_dataset(factory.DatasetRequest(dataset_id=dataset_id, dataset_view=_STEADY_TASK_ID, storage_root=storage_root))
-    steady_runtime = datasets.runtime.steady
-    if not isinstance(dataset, (steady_runtime.SteadyFlowDataset, steady_runtime.SteadyDatasetSelection)):
-        msg = f"Dataset {dataset_id!r} did not resolve to a steady-flow runtime."
+    if not isinstance(dataset, datasets.runtime.steady.SteadyFlowDataset) or dataset.manifest_binding is None:
+        msg = f"Dataset {dataset_id!r} did not resolve to a manifest-bound steady-flow runtime."
         raise TypeError(msg)
-    count = len(dataset) if max_cases is None else min(max_cases, len(dataset))
-    if count == 0:
-        msg = f"Steady Dataset {dataset_id!r} contains no cases."
-        raise ValueError(msg)
-    items = [dataset[index] for index in range(count)]
+    case_ids = select_membership_cases(dataset.manifest_binding.case_partition, membership, dataset_id=dataset_id, max_cases=max_cases)
+    positions = datasets.preprocessing.splits.role_positions(dataset.identity, case_ids, label=membership)
+    items = [dataset[index] for index in positions]
     metadata: list[Mapping[str, object]] = [item["meta"] for item in items]
+    if tuple(str(meta["case_id"]) for meta in metadata) != case_ids:
+        msg = f"Steady Dataset {dataset_id!r} returned cases that differ from its {membership} membership."
+        raise ValueError(msg)
     task = domain.tasks.registry.get_task(_STEADY_TASK_ID)
     return SteadyReference(
         dataset_id=dataset_id,
-        case_ids=tuple(str(meta["case_id"]) for meta in metadata),
+        membership=membership,
+        case_ids=case_ids,
         material_families=tuple(str(meta["material_family"]) for meta in metadata),
         input_fields=tuple(task.input_names),
         output_fields=tuple(task.output_names),
@@ -336,20 +464,23 @@ def _read_source_balances(path: Path, *, expected_sha256: str, admitted_stat: tu
 def iter_transient_reference_cases(
     dataset_id: str,
     *,
+    membership: Membership,
     storage_root: Path | str | None = None,
     max_cases: int | None = None,
 ) -> Iterator[TransientReferenceCase]:
     """
-    Yield complete transient reference cases one at a time.
+    Yield complete transient reference cases of one membership one at a time.
 
     Parameters
     ----------
     dataset_id : str
         Published transient Dataset identifier.
+    membership : {"train", "validation"}
+        Partition role whose cases are yielded.
     storage_root : pathlib.Path or str, optional
         Scientific storage root; defaults to the canonical resolution.
     max_cases : int, optional
-        Leading package cases to yield; all cases when omitted.
+        Leading membership cases to yield; all when omitted.
 
     Yields
     ------
@@ -359,20 +490,18 @@ def iter_transient_reference_cases(
     Raises
     ------
     ValueError
-        If ``max_cases`` is not positive or a source fails its hash or contract.
+        If the membership is not admitted or absent, ``max_cases`` is not
+        positive, or a source fails its hash or contract.
 
     Notes
     -----
     Trajectories come from the canonical-HDF5 Dataset runtime at spatial
     stride one, which hashes every Dataset source on construction, also when
-    ``max_cases`` selects fewer. The COMSOL global series are not part of the
+    fewer cases are selected. The COMSOL global series are not part of the
     Dataset contract; they are read from the same source, which is re-hashed
     only if its size or modification time changed since admission.
 
     """
-    if max_cases is not None and max_cases < 1:
-        msg = "max_cases must be positive when given."
-        raise ValueError(msg)
     factory = datasets.runtime.factory
     contract = datasets.contracts.transient
     dataset = factory.create_hdf5_source_dataset(
@@ -388,11 +517,14 @@ def iter_transient_reference_cases(
     static_names = tuple(field.name for field in step.static_spatial_conditioning)
     boundary_names = tuple(field.name for field in step.step_boundary_conditioning)
     scalar_names = tuple(field.name for field in step.scalar_conditioning)
-    cases = dataset.payload["cases"]
-    selected = cases if max_cases is None else cases[:max_cases]
-    source_paths = [(dataset.source_root / str(case["source_relative_path"])).resolve() for case in selected]
-    admitted_stats = [_file_stat(path) for path in source_paths]
+    binding = dataset.manifest_binding
     try:
+        partition = None if binding is None else binding.case_partition
+        case_ids = select_membership_cases(partition, membership, dataset_id=dataset_id, max_cases=max_cases)
+        by_id = {str(case["package_case_id"]): case for case in dataset.payload["cases"]}
+        selected = [by_id[case_id] for case_id in case_ids]
+        source_paths = [(dataset.source_root / str(case["source_relative_path"])).resolve() for case in selected]
+        admitted_stats = [_file_stat(path) for path in source_paths]
         for case, source_path, admitted_stat in zip(selected, source_paths, admitted_stats, strict=True):
             arrays = dataset.read_case_arrays(str(case["package_case_id"]))
             global_series, constants = _read_source_balances(
@@ -402,6 +534,7 @@ def iter_transient_reference_cases(
                 dataset_id=dataset_id,
                 case_id=str(case["package_case_id"]),
                 material_family=str(case["material_family"]),
+                membership=membership,
                 time_hours=np.asarray(arrays.time, dtype=np.float64),
                 states={name: arrays.states[:, index] for index, name in enumerate(state_names)},
                 static={name: np.asarray(arrays.static[index], dtype=np.float64) for index, name in enumerate(static_names)},

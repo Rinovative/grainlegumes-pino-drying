@@ -1,8 +1,8 @@
 """Derive and validate source campaign names from their original designs.
 
 Responsibilities:
-  - Encode ordered material design sizes, domain profile, sampling mode, root seed and a deviating transient horizon
-  - Own the short filesystem token of every supported domain profile
+  - Encode ordered material design sizes per design kind, domain profile, root seed and a deviating transient horizon
+  - Derive the domain profile from the design kinds and own the short filesystem token of every supported profile
   - Own the revision grammar and the one Source label that a revision derives from a campaign name
   - Validate readable Source labels and their length as one filesystem component
   - Reject frozen scientific digests that conflict with the resolved campaign
@@ -32,14 +32,21 @@ if TYPE_CHECKING:
 from src import common
 
 from . import generation_contracts_material_registry as material_registry
+from .generation_contracts_vocabulary import DESIGN_KINDS
 
-SUPPORTED_MODES: Final[frozenset[str]] = frozenset({"lhs", "sobol"})
 _DOMAIN_TOKENS: Final = MappingProxyType({"reference_range": "ref-range", "reference_and_parameter_extension": "ref-param-ext"})
 SUPPORTED_DOMAIN_PROFILES: Final[frozenset[str]] = frozenset(_DOMAIN_TOKENS)
+# A material's design kinds take one of these shapes: a test design alone (held-out material) or the ID designs.
+DESIGN_SHAPES: Final = (("test",), ("train", "validation", "test"), DESIGN_KINDS)
 _MAX_COMPONENT_BYTES: Final = 255
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z0-9]+(?:[-_+][a-z0-9]+)*(?:__[a-z0-9]+(?:[-_+][a-z0-9]+)*)*\Z")
 _REVISION = re.compile(r"[a-z0-9]+(?:[-_+][a-z0-9]+)*\Z")
+
+
+def domain_profile(designs: Mapping[str, Mapping[str, int]]) -> str:
+    """Return the physical domain of a design set: the reference range, extended when any material has a parameter-OOD design."""
+    return "reference_and_parameter_extension" if any("parameter_ood" in kinds for kinds in designs.values()) else "reference_range"
 
 
 def domain_token(profile: str) -> str:
@@ -69,37 +76,39 @@ def deviating_horizon_hours(effective_hours: float, configured_hours: float) -> 
 
 
 def canonical_campaign_name(
-    design_sizes: Mapping[str, int],
+    designs: Mapping[str, Mapping[str, int]],
     *,
-    domain_profile: str,
-    mode: str,
     root_seed: int,
     horizon_hours: float | None,
 ) -> str:
     """Name the full source design, independent of successful selections.
 
-    A horizon from :func:`deviating_horizon_hours` is named as ``__h-<hours>``; ``None``
+    Each material is ``<slug>-<n>...`` with its design sizes in :data:`DESIGN_KINDS` order, one number per kind of its
+    shape (:data:`DESIGN_SHAPES`): ``kidney-bean-128`` is a test design alone, ``lentil-512-64-128-128`` the Train,
+    validation, test and parameter-OOD designs. Materials follow registry order, then come the derived domain token and
+    ``sobol-seed-<root_seed>``. A horizon from :func:`deviating_horizon_hours` is named as ``__h-<hours>``; ``None``
     (steady flow or the configured horizon) adds no horizon token.
     """
-    if mode not in SUPPORTED_MODES:
-        message = f"Unsupported campaign sampling mode {mode!r}."
-        raise ValueError(message)
-    token = domain_token(domain_profile)
+    token = domain_token(domain_profile(designs))
     if isinstance(root_seed, bool) or not isinstance(root_seed, int) or not 0 <= root_seed < 2**32:
         message = "Campaign root_seed must be an unsigned 32-bit integer."
         raise ValueError(message)
-    ordered = material_registry.ordered_materials(list(design_sizes))
+    ordered = material_registry.ordered_materials(list(designs))
     if not ordered:
         message = "Campaign must declare at least one material."
         raise ValueError(message)
     members: list[str] = []
     for material in ordered:
-        count = design_sizes[material]
-        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-            message = f"Original design size for {material!r} must be positive."
+        kinds = tuple(kind for kind in DESIGN_KINDS if kind in designs[material])
+        if kinds not in DESIGN_SHAPES or len(kinds) != len(designs[material]):
+            message = f"Design kinds of {material!r} must be one of {[list(shape) for shape in DESIGN_SHAPES]}, got {sorted(designs[material])}."
             raise ValueError(message)
-        members.append(f"{material_registry.material_slug(material)}-{count}")
-    components = ["+".join(members), token, f"{mode}-seed-{root_seed}"]
+        counts = [designs[material][kind] for kind in kinds]
+        if any(isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in counts):
+            message = f"Original design sizes for {material!r} must be positive integers."
+            raise ValueError(message)
+        members.append("-".join((material_registry.material_slug(material), *map(str, counts))))
+    components = ["+".join(members), token, f"sobol-seed-{root_seed}"]
     if horizon_hours is not None:
         components.append(horizon_token(horizon_hours))
     name = "__".join(components)

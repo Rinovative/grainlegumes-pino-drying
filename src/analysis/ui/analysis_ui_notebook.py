@@ -2,12 +2,14 @@
 
 Responsibilities:
   - Assemble plot functions into dropdown sections
-  - Build collapsible tabbed notebook panels
-  - Manage Matplotlib figure export state
+  - Build collapsible tabbed notebook panels with one shared header row
+  - Manage Matplotlib figure export state and write exports to the notebooks folder
+  - Show a failing view in place while the other views keep working
 
 Design principles:
   - Panels render lazily to keep notebooks responsive
   - Export state is passed explicitly between callbacks
+  - Exports go to the repository's notebooks folder, never to a user-chosen path
   - Display helpers handle figures, widgets and rich objects uniformly
 
 This module does NOT:
@@ -15,12 +17,14 @@ This module does NOT:
   - Load artifact cases or implement case-level plot mathematics
 """
 
+import os
 import re
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from inspect import signature
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
@@ -29,10 +33,13 @@ from IPython.display import clear_output, display
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
-from . import analysis_ui_components as components
+from src import common
 
-COMPACT_VIEW_SELECTOR_WIDTH_PX = components.COMPACT_CONTROL_WIDTH_PX
+from . import analysis_ui_viewers as viewers
+
 STANDARD_VIEW_SELECTOR_WIDTH_PX = 360
+PANEL_BUTTON_WIDTH_PX = 145
+PANEL_HEADER_GAP = "0 8px 0 0"
 
 
 class _DropdownSectionVBox(widgets.VBox):
@@ -112,14 +119,111 @@ def _export_stem(export_state: dict[str, Any]) -> str:
     return _sanitize_export_basename("__".join(context) or "plot")
 
 
-def _next_export_path(directory: Path, *, stem: str, timestamp: str) -> Path:
-    """Return one timestamped PDF path without overwriting an existing export."""
-    candidate = directory / f"{stem}_{timestamp}.pdf"
+def _next_export_path(directory: Path, *, stem: str, timestamp: str, suffix: str) -> Path:
+    """Return one timestamped path with ``suffix`` without overwriting an existing export."""
+    candidate = directory / f"{stem}_{timestamp}{suffix}"
     index = 1
     while candidate.exists() or candidate.is_symlink():
-        candidate = directory / f"{stem}_{timestamp}_{index}.pdf"
+        candidate = directory / f"{stem}_{timestamp}_{index}{suffix}"
         index += 1
     return candidate
+
+
+def _export_destination() -> Path:
+    """Return the repository's ``notebooks`` folder or raise why exporting there is refused."""
+    if common.paths.source_tree_id() is not None:
+        message = "Export is unavailable in a frozen source tree."
+        raise RuntimeError(message)
+    folder = common.paths.get_project_root() / "notebooks"
+    if folder.is_symlink() or not folder.is_dir():
+        message = f"The notebooks folder {folder} is missing or not a real directory."
+        raise RuntimeError(message)
+    return folder
+
+
+def _show_status(status_out: widgets.Output, message: str) -> None:
+    """Replace the panel status with one plain line."""
+    with status_out:
+        status_out.clear_output(wait=True)
+        print(message)
+
+
+def write_export(status_out: widgets.Output, *, stem: str, suffix: str, write: Callable[[IO[bytes]], None]) -> None:
+    """
+    Write one export file into the notebooks folder and report the outcome in ``status_out``.
+
+    The file is named ``<sanitized stem>_<UTC timestamp><suffix>`` and created exclusively, so no
+    existing file is overwritten and no symlink is followed. ``write`` receives the opened
+    binary file. A refused destination, a failing writer or a name replaced during the write
+    is shown in the status instead of a saved path.
+    """
+    try:
+        directory = _export_destination()
+    except RuntimeError as error:
+        _show_status(status_out, f"[Export] {error}")
+        return
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    path = _next_export_path(directory, stem=_sanitize_export_basename(stem), timestamp=timestamp, suffix=suffix)
+    try:
+        output = path.open("xb")
+    except FileExistsError:
+        _show_status(status_out, "[Export] The output filename became occupied. Export again to choose a free filename.")
+        return
+    except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+        viewers.show_render_failure(status_out, error)
+        return
+    with output:
+        try:
+            write(output)
+        except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+            path.unlink(missing_ok=True)
+            viewers.show_render_failure(status_out, error)
+            return
+        # The bytes went to the reserved open file; report success only while the name still points to it.
+        reserved = os.fstat(output.fileno())
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            current = None
+        if current is None or (current.st_dev, current.st_ino) != (reserved.st_dev, reserved.st_ino):
+            _show_status(status_out, f"[Export] {path.name} was replaced during the export; nothing was saved there. Export again.")
+            return
+    _show_status(status_out, f"[Export] Saved: {path}")
+
+
+def _write_pdf(output: IO[bytes], figures: tuple[Figure, ...]) -> None:
+    """Write one figure as a PDF or several figures as pages of one PDF."""
+    if len(figures) == 1:
+        figures[0].savefig(output, format="pdf", bbox_inches="tight")
+        return
+    with PdfPages(output) as pdf:
+        for figure in figures:
+            pdf.savefig(figure, bbox_inches="tight")
+
+
+def export_pdf(status_out: widgets.Output, export_state: dict[str, Any] | None) -> None:
+    """Export the current figure bundle of one panel as a PDF into the notebooks folder."""
+    if export_state is None:
+        _show_status(status_out, "[Export] Export is unavailable for this panel.")
+        return
+    primary = export_state.get("fig")
+    bundled = export_state.get("figures")
+    figures = tuple(figure for figure in bundled if isinstance(figure, Figure)) if isinstance(bundled, (list, tuple)) else ()
+    if not figures and isinstance(primary, Figure):
+        figures = (primary,)
+    if not figures:
+        _show_status(status_out, "[Export] No figure is selected. Render a plot first.")
+        return
+    write_export(status_out, stem=_export_stem(export_state), suffix=".pdf", write=partial(_write_pdf, figures=figures))
+
+
+def panel_header(close_btn: widgets.Button, export_btn: widgets.Button, status_out: widgets.Output) -> widgets.HBox:
+    """Return the uniform shell header: close and export buttons followed by the flexible status."""
+    for button in (close_btn, export_btn):
+        button.layout.width = f"{PANEL_BUTTON_WIDTH_PX}px"
+        button.layout.margin = PANEL_HEADER_GAP
+    status_out.layout.flex = "1 1 auto"
+    return widgets.HBox((close_btn, export_btn, status_out), layout=widgets.Layout(align_items="center"))
 
 
 def _show_anything(result: Any) -> None:
@@ -189,7 +293,8 @@ def make_dropdown_section(
     -----
     Selecting the prompt clears output. A first-entry section remains lazy until
     its tab opens. Before rendering, the prior export figure is cleared. Non-figure
-    widgets may populate it later through viewer callbacks.
+    widgets may populate it later through viewer callbacks. A failing entry shows
+    its failure in the section output; the other entries stay selectable.
 
     """
     plot_options = [(title, i) for i, (title, _, _) in enumerate(plots)]
@@ -198,7 +303,7 @@ def make_dropdown_section(
         value=None if select_first else -1,
         description="" if select_first else "View:",
         style={"description_width": "initial"},
-        layout=widgets.Layout(width=(f"{COMPACT_VIEW_SELECTOR_WIDTH_PX}px" if select_first else f"{STANDARD_VIEW_SELECTOR_WIDTH_PX}px")),
+        layout=widgets.Layout(width=f"{STANDARD_VIEW_SELECTOR_WIDTH_PX}px"),
     )
     output = widgets.Output()
     last_idx: dict[str, int | None] = {"idx": None}
@@ -250,12 +355,18 @@ def make_dropdown_section(
                 export_state["title"] = title
                 export_state["filename_stem"] = None
 
-            result = _invoke_dropdown_entry(
-                plot_func,
-                export_state=export_state,
-                export_plot_name=plot_name,
-                export_title=title,
-            )
+            try:
+                result = _invoke_dropdown_entry(
+                    plot_func,
+                    export_state=export_state,
+                    export_plot_name=plot_name,
+                    export_title=title,
+                )
+            except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+                active_result["value"] = None
+                viewers.show_render_failure(output, error)
+                last_idx["idx"] = idx
+                return
             active_result["value"] = result
             if isinstance(result, tuple):
                 result = result[0]
@@ -397,8 +508,6 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
     *,
     panel_controls: Sequence[widgets.Widget] = (),
     export_state: dict | None = None,
-    export_dir: str = "",
-    protected_export_roots: Sequence[Path | str] = (),
     export_btn_text: str = "Export PDF",
 ) -> LazyTabbedPanelOutput:
     """Build one collapsible, replaceable lazy tab panel with explicit PDF export.
@@ -419,18 +528,13 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
         Label of the explicit export action.
     export_state : dict | None, optional
         Current figure and naming context populated by selected views.
-    export_dir : str, optional
-        Initial value for the editable export-directory field. An empty value
-        requires the user to choose a directory before export.
-    protected_export_roots : Sequence[Path | str], optional
-        Immutable artifact roots where PDF exports are forbidden. Resolved
-        paths are checked on explicit export, including symlink targets.
 
     Notes
     -----
-    Viewing figures never creates the selected export directory. The directory
-    and PDF are created only after the Export button is pressed and the path
-    passes the protected-root check.
+    Viewing figures creates no file. The PDF is written only after the Export
+    button is pressed, into the repository's ``notebooks`` folder (see
+    :func:`export_pdf`). The header row holds the close and export buttons and
+    the status. A failing tab activation is shown in that status.
 
     """
     current_sections = list(sections)
@@ -445,11 +549,7 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
         button_style="primary",
         layout=widgets.Layout(width="auto"),
     )
-    close_btn = widgets.Button(
-        description=close_btn_text,
-        button_style="danger",
-        layout=widgets.Layout(width="145px"),
-    )
+    close_btn = widgets.Button(description=close_btn_text, button_style="danger")
     tabs = widgets.Tab(children=tuple(current_sections))
     main_out.tabs = tabs
 
@@ -462,74 +562,14 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
             tabs.set_title(index, value)
 
     set_titles(titles)
-    status_out = widgets.Output(
-        layout=widgets.Layout(
-            display="none",
-            flex="0 0 auto",
-        )
-    )
-    export_btn = widgets.Button(
-        description=export_btn_text,
-        button_style="success",
-        layout=widgets.Layout(width="145px"),
-    )
-    export_directory = widgets.Text(
-        value=export_dir,
-        description="Export directory:",
-        placeholder="Choose a folder before exporting",
-        style={"description_width": "initial"},
-        layout=widgets.Layout(width="100%"),
-    )
-
-    def do_export(_: object = None) -> None:
-        """Write the current single- or multi-page figure bundle to PDF."""
-        status_out.layout.display = "block"
-        with status_out:
-            status_out.clear_output(wait=True)
-            if export_state is None:
-                print("[Export] Export is unavailable for this panel.")
-                return
-            primary = export_state.get("fig")
-            bundled = export_state.get("figures")
-            figures = tuple(figure for figure in bundled if isinstance(figure, Figure)) if isinstance(bundled, (list, tuple)) else ()
-            if not figures and isinstance(primary, Figure):
-                figures = (primary,)
-            if not figures:
-                print("[Export] No figure is selected. Render a plot first.")
-                return
-            selected_directory = export_directory.value.strip()
-            if not selected_directory:
-                print("[Export] Choose an export directory before exporting.")
-                return
-            out_dir = Path(selected_directory).expanduser().resolve()
-            protected_roots = tuple(Path(root).expanduser().resolve() for root in protected_export_roots)
-            if any(out_dir == root or out_dir.is_relative_to(root) for root in protected_roots):
-                print("[Export] Choose a directory outside immutable artifact roots.")
-                return
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stem = _export_stem(export_state)
-            timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-            out_path = _next_export_path(out_dir, stem=stem, timestamp=timestamp)
-            try:
-                with out_path.open("xb") as output:
-                    if len(figures) == 1:
-                        figures[0].savefig(output, format="pdf", bbox_inches="tight")
-                    else:
-                        with PdfPages(output) as pdf:
-                            for figure in figures:
-                                pdf.savefig(figure, bbox_inches="tight")
-            except FileExistsError:
-                print("[Export] The output filename became occupied. Export again to choose a free filename.")
-                return
-            print(f"[Export] Saved: {out_path}")
-
-    export_btn.on_click(do_export)
-    header = widgets.HBox((close_btn, export_btn))
-    controls_box = widgets.VBox(tuple(panel_controls))
-    panel_children: list[widgets.Widget] = [header, widgets.HBox((export_directory,))]
+    status_out = widgets.Output()
+    export_btn = widgets.Button(description=export_btn_text, button_style="success")
+    export_btn.on_click(lambda _: export_pdf(status_out, export_state))
+    header = panel_header(close_btn, export_btn, status_out)
+    panel_children: list[widgets.Widget] = [header]
     if panel_controls:
-        panel_children.append(controls_box)
-    panel_children.extend((status_out, tabs))
+        panel_children.append(widgets.VBox(tuple(panel_controls)))
+    panel_children.append(tabs)
     panel = widgets.VBox(tuple(panel_children))
     initialized_sections: set[int] = set()
     section_export_states: dict[int, dict[str, Any]] = {}
@@ -562,7 +602,7 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
         if callable(deactivate):
             deactivate()
 
-    def activate_selected_view(_: object = None) -> None:
+    def activate_selected_section() -> None:
         """Initialize or reactivate the currently selected lazy section."""
         selected_index = tabs.selected_index
         section = current_section(selected_index)
@@ -597,6 +637,13 @@ def make_lazy_panel_with_tabs(  # noqa: C901, PLR0915 -- coordinated lifecycle
         if callable(activate):
             activate()
         snapshot_section(selected_index)
+
+    def activate_selected_view() -> None:
+        """Activate the selected section; a failure is shown in the header status."""
+        try:
+            activate_selected_section()
+        except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+            viewers.show_render_failure(status_out, error)
 
     def show_panel(_: object = None) -> None:
         """Display the expanded panel and activate its selected view."""

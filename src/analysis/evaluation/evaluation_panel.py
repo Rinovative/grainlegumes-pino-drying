@@ -1,11 +1,14 @@
 """Compose curated evaluation panels over admitted artifacts.
 
 Responsibilities:
-  - Keep the approved single-model and comparison view order explicit
+  - Keep the approved view order explicit per task and per single-model or comparison mode
+  - Number the displayed tabs and views from their final position
   - Bind every view to its defined local controls and defaults
   - Accept caller-provided context labels and session-owned canonical frames
   - Keep comparison roles separate without an outer dataset selector
   - Preserve lazy first rendering and panel-local figure export
+  - Close a replaced panel together with every view it rendered
+  - Export the selected transient sample case as a GIF over all stored times
 
 Design principles:
   - Strict artifact loading and EvaluationSession binding precede construction
@@ -24,14 +27,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from html import escape
 from itertools import pairwise
 from math import isfinite
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from weakref import WeakKeyDictionary
 
 import ipywidgets as widgets
+import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.animation import PillowWriter
 
 from src import analysis
 from src.analysis.evaluation import evaluation_transient_artifact as transient_artifact
@@ -41,9 +48,10 @@ from src.learning.models import naming
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
+    from typing import IO
 
     from matplotlib.figure import Figure
+    from PIL import Image
 
     from src.analysis.evaluation.evaluation_selection import EvaluationSelectionState
     from src.analysis.evaluation.evaluation_session import EvaluationSession
@@ -53,8 +61,23 @@ _MINIMUM_COMPARISON_RUNS = 2
 _MINIMUM_VELOCITY_COMPONENTS = 2
 _FRAME_MATERIAL_CONTEXT_SIZE = 2
 _OUTLIER_COUNT = 5
+_GIF_DPI = 60
+_GIF_FPS = 5
+_GIF_BYTES_PER_PIXEL = 4
+_GIF_MEMORY_LIMIT_BYTES = 1_500_000_000
+_GIF_PROGRESS_STEP = 10
 
-SINGLE_MODEL_EVALUATION_SECTION_KEYS = (
+STEADY_SINGLE_SECTION_KEYS = (
+    "overview",
+    "global_error",
+    "error_decomposition",
+    "physical_consistency",
+    "spectral_analysis",
+    "parameter_sensitivity",
+    "sample_viewer",
+    "outlier_analysis",
+)
+STEADY_COMPARISON_SECTION_KEYS = (
     "overview",
     "global_error",
     "architecture",
@@ -65,10 +88,24 @@ SINGLE_MODEL_EVALUATION_SECTION_KEYS = (
     "sample_viewer",
     "outlier_analysis",
 )
-COMPARISON_EVALUATION_SECTION_KEYS = SINGLE_MODEL_EVALUATION_SECTION_KEYS
-TRANSIENT_EVALUATION_SECTION_KEYS = (
-    *SINGLE_MODEL_EVALUATION_SECTION_KEYS,
+TRANSIENT_SINGLE_SECTION_KEYS = (
+    "overview",
+    "global_error",
+    "error_decomposition",
     "temporal_rollout",
+    "sample_viewer",
+    "outlier_analysis",
+    "runtime",
+    "matched_stages",
+)
+TRANSIENT_COMPARISON_SECTION_KEYS = (
+    "overview",
+    "global_error",
+    "architecture",
+    "error_decomposition",
+    "temporal_rollout",
+    "sample_viewer",
+    "outlier_analysis",
     "runtime",
     "matched_stages",
 )
@@ -349,54 +386,61 @@ def _build_sections(
     parameter_options = tuple((analysis.evaluation.presentation.metadata_label(parameter), parameter) for parameter in parameters)
     toggle = analysis.ui.notebook.make_toggle_shortcut(dataset_map)
 
+    configuration_entry = toggle(
+        "Model-family configuration",
+        plots.run_summary.plot_architecture_table,
+        plot_name="Model-family configuration",
+    )
     overview_entries = [
         toggle(
-            "Overview: Summary table",
+            "Summary table",
             plots.run_summary.plot_run_summary_table,
-            plot_name="Overview: Summary table",
+            plot_name="Summary table",
         ),
     ]
     if comparison:
         overview_entries.extend(
             (
                 toggle(
-                    "Overview: Global comparison summary",
+                    "Global comparison summary",
                     plots.run_summary.plot_relative_comparison_scoreboard,
-                    plot_name="Overview: Global comparison summary",
+                    plot_name="Global comparison summary",
                 ),
                 toggle(
-                    "Overview: Pareto (Error vs Physics)",
+                    "Pareto (Error vs Physics)",
                     plots.run_summary.plot_accuracy_physics_pareto,
-                    plot_name="Overview: Pareto (Error vs Physics)",
+                    plot_name="Pareto (Error vs Physics)",
                 ),
             )
         )
+    else:
+        overview_entries.append(configuration_entry)
     global_error_entries = [
         toggle(
-            "1-1. Global error metrics",
+            "Global error metrics",
             plots.error_behavior.plot_global_error_metrics,
-            plot_name="1-1. Global error metrics",
+            plot_name="Global error metrics",
         ),
         toggle(
-            "1-2. Global error distribution",
+            "Global error distribution",
             viewers.make_casecount_viewer,
-            plot_name="1-2. Global error distribution",
+            plot_name="Global error distribution",
             plot_func=plots.error_behavior.plot_predictive_error_distributions,
             start_cases=50,
             step_size=50,
         ),
         toggle(
-            "1-3. GT vs Prediction (mean)",
+            "GT vs Prediction (mean)",
             viewers.make_casecount_viewer,
-            plot_name="1-3. GT vs Prediction (mean)",
+            plot_name="GT vs Prediction (mean)",
             plot_func=plots.error_behavior.plot_mean_field_bias,
             start_cases=50,
             step_size=50,
         ),
         toggle(
-            "1-4. Mean error maps",
+            "Mean error maps",
             viewers.make_casecount_viewer,
-            plot_name="1-4. Mean error maps",
+            plot_name="Mean error maps",
             plot_func=plots.error_behavior.plot_mean_error_maps,
             start_cases=100,
             step_size=50,
@@ -406,9 +450,9 @@ def _build_sections(
             },
         ),
         toggle(
-            "1-5. Std error maps",
+            "Std error maps",
             viewers.make_casecount_viewer,
-            plot_name="1-5. Std error maps",
+            plot_name="Std error maps",
             plot_func=plots.error_behavior.plot_std_error_maps,
             start_cases=100,
             step_size=50,
@@ -417,15 +461,11 @@ def _build_sections(
     ]
 
     architecture_entries = [
+        configuration_entry,
         toggle(
-            "2-1. Model-family configuration",
-            plots.run_summary.plot_architecture_table,
-            plot_name="2-1. Model-family configuration",
-        ),
-        toggle(
-            "2-2. Exact trainable parameters vs performance",
+            "Exact trainable parameters vs performance",
             viewers.make_casecount_viewer,
-            plot_name="2-2. Exact trainable parameters vs performance",
+            plot_name="Exact trainable parameters vs performance",
             plot_func=plots.sensitivity_capacity.plot_capacity_accuracy,
             start_cases=50,
             step_size=50,
@@ -434,9 +474,9 @@ def _build_sections(
 
     error_decomposition_entries = [
         toggle(
-            "3-1. Error vs |GT| magnitude",
+            "Error vs |GT| magnitude",
             viewers.make_casecount_viewer,
-            plot_name="3-1. Error vs |GT| magnitude",
+            plot_name="Error vs |GT| magnitude",
             plot_func=plots.error_behavior.plot_error_vs_target_magnitude,
             start_cases=50,
             step_size=50,
@@ -444,9 +484,9 @@ def _build_sections(
             selector_title="datasets",
         ),
         toggle(
-            "3-2. Boundary vs interior error",
+            "Boundary vs interior error",
             viewers.make_casecount_viewer,
-            plot_name="3-2. Boundary vs interior error",
+            plot_name="Boundary vs interior error",
             plot_func=plots.error_behavior.plot_boundary_error_decomposition,
             start_cases=100,
             step_size=50,
@@ -458,38 +498,38 @@ def _build_sections(
     if _physics_available(dataset_map):
         physical_entries = [
             toggle(
-                "4-1. Physical consistency summary table",
+                "Physical consistency summary table",
                 plots.physical_consistency.plot_physical_consistency_summary_table,
-                plot_name="4-1. Physical consistency summary table",
+                plot_name="Physical consistency summary table",
             ),
             toggle(
-                "4-2. Physical consistency CDF grid (2x2)",
+                "Physical consistency CDF grid (2x2)",
                 viewers.make_casecount_viewer,
-                plot_name="4-2. Physical consistency CDF grid (2x2)",
+                plot_name="Physical consistency CDF grid (2x2)",
                 plot_func=plots.physical_consistency.plot_physical_consistency_cdf_grid,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "4-3. Cross-section flux balance",
+                "Cross-section flux balance",
                 viewers.make_casecount_viewer,
-                plot_name="4-3. Cross-section flux balance",
+                plot_name="Cross-section flux balance",
                 plot_func=plots.physical_consistency.plot_flux_balance,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "4-4. Darcy–Brinkman operator residual",  # noqa: RUF001
+                "Darcy–Brinkman operator residual",  # noqa: RUF001
                 viewers.make_casecount_viewer,
-                plot_name="4-4. Darcy–Brinkman operator residual",  # noqa: RUF001
+                plot_name="Darcy–Brinkman operator residual",  # noqa: RUF001
                 plot_func=plots.physical_consistency.plot_brinkman_residual,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "4-5. Pressure and boundary-condition consistency",
+                "Pressure and boundary-condition consistency",
                 viewers.make_casecount_viewer,
-                plot_name="4-5. Pressure and boundary-condition consistency",
+                plot_name="Pressure and boundary-condition consistency",
                 plot_func=plots.physical_consistency.plot_pressure_consistency,
                 start_cases=100,
                 step_size=50,
@@ -498,9 +538,9 @@ def _build_sections(
 
     spectral_entries = [
         toggle(
-            "5-1. Demand vs prediction + error",
+            "Demand vs prediction + error",
             viewers.make_casecount_viewer,
-            plot_name="5-1. Demand vs prediction + error",
+            plot_name="Demand vs prediction + error",
             plot_func=plots.spectral_fidelity.plot_spectral_demand_prediction_error,
             start_cases=50,
             step_size=50,
@@ -510,9 +550,9 @@ def _build_sections(
             },
         ),
         toggle(
-            "5-2. Log spectral transfer with support",
+            "Log spectral transfer with support",
             viewers.make_casecount_viewer,
-            plot_name="5-2. Log spectral transfer with support",
+            plot_name="Log spectral transfer with support",
             plot_func=plots.spectral_fidelity.plot_spectral_transfer_ratio,
             start_cases=50,
             step_size=50,
@@ -524,17 +564,17 @@ def _build_sections(
     if parameters:
         sensitivity_entries = [
             toggle(
-                "6-1. Parameter-error correlation (heatmap)",
+                "Parameter-error correlation (heatmap)",
                 viewers.make_casecount_viewer,
-                plot_name="6-1. Parameter-error correlation (heatmap)",
+                plot_name="Parameter-error correlation (heatmap)",
                 plot_func=plots.sensitivity_capacity.plot_metadata_error_heatmap,
                 start_cases=100,
                 step_size=50,
             ),
             toggle(
-                "6-2. Error vs input parameter (binned trend)",
+                "Error vs input parameter (binned trend)",
                 viewers.make_casecount_viewer,
-                plot_name="6-2. Error vs input parameter (binned trend)",
+                plot_name="Error vs input parameter (binned trend)",
                 plot_func=plots.sensitivity_capacity.plot_metadata_error_trends,
                 start_cases=100,
                 step_size=50,
@@ -544,9 +584,9 @@ def _build_sections(
 
     sample_entries = [
         toggle(
-            "7-1. Sample GT vs Prediction",
+            "Sample GT vs Prediction",
             _make_steady_indexed_viewer,
-            plot_name="7-1. Sample GT vs Prediction",
+            plot_name="Sample GT vs Prediction",
             plot_func=plots.samples_outliers.plot_sample_prediction_overview,
             controls={
                 "scale_mode": controls.ui_radio_pred_scale_mode(),
@@ -561,9 +601,9 @@ def _build_sections(
     if _permeability_available(dataset_map):
         sample_entries.append(
             toggle(
-                "7-2. Kappa tensor with error overlay",
+                "Kappa tensor with error overlay",
                 _make_steady_indexed_viewer,
-                plot_name="7-2. Kappa tensor with error overlay",
+                plot_name="Kappa tensor with error overlay",
                 plot_func=plots.samples_outliers.plot_permeability_error_overlay,
                 controls={
                     "kappa_scale": controls.ui_radio_kappa_scale(),
@@ -580,9 +620,9 @@ def _build_sections(
         labels = tuple(dataset_map)
         sample_entries.append(
             toggle(
-                "7-3. Pressure & velocity field comparison",
+                "Pressure & velocity field comparison",
                 _make_steady_indexed_viewer,
-                plot_name="7-3. Pressure & velocity field comparison",
+                plot_name="Pressure & velocity field comparison",
                 plot_func=plots.samples_outliers.plot_pressure_velocity_comparison,
                 controls={
                     "model_1": _dropdown(labels, description="Model 1:", value=labels[0]),
@@ -598,16 +638,16 @@ def _build_sections(
 
     outlier_entries = [
         toggle(
-            "8-1. Worst per-channel cases (tables)",
+            "Worst per-channel cases (tables)",
             _make_outlier_table_viewer,
-            plot_name="8-1. Worst per-channel cases (tables)",
+            plot_name="Worst per-channel cases (tables)",
             plot_func=plots.samples_outliers.plot_outlier_table,
             top_k=_OUTLIER_COUNT,
         ),
         toggle(
-            "8-2. Worst per-channel cases (field plots)",
+            "Worst per-channel cases (field plots)",
             viewers.make_indexed_viewer,
-            plot_name="8-2. Worst per-channel cases (field plots)",
+            plot_name="Worst per-channel cases (field plots)",
             plot_func=plots.samples_outliers.plot_linked_outlier_cases,
             controls={
                 "channel": controls.ui_dropdown_channel(channels=channels),
@@ -623,14 +663,14 @@ def _build_sections(
         outlier_entries.extend(
             (
                 toggle(
-                    "8-3. Extreme input parameters (table view)",
+                    "Extreme input parameters (table view)",
                     plots.samples_outliers.plot_input_extremes_table,
-                    plot_name="8-3. Extreme input parameters (table view)",
+                    plot_name="Extreme input parameters (table view)",
                 ),
                 toggle(
-                    "8-4. Extreme input parameter cases (field plots)",
+                    "Extreme input parameter cases (field plots)",
                     viewers.make_indexed_viewer,
-                    plot_name="8-4. Extreme input parameter cases (field plots)",
+                    plot_name="Extreme input parameter cases (field plots)",
                     plot_func=plots.samples_outliers.plot_linked_input_extreme_cases,
                     controls={
                         "parameter": _dropdown(parameter_options, description="Parameter:"),
@@ -647,7 +687,7 @@ def _build_sections(
     registry = {
         "overview": (overview_entries, EVALUATION_SECTION_TITLES["overview"]),
         "global_error": (global_error_entries, EVALUATION_SECTION_TITLES["global_error"]),
-        "architecture": (architecture_entries, EVALUATION_SECTION_TITLES["architecture"]),
+        "architecture": (architecture_entries if comparison else [], EVALUATION_SECTION_TITLES["architecture"]),
         "error_decomposition": (error_decomposition_entries, EVALUATION_SECTION_TITLES["error_decomposition"]),
         "physical_consistency": (physical_entries, EVALUATION_SECTION_TITLES["physical_consistency"]),
         "spectral_analysis": (spectral_entries, EVALUATION_SECTION_TITLES["spectral_analysis"]),
@@ -662,11 +702,11 @@ def _selected_section_keys(
     sections: Sequence[str] | str,
     *,
     registry: Mapping[str, object],
-) -> list[str]:
-    """Validate explicit section selection against the fixed approved order."""
-    approved = SINGLE_MODEL_EVALUATION_SECTION_KEYS
+    order: Sequence[str],
+) -> tuple[str, ...]:
+    """Validate section selection against the approved order of one task and mode."""
     if sections == "all":
-        return [key for key in approved if key in registry]
+        return tuple(key for key in order if key in registry)
     if isinstance(sections, str) or not isinstance(sections, Sequence) or not sections:
         msg = "sections must be 'all' or a non-empty sequence of section keys."
         raise TypeError(msg)
@@ -677,7 +717,7 @@ def _selected_section_keys(
     if len(selected) != len(set(selected)):
         msg = "sections must not contain duplicate keys."
         raise ValueError(msg)
-    unknown = sorted(set(selected).difference(approved))
+    unknown = sorted(set(selected).difference(order))
     if unknown:
         msg = f"Unknown evaluation sections: {unknown}."
         raise ValueError(msg)
@@ -685,7 +725,74 @@ def _selected_section_keys(
     if unavailable:
         msg = f"Evaluation sections are unavailable for these artifacts: {unavailable}."
         raise ValueError(msg)
-    return list(selected)
+    return selected
+
+
+_RENDERED_VIEWS: WeakKeyDictionary[widgets.Widget, list[widgets.Widget]] = WeakKeyDictionary()
+
+
+def _record_views(factory: Callable[..., Any], views: list[widgets.Widget]) -> Callable[..., Any]:
+    """Wrap one lazy entry so that its panel knows every widget the entry renders."""
+
+    @wraps(factory)
+    def build(**context: Any) -> Any:
+        result = factory(**context)
+        views.extend(item for item in (result if isinstance(result, tuple) else (result,)) if isinstance(item, widgets.Widget))
+        return result
+
+    return build
+
+
+def close_panel(panel: widgets.Widget) -> None:
+    """Close a replaced panel, its nested widgets and every view it rendered.
+
+    Rendered views live in output areas, not in ``children``, and keep their loaded records and compute-preference
+    callbacks alive until they are closed. Deactivation stops a later preference change from reaching a view whose
+    session is already closed.
+    """
+    nested = (*getattr(panel, "children", ()), getattr(panel, "tabs", None), *_RENDERED_VIEWS.pop(panel, ()))
+    for widget in nested:
+        if isinstance(widget, widgets.Widget):
+            close_panel(widget)
+    deactivate = getattr(panel, "deactivate", None)
+    if callable(deactivate):
+        deactivate()
+    panel.close()
+
+
+def _assemble_panel(
+    registry: Mapping[str, tuple[list[tuple[str, Callable[..., Any], str]], str]],
+    keys: Sequence[str],
+    *,
+    export_state: dict[str, Any],
+    comparison: bool,
+) -> widgets.Widget:
+    """Build the lazy panel and number its tabs and views by displayed position.
+
+    The tab title is ``"{n}. {title}"`` and a view title ``"{n}-{k}. {title}"``; both its dropdown label and its export
+    plot name carry the displayed number, so capability filtering and section selection never leave a gap.
+    """
+    views: list[widgets.Widget] = []
+    sections: list[widgets.Widget] = []
+    titles: list[str] = []
+    for tab, key in enumerate(keys, start=1):
+        entries, title = registry[key]
+        numbered: list[tuple[str, Callable[..., Any], str]] = []
+        for position, (entry_title, factory, _entry_key) in enumerate(entries, start=1):
+            name = f"{tab}-{position}. {entry_title}"
+            numbered.append((name, _record_views(factory, views), name))
+        sections.append(analysis.ui.notebook.make_dropdown_section(numbered, export_state=export_state, select_first=True))
+        titles.append(f"{tab}. {title}")
+    panel = analysis.ui.notebook.make_lazy_panel_with_tabs(
+        sections,
+        tab_titles=titles,
+        open_btn_text="Model comparison - Open Evaluation" if comparison else "Single model - Open Evaluation",
+        close_btn_text="Close",
+        export_state=export_state,
+        export_btn_text="Export PDF",
+    )
+    _RENDERED_VIEWS[panel] = views
+    return panel
 
 
 def _build_panel(
@@ -694,7 +801,6 @@ def _build_panel(
     comparison: bool,
     sections: Sequence[str] | str,
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build one lazy panel without an outer dataset selector."""
     dataset_map = dict(datasets)
@@ -703,7 +809,11 @@ def _build_panel(
         comparison=comparison,
         selection_state=selection_state,
     )
-    section_keys = _selected_section_keys(sections, registry=registry)
+    section_keys = _selected_section_keys(
+        sections,
+        registry=registry,
+        order=STEADY_COMPARISON_SECTION_KEYS if comparison else STEADY_SINGLE_SECTION_KEYS,
+    )
     if not section_keys:
         msg = "The selected artifacts provide no approved evaluation sections."
         raise ValueError(msg)
@@ -714,25 +824,7 @@ def _build_panel(
         "filename_stem": None,
         "filename_prefix": "steady_flow",
     }
-    ui_sections = [
-        analysis.ui.notebook.make_dropdown_section(
-            registry[key][0],
-            export_state=export_state,
-            select_first=True,
-        )
-        for key in section_keys
-    ]
-    open_text = "Model comparison - Open Evaluation" if comparison else "Single model - Open Evaluation"
-    return analysis.ui.notebook.make_lazy_panel_with_tabs(
-        ui_sections,
-        tab_titles=[registry[key][1] for key in section_keys],
-        open_btn_text=open_text,
-        close_btn_text="Close",
-        export_state=export_state,
-        export_dir="" if export_dir is None else str(export_dir),
-        export_btn_text="Export PDF",
-        protected_export_roots=tuple(frame.attrs["artifact_root"] for frame in datasets.values() if "artifact_root" in frame.attrs),
-    )
+    return _assemble_panel(registry, section_keys, export_state=export_state, comparison=comparison)
 
 
 def _normalize_contexts(
@@ -792,7 +884,6 @@ def build_single_model_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build one single-model panel containing every supplied dataset."""
     normalized = _normalize_contexts(session, contexts, comparison=False)
@@ -806,7 +897,6 @@ def build_single_model_panel(
         comparison=False,
         sections=sections,
         selection_state=selection_state,
-        export_dir=export_dir,
     )
 
 
@@ -816,7 +906,6 @@ def build_comparison_panel(
     contexts: Sequence[EvaluationContext],
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build separate role-local comparison panels without a selector."""
     normalized = _normalize_contexts(session, contexts, comparison=True)
@@ -826,7 +915,6 @@ def build_comparison_panel(
             comparison=True,
             sections=sections,
             selection_state=selection_state,
-            export_dir=export_dir,
         )
         for context in normalized
     ]
@@ -895,32 +983,6 @@ def _shared_transient_physical_times(records: Sequence[Any]) -> tuple[float, ...
         msg = "Aggregate transient cases contain no exact stored physical time."
         raise ValueError(msg)
     return times
-
-
-def _transient_section_keys(
-    sections: Sequence[str] | str,
-    *,
-    registry: Mapping[str, object],
-) -> tuple[str, ...]:
-    """Validate transient selection against baseline order plus one final extension."""
-    if sections == "all":
-        return tuple(key for key in TRANSIENT_EVALUATION_SECTION_KEYS if key in registry)
-    if isinstance(sections, str) or not isinstance(sections, Sequence) or not sections:
-        msg = "Transient sections must be 'all' or a non-empty sequence."
-        raise TypeError(msg)
-    selected = tuple(sections)
-    if any(not isinstance(key, str) for key in selected) or len(set(selected)) != len(selected):
-        msg = "Transient sections must contain unique string keys."
-        raise ValueError(msg)
-    unknown = sorted(set(selected).difference(TRANSIENT_EVALUATION_SECTION_KEYS))
-    if unknown:
-        msg = f"Unknown transient Evaluation sections: {unknown}."
-        raise ValueError(msg)
-    unavailable = tuple(key for key in selected if key not in registry)
-    if unavailable:
-        msg = f"Transient Evaluation sections are unavailable for these artifacts: {list(unavailable)}."
-        raise ValueError(msg)
-    return selected
 
 
 def _transient_channel_fields(
@@ -1134,6 +1196,132 @@ def _transient_reference_scales(
     return result
 
 
+def _show_output_line(out: widgets.Output, message: str) -> None:
+    """Replace the content of one status output with a single line."""
+    with out:
+        out.clear_output(wait=True)
+        print(message)
+
+
+class _HandleGifWriter(PillowWriter):
+    """Collect frames like PillowWriter, then write the GIF through one already open handle."""
+
+    _frames: list[Image.Image]
+
+    def __init__(self, handle: IO[bytes]) -> None:
+        super().__init__(fps=_GIF_FPS)
+        self._handle = handle
+
+    def finish(self) -> None:
+        """Write the collected frames as one looping GIF without reopening the reserved path."""
+        # Another process could replace the reserved path after its exclusive creation; the open handle stays the reserved file.
+        self._frames[0].save(self._handle, format="GIF", save_all=True, append_images=self._frames[1:], duration=int(1000 / self.fps), loop=0)
+
+
+def _write_state_map_gif(
+    handle: IO[bytes],
+    *,
+    record: Any,
+    times: tuple[float, ...],
+    plot_kwargs: dict[str, Any],
+    progress: Callable[[int], None],
+) -> None:
+    """Render one frame per stored time on a single reused figure and write them as a looping GIF."""
+    transient = analysis.evaluation.plots.transient
+    norms = transient.state_map_norms(
+        record,
+        state_fields=plot_kwargs["state_fields"],
+        time_indices=range(len(times)),
+        lock_scale=plot_kwargs["lock_scale"],
+        error_mode=plot_kwargs["error_mode"],
+        reference_scales=plot_kwargs["reference_scales"],
+    )
+    figure, _axes = analysis.ui.plot_layout.map_subplots(rows=len(plot_kwargs["state_fields"]), columns=3)
+    try:
+        # The writer keeps its frames in memory; the setup path only names the reserved file's folder.
+        with _HandleGifWriter(handle).saving(figure, str(Path(handle.name)), _GIF_DPI) as writer:
+            for done, time in enumerate(times, start=1):
+                transient.plot_state_maps(record, physical_time=time, norms=norms, figure=figure, **plot_kwargs)
+                writer.grab_frame()
+                progress(done)
+    finally:
+        plt.close(figure)
+
+
+def _transient_sample_status(entry: Any, suffix: str) -> str:
+    """Return the sample-viewer case status line: material and role, exact case and relation."""
+    assignment = entry.evaluation_assignment
+    declared_role = str(assignment["role"]) if assignment is not None else entry.dataset_role
+    context = analysis.presentation.display_labels.material_role_display_label(entry.material_family, declared_role)
+    relation = f" · relation: {assignment['relation']}" if assignment is not None else ""
+    return (
+        f"<span style='color:#555'><b>{escape(context)}</b> · Exact case: "
+        f"<code>{escape(entry.case_id)}</code>{escape(relation)}{escape(suffix)}</span>"
+    )
+
+
+def _transient_sample_stem(entry: Any, plot_name: str | None, channels: tuple[str, ...], time_part: str) -> str:
+    """Return the export file stem of one sample-viewer case, channel selection and time part."""
+    return "__".join(
+        (
+            "transient_drying",
+            entry.frame_name,
+            str(plot_name or "sample"),
+            f"case_{entry.case_id}",
+            f"channel_{'-'.join(channels)}",
+            time_part,
+        )
+    )
+
+
+def _gif_status_output() -> widgets.Output:
+    """Return the GIF status output, initially stating how the colour scales behave."""
+    status = widgets.Output()
+    _show_output_line(status, "GIF: colour scales fixed over all times")
+    return status
+
+
+def _click_gif_export(button: widgets.Button, status: widgets.Output, inputs: Callable[[], tuple[str, Any, dict[str, Any]]]) -> None:
+    """Run one GIF export with its button disabled, showing any failure in the status."""
+    button.disabled = True
+    try:
+        stem, record, plot_kwargs = inputs()
+        _export_state_map_gif(status, stem=stem, record=record, plot_kwargs=plot_kwargs)
+    except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+        analysis.ui.viewers.show_render_failure(status, error)
+    finally:
+        button.disabled = False
+
+
+def _export_state_map_gif(status: widgets.Output, *, stem: str, record: Any, plot_kwargs: dict[str, Any]) -> None:
+    """Refuse a GIF whose frames would exceed the memory limit, otherwise export it through the shared allocator."""
+    channels = plot_kwargs["state_fields"]
+    if not channels:
+        _show_output_line(status, "[GIF] Select at least one compatible channel.")
+        return
+    times = tuple(float(value) for value in record.physical_times)
+    width, height = analysis.ui.plot_layout.MAP_LAYOUT.figure_size(rows=len(channels), columns=3)
+    frame_bytes = len(times) * round(width * _GIF_DPI) * round(height * _GIF_DPI) * _GIF_BYTES_PER_PIXEL
+    if frame_bytes > _GIF_MEMORY_LIMIT_BYTES:
+        _show_output_line(
+            status,
+            f"[GIF] Refused: {len(times)} frames need about {frame_bytes / 1e9:.1f} GB (limit {_GIF_MEMORY_LIMIT_BYTES / 1e9:.1f} GB). "
+            "Deselect channels or choose a case with fewer stored times.",
+        )
+        return
+
+    def progress(done: int) -> None:
+        if done % _GIF_PROGRESS_STEP == 0 and done < len(times):
+            _show_output_line(status, f"[GIF] Frame {done}/{len(times)} · colour scales fixed over all times")
+
+    analysis.ui.notebook.write_export(
+        status,
+        stem=stem,
+        suffix=".gif",
+        write=partial(_write_state_map_gif, record=record, times=times, plot_kwargs=plot_kwargs, progress=progress),
+    )
+
+
 def _make_transient_sample_viewer(
     *,
     session: TransientEvaluationSession,
@@ -1178,8 +1366,10 @@ def _make_transient_sample_viewer(
     scale_lock = analysis.ui.components.ui_checkbox_map_scale_lock(value=True)
     error_mode = analysis.ui.components.ui_radio_transient_error_mode()
     display_stride = analysis.ui.components.ui_dropdown_display_spatial_stride()
-    scale_container = widgets.HBox((scale_lock, error_mode, display_stride))
+    switch_row = analysis.ui.components.ui_control_row(error_mode, scale_lock, display_stride)
     time_container = widgets.VBox()
+    gif_button = widgets.Button(description="Export GIF", layout=widgets.Layout(width="145px"))
+    gif_status = _gif_status_output()
     output = analysis.ui.components.ui_output_plot()
     navigator: analysis.ui.time.TimeStepNavigator | None = None
     state = {"updating": False}
@@ -1246,31 +1436,10 @@ def _make_transient_sample_viewer(
             physical_time = navigator.selection.physical_time
         publish(record, physical_time, channels)
         entry = current_entry()
-        reference_scales = (
-            _transient_reference_scales(session, entry.frame_name, channels, record)
-            if error_mode.value == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
-            else {}
-        )
-        assignment = entry.evaluation_assignment
-        declared_role = str(assignment["role"]) if assignment is not None else entry.dataset_role
-        context = analysis.presentation.display_labels.material_role_display_label(entry.material_family, declared_role)
-        relation = f" · relation: {assignment['relation']}" if assignment is not None else ""
-        suffix = f" · selected-channel error-max time: {physical_time:g} h" if outlier else ""
-        status.value = (
-            f"<span style='color:#555'><b>{escape(context)}</b> · Exact case: "
-            f"<code>{escape(entry.case_id)}</code>{escape(relation)}{escape(suffix)}</span>"
-        )
+        reference_scales = _transient_reference_scales(session, entry.frame_name, channels, record)
+        status.value = _transient_sample_status(entry, f" · selected-channel error-max time: {physical_time:g} h" if outlier else "")
         if export_state is not None:
-            export_state["filename_stem"] = "__".join(
-                (
-                    "transient_drying",
-                    entry.frame_name,
-                    str(export_plot_name or "sample"),
-                    f"case_{entry.case_id}",
-                    f"channel_{'-'.join(channels)}",
-                    f"t_{physical_time:g}h",
-                )
-            )
+            export_state["filename_stem"] = _transient_sample_stem(entry, export_plot_name, channels, f"t_{physical_time:g}h")
         analysis.ui.viewers.render_figure(
             out=output,
             plot_func=analysis.evaluation.plots.transient.plot_state_maps,
@@ -1317,7 +1486,7 @@ def _make_transient_sample_viewer(
                     callback=lambda _selection: render(),
                     initial_time=initial_time,
                 )
-                time_container.children = (navigator.widget,)
+                time_container.children = (analysis.ui.components.ui_control_row(navigator.widget, gif_button, gif_status),)
             else:
                 navigator.rebind(
                     times,
@@ -1332,6 +1501,18 @@ def _make_transient_sample_viewer(
         current = int(cast("int", case_selector.value))
         case_selector.value = min(max(current + offset, 0), len(inventory) - 1)
 
+    def gif_inputs() -> tuple[str, Any, dict[str, Any]]:
+        channels, record, entry = channel_state.selected, selected_record(), current_entry()
+        plot_kwargs = {
+            "state_fields": channels,
+            "lock_scale": bool(scale_lock.value),
+            "error_mode": str(error_mode.value),
+            "reference_scales": _transient_reference_scales(session, entry.frame_name, channels, record),
+            "display_spatial_stride": display_stride.value,
+        }
+        return _transient_sample_stem(entry, export_plot_name, channels, "t-all"), record, plot_kwargs
+
+    gif_button.on_click(lambda button: _click_gif_export(button, gif_status, gif_inputs))
     case_selector.observe(rebind_case, names="value")
     previous.on_click(lambda _button: step_case(-1))
     following.on_click(lambda _button: step_case(1))
@@ -1341,10 +1522,10 @@ def _make_transient_sample_viewer(
     rebind_case()
     children: tuple[widgets.Widget, ...] = (
         case_row,
-        status,
         channel_state.container,
-        scale_container,
+        switch_row,
         time_container,
+        status,
         output,
     )
     return _ActivatableVBox(children, activate=rebind_case)
@@ -2006,26 +2187,6 @@ def _transient_temporal_capabilities(
     return full, horizon, target
 
 
-TRANSIENT_PLOT_CLASSIFICATION = {
-    "Overview: Summary table": "AGGREGATE_ONLY",
-    "Overview: Global comparison summary": "AGGREGATE_ONLY",
-    "1-1. Global error metrics": "AGGREGATE_ONLY",
-    "1-2. Global error distribution": "AGGREGATE_ONLY",
-    "1-3. GT vs Prediction (mean)": "AGGREGATE_ONLY",
-    "1-4. Mean error maps": "AGGREGATE_ONLY",
-    "1-5. Std error maps": "AGGREGATE_ONLY",
-    "2-1. Model-family configuration": "AGGREGATE_ONLY",
-    "3-1. Error vs |GT| magnitude": "SINGLE_AND_AGGREGATE",
-    "7-1. Sample GT vs Prediction": "SINGLE_ONLY",
-    "8-1. Worst per-channel cases (tables)": "AGGREGATE_ONLY",
-    "8-2. Worst per-channel cases (field plots)": "SINGLE_ONLY",
-    "9-1. Reference vs prediction trajectories": "SINGLE_AND_AGGREGATE",
-    "9-2. Error over physical time": "SINGLE_AND_AGGREGATE",
-    "9-3. Error vs rollout horizon": "AGGREGATE_ONLY",
-    "9-4. Final-state drying summary": "AGGREGATE_ONLY",
-}
-
-
 def _make_transient_runtime_viewer(
     *,
     session: TransientEvaluationSession,
@@ -2101,7 +2262,7 @@ def _make_transient_runtime_viewer(
 
 def _transient_matched_stage_status(reason: str | None) -> widgets.HTML:
     """Explain missing controlled comparison evidence without blocking general plots."""
-    text = reason or "Select exactly one admitted A0/B/A1 or A0/B/A+ group with shared A0 and immutable B budget evidence."
+    text = reason or "Select exactly one admitted A0/B/A1 group with shared A0 and immutable B budget evidence."
     return widgets.HTML(f"<b>Controlled stage comparison unavailable.</b> {escape(text)} General prediction comparisons remain available.")
 
 
@@ -2237,21 +2398,12 @@ def _build_transient_sections(
 
         return build
 
-    overview_entries = [
-        (
-            "Overview: Summary table",
-            summary_table,
-            "overview_summary_table",
-        )
-    ]
+    configuration_entry = ("Model-family configuration", architecture_table, "model_family_configuration")
+    overview_entries = [("Summary table", summary_table, "overview_summary_table")]
     if comparison:
-        overview_entries.append(
-            (
-                "Overview: Global comparison summary",
-                comparison_summary,
-                "overview_global_comparison_summary",
-            )
-        )
+        overview_entries.append(("Global comparison summary", comparison_summary, "overview_global_comparison_summary"))
+    else:
+        overview_entries.append(configuration_entry)
     registry: dict[
         str,
         tuple[list[tuple[str, Callable[..., Any], str]], str],
@@ -2262,85 +2414,37 @@ def _build_transient_sections(
         ),
         "global_error": (
             [
+                ("Global error metrics", global_metrics, "global_error_metrics"),
+                ("Global error distribution", distributions, "global_error_distribution"),
+                ("GT vs Prediction (mean)", aggregate_view("predicted_reference"), "gt_vs_prediction_mean"),
+                ("Mean error maps", aggregate_view("mean_error"), "mean_error_maps"),
+                ("Std error maps", aggregate_view("std_error"), "std_error_maps"),
                 (
-                    "1-1. Global error metrics",
-                    global_metrics,
-                    "1_1_global_error_metrics",
-                ),
-                (
-                    "1-2. Global error distribution",
-                    distributions,
-                    "1_2_global_error_distribution",
-                ),
-                (
-                    "1-3. GT vs Prediction (mean)",
-                    aggregate_view("predicted_reference"),
-                    "1_3_gt_vs_prediction_mean",
-                ),
-                (
-                    "1-4. Mean error maps",
-                    aggregate_view("mean_error"),
-                    "1_4_mean_error_maps",
-                ),
-                (
-                    "1-5. Std error maps",
-                    aggregate_view("std_error"),
-                    "1_5_std_error_maps",
-                ),
-                (
-                    "1-6. Endpoint vs cumulative error",
+                    "Endpoint vs cumulative error",
                     lambda: plots.plot_endpoint_vs_cumulative(session.dataset_dataframe()),
-                    "1_6_endpoint_cumulative_error",
+                    "endpoint_cumulative_error",
                 ),
             ],
             EVALUATION_SECTION_TITLES["global_error"],
         ),
-        "architecture": (
-            [
-                (
-                    "2-1. Model-family configuration",
-                    architecture_table,
-                    "2_1_model_family_configuration",
-                )
-            ],
-            EVALUATION_SECTION_TITLES["architecture"],
-        ),
         "error_decomposition": (
-            [
-                (
-                    "3-1. Error vs |GT| magnitude",
-                    scoped_view("target_magnitude"),
-                    "3_1_error_vs_gt_magnitude",
-                )
-            ],
+            [("Error vs |GT| magnitude", scoped_view("target_magnitude"), "error_vs_gt_magnitude")],
             EVALUATION_SECTION_TITLES["error_decomposition"],
         ),
         "sample_viewer": (
-            [
-                (
-                    "7-1. Sample GT vs Prediction",
-                    sample_view(False),
-                    "7_1_sample_gt_vs_prediction",
-                )
-            ],
+            [("Sample GT vs Prediction", sample_view(False), "sample_gt_vs_prediction")],
             EVALUATION_SECTION_TITLES["sample_viewer"],
         ),
         "outlier_analysis": (
             [
-                (
-                    "8-1. Worst per-channel cases (tables)",
-                    outlier_table,
-                    "8_1_worst_per_channel_tables",
-                ),
-                (
-                    "8-2. Worst per-channel cases (field plots)",
-                    sample_view(True),
-                    "8_2_worst_per_channel_fields",
-                ),
+                ("Worst per-channel cases (tables)", outlier_table, "worst_per_channel_tables"),
+                ("Worst per-channel cases (field plots)", sample_view(True), "worst_per_channel_fields"),
             ],
             EVALUATION_SECTION_TITLES["outlier_analysis"],
         ),
     }
+    if comparison:
+        registry["architecture"] = ([configuration_entry], EVALUATION_SECTION_TITLES["architecture"])
     registry["runtime"] = (
         [
             ("Measured runtime distributions", _transient_runtime_entry(session, "distributions"), "runtime_distributions"),
@@ -2367,32 +2471,24 @@ def _build_transient_sections(
     if has_full:
         temporal_entries.extend(
             (
-                (
-                    "9-1. Reference vs prediction trajectories",
-                    scoped_view("trajectory"),
-                    "9_1_reference_prediction_trajectories",
-                ),
-                (
-                    "9-2. Error over physical time",
-                    scoped_view("error_time"),
-                    "9_2_error_over_physical_time",
-                ),
+                ("Reference vs prediction trajectories", scoped_view("trajectory"), "reference_prediction_trajectories"),
+                ("Error over physical time", scoped_view("error_time"), "error_over_physical_time"),
             )
         )
     if has_horizon:
         temporal_entries.append(
             (
-                "9-3. Error vs rollout horizon",
+                "Error vs rollout horizon",
                 lambda: plots.plot_horizon_error(session.dataset_dataframe()),
-                "9_3_error_vs_rollout_horizon",
+                "error_vs_rollout_horizon",
             )
         )
     if has_target:
         temporal_entries.append(
             (
-                "9-4. Final-state drying summary",
+                "Final-state drying summary",
                 lambda: plots.plot_target_time({name: session.full_autonomous_summaries(name) for name in session.frame_names}),
-                "9_4_final_state_drying_summary",
+                "final_state_drying_summary",
             )
         )
     if temporal_entries:
@@ -2412,7 +2508,6 @@ def build_transient_panel(
     matched_stage_unavailable_reason: str | None = None,
     selection_state: EvaluationSelectionState | None = None,
     evaluation_compute_device: str | compute.AnalysisComputePreference = "cpu",
-    export_dir: Path | str | None = None,
 ) -> widgets.Widget:
     """Build the baseline Evaluation architecture with transient capabilities."""
     if not session.frame_names:
@@ -2428,7 +2523,11 @@ def build_transient_panel(
         training_performance=training_performance,
         matched_stage_unavailable_reason=matched_stage_unavailable_reason,
     )
-    selected = _transient_section_keys(sections, registry=registry)
+    selected = _selected_section_keys(
+        sections,
+        registry=registry,
+        order=TRANSIENT_COMPARISON_SECTION_KEYS if comparison else TRANSIENT_SINGLE_SECTION_KEYS,
+    )
     if not selected:
         msg = "The selected transient artifacts provide no approved Evaluation sections."
         raise ValueError(msg)
@@ -2440,21 +2539,4 @@ def build_transient_panel(
         "filename_stem": None,
         "filename_prefix": "transient_drying",
     }
-    ui_sections = [
-        analysis.ui.notebook.make_dropdown_section(
-            registry[key][0],
-            export_state=export_state,
-            select_first=True,
-        )
-        for key in selected
-    ]
-    return analysis.ui.notebook.make_lazy_panel_with_tabs(
-        ui_sections,
-        tab_titles=[registry[key][1] for key in selected],
-        open_btn_text=("Model comparison - Open Evaluation" if comparison else "Single model - Open Evaluation"),
-        close_btn_text="Close",
-        export_state=export_state,
-        export_dir="" if export_dir is None else str(export_dir),
-        export_btn_text="Export PDF",
-        protected_export_roots=session.artifact_roots,
-    )
+    return _assemble_panel(registry, selected, export_state=export_state, comparison=comparison)

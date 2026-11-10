@@ -54,13 +54,13 @@ from src import datasets, domain, generation
 from src.analysis import evaluation
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
 
-from . import physics_diagnostics_sources as sources
+from . import component_checks_sources as sources
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from .physics_diagnostics_sources import TransientReferenceCase
+    from .component_checks_sources import Membership, TransientReferenceCase
 
 # CODATA 2018 molar gas constant, as COMSOL's R_const.
 MOLAR_GAS_CONSTANT: Final = 8.314462618
@@ -542,11 +542,13 @@ def evaluate_case(case: TransientReferenceCase) -> CaseBalanceDiagnostics:
 def evaluate_dataset(
     dataset_id: str,
     *,
+    membership: Membership,
     storage_root: Path | str | None = None,
     max_cases: int | None = None,
 ) -> list[CaseBalanceDiagnostics]:
-    """Evaluate every balance diagnostic for the leading cases of one transient Dataset."""
-    return [evaluate_case(case) for case in sources.iter_transient_reference_cases(dataset_id, storage_root=storage_root, max_cases=max_cases)]
+    """Evaluate every balance diagnostic for the leading cases of one transient Dataset membership."""
+    cases = sources.iter_transient_reference_cases(dataset_id, membership=membership, storage_root=storage_root, max_cases=max_cases)
+    return [evaluate_case(case) for case in cases]
 
 
 def summary_table(cases: Sequence[CaseBalanceDiagnostics]) -> pd.DataFrame:

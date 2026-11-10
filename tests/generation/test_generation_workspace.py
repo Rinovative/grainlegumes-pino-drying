@@ -31,7 +31,7 @@ def _steady_natural_batch_name() -> str:
     return generation.cases.config.build_batch_name(
         "steady_flow",
         "lentil",
-        "natural",
+        "test",
     )
 
 
@@ -254,6 +254,7 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
             cores_per_case=1,
             storage_root=storage,
             work_root=tmp_path / "work",
+            scheduler_kind="local",
         )
     assert not observed["work"].exists()
     first = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
@@ -261,7 +262,6 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
     assert first.payload["case_state"] == "interrupted"
     assert first.payload["attempt_index"] == 1
     assert first.payload["previous_attempt"] is None
-    assert first.payload["schema_version"] == 1
     first_cleanup = attempt_service.attempt_cleanup_evidence(first)
     assert first_cleanup is not None
     assert first_cleanup["status"] == "complete"
@@ -279,6 +279,7 @@ def test_interrupted_case_persists_attempt_and_remains_rerunnable(
             cores_per_case=1,
             storage_root=storage,
             work_root=tmp_path / "work",
+            scheduler_kind="local",
         )
     second = attempt_service.latest_case_attempt(config, 1, storage_root=storage)
     assert second is not None

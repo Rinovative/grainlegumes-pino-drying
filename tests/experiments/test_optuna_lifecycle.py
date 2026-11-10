@@ -135,8 +135,6 @@ def test_signature_excludes_runtime_location_but_covers_science(
     """Separate study continuation identity from invocation-only settings."""
     loaded = optuna_trials.with_configured_identities(_load(tmp_path))
     signature = optuna_runtime.build_study_signature(loaded)
-    assert signature["schema_version"] == optuna_runtime.STUDY_SIGNATURE_SCHEMA_VERSION
-    assert signature["payload"]["schema_version"] == optuna_runtime.STUDY_SIGNATURE_SCHEMA_VERSION
     baseline = signature["digest"]
 
     operational_base = copy.deepcopy(loaded.base_config)
@@ -384,7 +382,7 @@ def test_sqlite_study_persists_states_and_resumes_new_trials(
     base = copy.deepcopy(loaded.base_config)
     base["training"]["epochs"] = 10
     base["training"]["evaluation_interval"] = 5
-    base["training"]["additional_evaluation_interval"] = 5
+    base["training"]["ood_evaluation_interval"] = 5
     base["tracking"]["wandb"]["monitor"]["interval"] = 5
     base = experiments.config.loader.finalize_run_layout(base)
     settings = copy.deepcopy(loaded.study)
@@ -402,9 +400,10 @@ def test_sqlite_study_persists_states_and_resumes_new_trials(
     )
 
     def synthetic_factory(
-        _config: optuna_runtime.OptunaStudyConfig,
+        config: optuna_runtime.OptunaStudyConfig,
     ) -> Callable[[Any], float]:
         def objective(trial: Any) -> float:
+            experiments.tuning.search_space.suggest_trial_overrides(trial, config.search_space)
             if trial.number == 1:
                 message = "recoverable synthetic failure"
                 raise optuna_runtime.RecoverableTrialError(message)
@@ -463,6 +462,7 @@ def test_sqlite_study_persists_states_and_resumes_new_trials(
     assert [trial["number"] for trial in summary["trials"]] == [0, 1, 2]
     assert summary["training_seed"] == loaded.base_config["run"]["seed"]
     assert summary["sampler"]["seed"] == loaded.study["seed"]
+    assert (study_dir / "best_config.yaml").is_file()
 
     def unexpected_factory(
         _config: optuna_runtime.OptunaStudyConfig,
@@ -478,8 +478,16 @@ def test_sqlite_study_persists_states_and_resumes_new_trials(
         "create_objective",
         unexpected_factory,
     )
-    with pytest.raises(RuntimeError, match="unexpected synthetic bug"):
-        optuna_runtime.run_optuna_study(loaded, n_trials=1)
+
+    # A publication error of the failed study's summary must not replace the study's own error.
+    def failing_publication(*_args: object) -> str:
+        message = "publication error"
+        raise OSError(message)
+
+    with monkeypatch.context() as publication_patch:
+        publication_patch.setattr(optuna_runtime, "_best_experiment_yaml", failing_publication)
+        with pytest.raises(RuntimeError, match="unexpected synthetic bug"):
+            optuna_runtime.run_optuna_study(loaded, n_trials=1)
 
     storage = f"sqlite:///{study_dir / 'synthetic_lifecycle.db'}"
     reopened = optuna.load_study(
@@ -590,7 +598,8 @@ def _install_trial_harness(task: str, monkeypatch: pytest.MonkeyPatch, train: Ca
         "split_indices": {},
         "train": [None],
         "eval": None,
-        "additional_evaluation": None,
+        "material_ood": None,
+        "parameter_ood": None,
         "spatial_view": {},
     }
 

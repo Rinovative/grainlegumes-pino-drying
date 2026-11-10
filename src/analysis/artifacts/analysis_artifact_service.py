@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from numbers import Integral, Real
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import numpy as np
@@ -56,7 +56,8 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_artifact_loader import LoadedRunArtifacts
     from src.learning.learning_device import DeviceResolution
 
-ArtifactSplit = Literal["eval", "additional_evaluation"]
+ArtifactSplit = artifact_plan.ArtifactSplit
+ArtifactDatasetRole = artifact_plan.ArtifactDatasetRole
 _MINIMUM_GRID_VARIANT_STRIDE = 2
 
 
@@ -285,13 +286,13 @@ def _artifact_save_root(
 ) -> Path:
     """Resolve one split- and Evaluation-grid-qualified artifact save root."""
     stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
-    if split not in {"eval", "additional_evaluation"}:
+    if split not in artifact_plan.ARTIFACT_SPLITS:
         msg = f"Unknown artifact split {split!r}."
         raise ValueError(msg)
     if stride == 1:
         if split == "eval":
             return common.paths.resolve_id_analysis_dir(run_dir)
-        return common.paths.resolve_additional_evaluation_analysis_dir(run_dir, dataset_name)
+        return common.paths.resolve_ood_analysis_dir(run_dir, split, dataset_name)
     variant_root = common.paths.resolve_analysis_root(run_dir) / f"grid_s{stride}"
     return variant_root / "id" if split == "eval" else variant_root / split / dataset_name
 
@@ -337,7 +338,7 @@ def _validated_artifact_target(*, run_dir: Path, save_root: Path) -> tuple[Path,
     """
     Admit one exact run-owned artifact leaf without following symlink aliases.
 
-    Only ``analysis/id`` and one named ``analysis/additional_evaluation/<dataset>`` leaf are
+    Only ``analysis/id`` and one named ``analysis/<material_ood|parameter_ood>/<dataset>`` leaf are
     accepted. Lexical containment and every existing path component are checked
     before a destructive rebuild or publication lock path is derived.
     """
@@ -348,11 +349,11 @@ def _validated_artifact_target(*, run_dir: Path, save_root: Path) -> tuple[Path,
         msg = f"Refusing rebuild outside one exact artifact target: {target}"
         raise ValueError(msg)
     id_target = analysis_root / "id"
-    role_roots = {analysis_root / "additional_evaluation"}
+    role_roots = {analysis_root / role for role in common.paths.ANALYSIS_OOD_ROLES}
     is_named_role_target = target.parent in role_roots and target.name not in {"", ".", ".."}
     is_id_grid_target = target.name == "id" and target.parent.parent == analysis_root and _grid_token_stride(target.parent.name) is not None
     is_named_grid_target = (
-        target.parent.name == "additional_evaluation"
+        target.parent.name in common.paths.ANALYSIS_OOD_ROLES
         and target.parent.parent.parent == analysis_root
         and target.name not in {"", ".", ".."}
         and _grid_token_stride(target.parent.parent.name) is not None
@@ -411,7 +412,7 @@ def _build_artifact_request(
     run_dir : pathlib.Path
         Evaluable run whose immutable evidence owns the artifacts.
     role : ArtifactRolePlan
-        Saved ID-test or additional-evaluation role to materialize, all sources in split order.
+        Saved ID-test, material-OOD or parameter-OOD role to materialize, all sources in split order.
     device_resolution : DeviceResolution
         Already resolved execution-device decision.
 
@@ -508,8 +509,6 @@ def _build_artifact_request(
     if parameter_counts is not None:
         model_provenance["parameter_counts"] = parameter_counts
     provenance: dict[str, Any] = {
-        "provenance_schema_version": contracts.ARTIFACT_PROVENANCE_SCHEMA_VERSION,
-        "artifact_schema_version": contracts.ARTIFACT_SCHEMA_VERSION,
         "producer": contracts.analysis_producer(task.id),
         "run": {
             "name": admitted["scientific_run_name"],
@@ -525,7 +524,7 @@ def _build_artifact_request(
         "split_role": role.split,
         "dataset": role.dataset_provenance(),
         "selection": {
-            "index_key": "id_test_indices" if role.split == "eval" else "additional_evaluation_indices",
+            "index_key": f"{role.split_role}_indices",
             "full_selected_case_count": len(source_indices),
             "effective_case_count": len(source_indices),
             "generation_limit": None,
@@ -994,7 +993,7 @@ def _require_parquet_string_sequence(value: Any, *, label: str) -> tuple[str, ..
     return tuple(value)
 
 
-def _validate_staged_case_payloads(stage: Path, *, request: ArtifactRequest, dataset_name: str) -> None:
+def _validate_staged_case_payloads(stage: Path, *, request: ArtifactRequest) -> None:
     """
     Open every staged steady NPZ once and bind its arrays and metadata to the staged rows.
 
@@ -1003,7 +1002,7 @@ def _validate_staged_case_payloads(stage: Path, *, request: ArtifactRequest, dat
     published digests then carry the checked bytes to every later cache hit and read.
     """
     contract = _evaluator_artifact_contract(request.provenance)
-    rows = pd.read_parquet(stage / f"{dataset_name}.parquet")
+    rows = pd.read_parquet(stage / common.paths.ANALYSIS_ARTIFACTS_FILENAME)
     if len(rows) != len(request.source_indices):
         msg = f"Staged Parquet has {len(rows)} rows, but {len(request.source_indices)} were expected."
         raise ArtifactCacheError(msg)
@@ -1164,7 +1163,6 @@ def _steady_target_build(
     """Bind the steady writer; batch-amortized timing cannot resume per case, so an incomplete stage restarts whole."""
     request = _build_artifact_request(run_dir=run_dir, role=role, device_resolution=device_resolution)
     split = role.split
-    dataset_name = role.dataset_name
 
     def generate(stage: Path, reporter: artifact_performance.ArtifactProgressReporter) -> None:
         from src import learning  # noqa: PLC0415
@@ -1196,7 +1194,6 @@ def _steady_target_build(
                     device=device,
                     save_root=stage,
                     publication_root=save_root,
-                    dataset_name=dataset_name,
                     provenance=request.provenance,
                     case_ids=request.case_ids,
                     timing_cases=timing_cases,
@@ -1222,7 +1219,7 @@ def _steady_target_build(
     return _TargetBuild(
         case_ids=request.case_ids,
         generate=generate,
-        finish_stage=lambda stage: _validate_staged_case_payloads(stage, request=request, dataset_name=dataset_name),
+        finish_stage=lambda stage: _validate_staged_case_payloads(stage, request=request),
     )
 
 
@@ -1250,9 +1247,9 @@ def _run_or_load_artifacts_locked(
         Current run directory satisfying the saved-run contract.
     dataset_name : str
         Logical dataset name used for artifact file naming.
-    split : {"eval", "additional_evaluation"}
-        Saved split role to load: "eval" is the ID-test membership, "additional_evaluation"
-        the declared evaluation holdouts.
+    split : {"eval", "material_ood", "parameter_ood"}
+        Saved split role to load: "eval" is the ID-test membership, "material_ood" and "parameter_ood"
+        the declared material and parameter holdouts.
     device_resolution : DeviceResolution
         Immutable device decision resolved once at the artifact boundary.
     dataset_root : Path
@@ -1269,8 +1266,8 @@ def _run_or_load_artifacts_locked(
 
     Notes
     -----
-    - Artifacts cached in analysis/id or analysis/additional_evaluation/<dataset_name>/.
-    - ID and additional evaluation always use saved split membership.
+    - Artifacts cached in analysis/id or analysis/<material_ood|parameter_ood>/<dataset_name>/, as artifacts.parquet plus npz/.
+    - ID and OOD evaluation always use saved split membership.
     - One validator (``evaluation_artifact_loader.admit_role_artifact``) admits the stage, a cache hit and the published target.
     - The deterministic stage ``.<target>.stage`` survives a failure; a complete stage is reused only after admission,
       an incomplete one resumes per case (transient) or restarts whole (steady).
@@ -1280,8 +1277,8 @@ def _run_or_load_artifacts_locked(
     from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
 
     dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
-    if split not in {"eval", "additional_evaluation"}:
-        msg = "Artifact split must be eval or additional_evaluation."
+    if split not in artifact_plan.ARTIFACT_SPLITS:
+        msg = f"Artifact split must be one of {list(artifact_plan.ARTIFACT_SPLITS)}."
         raise ValueError(msg)
     completed = experiments.run.validate_completed_run(run_dir)
     task = experiments.config.loader.validate_resolved_task_contract(completed["config"])
@@ -1304,7 +1301,7 @@ def _run_or_load_artifacts_locked(
             return artifact_loader.admit_role_artifact(
                 run_dir,
                 completed,
-                selection_role="id" if split == "eval" else "additional_evaluation",
+                selection_role=artifact_plan.dataset_role_of(split),
                 root=root,
                 evaluation_spatial_stride=evaluation_spatial_stride,
             ).frame
@@ -1316,7 +1313,9 @@ def _run_or_load_artifacts_locked(
             raise ArtifactCacheError(msg) from error
 
     unit = f"{run_dir.name}/{split}/{dataset_name}"
-    if not rebuild and _cache_has_outputs(save_root=save_root, parquet_path=save_root / f"{dataset_name}.parquet", npz_dir=save_root / "npz"):
+    if not rebuild and _cache_has_outputs(
+        save_root=save_root, parquet_path=save_root / common.paths.ANALYSIS_ARTIFACTS_FILENAME, npz_dir=save_root / "npz"
+    ):
         print(f"[VALIDATE] {run_dir.name} | {label} | {dataset_name} (existing cache)")
         frame = admit(save_root)
         # Admission validated the recorded producer as evidence; only this requested result is compared with the running code.
@@ -1410,7 +1409,7 @@ def validate_artifact_upload_source(
     run_dir : pathlib.Path
         Authoritative completed run that must own ``artifact_root``.
     artifact_root : pathlib.Path
-        Exact ``analysis/id`` or named ``analysis/additional_evaluation/<dataset>`` target.
+        Exact ``analysis/id`` or named ``analysis/<material_ood|parameter_ood>/<dataset>`` target.
 
     Returns
     -------
@@ -1443,12 +1442,11 @@ def validate_artifact_upload_source(
     completed = experiments.run.validate_completed_run(run_path)
     plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_path)
     analysis_root = common.paths.resolve_analysis_root(run_path).resolve()
-    strides = {
+    strides: dict[ArtifactSplit, int | None] = {
         role.split: _artifact_target_stride(root, analysis_root=analysis_root, split=role.split, dataset_name=role.dataset_name)
-        for role in (plan.id_role, plan.additional_role)
-        if role is not None
+        for role in plan.roles
     }
-    matched = [(split, stride) for split, stride in strides.items() if stride is not None]
+    matched: list[tuple[ArtifactSplit, int]] = [(split, stride) for split, stride in strides.items() if stride is not None]
     if not matched:
         msg = "Artifact upload target does not match a saved Evaluation-grid role."
         raise ArtifactCacheError(msg)
@@ -1457,7 +1455,7 @@ def validate_artifact_upload_source(
         loaded = artifact_loader.admit_role_artifact(
             run_path,
             completed,
-            selection_role="id" if split == "eval" else "additional_evaluation",
+            selection_role=artifact_plan.dataset_role_of(split),
             root=root,
             evaluation_spatial_stride=stride,
         )
@@ -1486,8 +1484,8 @@ def run_or_load_artifacts(
         Current evaluable run with immutable config/checkpoint/split identity.
     dataset_name : str
         Logical dataset required by the saved split metadata.
-    split : {"eval", "additional_evaluation"}
-        Saved membership role. ``eval`` publishes under ``analysis/id``.
+    split : {"eval", "material_ood", "parameter_ood"}
+        Saved membership role. ``eval`` publishes under ``analysis/id``, an OOD role under ``analysis/<role>/<dataset>``.
     device_resolution : DeviceResolution
         Device decision resolved once before any inference allocation.
     dataset_root : pathlib.Path
@@ -1558,16 +1556,15 @@ def _validated_upload_roots(
     *,
     plan: artifact_plan.ArtifactPlan,
     id_frame: pd.DataFrame,
-    additional_frame: pd.DataFrame | None,
+    ood_frames: Mapping[ArtifactSplit, pd.DataFrame],
     evaluation_spatial_stride: int,
 ) -> dict[ArtifactSplit, Path]:
     """Validate every published role and bind its frame before any observer starts."""
-    if (plan.additional_role is None) is not (additional_frame is None):
-        msg = "W&B publication requires matching saved additional Evaluation identity and frame availability."
+    if set(plan.ood_roles) != set(ood_frames):
+        msg = "W&B publication requires matching saved OOD Evaluation identity and frame availability."
         raise ArtifactCacheError(msg)
     role_specs: list[tuple[ArtifactSplit, str, pd.DataFrame]] = [("eval", plan.id_role.dataset_name, id_frame)]
-    if plan.additional_role is not None and additional_frame is not None:
-        role_specs.append(("additional_evaluation", plan.additional_role.dataset_name, additional_frame))
+    role_specs.extend((split, role.dataset_name, ood_frames[split]) for split, role in plan.ood_roles.items())
     roots: dict[ArtifactSplit, Path] = {}
     for split, dataset_name, frame in role_specs:
         root = _artifact_save_root(
@@ -1642,7 +1639,7 @@ def _upload_published_artifacts(
     plan: artifact_plan.ArtifactPlan,
     device_resolution: DeviceResolution,
     id_frame: pd.DataFrame,
-    additional_frame: pd.DataFrame | None = None,
+    ood_frames: Mapping[ArtifactSplit, pd.DataFrame] | None = None,
     evaluation_spatial_stride: int = 1,
 ) -> None:
     """Publish both tasks' provenance files and bounded Evaluation summary, then steady curated media."""
@@ -1656,14 +1653,15 @@ def _upload_published_artifacts(
         return
 
     task = experiments.config.loader.validate_resolved_task_contract(config)
+    ood_frames = dict(ood_frames or {})
     artifact_roots = _validated_upload_roots(
         plan=plan,
         id_frame=id_frame,
-        additional_frame=additional_frame,
+        ood_frames=ood_frames,
         evaluation_spatial_stride=evaluation_spatial_stride,
     )
     is_transient = task.id == "transient_drying"
-    frames = {"id": id_frame} if additional_frame is None else {"id": id_frame, "additional_evaluation": additional_frame}
+    frames = {"id": id_frame} | ood_frames
     evidence = (_transient_wandb_summary if is_transient else _steady_wandb_summary)(frames)
 
     started_at = datetime.now(UTC)
@@ -1695,6 +1693,7 @@ def _upload_published_artifacts(
         previous_last_logged_epoch=last_logged_epoch,
         previous_evaluation_summary_keys=experiments.tracking.persisted_evaluation_summary_keys(summary),
         state_updater=state_updater,
+        ood_roles=tuple(plan.ood_roles),
     )
     upload_error: BaseException | None = None
     try:
@@ -1702,12 +1701,13 @@ def _upload_published_artifacts(
             session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
         session.log_evaluation_summary(evidence)
         if not is_transient:
+            from src.analysis.presentation import analysis_display_labels as display_labels  # noqa: PLC0415
             from src.analysis.presentation import curated  # noqa: PLC0415
 
             # Admitted role frames are already the evaluation frames the loader returns.
             datasets_eval = {
                 f"{plan.run_dir.name} ID": id_frame,
-                **({} if additional_frame is None else {f"{plan.run_dir.name} additional evaluation": additional_frame}),
+                **{f"{plan.run_dir.name} {display_labels.evaluation_role_display_label(role)}": frame for role, frame in ood_frames.items()},
             }
             with tempfile.TemporaryDirectory(prefix="grainlegumes-curated-analysis-") as temporary_directory:
                 bundle = curated.render_curated_analysis(
@@ -1754,7 +1754,7 @@ class ScopedTransientArtifact:
     """Report one validated noncanonical transient debug artifact."""
 
     root: Path
-    split: Literal["id", "additional_evaluation"]
+    split: ArtifactDatasetRole
     dataset_name: str
     case_ids: tuple[str, ...]
     identity_sha256: str
@@ -1785,18 +1785,15 @@ class PreparedRunArtifacts:
 def invalid_prediction_note(*runs: PreparedRunArtifacts) -> str | None:
     """Return ``valid V of N`` over the selected roles of ``runs`` when any prediction is invalid, else ``None``."""
     return validity_contract.invalid_prediction_note(
-        artifact.frame.attrs["artifact_provenance"]
-        for run in runs
-        for artifact in (run.loaded_run.id_artifact, run.loaded_run.additional_artifact)
-        if artifact is not None
+        artifact.frame.attrs["artifact_provenance"] for run in runs for artifact in run.loaded_run.role_artifacts().values()
     )
 
 
 def load_or_build_run_artifacts(
     run_dir: Path | str,
     *,
-    artifact_roles: tuple[Literal["id", "additional_evaluation"], ...] | None = None,
-    artifact_root_overrides: Mapping[Literal["id", "additional_evaluation"], Path | str] | None = None,
+    artifact_roles: tuple[ArtifactDatasetRole, ...] | None = None,
+    artifact_root_overrides: Mapping[ArtifactDatasetRole, Path | str] | None = None,
     dataset_root: Path | str | None = None,
     auto_build_missing: bool = True,
     rebuild_incompatible: bool = False,
@@ -1831,27 +1828,17 @@ def load_or_build_run_artifacts(
         overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
         return PreparedRunArtifacts(
             loaded_run=loaded,
-            role_actions={
-                role: "reused_scoped_partial" if role in overrides else "reused"
-                for role, artifact in (
-                    ("id", loaded.id_artifact),
-                    ("additional_evaluation", loaded.additional_artifact),
-                )
-                if artifact is not None
-            },
+            role_actions={role: "reused_scoped_partial" if role in overrides else "reused" for role in loaded.role_artifacts()},
             artifact_device=None,
         )
     plan = load_run_artifact_plan(path)
-    allowed_roles = {"id", "additional_evaluation"}
-    default_roles: tuple[Literal["id", "additional_evaluation"], ...] = (
-        ("id", "additional_evaluation") if plan.additional_role is not None else ("id",)
-    )
-    roles: tuple[Literal["id", "additional_evaluation"], ...] = artifact_roles if artifact_roles is not None else default_roles
-    if not roles or len(set(roles)) != len(roles) or set(roles).difference(allowed_roles):
-        msg = f"artifact_roles must contain unique values from {sorted(allowed_roles)}."
+    roles: tuple[ArtifactDatasetRole, ...] = artifact_roles if artifact_roles is not None else plan.dataset_roles
+    if not roles or len(set(roles)) != len(roles) or set(roles).difference(artifact_plan.ARTIFACT_DATASET_ROLES):
+        msg = f"artifact_roles must contain unique values from {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
         raise ValueError(msg)
-    if "additional_evaluation" in roles and plan.additional_role is None:
-        msg = "Completed run has no saved additional Evaluation artifact role."
+    unplanned = [role for role in roles if role not in plan.dataset_roles]
+    if unplanned:
+        msg = f"Completed run has no saved {unplanned[0]} artifact role."
         raise ValueError(msg)
     overrides = {} if artifact_root_overrides is None else dict(artifact_root_overrides)
     if set(overrides).difference(roles):
@@ -1877,26 +1864,24 @@ def load_or_build_run_artifacts(
         msg = f"device_resolution must be a DeviceResolution, got {device_resolution!r}."
         raise TypeError(msg)
     resolution = device_resolution
-    split_by_role: dict[str, ArtifactSplit] = {"id": "eval", "additional_evaluation": "additional_evaluation"}
 
     for _attempt in range(len(roles) + 1):
+        selected_role: ArtifactDatasetRole | None
         try:
             loaded = artifact_loader.load_run_artifacts(path, artifact_roles=roles)
         except artifact_loader.MissingEvaluationArtifactsError as error:
-            split_role = getattr(error, "role", None)
-            selected_role = "id" if split_role == "eval" else split_role if split_role == "additional_evaluation" else None
+            selected_role = _failed_role(error)
             if not auto_build_missing or selected_role is None or selected_role not in roles:
                 raise
             rebuild = False
             action = "generated"
             older = _older_sibling_to_rebuild(
-                path=path, plan=plan, split=split_by_role[selected_role], roles=roles, rebuild_incompatible=rebuild_incompatible
+                path=path, plan=plan, split=artifact_plan.split_of(selected_role), roles=roles, rebuild_incompatible=rebuild_incompatible
             )
             if older is not None:
                 selected_role, rebuild, action = older, True, "rebuilt"
         except artifact_loader.IncompatibleEvaluationArtifactsError as error:
-            split_role = getattr(error, "role", None)
-            selected_role = "id" if split_role == "eval" else split_role if split_role == "additional_evaluation" else None
+            selected_role = _failed_role(error)
             if not rebuild_incompatible or selected_role not in roles:
                 raise
             rebuild = True
@@ -1924,8 +1909,8 @@ def load_or_build_run_artifacts(
             resolution = learning.device.resolve_device(device_policy, path="device_policy")
         run_or_load_artifacts(
             run_dir=path,
-            dataset_name=plan.role("eval" if selected_role == "id" else "additional_evaluation").dataset_name,
-            split=split_by_role[selected_role],
+            dataset_name=plan.role(artifact_plan.split_of(selected_role)).dataset_name,
+            split=artifact_plan.split_of(selected_role),
             device_resolution=resolution,
             dataset_root=current_dataset_root,
             rebuild=rebuild,
@@ -1935,17 +1920,22 @@ def load_or_build_run_artifacts(
     raise RuntimeError(msg)
 
 
-def _role_from_other_analysis(loaded: LoadedRunArtifacts, task_id: str) -> Literal["id", "additional_evaluation"] | None:
+def _role_from_other_analysis(loaded: LoadedRunArtifacts, task_id: str) -> ArtifactDatasetRole | None:
     """Return a loaded role not produced by the running analysis code when the loaded roles disagree, otherwise None."""
-    recorded = {
+    recorded: dict[ArtifactDatasetRole, str] = {
         role: contracts.validate_analysis_producer(artifact.frame.attrs["artifact_provenance"].get("producer"))["analysis_sha256"]
-        for role, artifact in (("id", loaded.id_artifact), ("additional_evaluation", loaded.additional_artifact))
-        if artifact is not None
+        for role, artifact in loaded.role_artifacts().items()
     }
     if len(set(recorded.values())) <= 1:
         return None
     current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
-    return next(cast("Literal['id', 'additional_evaluation']", role) for role, digest in recorded.items() if digest != current)
+    return next(role for role, digest in recorded.items() if digest != current)
+
+
+def _failed_role(error: Exception) -> ArtifactDatasetRole | None:
+    """Return the Dataset role a role-local artifact load failure names, if it names one."""
+    split_role = getattr(error, "role", None)
+    return artifact_plan.dataset_role_of(split_role) if split_role in artifact_plan.ARTIFACT_SPLITS else None
 
 
 def _sibling_from_other_analysis(
@@ -1956,20 +1946,20 @@ def _sibling_from_other_analysis(
     split: ArtifactSplit,
     evaluation_spatial_stride: int = 1,
 ) -> ArtifactSplit | None:
-    """Return the run's other published split when its recorded analysis implementation is not the running one, otherwise None."""
-    sibling: ArtifactSplit = "additional_evaluation" if split == "eval" else "eval"
-    if sibling == "additional_evaluation" and plan.additional_role is None:
-        return None
-    root = _artifact_save_root(
-        run_dir=run_dir, dataset_name=plan.role(sibling).dataset_name, split=sibling, evaluation_spatial_stride=evaluation_spatial_stride
-    )
-    marker = contracts.artifact_provenance_path(root)
-    if not marker.is_file():
-        return None
-    recorded = _recorded_marker(marker)
-    producer = recorded.get("producer") if isinstance(recorded, Mapping) else None
-    digest = producer.get("analysis_sha256") if isinstance(producer, Mapping) else None
-    return None if digest == contracts.ANALYSIS_PROJECTIONS[task_id].sha256() else sibling
+    """Return another published split of the run whose recorded analysis implementation is not the running one, otherwise None."""
+    current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
+    for sibling in (role for role in plan.roles if role.split != split):
+        root = _artifact_save_root(
+            run_dir=run_dir, dataset_name=sibling.dataset_name, split=sibling.split, evaluation_spatial_stride=evaluation_spatial_stride
+        )
+        marker = contracts.artifact_provenance_path(root)
+        if not marker.is_file():
+            continue
+        recorded = _recorded_marker(marker)
+        producer = recorded.get("producer") if isinstance(recorded, Mapping) else None
+        if (producer.get("analysis_sha256") if isinstance(producer, Mapping) else None) != current:
+            return sibling.split
+    return None
 
 
 def _older_sibling_to_rebuild(
@@ -1977,14 +1967,14 @@ def _older_sibling_to_rebuild(
     path: Path,
     plan: artifact_plan.ArtifactPlan,
     split: ArtifactSplit,
-    roles: tuple[Literal["id", "additional_evaluation"], ...],
+    roles: tuple[ArtifactDatasetRole, ...],
     rebuild_incompatible: bool,
-) -> Literal["id", "additional_evaluation"] | None:
+) -> ArtifactDatasetRole | None:
     """Return the selected role of other analysis code to rebuild before a missing split is generated beside it; refuse when not authorized."""
     sibling = _sibling_from_other_analysis(run_dir=path, plan=plan, task_id=plan.task, split=split)
     if sibling is None:
         return None
-    role: Literal["id", "additional_evaluation"] = "id" if sibling == "eval" else "additional_evaluation"
+    role = artifact_plan.dataset_role_of(sibling)
     if not rebuild_incompatible or role not in roles:
         raise _two_producers_error(path, role)
     return role
@@ -2031,7 +2021,7 @@ def build_scoped_transient_artifact(
     run_dir: Path | str,
     dataset_root: Path | str,
     output_root: Path | str,
-    split: Literal["id", "additional_evaluation"],
+    split: ArtifactDatasetRole,
     case_ids: Sequence[str] | None = None,
     one_case: bool = False,
     device_policy: str = "auto",
@@ -2044,8 +2034,8 @@ def build_scoped_transient_artifact(
     )
 
     resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
-    if split not in {"id", "additional_evaluation"}:
-        msg = "Scoped transient split must be 'id' or 'additional_evaluation'."
+    if split not in artifact_plan.ARTIFACT_DATASET_ROLES:
+        msg = f"Scoped transient split must be one of {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
         raise ValueError(msg)
     if not isinstance(one_case, bool):
         msg = "one_case must be boolean."
@@ -2061,7 +2051,7 @@ def build_scoped_transient_artifact(
     path = Path(run_dir).expanduser().resolve(strict=True)
     _refuse_optuna_trial(path)
     plan = transient.load_transient_artifact_plan(path)
-    saved_role = plan.role("eval" if split == "id" else "additional_evaluation")
+    saved_role = plan.role(artifact_plan.split_of(split))
     selected_ids = saved_role.case_ids[:1] if one_case else requested
     selected_role = transient.select_transient_role_cases(
         saved_role,
@@ -2186,7 +2176,7 @@ def build_artifacts(
     Returns
     -------
     dict[str, dict[str, pandas.DataFrame]]
-        Validated ``eval`` and any saved ``additional_evaluation`` frames keyed by run name.
+        Validated ``eval`` and any saved ``material_ood`` and ``parameter_ood`` frames keyed by run name.
 
     Raises
     ------
@@ -2223,25 +2213,24 @@ def build_artifacts(
             rebuild=rebuild,
             evaluation_spatial_stride=resolved_evaluation_stride,
         )
-        additional_frame: pd.DataFrame | None = None
-        role_results = {"eval": id_frame}
-        if plan.additional_role is not None:
-            additional_frame = run_or_load_artifacts(
+        ood_frames: dict[ArtifactSplit, pd.DataFrame] = {
+            split: run_or_load_artifacts(
                 run_dir=plan.run_dir,
-                dataset_name=plan.additional_role.dataset_name,
-                split="additional_evaluation",
+                dataset_name=role.dataset_name,
+                split=split,
                 device_resolution=device_resolution,
                 dataset_root=dataset_root,
                 rebuild=rebuild,
                 evaluation_spatial_stride=resolved_evaluation_stride,
             )
-            role_results["additional_evaluation"] = additional_frame
-        results[str(run_dir.resolve())] = role_results
+            for split, role in plan.ood_roles.items()
+        }
+        results[str(run_dir.resolve())] = {"eval": id_frame} | ood_frames
         _upload_published_artifacts(
             plan=plan,
             device_resolution=device_resolution,
             id_frame=id_frame,
-            additional_frame=additional_frame,
+            ood_frames=ood_frames,
             evaluation_spatial_stride=resolved_evaluation_stride,
         )
         cleanup_runtime(device_resolution.device)

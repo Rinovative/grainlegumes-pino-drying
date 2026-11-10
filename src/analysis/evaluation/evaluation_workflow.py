@@ -45,7 +45,8 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
     from src.analysis.presentation.analysis_compute import AnalysisComputePreference
 
-ArtifactSelectionRole = Literal["id", "additional_evaluation"]
+ArtifactSelectionRole = Literal["id", "material_ood", "parameter_ood"]
+_SELECTION_ROLES: tuple[ArtifactSelectionRole, ...] = ("id", "material_ood", "parameter_ood")
 _TRAINING_COMPARISON_ARM_COUNT = 3
 _MINIMUM_COMPARISON_RUNS = 2
 
@@ -80,7 +81,7 @@ class EvaluationContextSpec:
         Stable panel-local context key.
     label : str
         User-facing dataset context label.
-    artifact_role : {"id", "additional_evaluation"}
+    artifact_role : {"id", "material_ood", "parameter_ood"}
         Selected run artifact role supplying each model frame.
 
     """
@@ -147,7 +148,7 @@ def _normalized_selections(
             msg = f"run_selections[{position}].label must be non-blank text or None."
             raise ValueError(msg)
         roots = {} if selection.artifact_roots is None else dict(selection.artifact_roots)
-        if set(roots).difference({"id", "additional_evaluation"}):
+        if set(roots).difference(_SELECTION_ROLES):
             msg = f"run_selections[{position}].artifact_roots contains an unsupported role."
             raise ValueError(msg)
         normalized.append(
@@ -194,7 +195,7 @@ def _selected_artifact(
     role: ArtifactSelectionRole,
 ) -> LoadedEvaluationArtifact:
     """Return one role guaranteed by artifact preparation."""
-    artifact = loaded.id_artifact if role == "id" else loaded.additional_artifact
+    artifact = loaded.artifact(role)
     if artifact is None:
         msg = f"Prepared run is missing its selected {role!r} artifact: {loaded.run_dir}"
         raise RuntimeError(msg)
@@ -550,21 +551,29 @@ def _transient_selection_case_ids(
     return tuple(selected)
 
 
+def _steady_selection_case_ids(
+    artifacts: Mapping[tuple[Path, ArtifactSelectionRole], LoadedEvaluationArtifact],
+) -> tuple[str, ...]:
+    """Return each role's cases shared by every run, role after role, each case once."""
+    selected: dict[int, None] = {}
+    for role in dict.fromkeys(role for _run_dir, role in artifacts):
+        frames = [artifact.frame for (_run_dir, artifact_role), artifact in artifacts.items() if artifact_role == role]
+        shared = set.intersection(*({int(value) for value in frame["case_index"]} for frame in frames))
+        selected.update(dict.fromkeys(sorted(shared)))
+    return _require_shared_case_ids(tuple(str(case_id) for case_id in selected))
+
+
 def _bind_steady_capabilities(
     selection_state: EvaluationSelectionState,
     artifacts: Mapping[tuple[Path, ArtifactSelectionRole], LoadedEvaluationArtifact],
 ) -> None:
-    """Bind exact steady channels and shared case membership once."""
-    frames = tuple(artifact.frame for artifact in artifacts.values())
-    display_fields = analysis.evaluation.presentation.shared_display_fields(frames)
-    shared_cases = {int(value) for value in frames[0]["case_index"]}
-    for frame in frames[1:]:
-        shared_cases.intersection_update(int(value) for value in frame["case_index"])
+    """Bind exact steady channels and the role-wise shared case membership once."""
+    display_fields = analysis.evaluation.presentation.shared_display_fields(tuple(artifact.frame for artifact in artifacts.values()))
     selection_state.bind_capabilities(
         analysis.evaluation.selection.EvaluationViewCapabilities(
             task="steady_flow",
             channels=tuple(field.key for field in display_fields),
-            case_ids=_require_shared_case_ids(tuple(str(value) for value in sorted(shared_cases))),
+            case_ids=_steady_selection_case_ids(artifacts),
         )
     )
 
@@ -581,13 +590,12 @@ def prepare_evaluation_workflow(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare one steady or transient Evaluation workflow through task-owned sessions."""
     requested_device = (
         evaluation_compute_device.requested if isinstance(evaluation_compute_device, compute.AnalysisComputePreference) else evaluation_compute_device
     )
-    compute.resolve_analysis_device(requested_device)
+    compute.admit_analysis_request(requested_device)
     normalized_selections = _normalized_selections(run_selections)
     requested_roles = None if artifact_roles is None else tuple(artifact_roles)
     prepared_runs = tuple(
@@ -612,14 +620,13 @@ def prepare_evaluation_workflow(
         msg = f"Unsupported Evaluation task {task!r}."
         raise ValueError(msg)
 
-    selected_roles: tuple[ArtifactSelectionRole, ...] = requested_roles if requested_roles is not None else ("id", "additional_evaluation")
-    allowed_roles = {"id", "additional_evaluation"}
-    if set(selected_roles).difference(allowed_roles):
+    selected_roles: tuple[ArtifactSelectionRole, ...] = requested_roles if requested_roles is not None else _SELECTION_ROLES
+    if set(selected_roles).difference(_SELECTION_ROLES):
         msg = f"Selected Evaluation roles contradict task {task!r}."
         raise ValueError(msg)
     effective_roles: list[ArtifactSelectionRole] = []
     for role in selected_roles:
-        available = tuple((loaded.id_artifact if role == "id" else loaded.additional_artifact) is not None for loaded in loaded_runs)
+        available = tuple(loaded.artifact(role) is not None for loaded in loaded_runs)
         if any(available) and not all(available):
             msg = f"Selected runs disagree on {role!r} artifact-role availability."
             raise ValueError(msg)
@@ -719,7 +726,6 @@ def prepare_evaluation_workflow(
                 matched_stage_unavailable_reason=matched_stage_unavailable_reason,
                 selection_state=selection_state,
                 evaluation_compute_device=evaluation_compute_device,
-                export_dir=export_dir,
             )
         elif len(loaded_runs) == 1:
             if selection_state is not None:
@@ -729,7 +735,6 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
-                export_dir=export_dir,
             )
         else:
             if selection_state is not None:
@@ -739,7 +744,6 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
-                export_dir=export_dir,
             )
         report = tuple(
             _report_row(prepared, artifact_roles=roles, display_label=display_label)
@@ -784,11 +788,12 @@ def _validated_expected_task(expected_task: str) -> str:
     return expected_task
 
 
-def _default_context_specs() -> tuple[EvaluationContextSpec, EvaluationContextSpec]:
-    """Return the ID and optional additional evaluation notebook contexts."""
+def _default_context_specs() -> tuple[EvaluationContextSpec, ...]:
+    """Return the ID and the optional material-OOD and parameter-OOD notebook contexts."""
     return (
         EvaluationContextSpec("id", "ID", "id"),
-        EvaluationContextSpec("additional_evaluation", "Additional evaluation", "additional_evaluation"),
+        EvaluationContextSpec("material_ood", "Material OOD", "material_ood"),
+        EvaluationContextSpec("parameter_ood", "Parameter OOD", "parameter_ood"),
     )
 
 
@@ -818,7 +823,6 @@ def prepare_single_model_evaluation_workspace(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare one notebook-facing Evaluation workspace with task-owned contexts."""
     task = _validated_expected_task(expected_task)
@@ -839,7 +843,6 @@ def prepare_single_model_evaluation_workspace(
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
-        export_dir=export_dir,
     )
     return _with_expected_task(workflow, expected_task=task)
 
@@ -857,7 +860,6 @@ def prepare_model_comparison_evaluation_workspace(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
-    export_dir: Path | str | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare an ordered multi-run notebook workspace with task-owned contexts."""
     task = _validated_expected_task(expected_task)
@@ -883,6 +885,5 @@ def prepare_model_comparison_evaluation_workspace(
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
-        export_dir=export_dir,
     )
     return _with_expected_task(workflow, expected_task=task)

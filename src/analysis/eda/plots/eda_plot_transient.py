@@ -481,7 +481,6 @@ def _spatial_map_figure(
         if len(units) != 1 or len(representations) != 1:
             message = f"Spatial field {field!r} has incompatible units or representations."
             raise ValueError(message)
-        reference_label = resolution.datasets_by_field[field][0]
         values_by_label: dict[str, np.ndarray] = {}
         for label in compatible:
             frame = datasets[label]
@@ -554,11 +553,7 @@ def _spatial_map_figure(
             colorbar.set_ticks(normalization.ticks.tolist())
         layout.add_channel_row_label(
             map_axes[field_index, 0],
-            capabilities.field_quantity_label(
-                datasets[reference_label],
-                field,
-                mathtext=True,
-            ),
+            field_labels.field_label(field, mathtext=True),
             figure_x=(_TRANSIENT_ROW_LABEL_X if include_schedules else None),
         )
     _apply_eda_map_axis_labels(map_axes)

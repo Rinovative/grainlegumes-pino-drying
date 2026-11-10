@@ -189,18 +189,9 @@ def plot_spectral_demand_prediction_error(
         "Spectral demand vs prediction and error",
         {label: summaries[id(frame)].case_count for label, frame in datasets.items()},
     )
-    figure = plt.figure(figsize=(6.0 * len(datasets) + 2.8, 7.0))
-    grid = figure.add_gridspec(
-        2,
-        len(datasets) + 1,
-        width_ratios=(*([1.0] * len(datasets)), 0.35),
-        wspace=0.25,
-        hspace=0.25,
-    )
-    top_axes = [figure.add_subplot(grid[0, index]) for index in range(len(datasets))]
-    bottom_axes = [figure.add_subplot(grid[1, index]) for index in range(len(datasets))]
-    legend_axis = figure.add_subplot(grid[:, -1])
-    legend_axis.axis("off")
+    figure, axes = plt.subplots(2, len(datasets), figsize=(6.0 * len(datasets) + 2.8, 7.0), squeeze=False, layout="constrained")
+    top_axes = list(axes[0])
+    bottom_axes = list(axes[1])
     for dataset_index, (label, frame) in enumerate(datasets.items()):
         top_axis = top_axes[dataset_index]
         bottom_axis = bottom_axes[dataset_index]
@@ -230,18 +221,15 @@ def plot_spectral_demand_prediction_error(
         Line2D([0], [0], color="black", linewidth=2.2, linestyle="-", label="Prediction"),
         Line2D([0], [0], color="black", linewidth=2.2, linestyle="-", label="Error"),
     )
-    curve_legend = legend_axis.legend(handles=curve_handles, title="Curves", loc="upper left")
-    legend_axis.add_artist(curve_legend)
+    figure.legend(handles=curve_handles, title="Curves", loc="outside right upper")
     channel_handles = [Line2D([0], [0], color=colors[field.label], linewidth=2.6, label=field.matplotlib_label) for field in fields]
-    legend_axis.legend(
+    figure.legend(
         channel_handles,
         [field.matplotlib_label for field in fields],
         title="Channels",
-        loc="upper left",
-        bbox_to_anchor=(0.0, 0.80),
+        loc="outside right lower",
     )
-    figure.subplots_adjust(top=0.92, bottom=0.10, left=0.06, right=0.98)
-    layout.title_over_axes(figure, figure_title, (*top_axes, *bottom_axes), y=0.97)
+    layout.title_over_axes(figure, figure_title, (*top_axes, *bottom_axes))
     return figure
 
 

@@ -41,7 +41,7 @@ _MATCHED_A0_KEYS = frozenset(
     {
         "max_epochs",
         "evaluation_interval",
-        "additional_evaluation_interval",
+        "ood_evaluation_interval",
         "gradient_accumulation_steps",
         "sampling",
         "curriculum",
@@ -106,7 +106,6 @@ def resolve_matched_a1_b_plan(
     source: config_naming.ConfigSource,
     storage_root: Path | str | None = None,
     output_root: Path | str | None = None,
-    naming_schema_version: int = loader.RUN_NAMING_SCHEMA_VERSION,
 ) -> MatchedA1BPlan:
     """
     Validate authored stage budgets and derive ordinary independent run configs.
@@ -121,8 +120,6 @@ def resolve_matched_a1_b_plan(
         Explicit root for controlled logical Dataset-reference resolution.
     output_root : Path or str or None, optional
         Override the experiments root that stage destinations descend from.
-    naming_schema_version : int, optional
-        Sole current saved-run naming schema.
 
     Returns
     -------
@@ -200,7 +197,7 @@ def resolve_matched_a1_b_plan(
             "epochs": stage["max_epochs"],
             "stage_schedule": copy.deepcopy(schedule),
             "evaluation_interval": stage["evaluation_interval"],
-            "additional_evaluation_interval": stage["additional_evaluation_interval"],
+            "ood_evaluation_interval": stage["ood_evaluation_interval"],
             "stage": "b" if name == "b" else "a",
             "comparison_arm": name,
             "gradient_accumulation_steps": stage["gradient_accumulation_steps"],
@@ -220,7 +217,6 @@ def resolve_matched_a1_b_plan(
             source=source,
             storage_root=storage_root,
             output_root=output_root,
-            naming_schema_version=naming_schema_version,
         )
         return loader.validate_resolved_config(resolved)
 
@@ -232,7 +228,7 @@ def resolve_matched_a1_b_plan(
     identity_a1["training"][protocol_key]["receipt_source_run_name"] = "b"
     branch_id = common.serialization.canonical_json_sha256({"protocol": protocol_key, "b": identity_b, "a1": identity_a1})[:16]
     a0_id = resolved_a0["run"]["layout"]["a0_id"]
-    pair = config_naming.pair_key(resolved_b, resolved_a1)
+    pair = config_naming.pair_key(resolved_b, resolved_a1, source.authored)
     resolved_b = loader.finalize_run_layout(resolved_b, a0_id=a0_id, branch_id=branch_id, stage="b", pair=pair)
     resolved_a1["training"][protocol_key]["receipt_source_run_name"] = resolved_b["run"]["name"]
     resolved_a1 = loader.finalize_run_layout(resolved_a1, a0_id=a0_id, branch_id=branch_id, stage="a1", pair=pair)

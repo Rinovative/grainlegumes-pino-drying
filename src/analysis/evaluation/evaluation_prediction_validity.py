@@ -1,7 +1,7 @@
 """Own the prediction-validity vocabulary, count format and warnings both tasks share.
 
 Responsibilities:
-  - Define statuses, schema version and exact per-channel value counts
+  - Define statuses and exact per-channel value counts
   - Classify one steady-flow field prediction as VALID or NONFINITE and admit its document
   - Summarize field documents as metric support counts and role-level status counts, also from a steady artifact table
   - Print the invalid-prediction warnings and the ``valid k of n`` note for both tasks
@@ -27,12 +27,9 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import numpy as np
 
-from src import common
-
 if TYPE_CHECKING:
     import pandas as pd
 
-PREDICTION_VALIDITY_SCHEMA_VERSION: Final = 1
 VALID: Final = "VALID"
 FINITE_BUT_PHYSICALLY_INVALID: Final = "FINITE_BUT_PHYSICALLY_INVALID"
 NONFINITE: Final = "NONFINITE"
@@ -42,16 +39,9 @@ SUPPORT_COUNT_FIELDS: Final = ("required_value_count", "computed_value_count", "
 _COUNT_FIELDS: Final = frozenset(
     {"total_value_count", "finite_value_count", "nonfinite_value_count", "nan_count", "positive_infinity_count", "negative_infinity_count"}
 )
-_FIELD_DOCUMENT_FIELDS: Final = frozenset({"schema_version", "status", "count_scope", "channels", "first_invalid"})
+_FIELD_DOCUMENT_FIELDS: Final = frozenset({"status", "count_scope", "channels", "first_invalid"})
 _FIELD_COUNT_SCOPE: Final = "all_evaluation_grid_cells_in_physical_model_output"
 _FIELD_PREDICTION_RANK: Final = 3
-
-
-def require_schema_version(version: Any) -> None:
-    """Reject superseded or unknown validity schema versions."""
-    if not common.serialization.is_schema_version(version, PREDICTION_VALIDITY_SCHEMA_VERSION):
-        msg = f"Prediction validity schema_version {version!r} is unsupported; expected {PREDICTION_VALIDITY_SCHEMA_VERSION}."
-        raise ValueError(msg)
 
 
 def channel_counts(values: np.ndarray, channels: Sequence[str], *, physical_invalid: np.ndarray | None = None) -> dict[str, dict[str, int]]:
@@ -112,7 +102,6 @@ def build_field_prediction_validity(prediction: Any, *, channels: Sequence[str])
         channel_index, y_index, x_index = (int(item) for item in locations[0])
         first_invalid = {"kind": NONFINITE, "channel": channels[channel_index], "channel_index": channel_index, "spatial_index": [y_index, x_index]}
     return {
-        "schema_version": PREDICTION_VALIDITY_SCHEMA_VERSION,
         "status": VALID if first_invalid is None else NONFINITE,
         "count_scope": _FIELD_COUNT_SCOPE,
         "channels": channel_counts(array[None], channels),
@@ -126,7 +115,6 @@ def admit_field_prediction_validity(text: Any, *, channels: Sequence[str]) -> di
     if not isinstance(document, dict) or set(document) != _FIELD_DOCUMENT_FIELDS:
         msg = "Field prediction validity must be one JSON document with the current fields."
         raise ValueError(msg)
-    require_schema_version(document["schema_version"])
     counts = admit_channel_counts(document["channels"], channels, physical_validity_defined=False)
     nonfinite = sum(item["nonfinite_value_count"] for item in counts.values())
     first = document["first_invalid"]
@@ -200,7 +188,6 @@ def support_counts(documents: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
 def role_prediction_validity(cases: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """Return role-level status counts and per-case documents keyed by package case ID."""
     return {
-        "schema_version": PREDICTION_VALIDITY_SCHEMA_VERSION,
         "case_count": len(cases),
         "status_counts": {status: sum(case["status"] == status for case in cases.values()) for status in PREDICTION_VALIDITY_STATUSES},
         "cases": {case_id: dict(cases[case_id]) for case_id in sorted(cases)},

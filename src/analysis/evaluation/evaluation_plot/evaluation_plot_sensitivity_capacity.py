@@ -34,6 +34,7 @@ from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_presentation as presentation
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.presentation import analysis_field_labels as field_labels
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -254,7 +255,7 @@ def plot_metadata_error_heatmap(
             if np.isfinite(value):
                 axis.text(column, row, f"{value:+.2f}", ha="center", va="center", fontsize=8)
     if image is not None:
-        figure.colorbar(image, ax=axes.ravel().tolist(), shrink=0.85, label="Spearman correlation")
+        figure.colorbar(image, ax=axes.ravel().tolist(), shrink=0.85, label=f"Spearman correlation [{field_labels.display_unit('1')}]")
     figure.suptitle(figure_title)
     return figure
 

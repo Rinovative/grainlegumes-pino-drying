@@ -10,7 +10,6 @@ Provides:
 - trajectory: transient source admission and compact trajectory indexes
 - transient_shards: Dataset-bound derived PT shards, written inside the Dataset publication, and their admission
 - DATASET_PACKAGE_SCHEMA_KIND: canonical package-manifest schema kind
-- DATASET_PACKAGE_SCHEMA_VERSION: canonical package-manifest schema version
 - DEFAULT_TRANSIENT_PT_SHARD_BYTES: default soft PT-shard packing target
 - build_dataset_selection: publish one independent immutable ordered Dataset
 - discover_source_collections: inspect successful and failed source outcomes
@@ -38,7 +37,6 @@ if TYPE_CHECKING:
     from . import dataset_packages_transient_shards as transient_shards
     from .dataset_packages_manifest import (
         DATASET_PACKAGE_SCHEMA_KIND,
-        DATASET_PACKAGE_SCHEMA_VERSION,
         declared_evaluation_assignments,
         load_package_manifest,
         load_package_manifest_evidence,
@@ -58,7 +56,6 @@ DEFAULT_TRANSIENT_PT_SHARD_BYTES: Final = int(1.5 * 1024**3)
 _FACADE_EXPORTS = frozenset({"build_dataset_selection", "inspect_dataset_package"})
 _EXPORTS = {
     "DATASET_PACKAGE_SCHEMA_KIND": "dataset_packages_manifest",
-    "DATASET_PACKAGE_SCHEMA_VERSION": "dataset_packages_manifest",
     "declared_evaluation_assignments": "dataset_packages_manifest",
     "load_package_manifest": "dataset_packages_manifest",
     "load_package_manifest_evidence": "dataset_packages_manifest",
@@ -68,7 +65,6 @@ _EXPORTS = {
 }
 __all__ = [
     "DATASET_PACKAGE_SCHEMA_KIND",
-    "DATASET_PACKAGE_SCHEMA_VERSION",
     "DEFAULT_TRANSIENT_PT_SHARD_BYTES",
     "build_dataset_selection",
     "builder",

@@ -1,7 +1,7 @@
 """Protect transient training Dataset assembly and case-role boundaries.
 
 Responsibilities:
-  - Check stratified partitions, exact source membership, spatial views, loaders, and declared OOD assignments
+  - Check design-kind partitions, Train subsets, exact source membership, spatial views, loaders, and declared OOD assignments
 
 Design principles:
   - Case splits precede transition expansion; role leakage is the shared split contract's test
@@ -35,80 +35,64 @@ if TYPE_CHECKING:
     from typing import Self
 
 
-def test_experiment_partition_preserves_material_counts_and_rejects_small_strata() -> None:
-    research_cases = tuple(f"{material}_{index}" for material in ("lentil", "chickpea") for index in range(50))
-    materials = {case_id: case_id.split("_", 1)[0] for case_id in research_cases}
-    recipe = {"kind": "seeded_material_fraction", "train_fraction": 0.8, "validation_fraction": 0.1, "id_test_fraction": 0.1}
-    first = partition.resolve_case_partition(research_cases, recipe, split_seed=9, material_by_case=materials)
-    second = partition.resolve_case_partition(research_cases, recipe, split_seed=9, material_by_case=materials)
-    assert first == second
-    for material in ("lentil", "chickpea"):
-        assert [sum(materials[case_id] == material for case_id in first[role]) for role in ("train", "validation", "id_test")] == [40, 5, 5]
-    assert {case_id for cases in first.values() for case_id in cases} == set(research_cases)
-
-    smoke_cases = tuple(f"lentil_{index}" for index in range(4))
-    smoke_materials = dict.fromkeys(smoke_cases, "lentil")
-    smoke_recipe = {"kind": "seeded_material_fraction", "train_fraction": 0.5, "validation_fraction": 0.25, "id_test_fraction": 0.25}
-    smoke = partition.resolve_case_partition(smoke_cases, smoke_recipe, split_seed=9, material_by_case=smoke_materials)
-    assert [len(smoke[role]) for role in ("train", "validation", "id_test")] == [2, 1, 1]
-    with pytest.raises(ValueError, match="without a complete case"):
-        partition.resolve_case_partition(smoke_cases[:3], smoke_recipe, split_seed=9, material_by_case=dict.fromkeys(smoke_cases[:3], "lentil"))
+_CASES = {
+    "lentil_t0": ("lentil", "train"),
+    "lentil_t1": ("lentil", "train"),
+    "lentil_v0": ("lentil", "validation"),
+    "lentil_s0": ("lentil", "test"),
+    "lentil_p0": ("lentil", "parameter_ood"),
+    "chickpea_t0": ("chickpea", "train"),
+    "chickpea_t1": ("chickpea", "train"),
+    "chickpea_v0": ("chickpea", "validation"),
+    "chickpea_s0": ("chickpea", "test"),
+    "wheat_s0": ("wheat", "test"),
+}
+_MATERIALS = {case_id: material for case_id, (material, _kind) in _CASES.items()}
+_KINDS = {case_id: kind for case_id, (_material, kind) in _CASES.items()}
+_ROLES = {"lentil": "id", "chickpea": "id", "wheat": "ood"}
 
 
-def test_experiment_partition_rejects_incomplete_source_evidence_and_nonfinite_recipe() -> None:
-    cases = ("a", "b", "c", "d")
-    recipe = {"kind": "seeded_material_fraction", "train_fraction": 0.5, "validation_fraction": 0.25, "id_test_fraction": 0.25}
-    with pytest.raises(ValueError, match="exact source material"):
-        partition.resolve_case_partition(cases, recipe, split_seed=9, material_by_case={"a": "lentil"})
-    with pytest.raises(ValueError, match="finite"):
-        partition.resolve_case_partition(
-            cases,
-            {**recipe, "train_fraction": float("nan")},
-            split_seed=9,
-            material_by_case=dict.fromkeys(cases, "lentil"),
-        )
-
-
-def test_partition_contract_preserves_seeded_order_and_builds_fixed_id_ood_membership() -> None:
-    cases = tuple(f"{material}_{index}" for material in ("lentil", "chickpea") for index in range(5))
-    materials = {case_id: case_id.split("_", 1)[0] for case_id in cases}
-    recipe = {"kind": "seeded_material_fraction", "train_fraction": 0.6, "validation_fraction": 0.2, "id_test_fraction": 0.2}
-    expected = {
-        "train": ("lentil_0", "lentil_3", "lentil_4", "chickpea_0", "chickpea_4", "chickpea_3"),
-        "validation": ("lentil_2", "chickpea_1"),
-        "id_test": ("lentil_1", "chickpea_2"),
+def test_partition_follows_the_design_kinds_in_source_order() -> None:
+    """Each case's role is its material role and design kind; Train keeps source order; validation rebuilds and compares."""
+    value = partition.build_fixed_partition(tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS, material_roles=_ROLES)
+    assert {role: value[role] for role in partition.CASE_ROLES} == {
+        "train": ["lentil_t0", "lentil_t1", "chickpea_t0", "chickpea_t1"],
+        "validation": ["lentil_v0", "chickpea_v0"],
+        "id_test": ["lentil_s0", "chickpea_s0"],
+        "parameter_ood": ["lentil_p0"],
+        "ood": ["wheat_s0"],
     }
-    assert partition.resolve_case_partition(cases, recipe, split_seed=9, material_by_case=materials) == expected
-
-    fixed_cases = ("lentil_a", "lentil_b", "lentil_c", "wheat_ood", "lentil_d")
-    fixed_materials = {case_id: "wheat" if case_id == "wheat_ood" else "lentil" for case_id in fixed_cases}
-    fixed_recipe = {"kind": "seeded_material_fraction", "train_fraction": 1 / 3, "validation_fraction": 1 / 3, "id_test_fraction": 1 / 3}
-    value = partition.build_fixed_partition(
-        fixed_cases,
-        material_by_case=fixed_materials,
-        material_roles={"lentil": "id", "wheat": "ood"},
-        recipe=fixed_recipe,
-        seed_input=9,
-        seed=1028622135437308793,
-    )
-    assert value["ood"] == ["wheat_ood"]
-    assert set(value["train"] + value["validation"] + value["id_test"]) == set(fixed_cases) - {"wheat_ood"}
-    assert partition.validate_fixed_partition(value, case_ids=fixed_cases, material_by_case=fixed_materials) == value
+    assert partition.evaluation_cases(value, "material_ood") == ("wheat_s0",)
+    assert partition.evaluation_cases(value, "parameter_ood") == ("lentil_p0",)
+    validated = partition.validate_fixed_partition(value, case_ids=tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS)
+    assert validated == value
     assert partition.partition_digest(value) == partition.partition_digest(dict(value))
-    corrupted = {**value, "ood": ["lentil_a"]}
     with pytest.raises(ValueError, match="roles must be disjoint"):
-        partition.validate_fixed_partition(corrupted, case_ids=fixed_cases, material_by_case=fixed_materials)
-
-    too_small_recipe = {"kind": "seeded_material_fraction", "train_fraction": 0.8, "validation_fraction": 0.1, "id_test_fraction": 0.1}
-    with pytest.raises(ValueError, match="without a complete case"):
-        partition.build_fixed_partition(
-            ("lentil_a", "lentil_b", "lentil_c"),
-            material_by_case={"lentil_a": "lentil", "lentil_b": "lentil", "lentil_c": "lentil"},
-            material_roles={"lentil": "id"},
-            recipe=too_small_recipe,
-            seed_input=9,
-            seed=1028622135437308793,
+        partition.validate_fixed_partition(
+            {**value, "ood": ["lentil_t0"]}, case_ids=tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS
         )
+    swapped = {**value, "train": ["lentil_t0", "lentil_v0", "chickpea_t0", "chickpea_t1"], "validation": ["lentil_t1", "chickpea_v0"]}
+    with pytest.raises(ValueError, match="membership does not match"):
+        partition.validate_fixed_partition(swapped, case_ids=tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS)
+
+
+def test_partition_refuses_a_design_kind_its_material_role_cannot_hold_and_incomplete_evidence() -> None:
+    """An OOD material holds only its test design; every case needs its material and design kind."""
+    with pytest.raises(ValueError, match="which a ood material cannot hold"):
+        partition.build_fixed_partition(
+            ("wheat_t0",), material_by_case={"wheat_t0": "wheat"}, design_kind_by_case={"wheat_t0": "train"}, material_roles={"wheat": "ood"}
+        )
+    with pytest.raises(ValueError, match="exact source design kind"):
+        partition.build_fixed_partition(tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case={}, material_roles=_ROLES)
+
+
+def test_train_subset_takes_the_first_train_cases_of_every_id_material() -> None:
+    """A Train subset is a per-material prefix in stored order; a size beyond any material's Train cases is refused."""
+    value = partition.build_fixed_partition(tuple(_CASES), material_by_case=_MATERIALS, design_kind_by_case=_KINDS, material_roles=_ROLES)
+    assert partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=None) == tuple(value["train"])
+    assert partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=1) == ("lentil_t0", "chickpea_t0")
+    with pytest.raises(ValueError, match=r"data.train_subset 4 exceeds the Train cases of \['chickpea', 'lentil'\]"):
+        partition.train_subset_cases(value, material_by_case=_MATERIALS, train_subset=4)
 
 
 def _dataset(*, mode: str) -> transient.TransientPhysicalDataset:
@@ -334,6 +318,7 @@ def test_runtime_uses_shared_declared_assignments_before_ood_payload_loading(mon
     dataset.sampling = TransientSamplingSpec(mode="one_step_transition")
     dataset._item_references = dataset._build_item_references()
     materials: dict[str, str] = dict.fromkeys(("a", "b", "c"), "lentil")
+    kinds = {"a": "train", "b": "validation", "c": "test"}
     dataset.manifest_binding = identity.ManifestBinding(
         dataset_id="fixed-primary",
         dataset_digest="1" * 64,
@@ -341,13 +326,9 @@ def test_runtime_uses_shared_declared_assignments_before_ood_payload_loading(mon
         case_ids=("a", "b", "c"),
         physical_sources={case_id: (case_id, case_id) for case_id in ("a", "b", "c")},
         materials=materials,
+        design_kinds=kinds,
         case_partition=partition.build_fixed_partition(
-            ("a", "b", "c"),
-            material_by_case=materials,
-            material_roles={"lentil": "id"},
-            recipe={"kind": "exact", "train": ["a"], "validation": ["b"], "id_test": ["c"]},
-            seed_input=9,
-            seed=1028622135437308793,
+            ("a", "b", "c"), material_by_case=materials, design_kind_by_case=kinds, material_roles={"lentil": "id"}
         ),
     )
     loaded: list[str] = []
@@ -369,9 +350,10 @@ def test_runtime_uses_shared_declared_assignments_before_ood_payload_loading(mon
     with pytest.raises(RuntimeError, match="metadata projection seam reached"):
         training.create_transient_training_loaders(
             train_dataset_id="fixed-primary",
-            additional_evaluation_dataset_ids=("external",),
+            material_ood_dataset_ids=("external",),
+            train_subset=None,
             tensorizer=TransientTensorizerSpec(
-                input_profile="canonical_physics_complete_v1", temporal_conditioning=TemporalConditioningSpec("normalized_current_time")
+                input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("normalized_current_time")
             ),
             train_sampling=TransientSamplingSpec(mode="one_step_transition"),
             loader_settings=training.factory.LoaderSettings(),

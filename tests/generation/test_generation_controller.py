@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import runpy
 import subprocess
@@ -82,7 +83,7 @@ def _canonical_status(
     running_jobs: int = 0,
     submission_unknown: bool = False,
 ) -> str:
-    """Represent the current schema-1 source status returned by campaign-status."""
+    """Represent the current source status returned by campaign-status."""
     decisions = terminal_decisions or (None,) * len(case_states)
     return json.dumps(
         {
@@ -252,7 +253,7 @@ def test_canonical_campaign_fails_on_an_unfillable_deficit_with_the_success_rate
     unfilled = _canonical_status(
         campaign_state=_QUIESCENT, case_states=("failed", "successful"), terminal_decisions=("failed", "successful"), replacement_deficit=1
     )
-    unfilled = json.dumps({**json.loads(unfilled), "success_rate_stop": "Stopped: lentil (natural): k/n 1/2. Lower s with amend-replacements."})
+    unfilled = json.dumps({**json.loads(unfilled), "success_rate_stop": "Stopped: lentil (test): k/n 1/2. Lower s with amend-replacements."})
     port.responses["submit-campaign"] = [_resumed()]
     port.responses["campaign-status"] = [unfilled, unfilled, unfilled]
     port.responses["resume-campaign"] = [_resumed(), _resumed()]
@@ -488,8 +489,6 @@ def test_public_amend_replacements_delegates_without_freezing_the_source(
             run_id,
             "--material",
             "lentil",
-            "--regime",
-            "natural",
             "--minimum-success-rate",
             "0.8",
             "--reason",
@@ -533,8 +532,6 @@ def _resources() -> dict[str, Any]:
             "submission": {"max_admission_cases": 2, "poll_interval_seconds": 1},
             "site": {
                 "partition": "standard",
-                "scheduler": "slurm",
-                "python_module": "Python/3.12",
                 "comsol_module": "Comsol/v6.4",
                 "python_executable": "python3",
                 "comsol_executable": "comsol",
@@ -697,7 +694,7 @@ def test_executing_controller_schedules_only_explicit_compute_continuation(
             assert "--metadata-only" in command
             initial: dict[str, Any] = {"campaign_run_id": _CANONICAL, "state": "blocked" if initial_compute else "active"}
             if initial_compute:
-                initial.update(continuation_requires_compute=True, continuation_reason="supplemental_inputs_missing")
+                initial.update(continuation_requires_compute=True, continuation_reason="replacement_inputs_missing")
             value = json.dumps(initial)
         elif operation == "campaign-status":
             assert not initial_compute or scheduled, "Initial compute request must precede state/status admission"
@@ -742,16 +739,15 @@ def test_executing_controller_schedules_only_explicit_compute_continuation(
 def test_blocked_campaign_names_its_stop_and_its_restart_preserves_admission_and_scientific_flags(port: FakePort, field: str) -> None:
     """A blocked campaign reports its success-rate or cap stop from its status; following the continuation keeps the original constraints."""
     plan = _canonical_plan()
-    plan.payload["scientific_overrides"] = {"materials": ["lentil"], "cases_per_material": 4, "duration_hours": 4, "revision": "producer-fix"}
+    plan.payload["scientific_overrides"] = {"materials": ["lentil"], "duration_hours": 4, "revision": "producer-fix"}
     port.responses["submit-campaign"] = [json.dumps({"campaign_run_id": _CANONICAL, "state": "blocked"})]
-    port.responses["campaign-status"] = [json.dumps({"campaign_run_id": _CANONICAL, field: "Stopped: lentil (natural): k/n 1/4."})]
-    with pytest.raises(GenerationControllerError, match=r"blocked\. Stopped: lentil \(natural\): k/n 1/4") as failure:
+    port.responses["campaign-status"] = [json.dumps({"campaign_run_id": _CANONICAL, field: "Stopped: lentil (test): k/n 1/4."})]
+    with pytest.raises(GenerationControllerError, match=r"blocked\. Stopped: lentil \(test\): k/n 1/4") as failure:
         GenerationController(port).run(plan, _CONFIG, max_admission_cases=2)
     continuation = failure.value.report()
     assert "--revision producer-fix" in continuation
     assert "--max-admission-cases 2" in continuation
     assert "--materials lentil" in continuation
-    assert "--cases-per-material 4" in continuation
     assert "--duration-hours 4" in continuation
 
 
@@ -822,8 +818,6 @@ def test_public_normal_resource_dry_run_resolves_exact_budget(
             str(path),
             "--materials",
             "lentil",
-            "--cases-per-material",
-            "4",
             "--duration-hours",
             "4",
             "--node-jobs",
@@ -842,7 +836,7 @@ def test_public_normal_resource_dry_run_resolves_exact_budget(
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
     assert f"PREFLIGHT COMPLETE: plan={payload['identity']}" in captured.err
-    assert payload["scientific_overrides"] == {"materials": ["lentil"], "cases_per_material": 4, "duration_hours": 4.0}
+    assert payload["scientific_overrides"] == {"materials": ["lentil"], "duration_hours": 4.0}
     assert payload["execution_overrides"] == {
         "node_jobs": 1,
         "max_admission_cases": 4,
@@ -1040,10 +1034,10 @@ def test_allocated_host_preserves_worker_failure(tmp_path: Path, monkeypatch: py
     ],
     ids=["json-with-state", "json-without-state", "text", "json-array", "failed-run"],
 )
-def test_scheduled_log_summarizes_a_returned_json_object_and_keeps_all_other_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output: str, status: int, state: str | None
+def test_scheduled_run_prints_a_returned_json_object_as_one_line_without_a_file_and_keeps_all_other_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], output: str, status: int, state: str | None
 ) -> None:
-    """A successful JSON object is one summary line in the runtime log while the driver gets it byte for byte; anything else stays raw."""
+    """A successful JSON object is one driver-log line and no file, the driver gets it byte for byte; other output stays in a file."""
     repository = tmp_path / "repository"
     worker = repository / "scripts/generation_node.sh"
     worker.parent.mkdir(parents=True)
@@ -1061,12 +1055,39 @@ def test_scheduled_log_summarizes_a_returned_json_object_and_keeps_all_other_out
         assert failure.value.returncode == status
     else:
         assert host.call("resume-campaign", scheduled=True) == output
-    (log,) = layout.logs.glob("python-resume-campaign.*.out")
+    captured = capsys.readouterr()
+    printed = captured.err
     if state is None:
+        (log,) = layout.logs.glob("python-resume-campaign.*.out")
         assert log.read_text() == output
+        assert printed == ""
     else:
         digest = hashlib.sha256(output.encode()).hexdigest()[:12]
-        assert log.read_text() == f"resume-campaign: JSON result returned to the driver ({len(output)} bytes, sha256 {digest}){state}\n"
+        assert printed == f"resume-campaign: JSON result returned to the driver ({len(output)} bytes, sha256 {digest}){state}\n"
+        assert captured.out == ""  # stdout stays the step's own result
+        assert not list(layout.logs.glob("python-resume-campaign.*"))
+
+
+@pytest.mark.parametrize(("stderr_text", "kept"), [("", []), ("warning from the step", [".err"])], ids=["silent", "with-stderr"])
+def test_a_successful_srun_step_leaves_no_summarized_out_and_no_empty_err_file(tmp_path: Path, stderr_text: str, kept: list[str]) -> None:
+    """On the srun path the summarized .out is gone and an empty .err is removed; an .err with text stays for linking."""
+    repository = tmp_path / "repository"
+    worker = repository / "scripts/generation_node.sh"
+    worker.parent.mkdir(parents=True)
+    worker.write_text(f"#!/bin/sh\necho '{stderr_text}' | grep . >&2\necho '{{\"state\": \"active\"}}'\n")
+    worker.chmod(0o755)
+    srun = tmp_path / "bin/srun"
+    srun.parent.mkdir()
+    srun.write_text(
+        '#!/bin/sh\nwhile [ "${1#--}" != "$1" ]; do case "$1" in --error=*) err="${1#--error=}";; esac; shift; done\nexec "$@" 2>>"$err"\n'
+    )
+    srun.chmod(0o755)
+    environment = {"PATH": f"{srun.parent}:{os.environ['PATH']}"}
+    layout = host_service.HostLayout(repository, tmp_path / "storage", tmp_path / "runtime", tmp_path / "venv", environment)
+    host = host_service.GenerationHost(layout, _admission(repository))
+
+    assert host.call("resume-campaign", scheduled=True) == '{"state": "active"}\n'
+    assert sorted(path.suffix for path in layout.logs.glob("python-resume-campaign.*")) == kept
 
 
 def test_completed_campaign_waits_until_its_node_jobs_have_ended(port: FakePort, monkeypatch: Any) -> None:
@@ -1163,34 +1184,36 @@ def test_each_stage_prints_its_line_and_its_duration(port: FakePort, capsys: pyt
     assert all(re.fullmatch(pattern, line) for pattern, line in zip(expected, stages, strict=True)), stages
 
 
-def test_board_appears_on_a_state_change_and_after_the_interval_but_not_at_every_poll(
+def test_board_appears_on_a_state_change_and_a_compact_line_every_minute_but_not_at_every_poll(
     port: FakePort, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Progress alone does not reprint the board; a changed case state does, and so does the repeat interval of 300 s."""
+    """Progress alone prints one compact line per running case after 60 s; only a changed case state reprints the whole board."""
 
     def two(simulated: float) -> str:
         return _live_status(_live_case("case_0001", simulated=simulated), _live_case("case_0002", "never_started"))
 
     finished = _live_status(_live_case("case_0001", "successful", elapsed="00:10:00"), _live_case("case_0002", simulated=50.0))
-    _poll(port, monkeypatch, [two(100.0), two(200.0), two(300.0), finished], seconds_per_poll=150.0)
-    first, second, third = _boards(capsys.readouterr().out)
-    assert first[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 0 s  ETA: not yet estimable")
-    assert any("3 %" in line and "0.02778 h / 1 h" in line for line in first)
+    _poll(port, monkeypatch, [two(100.0), two(200.0), two(300.0), finished], seconds_per_poll=30.0)
+    printed = capsys.readouterr().out
+    first, second = _boards(printed)
+    assert first[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 0 s")
+    assert any("simulated 0.02778 h" in line for line in first)
     assert any("case_0002  waiting  not started yet" in line for line in first)
-    assert second[0].startswith("Board  done 0  running 1  waiting 1  failed 0  of 2  elapsed 5 min")
-    assert any("0.08333 h / 1 h" in line for line in second)
-    assert third[0].startswith("Board  done 1  running 1  waiting 0  failed 0  of 2  elapsed 7 min")
-    assert any("case_0001  done" in line and "took 10 min" in line for line in third)
+    assert second[0].startswith("Board  done 1  running 1  waiting 0  failed 0  of 2  elapsed 1 min 30 s")
+    assert any("case_0001  done" in line and "took 10 min" in line for line in second)
+    compact = [line for line in printed.splitlines() if "lentil/case_0001  simulated" in line]
+    assert len(compact) == 1  # polls at 30 s and 60 s: only the one at 60 s is a full minute after the board
+    assert "simulated 0.08333 h" in compact[0]
 
 
-def test_a_default_horizon_campaign_shows_progress_from_the_status_horizon(
+def test_a_case_with_a_nonzero_window_start_shows_the_simulated_time_past_the_start(
     port: FakePort, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Without a --duration-hours override, each case's persisted time window gives its progress past the start."""
+    """A case whose persisted time window starts at 24 h shows its simulated time counted from that start."""
     case = _live_case("case_0001", simulated=25 * 3600.0, physical_start_hours=24.0, physical_horizon_hours=4.0)
     _poll(port, monkeypatch, [_live_status(case)], seconds_per_poll=1.0)
     (board,) = _boards(capsys.readouterr().out)
-    assert any("case_0001" in line and "25 %" in line and "1 h / 4 h" in line for line in board)
+    assert any("case_0001" in line and "simulated 1 h" in line for line in board)
 
 
 @pytest.mark.parametrize("failing", ["prepare-campaign-inputs", "submit-campaign"])
@@ -1212,9 +1235,9 @@ def test_a_running_case_without_new_solver_evidence_is_marked_after_ten_minutes(
     """The mark counts from when the board last saw the evidence change, not from the receipt's own heartbeat."""
     still = _live_status(_live_case("case_0001", simulated=100.0))
     _poll(port, monkeypatch, [still, still, still], seconds_per_poll=400.0)
-    first, second, third = _boards(capsys.readouterr().out)
-    assert not any("no progress" in line for line in (*first, *second))
-    assert any(line.endswith("no progress for 13 min") for line in third)
+    lines = capsys.readouterr().out.splitlines()
+    marked = [line for line in lines if "no progress" in line]
+    assert [line.endswith("no progress for 13 min") for line in marked] == [True]  # compact lines at 400 s and 800 s; only the second is stale
 
 
 def _undecided_failure_run(port: FakePort, monkeypatch: Any) -> tuple[list[str], GenerationControllerError]:
