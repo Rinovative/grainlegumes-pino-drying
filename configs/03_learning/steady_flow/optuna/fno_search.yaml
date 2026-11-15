@@ -1,26 +1,29 @@
 # Role: steady_flow Optuna study; its experiment section states only what differs from base.yaml and the FNO defaults. Edit: freely.
-# Supervised FNO search: 30 trials of 300 epochs on validation; copy the selected values into experiments/architecture_comparison/fno_m128x160_h64_l3_p0p1__lr-0p000388.yaml (renamed with the selected learning rate, `lr`) and the pi-fno_search study.
+# Supervised FNO search: 30 trials of half the 600-epoch budget on validation; copy the selected values into experiments/architecture_comparison/fno_m128x160_h64_l3_p0p1__lr-0p000388.yaml (renamed with the selected learning rate, `lr`) and the pi-fno_search study.
 
 study:
   n_trials: 30  # Maximum number of trials requested for the study.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
+  budget_fraction: 0.5  # Trial budget as a fraction of the budget K (training.budget_epochs): 300 of 600 passes, each trial with its own cosine.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.
     multivariate: true  # Allow the TPE sampler to model parameter interactions.
   pruner:
     kind: median  # Optuna pruning rule for stopping unpromising trials.
-    n_startup_trials: 5  # Trials completed before pruning decisions begin.
-    n_warmup_steps: 60  # Reported objective steps (validated epochs) required before pruning can occur.
-    interval_steps: 2  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
+    n_startup_trials: 5  # Completed trials before pruning decisions begin.
+    n_min_trials: 5  # Trials that must have reported at the same validation point before a trial can be pruned there.
+    n_warmup_steps: 4  # Start point: the first of the 20 validation points at which a trial can be pruned, 60 of 300 epochs.
+    interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
+# Modes and widths are the union of both tasks' FNO studies, not yet filtered by the GPU probe.
 search_space:
-  model.params.n_modes.0: {name: modes_y, kind: categorical, values: [32, 64, 96, 128]}
+  model.params.n_modes.0: {name: modes_y, kind: categorical, values: [32, 48, 64, 96, 128]}
   model.params.n_modes.1: {name: modes_x, kind: categorical, values: [64, 96, 128, 160]}
-  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64]}
+  model.params.hidden_channels: {name: hidden_channels, kind: categorical, values: [32, 64, 96]}
   model.params.n_layers: {name: n_layers, kind: categorical, values: [3, 4]}
   optimizer.lr: {name: lr, kind: float, low: 1.0e-4, high: 1.0e-2, log: true}
-  data.batch_size: {name: batch, kind: categorical, values: [16, 32]}
+  training.units_per_update: {name: k, kind: categorical, values: [2, 4, 8, 16, 32]}  # Cases per update.
 
 experiment:
   model:
@@ -31,8 +34,6 @@ experiment:
       n_layers: 3  # Search base value: number of Fourier layers.
   optimizer:
     lr: 3.883614530748613e-4  # Search base value: initial learning rate.
-  training:
-    epochs: 300  # Trial epoch budget, shorter than the final run to rank configurations cheaply.
   tracking:
     wandb:
       workflow: optuna_trial  # Workflow label attached to tracking metadata.

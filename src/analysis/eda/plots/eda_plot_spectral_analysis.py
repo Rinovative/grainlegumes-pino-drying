@@ -27,7 +27,6 @@ import numpy as np
 
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.presentation import analysis_display_labels as display_labels
-from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.presentation import visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as plot_layout
@@ -131,7 +130,7 @@ def _field_values(
     row: pd.Series,
     field: str,
 ) -> np.ndarray:
-    """Return one direct or final-valid-state 2D field without resampling time."""
+    """Return one direct or final-valid-state 2D field on its display scale, so spectra share the row label's unit."""
     state_index = _final_valid_state_index(row) if _is_transient(frame) and field in row["state_trajectories"] else None
     values = capabilities.field_values(
         frame,
@@ -142,7 +141,7 @@ def _field_values(
     if values.ndim != _MIN_GRID_SIZE:
         msg = f"Spectral channel {field!r} does not resolve to one stored 2D field."
         raise ValueError(msg)
-    return values
+    return capabilities.field_display_values(frame, row, field, values)
 
 
 def _coordinate_values(row: pd.Series) -> tuple[np.ndarray, np.ndarray]:
@@ -249,11 +248,6 @@ def _validate_datasets(
     return resolution
 
 
-def _field_unit(frame: pd.DataFrame, field: str) -> str:
-    """Return one authoritative field unit through the central resolver."""
-    return capabilities.field_unit(frame, field)
-
-
 def _field_representation(frame: pd.DataFrame, field: str) -> str:
     """Return one authoritative stored or derived field representation."""
     return capabilities.field_representation(frame, field)
@@ -331,18 +325,14 @@ def _add_sidebar_legend(axis: Axes, handles: Sequence[Artist], labels: Sequence[
 
 
 def _spectral_power_ylabel(frame: pd.DataFrame, field: str) -> str:
-    """Label spectral power from stored values, not pre-transform physical units."""
+    """Label spectral power of the displayed values, whose mean-removed fluctuations carry the difference unit."""
     representation = _field_representation(frame, field)
     if representation in _DIMENSIONLESS_REPRESENTATION_LABELS:
         return f"Mean spectral power [-]\nStored: {_stored_representation_label(frame, field)}"
     if representation not in _PHYSICAL_VALUE_REPRESENTATIONS:
         msg = f"EDA field {field!r} has unsupported stored representation {representation!r}."
         raise ValueError(msg)
-    unit = field_labels.display_unit(
-        _field_unit(frame, field),
-        quantity_kind="difference",
-    )
-    return f"Mean spectral power [({unit})²]"
+    return f"Mean spectral power [({capabilities.field_display_unit(frame, field, quantity_kind='difference')})²]"
 
 
 def _spacing(row: pd.Series) -> tuple[float, float, str]:

@@ -39,12 +39,13 @@ from . import evaluation_case as cases
 from . import evaluation_prediction_validity as validity_contract
 
 COMPLETED_RUN_CONFIG_ATTR = "completed_run_config"
+COMPLETED_RUN_SUMMARY_ATTR = "completed_run_summary"
 PRIMARY_OBJECTIVE_ID = "normalized_group_macro_rmse"
 PRIMARY_OBJECTIVE_DEFINITION = {
     "id": PRIMARY_OBJECTIVE_ID,
     "kind": "group_macro_rmse",
     "space": "physical",
-    "reduction": "group_macro_element_mean",
+    "reduction": "material_case_mean",
     "direction": "minimize",
 }
 STEADY_PHYSICS_METRICS = (
@@ -190,14 +191,18 @@ def _string_sequence(
 
 
 def _validate_metric_values(frame: pd.DataFrame, columns: set[str], *, counts: frozenset[str], valid: np.ndarray) -> None:
-    """Require finite non-negative metrics for valid predictions, and NaN for every non-count metric otherwise."""
+    """
+    Require finite non-negative metrics for valid predictions, and NaN for every non-count metric otherwise.
+
+    A per-case relative norm may also be NaN for a valid prediction: its reference is below the floor.
+    """
     for column in sorted(columns):
         values = frame[column].tolist()
         if any(isinstance(value, bool) or not isinstance(value, Real) for value in values):
             msg = f"Evaluation artifact metric {column!r} must contain real scalar values."
             raise TypeError(msg)
         numeric = np.asarray(values, dtype=float)
-        reported = valid | (column in counts)
+        reported = (valid & ~np.isnan(numeric)) if column in contracts.RELATIVE_CASE_COLUMNS else valid | (column in counts)
         if not np.isfinite(numeric[reported]).all() or (numeric[reported] < 0.0).any() or not np.isnan(numeric[~reported]).all():
             msg = f"Evaluation artifact metric {column!r} must be finite and non-negative for valid predictions and NaN otherwise."
             raise ValueError(msg)
@@ -305,12 +310,9 @@ def _validate_artifact_table(
             msg = "Evaluation artifact output fields or units change across case rows."
             raise ValueError(msg)
 
-    predictive = {"rel_l2", "rel_h1"}
-    physical = {column for field in output_fields for column in contracts.physical_statistic_columns(field)}
-    normalized = {column for field in output_fields for column in contracts.normalized_statistic_columns(field)}
-    group_metrics = set(_declared_group_metric_columns(provenance))
-    expected = set(_BASE_ARTIFACT_COLUMNS | predictive | physical | normalized | group_metrics)
-    metrics = set(predictive | physical | normalized | group_metrics)
+    statistics = {column for field in output_fields for column in contracts.case_statistic_columns(field)}
+    metrics = {*statistics, *contracts.case_metric_columns(output_fields), *_declared_group_metric_columns(provenance)}
+    expected = set(_BASE_ARTIFACT_COLUMNS | metrics)
     if task_id == "steady_flow":
         steady = set(_STEADY_PHYSICS_COLUMNS | {"physical_rmse_speed_magnitude", "kappa_names"})
         expected.update(steady)
@@ -412,8 +414,8 @@ def _aggregate_contract(
     provenance: Mapping[str, Any],
     *,
     output_fields: tuple[str, ...],
-) -> tuple[list[dict[str, Any]], dict[str, float], float]:
-    """Return task groups, raw training scales, and transform floor from provenance."""
+) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, float]]:
+    """Return task groups, the saved Train state scales and the reference floors from provenance."""
     evaluator = _mapping(provenance.get("evaluator"), label="provenance.evaluator")
     groups = contracts.output_group_payload(evaluator.get("output_groups", ()))
     grouped_fields = tuple(field for group in groups for field in group["fields"])
@@ -421,30 +423,13 @@ def _aggregate_contract(
         msg = "Artifact output groups do not partition TaskSpec output fields in order."
         raise ComparisonCompatibilityError(msg)
     normalizer = _mapping(provenance.get("normalizer"), label="provenance.normalizer")
-    raw_scales = _mapping(
-        normalizer.get("output_standard_deviations"),
-        label="provenance.normalizer.output_standard_deviations",
-    )
+    raw_scales = _mapping(normalizer.get("output_scales"), label="provenance.normalizer.output_scales")
     if set(raw_scales) != set(output_fields):
-        msg = "Artifact train standard deviations do not map exactly the output fields."
+        msg = "Artifact Train scales do not map exactly the output fields."
         raise ComparisonCompatibilityError(msg)
-    scales: dict[str, float] = {}
-    for field in output_fields:
-        value = raw_scales[field]
-        if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(float(value)) or float(value) <= 0.0:
-            msg = f"Artifact train standard deviation for {field!r} must be finite and strictly positive."
-            raise ValueError(msg)
-        scales[field] = float(value)
-    denominator_floor = normalizer.get("denominator_floor")
-    if (
-        isinstance(denominator_floor, bool)
-        or not isinstance(denominator_floor, Real)
-        or not np.isfinite(float(denominator_floor))
-        or float(denominator_floor) < 0.0
-    ):
-        msg = "Artifact normalizer denominator floor must be finite and non-negative."
-        raise ValueError(msg)
-    return groups, scales, float(denominator_floor)
+    evidence = _mapping(evaluator.get("metric_evidence"), label="provenance.evaluator.metric_evidence")
+    floors = contracts.validated_train_scales(evidence.get("reference_floors"), fields=output_fields, label="reference floor")
+    return groups, contracts.validated_train_scales(raw_scales, fields=output_fields), floors
 
 
 def _validated_provenance(
@@ -497,10 +482,7 @@ def _validated_provenance(
     if resolved_fields != output_fields:
         msg = "Artifact primary objective fields do not match TaskSpec output semantics."
         raise ComparisonCompatibilityError(msg)
-    output_groups, _train_scales, _denominator_floor = _aggregate_contract(
-        payload,
-        output_fields=output_fields,
-    )
+    output_groups, _train_scales, _floors = _aggregate_contract(payload, output_fields=output_fields)
     if output_groups != aggregate.get("groups"):
         msg = "Artifact aggregate output groups contradict evaluator provenance."
         raise ComparisonCompatibilityError(msg)
@@ -585,13 +567,10 @@ def _apply_contract_attrs(
     input_units = _mapping(evaluator["input_units"], label="provenance.evaluator.input_units")
     frame.attrs["input_fields"] = input_fields
     frame.attrs["input_units"] = tuple(str(input_units[field]) for field in input_fields)
-    output_groups, train_standard_deviations, denominator_floor = _aggregate_contract(
-        validated,
-        output_fields=output_fields,
-    )
+    output_groups, train_scales, reference_floors = _aggregate_contract(validated, output_fields=output_fields)
     frame.attrs["output_groups"] = tuple((str(group["id"]), tuple(group["fields"])) for group in output_groups)
-    frame.attrs["train_standard_deviations"] = dict(train_standard_deviations)
-    frame.attrs["normalization_denominator_floor"] = denominator_floor
+    frame.attrs["train_scales"] = dict(train_scales)
+    frame.attrs["reference_floors"] = dict(reference_floors)
     frame.attrs["dataset_role"] = validated["split_role"]
 
 
@@ -636,15 +615,12 @@ def build_eval_df(frame_raw: pd.DataFrame) -> pd.DataFrame:
     )
     aggregate: dict[str, Any] | None = None
     if provenance is not None:
-        groups, train_standard_deviations, denominator_floor = _aggregate_contract(
-            provenance,
-            output_fields=output_fields,
-        )
+        groups, train_scales, reference_floors = _aggregate_contract(provenance, output_fields=output_fields)
         aggregate = contracts.aggregate_normalized_group_macro_rmse(
             frame_raw,
             output_groups=groups,
-            train_standard_deviations=train_standard_deviations,
-            normalization_denominator_floor=denominator_floor,
+            train_scales=train_scales,
+            reference_floors=reference_floors,
         )
         if provenance.get("evaluation") != {"prediction_validity": validity_contract.table_role_prediction_validity(frame_raw)}:
             msg = "Artifact provenance prediction validity does not match the Parquet validity documents."
@@ -727,6 +703,20 @@ def field_units(frame: pd.DataFrame) -> dict[str, str]:
     return dict(zip(fields, units, strict=True))
 
 
+def reference_floor(frame: pd.DataFrame, component_fields: tuple[str, ...]) -> float:
+    """
+    Return the reference-RMS floor of one learned field, or of a vector magnitude over its components.
+
+    Below the floor a relative error is unavailable, never stabilised; a magnitude takes its
+    largest component floor.
+    """
+    floors = frame.attrs.get("reference_floors")
+    if not isinstance(floors, Mapping) or not component_fields or any(field not in floors for field in component_fields):
+        msg = f"Evaluation DataFrame has no reference floor for {component_fields}."
+        raise ValueError(msg)
+    return max(float(floors[field]) for field in component_fields)
+
+
 def dataset_role(frame: pd.DataFrame) -> str:
     """
     Return ``ID``, ``Material OOD`` or ``Parameter OOD`` from the explicit saved split role.
@@ -742,8 +732,8 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
     """
     Build the exact role-local identity used for scientific comparison admission.
 
-    Task/objective/schema/field/unit and dataset/effective-membership evidence
-    always participate. When ``physics`` is requested, residual equations,
+    Task/objective/schema/field/unit and dataset/effective-membership evidence,
+    and the materials a dataset cut chose, always participate. When ``physics`` is requested, residual equations,
     derivative/crop settings, boundary semantics, and array definitions join the
     identity. Architecture and physics-loss settings deliberately do not.
     """
@@ -756,11 +746,12 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
         "input_units": evaluator.get("input_units"),
         "output_fields": evaluator.get("output_fields"),
         "output_units": evaluator.get("output_units"),
-        "predictive_metrics": evaluator.get("predictive_metrics"),
+        "metric_evidence": evaluator.get("metric_evidence"),
         "split_role": provenance.get("split_role"),
         "dataset": provenance.get("dataset"),
         "effective_membership_digest": provenance.get("selection", {}).get("effective_ordered_source_indices_sha256"),
         "effective_case_count": provenance.get("selection", {}).get("effective_case_count"),
+        "material_families": provenance.get("selection", {}).get("material_families"),
     }
     if physics:
         raw_physics = _mapping(provenance.get("physics"), label="provenance.physics")
@@ -776,6 +767,12 @@ def _comparison_identity(provenance: Mapping[str, Any], *, physics: bool) -> dic
             "residual_evaluation_region": raw_physics.get("residual_evaluation_region"),
         }
     return identity
+
+
+def _group_name(group: tuple[str, tuple[str, ...] | None]) -> str:
+    """Name one comparison dataset by its split role and, for a dataset cut, its materials."""
+    role, materials = group
+    return repr(role) if materials is None else f"{role!r} {list(materials)}"
 
 
 def _require_one_artifact_grid(members: tuple[tuple[int, int, int], ...], grids: tuple[display_grid.SpatialGridIdentity, ...]) -> None:
@@ -875,8 +872,10 @@ def validate_comparison(
 
     Notes
     -----
-    ID and OOD roles may coexist. Within each role, dataset fingerprint and saved
-    effective membership must match. Across roles, task/objective/schema/field/
+    ID and OOD roles may coexist. Within each dataset (a split role and, for a
+    dataset cut, the materials it chose), dataset fingerprint and saved effective
+    membership must match; one role holds either whole frames or cuts, never
+    both. Across datasets, task/objective/schema/field/
     unit semantics still agree. Architecture, hyperparameters, and physics
     enablement remain comparison dimensions, not blockers. All frames, within
     and across roles, must record one valid analysis producer; the recorded
@@ -886,8 +885,9 @@ def validate_comparison(
     if not datasets:
         msg = "At least one evaluation dataset is required."
         raise ValueError(msg)
-    grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-    frames_by_role: dict[str, list[tuple[str, pd.DataFrame]]] = {}
+    # One dataset is one split role and, for a dataset cut, the materials it chose; exact membership is compared per dataset.
+    grouped: dict[tuple[str, tuple[str, ...] | None], list[tuple[str, dict[str, Any]]]] = {}
+    frames_by_group: dict[tuple[str, tuple[str, ...] | None], list[tuple[str, pd.DataFrame]]] = {}
     provenances: dict[str, Mapping[str, Any]] = {}
     for label, frame in datasets.items():
         if not isinstance(label, str) or not label:
@@ -897,21 +897,28 @@ def validate_comparison(
         if require_physics and frame.attrs.get("task_id") != "steady_flow":
             msg = f"Physics plots are unavailable for task {frame.attrs.get('task_id')!r}."
             raise ComparisonCompatibilityError(msg)
-        role = str(provenance.get("split_role"))
-        grouped.setdefault(role, []).append((label, _comparison_identity(provenance, physics=require_physics)))
-        frames_by_role.setdefault(role, []).append((label, frame))
+        identity = _comparison_identity(provenance, physics=require_physics)
+        materials = identity["material_families"]
+        group = (str(provenance.get("split_role")), None if materials is None else tuple(materials))
+        grouped.setdefault(group, []).append((label, identity))
+        frames_by_group.setdefault(group, []).append((label, frame))
     try:
         contracts.require_common_analysis_producer(provenances)
     except ValueError as error:
         raise ComparisonCompatibilityError(str(error)) from error
+    # A whole frame and a cut of one role would sit in different groups and never be compared on membership or grids.
+    mixed = {role for role, materials in grouped if materials is None} & {role for role, materials in grouped if materials is not None}
+    if mixed:
+        msg = f"Role {min(mixed)!r} holds both whole artifact frames and dataset cuts; compare one kind per role."
+        raise ComparisonCompatibilityError(msg)
 
     reference_global: dict[str, Any] | None = None
-    for role, entries in grouped.items():
+    for group, entries in grouped.items():
         first_label, first = entries[0]
         for label, identity in entries[1:]:
             if identity != first:
                 msg = (
-                    f"Incompatible {role!r} artifacts: {first_label!r} and {label!r} "
+                    f"Incompatible {_group_name(group)} artifacts: {first_label!r} and {label!r} "
                     "differ in task/objective/schema/formulas/units/dataset/membership."
                 )
                 raise ComparisonCompatibilityError(msg)
@@ -925,7 +932,7 @@ def validate_comparison(
                 "input_units",
                 "output_fields",
                 "output_units",
-                "predictive_metrics",
+                "metric_evidence",
             )
         }
         if reference_global is None:
@@ -934,14 +941,15 @@ def validate_comparison(
             msg = "ID and OOD artifact groups use incompatible task/objective/schema/field/unit contracts."
             raise ComparisonCompatibilityError(msg)
     if verify_grid and all(frame.attrs.get("artifact_kind") != "transient_sequence" for frame in datasets.values()):
-        for role, role_frames in frames_by_role.items():
-            admitted = [(name, *_exact_comparison_grids(frame)) for name, frame in role_frames]
+        for group, group_frames in frames_by_group.items():
+            admitted = [(name, *_exact_comparison_grids(frame)) for name, frame in group_frames]
             if len(admitted) < _MINIMUM_DIRECT_MODEL_COMPARISON:
                 continue
             reference_name, reference_members, reference_grids = admitted[0]
             for name, members, grids in admitted[1:]:
-                if members != reference_members:
-                    msg = f"Models {reference_name!r} and {name!r} have different exact {role!r} case/source membership."
+                # The split-local position is source evidence of each model's saved order, not part of the case identity.
+                if [member[:2] for member in members] != [member[:2] for member in reference_members]:
+                    msg = f"Models {reference_name!r} and {name!r} have different exact {_group_name(group)} case/source membership."
                     raise ComparisonCompatibilityError(msg)
                 for member, left, right in zip(members, reference_grids, grids, strict=True):
                     try:
@@ -968,7 +976,7 @@ def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:
 
     Notes
     -----
-    Identity, predictive, physical, boundary, and normalized sufficient-statistic
+    Identity, per-case statistic and metric, physics and boundary
     columns are excluded. Callers that require complete finite rows must validate
     the returned columns more strictly for their own analysis.
 
@@ -978,23 +986,16 @@ def numeric_metadata_columns(frame: pd.DataFrame) -> tuple[str, ...]:
     fields = tuple(frame.attrs.get("output_fields", ()))
     reserved.update(
         {
-            "rel_l2",
-            "rel_h1",
             "physical_rmse_speed_magnitude",
             *STEADY_PHYSICS_METRICS,
             *PRESSURE_BOUNDARY_METRICS,
+            *contracts.case_metric_columns(fields),
+            *(column for field in fields for column in contracts.case_statistic_columns(field)),
         }
     )
     provenance = frame.attrs.get("artifact_provenance")
     if isinstance(provenance, Mapping):
         reserved.update(_declared_group_metric_columns(provenance))
-    for field in fields:
-        reserved.update(
-            {
-                *contracts.physical_statistic_columns(field),
-                *contracts.normalized_statistic_columns(field),
-            }
-        )
     columns: list[str] = []
     for column in frame.columns:
         if column in reserved:

@@ -3,11 +3,14 @@
 Responsibilities:
   - Normalize explicit current run paths and optional presentation labels
   - Invoke shared artifact load-or-build orchestration for selected roles
+  - Admit each requested role on its own and report every refused role with its reason
   - Compose session-owned role contexts for single-run or comparison panels
+  - Admit a matched B or A1 without an eligible checkpoint into the A0/A1/B comparison from its finished run
   - Return concise lifecycle, checkpoint, artifact, and device reporting
 
 Design principles:
   - Notebook cells expose choices while reusable orchestration remains in source
+  - A role the selected runs cannot share is refused alone: the other roles load and the session holds only admitted roles
   - Scientific run identity and mutable storage identity remain visibly separate
   - Presentation labels never participate in artifact or numerical identity
   - Failed preparation closes any session created before the failure
@@ -20,18 +23,21 @@ This module does NOT:
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cache
-from numbers import Real
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pandas as pd
 
-from src import analysis, common
+from src import analysis, common, experiments
 from src.analysis.presentation import analysis_compute as compute
 from src.experiments import experiments_matched_budget as matched_budget
+from src.learning.training import learning_training_budget as stage_budget
+from src.learning.transient import learning_transient_handoff as transient_handoff
 
 if TYPE_CHECKING:
     import ipywidgets as widgets
@@ -44,6 +50,7 @@ if TYPE_CHECKING:
     from src.analysis.evaluation.evaluation_transient_comparison import LineageComparison
     from src.analysis.evaluation.evaluation_transient_session import TransientEvaluationSession
     from src.analysis.presentation.analysis_compute import AnalysisComputePreference
+    from src.analysis.ui.analysis_ui_notebook import WidthScope
 
 ArtifactSelectionRole = Literal["id", "material_ood", "parameter_ood"]
 _SELECTION_ROLES: tuple[ArtifactSelectionRole, ...] = ("id", "material_ood", "parameter_ood")
@@ -104,6 +111,7 @@ class PreparedEvaluationWorkflow:
     summary_text: str
     transient_lineage: LineageComparison | None = None
     matched_stage_unavailable_reason: str | None = None
+    refused_roles: Mapping[str, str] = MappingProxyType({})
     _transient_performance_loader: Callable[[], pd.DataFrame | None] | None = None
 
     @property
@@ -116,20 +124,6 @@ class PreparedEvaluationWorkflow:
     def close(self) -> None:
         """Release all session-owned case and numerical state."""
         self.session.close()
-
-    def render_report(self, output_dir: Path | str) -> Any:
-        """Render the task-owned local report bundle below a caller-owned directory."""
-        if self.task == "transient_drying":
-            return analysis.presentation.curated.render_curated_transient_analysis(
-                session=cast("TransientEvaluationSession", self.session),
-                output_dir=output_dir,
-                training_performance=self.transient_performance,
-            )
-        datasets = {f"{context.label} / {model_label}": frame for context in self.contexts for model_label, frame in context.datasets.items()}
-        return analysis.presentation.curated.render_curated_analysis(
-            datasets=datasets,
-            output_dir=output_dir,
-        )
 
 
 def _normalized_selections(
@@ -158,6 +152,13 @@ def _normalized_selections(
             )
         )
     return tuple(normalized)
+
+
+def _unsuccessful(run_dir: Path) -> bool:
+    """Return whether a selected run ended without an eligible checkpoint (lifecycle ``unsuccessful``)."""
+    if not common.paths.resolve_run_summary_path(run_dir).is_file():
+        return False
+    return experiments.run.read_run_summary(run_dir).get("status") == "unsuccessful"
 
 
 def _normalized_context_specs(
@@ -226,20 +227,25 @@ def _required_text(value: Any, *, label: str) -> str:
     return value
 
 
-def _required_number(value: Any, *, label: str) -> float:
-    """Return one real matched-compute value without accepting booleans."""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        msg = f"{label} must be one real compute value."
-        raise TypeError(msg)
-    return float(value)
-
-
 def _required_nonnegative_int(value: Any, *, label: str) -> int:
     """Return one exact non-negative persisted counter."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         msg = f"{label} must be one non-negative integer."
         raise TypeError(msg)
     return value
+
+
+def _lineage_of(loaded: LoadedRunArtifacts) -> Mapping[str, Any]:
+    """Return one run's persisted transient lineage from its ID artifact."""
+    provenance = _required_mapping(_selected_artifact(loaded, "id").frame.attrs.get("artifact_provenance"), label="transient artifact provenance")
+    return _required_mapping(provenance.get("lineage"), label="transient lineage")
+
+
+def _matched_receipt(loaded: LoadedRunArtifacts) -> dict[str, Any] | None:
+    """Return the validated B receipt a matched B or A1 artifact carries, or ``None`` for A0."""
+    matched = _required_mapping(_lineage_of(loaded).get("matched_compute_manifest"), label="transient matched-compute manifest")
+    evidence = matched.get("b_train_budget_receipt")
+    return None if evidence is None else matched_budget.validate_b_receipt(dict(_required_mapping(evidence, label="B train budget receipt")))
 
 
 def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
@@ -274,25 +280,21 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
     scaling = _required_mapping(identity.get("scaling_identity"), label="transient scaling identity")
     matched = _required_mapping(lineage.get("matched_compute_manifest"), label="transient matched-compute manifest")
     controller = _required_mapping(matched.get("actual"), label="transient terminal controller")
-    clock_kind = _required_text(controller.get("clock_kind"), label="transient compute clock")
-    receipt_evidence = matched.get("b_train_budget_receipt")
-    receipt = (
-        matched_budget.validate_b_receipt(dict(_required_mapping(receipt_evidence, label="B train budget receipt")))
-        if receipt_evidence is not None
-        else None
-    )
+    budget = _required_mapping(matched.get("budget"), label="transient terminal budget")
+    clock_kind = _required_text(budget.get("unit"), label="transient budget unit")
+    receipt = _matched_receipt(loaded)
     if arm != "A0" and receipt is None:
         msg = "B/A1 lineage comparison requires the validated immutable matched_a1_b B budget receipt."
         raise ValueError(msg)
     expected_controller = {
-        "A0": ("A0", "stage_a_teacher_forcing", "stage_epochs"),
+        "A0": ("A0", "stage_a_teacher_forcing", "units"),
         "A1": ("A1", "stage_a_teacher_forcing", "train_seconds"),
         "B": ("B", "stage_b_self_fed", "train_seconds"),
     }[arm]
     observed_controller = (
         controller.get("arm"),
         controller.get("stage"),
-        controller.get("budget_control"),
+        clock_kind,
     )
     if observed_controller != expected_controller or stage.get("stage") not in ({"b"} if arm == "B" else {"a"}):
         msg = f"{arm} terminal controller identity is incompatible."
@@ -301,22 +303,23 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         controller.get("best_within_budget_epoch"),
         label=f"{arm} best-within-budget epoch",
     )
-    if controller.get("budget_complete") is not True or loaded.selected_checkpoint_epoch != best_epoch + 1:
-        msg = f"{arm} selected checkpoint does not match completed best-within-budget evidence."
+    try:
+        terminal_budget = stage_budget.StageBudget(**stage_budget.validate_state(budget))
+    except (TypeError, ValueError) as error:
+        msg = f"{arm} budget state is invalid: {error}"
+        raise ValueError(msg) from error
+    # B's end comes from its receipt, the comparison's one source of it; A0 and A1 report their own training outcome.
+    outcome = (
+        {"status": receipt["b_status"], "budget_progress": receipt["b_budget_progress"], "eligible_points": receipt["b_eligible_points"]}
+        if arm == "B" and receipt is not None
+        else _required_mapping(matched.get("training_outcome"), label="transient training outcome")
+    )
+    if (not terminal_budget.complete and outcome.get("status") != "diverged") or loaded.selected_checkpoint_epoch != best_epoch + 1:
+        msg = f"{arm} selected checkpoint does not match its best-within-budget evidence of a completed or diverged stage."
         raise ValueError(msg)
+    total, spent = float(terminal_budget.total), terminal_budget.spent
     best_checkpoint_id = f"{loaded.selected_checkpoint_sha256}@epoch={loaded.selected_checkpoint_epoch}"
     if receipt is None:
-        planned_epochs = _required_nonnegative_int(
-            controller.get("planned_stage_epochs"),
-            label="A0 planned stage epochs",
-        )
-        completed_epochs = _required_nonnegative_int(
-            controller.get("completed_stage_epochs"),
-            label="A0 completed stage epochs",
-        )
-        if planned_epochs < 1 or completed_epochs != planned_epochs:
-            msg = "A0 must complete its persisted Stage-A epoch budget before comparison."
-            raise ValueError(msg)
         planned = 0.0
         actual = 0.0
         overrun = 0.0
@@ -332,19 +335,13 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         ):
             msg = "Matched B/A1 receipt contradicts the common A0 parent experiment."
             raise ValueError(msg)
-        planned = _required_number(controller.get("planned_train_seconds"), label=f"{arm} planned train_seconds")
-        actual = _required_number(controller.get("train_seconds"), label=f"{arm} committed train_seconds")
-        if (
-            clock_kind != "train_seconds"
-            or planned <= 0.0
-            or actual < planned
-            or (arm == "B" and (actual != receipt["budget_value"] or loaded.selected_checkpoint_sha256 != receipt["best_checkpoint_sha256"]))
-            or (arm == "A1" and (planned != receipt["budget_value"] or controller.get("matched_receipt_sha256") != receipt["receipt_sha256"]))
+        planned, actual = total, spent
+        if (arm == "B" and (actual != receipt["budget_value"] or loaded.selected_checkpoint_sha256 != receipt["best_checkpoint_sha256"])) or (
+            arm == "A1" and (planned != receipt["budget_value"] or controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
         ):
             msg = f"{arm} committed budget contradicts the immutable B receipt."
             raise ValueError(msg)
         overrun = actual - planned
-    budget_complete = True
     comparison = analysis.evaluation.transient_comparison
     return comparison.TrainingArmEvidence(
         arm=arm,
@@ -375,7 +372,10 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
         actual_post_handoff_compute=actual,
         safe_boundary_overrun=overrun,
         clock_kind=clock_kind,
-        budget_complete=budget_complete,
+        budget_complete=terminal_budget.complete,
+        training_status=_required_text(outcome.get("status"), label=f"{arm} training outcome status"),
+        budget_progress=float(outcome["budget_progress"]),
+        eligible_points=_required_nonnegative_int(outcome.get("eligible_points"), label=f"{arm} eligible points"),
         best_within_budget_checkpoint_id=best_checkpoint_id,
         parent_experiment_sha256=(
             _required_text(matched.get("parent_experiment_sha256"), label="matched parent experiment identity")
@@ -383,8 +383,14 @@ def _transient_arm_evidence(loaded: LoadedRunArtifacts) -> Any:
             else None
         ),
         receipt_sha256=(str(receipt["receipt_sha256"]) if receipt is not None else None),
-        a0_handoff_sha256=(str(receipt["a0_handoff_sha256"]) if receipt is not None else None),
+        a0_handoff_sha256=str(receipt["a0_handoff_sha256"]) if receipt is not None else _own_handoff_sha256(loaded.run_dir),
     )
+
+
+def _own_handoff_sha256(run_dir: Path) -> str | None:
+    """Return the digest of the handoff manifest an A0 published for its B and A1, or ``None`` without one."""
+    manifest = run_dir / transient_handoff.HANDOFF_DIRECTORY / "manifest.json"
+    return common.serialization.file_sha256(manifest) if manifest.is_file() and not manifest.is_symlink() else None
 
 
 def _role_membership(artifact: LoadedEvaluationArtifact) -> Any:
@@ -414,24 +420,89 @@ def _validate_shared_membership(
         )
 
 
-def _transient_lineage(loaded_runs: Sequence[LoadedRunArtifacts]) -> tuple[Any | None, str | None]:
+def _receipt_arm(receipt: Mapping[str, Any]) -> Any:
+    """Return B without an eligible checkpoint as its receipt records its end: no artifact, no result."""
+    return analysis.evaluation.transient_comparison.UnavailableArm(
+        arm="B",
+        training_status=str(receipt["b_status"]),
+        budget_progress=float(receipt["b_budget_progress"]),
+        eligible_points=int(receipt["b_eligible_points"]),
+        receipt_sha256=str(receipt["receipt_sha256"]),
+        a0_handoff_sha256=str(receipt["a0_handoff_sha256"]),
+    )
+
+
+def _unavailable_arm(run_dir: Path) -> tuple[Any, dict[str, Any]]:
+    """
+    Return a matched B or A1 without an eligible checkpoint, from its validated finished run, and its receipt.
+
+    The run has no artifact; its end comes from its admitted terminal summary
+    (``experiments.run.validate_finished_run``), B's from its receipt, the one source of B's end.
+    A B's receipt must be the one its admitted end builds (``build_b_receipt``), so a receipt
+    copied from another B is refused; an A1's receipt is bound by its terminal controller
+    during that admission.
+    """
+    finished = experiments.run.validate_finished_run(run_dir)
+    protocol = finished["config"]["training"].get("matched_a1_b")
+    role = None if protocol is None else protocol["role"]
+    if finished["summary"]["status"] != "unsuccessful" or role not in {"a1", "b"}:
+        msg = f"Only a matched B or A1 without an eligible checkpoint enters a comparison without artifacts: {run_dir}"
+        raise ValueError(msg)
+    source = run_dir / matched_budget.RECEIPT_NAME
+    if source.is_symlink() or not source.is_file():
+        msg = f"Matched {role.upper()} without artifacts lacks its B budget receipt: {source}"
+        raise FileNotFoundError(msg)
+    receipt = matched_budget.validate_b_receipt(json.loads(source.read_text(encoding="utf-8")))
+    if role == "b":
+        expected = matched_budget.build_b_receipt(
+            parent_identity_sha256=receipt["parent_identity_sha256"],
+            a0_handoff_sha256=receipt["a0_handoff_sha256"],
+            b_config=finished["config"],
+            finished_b=finished,
+        )
+        if expected != receipt:
+            msg = f"The B budget receipt in {run_dir} is not the receipt of this B's admitted end."
+            raise ValueError(msg)
+        return _receipt_arm(receipt), receipt
+    outcome = finished["summary"]["training_outcome"]
+    arm = analysis.evaluation.transient_comparison.UnavailableArm(
+        arm="A1",
+        training_status=str(outcome["status"]),
+        budget_progress=float(outcome["budget_progress"]),
+        eligible_points=int(outcome["eligible_points"]),
+        receipt_sha256=str(receipt["receipt_sha256"]),
+        a0_handoff_sha256=str(receipt["a0_handoff_sha256"]),
+    )
+    return arm, receipt
+
+
+def _transient_lineage(loaded_runs: Sequence[LoadedRunArtifacts], *, unavailable_runs: Sequence[Path] = ()) -> tuple[Any | None, str | None]:
     """
     Return an admitted A0/A1/B lineage comparison or the reason none applies.
 
     A selection that is not one A0/A1/B set of shared immutable lineage has no
     matched stage (reason string). Malformed arm evidence, and contradictory
-    evidence of a set that does share its lineage, fail closed.
+    evidence of a set that does share its lineage, fail closed. A matched B or A1
+    without an eligible checkpoint has no artifact: it enters from its finished run
+    (``unavailable_runs``), and an absent B from the receipt of A1, when the receipt
+    records no eligible checkpoint of B.
     """
-    if len(loaded_runs) != _TRAINING_COMPARISON_ARM_COUNT:
-        return None, "a matched training-stage comparison needs exactly the three runs A0, A1 and B"
-    arm_ids = set()
-    for loaded in loaded_runs:
-        provenance = _required_mapping(_selected_artifact(loaded, "id").frame.attrs.get("artifact_provenance"), label="transient artifact provenance")
-        lineage = _required_mapping(provenance.get("lineage"), label="transient lineage")
-        arm_ids.add(_required_mapping(lineage.get("stage_identity"), label="transient stage identity").get("comparison_arm"))
-    if arm_ids != {"a0", "a1", "b"}:
-        return None, "the selected runs are not one A0, A1 and B training-stage set"
-    by_name = {arm.arm: arm for arm in (_transient_arm_evidence(loaded) for loaded in loaded_runs)}
+    arm_ids = [
+        _required_mapping(_lineage_of(loaded).get("stage_identity"), label="transient stage identity").get("comparison_arm") for loaded in loaded_runs
+    ]
+    unavailable = [_unavailable_arm(Path(run_dir)) for run_dir in unavailable_runs]
+    names = sorted([*(str(arm_id).upper() for arm_id in arm_ids), *(arm.arm for arm, _receipt in unavailable)])
+    if names not in (["A0", "A1", "B"], ["A0", "A1"]) or "a0" not in arm_ids:
+        return None, "the selected runs are not one A0, A1 and B training-stage set (B may be absent only without an eligible checkpoint)"
+    by_name: dict[str, Any] = {arm.arm: arm for arm in (_transient_arm_evidence(loaded) for loaded in loaded_runs)}
+    by_name.update({arm.arm: arm for arm, _receipt in unavailable})
+    if "B" not in by_name:
+        # A B without an eligible checkpoint enters from the receipt its A1 trained on.
+        receipts = [*(_matched_receipt(loaded) for loaded in loaded_runs), *(receipt for arm, receipt in unavailable if arm.arm == "A1")]
+        receipt = next(receipt for receipt in receipts if receipt is not None)
+        if receipt["best_checkpoint_sha256"] is not None:
+            return None, "a matched training-stage comparison needs B's run unless B has no eligible checkpoint"
+        by_name["B"] = _receipt_arm(receipt)
     comparison = analysis.evaluation.transient_comparison
     mismatch = comparison.matched_lineage_mismatch(a0=by_name["A0"], a1=by_name["A1"], b=by_name["B"])
     if mismatch is not None:
@@ -453,7 +524,8 @@ def _transient_performance_frame(
     frames: list[pd.DataFrame] = []
     for loaded, display_label in zip(loaded_runs, display_labels, strict=True):
         evidence = _transient_arm_evidence(loaded)
-        selected = summaries.loc[summaries["frame"] == f"{display_label} ID"].copy()
+        # A row without records (a rolling horizon the material never reaches) has no error to set against compute.
+        selected = summaries.loc[(summaries["frame"] == f"{display_label} ID") & (summaries["contributing_record_count"] > 0)].copy()
         if selected.empty:
             msg = f"Transient comparison lacks ID summaries for {display_label!r}."
             raise RuntimeError(msg)
@@ -464,6 +536,7 @@ def _transient_performance_frame(
         selected["training_compute"] = evidence.actual_post_handoff_compute
         selected["safe_boundary_overrun"] = evidence.safe_boundary_overrun
         selected["compute_clock"] = evidence.clock_kind
+        selected["training_status"] = evidence.training_status
         selected["checkpoint_role"] = "stage_a_handoff" if evidence.arm == "A0" else "best_within_budget"
         selected["checkpoint_identity"] = evidence.best_within_budget_checkpoint_id
         frames.append(selected)
@@ -578,6 +651,34 @@ def _bind_steady_capabilities(
     )
 
 
+def _admit_roles(
+    requested: Sequence[ArtifactSelectionRole], loaded_runs: Sequence[LoadedRunArtifacts], *, task: str
+) -> tuple[tuple[ArtifactSelectionRole, ...], dict[str, str]]:
+    """
+    Return the requested roles the runs hold and can share, and the reason of each role they hold but cannot share.
+
+    A role stands or falls alone: some runs holding it, different exact membership, or (steady) no case shared by
+    every run refuse that role only. Malformed evidence is not a refusal and still raises.
+    """
+    admitted: list[ArtifactSelectionRole] = []
+    refused: dict[str, str] = {}
+    for role in requested:
+        if not any(loaded.artifact(role) is not None for loaded in loaded_runs):
+            continue
+        if not all(loaded.artifact(role) is not None for loaded in loaded_runs):
+            refused[role] = f"Selected runs disagree on {role!r} artifact-role availability."
+            continue
+        try:
+            _validate_shared_membership(loaded_runs, roles=(role,))
+            if task == "steady_flow":
+                _steady_selection_case_ids({(loaded.run_dir, role): _selected_artifact(loaded, role) for loaded in loaded_runs})
+        except ValueError as error:
+            refused[role] = str(error)
+        else:
+            admitted.append(role)
+    return tuple(admitted), refused
+
+
 def prepare_evaluation_workflow(
     run_selections: Sequence[EvaluationRunSelection],
     context_specs: Sequence[EvaluationContextSpec],
@@ -590,13 +691,28 @@ def prepare_evaluation_workflow(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    widths: WidthScope | None = None,
+    refused_roles: Mapping[str, str] | None = None,
 ) -> PreparedEvaluationWorkflow:
-    """Prepare one steady or transient Evaluation workflow through task-owned sessions."""
+    """
+    Prepare one steady or transient Evaluation workflow through task-owned sessions.
+
+    Each requested role is admitted on its own: a refused role does not fail the others, it is reported in
+    ``refused_roles`` with its reason, and the session holds only admitted roles. ``refused_roles`` given by the caller
+    names roles it refused before loading; they are carried into the result and the panel unchanged. ``widths`` is the
+    notebook's width scope.
+    """
     requested_device = (
         evaluation_compute_device.requested if isinstance(evaluation_compute_device, compute.AnalysisComputePreference) else evaluation_compute_device
     )
     compute.admit_analysis_request(requested_device)
-    normalized_selections = _normalized_selections(run_selections)
+    selected = _normalized_selections(run_selections)
+    # A run that ended without an eligible checkpoint has no artifact; it enters only the matched comparison.
+    unavailable_runs = tuple(path for _selection, path in selected if _unsuccessful(path))
+    normalized_selections = tuple(item for item in selected if item[1] not in unavailable_runs)
+    if not normalized_selections:
+        msg = "An Evaluation workflow needs at least one selected run with artifacts."
+        raise ValueError(msg)
     requested_roles = None if artifact_roles is None else tuple(artifact_roles)
     prepared_runs = tuple(
         analysis.artifacts.service.load_or_build_run_artifacts(
@@ -619,22 +735,20 @@ def prepare_evaluation_workflow(
     if task not in {"steady_flow", "transient_drying"}:
         msg = f"Unsupported Evaluation task {task!r}."
         raise ValueError(msg)
+    if unavailable_runs and task != "transient_drying":
+        msg = "Only a matched transient comparison admits a selected run without an eligible checkpoint."
+        raise ValueError(msg)
 
     selected_roles: tuple[ArtifactSelectionRole, ...] = requested_roles if requested_roles is not None else _SELECTION_ROLES
     if set(selected_roles).difference(_SELECTION_ROLES):
         msg = f"Selected Evaluation roles contradict task {task!r}."
         raise ValueError(msg)
-    effective_roles: list[ArtifactSelectionRole] = []
-    for role in selected_roles:
-        available = tuple(loaded.artifact(role) is not None for loaded in loaded_runs)
-        if any(available) and not all(available):
-            msg = f"Selected runs disagree on {role!r} artifact-role availability."
-            raise ValueError(msg)
-        if all(available):
-            effective_roles.append(role)
-    roles = tuple(effective_roles)
+    roles, own_refusals = _admit_roles(selected_roles, loaded_runs, task=task)
+    refused = {**(refused_roles or {}), **own_refusals}
     if not roles:
         msg = "No requested Evaluation artifact role is available across every selected run."
+        if refused:
+            msg += " " + "; ".join(f"{role}: {reason}" for role, reason in refused.items())
         raise ValueError(msg)
     specs = _normalized_context_specs(context_specs, artifact_roles=roles)
 
@@ -674,10 +788,14 @@ def prepare_evaluation_workflow(
             {f"{loaded.run_dir}:{role}": artifacts[(loaded.run_dir, role)].frame for loaded in loaded_runs for role in roles}
         )
     try:
-        _validate_shared_membership(loaded_runs, roles=roles)
         if task == "transient_drying":
             transient_session = cast("TransientEvaluationSession", session)
-            lineage, matched_stage_unavailable_reason = _transient_lineage(loaded_runs)
+            # The lineage comparison is read from the ID artifacts: without an admitted ID role it has none.
+            lineage, matched_stage_unavailable_reason = (
+                _transient_lineage(loaded_runs, unavailable_runs=unavailable_runs)
+                if "id" in roles
+                else (None, "the controlled stage evidence is read from the ID role, which is not admitted for the selected runs")
+            )
             transient_performance_loader = _lazy_transient_performance(
                 transient_session,
                 loaded_runs=loaded_runs,
@@ -723,9 +841,12 @@ def prepare_evaluation_workflow(
                 sections=sections,
                 comparison=len(loaded_runs) > 1,
                 training_performance=transient_performance_loader,
+                training_lineage=lineage,
                 matched_stage_unavailable_reason=matched_stage_unavailable_reason,
                 selection_state=selection_state,
                 evaluation_compute_device=evaluation_compute_device,
+                widths=widths,
+                refused_roles=refused,
             )
         elif len(loaded_runs) == 1:
             if selection_state is not None:
@@ -735,6 +856,7 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
+                widths=widths,
             )
         else:
             if selection_state is not None:
@@ -744,6 +866,8 @@ def prepare_evaluation_workflow(
                 contexts=contexts,
                 sections=sections,
                 selection_state=selection_state,
+                widths=widths,
+                refused_roles=refused,
             )
         report = tuple(
             _report_row(prepared, artifact_roles=roles, display_label=display_label)
@@ -762,6 +886,7 @@ def prepare_evaluation_workflow(
         summary_text="",
         transient_lineage=lineage,
         matched_stage_unavailable_reason=matched_stage_unavailable_reason,
+        refused_roles=MappingProxyType(refused),
         _transient_performance_loader=transient_performance_loader,
     )
 
@@ -823,6 +948,7 @@ def prepare_single_model_evaluation_workspace(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    widths: WidthScope | None = None,
 ) -> PreparedEvaluationWorkflow:
     """Prepare one notebook-facing Evaluation workspace with task-owned contexts."""
     task = _validated_expected_task(expected_task)
@@ -843,6 +969,7 @@ def prepare_single_model_evaluation_workspace(
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
+        widths=widths,
     )
     return _with_expected_task(workflow, expected_task=task)
 
@@ -860,8 +987,10 @@ def prepare_model_comparison_evaluation_workspace(
     evaluation_compute_device: str | AnalysisComputePreference = "auto",
     sections: Sequence[str] | str = "all",
     selection_state: EvaluationSelectionState | None = None,
+    widths: WidthScope | None = None,
+    refused_roles: Mapping[str, str] | None = None,
 ) -> PreparedEvaluationWorkflow:
-    """Prepare an ordered multi-run notebook workspace with task-owned contexts."""
+    """Prepare an ordered multi-run notebook workspace with task-owned contexts; see ``prepare_evaluation_workflow`` for the roles."""
     task = _validated_expected_task(expected_task)
     if isinstance(run_dirs, (str, bytes)) or not isinstance(run_dirs, Sequence) or len(run_dirs) < _MINIMUM_COMPARISON_RUNS:
         msg = "Model-comparison Evaluation workspace requires at least two ordered run paths."
@@ -885,5 +1014,7 @@ def prepare_model_comparison_evaluation_workspace(
         evaluation_compute_device=evaluation_compute_device,
         sections=sections,
         selection_state=selection_state,
+        widths=widths,
+        refused_roles=refused_roles,
     )
     return _with_expected_task(workflow, expected_task=task)

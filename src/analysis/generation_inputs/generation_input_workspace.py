@@ -42,7 +42,7 @@ class GenerationInputEDAWorkspace:
     """Hold plain notebook guidance, the separately displayed EDA panel, and the discovered campaign candidate outcomes."""
 
     summary_text: str
-    panel: widgets.Output | None
+    panel: widgets.VBox | None
     outcomes: sources.CampaignOutcomeCatalog
 
 

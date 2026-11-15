@@ -37,7 +37,7 @@ import pytest
 import torch
 import yaml
 
-from src import common, datasets, domain, experiments, generation
+from src import common, datasets, domain, experiments, generation, learning
 from src.analysis.component_checks import component_checks_increments as increments
 from src.analysis.component_checks import component_checks_plots as plots
 from src.analysis.component_checks import component_checks_sources as sources
@@ -595,7 +595,13 @@ def test_membership_scaling_fits_only_the_leading_membership_cases(monkeypatch: 
             """Release nothing."""
 
     def select(_dataset: object, case_ids: tuple[str, ...]) -> SimpleNamespace:
-        return SimpleNamespace(iter_scaling_items=lambda: scaling_items(case_ids), configured_regular_horizon=1, close=lambda: None)
+        view = SimpleNamespace(view_evidence=lambda: {"spatial_stride": 1})
+        return SimpleNamespace(
+            iter_scaling_items=lambda: scaling_items(case_ids),
+            configured_regular_horizon=1,
+            spatial_representation=lambda: view,
+            close=lambda: None,
+        )
 
     def fit(items: Iterator[dict[str, str]], **kwargs: object) -> str:
         consumed.extend(item["case_id"] for item in items)
@@ -606,9 +612,9 @@ def test_membership_scaling_fits_only_the_leading_membership_cases(monkeypatch: 
     monkeypatch.setattr(datasets.runtime.factory, "create_dataset", lambda _request: FakeShards())
     monkeypatch.setattr(datasets.runtime.transient, "select_transient_cases", select)
     monkeypatch.setattr(datasets.preprocessing.splits, "split_dataset_identity", lambda _binding, _identity: {})
-    monkeypatch.setattr(increments.transient_contracts.TransientTensorizerSpec, "from_mapping", lambda _mapping: None)
+    monkeypatch.setattr(increments.transient_contracts.TransientTensorizerSpec, "from_mapping", lambda _mapping: SimpleNamespace(as_dict=dict))
     monkeypatch.setattr(increments.transient_scaling, "fit_transient_scaling", fit)
-    config = {"data": {"spatial_stride": 1}, "input_profile": None, "temporal": {"temporal_conditioning": None}, "scaling": {"mode": "state_std"}}
+    config = {"data": {"spatial_stride": 1}, "input_profile": None, "temporal": {"temporal_conditioning": None}}
     assert increments.fit_membership_scaling("synthetic", membership="validation", config=config, max_cases=1) == "scaling"
     assert consumed == _PARTITION_IDS["validation"][:1]
     assert fitted["train_membership_digest"] == common.serialization.canonical_json_sha256(_PARTITION_IDS["validation"][:1])
@@ -666,16 +672,21 @@ def test_stride_views_keep_endpoints_and_rebuild_bilinear_fields_exactly() -> No
     assert floor.loc[floor["stride"] == 4, "status"].str.startswith("refused").all()
 
 
-def test_increment_statistics_count_beta_exceedance_and_zeros_and_flag_nonuniform_steps() -> None:
-    """Exact zeros, values above beta, the maximum and equal-weight shares are exact; an irregular step is not uniform."""
-    batch = torch.tensor([[[[0.0, 0.5]], [[0.1, 0.1]]], [[[2.0, 0.0]], [[0.1, 0.1]]]])
-    stats = increments.scaled_increment_statistics([batch], channels=("a", "b"), beta=1.0)
-    assert stats.loc["a", "zero_fraction"] == 0.5
-    assert stats.loc["a", "above_beta_fraction"] == 0.25
-    assert stats.loc["b", "above_beta_fraction"] == 0.0
-    assert stats.loc["a", "max"] == 2.0
-    assert stats.loc["b", "q50"] == pytest.approx(0.1, rel=1e-6)
-    assert stats.loc["a", "loss_share"] == pytest.approx((1.625 / 4) / (1.625 / 4 + 0.005), rel=1e-6)
+def test_increment_statistics_count_zeros_and_group_weighted_loss_shares_and_flag_nonuniform_steps() -> None:
+    """Exact zeros, the maximum and the shares of the group-weighted state loss are exact; an irregular step is not uniform."""
+    task = domain.tasks.registry.get_task("transient_drying")
+    channels = task.metric_names
+    first = torch.tensor([[[0.0, 0.5]], [[0.1, 0.1]], [[0.2, 0.2]], [[0.0, 0.0]]])
+    second = torch.tensor([[[2.0, 0.0]], [[0.1, 0.1]], [[0.2, 0.2]], [[0.0, 0.0]]])
+    loss = learning.losses.factory.build_data_loss(task, "mse")
+    stats = increments.scaled_increment_statistics([torch.stack((first, second))], channels=channels, loss=loss)
+    assert stats.loc["T", "zero_fraction"] == 0.5
+    assert stats.loc["T", "max"] == 2.0
+    assert stats.loc["phi", "q50"] == pytest.approx(0.1, rel=1e-6)
+    # Mean squares 1.0625, 0.01, 0.04 and 0 under the weights 1/3, 1/3, 1/6 and 1/6.
+    weighted = {"T": 1.0625 / 3, "phi": 0.01 / 3, "w_surf": 0.04 / 6, "w_int": 0.0}
+    total = sum(weighted.values())
+    assert stats["loss_share"].to_dict() == pytest.approx({name: value / total for name, value in weighted.items()}, rel=1e-6)
     steps = increments.time_step_table({"regular": np.array([0.0, 1.0, 2.0]), "irregular": np.array([0.0, 1.0, 2.5])})
     assert steps["uniform"].to_dict() == {"regular": True, "irregular": False, "all cases": False}
 
@@ -722,16 +733,13 @@ def test_summary_applies_each_proposed_criterion() -> None:
     stride = pd.DataFrame(
         {"stride": [1, 2, 4], "status": ["admissible", "admissible", "refused: endpoint"], "max_normalized_rmse": [0.0, 1e-3, math.nan]}
     )
-    tables = increments.TransientComponentTables(
-        spectral=modes, stride=stride, increments=pd.DataFrame({"above_beta_fraction": [0.0, 0.0]}), time_steps=pd.DataFrame()
-    )
+    tables = increments.TransientComponentTables(spectral=modes, stride=stride, increments=pd.DataFrame(), time_steps=pd.DataFrame())
     status = summary.summary_table(crop=crop, timing=timed, steady_modes=modes, transient=tables)["status"]
     assert status["Derivative backend: FC arm"] == "keep FC arm"
     assert status["Interior crop"] == "fd: crop 1; fc: none"
     assert status["n_modes steady, axis y"] == "padding 0: lower bound 16, sufficient 32"
     assert status["Domain padding steady"] == "no effect"
     assert status["Spatial stride"] == "stride 1: admissible; stride 2: admissible; stride 4: refused"
-    assert status["Huber regime"] == "Huber = MSE prior"
     assert (summary.summary_table()["status"] == summary.NOT_MEASURED).all()
     assert summary.summary_table()["criterion"].str.endswith(f"({summary.CRITERIA_STATE})").all()
     assert sources.membership_caption("train", ["a", "b"]) == "train membership · 2 cases"

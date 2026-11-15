@@ -41,6 +41,7 @@ import h5py
 import numpy as np
 
 from src import common, generation
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
@@ -153,12 +154,12 @@ def read_transient_case_arrays(  # noqa: C901, PLR0912, PLR0915 -- centralized c
     schedule_dataset = require_hdf5_dataset(handle, "schedule/values")
     scalar_dataset = require_hdf5_dataset(handle, "scalar/values")
     time_dataset = require_hdf5_dataset(handle, "time")
-    stride = transient_contract.validate_spatial_stride(spatial_stride)
+    stride = grid_contract.validate_spatial_stride(spatial_stride)
     if transient_dataset.ndim != _TRANSIENT_FIELD_RANK:
         message = f"Transient source spatial tensor rank is invalid: {path}."
         raise TransientDataContractError(message)
     canonical_shape = (int(transient_dataset.shape[2]), int(transient_dataset.shape[3]))
-    transient_contract.resolve_spatial_view(canonical_shape, stride)
+    grid_contract.resolve_spatial_view(canonical_shape, stride)
     transient_names = decode_json_string_list(
         transient_dataset.attrs["field_names"],
         label="transient.field_names",

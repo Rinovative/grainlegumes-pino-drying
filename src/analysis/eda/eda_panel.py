@@ -22,8 +22,6 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING, Any, Literal
 
-import ipywidgets as widgets
-
 from src.analysis import ui
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import registry as presentation
@@ -36,25 +34,25 @@ from . import plots
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    import ipywidgets as widgets
     from matplotlib.figure import Figure
 
 _TransientCaseKind = Literal["snapshot", "trajectory"]
-_ORIENTATION_SELECTOR_WIDTH_PX = int(ui.notebook.STANDARD_VIEW_SELECTOR_WIDTH_PX * 1.25)
 
 
 def _cached_factory(
-    builder: Callable[..., viewers.ActivatableView],
-) -> Callable[..., widgets.Widget]:
-    """Wrap one explicit builder in a state-preserving lazy factory."""
-    cached: viewers.ActivatableView | None = None
+    builder: Callable[..., ui.panel.ViewPanel],
+) -> Callable[..., ui.panel.ViewPanel]:
+    """Wrap one explicit builder in a state-preserving lazy factory; a shown view draws itself again on activation."""
+    cached: ui.panel.ViewPanel | None = None
 
     def invoke(
         *,
         export_state: dict[str, Any] | None = None,
         export_plot_name: str | None = None,
         export_title: str | None = None,
-    ) -> widgets.Widget:
-        """Construct once or reactivate the cached current-selection view."""
+    ) -> ui.panel.ViewPanel:
+        """Construct the view once and return the same view afterwards."""
         nonlocal cached
         if cached is None:
             cached = builder(
@@ -62,8 +60,6 @@ def _cached_factory(
                 export_plot_name=export_plot_name,
                 export_title=export_title,
             )
-        else:
-            cached.activate()
         return cached
 
     return invoke
@@ -73,14 +69,14 @@ def _view_factories(
     catalog: selection.GeneratedOutputEDACatalog,
     selection_state: selection.GeneratedOutputSelectionState,
     display_spatial_stride: display_grid.DisplayStride = "auto",
-) -> Mapping[str, Callable[..., widgets.Widget]]:
+) -> Mapping[str, Callable[..., ui.panel.ViewPanel]]:
     """Bind every maintained semantic registry key to one cached factory."""
 
     def statistics(
-        plot_function: Callable[..., widgets.Widget],
+        plot_function: Callable[..., ui.panel.ViewPanel],
         *,
         required_capabilities: Sequence[selection.GeneratedOutputCapability],
-    ) -> Callable[..., widgets.Widget]:
+    ) -> Callable[..., ui.panel.ViewPanel]:
         """Bind one established capability-adaptive case-statistics viewer."""
 
         def build(
@@ -88,7 +84,7 @@ def _view_factories(
             export_state: dict[str, Any] | None = None,
             export_plot_name: str | None = None,
             export_title: str | None = None,
-        ) -> viewers.ActivatableView:
+        ) -> ui.panel.ViewPanel:
             """Build one shared-selection statistics view."""
             return viewers.make_statistics_view(
                 catalog=catalog,
@@ -107,7 +103,7 @@ def _view_factories(
         single: Callable[..., Figure],
         aggregate: Callable[..., Figure] | None,
         semantic_controls: Mapping[str, widgets.ValueWidget] | None = None,
-    ) -> Callable[..., widgets.Widget]:
+    ) -> Callable[..., ui.panel.ViewPanel]:
         """Bind one capability-adaptive spectral view."""
 
         def build(
@@ -115,7 +111,7 @@ def _view_factories(
             export_state: dict[str, Any] | None = None,
             export_plot_name: str | None = None,
             export_title: str | None = None,
-        ) -> viewers.ActivatableView:
+        ) -> ui.panel.ViewPanel:
             """Build one shared-selection spectral view."""
             return viewers.make_spectral_view(
                 catalog=catalog,
@@ -135,7 +131,7 @@ def _view_factories(
         export_state: dict[str, Any] | None = None,
         export_plot_name: str | None = None,
         export_title: str | None = None,
-    ) -> viewers.ActivatableView:
+    ) -> ui.panel.ViewPanel:
         """Build shared steady/transient retained spatial-field maps."""
         return viewers.make_spatial_case_view(
             display_spatial_stride=display_spatial_stride,
@@ -146,7 +142,7 @@ def _view_factories(
             export_title=export_title,
         )
 
-    def transient_case(kind: _TransientCaseKind) -> Callable[..., widgets.Widget]:
+    def transient_case(kind: _TransientCaseKind) -> Callable[..., ui.panel.ViewPanel]:
         """Bind one transient case view through shared case/time controls."""
 
         def build(
@@ -154,7 +150,7 @@ def _view_factories(
             export_state: dict[str, Any] | None = None,
             export_plot_name: str | None = None,
             export_title: str | None = None,
-        ) -> viewers.ActivatableView:
+        ) -> ui.panel.ViewPanel:
             """Build one task-native transient case view."""
             return viewers.make_transient_case_view(
                 display_spatial_stride=display_spatial_stride,
@@ -173,7 +169,7 @@ def _view_factories(
         export_state: dict[str, Any] | None = None,
         export_plot_name: str | None = None,
         export_title: str | None = None,
-    ) -> viewers.ActivatableView:
+    ) -> ui.panel.ViewPanel:
         """Build the consolidated target diagnostic and companion table."""
         return viewers.make_completion_target_view(
             catalog=catalog,
@@ -183,25 +179,12 @@ def _view_factories(
             export_title=export_title,
         )
 
-    orientation = widgets.Dropdown(
-        options=(
-            (
-                "Cross-stream spectrum k_x along flow direction y",
-                "cross_stream_along_flow",
-            ),
-            (
-                "Flow-direction spectrum k_y across cross-stream direction x",
-                "flow_across_cross_stream",
-            ),
+    orientation = ui.controls.dropdown(
+        (
+            ("Cross-stream spectrum k_x along flow direction y", "cross_stream_along_flow"),
+            ("Flow-direction spectrum k_y across cross-stream direction x", "flow_across_cross_stream"),
         ),
-        value="cross_stream_along_flow",
-        description="Orientation:",
-        style={"description_width": "initial"},
-        layout=widgets.Layout(
-            width=f"{_ORIENTATION_SELECTOR_WIDTH_PX}px",
-            max_width=f"{_ORIENTATION_SELECTOR_WIDTH_PX}px",
-            flex=f"0 0 {_ORIENTATION_SELECTOR_WIDTH_PX}px",
-        ),
+        description="Orientation",
     )
     factories = {
         "metadata_statistics": statistics(
@@ -245,10 +228,10 @@ def _view_factories(
 
 def _numbered_section(
     numbered_plots: Sequence[tuple[Any, str]],
-    factories: Mapping[str, Callable[..., widgets.Widget]],
+    factories: Mapping[str, Callable[..., ui.panel.ViewPanel]],
     export_state: dict[str, Any],
-) -> widgets.Widget:
-    """Build one lazy dropdown section from numbered registry plots."""
+) -> ui.notebook.ViewSection:
+    """Build one lazy view section from numbered registry plots."""
     entries = []
     for plot, plot_label in numbered_plots:
         try:
@@ -257,21 +240,21 @@ def _numbered_section(
             message = f"EDA presentation view {plot.key!r} has no registered factory."
             raise ValueError(message) from error
         entries.append((plot_label, factory, plot.key))
-    return ui.notebook.make_dropdown_section(entries, export_state=export_state, select_first=True)
+    return ui.notebook.view_section(entries, export_state=export_state)
 
 
 def _sections_for_capabilities(
     *,
     capabilities: Sequence[selection.GeneratedOutputCapability],
-    factories: Mapping[str, Callable[..., widgets.Widget]],
+    factories: Mapping[str, Callable[..., ui.panel.ViewPanel]],
     export_state: dict[str, Any],
-) -> tuple[tuple[widgets.Widget, ...], tuple[str, ...]]:
+) -> tuple[tuple[ui.notebook.ViewSection, ...], tuple[str, ...]]:
     """Build lazy numbered sections for one selected-dataset capability union."""
-    sections: list[widgets.Widget] = []
+    sections: list[ui.notebook.ViewSection] = []
     titles: list[str] = []
     if "published_tensors" in factories:
         entries = [("Model inputs and targets", factories["published_tensors"], "published_tensors")]
-        sections.append(ui.notebook.make_dropdown_section(entries, export_state=export_state, select_first=True))
+        sections.append(ui.notebook.view_section(entries, export_state=export_state))
         titles.append("Model inputs and targets")
     visible = presentation.eda_sections_for_capabilities(capabilities)
     for _section, section_label, numbered_plots in presentation.numbered_registry(visible):
@@ -298,7 +281,7 @@ def build_eda_panel(
     selection_state: selection.GeneratedOutputSelectionState,
     title: str = "Generated-output EDA",
     display_spatial_stride: display_grid.DisplayStride = "auto",
-) -> widgets.Widget:
+) -> widgets.VBox:
     """Build the sole capability-adaptive generated-output EDA outer panel."""
     if not isinstance(catalog, selection.GeneratedOutputEDACatalog):
         message = "EDA panel construction requires a GeneratedOutputEDACatalog."
@@ -325,21 +308,10 @@ def build_eda_panel(
         factories=factories,
         export_state=export_state,
     )
-    dataset_control = controls.GeneratedOutputDatasetControl(
-        selection_state=selection_state,
-    )
-    outer = ui.notebook.make_lazy_panel_with_tabs(
-        sections,
-        tab_titles=tab_titles,
-        open_btn_text=f"{title.strip()} - Open",
-        close_btn_text="Close",
-        panel_controls=(dataset_control.widget, widgets.HTML(f"Map display stride: {display_spatial_stride}; full-grid statistics.")),
-        export_state=export_state,
-        export_btn_text="Export PDF",
-    )
     displayed_capabilities = {"value": capabilities}
+    committing = False
 
-    def selection_changed(_current: selection.GeneratedOutputSelection) -> None:
+    def replace_tabs_for_capabilities() -> None:
         """Replace only registry sections when the capability union changes."""
         current_capabilities = _selected_capabilities(selection_state)
         if not current_capabilities or current_capabilities == displayed_capabilities["value"]:
@@ -352,5 +324,30 @@ def build_eda_panel(
         displayed_capabilities["value"] = current_capabilities
         outer.replace_tabs(replacement_sections, replacement_titles)
 
+    def selection_changed(_current: selection.GeneratedOutputSelection) -> None:
+        """Follow a selection that no selector callback is finishing at once."""
+        if not committing:
+            replace_tabs_for_capabilities()
+
+    def commit(keys: tuple[str, ...]) -> None:
+        """Apply the user's dataset choice, then replace the tabs once the notification of the shared state has returned."""
+        nonlocal committing
+        committing = True
+        try:
+            selection_state.select_datasets(keys)
+        finally:
+            committing = False
+        replace_tabs_for_capabilities()
+
+    # The sole dataset selector belongs to the panel: it stays while the capability union replaces the tabs below it.
+    datasets = controls.dataset_selector(selection_state, commit=commit)
+    outer = ui.notebook.LazyPanel(
+        sections,
+        tab_titles,
+        open_label=f"{title.strip()} - Open",
+        export_state=export_state,
+        controls=[ui.panel.row(datasets.header)],
+        popovers=[(datasets.header, datasets.body)],
+    )
     selection_state.observe(selection_changed)
-    return outer
+    return outer.widget

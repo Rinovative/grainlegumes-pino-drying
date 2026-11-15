@@ -16,12 +16,11 @@ Design principles:
     the stage, every cache hit, and the published target
   - The required timing block is written into the stage before validation, so a timing failure publishes nothing
   - Rebuild publishes a validated replacement only for the requested target
-  - Local notebook orchestration never invokes tracking uploads
 
 This module does NOT:
   - Parse CLI arguments or choose which runs a user intends to process
   - Define scientific metrics or the Parquet/NPZ payload schema
-  - Render notebook figures or bypass bounded W&B publication contracts
+  - Render notebook figures
 """
 
 from __future__ import annotations
@@ -30,23 +29,20 @@ import gc
 import json
 import os
 import shutil
-import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from numbers import Integral, Real
+from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 import torch
 
-from src import common, domain, experiments
+from src import common, datasets, domain, experiments
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
-from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 from . import analysis_artifact_performance as artifact_performance
 from . import analysis_artifact_plan as artifact_plan
@@ -58,12 +54,11 @@ if TYPE_CHECKING:
 
 ArtifactSplit = artifact_plan.ArtifactSplit
 ArtifactDatasetRole = artifact_plan.ArtifactDatasetRole
-_MINIMUM_GRID_VARIANT_STRIDE = 2
 
 
 class ArtifactCacheError(RuntimeError):
     """
-    Signal rejection of an existing or upload-bound artifact cache.
+    Signal rejection of an existing artifact cache.
 
     Artifact admission raises this exception when schema, scientific identity,
     aggregate, manifest, or payload evidence cannot prove that a cache is both
@@ -125,10 +120,8 @@ class _EvaluatorArtifactContract:
         Ordered names and output units required in every Parquet row and NPZ.
     output_groups : tuple[tuple[str, tuple[str, ...]], ...]
         Ordered task-owned physical output groups.
-    train_standard_deviations : dict[str, float]
-        Exact raw output scales from the saved training normalizer.
-    normalization_denominator_floor : float
-        Saved transform denominator addition used to validate normalized evidence.
+    train_scales : dict[str, float]
+        Exact Train state scales ``max(sigma, floor)`` from the saved run scaling.
     group_metric_columns : tuple[str, ...]
         Task-declared per-case physical and normalized group diagnostics.
     physics_kind : str
@@ -141,8 +134,7 @@ class _EvaluatorArtifactContract:
     output_fields: tuple[str, ...]
     output_units: tuple[str, ...]
     output_groups: tuple[tuple[str, tuple[str, ...]], ...]
-    train_standard_deviations: dict[str, float]
-    normalization_denominator_floor: float
+    train_scales: dict[str, float]
     group_metric_columns: tuple[str, ...]
     physics_kind: str
 
@@ -243,7 +235,9 @@ def iter_run_dirs(root: Path, *, run_names: Iterable[str] | None = None) -> Iter
         if not selected and common.paths.resolve_run_summary_path(candidate).is_file():
             status = experiments.run.read_run_summary(candidate).get("status")
             if isinstance(status, str) and status != "completed":
-                print(f"[SKIP] {name or candidate.name} | status {status} (resume it to completion to evaluate it)")
+                # An unsuccessful run has no eligible checkpoint and is never resumed.
+                hint = "no eligible checkpoint to evaluate" if status == "unsuccessful" else "resume it to completion to evaluate it"
+                print(f"[SKIP] {name or candidate.name} | status {status} ({hint})")
                 continue  # A selected name is admitted below instead and refused with the same resume hint.
         admitted = experiments.run.validate_evaluable_run(candidate)
         found.add(str(admitted["scientific_run_name"]))
@@ -282,51 +276,14 @@ def _artifact_save_root(
     run_dir: Path,
     dataset_name: str,
     split: ArtifactSplit,
-    evaluation_spatial_stride: int = 1,
 ) -> Path:
-    """Resolve one split- and Evaluation-grid-qualified artifact save root."""
-    stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
+    """Resolve one split-qualified artifact save root."""
     if split not in artifact_plan.ARTIFACT_SPLITS:
         msg = f"Unknown artifact split {split!r}."
         raise ValueError(msg)
-    if stride == 1:
-        if split == "eval":
-            return common.paths.resolve_id_analysis_dir(run_dir)
-        return common.paths.resolve_ood_analysis_dir(run_dir, split, dataset_name)
-    variant_root = common.paths.resolve_analysis_root(run_dir) / f"grid_s{stride}"
-    return variant_root / "id" if split == "eval" else variant_root / split / dataset_name
-
-
-def _grid_token_stride(name: str) -> int | None:
-    """Return one exact noncanonical Evaluation stride from a path token."""
-    suffix = name.removeprefix("grid_s")
-    if not name.startswith("grid_s") or not suffix.isdigit() or suffix.startswith("0"):
-        return None
-    stride = int(suffix)
-    return stride if stride >= _MINIMUM_GRID_VARIANT_STRIDE else None
-
-
-def _artifact_target_stride(
-    target: Path,
-    *,
-    analysis_root: Path,
-    split: ArtifactSplit,
-    dataset_name: str,
-) -> int | None:
-    """Resolve a canonical or exact sibling grid-variant role target."""
-    canonical = analysis_root / "id" if split == "eval" else analysis_root / split / dataset_name
-    if target == canonical:
-        return 1
     if split == "eval":
-        variant_root = target.parent
-        exact_leaf = target.name == "id"
-    else:
-        variant_root = target.parent.parent
-        exact_leaf = target.parent.name == split and target.name == dataset_name
-    stride = _grid_token_stride(variant_root.name)
-    if variant_root.parent != analysis_root or not exact_leaf:
-        return None
-    return stride
+        return common.paths.resolve_id_analysis_dir(run_dir)
+    return common.paths.resolve_ood_analysis_dir(run_dir, split, dataset_name)
 
 
 def _normalise_path(path: Path) -> Path:
@@ -351,14 +308,7 @@ def _validated_artifact_target(*, run_dir: Path, save_root: Path) -> tuple[Path,
     id_target = analysis_root / "id"
     role_roots = {analysis_root / role for role in common.paths.ANALYSIS_OOD_ROLES}
     is_named_role_target = target.parent in role_roots and target.name not in {"", ".", ".."}
-    is_id_grid_target = target.name == "id" and target.parent.parent == analysis_root and _grid_token_stride(target.parent.name) is not None
-    is_named_grid_target = (
-        target.parent.name in common.paths.ANALYSIS_OOD_ROLES
-        and target.parent.parent.parent == analysis_root
-        and target.name not in {"", ".", ".."}
-        and _grid_token_stride(target.parent.parent.name) is not None
-    )
-    if target != id_target and not is_named_role_target and not is_id_grid_target and not is_named_grid_target:
+    if target != id_target and not is_named_role_target:
         msg = f"Refusing rebuild outside one exact artifact target: {target}"
         raise ValueError(msg)
 
@@ -454,9 +404,9 @@ def _build_artifact_request(
     if not isinstance(device_resolution, learning.device.DeviceResolution):
         msg = "Artifact provenance requires one resolved runtime device decision."
         raise TypeError(msg)
-    raw_batch_size = data_cfg.get("batch_size")
+    raw_batch_size = data_cfg.get("evaluation_batch_size")
     if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, Integral) or int(raw_batch_size) <= 0:
-        msg = "Evaluable run config data.batch_size must be a positive integer."
+        msg = "Evaluable run config data.evaluation_batch_size must be a positive integer."
         raise TypeError(msg)
     batch_size = int(raw_batch_size)
     task = experiments.config.loader.validate_resolved_task_contract(run_config)
@@ -465,8 +415,8 @@ def _build_artifact_request(
     if not isinstance(normalizer_state, Mapping):
         msg = "Evaluable run must contain the validated saved normalizer state."
         raise TypeError(msg)
-    train_standard_deviations = contracts.output_standard_deviations_from_state(
-        normalizer_state,
+    train_scales = contracts.output_scales(
+        datasets.preprocessing.normalization.TrainScaling.from_state_dict(normalizer_state),
         output_fields=task.output_names,
     )
     source_indices = role.source_indices
@@ -535,9 +485,8 @@ def _build_artifact_request(
             "sha256": admitted["normalizer_sha256"],
             "identity": "saved_run_normalizer.pt",
             "fit_split": task.preprocessing.fit_split,
-            "output_normalization": task.preprocessing.output_normalization,
-            "denominator_floor": 1e-7,
-            "output_standard_deviations": train_standard_deviations,
+            "normalization": task.preprocessing.normalization,
+            "output_scales": train_scales,
         },
         "evaluator": {
             "metrics": metrics,
@@ -548,18 +497,7 @@ def _build_artifact_request(
             "output_units": {field.name: field.unit for field in task.outputs},
             "output_groups": output_groups,
             "physics_kind": task.physics.kind,
-            "group_objective_evidence": {
-                "squared_error_accumulation_dtype": "float64",
-                "per_case_physical_columns": {field: list(contracts.physical_statistic_columns(field)) for field in task.output_names},
-                "per_case_normalized_columns": {field: list(contracts.normalized_statistic_columns(field)) for field in task.output_names},
-                "train_scale_source": "saved_run_normalizer.output_standard_deviations",
-                "dataset_reduction": ("sum physical field SSE/count, finalize shared-scale group RMSE, equal macro mean over output groups"),
-            },
-            "predictive_metrics": {
-                "rel_l2": "per-case arithmetic mean of physical per-field relative L2 ratios",
-                "rel_h1": "per-case arithmetic mean of physical per-field relative H1 ratios on the declared artifact region where available",
-                "physical_rmse_columns": {field: contracts.physical_statistic_columns(field)[2] for field in task.output_names},
-            },
+            "metric_evidence": contracts.metric_evidence_provenance(task),
         },
         "generation": {
             "effective_case_limit": None,
@@ -600,11 +538,7 @@ def _report_admitted_target(frame: pd.DataFrame) -> None:
     provenance = frame.attrs["artifact_provenance"]
     report = provenance[timing.TIMING_KEY]["report"]
     validity_contract.report_invalid_predictions(provenance["evaluation"]["prediction_validity"])
-    if frame.attrs["artifact_kind"] == "transient_sequence":
-        measured = len(report["cases"])
-    else:
-        measured = report["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"]
-    print(f"timing validated: neural-operator runtime measured for {measured} cases")
+    print(f"timing validated: neural-operator runtime measured for {len(report['cases'])} cases")
 
 
 def _cache_has_outputs(*, save_root: Path, parquet_path: Path, npz_dir: Path) -> bool:
@@ -704,26 +638,14 @@ def _evaluator_artifact_contract(provenance: Mapping[str, Any]) -> _EvaluatorArt
         raise ArtifactCacheError(msg)
 
     normalizer = provenance.get("normalizer")
-    raw_scales = normalizer.get("output_standard_deviations") if isinstance(normalizer, Mapping) else None
-    denominator_floor = normalizer.get("denominator_floor") if isinstance(normalizer, Mapping) else None
-    if (
-        isinstance(denominator_floor, bool)
-        or not isinstance(denominator_floor, Real)
-        or not np.isfinite(float(denominator_floor))
-        or float(denominator_floor) < 0.0
-    ):
-        msg = "Artifact normalizer denominator_floor must be finite and non-negative."
-        raise ArtifactCacheError(msg)
-    if not isinstance(raw_scales, Mapping) or set(raw_scales) != set(output_fields):
-        msg = "Artifact normalizer output_standard_deviations must map exactly the output fields."
-        raise ArtifactCacheError(msg)
-    train_standard_deviations: dict[str, float] = {}
-    for field in output_fields:
-        value = raw_scales[field]
-        if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(float(value)) or float(value) <= 0.0:
-            msg = f"Artifact train standard deviation for {field!r} must be finite and strictly positive."
-            raise ArtifactCacheError(msg)
-        train_standard_deviations[field] = float(value)
+    try:
+        train_scales = contracts.validated_train_scales(
+            normalizer.get("output_scales") if isinstance(normalizer, Mapping) else None,
+            fields=output_fields,
+        )
+    except (TypeError, ValueError) as error:
+        msg = f"Artifact normalizer output_scales are invalid: {error}"
+        raise ArtifactCacheError(msg) from error
 
     raw_metrics = evaluator.get("metrics")
     if not isinstance(raw_metrics, list):
@@ -755,8 +677,7 @@ def _evaluator_artifact_contract(provenance: Mapping[str, Any]) -> _EvaluatorArt
         output_fields=output_fields,
         output_units=tuple(raw_units[name] for name in output_fields),
         output_groups=tuple((str(group["id"]), tuple(group["fields"])) for group in group_payload),
-        train_standard_deviations=train_standard_deviations,
-        normalization_denominator_floor=float(denominator_floor),
+        train_scales=train_scales,
         group_metric_columns=tuple(group_metric_columns),
         physics_kind=physics_kind,
     )
@@ -1127,7 +1048,6 @@ def _transient_target_build(
     role: artifact_plan.ArtifactRolePlan,
     device_resolution: DeviceResolution,
     dataset_root: Path,
-    evaluation_spatial_stride: int,
 ) -> _TargetBuild:
     """Bind the transient sequence writer, which resumes an incomplete stage case by case."""
     from src.analysis.evaluation import evaluation_transient_artifact as sequence_artifact  # noqa: PLC0415
@@ -1140,7 +1060,6 @@ def _transient_target_build(
             dataset_root=dataset_root,
             staging_root=stage,
             completed=completed,
-            evaluation_spatial_stride=evaluation_spatial_stride,
             progress_reporter=reporter,
         )
 
@@ -1163,6 +1082,7 @@ def _steady_target_build(
     """Bind the steady writer; batch-amortized timing cannot resume per case, so an incomplete stage restarts whole."""
     request = _build_artifact_request(run_dir=run_dir, role=role, device_resolution=device_resolution)
     split = role.split
+    storage_root = common.paths.storage_root_for_datasets_root(dataset_root)
 
     def generate(stage: Path, reporter: artifact_performance.ArtifactProgressReporter) -> None:
         from src import learning  # noqa: PLC0415
@@ -1170,7 +1090,9 @@ def _steady_target_build(
         _clear_artifact_stage(stage)
         timing_cases: list[dict[str, Any]] = []
         with reporter.phase("model_setup"):
-            model, loader, processor, device = learning.inference.context.load_inference_context_with_resolution(
+            sources = artifact_plan.generation_case_sources(role, task=task.id, storage_root=storage_root)
+            solver_cases = {case_id: timing.solver_case_timing(source.load_timing()) for case_id, source in sources.items()}
+            model, loader, scaling, device = learning.inference.context.load_inference_context_with_resolution(
                 run_dir=run_dir,
                 device_resolution=device_resolution,
                 dataset_root=dataset_root,
@@ -1182,7 +1104,7 @@ def _steady_target_build(
                 timing.warm_up_forward(
                     representative_batch=next(iter(loader)),
                     model=model,
-                    processor=processor,
+                    scaling=scaling,
                     device=device,
                     passes=timing.WARMUP_PASSES,
                 )
@@ -1190,7 +1112,7 @@ def _steady_target_build(
                     task=task,
                     model=model,
                     loader=loader,
-                    processor=processor,
+                    scaling=scaling,
                     device=device,
                     save_root=stage,
                     publication_root=save_root,
@@ -1207,12 +1129,10 @@ def _steady_target_build(
                 neural_runtime=timing.neural_runtime_metadata(device_metadata=device_resolution.as_dict(), model=model),
                 batch_size=request.batch_size,
                 cases=timing_cases,
-                comsol_timing=None,
-                batch_manifest_sha256=None,
-                unavailable_reason="current Dataset selection has no aggregate simulation timing snapshot",
+                solver_cases=solver_cases,
             )
         finally:
-            del model, loader, processor
+            del model, loader, scaling
             cleanup_runtime(device)
         timing.write_stage_timing(stage, {"report": report})
 
@@ -1231,7 +1151,6 @@ def _run_or_load_artifacts_locked(
     device_resolution: DeviceResolution,
     dataset_root: Path,
     rebuild: bool = False,
-    evaluation_spatial_stride: int = 1,
 ) -> pd.DataFrame:
     """
     Load or generate artifacts for one run and saved split.
@@ -1256,8 +1175,6 @@ def _run_or_load_artifacts_locked(
         Current final-dataset root.
     rebuild : bool, optional
         Force staged regeneration and atomically replace only this target.
-    evaluation_spatial_stride : int, optional
-        Transient artifact Evaluation-grid stride. The default one retains the canonical source grid.
 
     Returns
     -------
@@ -1282,15 +1199,12 @@ def _run_or_load_artifacts_locked(
         raise ValueError(msg)
     completed = experiments.run.validate_completed_run(run_dir)
     task = experiments.config.loader.validate_resolved_task_contract(completed["config"])
-    if task.id != "transient_drying" and evaluation_spatial_stride != 1:
-        msg = "Non-unit --evaluation-spatial-stride is supported only for transient_drying artifacts."
-        raise ValueError(msg)
     plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_dir)
     role = plan.role(split)
     if role.dataset_name != dataset_name:
         msg = f"Requested dataset {dataset_name!r} does not match the saved {split!r} artifact Dataset {role.dataset_name!r}."
         raise RuntimeError(msg)
-    save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split, evaluation_spatial_stride=evaluation_spatial_stride)
+    save_root = _artifact_save_root(run_dir=run_dir, dataset_name=dataset_name, split=split)
     label = artifact_performance.split_label(split)
     print(f"artifacts for {run_dir.name} | {label} | dataset {dataset_name}")
     print(f"      run_dir={run_dir}")
@@ -1303,7 +1217,6 @@ def _run_or_load_artifacts_locked(
                 completed,
                 selection_role=artifact_plan.dataset_role_of(split),
                 root=root,
-                evaluation_spatial_stride=evaluation_spatial_stride,
             ).frame
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             msg = (
@@ -1327,11 +1240,7 @@ def _run_or_load_artifacts_locked(
         msg = f"Artifact target is unsafe; rerun only this exact target with --rebuild: {save_root}"
         raise ArtifactCacheError(msg)
     # Generating beside a published role of other analysis code would leave the run with two producers; --rebuild replaces them all.
-    if not rebuild and (
-        sibling := _sibling_from_other_analysis(
-            run_dir=run_dir, plan=plan, task_id=task.id, split=split, evaluation_spatial_stride=evaluation_spatial_stride
-        )
-    ):
+    if not rebuild and (sibling := _sibling_from_other_analysis(run_dir=run_dir, plan=plan, task_id=task.id, split=split)):
         msg = (
             f"Artifact {unit} would leave {run_dir.name} with two analysis producers: its published {sibling} artifact "
             "comes from other analysis code; rebuild the run's artifacts with --rebuild."
@@ -1349,7 +1258,6 @@ def _run_or_load_artifacts_locked(
             role=role,
             device_resolution=device_resolution,
             dataset_root=dataset_root,
-            evaluation_spatial_stride=evaluation_spatial_stride,
         )
         if task.id == "transient_drying"
         else _steady_target_build(
@@ -1396,75 +1304,6 @@ def _run_or_load_artifacts_locked(
     return frame
 
 
-def validate_artifact_upload_source(
-    *,
-    run_dir: Path,
-    artifact_root: Path,
-) -> Mapping[str, Any]:
-    """
-    Validate one explicit complete current artifact target for bounded upload.
-
-    Parameters
-    ----------
-    run_dir : pathlib.Path
-        Authoritative completed run that must own ``artifact_root``.
-    artifact_root : pathlib.Path
-        Exact ``analysis/id`` or named ``analysis/<material_ood|parameter_ood>/<dataset>`` target.
-
-    Returns
-    -------
-    Mapping[str, Any]
-        Admitted current provenance, including the verified payload manifest.
-
-    Raises
-    ------
-    ArtifactCacheError
-        If schemas, digests, payloads, or completed-run identities disagree.
-    ValueError
-        If the target escapes the run analysis tree or is not an exact leaf.
-
-    Notes
-    -----
-    The gate never scans sibling targets, regenerates artifacts, or contacts W&B.
-
-    """
-    run_path = Path(run_dir).resolve()
-    root = Path(artifact_root).resolve()
-    _analysis_root, validated_target = _validated_artifact_target(
-        run_dir=run_path,
-        save_root=root,
-    )
-    if _normalise_path(validated_target) != _normalise_path(root):
-        msg = f"Artifact upload target does not resolve to the explicit artifact root: {root}"
-        raise ArtifactCacheError(msg)
-    from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
-
-    completed = experiments.run.validate_completed_run(run_path)
-    plan = artifact_plan.artifact_plan_from_completed(completed, run_dir=run_path)
-    analysis_root = common.paths.resolve_analysis_root(run_path).resolve()
-    strides: dict[ArtifactSplit, int | None] = {
-        role.split: _artifact_target_stride(root, analysis_root=analysis_root, split=role.split, dataset_name=role.dataset_name)
-        for role in plan.roles
-    }
-    matched: list[tuple[ArtifactSplit, int]] = [(split, stride) for split, stride in strides.items() if stride is not None]
-    if not matched:
-        msg = "Artifact upload target does not match a saved Evaluation-grid role."
-        raise ArtifactCacheError(msg)
-    split, stride = matched[0]
-    try:
-        loaded = artifact_loader.admit_role_artifact(
-            run_path,
-            completed,
-            selection_role=artifact_plan.dataset_role_of(split),
-            root=root,
-            evaluation_spatial_stride=stride,
-        )
-    except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
-        msg = f"Artifact upload source is incompatible: {type(error).__name__}: {error}"
-        raise ArtifactCacheError(msg) from error
-    return cast("Mapping[str, Any]", loaded.frame.attrs["artifact_provenance"])
-
-
 def run_or_load_artifacts(
     *,
     run_dir: Path,
@@ -1473,7 +1312,6 @@ def run_or_load_artifacts(
     device_resolution: DeviceResolution,
     dataset_root: Path,
     rebuild: bool = False,
-    evaluation_spatial_stride: int = 1,
 ) -> pd.DataFrame:
     """
     Validate, reuse, or atomically generate one split-qualified artifact cache.
@@ -1493,8 +1331,6 @@ def run_or_load_artifacts(
     rebuild : bool, optional
         Replace only the observed target. A concurrent newer publication wins and
         is validated instead of being deleted.
-    evaluation_spatial_stride : int, optional
-        Transient artifact Evaluation-grid stride. The default is one.
 
     Returns
     -------
@@ -1523,13 +1359,7 @@ def run_or_load_artifacts(
 
     """
     logical_dataset_name = common.paths.validate_logical_name(dataset_name, label="dataset_name")
-    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
-    save_root = _artifact_save_root(
-        run_dir=run_dir,
-        dataset_name=logical_dataset_name,
-        split=split,
-        evaluation_spatial_stride=resolved_evaluation_stride,
-    )
+    save_root = _artifact_save_root(run_dir=run_dir, dataset_name=logical_dataset_name, split=split)
     completion_path = contracts.artifact_provenance_path(save_root)
     observed_completion = _completion_marker_identity(completion_path) if rebuild else None
     lock_path = _artifact_lock_path(run_dir=run_dir, save_root=save_root)
@@ -1548,205 +1378,7 @@ def run_or_load_artifacts(
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             rebuild=effective_rebuild,
-            evaluation_spatial_stride=resolved_evaluation_stride,
         )
-
-
-def _validated_upload_roots(
-    *,
-    plan: artifact_plan.ArtifactPlan,
-    id_frame: pd.DataFrame,
-    ood_frames: Mapping[ArtifactSplit, pd.DataFrame],
-    evaluation_spatial_stride: int,
-) -> dict[ArtifactSplit, Path]:
-    """Validate every published role and bind its frame before any observer starts."""
-    if set(plan.ood_roles) != set(ood_frames):
-        msg = "W&B publication requires matching saved OOD Evaluation identity and frame availability."
-        raise ArtifactCacheError(msg)
-    role_specs: list[tuple[ArtifactSplit, str, pd.DataFrame]] = [("eval", plan.id_role.dataset_name, id_frame)]
-    role_specs.extend((split, role.dataset_name, ood_frames[split]) for split, role in plan.ood_roles.items())
-    roots: dict[ArtifactSplit, Path] = {}
-    for split, dataset_name, frame in role_specs:
-        root = _artifact_save_root(
-            run_dir=plan.run_dir,
-            dataset_name=dataset_name,
-            split=split,
-            evaluation_spatial_stride=evaluation_spatial_stride,
-        )
-        validated = validate_artifact_upload_source(run_dir=plan.run_dir, artifact_root=root)
-        frame_provenance = frame.attrs.get("artifact_provenance")
-        if not isinstance(frame_provenance, Mapping) or common.serialization.canonical_json_sha256(
-            frame_provenance
-        ) != common.serialization.canonical_json_sha256(validated):
-            msg = f"The {split} frame provenance is not the validated upload source."
-            raise ArtifactCacheError(msg)
-        roots[split] = root
-    return roots
-
-
-def _transient_wandb_summary(frames: Mapping[str, pd.DataFrame]) -> dict[str, bool | float | int | str]:
-    """Reduce validated transient role frames to the bounded W&B summary."""
-    from src.analysis.evaluation import transient_session  # noqa: PLC0415
-
-    evaluation = transient_session.TransientEvaluationSession(frames)
-    try:
-        return evaluation.wandb_publication_summary()
-    finally:
-        evaluation.close()
-
-
-def _steady_wandb_summary(frames: Mapping[str, pd.DataFrame]) -> dict[str, bool | float | int | str]:
-    """
-    Reduce validated steady role frames to the bounded W&B summary structure both tasks share.
-
-    Per role it carries case validity and the objective's finite-support counts; the objective and
-    per-field RMSE appear only when available, so a missing value never reads as zero. Identity and
-    timing keys follow the transient publication vocabulary.
-    """
-    provenances = {role: frame.attrs["artifact_provenance"] for role, frame in frames.items()}
-    reports = [provenance[timing.TIMING_KEY]["report"] for provenance in provenances.values()]
-    run = provenances["id"]["run"]
-    forward = [case["batch_amortized_neural_operator_forward_s"] for report in reports for case in report["cases"]]
-    component = "evaluation/timing/component/batch_amortized_neural_operator_forward_seconds"
-    values: dict[str, bool | float | int | str] = {
-        "evaluation/identity/checkpoint_sha256": run["best_checkpoint_sha256"],
-        "evaluation/identity/checkpoint_epoch": run["best_checkpoint_epoch"],
-        "evaluation/identity/model_kind": provenances["id"]["model"]["kind"],
-        "evaluation/identity/dataset_sha256": common.serialization.canonical_json_sha256({role: p["dataset"] for role, p in provenances.items()}),
-        "evaluation/timing/device": "|".join(sorted({report["neural_runtime"]["resolved_device"] for report in reports})),
-        "evaluation/timing/precision": "|".join(sorted({report["neural_runtime"]["inference_dtype"] for report in reports})),
-        "evaluation/timing/warmup_passes": reports[0]["measurement"]["warmup_passes"],
-        "evaluation/timing/hardware_identity_sha256": common.serialization.canonical_json_sha256([report["neural_runtime"] for report in reports]),
-        f"{component}/available_count": len(forward),
-        f"{component}/median_seconds": float(np.median(forward)),
-    }
-    for role, provenance in provenances.items():
-        aggregate, counts = provenance["aggregate"], provenance["evaluation"]["prediction_validity"]["status_counts"]
-        values[f"evaluation/identity/dataset/{role}/name"] = provenance["dataset"]["name"]
-        values[f"evaluation/{role}/valid_case_count"] = counts[validity_contract.VALID]
-        values[f"evaluation/{role}/nonfinite_case_count"] = counts[validity_contract.NONFINITE]
-        values.update({f"evaluation/{role}/{name}": aggregate[name] for name in validity_contract.SUPPORT_COUNT_FIELDS})
-        if aggregate["available"]:
-            values[f"evaluation/{role}/normalized_group_macro_rmse"] = aggregate["value"]
-            for field, statistics in aggregate["field_statistics"].items():
-                values[f"evaluation/{role}/normalized_rmse_{field}"] = statistics["normalized_rmse"]
-                values[f"evaluation/{role}/physical_rmse_{field}"] = statistics["physical_rmse"]
-    return values
-
-
-def _upload_published_artifacts(
-    *,
-    plan: artifact_plan.ArtifactPlan,
-    device_resolution: DeviceResolution,
-    id_frame: pd.DataFrame,
-    ood_frames: Mapping[ArtifactSplit, pd.DataFrame] | None = None,
-    evaluation_spatial_stride: int = 1,
-) -> None:
-    """Publish both tasks' provenance files and bounded Evaluation summary, then steady curated media."""
-    config = _load_run_config(plan.run_dir)
-    settings = config.get("tracking", {}).get("wandb")
-    if not isinstance(settings, Mapping):
-        msg = "Completed run config must contain tracking.wandb."
-        raise TypeError(msg)
-    upload = settings.get("upload")
-    if settings.get("mode") == "disabled" or not isinstance(upload, Mapping) or not bool(upload.get("evaluation_artifacts")):
-        return
-
-    task = experiments.config.loader.validate_resolved_task_contract(config)
-    ood_frames = dict(ood_frames or {})
-    artifact_roots = _validated_upload_roots(
-        plan=plan,
-        id_frame=id_frame,
-        ood_frames=ood_frames,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
-    is_transient = task.id == "transient_drying"
-    frames = {"id": id_frame} | ood_frames
-    evidence = (_transient_wandb_summary if is_transient else _steady_wandb_summary)(frames)
-
-    started_at = datetime.now(UTC)
-    runtime_session_id = uuid4().hex
-    experiments.run.append_runtime_session(
-        plan.run_dir,
-        device_resolution,
-        started_at=started_at,
-        session_id=runtime_session_id,
-        tracking_state=experiments.run.initial_tracking_state(config),
-    )
-    summary = experiments.run.read_run_summary(plan.run_dir)
-    persisted_run_id, last_logged_epoch = experiments.tracking.persisted_wandb_identity(summary)
-
-    def state_updater(updates: Mapping[str, Any]) -> None:
-        """Persist observer-only facts in this artifact-upload runtime session."""
-        experiments.run.update_runtime_session(
-            plan.run_dir,
-            runtime_session_id,
-            updates,
-        )
-
-    session = experiments.tracking.initialize_wandb(
-        config,
-        run_dir=plan.run_dir,
-        semantic_config={},
-        resume=True,
-        persisted_run_id=persisted_run_id,
-        previous_last_logged_epoch=last_logged_epoch,
-        previous_evaluation_summary_keys=experiments.tracking.persisted_evaluation_summary_keys(summary),
-        state_updater=state_updater,
-        ood_roles=tuple(plan.ood_roles),
-    )
-    upload_error: BaseException | None = None
-    try:
-        for artifact_root in artifact_roots.values():
-            session.upload_files({"artifact_provenance": contracts.artifact_provenance_path(artifact_root)})
-        session.log_evaluation_summary(evidence)
-        if not is_transient:
-            from src.analysis.presentation import analysis_display_labels as display_labels  # noqa: PLC0415
-            from src.analysis.presentation import curated  # noqa: PLC0415
-
-            # Admitted role frames are already the evaluation frames the loader returns.
-            datasets_eval = {
-                f"{plan.run_dir.name} ID": id_frame,
-                **{f"{plan.run_dir.name} {display_labels.evaluation_role_display_label(role)}": frame for role, frame in ood_frames.items()},
-            }
-            with tempfile.TemporaryDirectory(prefix="grainlegumes-curated-analysis-") as temporary_directory:
-                bundle = curated.render_curated_analysis(
-                    datasets=datasets_eval,
-                    output_dir=temporary_directory,
-                )
-                session.upload_post_artifact(
-                    artifact_root=artifact_roots["eval"],
-                    media_files=bundle.media_files,
-                    tables=bundle.tables,
-                )
-    except BaseException as error:
-        upload_error = error
-        raise
-    finally:
-        local_summary: Mapping[str, Any] | None = None
-        with suppress(Exception):
-            local_summary = experiments.run.read_run_summary(plan.run_dir)
-        status = str(local_summary.get("status", "completed")) if local_summary is not None else "completed"
-        result = None
-        if local_summary is not None:
-            result = {
-                "completed_epoch": local_summary.get("completed_epoch"),
-                "global_step": local_summary.get("global_step"),
-                "selected_epoch": local_summary.get("selected_epoch"),
-                "selected_metrics": local_summary.get("selected_metrics", {}),
-                "terminal_epoch": local_summary.get("terminal_epoch"),
-                "terminal_metrics": local_summary.get("terminal_metrics", {}),
-            }
-        try:
-            session.finish(
-                status=status,
-                result=result,
-                local_summary=local_summary,
-                error=upload_error,
-            )
-        except experiments.tracking.TrackingError:
-            if upload_error is None:
-                raise
 
 
 @dataclass(frozen=True)
@@ -1813,7 +1445,7 @@ def load_or_build_run_artifacts(
     a role of other analysis code, that role is rebuilt first under
     ``rebuild_incompatible`` and the preparation is refused before any build
     otherwise. This service
-    never uploads to W&B or changes lifecycle status.
+    never changes lifecycle status.
     """
     from src import learning  # noqa: PLC0415
     from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader  # noqa: PLC0415
@@ -1944,14 +1576,11 @@ def _sibling_from_other_analysis(
     plan: artifact_plan.ArtifactPlan,
     task_id: str,
     split: ArtifactSplit,
-    evaluation_spatial_stride: int = 1,
 ) -> ArtifactSplit | None:
     """Return another published split of the run whose recorded analysis implementation is not the running one, otherwise None."""
     current = contracts.ANALYSIS_PROJECTIONS[task_id].sha256()
     for sibling in (role for role in plan.roles if role.split != split):
-        root = _artifact_save_root(
-            run_dir=run_dir, dataset_name=sibling.dataset_name, split=sibling.split, evaluation_spatial_stride=evaluation_spatial_stride
-        )
+        root = _artifact_save_root(run_dir=run_dir, dataset_name=sibling.dataset_name, split=sibling.split)
         marker = contracts.artifact_provenance_path(root)
         if not marker.is_file():
             continue
@@ -2025,7 +1654,6 @@ def build_scoped_transient_artifact(
     case_ids: Sequence[str] | None = None,
     one_case: bool = False,
     device_policy: str = "auto",
-    evaluation_spatial_stride: int = 1,
 ) -> ScopedTransientArtifact:
     """Generate selected transient cases into one explicit noncanonical root."""
     from src import learning  # noqa: PLC0415
@@ -2033,7 +1661,6 @@ def build_scoped_transient_artifact(
         evaluation_transient_artifact as sequence_artifact,
     )
 
-    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
     if split not in artifact_plan.ARTIFACT_DATASET_ROLES:
         msg = f"Scoped transient split must be one of {list(artifact_plan.ARTIFACT_DATASET_ROLES)}."
         raise ValueError(msg)
@@ -2100,7 +1727,6 @@ def build_scoped_transient_artifact(
                     dataset_root=dataset_root,
                     staging_root=stage,
                     completed=completed,
-                    evaluation_spatial_stride=resolved_evaluation_stride,
                     progress_reporter=reporter,
                 )
             else:
@@ -2108,12 +1734,7 @@ def build_scoped_transient_artifact(
             timing.write_stage_timing(stage, {"operational_performance": reporter.final_snapshot()})
             with reporter.phase("validation"):
                 sequence_artifact.cleanup_transient_resume_metadata(stage)
-                transient.validate_scoped_transient_role_artifact_index(
-                    stage,
-                    completed=completed,
-                    saved_role=saved_role,
-                    evaluation_spatial_stride=resolved_evaluation_stride,
-                )
+                transient.validate_scoped_transient_role_artifact_index(stage, completed=completed, saved_role=saved_role)
         lock_path = target.parent / f".{target.name}.scoped.lock"
         with (
             reporter.phase("publication"),
@@ -2124,7 +1745,6 @@ def build_scoped_transient_artifact(
                 target,
                 completed=completed,
                 saved_role=saved_role,
-                evaluation_spatial_stride=resolved_evaluation_stride,
             )
         reporter.done()
     except BaseException:
@@ -2151,7 +1771,6 @@ def build_artifacts(
     run_names: Iterable[str] | None = None,
     device_policy: str = "auto",
     rebuild: bool = False,
-    evaluation_spatial_stride: int = 1,
 ) -> dict[str, dict[str, pd.DataFrame]]:
     """
     Build or validate saved ID/OOD roles keyed by each exact resolved run path.
@@ -2170,8 +1789,6 @@ def build_artifacts(
     rebuild : bool, optional
         Stage and validate a replacement for each exact selected target. A newer
         concurrent publication is preserved and validated instead.
-    evaluation_spatial_stride : int, optional
-        Transient artifact Evaluation-grid stride. The default one uses the original grid.
 
     Returns
     -------
@@ -2186,16 +1803,11 @@ def build_artifacts(
 
     Notes
     -----
-    Each saved cache role is locally authoritative. Persisted W&B settings are
-    the sole publication opt-in. Both tasks validate every published role before
-    observer initialization and upload its provenance file; steady runs add curated
-    media, transient runs one bounded aggregate scalar/string summary. Any requested
-    online or offline observer failure propagates.
+    Each saved cache role is locally authoritative.
 
     """
     from src import learning  # noqa: PLC0415
 
-    resolved_evaluation_stride = transient_contract.validate_spatial_stride(evaluation_spatial_stride)
     device_resolution = learning.device.resolve_device(
         device_policy,
         path="device_policy",
@@ -2211,7 +1823,6 @@ def build_artifacts(
             device_resolution=device_resolution,
             dataset_root=dataset_root,
             rebuild=rebuild,
-            evaluation_spatial_stride=resolved_evaluation_stride,
         )
         ood_frames: dict[ArtifactSplit, pd.DataFrame] = {
             split: run_or_load_artifacts(
@@ -2221,17 +1832,9 @@ def build_artifacts(
                 device_resolution=device_resolution,
                 dataset_root=dataset_root,
                 rebuild=rebuild,
-                evaluation_spatial_stride=resolved_evaluation_stride,
             )
             for split, role in plan.ood_roles.items()
         }
         results[str(run_dir.resolve())] = {"eval": id_frame} | ood_frames
-        _upload_published_artifacts(
-            plan=plan,
-            device_resolution=device_resolution,
-            id_frame=id_frame,
-            ood_frames=ood_frames,
-            evaluation_spatial_stride=resolved_evaluation_stride,
-        )
         cleanup_runtime(device_resolution.device)
     return results

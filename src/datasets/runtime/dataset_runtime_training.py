@@ -6,11 +6,14 @@ Responsibilities:
     the declared OOD cases of the training and material-OOD Datasets and parameter OOD to the training Dataset's
     parameter-OOD cases
   - Report the startup phases both tasks share and obtain Train-only scaling through the shared scaling service
-  - Seed workers and construct train, validation, ID-test, material-OOD and parameter-OOD loaders (none for an empty part)
+  - Serve every role in the configured endpoint-preserving grid view and refuse an OOD source on another grid view or
+    coordinate grid
+  - Seed workers and construct the unit-sampled train loader and the validation, ID-test, material-OOD and
+    parameter-OOD loaders (none for an empty part)
 
 Design principles:
   - Membership comes from Dataset manifests; run seeds never repartition data
-  - Normalizers are fitted on Train membership only and reused unchanged
+  - The common case-equal scaling is fitted case by case on Train membership only and reused unchanged
   - The scaling cache is keyed by the identity and the run's recorded model digest; the artifact identity stays data-only
   - Loader and worker seeds do not alter persisted membership identity
 
@@ -37,12 +40,11 @@ from src.datasets.preprocessing import dataset_preprocessing_scaling as scaling
 from src.datasets.preprocessing import dataset_preprocessing_splits as splits
 from src.datasets.runtime import dataset_runtime_factory as runtime_factory
 from src.datasets.runtime import dataset_runtime_steady as steady
+from src.datasets.runtime import dataset_runtime_units as units
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
-
-    from neuralop.data.transforms.data_processors import DefaultDataProcessor
 
     from src.domain.tasks.domain_task_spec import TaskSpec
 
@@ -87,9 +89,11 @@ def _make_worker_init_fn(base_seed: int) -> Callable[[int], None]:
     return worker_init_fn
 
 
-def _steady_dataset(dataset_id: str, *, storage_root: Path | str | None) -> steady.SteadyFlowDataset:
-    """Load one complete verified steady package runtime."""
-    request = runtime_factory.DatasetRequest(dataset_id=dataset_id, dataset_view=_STEADY_TASK, storage_root=storage_root)
+def _steady_dataset(dataset_id: str, *, storage_root: Path | str | None, spatial_stride: int) -> steady.SteadyFlowDataset:
+    """Load one complete verified steady package runtime in the configured grid view."""
+    request = runtime_factory.DatasetRequest(
+        dataset_id=dataset_id, dataset_view=_STEADY_TASK, storage_root=storage_root, spatial_stride=spatial_stride
+    )
     value = runtime_factory.create_dataset(request)
     if not isinstance(value, steady.SteadyFlowDataset):
         msg = "Steady Dataset factory returned an unexpected runtime."
@@ -128,7 +132,10 @@ def create_dataloaders(
     task: TaskSpec,
     model_sha256: str,
     storage_root: Path | str | None = None,
-    batch_size: int = 32,
+    spatial_stride: int = 1,
+    units_per_update: int,
+    memory_batch: int,
+    evaluation_batch_size: int,
     num_workers: int = 0,
     pin_memory: bool = False,
     persistent_workers: bool = False,
@@ -138,7 +145,7 @@ def create_dataloaders(
     scaling_artifact: Mapping[str, Any] | None = None,
     split_persist_callback: Callable[[Mapping[str, Any]], None] | None = None,
     startup_callback: scaling.StartupCallback | None = None,
-) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], DefaultDataProcessor, dict[str, Any], dict[str, Any]]:
+) -> tuple[DataLoader[Any], dict[str, DataLoader[Any] | None], normalization.TrainScaling, dict[str, Any], dict[str, Any]]:
     """
     Create steady-flow loaders from the Dataset-owned fixed case partition.
 
@@ -157,8 +164,14 @@ def create_dataloaders(
         refits once while a loss-only change reuses the entry.
     storage_root : Path | str | None, optional
         Explicit storage root; the default project storage is used when omitted.
-    batch_size : int, optional
-        Batch size for all loaders.
+    spatial_stride : int, optional
+        ``data.spatial_stride``: the endpoint-preserving grid view of every role and of the scaling fit.
+    units_per_update : int
+        ``training.units_per_update``: Train cases of one optimizer update.
+    memory_batch : int
+        ``training.memory_batch``: largest number of Train cases loaded at once.
+    evaluation_batch_size : int
+        ``data.evaluation_batch_size``: cases per evaluation batch.
     num_workers : int, optional
         Training DataLoader worker count.
     pin_memory : bool, optional
@@ -166,33 +179,33 @@ def create_dataloaders(
     persistent_workers : bool, optional
         Whether nonzero training workers persist across epochs.
     loader_seed : int, optional
-        Shuffled training-loader generator seed; it never changes membership.
+        Seed of the resumable unit sampler that orders the Train cases; it never changes membership.
     worker_seed : int | None, optional
         Base worker seed; worker ``i`` receives ``worker_seed + i``. Defaults to
         ``loader_seed``.
     split_indices : Mapping[str, Any] | None, optional
         Saved split; it must equal the split rebuilt from the Datasets.
     scaling_artifact : Mapping[str, Any] | None, optional
-        Restored scaling artifact, admitted under this run's scaling identity. When omitted, the normalizers come from
-        the shared scaling cache or are fitted on Train only.
+        Restored scaling artifact, admitted under this run's scaling identity. When omitted, the scaling comes from
+        the shared scaling cache or is fitted on Train only.
     split_persist_callback : Callable or None, optional
-        Persist a newly resolved split before normalizer fitting.
+        Persist a newly resolved split before the scaling is fitted.
     startup_callback : Callable or None, optional
         Receives the startup phase events both tasks report.
 
     Returns
     -------
-    tuple[DataLoader, dict[str, DataLoader | None], DefaultDataProcessor, dict[str, Any], dict[str, Any]]
-        A shuffled train loader, the ``eval`` (validation), ``id_test``, ``material_ood`` and ``parameter_ood`` loaders
-        (``None`` for an empty OOD part), the processor, the split payload and the scaling artifact.
+    tuple[DataLoader, dict[str, DataLoader | None], TrainScaling, dict[str, Any], dict[str, Any]]
+        A train loader driven by a ``UnitSampler`` of cases, the ``eval`` (validation), ``id_test``, ``material_ood`` and ``parameter_ood`` loaders
+        (``None`` for an empty OOD part), the admitted scaling, the split payload and the scaling artifact.
 
     Raises
     ------
     TypeError
         If seeds, restored split state, or runtimes have incompatible types.
     ValueError
-        If a Dataset lacks its fixed partition, OOD declarations are missing,
-        family holdouts reuse training materials, or saved membership or scaling drifts.
+        If a Dataset lacks its fixed partition, OOD declarations are missing, family holdouts reuse training materials,
+        an OOD source lies on another grid, the stride does not tile the grid, or saved membership or scaling drifts.
 
     """
     loader_seed = _normalized_seed(loader_seed, label="loader_seed")
@@ -200,7 +213,8 @@ def create_dataloaders(
     if num_workers == 0:
         persistent_workers = False
 
-    full_train = _steady_dataset(train_dataset_id, storage_root=storage_root)
+    full_train = _steady_dataset(train_dataset_id, storage_root=storage_root, spatial_stride=spatial_stride)
+    spatial_view = full_train.spatial_representation().view_evidence()
     binding = _binding(full_train)
     if full_train.identity.task != task.id:
         msg = f"Training Dataset {train_dataset_id!r} does not belong to task {task.id!r}."
@@ -215,7 +229,14 @@ def create_dataloaders(
     assignments = package_manifest.declared_evaluation_assignments(
         _STEADY_TASK, train_dataset_id, tuple(material_ood_dataset_ids), storage_root=storage_root
     )
-    loaded = {dataset_id: _steady_dataset(dataset_id, storage_root=storage_root) for dataset_id in material_ood_dataset_ids}
+    loaded = {
+        dataset_id: _steady_dataset(dataset_id, storage_root=storage_root, spatial_stride=spatial_stride) for dataset_id in material_ood_dataset_ids
+    }
+    for dataset_id, source in loaded.items():
+        if source.spatial_representation().view_evidence() != spatial_view:
+            msg = f"Material-OOD Dataset {dataset_id!r} does not share the Train grid view {spatial_view}."
+            raise ValueError(msg)
+    identity.require_train_grid(binding, [_binding(source) for source in loaded.values()])
     loaded[train_dataset_id] = full_train
     parts = {
         role: [
@@ -244,43 +265,52 @@ def create_dataloaders(
     split_contract = splits.resolve_split(rebuilt, split_indices)
     split_info = split_contract.as_payload()
     if startup_callback is not None:
-        resolved = splits.resolved_event(split_contract, items=split_contract.train.count, grid=full_train.identity.spatial_shape)
-        startup_callback("dataset_resolved", resolved)
+        grid = (spatial_view["effective_ny"], spatial_view["effective_nx"])
+        startup_callback("dataset_resolved", splits.resolved_event(split_contract, items=split_contract.train.count, grid=grid))
     if split_indices is None and split_persist_callback is not None:
         split_persist_callback(split_info)
 
     train_set = Subset(full_train, list(split_contract.train.index_values))
+    scaling_identity = scaling.scaling_identity(split_contract, normalization.preprocessing_spec(task.id, spatial_view=spatial_view))
 
     def fit() -> dict[str, Any]:
-        fitting_loader = runtime_factory.make_data_loader(train_set, runtime_factory.LoaderSettings(batch_size=batch_size))
-        return normalization.processor_state(normalization.fit_data_processor(fitting_loader, task=task))
+        return normalization.fit_steady_scaling(
+            (train_set[position] for position in range(len(train_set))),
+            preprocessing=scaling_identity["preprocessing"],
+            dataset_identity=scaling_identity["dataset"],
+            train_membership_digest=scaling_identity["train_membership_digest"],
+        ).state_dict()
 
     artifact = scaling.fit_or_load_scaling(
-        scaling.scaling_identity(split_contract, normalization.preprocessing_spec(task)),
+        scaling_identity,
         model_sha256=model_sha256,
         fit=fit,
         storage_root=storage_root,
         restored=scaling_artifact,
         startup_callback=startup_callback,
     )
-    data_processor = normalization.data_processor_from_state(artifact["state"], device="cpu")
+    train_scaling = normalization.admit_scaling_state(artifact["state"], identity=scaling_identity)
 
     loader_started = time.perf_counter()
-    generator = torch.Generator().manual_seed(loader_seed)
     worker_init = _make_worker_init_fn(worker_seed) if num_workers > 0 else None
+    # Every Train case is one unit; its own sampler generator orders them, the loader generator only seeds workers.
+    sampler = units.UnitSampler(
+        unit_kind="case",
+        cases=tuple(range(len(train_set))),
+        keys=None,
+        units_per_update=units_per_update,
+        memory_batch=memory_batch,
+        seed=loader_seed,
+        full_set_units=len(fixed["train"]),
+    )
     train_loader = runtime_factory.make_data_loader(
         train_set,
-        runtime_factory.LoaderSettings(
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            shuffle=True,
-        ),
-        generator=generator,
+        runtime_factory.LoaderSettings(num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers),
+        batches=sampler,
+        generator=torch.Generator().manual_seed(worker_seed),
         worker_init_fn=worker_init,
     )
-    evaluation_settings = runtime_factory.LoaderSettings(batch_size=batch_size)
+    evaluation_settings = runtime_factory.LoaderSettings(batch_size=evaluation_batch_size)
     evaluation_loaders: dict[str, DataLoader[Any] | None] = {
         "eval": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.validation.index_values)), evaluation_settings),
         "id_test": runtime_factory.make_data_loader(Subset(full_train, list(split_contract.id_test.index_values)), evaluation_settings),
@@ -290,4 +320,4 @@ def create_dataloaders(
         evaluation_loaders[role] = None if ood_dataset is None else runtime_factory.make_data_loader(ood_dataset, evaluation_settings)
     if startup_callback is not None:
         startup_callback("dataloader_ready", {"workers": num_workers, "seconds": time.perf_counter() - loader_started})
-    return train_loader, evaluation_loaders, data_processor, split_info, artifact
+    return train_loader, evaluation_loaders, train_scaling, split_info, artifact

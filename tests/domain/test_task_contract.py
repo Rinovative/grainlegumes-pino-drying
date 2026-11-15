@@ -41,9 +41,10 @@ def test_steady_flow_contract_is_task_owned_and_scientifically_complete() -> Non
     assert (objective.space, objective.fields, objective.reduction, objective.direction) == (
         "physical",
         task.output_names,
-        "group_macro_element_mean",
+        "material_case_mean",
         "minimize",
     )
+    assert {term.id: (term.fields, term.weight) for term in task.error_terms} == {"p": (("p",), 0.5), "velocity": (("u", "v"), 0.5)}
     normalized_vector = next(metric for metric in task.default_metrics if metric.kind == "group_rmse")
     physical_vector = next(metric for metric in task.default_metrics if metric.kind == "vector_rmse")
     assert normalized_vector.fields == physical_vector.fields == groups["velocity"].fields
@@ -94,7 +95,7 @@ def test_task_declarations_fail_closed_on_runtime_literals_and_layout(
             kind="rmse",
             space="physical",
             fields=("response_b",),
-            reduction="element_mean",
+            reduction="material_case_mean",
             direction="sideways",  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="current 2D layout"):

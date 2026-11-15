@@ -2,18 +2,18 @@
 
 Responsibilities:
   - Select Dataset-owned conditioning fields from Generation storage descriptors
-  - Declare ordered state, temporal, boundary, scalar, target, and archive fields
-  - Validate explicit sampling and boundary-preserving spatial-view specifications
+  - Declare ordered state, temporal, boundary, scalar, next-state, and archive fields
+  - Validate explicit sampling specifications
   - Own the rollout-window placement shared by Dataset items and trajectory windows
   - Serialize and digest the exact persisted transient sample contract
 
 Design principles:
   - Generation owns canonical HDF5 source names and physical units
-  - Dataset owns model-facing channel selection and delta-target derivation
+  - Dataset owns model-facing channel selection; its items carry the stored next states as reference
   - HDF5 regular-time coordinates, not copied index values, own physical time
 
 This module does NOT:
-  - Register a transient learning task or build transient tensors
+  - Register a transient learning task, choose the model's output representation, or build transient tensors
   - Validate HDF5 payloads, normalize time, or execute model rollouts
 """
 
@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Final, Literal, TypeAlias, cast
 
 from src import generation
@@ -36,19 +36,26 @@ TRANSIENT_SAMPLE_MODES: Final[tuple[TransientSampleMode, ...]] = (
     "rollout_window",
     "trajectory",
 )
-_SPATIAL_AXIS_COUNT: Final = 2
-_MINIMUM_SPATIAL_AXIS_LENGTH: Final = 2
 
 
-def rollout_window_starts(transition_count: int, *, rollout_length: int, window_stride: int, window_offset: int) -> tuple[int, ...]:
+def _require_window_integers(**values: tuple[int, int]) -> None:
+    """Reject a window count, length, stride, or offset that is not an integer at its minimum."""
+    for label, (value, minimum) in values.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            message = f"{label} must be an integer >= {minimum}."
+            raise ValueError(message)
+
+
+def rollout_windows(transition_count: int, *, rollout_length: int, window_stride: int, window_offset: int) -> tuple[tuple[int, int], ...]:
     """
-    Return every rollout-window start of one trajectory, the last aligned to its end.
+    Return the ``(start, length)`` of every rollout window of one trajectory, the last aligned to its end.
 
-    Windows start at ``window_offset + k * window_stride``. When these stop short
-    of the final transition, one more window ending exactly at the trajectory end
-    is added, so every trajectory's last transitions are covered; it overlaps its
-    predecessor. A trajectory shorter than ``window_offset + rollout_length`` has
-    no window.
+    Windows of ``rollout_length`` start at ``window_offset + k * window_stride``. When these
+    stop short of the final transition, one more window ending exactly at the trajectory end
+    is added, so every trajectory's last transitions are covered; it overlaps its predecessor
+    and counts those transitions twice. A trajectory with no placed window, such as one shorter
+    than ``rollout_length``, forms one window over its last ``min(rollout_length, count)``
+    transitions, so every trajectory keeps at least one window.
 
     Raises
     ------
@@ -56,147 +63,35 @@ def rollout_window_starts(transition_count: int, *, rollout_length: int, window_
         If a count, length, stride, or offset is not a valid integer.
 
     """
-    for label, value, minimum in (
-        ("transition_count", transition_count, 0),
-        ("rollout_length", rollout_length, 1),
-        ("window_stride", window_stride, 1),
-        ("window_offset", window_offset, 0),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            message = f"{label} must be an integer >= {minimum}."
-            raise ValueError(message)
+    _require_window_integers(
+        transition_count=(transition_count, 1),
+        rollout_length=(rollout_length, 1),
+        window_stride=(window_stride, 1),
+        window_offset=(window_offset, 0),
+    )
     final_start = transition_count - rollout_length
-    starts = list(range(window_offset, final_start + 1, window_stride))
-    if starts and starts[-1] < final_start:
-        starts.append(final_start)
-    return tuple(starts)
+    windows = [(start, rollout_length) for start in range(window_offset, final_start + 1, window_stride)]
+    if not windows or windows[-1][0] < final_start:
+        windows.append((max(0, final_start), min(rollout_length, transition_count)))
+    return tuple(windows)
 
 
-def validate_spatial_stride(value: Any) -> int:
-    """Return one exact positive spatial stride without coercion."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        message = "spatial_stride must be an integer."
-        raise TypeError(message)
-    if value < 1:
-        message = "spatial_stride must be >= 1."
-        raise ValueError(message)
-    return value
+def consecutive_windows(transition_count: int, *, window: int) -> tuple[tuple[int, int], ...]:
+    """
+    Return the ``(start, length)`` of consecutive non-overlapping windows from the trajectory start.
 
+    The last window is a shorter rest window when ``window`` does not divide the
+    trajectory, so every transition lies in exactly one window and a trajectory
+    shorter than ``window`` forms one window.
 
-@dataclass(frozen=True, slots=True)
-class TransientSpatialRepresentation:
-    """Describe one exact endpoint-preserving view of a canonical grid."""
+    Raises
+    ------
+    ValueError
+        If the count or window length is not a positive integer.
 
-    source_shape: tuple[int, int]
-    spatial_stride: int
-    represented_shape: tuple[int, int]
-    y_indices: tuple[int, ...]
-    x_indices: tuple[int, ...]
-    _index_identity_sha256: str = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        """Reject shape, stride, endpoint, or index-map drift."""
-        stride = validate_spatial_stride(self.spatial_stride)
-        source_shape = _validate_spatial_shape(
-            self.source_shape,
-            label="source_shape",
-        )
-        expected_y = tuple(range(0, source_shape[0], stride))
-        expected_x = tuple(range(0, source_shape[1], stride))
-        represented_shape = (len(expected_y), len(expected_x))
-        if represented_shape != self.represented_shape:
-            message = "represented_shape does not match the source grid and spatial stride."
-            raise ValueError(message)
-        if self.y_indices != expected_y or self.x_indices != expected_x:
-            message = "Transient spatial indices must be the exact endpoint-preserving strided source indices."
-            raise ValueError(message)
-        if expected_y[-1] != source_shape[0] - 1 or expected_x[-1] != source_shape[1] - 1:
-            message = "Transient spatial indices must retain both physical endpoints."
-            raise ValueError(message)
-        object.__setattr__(self, "_index_identity_sha256", self._compute_index_identity_sha256())
-
-    @property
-    def index_identity_sha256(self) -> str:
-        """Return the exact source-index-map identity."""
-        return self._index_identity_sha256
-
-    def _compute_index_identity_sha256(self) -> str:
-        """Compute the immutable exact source-index-map identity once."""
-        encoded = json.dumps(
-            {
-                "source_shape": list(self.source_shape),
-                "spatial_stride": self.spatial_stride,
-                "represented_shape": list(self.represented_shape),
-                "y_indices": list(self.y_indices),
-                "x_indices": list(self.x_indices),
-            },
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
-
-    def as_dict(self) -> dict[str, Any]:
-        """Serialize the exact index-based spatial representation."""
-        return {
-            "source_shape": list(self.source_shape),
-            "spatial_stride": self.spatial_stride,
-            "represented_shape": list(self.represented_shape),
-            "axis_indices": {
-                "y": list(self.y_indices),
-                "x": list(self.x_indices),
-            },
-            "index_identity_sha256": self.index_identity_sha256,
-            "representation_transformation": "endpoint_preserving_strided_source_index_selection",
-        }
-
-
-def _validate_spatial_shape(value: Any, *, label: str) -> tuple[int, int]:
-    """Return one exact two-axis spatial shape."""
-    if (
-        not isinstance(value, tuple)
-        or len(value) != _SPATIAL_AXIS_COUNT
-        or any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in value)
-    ):
-        message = f"{label} must contain two integer spatial axes >= 2."
-        raise ValueError(message)
-    return cast("tuple[int, int]", value)
-
-
-def resolve_spatial_representation(
-    canonical_shape: tuple[int, int],
-    spatial_stride: int,
-) -> TransientSpatialRepresentation:
-    """Return one exact endpoint-preserving canonical-grid representation."""
-    stride = validate_spatial_stride(spatial_stride)
-    source_shape = _validate_spatial_shape(
-        canonical_shape,
-        label="canonical_shape",
-    )
-    if any((axis - 1) % stride != 0 for axis in source_shape):
-        message = f"spatial_stride={stride} does not preserve both boundaries of canonical spatial shape {source_shape}."
-        raise ValueError(message)
-    y_indices = tuple(range(0, source_shape[0], stride))
-    x_indices = tuple(range(0, source_shape[1], stride))
-    return TransientSpatialRepresentation(
-        source_shape=source_shape,
-        spatial_stride=stride,
-        represented_shape=(len(y_indices), len(x_indices)),
-        y_indices=y_indices,
-        x_indices=x_indices,
-    )
-
-
-def resolve_spatial_view(
-    canonical_shape: tuple[int, int],
-    spatial_stride: int,
-) -> tuple[int, int]:
-    """Return the boundary-preserving effective ``(Y, X)`` shape."""
-    return resolve_spatial_representation(
-        canonical_shape,
-        spatial_stride,
-    ).represented_shape
+    """
+    _require_window_integers(transition_count=(transition_count, 1), window=(window, 1))
+    return tuple((start, min(window, transition_count - start)) for start in range(0, transition_count, window))
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,11 +129,11 @@ class TransientSamplingSpec:
     Select one explicit deterministic transient sample materialization.
 
     ``one_step_transition`` yields single transitions. ``rollout_window`` yields
-    windows of ``rollout_length`` placed by :func:`rollout_window_starts`.
-    ``trajectory`` yields each complete case trajectory as one item. Its
-    optional ``rollout_length`` is the length of the consecutive windows a
-    recurrent trainer cuts from it with stride ``rollout_length`` and offset
-    zero; evaluation of whole trajectories sets none.
+    windows of ``rollout_length`` placed by :func:`rollout_windows`, one shorter
+    window for a trajectory below that length. ``trajectory`` yields each complete
+    case trajectory as one item. Its optional ``rollout_length`` is the length of
+    the windows a recurrent trainer cuts from it; evaluation of whole trajectories
+    sets none.
     """
 
     mode: TransientSampleMode
@@ -305,14 +200,14 @@ class TransientSamplingSpec:
             window_offset=value.get("window_offset"),
         )
 
-    def window_starts(self, transition_count: int) -> tuple[int, ...]:
-        """Return the window starts this sampling places in one trajectory."""
+    def windows(self, transition_count: int) -> tuple[tuple[int, int], ...]:
+        """Return the end-aligned ``(start, length)`` windows this sampling places in one trajectory."""
         if self.rollout_length is None:
             message = "One-step and whole-trajectory sampling place no rollout windows."
             raise ValueError(message)
         stride = self.rollout_length if self.window_stride is None else self.window_stride
         offset = 0 if self.window_offset is None else self.window_offset
-        return rollout_window_starts(transition_count, rollout_length=self.rollout_length, window_stride=stride, window_offset=offset)
+        return rollout_windows(transition_count, rollout_length=self.rollout_length, window_stride=stride, window_offset=offset)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize the exact explicit sampling choice."""
@@ -345,12 +240,10 @@ class TransientStepContract:
     boundary_interval_representation: str
     scalar_conditioning: tuple[DataField, ...]
     temporal: TransientTemporalContract
-    target_increments: tuple[DataField, ...]
     archived_ablation_fields: tuple[DataField, ...]
     sampling_modes: tuple[TransientSampleMode, ...]
     tensor_dtype: str
     canonical_storage_representation: str
-    target_derivation_stage: str
     material_family_usage: str
 
     @property
@@ -432,7 +325,6 @@ TRANSIENT_STEP_CONTRACT: Final = TransientStepContract(
         configured_horizon_source="generation_scientific_config.time.stop",
         exact_stop_usage="diagnostic_only_no_training_transition_or_rollout",
     ),
-    target_increments=tuple(DataField(f"delta_{field.name}", field.unit) for field in _SOURCE_PROFILE.transient_fields),
     archived_ablation_fields=tuple(
         _source_field(name)
         for name in (
@@ -446,13 +338,18 @@ TRANSIENT_STEP_CONTRACT: Final = TransientStepContract(
     sampling_modes=TRANSIENT_SAMPLE_MODES,
     tensor_dtype="float32",
     canonical_storage_representation="absolute_physical_states",
-    target_derivation_stage="transient_dataset_runtime",
     material_family_usage="metadata_only",
 )
 
 
 def transient_contract_payload() -> dict[str, Any]:
-    """Return the exact persisted transient tensor and temporal contract."""
+    """
+    Return the exact persisted transient tensor and temporal contract.
+
+    Its field groups are the tensors of one runtime item: the current ``state``, the
+    conditioning, and the stored ``next_state`` (one step) or next-state sequence
+    (rollout window) as reference, over the state fields.
+    """
     contract = TRANSIENT_STEP_CONTRACT
     temporal = contract.temporal
     return {
@@ -472,15 +369,14 @@ def transient_contract_payload() -> dict[str, Any]:
             "configured_horizon_source": temporal.configured_horizon_source,
             "exact_stop_usage": temporal.exact_stop_usage,
         },
-        "target": [{"name": field.name, "unit": field.unit} for field in contract.target_increments],
+        "next_state": [{"name": field.name, "unit": field.unit} for field in contract.dynamic_state],
         "sampling": {
             "modes": list(contract.sampling_modes),
-            "rollout_target": "ordered_next_state_minus_current_state_sequence",
+            "rollout_reference": "ordered_stored_next_state_sequence",
             "window_boundary": "single_case_regular_transitions_only",
         },
         "tensor_dtype": contract.tensor_dtype,
         "storage": contract.canonical_storage_representation,
-        "target_derivation": contract.target_derivation_stage,
         "material_family_usage": contract.material_family_usage,
     }
 

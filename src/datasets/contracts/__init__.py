@@ -2,6 +2,7 @@
 Dataset view, identity, and transient channel contracts.
 
 Provides:
+- grid: endpoint-preserving strided grid views shared by both tasks
 - identity: deterministic Dataset and membership identities
 - partition: immutable Dataset case roles and exact fixed membership
 - transient: canonical transient sample-data contract
@@ -14,18 +15,20 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from . import dataset_contracts_grid as grid
     from . import dataset_contracts_identity as identity
     from . import dataset_contracts_partition as partition
     from . import dataset_contracts_transient as transient
     from . import dataset_contracts_views as views
 
 _MODULES = {
+    "grid": "dataset_contracts_grid",
     "identity": "dataset_contracts_identity",
     "partition": "dataset_contracts_partition",
     "transient": "dataset_contracts_transient",
     "views": "dataset_contracts_views",
 }
-__all__ = ["identity", "partition", "transient", "views"]
+__all__ = ["grid", "identity", "partition", "transient", "views"]
 
 
 def __getattr__(name: str) -> object:

@@ -1,7 +1,8 @@
 """Protect Optuna semantics with artificial configs and controlled fake trials.
 
 Responsibilities:
-  - Check search admission, exact types, sampler/pruner projection, transient A0 study admission, and package identity
+  - Check search admission, exact types, sampler/pruner projection, the trial budget, transient A0 study admission, and package identity
+  - Check that the median pruner starts after trained trials only, never counting a repeated trial
 
 Design principles:
   - Invalid searches and physical-package drift fail before study allocation
@@ -18,7 +19,7 @@ import shutil
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import optuna
 import pytest
@@ -84,14 +85,59 @@ def test_epoch_override_is_applied_before_optuna_resolution_and_signature(
     shortened = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(path, epochs=2, train_dataset="synthetic_ood"))
     dataset_changed = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(path, train_dataset="synthetic_ood"))
 
-    assert shortened.base_config["training"]["epochs"] == 2
-    assert shortened.base_experiment["training"]["epochs"] == 2
+    # The override sets the budget K, which this study's trials train whole.
+    assert (shortened.study["full_budget_epochs"], shortened.base_config["training"]["budget_epochs"]) == (2, 2)
     assert shortened.base_config["data"]["train_dataset"] == "synthetic_ood"
-    assert shortened.base_experiment["data"]["train_dataset"] == "synthetic_ood"
     default_signature = optuna_runtime.build_study_signature(default)["digest"]
     assert optuna_runtime.build_study_signature(shortened)["digest"] != default_signature
     assert optuna_runtime.build_study_signature(dataset_changed)["digest"] != default_signature
-    assert payload["experiment"]["training"]["epochs"] != 2
+    assert payload["experiment"]["training"]["budget_epochs"] != 2
+
+
+def test_a_trial_trains_the_study_fraction_of_the_budget_and_the_study_identity_binds_both(tmp_path: Path) -> None:
+    """Half of K = 4 is a 2-epoch trial; the whole of K = 2 trains as long but is another study, and a fraction that splits an epoch is refused."""
+    payload = configs.optuna_config()
+    payload["study"]["budget_fraction"] = 0.5
+    half = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(_write_study(tmp_path, payload), epochs=4))
+    whole = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(_write_study(tmp_path), epochs=2))
+
+    assert (half.study["full_budget_epochs"], half.study["budget_fraction"], half.base_config["training"]["budget_epochs"]) == (4, 0.5, 2)
+    assert whole.base_config["training"]["budget_epochs"] == 2
+    assert optuna_runtime.build_study_signature(half)["payload"]["trial_budget"] == {
+        "full_budget_epochs": 4,
+        "budget_fraction": 0.5,
+        "budget_epochs": 2,
+    }
+    assert optuna_runtime.build_study_signature(half)["digest"] != optuna_runtime.build_study_signature(whole)["digest"]
+    with pytest.raises(ValueError, match="choose K so that the trial budget is whole"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path, payload), epochs=3)
+    for fraction in (0.0, 1.5, None):
+        payload["study"]["budget_fraction"] = fraction
+        with pytest.raises(ValueError, match=r"budget_fraction must be a number in \(0, 1\]"):
+            optuna_runtime.load_optuna_study_config(_write_study(tmp_path, payload))
+    drifted = replace(half, study={**half.study, "budget_fraction": 1.0})
+    with pytest.raises(ValueError, match="not the study's trial budget"):
+        optuna_runtime.build_study_signature(drifted)
+
+
+def test_a_trial_run_identity_names_the_trial_budget_its_k_and_the_schedule_its_study_binds(tmp_path: Path) -> None:
+    """A trial's seed group and identity carry the study's trial budget, the sampled k and the bound schedule; another k is another run."""
+    payload = configs.optuna_config()
+    payload["study"]["budget_fraction"] = 0.5
+    payload["search_space"]["training.units_per_update"] = _UNITS_PER_UPDATE
+    study = optuna_trials.with_configured_identities(optuna_runtime.load_optuna_study_config(_write_study(tmp_path, payload), epochs=4))
+    signature = optuna_runtime.build_study_signature(study)["payload"]
+
+    def trial_layout(k: int) -> dict[str, Any]:
+        trial = optuna.trial.FixedTrial({"hidden_channels": 8, "learning_rate": 1.0e-3, "units_per_update": k})
+        # Optuna's trial number is a read-only property, which the driver's protocol states as an attribute.
+        return optuna_runtime._prepare_trial_config(study, cast("Any", trial), sampler_seed=0)[0]["run"]["layout"]
+
+    layout = trial_layout(4)
+    schedule = common.names.text_token(signature["scientific_base_config"]["scheduler"]["kind"])
+    assert (layout["budget_epochs"], layout["units_per_update"], layout["schedule"]) == (signature["trial_budget"]["budget_epochs"], 4, schedule)
+    assert common.paths.seed_group_name(layout) == f"seed-{study.base_config['run']['seed']}__ep-2__k-4__sch-{schedule}"
+    assert trial_layout(2)["a0_id"] != layout["a0_id"]
 
 
 @pytest.mark.parametrize(
@@ -174,6 +220,15 @@ def test_study_scalars_require_exact_types(
         optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
 
 
+def test_an_authored_study_storage_is_refused(tmp_path: Path) -> None:
+    """Every study keeps its SQLite database in its own directory, so the study lock there binds every invocation."""
+    configured = configs.optuna_config()
+    configured["study"]["storage"] = "sqlite:///elsewhere.db"
+
+    with pytest.raises(ValueError, match=r"unknown key\(s\): \['storage'\]"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+
+
 def test_sampler_pruner_and_metadata_mirror_configured_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -198,9 +253,6 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
     )
     configured = configs.optuna_config(multivariate=False)
     loaded = optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
-    external_study = copy.deepcopy(loaded.study)
-    external_study["storage"] = "external://synthetic-study"
-    loaded = replace(loaded, study=external_study)
     captured: dict[str, Any] = {}
 
     def capture_sampler(**settings: Any) -> object:
@@ -225,9 +277,14 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
         captured["create_study"] = settings
         return fake_study
 
+    def capture_objective(_config: Any, *, sampler_seed: int) -> Callable[[Any], float]:
+        captured["trial_sampler_seed"] = sampler_seed
+        return lambda _trial: 0.0
+
     monkeypatch.setattr(optuna.samplers, "TPESampler", capture_sampler)
     monkeypatch.setattr(optuna.pruners, "MedianPruner", capture_pruner)
     monkeypatch.setattr(optuna, "create_study", create_study)
+    monkeypatch.setattr(optuna_runtime, "create_objective", capture_objective)
     monkeypatch.setattr(datasets.packages.manifest, "load_package_manifest", admitted_manifest)
 
     result = optuna_runtime.run_optuna_study(
@@ -239,12 +296,17 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
     sampler_config = loaded.study["sampler"]
     pruner_config = loaded.study["pruner"]
     assert result is fake_study
+    # A new study stores no trial yet; its sampler seed derives from the study seed and that count, which the invocation
+    # records, and its trials record the same derived seed.
     assert captured["sampler"] == {
-        "seed": loaded.study["seed"],
+        "seed": common.random.derive_subseed(loaded.study["seed"], "optuna_sampler_after_0_trials") % 2**32,
         "multivariate": sampler_config["multivariate"],
     }
+    assert captured["trial_sampler_seed"] == captured["sampler"]["seed"]
+    assert [record["stored_trials"] for key, record in user_attrs.items() if key.startswith("invocation/")] == [0]
     assert captured["pruner"] == {
         "n_startup_trials": pruner_config["n_startup_trials"],
+        "n_min_trials": pruner_config["n_min_trials"],
         "n_warmup_steps": pruner_config["n_warmup_steps"],
         "interval_steps": pruner_config["interval_steps"],
     }
@@ -252,6 +314,7 @@ def test_sampler_pruner_and_metadata_mirror_configured_values(
         "kind": sampler_config["kind"],
         "multivariate": sampler_config["multivariate"],
         "seed": loaded.study["seed"],
+        "invocation_seed": "derived_from_seed_and_stored_trial_count",
     }
     assert user_attrs["numerical_environment"] == runtime_environment
     assert environment_reads == [1]
@@ -276,6 +339,53 @@ def test_transient_optuna_admits_only_stage_a_only_mode(tmp_path: Path, mode: st
         optuna_runtime._validate_study_contract(replace(loaded, study=invalid))
 
 
+def test_the_median_pruner_states_its_start_point_and_compares_five_trials_at_a_point(tmp_path: Path) -> None:
+    """The start point is a config value below 20; pruning waits for 5 completed trials and 5 reports at the same point by default."""
+    configured = configs.optuna_config()
+    configured["study"]["pruner"] = {"kind": "median", "n_warmup_steps": 4}
+    configured["study"]["n_trials"] = 6
+    loaded = optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+    assert loaded.study["pruner"] == {"kind": "median", "n_startup_trials": 5, "n_min_trials": 5, "n_warmup_steps": 4, "interval_steps": 1}
+
+    configured["study"]["pruner"] = {"kind": "median", "n_startup_trials": 1}
+    with pytest.raises(KeyError, match="n_warmup_steps"):
+        optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+    invalid = copy.deepcopy(loaded.study)
+    invalid["pruner"] = {"kind": "median", "n_startup_trials": 1, "n_warmup_steps": 20}
+    with pytest.raises(ValueError, match=r"n_warmup_steps counts validation points and must be below 20"):
+        optuna_runtime._validate_study_contract(replace(loaded, study=invalid))
+    invalid["pruner"] = {"kind": "median", "n_warmup_steps": 4, "n_min_trials": 0}
+    with pytest.raises(ValueError, match=r"n_min_trials must be at least 1"):
+        optuna_runtime._validate_study_contract(replace(loaded, study=invalid))
+
+
+def test_median_pruning_starts_after_five_trainings_and_never_counts_a_reused_duplicate(tmp_path: Path) -> None:
+    """Four trained trials and two duplicates (complete with a reused value) do not start pruning; a fifth trained trial does."""
+    configured = configs.optuna_config()
+    # One comparison trial per point, so only the startup count decides.
+    configured["study"]["pruner"] = {"kind": "median", "n_warmup_steps": 4, "n_min_trials": 1}
+    configured["study"]["n_trials"] = 8
+    loaded = optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
+    study = optuna.create_study(direction="minimize", pruner=optuna_runtime._build_pruner(loaded.study))
+    complete = optuna.trial.TrialState.COMPLETE
+
+    def worse_trial_is_pruned() -> bool:
+        trial = study.ask()
+        trial.report(2.0, step=4)
+        pruned = trial.should_prune()
+        study.tell(trial, state=optuna.trial.TrialState.FAIL)
+        return pruned
+
+    for _ in range(4):
+        study.add_trial(optuna.trial.create_trial(state=complete, value=1.0, intermediate_values={4: 1.0}))
+    for _ in range(2):
+        study.add_trial(optuna.trial.create_trial(state=complete, value=1.0, user_attrs={"duplicate_of": "trials/0000"}))
+    assert not worse_trial_is_pruned()
+
+    study.add_trial(optuna.trial.create_trial(state=complete, value=1.0, intermediate_values={4: 1.0}))
+    assert worse_trial_is_pruned()
+
+
 def test_steady_study_rejects_the_transient_stage_a_only_mode(tmp_path: Path) -> None:
     """stage_a_only names the transient A0 protocol and must not enter a steady study identity."""
     configured = configs.optuna_config()
@@ -285,18 +395,23 @@ def test_steady_study_rejects_the_transient_stage_a_only_mode(tmp_path: Path) ->
         optuna_runtime.load_optuna_study_config(_write_study(tmp_path, configured))
 
 
-def test_transient_optuna_rejects_matched_plan_experiment(tmp_path: Path) -> None:
-    """Train matched A0/B/A1 plans instead of searching them, at load and on revalidation."""
-    payload = configs.optuna_transient_a0_config()
-    payload["experiment"]["training"] = {"mode": "matched_a1_b"}
-    match = "tune A0 only through stage_a_only"
+def test_transient_study_tunes_its_plans_a0_alone_at_the_study_fraction(tmp_path: Path) -> None:
+    """The trial is the plan's stage-A-only A0 over half of A0's budget, without B; a single-stage experiment is refused."""
+    payload = configs.optuna_transient_a0_config(model_kind="rno")
+    payload["study"]["budget_fraction"] = 0.5
+    plan = payload["experiment"]["training"]
 
-    with pytest.raises(ValueError, match=match):
-        optuna_runtime.load_optuna_study_config(configs.write_yaml(tmp_path / "matched-study.yaml", payload))
+    loaded = optuna_runtime.load_optuna_study_config(configs.write_yaml(tmp_path / "a0-study.yaml", payload))
 
-    loaded = _load_a0_study(tmp_path)
-    with pytest.raises(ValueError, match=match):
-        optuna_runtime._validate_study_contract(replace(loaded, base_experiment=payload["experiment"]))
+    training = loaded.base_config["training"]
+    assert (loaded.study["full_budget_epochs"], training["budget_epochs"]) == (plan["a0"]["budget_epochs"], plan["a0"]["budget_epochs"] // 2)
+    assert (training["stage"], training["comparison_arm"], training["stage_schedule"]["mode"]) == ("a", "a0", "stage_a_only")
+    assert training["units_per_update"] == plan["units_per_update"]
+    assert loaded.base_config["temporal"]["sampling"]["mode"] == plan["a0"]["sampling"]["mode"]
+    assert "curriculum" not in training  # teacher-forced A0 draws no rollout horizon
+    payload["experiment"] = configs.transient_stage_a_only_config()
+    with pytest.raises(ValueError, match="tunes the A0 of a matched plan"):
+        optuna_runtime.load_optuna_study_config(configs.write_yaml(tmp_path / "single-stage-study.yaml", payload))
 
 
 def _load_task_study(task: str, tmp_path: Path) -> optuna_runtime.OptunaStudyConfig:
@@ -431,7 +546,8 @@ def test_best_config_trains_once_copied_into_the_experiments_tree(task: str, tmp
     else:
         # A transient study names only its A0 part; B/A1 settings of the architecture experiment appear in its pair folder, not in the name.
         stem = "best"
-        pinned = "fno_m96x160_h96_l4_p0p1__bs-4__lr-0p003__a0smp-one-step-transition"  # the best trial's batch size and rate, no default curriculum
+        # The best trial's rate, no curriculum; its k names the run's seed group, not the config.
+        pinned = "fno_m128x160_h96_l4_p0p1__lr-0p01__a0smp-one-step-transition"
         assert f"the name is {pinned}; B/A1 settings it sets appear in the pair folder" in header
     target = tmp_path / "configs/03_learning" / task
     (target / "experiments/group").mkdir(parents=True)
@@ -446,7 +562,8 @@ def test_best_config_trains_once_copied_into_the_experiments_tree(task: str, tmp
     assert authored["run"] == shared["run"]
     if task == "steady_flow":
         result = preflight.inspect_config(config_path, train_dataset="synthetic_dataset")
-        assert (result.family, authored["training"]) == ("experiment", shared["training"])
+        # The best trial's k is the only training value it changes.
+        assert (result.family, authored["training"]) == ("experiment", {**shared["training"], "units_per_update": best["k"]})
         assert result.run_label.startswith(stem)
     else:
         # A transient matched experiment must also state B's rollout sampling, which no A0 study tunes; a default curriculum stays unstated.
@@ -461,7 +578,7 @@ def test_best_config_trains_once_copied_into_the_experiments_tree(task: str, tmp
     assert transient_plan.is_matched_a1_b_config(authored) == (task == "transient_drying")
 
 
-_ACCUMULATION = {"name": "accumulation", "kind": "categorical", "values": [1, 2]}
+_UNITS_PER_UPDATE = {"name": "units_per_update", "kind": "categorical", "values": [2, 4]}
 
 
 def test_best_config_of_an_external_steady_study_exports_against_the_task_base(tmp_path: Path) -> None:
@@ -517,67 +634,26 @@ def test_best_config_of_a_study_tuning_one_physics_weight_exports_the_whole_weig
     assert preflight.inspect_config(config_path, train_dataset="synthetic_train").family == "experiment"
 
 
-def test_best_config_of_an_a0_study_puts_a_searched_training_value_under_the_a0_stage(tmp_path: Path) -> None:
-    """A searched omitted default of a transient A0 study exports, at the A0 path where the matched plan reads it."""
+def test_best_config_of_an_a0_study_puts_a_searched_k_at_the_plan_level(tmp_path: Path) -> None:
+    """A searched units-per-update of a transient A0 study exports where the matched plan reads it: once for all stages."""
     payload = configs.optuna_transient_a0_config()
-    del payload["experiment"]["training"]["gradient_accumulation_steps"]  # an omitted default: the resolved config supplies 1
-    payload["search_space"]["training.gradient_accumulation_steps"] = _ACCUMULATION
+    payload["search_space"]["training.units_per_update"] = _UNITS_PER_UPDATE
     study = optuna_runtime.load_optuna_study_config(
         configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
     )
     paths = _study_paths(tmp_path / "study")
-    best = {"hidden_channels": 12, "learning_rate": 0.002, "accumulation": 2}
+    best = {"hidden_channels": 12, "learning_rate": 0.002, "units_per_update": 4}
 
     optuna_runtime._publish_study_lifecycle_summary(
         paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
     )
 
     training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
-    assert set(training) == {"a0"}
-    assert training["a0"]["gradient_accumulation_steps"] == 2
-
-
-def test_best_config_of_an_a0_study_without_authored_sampling_takes_the_resolved_one(tmp_path: Path) -> None:
-    """The A0 move follows the study mode, not the authored keys: omitted sampling comes from the resolved config."""
-    payload = configs.optuna_transient_a0_config()
-    del payload["experiment"]["temporal"]["sampling"]
-    payload["search_space"]["training.gradient_accumulation_steps"] = _ACCUMULATION
-    study = optuna_runtime.load_optuna_study_config(
-        configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
-    )
-    paths = _study_paths(tmp_path / "study")
-    best = {"hidden_channels": 12, "learning_rate": 0.002, "accumulation": 2}
-
-    optuna_runtime._publish_study_lifecycle_summary(
-        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
-    )
-
-    training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
-    assert set(training) == {"a0"}
-    assert training["a0"]["sampling"] == study.base_config["temporal"]["sampling"]
-    assert training["a0"]["gradient_accumulation_steps"] == 2
-    assert "curriculum" not in training["a0"]  # the code-default curriculum is not stated
-
-
-def test_best_config_of_an_a0_study_states_a_non_default_curriculum_under_the_a0_stage(tmp_path: Path) -> None:
-    """A curriculum that differs from the code default is part of A0's identity and exports under the A0 stage."""
-    payload = configs.optuna_transient_a0_config()
-    experiment = configs.transient_stage_a_only_config(model_kind="rno")  # its curriculum [2, 4] differs from the default
-    experiment["data"]["material_ood_datasets"] = []
-    experiment["tracking"]["wandb"]["workflow"] = "optuna_trial"
-    payload["experiment"] = experiment
-    study = optuna_runtime.load_optuna_study_config(
-        configs.write_yaml(tmp_path / "external" / "a0-study.yaml", payload), train_dataset="synthetic_transient_train"
-    )
-    paths = _study_paths(tmp_path / "study")
-    best = {"hidden_channels": 12, "learning_rate": 0.002}
-
-    optuna_runtime._publish_study_lifecycle_summary(
-        paths, {"study_name": "s", "best_trial_number": 1, "best_objective": 0.5, "best_parameters": best}, study
-    )
-
-    training = yaml.safe_load((paths.study_dir / "best_config.yaml").read_text(encoding="utf-8"))["training"]
-    assert training["a0"]["curriculum"] == study.base_config["training"]["curriculum"] != {"lengths": [1], "milestone_fractions": [0.0]}
+    assert training["units_per_update"] == 4
+    assert "units_per_update" not in training["a0"]
+    # The study's experiment is its plan, so A0's own settings stay under the A0 stage, without a curriculum.
+    assert training["a0"]["sampling"] == payload["experiment"]["training"]["a0"]["sampling"]
+    assert "curriculum" not in training["a0"]
 
 
 def test_a_study_without_the_task_base_is_refused_when_it_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

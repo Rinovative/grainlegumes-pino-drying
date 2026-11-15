@@ -17,7 +17,7 @@ Design principles:
 
 This module does NOT:
   - Import artifact generation, reconstruct models, or execute inference
-  - Create, repair, rebuild, publish, upload, or remove artifact payloads
+  - Create, repair, rebuild, publish, or remove artifact payloads
   - Open steady NPZ arrays; the writer checks their contents before the stage is admitted
   - Render figures or manage evaluation-session caches
 
@@ -495,7 +495,7 @@ def _expected_normalizer_provenance(
     normalizer_sha256 : Any
         Completed-run digest of ``normalizer.pt``.
     normalizer_state : collections.abc.Mapping[str, Any]
-        Validated saved normalizer tensors from completed-run admission.
+        Validated saved Train scaling state from completed-run admission.
 
     Returns
     -------
@@ -507,10 +507,9 @@ def _expected_normalizer_provenance(
         "sha256": normalizer_sha256,
         "identity": "saved_run_normalizer.pt",
         "fit_split": task_spec.preprocessing.fit_split,
-        "output_normalization": task_spec.preprocessing.output_normalization,
-        "denominator_floor": 1e-7,
-        "output_standard_deviations": contracts.output_standard_deviations_from_state(
-            normalizer_state,
+        "normalization": task_spec.preprocessing.normalization,
+        "output_scales": contracts.output_scales(
+            datasets.preprocessing.normalization.TrainScaling.from_state_dict(normalizer_state),
             output_fields=task_spec.output_names,
         ),
     }
@@ -556,18 +555,7 @@ def _expected_evaluator_provenance(
         "output_units": {field.name: field.unit for field in task_spec.outputs},
         "output_groups": contracts.output_group_payload(task_spec.output_groups),
         "physics_kind": task_spec.physics.kind,
-        "group_objective_evidence": {
-            "squared_error_accumulation_dtype": "float64",
-            "per_case_physical_columns": {field: list(contracts.physical_statistic_columns(field)) for field in task_spec.output_names},
-            "per_case_normalized_columns": {field: list(contracts.normalized_statistic_columns(field)) for field in task_spec.output_names},
-            "train_scale_source": "saved_run_normalizer.output_standard_deviations",
-            "dataset_reduction": ("sum physical field SSE/count, finalize shared-scale group RMSE, equal macro mean over output groups"),
-        },
-        "predictive_metrics": {
-            "rel_l2": "per-case arithmetic mean of physical per-field relative L2 ratios",
-            "rel_h1": ("per-case arithmetic mean of physical per-field relative H1 ratios on the declared artifact region where available"),
-            "physical_rmse_columns": {field: contracts.physical_statistic_columns(field)[2] for field in task_spec.output_names},
-        },
+        "metric_evidence": contracts.metric_evidence_provenance(task_spec),
     }
 
 
@@ -813,7 +801,7 @@ def _bind_artifact_to_run(
         msg = "Artifact dataset provenance does not match saved dataset identity and membership."
         raise ValueError(msg)
     data_config = _mapping(config.get("data"), label="config.yaml data")
-    evaluation_batch_size = _positive_int(data_config.get("batch_size"), label="config.yaml data.batch_size")
+    evaluation_batch_size = _positive_int(data_config.get("evaluation_batch_size"), label="config.yaml data.evaluation_batch_size")
     effective_count, effective_indices = _effective_selection(
         role,
         provenance,
@@ -932,13 +920,15 @@ def _apply_role_attrs(
     kind: str,
     scope: str,
     config: Mapping[str, Any],
+    summary: Mapping[str, Any],
 ) -> None:
-    """Attach the role attrs both tasks share; task-specific attrs stay with their admission path."""
+    """Attach the role attrs both tasks share, among them the run's config and summary; task-specific attrs stay with their admission path."""
     frame.attrs["artifact_root"] = str(root.resolve())
     frame.attrs["artifact_provenance"] = deepcopy(dict(provenance))
     frame.attrs["artifact_kind"] = kind
     frame.attrs["artifact_scope"] = scope
     frame.attrs[dataframe.COMPLETED_RUN_CONFIG_ATTR] = deepcopy(dict(config))
+    frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR] = deepcopy(dict(summary))
 
 
 def _load_role(
@@ -1073,6 +1063,7 @@ def _load_role(
         kind=contracts.STEADY_ARTIFACT_KIND,
         scope="canonical",
         config=config,
+        summary=summary,
     )
     return LoadedEvaluationArtifact(
         split_role=role.split_role,
@@ -1097,9 +1088,8 @@ def _transient_role_artifact(
     selection_role: ArtifactSelectionRole,
     root: Path | str | None,
     scoped: bool,
-    evaluation_spatial_stride: int = 1,
 ) -> LoadedEvaluationArtifact:
-    """Admit one transient sequence role at its canonical root, a private stage, a grid variant or a scoped root."""
+    """Admit one transient sequence role at its canonical root, a private stage or a scoped root."""
     from src.analysis.artifacts import transient  # noqa: PLC0415
 
     split_role = artifact_plan.split_of(selection_role)
@@ -1130,12 +1120,7 @@ def _transient_role_artifact(
         loaded = (
             transient.validate_scoped_transient_role_artifact_index(target, completed=admitted, saved_role=role_plan)
             if scoped
-            else transient.validate_transient_role_artifact_index(
-                target,
-                completed=admitted,
-                role=role_plan,
-                evaluation_spatial_stride=evaluation_spatial_stride,
-            )
+            else transient.validate_transient_role_artifact_index(target, completed=admitted, role=role_plan)
         )
     except Exception as error:
         raise _incompatible(
@@ -1154,6 +1139,7 @@ def _transient_role_artifact(
         kind="transient_sequence",
         scope="scoped_partial" if scoped else "canonical",
         config=cast("Mapping[str, Any]", admitted["config"]),
+        summary=_mapping(admitted.get("summary"), label="completed transient summary"),
     )
     frame.attrs["transient_sequence_index"] = loaded
     frame.attrs["transient_unavailable_horizons"] = loaded.unavailable_horizons
@@ -1272,7 +1258,6 @@ def admit_role_artifact(
     *,
     selection_role: ArtifactSelectionRole,
     root: Path | str | None = None,
-    evaluation_spatial_stride: int = 1,
 ) -> LoadedEvaluationArtifact:
     """
     Admit one role artifact through the authoritative validator of its task.
@@ -1286,10 +1271,8 @@ def admit_role_artifact(
     selection_role : {"id", "material_ood", "parameter_ood"}
         Saved role whose exact membership the artifact must carry.
     root : pathlib.Path | str | None, optional
-        Private build stage or transient Evaluation-grid variant to admit instead
-        of the canonical role root; the saved membership still applies unchanged.
-    evaluation_spatial_stride : int, optional
-        Transient Evaluation-grid stride of ``root``. Steady artifacts use one.
+        Private build stage to admit instead of the canonical role root; the saved
+        membership still applies unchanged.
 
     Returns
     -------
@@ -1312,18 +1295,7 @@ def admit_role_artifact(
     task_spec = experiments.config.loader.validate_resolved_task_contract(_mapping(admitted.get("config"), label="evaluable config"))
     if task_spec.id == "transient_drying":
         plan = artifact_plan.artifact_plan_from_completed(admitted, run_dir=path)
-        return _transient_role_artifact(
-            path,
-            admitted,
-            plan,
-            selection_role=selection_role,
-            root=root,
-            scoped=False,
-            evaluation_spatial_stride=evaluation_spatial_stride,
-        )
-    if evaluation_spatial_stride != 1:
-        msg = "Steady artifacts are admitted only on the canonical Evaluation grid."
-        raise ValueError(msg)
+        return _transient_role_artifact(path, admitted, plan, selection_role=selection_role, root=root, scoped=False)
     context, saved_roles = _steady_role_context(path, admitted, task_spec)
     role = saved_roles.get(selection_role)
     if role is None:

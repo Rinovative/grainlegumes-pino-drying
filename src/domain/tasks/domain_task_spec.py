@@ -1,7 +1,8 @@
 """Define immutable semantic contracts for learned operator tasks.
 
 Responsibilities:
-  - Describe fields, datasets, preprocessing, metrics, and physics selection
+  - Describe fields, datasets, preprocessing, metrics, reference floors, and physics selection
+  - Declare the per-field metric family both tasks report
   - Validate task structure, exact field membership, and tensor axes
   - Produce deterministic resolved, data, and complete contract digests
 
@@ -20,9 +21,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import Final, Literal, get_args
 
+# The one Train-only scaling of inputs and states in every task; the fitted normalizer and artifacts record it.
+TRAIN_SCALING_KIND: Final = "case_equal_train_channel_scaling"
 FieldRole = Literal[
     "airflow",
     "boundary",
@@ -33,13 +37,7 @@ FieldRole = Literal[
     "state",
 ]
 MetricSpace = Literal["normalized", "physical"]
-MetricReduction = Literal[
-    "sample_mean",
-    "element_mean",
-    "group_element_mean",
-    "group_macro_element_mean",
-    "vector_element_mean",
-]
+MetricReduction = Literal["material_case_mean"]
 OptimizationDirection = Literal["minimize", "maximize"]
 _SUPPORTED_TENSOR_LAYOUT = ("batch", "channel", "y", "x")
 _SUPPORTED_OPERATOR_AXES = (2, 3)
@@ -165,10 +163,9 @@ class PreprocessingSpec:
 
     Attributes
     ----------
-    input_normalization : str
-        Semantic input normalization strategy.
-    output_normalization : str
-        Semantic output normalization strategy.
+    normalization : str
+        The one scaling of inputs and states, shared by every task:
+        ``TRAIN_SCALING_KIND``.
     fit_split : str
         Dataset split used to fit preprocessing statistics. Only ``"train"`` is
         supported so evaluation membership cannot influence fitted state.
@@ -176,22 +173,18 @@ class PreprocessingSpec:
     Raises
     ------
     ValueError
-        If normalization identifiers are empty or ``fit_split`` is not exactly
-        ``"train"``.
+        If ``normalization`` is not ``TRAIN_SCALING_KIND`` or ``fit_split`` is
+        not exactly ``"train"``.
 
     """
 
-    input_normalization: str
-    output_normalization: str
+    normalization: str
     fit_split: str
 
     def __post_init__(self) -> None:
-        """Require explicit normalization strategies fitted only on training data."""
-        if not isinstance(self.input_normalization, str) or not self.input_normalization:
-            msg = "Input normalization strategy must be a non-empty string."
-            raise ValueError(msg)
-        if not isinstance(self.output_normalization, str) or not self.output_normalization:
-            msg = "Output normalization strategy must be a non-empty string."
+        """Require the shared Train-only scaling."""
+        if self.normalization != TRAIN_SCALING_KIND:
+            msg = f"Task normalization must be the shared {TRAIN_SCALING_KIND!r}, got {self.normalization!r}."
             raise ValueError(msg)
         if self.fit_split != "train":
             msg = f"Normalizer fit_split must be 'train', got {self.fit_split!r}."
@@ -207,11 +200,7 @@ class PreprocessingSpec:
             Input/output normalization assumptions and fit split.
 
         """
-        return {
-            "input_normalization": self.input_normalization,
-            "output_normalization": self.output_normalization,
-            "fit_split": self.fit_split,
-        }
+        return {"normalization": self.normalization, "fit_split": self.fit_split}
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +214,9 @@ class OutputGroupSpec:
         Canonical group identifier.
     fields : tuple[str, ...]
         Ordered output fields that jointly represent the physical quantity.
+    vector : bool
+        Whether the fields are the components of one vector, whose error is one
+        Euclidean quantity; otherwise every field is a separate compartment.
 
     Raises
     ------
@@ -235,6 +227,7 @@ class OutputGroupSpec:
 
     id: str
     fields: tuple[str, ...]
+    vector: bool = False
 
     def __post_init__(self) -> None:
         """Reject empty identifiers and ambiguous field membership."""
@@ -249,6 +242,9 @@ class OutputGroupSpec:
         ):
             msg = f"Output group {self.id!r} fields must be a unique non-empty tuple of strings."
             raise ValueError(msg)
+        if not isinstance(self.vector, bool):
+            msg = f"Output group {self.id!r} vector must be a boolean."
+            raise TypeError(msg)
 
     def as_dict(self) -> dict[str, object]:
         """
@@ -257,10 +253,69 @@ class OutputGroupSpec:
         Returns
         -------
         dict[str, object]
-            Group identifier and ordered member fields.
+            Group identifier, ordered member fields, and whether they form one vector.
 
         """
-        return {"id": self.id, "fields": list(self.fields)}
+        return {"id": self.id, "fields": list(self.fields), "vector": self.vector}
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorTermSpec:
+    """
+    Describe one weighted term of the training loss and of the selection objective.
+
+    Attributes
+    ----------
+    id : str
+        The field name of a one-field term, else the vector group's id.
+    fields : tuple[str, ...]
+        Fields whose squared errors the term sums before dividing by the sum of their squared Train scales.
+    weight : float
+        Positive term weight; the terms of a task sum to one.
+
+    """
+
+    id: str
+    fields: tuple[str, ...]
+    weight: float
+
+
+def error_terms(groups: tuple[OutputGroupSpec, ...]) -> tuple[ErrorTermSpec, ...]:
+    """
+    Return the weighted error terms of the given physical output groups.
+
+    Every group receives the equal weight ``1 / len(groups)``. A vector group is one
+    term over all its components; any other group splits its weight equally over
+    one term per field (steady: pressure 1/2, velocity vector 1/2; transient: T 1/3,
+    phi 1/3, w_surf 1/6, w_int 1/6).
+
+    Parameters
+    ----------
+    groups : tuple[OutputGroupSpec, ...]
+        Non-empty ordered physical output groups.
+
+    Returns
+    -------
+    tuple[ErrorTermSpec, ...]
+        Terms in group and field order.
+
+    Raises
+    ------
+    ValueError
+        If no group is given.
+
+    """
+    if not groups:
+        msg = "Error terms require at least one physical output group."
+        raise ValueError(msg)
+    group_weight = 1.0 / len(groups)
+    terms: list[ErrorTermSpec] = []
+    for group in groups:
+        if group.vector or len(group.fields) == 1:
+            terms.append(ErrorTermSpec(group.fields[0] if len(group.fields) == 1 else group.id, group.fields, group_weight))
+        else:
+            terms.extend(ErrorTermSpec(field, (field,), group_weight / len(group.fields)) for field in group.fields)
+    return tuple(terms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,11 +334,10 @@ class MetricSpec:
     fields : tuple[str, ...]
         Ordered task output fields evaluated by the metric.
     reduction : MetricReduction
-        Aggregation contract. ``sample_mean`` averages independently computed
-        per-sample values. ``element_mean`` pools selected elements before the
-        metric's final transform. Group reductions consume task-owned physical
-        output groups, and ``vector_element_mean`` combines component mean
-        squared errors.
+        Aggregation contract. ``material_case_mean`` reduces every case over its
+        grid and time first (squared or absolute errors, or one relative norm per
+        case), then averages equally over the cases of a material and over the
+        materials; RMSE values take their root only after that mean.
     direction : OptimizationDirection
         Objective optimization direction.
 
@@ -347,6 +401,77 @@ class MetricSpec:
             "reduction": self.reduction,
             "direction": self.direction,
         }
+
+
+def field_metric_specs(fields: tuple[str, ...]) -> tuple[MetricSpec, ...]:
+    """
+    Return the per-field metric family that both tasks declare over their metric fields.
+
+    Per field: scaled and physical RMSE and MAE, and the physical relative L2 and H1
+    norms; for each relative norm also one summary over all fields, which averages the
+    fields within their output group and then the groups with the group weights.
+
+    Parameters
+    ----------
+    fields : tuple[str, ...]
+        Ordered task metric fields.
+
+    Returns
+    -------
+    tuple[MetricSpec, ...]
+        ``{normalized,physical}_{rmse,mae}_<field>``, ``physical_relative_{l2,h1}`` and
+        ``physical_relative_{l2,h1}_<field>``, all reduced by ``material_case_mean``.
+
+    """
+    specs = [
+        MetricSpec(f"{space}_{kind}_{field}", kind, space, (field,), "material_case_mean", "minimize")
+        for kind in ("rmse", "mae")
+        for space in ("normalized", "physical")
+        for field in fields
+    ]
+    for kind in ("relative_l2", "relative_h1"):
+        specs.append(MetricSpec(f"physical_{kind}", kind, "physical", fields, "material_case_mean", "minimize"))
+        specs.extend(MetricSpec(f"physical_{kind}_{field}", kind, "physical", (field,), "material_case_mean", "minimize") for field in fields)
+    return tuple(specs)
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceFloorSpec:
+    """
+    Declare the smallest reference magnitude of one metric field that supports a relative norm.
+
+    Attributes
+    ----------
+    field : str
+        Metric field name.
+    rms : float
+        Positive finite reference root mean square in the field's physical unit. A case
+        whose reference RMS over a norm's domain (the L2 or H1 integrand, per grid point)
+        falls below it has no relative value for that field: it is counted as unavailable,
+        never set to zero or stabilized.
+
+    Raises
+    ------
+    ValueError
+        If the field is empty or the floor is not positive and finite.
+
+    """
+
+    field: str
+    rms: float
+
+    def __post_init__(self) -> None:
+        """Reject empty fields and non-positive or non-finite floors."""
+        if not isinstance(self.field, str) or not self.field:
+            msg = "Reference floor field must be a non-empty string."
+            raise ValueError(msg)
+        if isinstance(self.rms, bool) or not isinstance(self.rms, float) or not math.isfinite(self.rms) or self.rms <= 0.0:
+            msg = f"Reference floor of {self.field!r} must be a positive finite float."
+            raise ValueError(msg)
+
+    def as_dict(self) -> dict[str, object]:
+        """Return the JSON-serializable floor declaration."""
+        return {"field": self.field, "rms": self.rms}
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +557,9 @@ class TaskSpec:
     output_groups : tuple[OutputGroupSpec, ...]
         Ordered physical output quantities. When declared, the groups form an
         exact ordered partition of the task metric fields.
+    reference_floors : tuple[ReferenceFloorSpec, ...], optional
+        Smallest reference RMS per metric field that supports a relative norm; when
+        declared, one floor per metric field in declared order.
     metric_fields : tuple[FieldSpec, ...], optional
         Reconstructed physical fields used for metric reporting when model
         outputs represent increments or another derived quantity.
@@ -472,6 +600,7 @@ class TaskSpec:
     default_metrics: tuple[MetricSpec, ...]
     physics: PhysicsSpec
     output_groups: tuple[OutputGroupSpec, ...] = ()
+    reference_floors: tuple[ReferenceFloorSpec, ...] = ()
     metric_fields: tuple[FieldSpec, ...] = ()
     input_profiles: tuple[InputProfileSpec, ...] = ()
     primary_input_profile: str | None = None
@@ -590,7 +719,13 @@ class TaskSpec:
             raise ValueError(msg)
 
     def _validate_output_groups_and_metric_references(self) -> None:
-        """Validate that optional output groups partition metric fields exactly."""
+        """Validate that optional output groups partition and reference floors cover the metric fields exactly."""
+        if not isinstance(self.reference_floors, tuple) or not all(isinstance(floor, ReferenceFloorSpec) for floor in self.reference_floors):
+            msg = f"Task {self.id!r} reference_floors must be a ReferenceFloorSpec tuple."
+            raise TypeError(msg)
+        if self.reference_floors and tuple(floor.field for floor in self.reference_floors) != self.metric_names:
+            msg = f"Task {self.id!r} reference floors must name every metric field once in declared order: {self.metric_names!r}."
+            raise ValueError(msg)
         if not self.output_groups:
             return
         group_ids = tuple(group.id for group in self.output_groups)
@@ -636,6 +771,19 @@ class TaskSpec:
         """Return ordered reconstructed-state metric field names."""
         selected = self.metric_fields or self.outputs
         return tuple(field.name for field in selected)
+
+    @property
+    def error_terms(self) -> tuple[ErrorTermSpec, ...]:
+        """Return the weighted error terms of the task's output groups, shared by loss and selection."""
+        return error_terms(self.output_groups)
+
+    def reference_floor(self, name: str) -> float:
+        """Return the declared reference-RMS floor of one metric field's relative norms."""
+        for floor in self.reference_floors:
+            if floor.field == name:
+                return floor.rms
+        msg = f"Task {self.id!r} declares no reference floor for metric field {name!r}."
+        raise ValueError(msg)
 
     def metric_field(self, name: str) -> FieldSpec:
         """Resolve one exact metric field without conflating model outputs."""
@@ -802,6 +950,8 @@ class TaskSpec:
             "default_metrics": [metric.as_dict(all_fields=self.metric_names) for metric in self.default_metrics],
             "physics": self.physics.as_dict(),
         }
+        if self.reference_floors:
+            payload["reference_floors"] = [floor.as_dict() for floor in self.reference_floors]
         if self.metric_fields:
             payload["metric_fields"] = [field.as_dict() for field in self.metric_fields]
         if self.input_profiles:

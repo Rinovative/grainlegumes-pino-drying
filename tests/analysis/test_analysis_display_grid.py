@@ -58,7 +58,6 @@ def test_same_coordinate_values_with_different_index_map_fail() -> None:
         coordinate_units=("m", "m"),
         field_order=("p",),
         source_shape=(5, 11),
-        artifact_stride=2,
         axis_indices=(tuple(range(5)), (0, 2, 4, 6, 8, 10)),
     )
     with pytest.raises(ValueError, match="source_shape"):

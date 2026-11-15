@@ -27,16 +27,17 @@ _OBJECTIVE = "normalized_drying_group_macro_rmse"
 _BOTH_PARTS = ("material_ood", "parameter_ood")
 _FIELDS = ("phi", "temperature", "w_surf")
 _TERMS = ("boundary", "continuity", "momentum")
+_BUDGET = ["budget-progress"]
 _PERFORMANCE = [
-    "duration-epoch",
+    "duration-event",
     "duration-train",
     "duration-validation",
     "memory-cuda_peak_gib",
     "progress-{}",
-    "rate-samples_per_second",
+    "rate-units_per_second",
 ]
 _OVERVIEW = [
-    "objective-id",
+    "objective-id_validation",
     "objective-material",
     "objective-parameter",
     "train-loss_total",
@@ -47,7 +48,7 @@ _OVERVIEW = [
 
 def _pages(quantities: tuple[str, ...]) -> list[str]:
     """Return the names of a comparison section: ID above OOD on the material page, then on the parameter page."""
-    return [f"{part}-{label}-{name}" for part in ("material", "parameter") for label in ("id", "ood") for name in quantities]
+    return [f"{part}-{label}-{name}" for part in ("material", "parameter") for label in ("id_validation", "ood") for name in quantities]
 
 
 def _sections(projections: tuple[schema.MetricProjection, ...]) -> dict[str, list[str]]:
@@ -67,25 +68,26 @@ def _steady(**overrides: Any) -> tuple[schema.MetricProjection, ...]:
     flags: dict[str, Any] = {
         "physics_training_enabled": True,
         "physics_monitor_enabled": True,
-        "state_aux_enabled": False,
         "ood_roles": _BOTH_PARTS,
         "cuda_enabled": True,
         "optuna_trial": False,
+        "rollout_curriculum": False,
     } | overrides
     return schema.curated_metric_projections("steady_flow", metrics, objective_id="normalized_group_macro_rmse", **flags)
 
 
 def _transient(**overrides: Any) -> tuple[schema.MetricProjection, ...]:
-    """Return the transient projections of a GPU run with state aux and both OOD parts unless overridden."""
+    """Return the transient projections of a self-fed (Stage B) GPU run with both OOD parts unless overridden."""
     flags: dict[str, Any] = {
         "physics_training_enabled": False,
         "physics_monitor_enabled": False,
-        "state_aux_enabled": True,
         "ood_roles": _BOTH_PARTS,
         "cuda_enabled": True,
         "optuna_trial": False,
+        "rollout_curriculum": True,
     } | overrides
     metrics = [{"id": f"{space}_rmse_{field}"} for space in ("normalized", "physical") for field in ("T", "phi", "w_surf", "w_int")]
+    metrics += [{"id": "physical_relative_h1"}, {"id": "physical_relative_l2"}]
     return schema.curated_metric_projections("transient_drying", metrics, objective_id=_OBJECTIVE, **flags)
 
 
@@ -95,11 +97,12 @@ def test_steady_history_follows_the_design_sections() -> None:
 
     assert sections == {
         "Overview": _OVERVIEW,
-        "Training": ["learning_rate", "loss_data", "optimizer_steps", *(f"weight-{term}" for term in _TERMS)],
-        "Physics": [f"{role}-{term}" for role in ("train", "val") for term in _TERMS],
-        "Fields": _pages(("p", "u", "v")),
+        "Training": [*_BUDGET, "learning_rate", "optimizer_steps", *(f"weight-{term}" for term in _TERMS)],
+        "Loss": ["data-p", "data-total", "data-u", "data-v", "data-velocity", *(f"physics-{term}" for term in _TERMS)],
+        "Residuals": [f"val-{term}" for term in _TERMS],
+        "Fields": _pages(("p", "u", "v", "velocity")),
         "Physical": _pages(("p", "u", "v")),
-        "Norms": _pages(("relative_h1", "relative_l2", "velocity")),
+        "Norms": _pages(("relative_h1", "relative_l2")),
         "Performance": [name.format("remaining_seconds") for name in _PERFORMANCE],
     }
 
@@ -111,6 +114,7 @@ def test_transient_history_follows_the_design_sections() -> None:
     assert sections == {
         "Overview": _OVERVIEW,
         "Training": [
+            *_BUDGET,
             "curriculum-horizon",
             "curriculum-progress",
             "forward_transitions",
@@ -118,12 +122,15 @@ def test_transient_history_follows_the_design_sections() -> None:
             "optimizer_steps",
             "transitions",
         ],
-        "Loss": ["data-phi", "data-temperature", "data-total", "data-w_int", "data-w_surf", "state_aux"],
+        "Loss": ["data-phi", "data-temperature", "data-total", "data-w_int", "data-w_surf"],
         "Fields": _pages(_FIELDS),
         "Physical": _pages(_FIELDS),
+        "Norms": _pages(("relative_h1", "relative_l2")),
         "Moisture": _pages(("grain_moisture", "w_gr_physical", "w_int")),
-        "OneStep": [f"{role}-{kind}-{name}" for role in ("id", "material", "parameter") for kind in ("one_step", "rollout") for name in _FIELDS],
-        "Performance": [name.format("wall_seconds") for name in _PERFORMANCE],
+        "OneStep": [
+            f"{role}-{kind}-{name}" for role in ("id_validation", "material", "parameter") for kind in ("one_step", "rollout") for name in _FIELDS
+        ],
+        "Performance": [name.format("remaining_seconds") for name in _PERFORMANCE],
     }
 
 
@@ -135,19 +142,30 @@ def test_names_sort_into_their_position_order(projections: tuple[schema.MetricPr
         assert names == sorted(names, key=str.casefold), section
         assert names == sorted(names, key=lambda name: name.replace("-", "").replace("_", "")), section
         if section in {"Fields", "Physical", "Norms", "Moisture", "OneStep"}:
-            assert len(names) % 6 == 0, section
+            # One column per quantity and two rows, ID above OOD: Norms has two quantities, steady Fields four, the others three.
+            columns = 2 if section == "Norms" else 4 if section == "Fields" and any(name.endswith("-velocity") for name in names) else 3
+            assert len(names) % (2 * columns) == 0, section
+            rows = [names[start : start + columns] for start in range(0, len(names), columns)]
+            if section != "OneStep":
+                assert all(("-id_validation-" in row[0]) == (index % 2 == 0) for index, row in enumerate(rows)), section
 
 
 def test_series_without_a_producer_are_not_listed() -> None:
-    """Drop OOD, physics, state aux and CUDA series when the run does not produce them."""
+    """Drop OOD, physics, CUDA and curriculum series when the run does not produce them."""
     steady = _sections(_steady(physics_training_enabled=False, physics_monitor_enabled=False, ood_roles=(), cuda_enabled=False))
-    transient = _sections(_transient(state_aux_enabled=False, ood_roles=(), cuda_enabled=False))
+    transient = _sections(_transient(ood_roles=(), cuda_enabled=False))
+    teacher_forced = _sections(_transient(rollout_curriculum=False))
 
-    assert set(steady) == {"Overview", "Training", "Fields", "Physical", "Norms", "Performance"}
-    assert steady["Overview"] == ["objective-id", "train-loss_total"]
-    assert steady["Training"] == ["learning_rate", "optimizer_steps"]
+    assert set(steady) == {"Overview", "Training", "Loss", "Fields", "Physical", "Norms", "Performance"}
+    assert steady["Overview"] == ["objective-id_validation", "train-loss_total"]
+    assert steady["Training"] == [*_BUDGET, "learning_rate", "optimizer_steps"]
+    # The data loss is produced by every run, so both projects show it under the same name.
+    assert steady["Loss"] == ["data-p", "data-total", "data-u", "data-v", "data-velocity"]
+    assert "data-total" in transient["Loss"]
+    assert teacher_forced["Training"] == [*_BUDGET, "forward_transitions", "learning_rate", "optimizer_steps", "transitions"]
     assert transient["Loss"] == ["data-phi", "data-temperature", "data-total", "data-w_int", "data-w_surf"]
-    assert transient["OneStep"] == [f"id-{kind}-{name}" for kind in ("one_step", "rollout") for name in _FIELDS]
+    assert transient["OneStep"] == [f"id_validation-{kind}-{name}" for kind in ("one_step", "rollout") for name in _FIELDS]
+    assert "Residuals" not in transient
     assert "memory-cuda_peak_gib" not in steady["Performance"]
 
 
@@ -157,23 +175,23 @@ def test_a_missing_ood_part_drops_its_page(ood_roles: tuple[str, ...], part: str
     other = "parameter" if part == "material" else "material"
     sections = _sections(_steady(ood_roles=ood_roles))
 
-    assert sections["Fields"] == [f"{part}-{label}-{name}" for label in ("id", "ood") for name in "puv"]
-    assert sections["Overview"] == ["objective-id", f"objective-{part}", "train-loss_total", f"transfer_gap-{part}"]
+    assert sections["Fields"] == [f"{part}-{label}-{name}" for label in ("id_validation", "ood") for name in ("p", "u", "v", "velocity")]
+    assert sections["Overview"] == ["objective-id_validation", f"objective-{part}", "train-loss_total", f"transfer_gap-{part}"]
     assert not any(name.startswith(f"{other}-") or name.endswith(f"-{other}") for names in sections.values() for name in names)
     with pytest.raises(ValueError, match="unknown OOD roles"):
         _steady(ood_roles=("additional",))
 
 
 def test_without_an_ood_part_the_comparison_sections_show_the_id_series_alone() -> None:
-    """Keep the ID errors per field visible as ``id-<q>`` when no OOD part is configured."""
+    """Keep the ID errors per field visible as ``id_validation-<q>`` when no OOD part is configured."""
     steady = _sections(_steady(ood_roles=()))
     transient = _sections(_transient(ood_roles=()))
 
-    assert steady["Fields"] == ["id-p", "id-u", "id-v"]
-    assert steady["Norms"] == ["id-relative_h1", "id-relative_l2", "id-velocity"]
-    assert transient["Fields"] == ["id-phi", "id-temperature", "id-w_surf"]
-    assert transient["Moisture"] == ["id-grain_moisture", "id-w_gr_physical", "id-w_int"]
-    assert transient["OneStep"] == [f"id-{kind}-{name}" for kind in ("one_step", "rollout") for name in _FIELDS]
+    assert steady["Fields"] == ["id_validation-p", "id_validation-u", "id_validation-v", "id_validation-velocity"]
+    assert steady["Norms"] == transient["Norms"] == ["id_validation-relative_h1", "id_validation-relative_l2"]
+    assert transient["Fields"] == ["id_validation-phi", "id_validation-temperature", "id_validation-w_surf"]
+    assert transient["Moisture"] == ["id_validation-grain_moisture", "id_validation-w_gr_physical", "id_validation-w_int"]
+    assert transient["OneStep"] == [f"id_validation-{kind}-{name}" for kind in ("one_step", "rollout") for name in _FIELDS]
     for names in (*steady.values(), *transient.values()):
         assert names == sorted(names)
 
@@ -186,34 +204,35 @@ def test_transient_metric_series_follow_the_resolved_metrics() -> None:
         objective_id=_OBJECTIVE,
         physics_training_enabled=False,
         physics_monitor_enabled=False,
-        state_aux_enabled=False,
         ood_roles=(),
         cuda_enabled=False,
         optuna_trial=False,
+        rollout_curriculum=False,
     )
     sections = _sections(projections)
 
-    assert sections["Physical"] == ["id-phi"]
-    assert sections["OneStep"] == ["id-one_step-phi", "id-rollout-phi"]
-    assert sections["Fields"] == ["id-phi", "id-temperature", "id-w_surf"]  # objective components need no metric id
+    assert sections["Physical"] == ["id_validation-phi"]
+    assert "Norms" not in sections
+    assert sections["OneStep"] == ["id_validation-one_step-phi", "id_validation-rollout-phi"]
+    assert sections["Fields"] == ["id_validation-phi", "id_validation-temperature", "id_validation-w_surf"]  # objective components need no metric id
 
 
 def test_steady_evaluation_series_follow_the_resolved_metrics() -> None:
     """List a diagnostic only when the resolved evaluation metrics contain it."""
-    metrics = [metric for metric in configs.resolve(configs.direct_config())["evaluation"]["metrics"] if metric["id"] != "normalized_relative_l2"]
+    metrics = [metric for metric in configs.resolve(configs.direct_config())["evaluation"]["metrics"] if metric["id"] != "physical_relative_l2"]
     projections = schema.curated_metric_projections(
         "steady_flow",
         metrics,
         objective_id="normalized_group_macro_rmse",
         physics_training_enabled=False,
         physics_monitor_enabled=False,
-        state_aux_enabled=False,
         ood_roles=("material_ood",),
         cuda_enabled=False,
         optuna_trial=False,
+        rollout_curriculum=False,
     )
 
-    assert _sections(projections)["Norms"] == ["material-id-relative_h1", "material-id-velocity", "material-ood-relative_h1", "material-ood-velocity"]
+    assert _sections(projections)["Norms"] == ["material-id_validation-relative_h1", "material-ood-relative_h1"]
 
 
 @pytest.mark.parametrize("task", ["steady", "transient"])
@@ -222,7 +241,7 @@ def test_destinations_are_unique_and_id_feeds_both_pages(task: str) -> None:
     projections = (_steady if task == "steady" else _transient)(optuna_trial=True)
     destinations = [projection.wandb_key for projection in projections]
     by_destination = {projection.wandb_key: projection for projection in projections}
-    first = "Fields/material-id-p" if task == "steady" else "Fields/material-id-temperature"
+    first = "Fields/material-id_validation-p" if task == "steady" else "Fields/material-id_validation-temperature"
 
     assert len(destinations) == len(set(destinations))
     assert by_destination[first].source_key == by_destination[first.replace("material", "parameter")].source_key
@@ -247,12 +266,12 @@ def test_producer_source_keys_feed_the_curated_series() -> None:
         "system/estimated_remaining_seconds",
     } <= steady
     assert {
-        f"id/{_OBJECTIVE}/component/grain_moisture_error",
+        f"id/{_OBJECTIVE}/component/grain_moisture",
         "material_ood/physical/w_gr_rmse",  # the loop's physical grain-moisture RMSE
         "parameter_ood/physical_rmse_T",
         "id/guardrail/one_step/normalized_rmse_phi",  # the loop's one-step guardrail of the ID role
         "material_ood/normalized_rmse_w_surf",
-        "transient/wall_seconds",  # the adapter telemetry name of the cumulative stage wall time
+        "system/estimated_remaining_seconds",  # both tasks' progress series, from the budget fraction
         "transient/processed_target_transitions",  # the cumulative stage total, not the per-epoch transient/train/ count
         "transient/forward_transitions",  # the cumulative stage total of model forward transitions
         "transient/curriculum_progress",
@@ -286,10 +305,10 @@ def test_projection_requires_an_objective() -> None:
             objective_id="",
             physics_training_enabled=False,
             physics_monitor_enabled=False,
-            state_aux_enabled=False,
             ood_roles=_BOTH_PARTS,
             cuda_enabled=False,
             optuna_trial=False,
+            rollout_curriculum=False,
         )
 
 

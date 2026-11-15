@@ -13,10 +13,13 @@ This module does NOT:
 from __future__ import annotations
 
 import copy
+import hashlib
+import io
 import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+import h5py
 import numpy as np
 import pytest
 import yaml
@@ -710,9 +713,12 @@ def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "no_ramp_case")
-    schedule_path = bundle.directory / "schedule.csv"
-    header = schedule_path.read_text(encoding="utf-8").splitlines()[0]
-    schedule = np.loadtxt(schedule_path, delimiter=";", skiprows=1)
+    rendered = generation.cases.case.render_input_files(
+        generation.cases.case.read_case_inputs(bundle.directory, bundle.case_payload),
+        bundle.case_payload["input_contract"],
+    )["schedule.csv"]
+    header = rendered.decode("utf-8").splitlines()[0]
+    schedule = np.loadtxt(io.BytesIO(rendered), delimiter=";", skiprows=1)
     regular_times = np.asarray(
         config.scientific_values["time"]["regular_times"],
         dtype=np.float64,
@@ -727,10 +733,7 @@ def test_schedule_csv_is_the_identity_bound_primitive_no_ramp_handoff(
     assert handoff["rejoin_row"] is None
     np.testing.assert_array_equal(schedule[0], handoff["canonical_start_row"])
     schedule_identity = bundle.case_payload["input_files"]["schedule.csv"]
-    assert schedule_identity == {
-        "sha256": common.serialization.file_sha256(schedule_path),
-        "size_bytes": schedule_path.stat().st_size,
-    }
+    assert schedule_identity == {"sha256": hashlib.sha256(rendered).hexdigest(), "size_bytes": len(rendered)}
     assert bundle.case_payload["input_contract"]["schedule"]["columns"] == [
         "t",
         "T_in_bc",
@@ -750,7 +753,7 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Reject a stale RH column even after its file and case identities are refreshed."""
+    """Reject a stale RH column even after its stored table, input contract, and case identities are refreshed."""
     config_path, _template = generation_config_factory(
         simulation_profile="transient_drying",
         startup_ramp_enabled=False,
@@ -768,19 +771,22 @@ def test_admission_rejects_identity_valid_stale_four_column_schedule(
         1,
         tmp_path / "stale_four_column_case",
     )
-    schedule_path = bundle.directory / "schedule.csv"
-    lines = schedule_path.read_text(encoding="utf-8").splitlines()
-    stale_lines = (
-        f"{lines[0]};phi_in_bc",
-        *(f"{line};0.5" for line in lines[1:]),
-    )
-    schedule_path.write_text("\n".join(stale_lines) + "\n", encoding="utf-8")
-
     payload = copy.deepcopy(bundle.case_payload)
-    payload["input_files"]["schedule.csv"] = {
-        "sha256": common.serialization.file_sha256(schedule_path),
-        "size_bytes": schedule_path.stat().st_size,
-    }
+    payload["input_contract"]["schedule"]["columns"].append("phi_in_bc")
+    with h5py.File(bundle.directory / "inputs.h5", "r+") as handle:
+        table = handle["schedule"]
+        assert isinstance(table, h5py.Dataset)
+        rows = np.asarray(table[()])
+        stale = np.empty(rows.shape, dtype=[*rows.dtype.descr, ("phi_in_bc", "<f8")])
+        for name in rows.dtype.names or ():
+            stale[name] = rows[name]
+        stale["phi_in_bc"] = 0.5
+        del handle["schedule"]
+        handle.create_dataset("schedule", data=stale)
+    stored = generation.cases.case._load_inputs(bundle.directory, payload["input_contract"], None)
+    payload["input_files"] = generation.cases.case._input_file_identities(
+        generation.cases.case.render_input_files(stored, payload["input_contract"]),
+    )
     payload["case_input_id"] = generation.cases.case.compute_case_input_id(payload)
     payload["simulation_case_id"] = generation.cases.case.compute_simulation_case_id(payload)
     common.serialization.atomic_write_json(bundle.directory / "case.json", payload)
@@ -882,8 +888,14 @@ def test_scalar_handoff_rejects_an_unknown_name(
         ),
     )
     bundle = generation.cases.case.generate_case_input_bundle(config, 1, tmp_path / "case")
-    scalar_path = bundle.directory / "scalars.csv"
-    content = scalar_path.read_text(encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    rendered = generation.cases.case.render_input_files(
+        generation.cases.case.read_case_inputs(bundle.directory, bundle.case_payload),
+        bundle.case_payload["input_contract"],
+    )
+    scalar_path = work / "scalars.csv"
+    content = rendered["scalars.csv"].decode("utf-8")
     assert bundle.scalar_handoff is not None
     assert bundle.scalar_handoff.field_names == generation.contracts.profiles.TRANSIENT_SCALAR_INPUT_FIELDS
     assert len(bundle.scalar_handoff.entries) == 12
@@ -907,7 +919,7 @@ def test_scalar_handoff_rejects_an_unknown_name(
     with pytest.raises(ValueError, match="missing, duplicate, unknown"):
         generation.contracts.scalar_handoff.admit_case_scalar_handoff(
             payload,
-            bundle.directory,
+            work,
         )
 
 

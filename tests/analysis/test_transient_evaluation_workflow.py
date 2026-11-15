@@ -12,6 +12,8 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
+import math
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -27,6 +29,9 @@ from support.synthetic_task import synthetic_split_payload
 
 from src import analysis, common, datasets
 from src.experiments import experiments_matched_budget as matched_budget
+from src.experiments import experiments_run as run_service
+from src.learning.training import learning_training_budget as stage_budget
+from src.learning.transient.learning_transient_handoff import HANDOFF_DIRECTORY
 
 if TYPE_CHECKING:
     from src.analysis.artifacts.analysis_artifact_service import PreparedRunArtifacts
@@ -43,48 +48,71 @@ def _split(arm: str, *, material_ood: tuple[tuple[str, tuple[str, ...]], ...] = 
     return split
 
 
-def _matched_receipt() -> dict[str, Any]:
-    """Build one matched train_seconds B receipt for test-owned comparison metadata."""
+def _budget(unit: str, *, total: float, spent: float) -> dict[str, Any]:
+    """Return one completed terminal stage budget in units (A0) or optimisation-clock seconds (B, A1)."""
+    units = int(spent) if unit == "units" else 12
+    seconds = spent if unit == "train_seconds" else 4.0
+    return {"unit": unit, "total": total, "units": units, "train_seconds": seconds, "validated_point": 20, "skipped_points": []}
+
+
+def _finished(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return B as validate_finished_run admits it: its summary and its admitted terminal budget."""
+    return {"summary": summary, "terminal_budget": stage_budget.StageBudget(**summary["terminal_budget"])}
+
+
+# The selected A0's handoff manifest: every B/A1 receipt of its lineage names these bytes' digest.
+_A0_HANDOFF = b'{"handoff": "run_a0"}\n'
+_A0_HANDOFF_SHA256 = hashlib.sha256(_A0_HANDOFF).hexdigest()
+_B_CONFIG: dict[str, Any] = {
+    "task": "transient_drying",
+    "run": {"name": "run_b"},
+    "training": {
+        "teacher_handoff": {"source_run_name": "run_a0"},
+        "matched_a1_b": {
+            "role": "b",
+            "train_seconds": 10.0,
+            "receipt_source_run_name": None,
+            "initialization": "a0_best_full_common_fresh_controller",
+        },
+    },
+    "data": {
+        "train_dataset": "transient_dataset",
+        "material_ood_datasets": [],
+        "evaluation_assignments": [],
+        "case_partition": {"kind": "exact", "train": ["train"], "validation": ["val"], "id_test": ["test"]},
+        "spatial_stride": 1,
+    },
+    "input_profile": "canonical_physics_complete",
+    "temporal": {"temporal_conditioning": "time"},
+    "model": {"kind": "fno", "params": {"hidden_channels": 8}},
+    "evaluation": {"objective": {"id": "objective"}},
+}
+_COMPLETED_B = {
+    "status": "completed",
+    "terminal_controller": {"post_handoff_optimizer_steps": 10},
+    "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+    "terminal_budget": _budget("train_seconds", total=10.0, spent=10.0),
+    "terminal_epoch": 3,
+    "best_epoch": 3,
+    "best_checkpoint_sha256": "b" * 64,
+    "last_checkpoint_sha256": "d" * 64,
+}
+# B diverged in its first group: 0 s, no checkpoint; its receipt holds 0 s for its A1.
+_FIRST_GROUP_DIVERGED_B = {
+    "status": "unsuccessful",
+    "terminal_controller": {"post_handoff_optimizer_steps": 0},
+    "training_outcome": {"status": "diverged", "budget_progress": 0.0, "eligible_points": 0, "divergence": "non-finite loss"},
+    "terminal_budget": {**_budget("train_seconds", total=10.0, spent=0.0), "units": 0, "validated_point": 0},
+    "terminal_epoch": 0,
+    "best_epoch": None,
+    "last_checkpoint_sha256": None,
+}
+
+
+def _matched_receipt(b_summary: dict[str, Any] = _COMPLETED_B, *, handoff: str = _A0_HANDOFF_SHA256) -> dict[str, Any]:
+    """Build the matched train_seconds receipt of one finished B under the selected A0 handoff."""
     return matched_budget.build_b_receipt(
-        parent_identity_sha256="a" * 64,
-        a0_handoff_sha256="c" * 64,
-        b_config={
-            "task": "transient_drying",
-            "run": {"name": "run_b"},
-            "training": {
-                "teacher_handoff": {"source_run_name": "run_a0"},
-                "matched_a1_b": {
-                    "role": "b",
-                    "train_seconds": 10.0,
-                    "receipt_source_run_name": None,
-                    "initialization": "a0_best_full_common_fresh_controller",
-                },
-            },
-            "data": {
-                "train_dataset": "transient_dataset",
-                "material_ood_datasets": [],
-                "evaluation_assignments": [],
-                "case_partition": {"kind": "exact", "train": ["train"], "validation": ["val"], "id_test": ["test"]},
-                "spatial_stride": 1,
-            },
-            "input_profile": "canonical_physics_complete",
-            "temporal": {"temporal_conditioning": "time"},
-            "model": {"kind": "fno", "params": {"hidden_channels": 8}},
-            "evaluation": {"objective": {"id": "objective"}},
-        },
-        b_summary={
-            "status": "completed",
-            "terminal_controller": {
-                "budget_complete": True,
-                "clock_kind": "train_seconds",
-                "train_seconds": 10.0,
-                "post_handoff_optimizer_steps": 10,
-            },
-            "terminal_epoch": 3,
-            "best_epoch": 3,
-            "best_checkpoint_sha256": "b" * 64,
-            "last_checkpoint_sha256": "d" * 64,
-        },
+        parent_identity_sha256="a" * 64, a0_handoff_sha256=handoff, b_config=_B_CONFIG, finished_b=_finished(deepcopy(b_summary))
     )
 
 
@@ -93,16 +121,10 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
     controller: dict[str, Any] = {
         "arm": {"a0": "A0", "a1": "A1", "b": "B"}[arm],
         "stage": "stage_b_self_fed" if arm == "b" else "stage_a_teacher_forcing",
-        "budget_control": "train_seconds" if matched else "stage_epochs",
-        "clock_kind": "train_seconds" if matched else "optimizer_steps",
-        "planned_stage_epochs": None if matched else 3,
-        "completed_stage_epochs": 0 if matched else 3,
-        "planned_train_seconds": 10.0 if matched else None,
-        "train_seconds": 10.0 if matched else 0.0,
         "post_handoff_optimizer_steps": 10 if matched else 3,
-        "budget_complete": True,
         "best_within_budget_epoch": 2,
     }
+    budget = _budget("train_seconds", total=10.0, spent=10.0) if matched else _budget("units", total=12, spent=12)
     identity = {
         "model_kind": "fno",
         "model_parameters": {"hidden_channels": 8},
@@ -138,7 +160,11 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
                         "a1": "teacher_forced_matched_train_seconds",
                         "b": "rollout",
                     }[arm],
-                    "matched_compute_manifest": {"actual": controller},
+                    "matched_compute_manifest": {
+                        "actual": controller,
+                        "budget": budget,
+                        "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+                    },
                 },
             },
         }
@@ -157,6 +183,10 @@ def _frame(arm: str, *, parent: str = "parent") -> pd.DataFrame:
 
 def _prepared(run_dir: Path, arm: str) -> Any:
     frame = _frame(arm)
+    if arm == "a0":
+        manifest = run_dir / HANDOFF_DIRECTORY / "manifest.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_bytes(_A0_HANDOFF)
     loaded_artifact = analysis.evaluation.artifact_loader.LoadedEvaluationArtifact(
         split_role="eval",
         dataset_name="transient_dataset",
@@ -180,24 +210,16 @@ def _prepared(run_dir: Path, arm: str) -> Any:
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("completed_stage_epochs", 2, "epoch budget"),
-        ("best_within_budget_epoch", 1, "selected checkpoint"),
-    ],
+    ("part", "changes"),
+    [("budget", {"units": 11, "validated_point": 18}), ("actual", {"best_within_budget_epoch": 1})],
+    ids=["incomplete-budget", "other-checkpoint"],
 )
-def test_a0_evidence_rejects_projected_zero_without_terminal_proof(
-    tmp_path: Path,
-    field: str,
-    value: int,
-    message: str,
-) -> None:
-    """Do not project zero A0 post-handoff compute from incomplete lineage."""
+def test_a0_evidence_rejects_projected_zero_without_terminal_proof(tmp_path: Path, part: str, changes: dict[str, int]) -> None:
+    """Do not project zero A0 post-handoff compute from an unspent unit budget (point 18 of 20) or another selected checkpoint."""
     prepared = _prepared(tmp_path / "a0", "a0")
     frame = prepared.loaded_run.id_artifact.frame
-    controller = frame.attrs["artifact_provenance"]["lineage"]["matched_compute_manifest"]["actual"]
-    controller[field] = value
-    with pytest.raises(ValueError, match=message):
+    frame.attrs["artifact_provenance"]["lineage"]["matched_compute_manifest"][part].update(changes)
+    with pytest.raises(ValueError, match="selected checkpoint"):
         analysis.evaluation.workflow._transient_arm_evidence(prepared.loaded_run)
 
 
@@ -233,6 +255,7 @@ def test_workflow_filters_absent_ood_roles_and_validates_exact_three_arm_lineage
                         "requested_horizon": "full",
                         "scope": "cumulative",
                         "normalized_drying_group_macro_rmse": 0.25,
+                        "contributing_record_count": 1,
                     }
                     for frame_name in self.frames
                 ]
@@ -282,7 +305,7 @@ def test_workflow_filters_absent_ood_roles_and_validates_exact_three_arm_lineage
     assert performance.attrs["primary_comparison"] == "B_vs_A1"
     assert workflow.transient_performance is performance
     assert len(dataset_calls) == 1
-    figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance)
+    figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=workflow.transient_lineage)
     assert len(figure.axes[0].lines) == 1
     np.testing.assert_allclose(
         np.asarray(figure.axes[0].lines[0].get_xdata(), dtype=np.float64),
@@ -299,7 +322,7 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
     parent_identity = "a" * 64
     receipt = matched_budget.build_b_receipt(
         parent_identity_sha256=parent_identity,
-        a0_handoff_sha256="c" * 64,
+        a0_handoff_sha256=_A0_HANDOFF_SHA256,
         b_config={
             "task": "transient_drying",
             "run": {"name": "run_b"},
@@ -319,19 +342,18 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
             "model": {"kind": "fno"},
             "evaluation": {"objective": {"id": "objective"}},
         },
-        b_summary={
-            "status": "completed",
-            "terminal_controller": {
-                "budget_complete": True,
-                "clock_kind": "train_seconds",
-                "train_seconds": 12.5,
-                "post_handoff_optimizer_steps": 4,
-            },
-            "terminal_epoch": 3,
-            "best_epoch": 3,
-            "best_checkpoint_sha256": "b" * 64,
-            "last_checkpoint_sha256": "d" * 64,
-        },
+        finished_b=_finished(
+            {
+                "status": "completed",
+                "terminal_controller": {"post_handoff_optimizer_steps": 4},
+                "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+                "terminal_budget": _budget("train_seconds", total=10.0, spent=12.5),
+                "terminal_epoch": 3,
+                "best_epoch": 3,
+                "best_checkpoint_sha256": "b" * 64,
+                "last_checkpoint_sha256": "d" * 64,
+            }
+        ),
     )
     prepared = tuple(_prepared(tmp_path / arm, arm) for arm in ("a0", "a1", "b"))
     for arm, current in zip(("a0", "a1", "b"), prepared, strict=True):
@@ -343,16 +365,8 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
         if arm != "a0":
             manifest["parent_experiment_sha256"] = parent_identity
         if arm != "a0":
-            controller = manifest["actual"]
-            controller.update(
-                {
-                    "clock_kind": "train_seconds",
-                    "budget_control": "train_seconds",
-                    "planned_train_seconds": 10.0 if arm == "b" else 12.5,
-                    "train_seconds": 12.5 if arm == "b" else 13.0,
-                    "matched_receipt_sha256": receipt["receipt_sha256"] if arm == "a1" else None,
-                }
-            )
+            manifest["actual"]["matched_receipt_sha256"] = receipt["receipt_sha256"] if arm == "a1" else None
+            manifest["budget"] = _budget("train_seconds", total=10.0, spent=12.5) if arm == "b" else _budget("train_seconds", total=12.5, spent=13.0)
             manifest["b_train_budget_receipt"] = receipt
     loaded = tuple(current.loaded_run for current in prepared)
     lineage, reason = analysis.evaluation.workflow._transient_lineage(loaded)
@@ -366,12 +380,15 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
         {
             "frame": f"{label} ID",
             "material_family": "lentil",
-            "mode": "autonomous_full",
-            "requested_horizon": "full",
+            "mode": mode,
+            "requested_horizon": horizon,
             "scope": "cumulative",
-            "normalized_drying_group_macro_rmse": 0.25,
+            "normalized_drying_group_macro_rmse": 0.25 if records else math.nan,
+            "contributing_record_count": records,
         }
         for label in ("A0", "A1", "B")
+        # A rolling horizon no case of the material reaches has a row without records: it has no error to set against compute.
+        for mode, horizon, records in (("autonomous_full", "full", 1), ("rolling_origin", 4, 0))
     )
     session = SimpleNamespace(dataset_dataframe=lambda: rows)
     performance = analysis.evaluation.workflow._transient_performance_frame(
@@ -382,7 +399,8 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
     )
     assert performance is not None
     assert set(performance["comparison_arm"]) == {"A0", "A1", "B"}
-    figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance)
+    assert set(performance["mode"]) == {"autonomous_full"}
+    figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=lineage)
     elapsed_seconds = np.asarray(figure.axes[0].lines[0].get_xdata())
     np.testing.assert_allclose(elapsed_seconds, [0.0, 13.0, 12.5])
     assert "[s]" in figure.axes[0].get_xlabel()
@@ -392,6 +410,140 @@ def test_matched_a1_b_lineage_and_plot_use_immutable_b_train_seconds(tmp_path: P
     a1_controller["matched_receipt_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="immutable B receipt"):
         analysis.evaluation.workflow._transient_lineage(loaded)
+
+
+_A1_WITHOUT_RESULT = {
+    "status": "unsuccessful",
+    "training_outcome": {"status": "no_eligible_checkpoint", "budget_progress": 1.0, "eligible_points": 0, "divergence": None},
+}
+
+
+def _unavailable_runs(monkeypatch: pytest.MonkeyPatch, runs: dict[Path, tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]) -> tuple[Path, ...]:
+    """Write unsuccessful leaves (summary status and receipt) and admit each as validate_finished_run would: (config, summary, receipt)."""
+    for run_dir, (_config, _summary, receipt) in runs.items():
+        run_dir.mkdir(parents=True)
+        common.serialization.atomic_write_json(common.paths.resolve_run_summary_path(run_dir), {"status": "unsuccessful"})
+        common.serialization.atomic_write_json(run_dir / matched_budget.RECEIPT_NAME, receipt)
+
+    def finished(path: Path) -> dict[str, Any]:
+        config, summary, _receipt = runs[Path(path)]
+        budget = summary.get("terminal_budget")
+        return {"config": config, "summary": deepcopy(summary), "terminal_budget": None if budget is None else stage_budget.StageBudget(**budget)}
+
+    monkeypatch.setattr(run_service, "validate_finished_run", finished)
+    return tuple(runs)
+
+
+_A1_CONFIG: dict[str, Any] = {"training": {"matched_a1_b": {"role": "a1"}}}
+
+
+def test_an_a1_without_an_eligible_checkpoint_enters_the_comparison_from_its_finished_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A0 and B have artifacts; A1 enters from its validated terminal summary with its status and an unavailable result."""
+    receipt = _matched_receipt()
+    unavailable = _unavailable_runs(monkeypatch, {tmp_path / "a1": (_A1_CONFIG, _A1_WITHOUT_RESULT, receipt)})
+    loaded = tuple(_prepared(tmp_path / arm, arm).loaded_run for arm in ("a0", "b"))
+
+    lineage, reason = analysis.evaluation.workflow._transient_lineage(loaded, unavailable_runs=unavailable)
+
+    assert reason is None
+    assert lineage is not None
+    assert isinstance(lineage.b, analysis.evaluation.transient_comparison.TrainingArmEvidence)
+    assert lineage.a1 == analysis.evaluation.transient_comparison.UnavailableArm(
+        arm="A1",
+        training_status="no_eligible_checkpoint",
+        budget_progress=1.0,
+        eligible_points=0,
+        receipt_sha256=receipt["receipt_sha256"],
+        a0_handoff_sha256=_A0_HANDOFF_SHA256,
+    )
+
+
+@pytest.mark.parametrize("b_selected", [False, True], ids=("b-from-a1-receipt", "b-from-its-run"))
+def test_both_matched_arms_without_an_eligible_checkpoint_enter_the_comparison_and_its_plot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, b_selected: bool
+) -> None:
+    """B diverged in its first group, so its 0-second A1 trained nothing: only A0 has an artifact, and the plot names both ends."""
+    receipt = _matched_receipt(_FIRST_GROUP_DIVERGED_B)
+    runs = {tmp_path / "a1": (_A1_CONFIG, _A1_WITHOUT_RESULT, receipt)}
+    if b_selected:
+        runs[tmp_path / "b"] = (_B_CONFIG, _FIRST_GROUP_DIVERGED_B, receipt)
+    loaded = (_prepared(tmp_path / "a0", "a0").loaded_run,)
+
+    lineage, reason = analysis.evaluation.workflow._transient_lineage(loaded, unavailable_runs=_unavailable_runs(monkeypatch, runs))
+
+    assert reason is None
+    assert lineage is not None
+    assert (lineage.b.training_status, lineage.b.eligible_points, lineage.a1.training_status) == ("diverged", 0, "no_eligible_checkpoint")
+    assert not isinstance(lineage.b, analysis.evaluation.transient_comparison.TrainingArmEvidence)
+    assert not isinstance(lineage.a1, analysis.evaluation.transient_comparison.TrainingArmEvidence)
+    rows = pd.DataFrame.from_records(
+        [
+            {
+                "frame": "A0 ID",
+                "material_family": "lentil",
+                "mode": "autonomous_full",
+                "requested_horizon": "full",
+                "scope": "cumulative",
+                "normalized_drying_group_macro_rmse": 0.25,
+                "contributing_record_count": 1,
+            }
+        ]
+    )
+    performance = analysis.evaluation.workflow._transient_performance_frame(
+        cast("TransientEvaluationSession", SimpleNamespace(dataset_dataframe=lambda: rows)),
+        loaded_runs=loaded,
+        display_labels=("A0",),
+        lineage=lineage,
+    )
+    assert performance is not None
+    figure = analysis.evaluation.plots.transient.plot_training_performance_vs_compute(performance, lineage=lineage)
+    title = figure.axes[0].get_title()
+    assert "B: diverged" in title
+    assert "A1: no_eligible_checkpoint" in title
+    plt.close(figure)
+
+
+def test_an_unavailable_arm_is_bound_to_its_own_run_and_to_the_selected_a0(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A receipt copied from another B, or a lineage whose receipts name another A0's handoff, is refused."""
+    other_b = deepcopy(_B_CONFIG)
+    other_b["run"]["name"] = "run_b_other"
+    copied = matched_budget.build_b_receipt(
+        parent_identity_sha256="a" * 64,
+        a0_handoff_sha256=_A0_HANDOFF_SHA256,
+        b_config=other_b,
+        finished_b=_finished(deepcopy(_FIRST_GROUP_DIVERGED_B)),
+    )
+    runs = {tmp_path / "a1": (_A1_CONFIG, _A1_WITHOUT_RESULT, copied), tmp_path / "b": (_B_CONFIG, _FIRST_GROUP_DIVERGED_B, copied)}
+    a0 = (_prepared(tmp_path / "a0", "a0").loaded_run,)
+    with pytest.raises(ValueError, match="receipt"):
+        analysis.evaluation.workflow._transient_lineage(a0, unavailable_runs=_unavailable_runs(monkeypatch, runs))
+
+    unrelated = _matched_receipt(_FIRST_GROUP_DIVERGED_B, handoff="f" * 64)
+    other = tmp_path / "other"
+    runs = {other / "a1": (_A1_CONFIG, _A1_WITHOUT_RESULT, unrelated), other / "b": (_B_CONFIG, _FIRST_GROUP_DIVERGED_B, unrelated)}
+    with pytest.raises(ValueError, match="handoff"):
+        analysis.evaluation.workflow._transient_lineage(a0, unavailable_runs=_unavailable_runs(monkeypatch, runs))
+
+
+def test_the_workflow_admits_an_unsuccessful_selection_only_into_the_comparison(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An unsuccessful A1 selection loads no artifact; the comparison reports its status beside A0 and B."""
+    (a1,) = _unavailable_runs(monkeypatch, {(tmp_path / "a1").resolve(): (_A1_CONFIG, _A1_WITHOUT_RESULT, _matched_receipt())})
+    prepared = {(tmp_path / arm).resolve(): _prepared((tmp_path / arm).resolve(), arm) for arm in ("a0", "b")}
+    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda path, **_kwargs: prepared[path])
+    monkeypatch.setattr(
+        analysis.evaluation.transient_session, "TransientEvaluationSession", lambda frames: SimpleNamespace(frames=frames, close=lambda: None)
+    )
+    monkeypatch.setattr(analysis.evaluation.panel, "build_transient_panel", lambda **_kwargs: widgets.Label("transient"))
+
+    paths = (*prepared, a1)
+    workflow = analysis.evaluation.workflow.prepare_evaluation_workflow(
+        tuple(analysis.evaluation.workflow.EvaluationRunSelection(path, label=label) for path, label in zip(paths, ("A0", "B", "A1"), strict=True)),
+        (analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),),
+    )
+
+    assert workflow.transient_lineage is not None
+    assert workflow.transient_lineage.a1.training_status == "no_eligible_checkpoint"
+    assert {row["display_label"] for row in workflow.report} == {"A0", "B"}
 
 
 def test_single_model_uses_partitioned_case_union_while_comparison_requires_pairs() -> None:
@@ -556,30 +708,118 @@ def test_generic_transient_comparison_rejects_mismatched_role_membership(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Reject generic transient comparisons whose saved case membership differs."""
+    """Refuse a generic transient comparison whose only requested role has different saved case membership."""
     prepared = {
         (tmp_path / "first").resolve(): _prepared((tmp_path / "first").resolve(), "a0"),
         (tmp_path / "second").resolve(): _prepared((tmp_path / "second").resolve(), "a1"),
     }
     second_dataset = prepared[(tmp_path / "second").resolve()].loaded_run.id_artifact.frame.attrs["artifact_provenance"]["dataset"]
     second_dataset["case_ids_by_source"] = [["different_case"]]
-    closed: list[bool] = []
+    created: list[bool] = []
 
     class FakeSession:
         def __init__(self, _frames: dict[str, pd.DataFrame]) -> None:
-            pass
-
-        def close(self) -> None:
-            closed.append(True)
+            created.append(True)
 
     monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda path, **_kwargs: prepared[path])
     monkeypatch.setattr(analysis.evaluation.transient_session, "TransientEvaluationSession", FakeSession)
-    with pytest.raises(ValueError, match="dataset membership"):
+    with pytest.raises(ValueError, match=r"No requested Evaluation artifact role.*dataset membership"):
         analysis.evaluation.workflow.prepare_evaluation_workflow(
             tuple(analysis.evaluation.workflow.EvaluationRunSelection(path) for path in prepared),
             (analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),),
         )
-    assert closed == [True]
+    assert created == []  # every role was refused before a session existed, so none has to be closed
+
+
+def test_a_role_without_shared_membership_is_refused_alone_with_its_reason(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The ID role loads for both models while their disjoint parameter-OOD roles are refused, in the workflow and in the panel."""
+    prepared = {}
+    for arm, case in (("a0", "ood_first"), ("a1", "ood_second")):
+        run_dir = (tmp_path / arm).resolve()
+        run = _prepared(run_dir, arm)
+        ood = pd.DataFrame()
+        ood.attrs = deepcopy(run.loaded_run.id_artifact.frame.attrs)
+        ood.attrs["artifact_provenance"]["dataset"]["case_ids_by_source"] = [[case]]
+        artifact = replace(run.loaded_run.id_artifact, frame=ood, split_role="parameter_ood")
+        prepared[run_dir] = replace(run, loaded_run=replace(run.loaded_run, parameter_ood_artifact=artifact))
+    frames: dict[str, pd.DataFrame] = {}
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        def __init__(self, session_frames: dict[str, pd.DataFrame]) -> None:
+            frames.update(session_frames)
+
+        def close(self) -> None:
+            pass
+
+    def panel(**kwargs: Any) -> widgets.Label:
+        captured.update(kwargs)
+        return widgets.Label("comparison")
+
+    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda path, **_kwargs: prepared[path])
+    monkeypatch.setattr(analysis.evaluation.transient_session, "TransientEvaluationSession", FakeSession)
+    monkeypatch.setattr(analysis.evaluation.panel, "build_transient_panel", panel)
+    specs = (
+        analysis.evaluation.workflow.EvaluationContextSpec("id", "ID", "id"),
+        analysis.evaluation.workflow.EvaluationContextSpec("parameter_ood", "Parameter OOD", "parameter_ood"),
+    )
+
+    result = analysis.evaluation.workflow.prepare_evaluation_workflow(
+        tuple(analysis.evaluation.workflow.EvaluationRunSelection(path, label=label) for path, label in zip(prepared, ("A0", "A1"), strict=True)),
+        specs,
+        refused_roles={"material_ood": "not ready in A1"},
+    )
+
+    assert set(frames) == {"A0 ID", "A1 ID"}
+    assert tuple(context.key for context in result.contexts) == ("id",)
+    assert all(row["artifact_roles"] == ["id"] for row in result.report)
+    assert set(result.refused_roles) == {"parameter_ood", "material_ood"}
+    assert "dataset membership" in result.refused_roles["parameter_ood"]
+    assert result.refused_roles["material_ood"] == "not ready in A1"
+    assert dict(captured["refused_roles"]) == dict(result.refused_roles)
+    result.close()
+
+
+def test_a_comparison_without_the_id_role_loads_its_other_role_and_has_no_controlled_stage_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Runs that offer only a material-OOD artifact (ID refused before loading) still compare; the lineage, read from ID, says so."""
+    prepared = {}
+    for arm in ("a0", "a1"):
+        run_dir = (tmp_path / arm).resolve()
+        run = _prepared(run_dir, arm)
+        ood = replace(run.loaded_run.id_artifact, split_role="material_ood")
+        prepared[run_dir] = replace(run, loaded_run=replace(run.loaded_run, id_artifact=None, material_ood_artifact=ood))
+    frames: dict[str, pd.DataFrame] = {}
+    captured: dict[str, Any] = {}
+
+    class FakeSession:
+        def __init__(self, session_frames: dict[str, pd.DataFrame]) -> None:
+            frames.update(session_frames)
+
+        def close(self) -> None:
+            pass
+
+    def panel(**kwargs: Any) -> widgets.Label:
+        captured.update(kwargs)
+        return widgets.Label("comparison")
+
+    monkeypatch.setattr(analysis.artifacts.service, "load_or_build_run_artifacts", lambda path, **_kwargs: prepared[path])
+    monkeypatch.setattr(analysis.evaluation.transient_session, "TransientEvaluationSession", FakeSession)
+    monkeypatch.setattr(analysis.evaluation.panel, "build_transient_panel", panel)
+
+    result = analysis.evaluation.workflow.prepare_evaluation_workflow(
+        tuple(analysis.evaluation.workflow.EvaluationRunSelection(path, label=label) for path, label in zip(prepared, ("A0", "A1"), strict=True)),
+        (analysis.evaluation.workflow.EvaluationContextSpec("material_ood", "Material OOD", "material_ood"),),
+    )
+
+    assert set(frames) == {"A0 MATERIAL_OOD", "A1 MATERIAL_OOD"}
+    assert all(row["artifact_roles"] == ["material_ood"] for row in result.report)
+    assert result.transient_lineage is None
+    assert result.transient_performance is None
+    assert captured["training_performance"] is None
+    assert "ID role" in str(result.matched_stage_unavailable_reason)
+    result.close()
 
 
 def test_physical_projection_drops_only_the_sampling_extension() -> None:
@@ -595,11 +835,11 @@ def test_physical_projection_drops_only_the_sampling_extension() -> None:
     assert split == before
 
 
-def test_strategy_sampling_does_not_change_physical_role_or_lineage() -> None:
+def test_strategy_sampling_does_not_change_physical_role_or_lineage(tmp_path: Path) -> None:
     """A0/A1 one-step and B rollout sampling compare the same complete physical cases."""
     assert _split("a0")["extension"] != _split("b")["extension"]
-    first = _prepared(Path("a0"), "a0").loaded_run
-    second = _prepared(Path("b"), "b").loaded_run
+    first = _prepared(tmp_path / "a0", "a0").loaded_run
+    second = _prepared(tmp_path / "b", "b").loaded_run
     workflow = analysis.evaluation.workflow
     first_artifact = first.id_artifact
     second_artifact = second.id_artifact
@@ -612,24 +852,24 @@ def test_strategy_sampling_does_not_change_physical_role_or_lineage() -> None:
 
 
 @pytest.mark.parametrize("role", ["train", "validation", "id_test", "material_ood"])
-def test_lineage_rejects_changes_in_every_physical_role(role: str) -> None:
+def test_lineage_rejects_changes_in_every_physical_role(role: str, tmp_path: Path) -> None:
     """Even unchanged evaluated ID cases cannot conceal a different training/validation split."""
-    first = _prepared(Path("a0"), "a0").loaded_run
-    second = _prepared(Path("b"), "b").loaded_run
+    first = _prepared(tmp_path / "a0", "a0").loaded_run
+    second = _prepared(tmp_path / "b", "b").loaded_run
     assert second.id_artifact is not None
     roles = second.id_artifact.frame.attrs["transient_physical_split"]["roles"]
     roles[role] = {"parts": [{"case_ids": ["different_case"]}]} if role == "material_ood" else {"case_ids": ["different_case"]}
     workflow = analysis.evaluation.workflow
     assert workflow._transient_arm_evidence(first).split_id != workflow._transient_arm_evidence(second).split_id
-    third = _prepared(Path("a1"), "a1").loaded_run
+    third = _prepared(tmp_path / "a1", "a1").loaded_run
     lineage, reason = workflow._transient_lineage((first, second, third))
     assert lineage is None
     assert reason is not None
     assert "split_id" in reason
 
 
-def test_missing_all_role_projection_fails_closed() -> None:
-    loaded = _prepared(Path("a0"), "a0").loaded_run
+def test_missing_all_role_projection_fails_closed(tmp_path: Path) -> None:
+    loaded = _prepared(tmp_path / "a0", "a0").loaded_run
     assert loaded.id_artifact is not None
     del loaded.id_artifact.frame.attrs["transient_physical_split"]
     with pytest.raises(TypeError, match="physical split"):

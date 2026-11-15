@@ -11,6 +11,7 @@ Design principles:
   - Every name is a pure function of the resolved config, its source and its layout; a config name reads the file's own leaves plus the model label
   - The model label reads the merged model parameters and the physics switch, so a base change of a model parameter renames every config
   - B/A1 settings name the pair folder, never the config folder that holds A0, so editing them keeps A0 findable
+  - Budget, k and schedule name every run's seed group, authored or inherited, so the config name never repeats them
   - A config YAML outside the canonical tree is an explicit ``external`` family, never guessed, and is name-checked like a maintained file
   - Readable names locate runs; exact scientific identity stays in saved metadata
 
@@ -193,12 +194,8 @@ def model_label(config: Mapping[str, Any]) -> str:
 
 
 _PHYSICS_TERMS = ("momentum_weight", "continuity_weight", "boundary_weight")
-# Leaves of one matched-plan stage by token suffix.
+# Leaves of one matched-plan stage by token suffix; A0's budget epochs name the seed group instead.
 _STAGE_LEAVES = {
-    "ep": ("max_epochs",),
-    "ev": ("evaluation_interval",),
-    "oev": ("ood_evaluation_interval",),
-    "acc": ("gradient_accumulation_steps",),
     "cur": ("curriculum.lengths", "curriculum.milestone_fractions"),
     "smp": ("sampling.mode",),
     "rl": ("sampling.rollout_length",),
@@ -210,59 +207,52 @@ _STAGE_LEAVES = {
 
 
 def _stage_tokens(*stages: str) -> dict[str, tuple[str, ...]]:
-    """Return the token of every stage leaf, prefixed by its stage."""
-    return {f"{stage}{token}": tuple(f"training.{stage}.{leaf}" for leaf in leaves) for stage in stages for token, leaves in _STAGE_LEAVES.items()}
+    """Return the token of every leaf a stage has, prefixed by its stage; only B self-feeds rollouts, so only B has a curriculum."""
+    return {
+        f"{stage}{suffix}": tuple(f"training.{stage}.{leaf}" for leaf in leaves)
+        for stage in stages
+        for suffix, leaves in _STAGE_LEAVES.items()
+        if suffix != "cur" or stage == "b"
+    }
 
 
 # The pair key's fixed part already shows these B/A1 leaves.
 _PAIR_SHOWN = ("training.b.train_seconds", "training.b.sampling.rollout_length", "training.b.lr_scale", "training.a1.lr_scale")
 # The tables of name tokens, in name order: token -> the authored leaves whose values it shows. The config name takes the
 # shared, single-stage and A0 tokens; the pair folder takes the B/A1 tokens, so editing a B/A1 setting never renames the config that holds A0.
-_PAIR_TOKENS: dict[str, tuple[str, ...]] = {
-    token: paths
-    for token, paths in {"cev": ("training.continuation_evaluations",), **_stage_tokens("b", "a1")}.items()
-    if not set(paths) & set(_PAIR_SHOWN)
-}
+_PAIR_TOKENS: dict[str, tuple[str, ...]] = {token: paths for token, paths in _stage_tokens("b", "a1").items() if not set(paths) & set(_PAIR_SHOWN)}
 _TOKENS: dict[str, tuple[str, ...]] = {
     "crop": ("loss.physics.interior_crop",),
     "w": tuple(f"loss.physics.{term}.target" for term in _PHYSICS_TERMS),
     "wu": tuple(f"loss.physics.{term}.warmup.epochs" for term in _PHYSICS_TERMS),
     "loss": ("loss.data.kind",),
-    "space": ("loss.data.space",),
     "lw": ("loss.data.weight",),
-    "huber": ("loss.data.beta",),
-    "cw": ("loss.data.channel_weights",),
-    "aux": ("loss.data.state_aux_weight",),
     "stride": ("data.spatial_stride",),
-    "bs": ("data.batch_size",),
     "sub": ("data.train_subset",),
     "lr": ("optimizer.lr",),
     "wd": ("optimizer.weight_decay",),
     "betas": ("optimizer.betas",),
     "eps": ("optimizer.second_moment_floor",),
-    "sch": ("scheduler",),
     "schf": ("scheduler.factor",),
     "schp": ("scheduler.patience",),
-    "schmin": ("scheduler.min_lr",),
     "det": ("run.deterministic",),
     "profile": ("input_profile",),
-    "scale": ("scaling.mode",),
     "tcond": ("temporal.temporal_conditioning.kind",),
     "obj": ("evaluation.objective.id",),
-    "ep": ("training.epochs",),
-    "ev": ("training.evaluation_interval",),
-    "oev": ("training.ood_evaluation_interval",),
-    "acc": ("training.gradient_accumulation_steps",),
     **_stage_tokens("a0"),
 }
-# Authored leaves no token shows; each reason is why the experiment's content does not depend on it.
+# Authored leaves no token shows; each reason is why the config name need not show it.
 _UNNAMED = (
+    # The seed group names every run's budget, k and schedule (ep-<E>__k-<k>__sch-<kind>), authored or not.
+    "training.budget_epochs",
+    "training.a0.budget_epochs",
+    "training.units_per_update",
+    "scheduler",  # its kind; a plateau's factor and patience keep their tokens
     "model",  # the model label shows the architecture and every deviating parameter
     "loss.physics.enabled",  # the pi- prefix
     "loss.physics.derivatives",  # the __fd/__spec suffix
     *(f"loss.physics.{term}.warmup.kind" for term in _PHYSICS_TERMS),  # one admitted kind
     "optimizer.kind",  # one admitted kind
-    "scheduler.kind",  # one admitted kind
     "training.mode",  # the matched plan's one admitted protocol
     "training.a1.match_to",  # one admitted value
     "training.stage_schedule",  # stage markers derived from the plan or the study mode
@@ -279,6 +269,8 @@ _UNNAMED = (
     "data.num_workers",  # loader throughput only
     "data.pin_memory",
     "data.persistent_workers",
+    "data.evaluation_batch_size",  # evaluation memory only; metrics accumulate over the whole role
+    "training.memory_batch",  # memory split of one update; changes only floating-point rounding
 )
 
 
@@ -448,15 +440,15 @@ def trial_leaf(trial_number: int, config: Mapping[str, Any], sampled_params: Map
 def run_name(layout: Mapping[str, Any]) -> str:
     """Return the run name of a saved layout.
 
-    Steady runs are ``<config>__seed-<n>[__rev-<r>]``; transient stages are
-    ``<config>__seed-<n>__a0ep-<epochs>[__rev-<r>]`` and append the pair (B/A1) and
+    Every run is ``<config>__seed-<n>__ep-<epochs>__k-<k>__sch-<schedule>[__rev-<r>]``
+    (:func:`common.paths.seed_group_name`); transient stages append the pair (B/A1) and
     the stage; trials are ``<study>__trial-<NNNN>`` (their directory keeps the
     descriptive trial leaf).
     """
     if layout["trial"] is not None:
         number = str(layout["trial"]).split("__", 1)[0]
         return f"{layout['config_name']}__trial-{number}"
-    parts = [layout["config_name"], common.paths.seed_group_name(layout["seed"], layout["revision"], a0_epochs=layout["budget_epochs"])]
+    parts = [layout["config_name"], common.paths.seed_group_name(layout)]
     if layout["pair"] is not None:
         parts.append(layout["pair"])
     if layout["stage"] != "single":
@@ -467,11 +459,10 @@ def run_name(layout: Mapping[str, Any]) -> str:
 def parent_label(layout: Mapping[str, Any]) -> str:
     """Return the label shared by every stage of one seed group: family, config and seed group.
 
-    A transient seed group carries its A0 epoch budget, so another budget is another parent.
+    A seed group carries its budget, k and schedule, so another value is another parent.
     A trial's group is its study directory name followed by the training seed.
     """
     if layout["trial"] is not None:
         group = common.paths.study_group_name(layout["config_name"], layout["budget_epochs"], layout["revision"])
         return f"{layout['family']}__{group}__seed-{layout['seed']}"
-    group = common.paths.seed_group_name(layout["seed"], layout["revision"], a0_epochs=layout["budget_epochs"])
-    return f"{layout['family']}__{layout['config_name']}__{group}"
+    return f"{layout['family']}__{layout['config_name']}__{common.paths.seed_group_name(layout)}"

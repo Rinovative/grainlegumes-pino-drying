@@ -1,7 +1,9 @@
 """Durable input-dataset, mean, table, schedule, map, and panel contracts.
 
 Responsibilities:
-  - Check input catalogs, scientific means, tables, schedules, panels, and superseded renders
+  - Check input catalogs, scientific means, tables, schedules, panels, superseded renders, and the panel's own export
+  - Check that the catalog reads the HDF5 input store, merges equivalent encodings of one case as duplicates, and refuses a
+    corrupt duplicate
   - Check that campaign outcomes carry their sampled parameters into the failures-by-parameter figure
 
 Design principles:
@@ -14,10 +16,12 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import h5py
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,15 +29,18 @@ import pandas as pd
 import pytest
 from matplotlib.colors import BoundaryNorm
 from matplotlib.figure import Figure
-from support.generation_fixtures import lentil_generation_config
+from support.generation_fixtures import lentil_generation_config, rewrite_input_store_equivalently
 
 from src import domain, generation
 from src.analysis import generation_inputs
 from src.analysis.generation_inputs import generation_input_controls as input_controls
+from src.analysis.ui import analysis_ui_controls as ui_controls
+from src.analysis.ui import analysis_ui_notebook as ui_notebook
+from src.analysis.ui import analysis_ui_panel as ui_panel
 from src.analysis.ui import tables
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 def test_input_batch_merging_uses_all_unique_cases(
@@ -123,7 +130,7 @@ def test_corrupt_manifested_adapter_is_excluded_from_discovery(
     generation_config_factory: Any,
     tmp_path: Path,
 ) -> None:
-    """Exclude a canonical source after one declared adapter changes."""
+    """Exclude a canonical source after its stored input container changes."""
     storage = tmp_path / "conflict-storage"
     config = lentil_generation_config(generation_config_factory, "steady_flow", storage_root=storage)
     generation.cases.input_generation.generate_input_cases(
@@ -132,19 +139,66 @@ def test_corrupt_manifested_adapter_is_excluded_from_discovery(
         storage_root=storage,
     )
     reference = generation.cases.admission.discover_input_batches(storage).sources[0].cases[0]
-    fields_path = reference.case_directory / "fields.csv"
-    fields_path.write_text(
-        fields_path.read_text(encoding="utf-8") + "\n",
-        encoding="utf-8",
-    )
+    store_path = reference.case_directory / "inputs.h5"
+    store_path.write_bytes(store_path.read_bytes() + b"\n")
 
     discovery = generation.cases.admission.discover_input_batches(storage)
     catalog = generation_inputs.sources.GenerationInputDatasetCatalog(discovery)
 
     assert discovery.sources == ()
     assert len(discovery.issues) == 1
-    assert "adapter hash or size" in discovery.issues[0].message
+    assert "store hash or size" in discovery.issues[0].message
     assert catalog.datasets == ()
+
+
+def test_equivalent_store_encodings_of_one_case_merge_as_duplicates(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Read inputs.h5 and merge a re-encoded copy of one case as the same input, because identities, not container bytes, compare."""
+    storage = tmp_path / "duplicate-storage"
+    config = lentil_generation_config(generation_config_factory, "steady_flow", storage_root=storage)
+    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
+    source = generation.cases.admission.discover_input_batches(storage).sources[0]
+    reference = source.cases[0]
+    copied = tmp_path / "re-encoded" / "inputs"
+    shutil.copytree(reference.case_directory, copied)
+    rewrite_input_store_equivalently(copied / "inputs.h5")
+    duplicate = replace(reference, case_directory=copied, store_identity=generation.cases.case.measure_input_store(copied))
+    discovery = generation.cases.admission.InputSourceDiscovery((source, replace(source, source_id="re-encoded-copy", cases=(duplicate,))), ())
+
+    dataset = generation_inputs.sources.GenerationInputDatasetCatalog(discovery).datasets[0]
+
+    assert duplicate.store_identity != reference.store_identity
+    assert len(dataset.publications) == 2
+    assert [case.case_input_id for case in dataset.cases] == [reference.case_input_id]
+    original, re_encoded = (generation.cases.admission.admit_input_case_reference(item) for item in (reference, duplicate))
+    for name, values in original.fields.items():
+        np.testing.assert_array_equal(re_encoded.fields[name], values)
+
+
+def test_corrupt_duplicate_of_the_same_size_is_refused_not_discarded(
+    generation_config_factory: Any,
+    tmp_path: Path,
+) -> None:
+    """Admit each duplicate against its own recorded store integrity before merging, so a same-size corrupt copy fails."""
+    storage = tmp_path / "duplicate-storage"
+    config = lentil_generation_config(generation_config_factory, "steady_flow", storage_root=storage)
+    generation.cases.input_generation.generate_input_cases(config, 1, storage_root=storage)
+    source = generation.cases.admission.discover_input_batches(storage).sources[0]
+    reference = source.cases[0]
+    copied = tmp_path / "corrupt-copy" / "inputs"
+    shutil.copytree(reference.case_directory, copied)
+    with h5py.File(copied / "inputs.h5", "r+") as handle:
+        kxx = handle["fields/Kxx"]
+        assert isinstance(kxx, h5py.Dataset)
+        kxx[0, 0] = 2.0 * float(kxx[0, 0])
+    assert generation.cases.case.measure_input_store(copied).size_bytes == reference.store_identity.size_bytes
+    duplicate = replace(reference, case_directory=copied)
+    discovery = generation.cases.admission.InputSourceDiscovery((source, replace(source, source_id="corrupt-copy", cases=(duplicate,))), ())
+
+    with pytest.raises(ValueError, match="recorded storage integrity"):
+        generation_inputs.sources.GenerationInputDatasetCatalog(discovery)
 
 
 def test_case_diagnostics_preserve_canonical_permeability_and_sorption(
@@ -429,7 +483,7 @@ def test_shared_selection_synchronizes_controls_and_preserves_local_state(
     first.set_callback(lambda: callbacks.__setitem__(0, callbacks[0] + 1))
     second.set_callback(lambda: callbacks.__setitem__(1, callbacks[1] + 1))
 
-    first.case_a.value = 3
+    first.case_a.field.value = 3
 
     assert state.selection.case_a_key == dataset_catalog.case_options(source_key)[2][1]
     assert second.case_a.value == 3
@@ -442,7 +496,7 @@ def test_shared_selection_synchronizes_controls_and_preserves_local_state(
     assert callbacks == [2, 1]
     callbacks[:] = [0, 0]
 
-    first.case_b.value = 3
+    first.case_b.field.value = 3
     assert callbacks == [1, 1]
     second_key = next(
         key
@@ -451,12 +505,26 @@ def test_shared_selection_synchronizes_controls_and_preserves_local_state(
         )
         if key != source_key
     )
-    second.dataset_b.value = second_key
+    second.dataset_b.select([second_key])
 
     assert state.selection.dataset_b_key == second_key
-    assert first.dataset_b.value == second_key
+    assert first.dataset_b.selected() == (second_key,)
     assert first.case_b.value == second.case_b.value == 1
     assert callbacks == [2, 2]
+
+    first.case_a.field.value = 99
+
+    assert first.case_a.value == 3
+    assert "99" in first.status.text
+    assert state.selection.case_a_key == dataset_catalog.case_options(source_key)[2][1]
+
+    steady_key = next(key for key in map(generation_inputs.sources.dataset_key, dataset_catalog.datasets) if key[0] == "steady_flow")
+    first.dataset_a.select([steady_key])
+
+    assert state.selection.dataset_a_key == steady_key
+    assert first.dataset_b.selected() == (steady_key,)
+    assert {cast("tuple[str, ...]", key)[0] for key in first.dataset_b.boxes} == {"steady_flow"}
+    assert second.dataset_b.selected() == (steady_key,)
 
 
 def test_selection_defaults_reconcile_sparse_and_single_case_datasets(
@@ -521,7 +589,7 @@ def test_workspace_composes_catalog_summary_naming_defaults_and_panel(
 ) -> None:
     """Compose admitted owners and initialize the panel from catalog order."""
     captured: dict[str, Any] = {}
-    panel_widget = widgets.Output()
+    panel_widget = widgets.VBox()
     issue = generation.cases.admission.InputDiscoveryIssue(
         "input-rejected",
         tmp_path / "rejected",
@@ -540,7 +608,7 @@ def test_workspace_composes_catalog_summary_naming_defaults_and_panel(
         lambda *, storage_root, **_kwargs: catalog_with_issue if storage_root == tmp_path else pytest.fail("wrong storage root"),
     )
 
-    def build_panel(**kwargs: Any) -> widgets.Output:
+    def build_panel(**kwargs: Any) -> widgets.VBox:
         captured.update(kwargs)
         return panel_widget
 
@@ -618,7 +686,7 @@ def test_panel_public_surface_accepts_catalog_and_rejects_invalid_input(
         datasets=dataset_catalog,
     )
 
-    assert isinstance(panel, widgets.Output)
+    assert isinstance(panel, widgets.VBox)
     with pytest.raises(TypeError):
         generation_inputs.panel.build_generation_input_eda_panel(
             datasets=cast("Any", []),
@@ -794,32 +862,40 @@ def test_permeability_and_moisture_plots_preserve_scientific_values(
         for figure, first, second, quantities in contracts:
             assert isinstance(figure, Figure)
             for quantity in quantities:
-                _map_norm_for_values(figure, first.fields[quantity])
-                _map_norm_for_values(figure, second.fields[quantity])
+                # Relative humidity maps and their differences show in % RH and pp; other fields keep their values.
+                percent = 100.0 if quantity == "phi_eq" else 1.0
+                _map_norm_for_values(figure, percent * first.fields[quantity])
+                _map_norm_for_values(figure, percent * second.fields[quantity])
                 _map_norm_for_values(
                     figure,
-                    second.fields[quantity] - first.fields[quantity],
+                    percent * (second.fields[quantity] - first.fields[quantity]),
                 )
 
         relationship = generation_inputs.plots.moisture._case_relationship(transient_first)
         statistics = generation_inputs.diagnostics.field_statistics(transient_first).loc["phi_eq"]
         startup = generation_inputs.diagnostics.transient_evidence(transient_first)[3]
         assert relationship == pytest.approx(
-            (
-                statistics["q05"],
-                statistics["median"],
-                statistics["q95"],
-                startup.variables["phi_in_bc"].start,
-                startup.variables["phi_in_bc"].end,
+            tuple(
+                100.0 * value
+                for value in (
+                    statistics["q05"],
+                    statistics["median"],
+                    statistics["q95"],
+                    startup.variables["phi_in_bc"].start,
+                    startup.variables["phi_in_bc"].end,
+                )
             )
         )
         assert generation_inputs.plots.moisture._mean_relationship(transient_mean) == pytest.approx(
-            (
-                transient_mean.field_summary_means[("phi_eq", "q05")],
-                transient_mean.field_summary_means[("phi_eq", "median")],
-                transient_mean.field_summary_means[("phi_eq", "q95")],
-                transient_mean.boundary_means["phi_in_bc start"],
-                transient_mean.boundary_means["phi_in_bc startup end"],
+            tuple(
+                100.0 * value
+                for value in (
+                    transient_mean.field_summary_means[("phi_eq", "q05")],
+                    transient_mean.field_summary_means[("phi_eq", "median")],
+                    transient_mean.field_summary_means[("phi_eq", "q95")],
+                    float(transient_mean.boundary_means["phi_in_bc start"]),
+                    float(transient_mean.boundary_means["phi_in_bc startup end"]),
+                )
             )
         )
     finally:
@@ -860,7 +936,7 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         assert any(np.array_equal(support, expected_operating_h) for support in observed_supports)
         assert any(np.array_equal(support, expected_early_minutes) for support in observed_supports)
 
-        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == "phi_in_bc [1]" and axis.get_xlabel() == "time [min]")
+        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == r"$\varphi_{\mathrm{in,bc}}$ [%]" and axis.get_xlabel() == "time [min]")
         expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
         expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
         expected_mean = np.mean(
@@ -869,7 +945,7 @@ def test_schedule_plot_preserves_semantic_windows_and_common_mean(
         )
         observed_phi = [np.asarray(line.get_ydata(), dtype=np.float64) for line in phi_axis.lines]
         for expected in (expected_first, expected_second, expected_mean):
-            assert any(values.shape == expected.shape and np.allclose(values, expected) for values in observed_phi)
+            assert any(values.shape == expected.shape and np.allclose(values, 100.0 * expected) for values in observed_phi)
 
         assert expected_operating_h[0] == startup_end_h
         assert not np.any(expected_operating_h == 0.0)
@@ -928,12 +1004,12 @@ def test_disabled_startup_plot_uses_regular_operation_without_hidden_support(
         observed_supports = [np.asarray(line.get_xdata(), dtype=np.float64) for axis in figure.axes for line in axis.lines]
         assert any(np.array_equal(support, source_schedule[:, 0]) for support in observed_supports)
         assert any(np.array_equal(support, 60.0 * display_times_h) for support in observed_supports)
-        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == "phi_in_bc [1]" and axis.get_xlabel() == "time [min]")
+        phi_axis = next(axis for axis in figure.axes if axis.get_ylabel() == r"$\varphi_{\mathrm{in,bc}}$ [%]" and axis.get_xlabel() == "time [min]")
         expected_first = generation_inputs.diagnostics.case_boundary_schedule(first, display_times_h)[:, 3]
         expected_second = generation_inputs.diagnostics.case_boundary_schedule(second, display_times_h)[:, 3]
         observed_phi = [np.asarray(line.get_ydata(), dtype=np.float64) for line in phi_axis.lines]
         for expected in (expected_first, expected_second):
-            assert any(values.shape == expected.shape and np.allclose(values, expected) for values in observed_phi)
+            assert any(values.shape == expected.shape and np.allclose(values, 100.0 * expected) for values in observed_phi)
         np.testing.assert_array_equal(first.schedule, source_schedule)
     finally:
         plt.close(figure)
@@ -982,6 +1058,13 @@ def test_temperature_display_preserves_source_evidence(
     assert amplitude == first.case.payload["sampled_values"]["T_in_amp"]
     assert startup_temperature == pytest.approx(first.startup.variables["T_in_bc"].start - 273.15)
     assert startup_delta == first.startup.variables["T_in_bc"].delta
+    # Relative humidity reads % RH with its startup change in pp; the wet-basis target reads % w.b.
+    humidity_start = boundaries.loc[("Drying", "Relative humidity", "Start [% RH]"), "Case A"]
+    humidity_change = boundaries.loc[("Drying", "Relative humidity", "Startup change [pp]"), "Case A"]
+    assert humidity_start == pytest.approx(100.0 * first.startup.variables["phi_in_bc"].start)
+    assert humidity_change == pytest.approx(100.0 * first.startup.variables["phi_in_bc"].delta)
+    target = parameters.loc[("Drying", "Initial state / sorption", "Target moisture, wet basis [% w.b.]"), "Case A"]
+    assert target == pytest.approx(100.0 * first.case.payload["sampled_values"]["X_target_wb"])
 
 
 def test_schedule_plot_rejects_mismatched_startup_durations(
@@ -1080,12 +1163,27 @@ def test_failures_by_parameter_places_terminal_candidates_by_material_and_typed_
         plt.close(figure)
 
 
+def _record_shows(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record every item a plot slot shows, in order, while the slot still builds its elements."""
+    shown: list[object] = []
+    show = ui_panel.PlotSlot.show
+
+    def record(slot: ui_panel.PlotSlot, items: Sequence[object]) -> None:
+        shown.extend(items)
+        show(slot, items)
+
+    monkeypatch.setattr(ui_panel.PlotSlot, "show", record)
+    return shown
+
+
 def test_superseded_live_render_cannot_replace_latest_export(monkeypatch: pytest.MonkeyPatch) -> None:
     """A newer selection can finish while an older render is still returning."""
     from src.analysis.generation_inputs import generation_input_panel as panel  # noqa: PLC0415
 
     class LocalControls:
-        widget = widgets.VBox()
+        rows = ()
+        popovers = ()
+        status = ui_controls.StatusLine()
         callback: Callable[[], None] = lambda: None
 
         def set_callback(self, callback: Callable[[], None]) -> None:
@@ -1095,8 +1193,7 @@ def test_superseded_live_render_cannot_replace_latest_export(monkeypatch: pytest
     old_figure = plt.figure()
     latest_figure = plt.figure()
     exports = {"plot_name": "candidate_view", "fig": None}
-    published = []
-    monkeypatch.setattr(panel, "display", published.append)
+    published = _record_shows(monkeypatch)
     calls = 0
 
     def render() -> Figure:
@@ -1107,16 +1204,159 @@ def test_superseded_live_render_cannot_replace_latest_export(monkeypatch: pytest
             return old_figure
         return latest_figure
 
-    view, _activate = panel._live_view(local, render, export_state=exports, export_plot_name="candidate_view", export_title="Candidate")
+    view = panel._live_view(local, render, export_state=exports, export_plot_name="candidate_view", export_title="Candidate")
     try:
         assert exports["fig"] is latest_figure
         assert old_figure not in published
         assert latest_figure in published
     finally:
-        view.close()
-        local.widget.close()
+        view.widget.close()
         plt.close(old_figure)
         plt.close(latest_figure)
+
+
+class _StubControls:
+    """Local controls of a live view without any control: only the render callback is real."""
+
+    rows = ()
+    popovers = ()
+
+    def __init__(self) -> None:
+        self.status = ui_controls.StatusLine()
+        self.callback: Callable[[], None] = lambda: None
+
+    def set_callback(self, callback: Callable[[], None]) -> None:
+        self.callback = callback
+
+
+def test_superseded_bundled_render_cannot_replace_latest_export(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A figure delivered together with further items is published under the same newest-wins rule as a lone figure."""
+    from src.analysis.generation_inputs import generation_input_panel as panel  # noqa: PLC0415
+
+    local = _StubControls()
+    old_figure = plt.figure()
+    latest_figure = plt.figure()
+    exports: dict[str, Any] = {"plot_name": "candidate_view", "fig": None}
+    published = _record_shows(monkeypatch)
+    calls = 0
+
+    def render() -> tuple[Figure, widgets.HTML]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            local.callback()
+            return old_figure, widgets.HTML("old note")
+        return latest_figure, widgets.HTML("latest note")
+
+    view = panel._live_view(local, render, export_state=exports, export_plot_name="candidate_view", export_title="Candidate")
+    try:
+        assert exports["fig"] is latest_figure
+        assert exports["figures"] == (latest_figure,)
+        assert old_figure not in published
+        assert [item.value for item in published if isinstance(item, widgets.HTML)] == ["latest note"]
+    finally:
+        view.widget.close()
+        plt.close(old_figure)
+        plt.close(latest_figure)
+
+
+def _walk(widget: widgets.Widget) -> tuple[widgets.Widget, ...]:
+    """Return one widget tree in depth-first order."""
+    return (widget, *(item for child in getattr(widget, "children", ()) for item in _walk(child)))
+
+
+def test_panel_export_button_writes_the_shown_figure_to_the_notebooks_folder(
+    dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generation-input panel's own export button writes the figure of the shown view into the notebooks folder under its name."""
+    (tmp_path / "notebooks").mkdir()
+    monkeypatch.setattr(ui_notebook.common.paths, "get_project_root", lambda: tmp_path)
+    monkeypatch.setattr(ui_notebook.common.paths, "source_tree_id", lambda *_args, **_kwargs: None)
+    transient = next(
+        generation_inputs.sources.dataset_key(dataset) for dataset in dataset_catalog.datasets if dataset.profile_id == "transient_drying"
+    )
+    resolution = generation_inputs.selection.resolve_generation_input_selection(dataset_catalog, preferred_dataset_key=transient)
+    state = generation_inputs.selection.GenerationInputSelectionState(dataset_catalog, initial_selection=resolution.selection)
+    try:
+        shell = generation_inputs.panel.build_generation_input_eda_panel(datasets=dataset_catalog, selection_state=state)
+        next(item for item in _walk(shell) if isinstance(item, widgets.Button)).click()
+        tabs = next(item for item in _walk(shell) if isinstance(item, widgets.Tab))
+        index, section = next(
+            (index, section) for index, section in enumerate(tabs.children) if any(key == "transient_schedules" for *_entry, key in section.entries)
+        )
+        tabs.selected_index = index
+        section.selector.value = next(position for position, (*_entry, key) in enumerate(section.entries) if key == "transient_schedules")
+        next(item for item in _walk(shell) if isinstance(item, widgets.Button) and item.description == "Export PDF").click()
+        # No output widget anywhere: VS Code's Jupyter extension stalls on output-capture updates (item 177).
+        assert any(isinstance(item, widgets.Image) for item in _walk(shell))
+        assert not any(isinstance(item, widgets.Output) for item in _walk(shell))
+    finally:
+        plt.close("all")
+    (written,) = (tmp_path / "notebooks").iterdir()
+    assert written.name.startswith("transient_schedules_")
+    assert written.suffix == ".pdf"
+
+
+def test_deactivation_supersedes_a_render_in_flight() -> None:
+    """A render that is still running when its view is hidden cannot publish into the shared export state."""
+    from src.analysis.generation_inputs import generation_input_panel as panel  # noqa: PLC0415
+
+    local = _StubControls()
+    figures = [plt.figure(), plt.figure()]
+    exports: dict[str, Any] = {"plot_name": "candidate_view", "fig": None}
+    holder: list[ui_panel.ViewPanel] = []
+    calls = 0
+
+    def render() -> Figure:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            holder[0].deactivate()
+        return figures[calls - 1]
+
+    view = panel._live_view(local, render, export_state=exports, export_plot_name="candidate_view", export_title="Candidate")
+    holder.append(view)
+    try:
+        assert exports["fig"] is figures[0]
+        local.callback()
+        assert calls == 2
+        assert exports["fig"] is figures[0]
+    finally:
+        view.widget.close()
+        for figure in figures:
+            plt.close(figure)
+
+
+def test_registered_views_build_in_panel_rows_and_publish_their_figures(
+    dataset_catalog: generation_inputs.sources.GenerationInputDatasetCatalog,
+) -> None:
+    """Every maintained view is a view panel of standard rows that renders without failure; a figure view exports its figure."""
+    from src.analysis.generation_inputs import generation_input_panel as panel  # noqa: PLC0415
+
+    transient = next(
+        generation_inputs.sources.dataset_key(dataset) for dataset in dataset_catalog.datasets if dataset.profile_id == "transient_drying"
+    )
+    resolution = generation_inputs.selection.resolve_generation_input_selection(dataset_catalog, preferred_dataset_key=transient)
+    state = generation_inputs.selection.GenerationInputSelectionState(dataset_catalog, initial_selection=resolution.selection)
+    rows = {}
+    try:
+        for key, factory in panel._view_factories(dataset_catalog, state).items():
+            export: dict[str, Any] = {"fig": None, "figures": (), "plot_name": key, "title": key}
+            view = factory(export_state=export, export_plot_name=key, export_title=key)
+            if key == "campaign_outcomes" and not dataset_catalog.outcomes.rows:
+                assert isinstance(view, widgets.HTML)
+                continue
+            assert isinstance(view, ui_panel.ViewPanel)
+            assert not view.failure.shown, key
+            rows[key] = len(view.rows)
+            if key == "transient_schedules":
+                assert isinstance(export["fig"], Figure)
+    finally:
+        plt.close("all")
+    assert rows["case_context"] == 2
+    assert rows["basic_spatial_inputs"] == 3
+    assert rows["field_atlas"] == 2
+    assert rows["dataset_cases_parameters"] == 1
 
 
 def test_campaign_outcomes_are_discovered_by_default(generation_config_factory: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,7 +1,7 @@
 """Build strict transient drying timing and speedup summaries.
 
 Responsibilities:
-  - Validate bounded raw timing repetitions and disclosure metadata
+  - Validate bounded raw timing repetitions and disclosure metadata, including surrogate and COMSOL solver hardware
   - Derive per-case component-composed speedups from named timing components
   - Aggregate speedups as ratios of summed paired durations
 
@@ -77,7 +77,7 @@ _SPEEDUP_BOUNDARIES = {
 
 @dataclass(frozen=True, slots=True)
 class TransientTimingCase:
-    """Store bounded raw timing repetitions and immutable disclosure for one case."""
+    """Store bounded raw timing repetitions and immutable disclosure for one case, including the COMSOL solver's host and cores."""
 
     case_id: str
     repetitions: Mapping[str, tuple[float, ...]]
@@ -85,6 +85,8 @@ class TransientTimingCase:
     precision: str
     pt_payload_identity: str
     warmup_passes: int
+    solver_hostname: str
+    solver_requested_cores: int
     batch_size: int = 1
     cpu: str = "unknown"
     gpu: str | None = None
@@ -268,6 +270,10 @@ def build_transient_timing_report(cases: Sequence[TransientTimingCase]) -> Trans
         if not case.cpu or (case.device.startswith("cuda") and not case.gpu):
             msg = "Timing cases must disclose CPU and any selected GPU."
             raise ValueError(msg)
+        host, cores = case.solver_hostname, case.solver_requested_cores
+        if not isinstance(host, str) or not host or isinstance(cores, bool) or not isinstance(cores, int) or cores < 1:
+            msg = "Timing cases must disclose the COMSOL solver host and its positive requested core count."
+            raise ValueError(msg)
         if isinstance(case.warmup_passes, bool) or not isinstance(case.warmup_passes, int) or case.warmup_passes < 0:
             msg = "warmup_passes must be a non-negative integer."
             raise ValueError(msg)
@@ -325,7 +331,7 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
         software_versions = item["software_versions"]
         cold_timings = item["cold_timings"]
         unavailable_reasons = item["unavailable_reasons"]
-        text_fields = ("case_id", "device", "precision", "pt_payload_identity", "cpu")
+        text_fields = ("case_id", "device", "precision", "pt_payload_identity", "cpu", "solver_hostname")
         if any(not isinstance(item[name], str) or not item[name] for name in text_fields):
             msg = f"Serialized transient timing case {position} text fields are invalid."
             raise TypeError(msg)
@@ -340,13 +346,10 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
             raise TypeError(msg)
         warmup_passes = item["warmup_passes"]
         batch_size = item["batch_size"]
+        solver_cores = item["solver_requested_cores"]
         gpu = item["gpu"]
-        if (
-            isinstance(warmup_passes, bool)
-            or not isinstance(warmup_passes, int)
-            or isinstance(batch_size, bool)
-            or not isinstance(batch_size, int)
-            or (gpu is not None and (not isinstance(gpu, str) or not gpu))
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (warmup_passes, batch_size, solver_cores)) or (
+            gpu is not None and (not isinstance(gpu, str) or not gpu)
         ):
             msg = f"Serialized transient timing case {position} scalar fields are invalid."
             raise TypeError(msg)
@@ -357,8 +360,10 @@ def admit_transient_timing_report(value: Mapping[str, object]) -> TransientTimin
                 device=cast("str", item["device"]),
                 precision=cast("str", item["precision"]),
                 pt_payload_identity=cast("str", item["pt_payload_identity"]),
-                warmup_passes=warmup_passes,
-                batch_size=batch_size,
+                warmup_passes=cast("int", warmup_passes),
+                solver_hostname=cast("str", item["solver_hostname"]),
+                solver_requested_cores=cast("int", solver_cores),
+                batch_size=cast("int", batch_size),
                 cpu=cast("str", item["cpu"]),
                 gpu=cast("str | None", gpu),
                 software_versions=cast("Mapping[str, str]", dict(software_versions)),

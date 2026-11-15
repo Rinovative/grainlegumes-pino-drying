@@ -5,12 +5,15 @@ Responsibilities:
   - Resolve one concrete indexed Torch device at a top-level service boundary
   - Fail strict CUDA requests without an availability-based CPU fallback
   - Return compact, immutable, serialization-safe runtime metadata
+  - Read the NVIDIA driver version of a CUDA resolution through ``nvidia-smi``
 
 Design principles:
   - Requested policy and concrete runtime resolution remain distinct facts
   - Only this module decides whether auto selects CPU or CUDA
   - CPU resolution never queries CUDA availability or device properties
   - Physical CUDA indices are operational metadata, not scientific identity
+  - ``cuda_build_version`` is the CUDA release PyTorch was built with, never the driver or its runtime
+  - An unreadable driver version is ``None``, never a guess
 
 This module does NOT:
   - Parse semantic config paths. ``experiments.config.loader`` owns config validation
@@ -20,6 +23,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,8 +35,13 @@ __all__ = [
     "DeviceResolution",
     "DeviceResolutionError",
     "DeviceRuntimeMetadata",
+    "cuda_driver_version",
     "resolve_device",
 ]
+
+# The venv has no NVML binding; nvidia-smi comes with the driver (Apptainer --nv binds it), bounded so a hung driver cannot stall a start.
+_DRIVER_QUERY = ("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader")
+_DRIVER_QUERY_TIMEOUT_SECONDS = 10.0
 
 
 class DeviceResolutionError(RuntimeError):
@@ -63,8 +72,8 @@ class DeviceRuntimeMetadata:
         Concrete visible CUDA index when CUDA is selected.
     cuda_device_name : str | None
         CUDA device name when CUDA is selected.
-    cuda_runtime_version : str | None
-        PyTorch-reported CUDA runtime version when CUDA is selected.
+    cuda_build_version : str | None
+        CUDA release PyTorch was built with (``torch.version.cuda``) when CUDA is selected.
 
     """
 
@@ -74,7 +83,7 @@ class DeviceRuntimeMetadata:
     pytorch_version: str
     cuda_index: int | None = None
     cuda_device_name: str | None = None
-    cuda_runtime_version: str | None = None
+    cuda_build_version: str | None = None
 
     def as_dict(self) -> dict[str, str | int]:
         """
@@ -97,8 +106,8 @@ class DeviceRuntimeMetadata:
             payload["cuda_index"] = self.cuda_index
         if self.cuda_device_name is not None:
             payload["cuda_device_name"] = self.cuda_device_name
-        if self.cuda_runtime_version is not None:
-            payload["cuda_runtime_version"] = self.cuda_runtime_version
+        if self.cuda_build_version is not None:
+            payload["cuda_build_version"] = self.cuda_build_version
         return payload
 
 
@@ -183,7 +192,7 @@ def _cuda_resolution(policy: _policy.DevicePolicy, *, path: str) -> DeviceResolu
         msg = f"{path} requested {policy!r}, but CUDA returned invalid device metadata."
         raise DeviceResolutionError(msg)
     device = torch.device("cuda", index)
-    runtime_version = torch.version.cuda
+    build_version = torch.version.cuda
     metadata = DeviceRuntimeMetadata(
         requested_policy=policy,
         resolved_device=str(device),
@@ -191,7 +200,7 @@ def _cuda_resolution(policy: _policy.DevicePolicy, *, path: str) -> DeviceResolu
         pytorch_version=str(torch.__version__),
         cuda_index=index,
         cuda_device_name=device_name,
-        cuda_runtime_version=None if runtime_version is None else str(runtime_version),
+        cuda_build_version=None if build_version is None else str(build_version),
     )
     return DeviceResolution(
         requested_policy=policy,
@@ -200,6 +209,24 @@ def _cuda_resolution(policy: _policy.DevicePolicy, *, path: str) -> DeviceResolu
         cuda_index=index,
         metadata=metadata,
     )
+
+
+def cuda_driver_version(resolution: DeviceResolution) -> str | None:
+    """
+    Return the NVIDIA driver version of a CUDA resolution, or ``None``.
+
+    A CPU resolution returns ``None`` without starting a process. On CUDA the
+    driver reports one version per visible GPU, the same for all GPUs of a node;
+    a missing, failing or hung ``nvidia-smi`` or an ambiguous answer yields ``None``.
+    """
+    if resolution.device_type != "cuda":
+        return None
+    try:
+        completed = subprocess.run(_DRIVER_QUERY, capture_output=True, text=True, timeout=_DRIVER_QUERY_TIMEOUT_SECONDS, check=True)  # noqa: S603 -- fixed argv, no shell
+    except (OSError, subprocess.SubprocessError):
+        return None
+    versions = {line.strip() for line in completed.stdout.splitlines() if line.strip()}
+    return versions.pop() if len(versions) == 1 else None
 
 
 def resolve_device(policy: Any, *, path: str = "device") -> DeviceResolution:

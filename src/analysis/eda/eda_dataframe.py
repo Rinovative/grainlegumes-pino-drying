@@ -246,8 +246,7 @@ def load_published_dataset_frame(
                 items.append(
                     {
                         "state": arrays.states[0],
-                        "state_sequence": arrays.states,
-                        "target": arrays.states[1:] - arrays.states[:-1],
+                        "next_state": arrays.states[1:],
                         "static": arrays.static,
                         "scalars": arrays.scalars,
                         "boundary": arrays.boundary,
@@ -436,15 +435,15 @@ def published_tensor_values(frame: pd.DataFrame, case_id: str, *, transition: in
                 values = np.asarray(row[field.name])
                 support = "domain"
                 if field.name == "p_in_bc":
-                    x = np.asarray(row["x"])
-                    values = values[x == np.min(x)]
+                    y = np.asarray(row["y"])
+                    values = values[y == np.min(y)]
                     support = "inlet boundary"
             elif group.name == "state":
                 values = np.asarray(row["state_trajectories"][field.name][transition])
                 support = "domain at current state time"
-            elif group.name == "target":
-                values = np.asarray(row["target_increments"][field.name][transition])
-                support = "domain; next-state minus current-state"
+            elif group.name == "next_state":
+                values = np.asarray(row["state_trajectories"][field.name][transition + 1])
+                support = "domain at next stored state time"
             elif group.name == "static":
                 values = np.asarray(row["static_fields"][field.name])
                 support = "static domain"

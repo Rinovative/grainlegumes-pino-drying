@@ -36,7 +36,7 @@ storage/
   02_datasets/
     <task>/<dataset>/                                  lentil-train32-val8-test8+chickpea-train32-val8-test8+kidney-bean-ood16__ref-range__sobol-seed-9200
   03_experiments/
-    <task>/<dataset>[__train-<N>]/<family>/<config_name>/seed-N[__a0ep-E][__rev-<label>]/   one experiment (a0ep only transient, train-N only with data.train_subset), mirroring configs/03_learning/<task>/experiments/<family>/<config_name>.yaml
+    <task>/<dataset>[__train-<N>]/<family>/<config_name>/seed-N__ep-E__k-K__sch-S[__rev-<label>]/   one experiment (train-N only with data.train_subset), mirroring configs/03_learning/<task>/experiments/<family>/<config_name>.yaml
       a0/, b-a1__budget-<S>s__rollout-<L>__lr-<X>[__<token>-<value>...]/{b,a1}/            transient stages (steady runs keep their files directly here)
     <task>/<dataset>[__train-<N>]/optuna/<study>__ep-E[__rev-<label>]/trials/<NNNN>__<model label>__<values>/
   source_snapshots/<commit12>-<fp12>/                  exact source bytes (commit, diff, untracked files) shared by Generation, Datasets and ML
@@ -110,7 +110,7 @@ For learning data use the Dataset plan ([Datasets](04_datasets.md)). `scripts/ge
 | `fail-case RUN_ID MATERIAL CASE_ID --reason-code CODE --detail TEXT` | Record an inspected candidate as failed | all required; no default |
 | `amend-replacements RUN_ID --material M --minimum-success-rate S --reason TEXT` | Lower a material's minimum success rate, with its reason | all required; no default |
 
-`run` freezes the source, including uncommitted changes, on the login node and submits the controller as its own CPU job (`--driver-partition`, `--driver-time`); the controller runs the cases with native COMSOL as job steps of `run.node_jobs` node jobs (default two, at most four; a per-user cap on the shared 32-core `standard` nodes; the COMSOL batch licence counts once per user across all hosts), and rerunning the same command continues the campaign. [Generation](03_generation.md) covers Source-only campaigns.
+`run` freezes the source, including uncommitted changes, on the login node and submits the controller as its own CPU job (`--driver-partition`, `--driver-time`); the controller runs the cases with native COMSOL as job steps of `run.node_jobs` node jobs (default four of 16 cores each, at most four; a per-user cap on the shared `standard` nodes; the COMSOL batch licence counts once per user across all hosts), and rerunning the same command continues the campaign. [Generation](03_generation.md) covers Source-only campaigns.
 
 </details>
 
@@ -134,7 +134,7 @@ All resource options are optional; an explicit option always wins. The command a
 | `--time` | Wall limit `[D-]HH:MM:SS` | `04:00:00` for `train` and `optuna`, `02:00:00` for `artifacts`, `00:10:00` for `probe` |
 | `--gres gpu:TYPE:1` | GPU type `v100`, `rtxa6000` or `rtx6000ada` (GPU mode only; CPU mode refuses it) | `gpu:rtx6000ada:1` in GPU mode, none in CPU mode |
 | `train`, `optuna`, `artifacts`, `probe` | Operation and its CLI arguments | required, no default |
-| `--continue-with-current-code` | `train` and `optuna` only: continue an existing run or study with the current code instead of the code it last ran in; the code-identity checks still apply ([Training](05_training.md#continue-extend-and-resume)) | off: the run or study continues in the code it last ran in |
+| `--continue-with-current-code` | `train` and `optuna` only: continue an existing run or study with the current code instead of the code it last ran in; the code-identity checks still apply ([Training](05_training.md#continue-and-resume)) | off: the run or study continues in the code it last ran in |
 
 The wrapper runs the configuration preflight before submission. Every job runs from a frozen, read-only copy of the code, `runtime/sources/COMMIT12-FINGERPRINT12/`, restored from the snapshot in `storage/source_snapshots/`; later edits in `repo/` do not reach submitted jobs ([Source snapshots and frozen trees](07_reproducibility_and_validation.md#source-snapshots-and-frozen-trees)). `probe` checks the container and the ML CLIs without opening Datasets. Logs go to `runtime/logs/ml/<operation>-<jobid>.out` and `.err`.
 

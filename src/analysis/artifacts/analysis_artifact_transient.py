@@ -30,9 +30,8 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
-import torch
 
-from src import common, datasets, domain, experiments, generation, learning
+from src import common, datasets, domain, experiments, learning
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_transient_artifact as sequence_artifact
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
@@ -43,7 +42,6 @@ from src.datasets.packages import dataset_packages_generated_batch as generated_
 from src.experiments import experiments_matched_budget as matched_budget
 from src.experiments import experiments_run_identity as run_identity
 from src.learning.transient import learning_transient_handoff as transient_handoff
-from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 
 from . import analysis_artifact_contracts as contracts
 from . import analysis_artifact_performance as artifact_performance
@@ -54,15 +52,6 @@ if TYPE_CHECKING:
     from src.datasets.runtime.dataset_runtime_transient import TransientPhysicalDataset
     from src.learning.learning_device import DeviceResolution
 
-_SOURCE_SELECTOR_KEYS = (
-    "campaign_name",
-    "campaign_digest",
-    "material_family",
-    "case_id",
-    "case_input_id",
-    "simulation_case_id",
-    "case_hdf5_sha256",
-)
 _TIMING_REPETITIONS = 3
 _RESUME_EVIDENCE_SCHEMA_KIND = "evaluation_transient_resume_case"
 # Per-case component evidence the generator writes next to its timing report; resume and role admission both require exactly these fields.
@@ -156,7 +145,7 @@ def select_transient_role_cases(
 
 def _training_spatial_representation(
     completed: Mapping[str, Any],
-) -> datasets.contracts.transient.TransientSpatialRepresentation:
+) -> datasets.contracts.grid.SpatialRepresentation:
     """Reconcile the resolved Training stride, the admitted split's spatial view and the fitted scaling shape."""
     _require_completed_transient(completed)
     config = cast("Mapping[str, Any]", completed["config"])
@@ -165,15 +154,15 @@ def _training_spatial_representation(
     if not isinstance(data, Mapping) or not isinstance(normalizer_state, Mapping):
         message = "Transient artifact grid preflight requires config and scaling evidence."
         raise TypeError(message)
-    stride = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
+    stride = datasets.contracts.grid.validate_spatial_stride(data["spatial_stride"])
     split = datasets.preprocessing.splits.admit_split(completed["split_indices"])
     view = cast("Mapping[str, Any]", split.extension)["spatial_view"]
     if view["spatial_stride"] != stride:
         message = "Resolved Training stride contradicts the admitted split spatial view."
         raise ValueError(message)
-    representation = datasets.contracts.transient.resolve_spatial_representation((view["canonical_ny"], view["canonical_nx"]), stride)
+    representation = datasets.contracts.grid.resolve_spatial_representation((view["canonical_ny"], view["canonical_nx"]), stride)
     represented_shape = (view["effective_ny"], view["effective_nx"])
-    scaling_shape = TransientScalingArtifact.from_state_dict(normalizer_state).spatial_shape
+    scaling_shape = datasets.preprocessing.normalization.TrainScaling.from_state_dict(normalizer_state).spatial_shape
     if representation.represented_shape != represented_shape or scaling_shape != represented_shape:
         message = "Training-grid shape contradicts the split spatial view or the fitted scaling shape."
         raise ValueError(message)
@@ -182,26 +171,20 @@ def _training_spatial_representation(
 
 def resolve_transient_artifact_spatial_representations(
     completed: Mapping[str, Any],
-    *,
-    evaluation_spatial_stride: int = 1,
 ) -> tuple[
-    datasets.contracts.transient.TransientSpatialRepresentation,
-    datasets.contracts.transient.TransientSpatialRepresentation,
+    datasets.contracts.grid.SpatialRepresentation,
+    datasets.contracts.grid.SpatialRepresentation,
 ]:
-    """Resolve authoritative Training and operator-selected Evaluation grids."""
+    """Resolve the authoritative Training grid and the full canonical Evaluation grid."""
     training = _training_spatial_representation(completed)
-    evaluation = datasets.contracts.transient.resolve_spatial_representation(
-        training.source_shape,
-        datasets.contracts.transient.validate_spatial_stride(evaluation_spatial_stride),
-    )
-    return training, evaluation
+    return training, sequence_artifact.full_grid_representation(training.source_shape)
 
 
 def _load_role_datasets(
     role: artifact_plan.ArtifactRolePlan,
     *,
     storage_root: Path,
-    spatial_representation: datasets.contracts.transient.TransientSpatialRepresentation,
+    spatial_representation: datasets.contracts.grid.SpatialRepresentation,
     saved_role: artifact_plan.ArtifactRolePlan | None = None,
 ) -> tuple[TransientPhysicalDataset, ...]:
     """
@@ -344,46 +327,10 @@ def _materialize_case(
             static_conditioning=assembled.static_conditioning,
             boundary_conditioning=assembled.boundary_conditioning,
             scalar_conditioning=assembled.scalar_conditioning,
-            spatial_mask=assembled.spatial_mask,
             metadata=metadata,
         ),
         spec.pt_identity,
     )
-
-
-def _generation_case_sources(
-    role: artifact_plan.ArtifactRolePlan,
-    *,
-    storage_root: Path,
-) -> dict[str, Any]:
-    """Re-admit saved package members through their exact current Source selectors."""
-    result: dict[str, Any] = {}
-    for dataset_id, selected_case_ids in zip(role.source_dataset_ids, role.case_ids_by_source, strict=True):
-        manifest = datasets.packages.load_package_manifest_evidence("transient_drying", dataset_id, storage_root=storage_root)
-        entries = manifest.get("source_case_identities")
-        if not isinstance(entries, list):
-            message = "Transient Dataset manifest lacks current Source case identities."
-            raise TypeError(message)
-        by_case = {entry["package_case_id"]: entry for entry in entries}
-        if len(by_case) != len(entries):
-            message = "Transient Dataset manifest repeats a package case identity."
-            raise ValueError(message)
-        for package_case_id in selected_case_ids:
-            if package_case_id in result or package_case_id not in by_case:
-                message = f"Transient artifact package case has no unique saved Source identity: {package_case_id!r}."
-                raise ValueError(message)
-            entry = by_case[package_case_id]
-            source = entry["source"]
-            admitted = generation.publication.catalog.resolve_raw_case_reference(
-                "transient_drying",
-                {key: source[key] for key in _SOURCE_SELECTOR_KEYS},
-                storage_root=storage_root,
-            )
-            if admitted.source_identity != source or admitted.design_provenance != entry["design"]:
-                message = f"Transient package Source or design evidence drifted for {package_case_id!r}."
-                raise ValueError(message)
-            result[package_case_id] = admitted
-    return result
 
 
 def _canonical_case_evidence(
@@ -392,7 +339,7 @@ def _canonical_case_evidence(
     package_case_id: str,
     case_record: Mapping[str, Any],
     generation_sources: Mapping[str, Any],
-    spatial_representation: datasets.contracts.transient.TransientSpatialRepresentation | None = None,
+    spatial_representation: datasets.contracts.grid.SpatialRepresentation | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Cross-check Dataset items against canonical Generation case semantics."""
     admitted = generation_sources.get(package_case_id)
@@ -421,7 +368,7 @@ def _canonical_case_evidence(
     )
     representation = spatial_representation
     if representation is None:
-        representation = datasets.contracts.transient.resolve_spatial_representation(
+        representation = datasets.contracts.grid.resolve_spatial_representation(
             cast("tuple[int, int]", canonical_reference.shape[-2:]),
             1,
         )
@@ -551,9 +498,14 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
         raise TypeError(message)
     checkpoint_controller = adapter_state.get("controller")
     terminal_controller = summary.get("terminal_controller")
+    # Only Stage B draws rollout horizons, so only a B records a terminal curriculum.
     terminal_curriculum = summary.get("terminal_curriculum")
-    if not isinstance(checkpoint_controller, Mapping) or not isinstance(terminal_controller, Mapping) or not isinstance(terminal_curriculum, Mapping):
-        message = "Completed transient summary lacks terminal controller/curriculum evidence."
+    if (
+        not isinstance(checkpoint_controller, Mapping)
+        or not isinstance(terminal_controller, Mapping)
+        or (training.get("stage") == "b") != isinstance(terminal_curriculum, Mapping)
+    ):
+        message = "Completed transient summary lacks terminal controller evidence, or curriculum evidence is not exactly Stage B's."
         raise TypeError(message)
     stage = training.get("stage")
     arm = training.get("comparison_arm")
@@ -574,14 +526,14 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
             message = "A0 lineage must not consume a teacher handoff."
             raise ValueError(message)
         task = experiments.config.loader.validate_resolved_task_contract(config)
-        scaling = TransientScalingArtifact.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
+        scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
         model = cast("Mapping[str, Any]", config["model"])
         parent = {
             "source_run_name": completed["scientific_run_name"],
             "source_checkpoint_sha256": completed["selected_checkpoint_sha256"],
             "source_scaling_sha256": completed["normalizer_sha256"],
             "task_contract_sha256": task.contract_digest,
-            "tensorizer_sha256": common.serialization.canonical_json_sha256(scaling.tensorizer.as_dict()),
+            "tensorizer_sha256": common.serialization.canonical_json_sha256(scaling.preprocessing["tensorizer"]),
             "model_kind": model["kind"],
             "input_profile": config["input_profile"],
         }
@@ -591,15 +543,21 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
             raise TypeError(message)
         parent = dict(teacher_handoff)
     strategy = "rollout" if arm == "b" else "teacher_forced_matched_train_seconds" if arm == "a1" else "stage_a_teacher_forced"
+    # The last checkpoint's budget is authoritative; validate_completed_run already required the summary to equal it.
+    budget = learning.training.budget.StageBudget(**learning.training.budget.validate_state(last_checkpoint["budget_state_dict"]))
+    # validate_completed_run admitted the outcome; a diverged stage ends before its budget with its best eligible checkpoint.
+    outcome = cast("Mapping[str, Any]", summary["training_outcome"])
+    if (not budget.complete and outcome["status"] != "diverged") or budget.unit != ("units" if arm == "a0" else "train_seconds"):
+        msg = "Completed transient lineage requires A0's unit budget or B/A1's train_seconds budget, complete unless the stage diverged."
+        raise ValueError(msg)
     manifest: dict[str, Any] = {
         "planned": None if matched is None else dict(matched),
         "actual": dict(terminal_controller),
+        "budget": budget.state_dict(),
+        "training_outcome": dict(outcome),
     }
     if matched is not None:
         if arm == "a0":
-            if checkpoint_controller.get("clock_kind") == "train_seconds" or checkpoint_controller.get("budget_control") != "stage_epochs":
-                msg = "Matched A0 must retain its completed Stage-A epoch budget."
-                raise ValueError(msg)
             parent_evidence = _parent_experiment_evidence(completed)
             if parent_evidence["kind"] != "independent":
                 msg = "Matched A0 requires its exact shared A0 content identity."
@@ -607,21 +565,11 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
             manifest["a0_semantic_config_sha256"] = parent_evidence["semantic_config_sha256"]
         else:
             receipt = _matched_budget_receipt(completed, parent)
-            planned = checkpoint_controller.get("planned_train_seconds")
-            actual = checkpoint_controller.get("train_seconds")
-            if (
-                checkpoint_controller.get("clock_kind") != "train_seconds"
-                or checkpoint_controller.get("budget_control") != "train_seconds"
-                or not isinstance(planned, (int, float))
-                or not isinstance(actual, (int, float))
-                or isinstance(planned, bool)
-                or isinstance(actual, bool)
-                or not (0 < planned <= actual)
-                or (arm == "b" and actual != receipt["budget_value"])
-                or (
-                    arm == "a1"
-                    and (planned != receipt["budget_value"] or checkpoint_controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
-                )
+            planned = budget.total
+            actual = budget.train_seconds
+            if (arm == "b" and actual != receipt["budget_value"]) or (
+                arm == "a1"
+                and (planned != receipt["budget_value"] or checkpoint_controller.get("matched_receipt_sha256") != receipt["receipt_sha256"])
             ):
                 msg = "Matched branch terminal budget contradicts the immutable B receipt."
                 raise ValueError(msg)
@@ -630,7 +578,7 @@ def _lineage(completed: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "stage_identity": {"stage": stage, "comparison_arm": arm},
         "training_strategy": strategy,
-        "curriculum_identity": dict(terminal_curriculum),
+        "curriculum_identity": dict(terminal_curriculum) if isinstance(terminal_curriculum, Mapping) else None,
         "parent_checkpoint": parent,
         "stage_a_handoff": parent,
         "matched_compute_manifest": manifest,
@@ -722,7 +670,7 @@ def _base_identity(
         message = "Completed transient config lacks input-profile identity."
         raise TypeError(message)
     profile = task.input_profile(profile_id)
-    scaling = TransientScalingArtifact.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
     model = config.get("model")
     if not isinstance(model, Mapping) or not isinstance(model.get("params"), Mapping):
         message = "Completed transient model identity is invalid."
@@ -762,10 +710,9 @@ def _base_identity(
         "scaling_identity": {
             "semantic_digest": scaling.digest,
             "normalizer_sha256": completed["normalizer_sha256"],
-            "scale_mode": scaling.scale_mode,
             "spatial_shape": list(scaling.spatial_shape),
             "horizon_hours": scaling.horizon,
-            "tensorizer": scaling.tensorizer.as_dict(),
+            "tensorizer": scaling.preprocessing["tensorizer"],
         },
         "spatial_representation": dict(spatial_representation),
         "training_airflow_source": task.training_airflow_source,
@@ -847,6 +794,8 @@ def _timing_case(
         precision="float32",
         pt_payload_identity=pt_identity,
         warmup_passes=benchmark.warmup_passes,
+        solver_hostname=str(generation_timing["solver_hostname"]),
+        solver_requested_cores=int(generation_timing["solver_requested_cores"]),
         batch_size=1,
         cpu=cpu,
         gpu=gpu,
@@ -869,9 +818,9 @@ def _parent_experiment_evidence(completed: Mapping[str, Any]) -> dict[str, Any]:
         message = "Completed transient evidence lacks its canonical run path, summary, or config."
         raise TypeError(message)
     checkpoint_identity = completed.get("checkpoint_identity")
-    saved_digest = checkpoint_identity.get("resume_contract_digest") if isinstance(checkpoint_identity, Mapping) else None
+    saved_digest = checkpoint_identity.get("effective_config_digest") if isinstance(checkpoint_identity, Mapping) else None
     if not isinstance(saved_digest, str) or re.fullmatch(r"[0-9a-f]{64}", saved_digest) is None:
-        message = "Completed transient parent binding requires a valid saved resume identity."
+        message = "Completed transient parent binding requires a valid saved config identity."
         raise ValueError(message)
     run_evidence = summary.get("run_identity")
     child_source: dict[str, Any] | None = None
@@ -925,20 +874,12 @@ def _parent_experiment_evidence(completed: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _record_metric_statistics(
-    record: sequence_artifact.TransientSequenceRecord,
-    *,
-    scaling: TransientScalingArtifact,
-) -> dict[str, Mapping[str, object]]:
+def _record_metric_statistics(record: sequence_artifact.TransientSequenceRecord) -> dict[str, Mapping[str, object]]:
     """Build full-support errors or explicit unavailability plus raw diagnostics."""
     result: dict[str, Mapping[str, object]] = {}
     density_index = sequence_artifact.STATIC_ORDER.index("rho_bu_dry")
     cumulative_prediction = record.predicted_states[1:]
     cumulative_reference = record.reference_states[1:]
-    cell_weights = transient_metrics.trapezoidal_cell_weights(record.spatial_mask)
-    full_support = bool(record.prediction_available.all()) and bool(np.isfinite(cumulative_prediction).all())
-    normalized_cumulative_prediction = _normalized_metric_state(cumulative_prediction, scaling=scaling) if full_support else None
-    normalized_cumulative_reference = _normalized_metric_state(cumulative_reference, scaling=scaling) if full_support else None
     for scope in ("cumulative", "endpoint"):
         selection = np.arange(record.available_horizon) if scope == "cumulative" else np.asarray([record.available_horizon - 1])
         prediction = cumulative_prediction[selection]
@@ -950,23 +891,13 @@ def _record_metric_statistics(
         support = validity_contract.support_evidence(required=required_count, computed=computed_count, finite=finite_count)
         statistics: Mapping[str, object] | None = None
         if support["available"]:
-            if normalized_cumulative_prediction is None or normalized_cumulative_reference is None:
-                message = "Available transient metrics unexpectedly lack normalized full support."
-                raise RuntimeError(message)
-            normalized_prediction = normalized_cumulative_prediction[selection]
-            normalized_reference = normalized_cumulative_reference[selection]
-            accumulator = transient_metrics.TransientMetricAccumulator(
-                scope=scope,
-            )
+            accumulator = transient_metrics.TransientMetricAccumulator(scope=scope)
             accumulator.update(
-                normalized_prediction=normalized_prediction,
-                normalized_reference=normalized_reference,
                 physical_prediction=prediction,
                 physical_reference=reference,
                 f_surf=np.asarray(record.scalar_conditioning[2]),
                 rho_bu_dry=record.static_conditioning[density_index],
-                cell_weights=cell_weights,
-                valid_mask=record.spatial_mask[None, None],
+                spacing=transient_metrics.grid_spacing(record.static_conditioning),
             )
             statistics = accumulator.state_dict()
         result[scope] = {**support, "statistics": statistics}
@@ -985,46 +916,21 @@ def _record_metric_statistics(
     return result
 
 
-def _normalized_metric_state(
-    value: np.ndarray,
-    *,
-    scaling: TransientScalingArtifact,
-) -> np.ndarray:
-    """Normalize one portable state array through the scaler runtime placement."""
-    with torch.inference_mode():
-        source = torch.from_numpy(np.ascontiguousarray(value))
-        runtime = source.to(device=scaling.device, dtype=scaling.dtype)
-        return scaling.encode_state(runtime).detach().to(device="cpu").numpy()
-
-
 def _timing_case_from_resume(
     value: Any,
     *,
     case_id: str,
 ) -> transient_timing.TransientTimingCase:
     """Restore one strict timing case from JSON-safe resume evidence."""
-    required = {
-        "case_id",
-        "repetitions",
-        "device",
-        "precision",
-        "pt_payload_identity",
-        "warmup_passes",
-        "batch_size",
-        "cpu",
-        "gpu",
-        "software_versions",
-        "cold_timings",
-        "unavailable_reasons",
-    }
-    if not isinstance(value, Mapping) or set(value) != required:
+    if not isinstance(value, Mapping) or set(value) != set(transient_timing.TransientTimingCase.__dataclass_fields__):
         message = "Resumed transient timing-case fields are invalid."
         raise ValueError(message)
     repetitions = value["repetitions"]
     if not isinstance(repetitions, Mapping):
         message = "Resumed transient timing repetitions must be a mapping."
         raise TypeError(message)
-    if any(not isinstance(value[name], str) or not value[name] for name in ("case_id", "device", "precision", "pt_payload_identity", "cpu")):
+    text_fields = ("case_id", "device", "precision", "pt_payload_identity", "cpu", "solver_hostname")
+    if any(not isinstance(value[name], str) or not value[name] for name in text_fields):
         message = "Resumed transient timing-case text fields are invalid."
         raise TypeError(message)
     restored = transient_timing.TransientTimingCase(
@@ -1034,6 +940,8 @@ def _timing_case_from_resume(
         precision=str(value["precision"]),
         pt_payload_identity=str(value["pt_payload_identity"]),
         warmup_passes=int(value["warmup_passes"]),
+        solver_hostname=str(value["solver_hostname"]),
+        solver_requested_cores=int(value["solver_requested_cores"]),
         batch_size=int(value["batch_size"]),
         cpu=str(value["cpu"]),
         gpu=None if value["gpu"] is None else str(value["gpu"]),
@@ -1249,8 +1157,8 @@ def _role_prediction_validity_evidence(
 def _role_spatial_representation_evidence(
     *,
     completed: Mapping[str, Any],
-    training: datasets.contracts.transient.TransientSpatialRepresentation,
-    evaluation: datasets.contracts.transient.TransientSpatialRepresentation,
+    training: datasets.contracts.grid.SpatialRepresentation,
+    evaluation: datasets.contracts.grid.SpatialRepresentation,
     spatial_compatibility: Mapping[str, Any],
     case_grids: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -1284,7 +1192,6 @@ def _role_spatial_representation_evidence(
             "dynamic_fields": list(sequence_artifact.STATE_ORDER),
             "static_fields": list(sequence_artifact.STATIC_ORDER),
             "coordinates": ["x", "y"],
-            "spatial_mask": "same_evaluation_index_map",
             "model_input": "evaluation_grid",
             "reference": "evaluation_grid",
             "prediction": "evaluation_grid",
@@ -1367,7 +1274,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
     dataset_root: Path | str,
     staging_root: Path | str,
     completed: Mapping[str, Any] | None = None,
-    evaluation_spatial_stride: int = 1,
     saved_role: artifact_plan.ArtifactRolePlan | None = None,
     progress_reporter: artifact_performance.ArtifactProgressReporter | None = None,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
@@ -1376,14 +1282,8 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
     with preflight_phase:
         admitted_completed = _completed_transient(run_dir) if completed is None else _require_completed_transient(completed)
         config = cast("Mapping[str, Any]", admitted_completed["config"])
-        training_representation, evaluation_representation = resolve_transient_artifact_spatial_representations(
-            admitted_completed,
-            evaluation_spatial_stride=evaluation_spatial_stride,
-        )
-        print(
-            f"artifact grid {evaluation_representation.source_shape} -> {evaluation_representation.represented_shape}"
-            f" (stride {evaluation_representation.spatial_stride})"
-        )
+        training_representation, evaluation_representation = resolve_transient_artifact_spatial_representations(admitted_completed)
+        print(f"artifact grid {evaluation_representation.source_shape} -> {evaluation_representation.represented_shape}")
         storage_root = common.paths.storage_root_for_datasets_root(dataset_root)
     datasets_for_role: tuple[TransientPhysicalDataset, ...] = ()
     context: Any | None = None
@@ -1478,7 +1378,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     precision="float32",
                     evaluation_spatial_shape=evaluation_representation.represented_shape,
                 )
-                generation_sources = _generation_case_sources(role, storage_root=storage_root)
+                generation_sources = artifact_plan.generation_case_sources(role, task="transient_drying", storage_root=storage_root)
                 datasets_for_role = _load_role_datasets(
                     role,
                     storage_root=storage_root,
@@ -1589,7 +1489,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                     evaluation_representation,
                     reference_states=case.reference_states,
                     static_conditioning=case.static_conditioning,
-                    spatial_mask=case.spatial_mask,
                 )
                 identity = _base_identity(
                     completed=admitted_completed,
@@ -1699,13 +1598,7 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
                 del prepared_case, canonical
             metrics_phase = nullcontext() if progress_reporter is None else progress_reporter.work_phase("metrics")
             with metrics_phase:
-                case_statistics = {
-                    record.record_id: _record_metric_statistics(
-                        record,
-                        scaling=context.scaling,
-                    )
-                    for record in evaluated.records
-                }
+                case_statistics = {record.record_id: _record_metric_statistics(record) for record in evaluated.records}
             serialization_phase = nullcontext() if progress_reporter is None else progress_reporter.work_phase("serialization")
             with serialization_phase:
                 stager.write_case(
@@ -1778,7 +1671,6 @@ def generate_transient_role_artifact(  # noqa: C901, PLR0912, PLR0915
         for phase_name in ("inference", "metrics", "serialization"):
             if phase_name in started_phases:
                 progress_reporter.finish_work_phase(phase_name)
-        progress_reporter.inference_summary()
         progress_reporter.update_cuda_peaks()
     if index is None:
         message = "Transient artifact staging did not finalize."
@@ -1904,7 +1796,6 @@ def _validate_role_spatial_representation(
     *,
     completed: Mapping[str, Any],
     expected_cases: set[str],
-    evaluation_spatial_stride: int,
 ) -> None:
     """Bind role and record grid evidence to exact completed-run spatial owners."""
     evidence = loaded.provenance.get("spatial_representation")
@@ -1922,10 +1813,7 @@ def _validate_role_spatial_representation(
     if not isinstance(evidence, Mapping) or set(evidence) != required:
         message = "Transient artifact role spatial evidence does not match the current schema."
         raise ValueError(message)
-    training, evaluation = resolve_transient_artifact_spatial_representations(
-        completed,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    training, evaluation = resolve_transient_artifact_spatial_representations(completed)
     expected_checkpoint = {
         "identity": dict(cast("Mapping[str, Any]", completed["checkpoint_identity"])),
         "best_checkpoint_sha256": completed["selected_checkpoint_sha256"],
@@ -1935,7 +1823,6 @@ def _validate_role_spatial_representation(
         "dynamic_fields": list(sequence_artifact.STATE_ORDER),
         "static_fields": list(sequence_artifact.STATIC_ORDER),
         "coordinates": ["x", "y"],
-        "spatial_mask": "same_evaluation_index_map",
         "model_input": "evaluation_grid",
         "reference": "evaluation_grid",
         "prediction": "evaluation_grid",
@@ -1951,7 +1838,7 @@ def _validate_role_spatial_representation(
     ):
         message = "Transient artifact role spatial identity is stale or incompatible."
         raise ValueError(message)
-    scaling = TransientScalingArtifact.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(cast("Mapping[str, Any]", completed["normalizer_state"]))
     expected_scaling = scaling.assess_spatial_compatibility(evaluation.represented_shape)
     if evidence["scaling_compatibility"] != expected_scaling:
         message = "Transient artifact scaling compatibility decision is stale or incompatible."
@@ -2010,7 +1897,6 @@ def _validate_role_spatial_representation(
         if (
             not isinstance(case_grid, Mapping)
             or case_grid.get("source_shape") != list(evaluation.source_shape)
-            or case_grid.get("evaluation_spatial_stride") != evaluation.spatial_stride
             or case_grid.get("evaluation_shape") != list(evaluation.represented_shape)
             or case_grid.get("index_identity_sha256") != evaluation.index_identity_sha256
             or case_grid.get("reference_grid_identity_sha256") != case_grid.get("prediction_grid_identity_sha256")
@@ -2024,7 +1910,6 @@ def _validate_transient_role_evidence(
     *,
     completed: Mapping[str, Any],
     role: artifact_plan.ArtifactRolePlan,
-    evaluation_spatial_stride: int = 1,
 ) -> None:
     """Bind eager or indexed sequence evidence to one exact completed run role."""
     _reject_trial(completed)
@@ -2049,12 +1934,7 @@ def _validate_transient_role_evidence(
         message = "Transient artifact Training lineage is stale or incompatible."
         raise ValueError(message)
     expected_cases = {case_id for case_ids in role.case_ids_by_source for case_id in case_ids}
-    _validate_role_spatial_representation(
-        loaded,
-        completed=completed,
-        expected_cases=expected_cases,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    _validate_role_spatial_representation(loaded, completed=completed, expected_cases=expected_cases)
     records: Sequence[object] = loaded.records if isinstance(loaded, sequence_artifact.LoadedTransientSequenceArtifact) else loaded.summaries
     _validate_sequence_inventory(
         records,
@@ -2162,16 +2042,10 @@ def validate_transient_role_artifact(
     *,
     completed: Mapping[str, Any],
     role: artifact_plan.ArtifactRolePlan,
-    evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.LoadedTransientSequenceArtifact:
     """Admit every payload and bind it to exact completed-run role evidence."""
     loaded = sequence_artifact.load_transient_sequence_artifact(root)
-    _validate_transient_role_evidence(
-        loaded,
-        completed=completed,
-        role=role,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    _validate_transient_role_evidence(loaded, completed=completed, role=role)
     return loaded
 
 
@@ -2180,7 +2054,6 @@ def validate_staged_transient_role_artifact(
     *,
     completed: Mapping[str, Any],
     role: artifact_plan.ArtifactRolePlan,
-    evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Bind writer-admitted private staging evidence without rereading payload bytes."""
     if not isinstance(
@@ -2190,12 +2063,7 @@ def validate_staged_transient_role_artifact(
         message = "Transient staging validation requires one admitted sequence index."
         raise TypeError(message)
     sequence_artifact.validate_transient_sequence_payload_inventory(index)
-    _validate_transient_role_evidence(
-        index,
-        completed=completed,
-        role=role,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    _validate_transient_role_evidence(index, completed=completed, role=role)
     return index
 
 
@@ -2204,7 +2072,6 @@ def validate_scoped_transient_role_artifact_index(
     *,
     completed: Mapping[str, Any],
     saved_role: artifact_plan.ArtifactRolePlan,
-    evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Admit one exact selected-case subset without treating it as canonical coverage."""
     loaded = sequence_artifact.load_transient_sequence_artifact_index(root)
@@ -2236,12 +2103,7 @@ def validate_scoped_transient_role_artifact_index(
         selected_case_ids,
     )
     sequence_artifact.validate_transient_sequence_payload_inventory(loaded)
-    _validate_transient_role_evidence(
-        loaded,
-        completed=completed,
-        role=selected_role,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    _validate_transient_role_evidence(loaded, completed=completed, role=selected_role)
     return loaded
 
 
@@ -2250,13 +2112,7 @@ def validate_transient_role_artifact_index(
     *,
     completed: Mapping[str, Any],
     role: artifact_plan.ArtifactRolePlan,
-    evaluation_spatial_stride: int = 1,
 ) -> sequence_artifact.TransientSequenceArtifactIndex:
     """Admit manifest evidence without opening numerical arrays until selected."""
     loaded = sequence_artifact.load_transient_sequence_artifact_index(root)
-    return validate_staged_transient_role_artifact(
-        loaded,
-        completed=completed,
-        role=role,
-        evaluation_spatial_stride=evaluation_spatial_stride,
-    )
+    return validate_staged_transient_role_artifact(loaded, completed=completed, role=role)

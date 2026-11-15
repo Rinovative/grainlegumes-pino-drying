@@ -5,6 +5,7 @@ Responsibilities:
   - Own the schema kind and version of the Dataset manifest and of the steady source-selection identity
   - Compute stable package, case, dataset, and split-membership fingerprints
   - Project an admitted manifest into the binding every runtime Dataset carries
+  - Refuse an Evaluation Dataset on another coordinate grid than the Train Dataset
   - Bind persisted tensors and ordered sample identities to task contracts
   - Refuse Source HDF5 bytes that changed after admission with one error for both Dataset views
 
@@ -60,7 +61,7 @@ _DATASET_CONVERSION_CONTRACTS: Final = {
     "transient_drying": {
         "schema_kind": "dataset_conversion_contract",
         "transition_selection": "consecutive_regular_states_excluding_irregular_stop",
-        "target_semantics": "next_state_minus_current_state",
+        "target_semantics": "stored_next_state",
         "payload_semantics": "portable_source_hdf5_transition_index",
     },
 }
@@ -133,6 +134,8 @@ class ManifestBinding:
     materials: Mapping[str, str]
     design_kinds: Mapping[str, str]
     case_partition: Mapping[str, Any] | None
+    # Every case of one Dataset shares this exact coordinate grid; the planner refuses any other.
+    grid_axes_sha256: str
 
     def split_identity(self) -> dict[str, Any]:
         """Return the manifest part of the persisted split and scaling identity."""
@@ -158,7 +161,30 @@ def manifest_binding(manifest: Mapping[str, Any]) -> ManifestBinding:
         materials={str(entry["package_case_id"]): str(entry["source"]["material_family"]) for entry in entries},
         design_kinds={str(entry["package_case_id"]): str(entry["design"]["design_kind"]) for entry in entries},
         case_partition=copy.deepcopy(manifest["case_partition"]),
+        grid_axes_sha256=_require_sha256(manifest["grid"]["axes_sha256"], label="Dataset grid axes_sha256"),
     )
+
+
+def require_train_grid(train: ManifestBinding, evaluation: Sequence[ManifestBinding]) -> None:
+    """
+    Refuse an Evaluation Dataset whose coordinate grid is not the Train Dataset's.
+
+    Losses and metrics that differentiate take the grid spacing of the Train grid
+    for every case, so the comparison reads only manifest metadata.
+
+    Raises
+    ------
+    ValueError
+        If an Evaluation Dataset's coordinate axes differ from the Train axes.
+
+    """
+    for binding in evaluation:
+        if binding.grid_axes_sha256 != train.grid_axes_sha256:
+            msg = (
+                f"Evaluation Dataset {binding.dataset_id!r} does not share the coordinate grid of Train Dataset {train.dataset_id!r}; "
+                "spatial derivatives use the Train grid spacing for every case."
+            )
+            raise ValueError(msg)
 
 
 def combined_dataset_id(dataset_ids: Sequence[str]) -> str:

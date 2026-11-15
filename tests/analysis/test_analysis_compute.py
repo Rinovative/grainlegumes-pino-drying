@@ -226,7 +226,7 @@ def test_actual_cuda_batch_matches_cpu_when_one_allocated_device_is_visible(monk
 
 
 def test_transient_aggregate_auto_retains_full_grid_and_reports_cpu_route(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A small exact-time aggregate uses all supported cells before display."""
+    """A small exact-time aggregate averages every grid cell of the contributing cases before display."""
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     x, y = np.meshgrid(np.array((0.0, 1.0)), np.array((0.0, 1.0)))
     static = np.zeros((len(transient_artifact.STATIC_ORDER), 2, 2), dtype=np.float64)
@@ -234,7 +234,7 @@ def test_transient_aggregate_auto_retains_full_grid_and_reports_cpu_route(monkey
     static[1] = y
     reference = np.zeros((2, len(transient_artifact.STATE_ORDER), 2, 2), dtype=np.float64)
 
-    def record(error: float, support: np.ndarray) -> dict[str, object]:
+    def record(error: float) -> dict[str, object]:
         prediction = reference.copy()
         prediction[1, 0] = error
         return {
@@ -243,17 +243,16 @@ def test_transient_aggregate_auto_retains_full_grid_and_reports_cpu_route(monkey
             "physical_times": np.array((0.0, 1.0)),
             "reference_states": reference,
             "predicted_states": prediction,
-            "spatial_mask": support,
             "static_conditioning": static,
         }
 
     evidence: dict[str, str] = {}
     result = transient_plots._aggregate_snapshot_evidence(
-        (record(1.0, np.ones((2, 2), dtype=bool)), record(3.0, np.array([[True, False], [True, True]]))),
+        (record(1.0), record(3.0)),
         state_field=transient_artifact.STATE_ORDER[0],
         physical_time=1.0,
         compute_device="auto",
         device_evidence=evidence,
     )
-    np.testing.assert_allclose(result[2], [[2.0, 1.0], [2.0, 2.0]])
+    np.testing.assert_allclose(result[2], np.full((2, 2), 2.0))
     assert "resolved cpu" in evidence["route"]

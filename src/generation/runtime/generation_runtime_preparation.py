@@ -2,12 +2,13 @@
 
 Responsibilities:
   - Create one marked case workspace beneath approved scratch storage
-  - Copy and byte-verify one raw case admitted from canonical storage
-  - Generate case-local adapters and copy a digest-verified COMSOL model
+  - Copy one admitted raw case.json and render its verified stored inputs into the COMSOL CSV files
+  - Copy a digest-verified COMSOL model
   - Preserve cleanup boundaries when preparation fails
 
 Design principles:
-  - Scientific bundle construction remains owned by the cases package
+  - Scientific bundle construction and CSV rendering remain owned by the cases package
+  - Every rendered CSV matches its case identity before COMSOL can start
   - Workspace creation and template copying remain runtime concerns
 
 This module does NOT:
@@ -33,6 +34,8 @@ from . import generation_runtime_workspace as workspace_service
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from src.generation.cases import generation_cases_admission as admission_service
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,11 +86,11 @@ def _resolve_raw_source(
     *,
     storage_root: Path,
     input_generation_id: str | None,
-) -> tuple[Path, str]:
-    """Return the raw case directory to copy and the input-generation identity it is recorded under."""
+) -> admission_service.InputCaseReference:
+    """Return the admitted raw case reference to materialize, bound to its recorded input generation."""
     case_id = config.case_id(case_index)
     try:
-        reference = (
+        return (
             input_service.admit_configured_input_case(
                 config,
                 case_index,
@@ -104,10 +107,9 @@ def _resolve_raw_source(
     except (FileNotFoundError, FileExistsError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = (
             f"Canonical input readiness is required before worker execution for {case_id}; "
-            "prepare canonical inputs through ./scripts/generation before worker execution."
+            f"prepare canonical inputs through ./scripts/generation before worker execution. Cause: {error}"
         )
         raise RuntimeError(message) from error
-    return reference.case_directory, reference.source_id
 
 
 def _materialize_raw_bundle(
@@ -118,14 +120,15 @@ def _materialize_raw_bundle(
     storage_root: Path,
     input_generation_id: str | None,
 ) -> tuple[case_service.CaseBundle, str, Path]:
-    """Copy and re-verify one raw case admitted from canonical storage into isolated scratch."""
+    """Copy one admitted raw case.json into isolated scratch and render its verified COMSOL CSV files beside it."""
     case_id = config.case_id(case_index)
-    source_directory, source_id = _resolve_raw_source(
+    reference = _resolve_raw_source(
         config,
         case_index,
         storage_root=storage_root,
         input_generation_id=input_generation_id,
     )
+    source_directory = reference.case_directory
     source_case_json = source_directory / "case.json"
     payload = json.loads(source_case_json.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -140,19 +143,7 @@ def _materialize_raw_bundle(
     if source_case_json.read_bytes() != target_case_json.read_bytes():
         message = f"Raw case.json changed during scratch materialization: {source_case_json}"
         raise RuntimeError(message)
-    input_paths: list[Path] = []
-    for filename, identity in sorted(payload["input_files"].items()):
-        source_path = source_directory / filename
-        target_path = work_directory / filename
-        shutil.copy2(source_path, target_path)
-        if (
-            target_path.stat().st_size != identity["size_bytes"]
-            or common.serialization.file_sha256(target_path) != identity["sha256"]
-            or target_path.read_bytes() != source_path.read_bytes()
-        ):
-            message = f"Raw case input changed during scratch materialization: {source_path}"
-            raise RuntimeError(message)
-        input_paths.append(target_path)
+    case_service.materialize_case_inputs(source_directory, work_directory, payload, store_identity=reference.store_identity)
     scalar_handoff = (
         None if config.profile.id != profiles.TRANSIENT_DRYING_PROFILE else scalar_handoff_contract.admit_case_scalar_handoff(payload, work_directory)
     )
@@ -163,10 +154,9 @@ def _materialize_raw_bundle(
             case_input_id=str(payload["case_input_id"]),
             simulation_case_id=str(payload["simulation_case_id"]),
             case_payload=payload,
-            input_paths=tuple(input_paths),
             scalar_handoff=scalar_handoff,
         ),
-        source_id,
+        reference.source_id,
         source_directory.resolve(),
     )
 

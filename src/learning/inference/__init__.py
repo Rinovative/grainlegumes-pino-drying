@@ -2,7 +2,7 @@
 Saved-run steady and transient inference reconstruction.
 
 Provides:
-- context: steady model, normalizer, split, and dataloader reconstruction
+- context: steady model, Train scaling, split, and dataloader reconstruction
 - transient: explicit transient-drying model and physical rollout service
 """
 

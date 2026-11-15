@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 import torch
 from support import configs, run_state
+from support.scaling import steady_scaling
 from torch import nn
 from torch.utils.data import Dataset
 
@@ -79,20 +80,24 @@ def _status_run(tmp_path: Path, status: str, *, touch_payloads: bool) -> Path:
     return run_dir
 
 
-@pytest.mark.parametrize("status", ["running", "interrupted", "budget_unmet"])
-def test_inference_and_artifacts_reject_non_completed_status(tmp_path: Path, status: str) -> None:
+@pytest.mark.parametrize(
+    ("status", "advice"),
+    [("running", "Resume the run to completion"), ("interrupted", "Resume the run to completion"), ("unsuccessful", "has no result")],
+)
+def test_inference_and_artifacts_reject_non_completed_status(tmp_path: Path, status: str, advice: str) -> None:
     """
     Create a non-completed run leaf containing every required payload filename.
 
     Inference and artifact planning must both reject it by lifecycle status and
-    tell the user to resume the run to completion, proving apparent file
+    tell the user to resume an unfinished run to completion, while an unsuccessful
+    run, which no resume can give a result, is named as such; apparent file
     completeness cannot bypass completion admission.
     """
     run_dir = _status_run(tmp_path, status, touch_payloads=True)
 
-    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*{advice}"):
         learning.inference.context.load_inference_context(run_dir=run_dir, device_policy="cpu")
-    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*Resume the run to completion"):
+    with pytest.raises(experiments.run.RunLifecycleError, match=rf"{status}.*{advice}"):
         analysis.artifacts.service.load_run_artifact_plan(run_dir)
 
 
@@ -177,12 +182,8 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     """
     context = learning.inference.context
     model = nn.Conv2d(1, 1, kernel_size=1, bias=False)
-    normalizer_state = {
-        "in_normalizer.mean": torch.zeros(1, 1, 1, 1),
-        "in_normalizer.std": torch.ones(1, 1, 1, 1),
-        "out_normalizer.mean": torch.zeros(1, 1, 1, 1),
-        "out_normalizer.std": torch.ones(1, 1, 1, 1),
-    }
+    expected_scaling = steady_scaling((2, 2), state_mean=1.5, state_std=3.0)
+    normalizer_state = expected_scaling.state_dict()
     completed_run = {
         "scientific_run_name": "run",
         "config": {"task": "steady_flow", "producer": _producer("steady_flow")},
@@ -227,7 +228,7 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
 
     monkeypatch.setattr(torch, "load", unexpected_torch_load)
 
-    loaded_model, loader, processor, device = context.load_inference_context(
+    loaded_model, loader, scaling, device = context.load_inference_context(
         run_dir=tmp_path / "run",
         device_policy="cpu",
     )
@@ -237,12 +238,8 @@ def test_inference_uses_exact_normalizer_state_returned_by_validation(
     assert isinstance(selected_dataset, context.IndexedSubset)
     assert len(selected_dataset) == 1
     assert device.type == "cpu"
-    in_normalizer = processor.in_normalizer
-    out_normalizer = processor.out_normalizer
-    assert in_normalizer is not None
-    assert out_normalizer is not None
-    assert torch.equal(in_normalizer.mean, normalizer_state["in_normalizer.mean"])
-    assert torch.equal(out_normalizer.std, normalizer_state["out_normalizer.std"])
+    assert scaling.digest == expected_scaling.digest
+    assert scaling.device == device
 
 
 def test_inference_loader_batches_steady_items_whose_metadata_holds_absent_values() -> None:

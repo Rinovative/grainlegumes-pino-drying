@@ -1,58 +1,80 @@
 """Aggregate strict transient drying evaluation statistics.
 
 Responsibilities:
-  - Accumulate complete-dataset normalized and physical error statistics
-  - Delegate normalized drying macro RMSE to the central learning metric
+  - Accumulate the physical field statistics of one case (learning.metrics.metrics.field_statistics) over its states
+  - Accumulate per-case grain-water and bulk-moisture errors and reduce them over cases like every field metric
   - Derive target, plausibility, and rollout-stability diagnostics
 
 Design principles:
-  - All reductions use float64 sufficient statistics and explicit valid masks
+  - All reductions use float64 sufficient statistics over the full Evaluation grid
+  - Moisture errors weigh cases equally within a material and materials equally, root after the mean
   - Endpoint and cumulative scopes remain explicit in every result
   - Physical granular water content requires an explicit surface fraction
 
 This module does NOT:
   - Run inference, load artifacts, or select evaluation cases
   - Impose monotonicity on surface or internal moisture states
+  - Reduce field errors or the drying objective over cases; the session weighs cases and materials equally for them
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from numbers import Real
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 import numpy as np
 import torch
 
-from src import domain
+from src import domain, learning
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
-from src.learning.metrics import learning_metrics as metrics
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
 _STATE_FIELDS = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
+_STATIC_FIELDS = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning)
 _MINIMUM_STATE_ARRAY_RANK = 2
 _MINIMUM_STABILITY_ARRAY_RANK = 3
-_SPATIAL_MASK_RANK = 2
+_SPATIAL_RANK = 2
 NORMALIZED_AIRFLOW_GROUP_MACRO_RMSE = "normalized_airflow_group_macro_rmse"
 NORMALIZED_DRYING_GROUP_MACRO_RMSE = "normalized_drying_group_macro_rmse"
 TEMPERATURE_PLAUSIBILITY_RANGE_K: Final = (0.0, 2_000.0)
-BULK_MOISTURE_CELL_WEIGHTING: Final = "canonical_trapezoidal_boundary_weights_over_spatial_mask"
+BULK_MOISTURE_CELL_WEIGHTING: Final = "canonical_trapezoidal_boundary_weights_over_the_full_grid"
 BULK_MOISTURE_INVALID_POLICY: Final = "unavailable_without_imputation"
 STABILITY_GROWTH_FACTOR: Final = 2.0
 
 
 @dataclass(frozen=True, slots=True)
-class TransientMetricSummary:
-    """Store complete-dataset transient error results for one explicit scope."""
+class CaseMoisture:
+    """
+    Hold one case's grain-water and bulk-moisture error means for one scope.
+
+    ``w_gr_*`` average over every grid value of every state; the bulk values average over
+    the states with a valid bulk moisture and are ``None`` without one.
+    """
 
     scope: str
-    normalized_drying_group_macro_rmse: float
-    normalized_rmse: Mapping[str, float]
-    physical_rmse: Mapping[str, float]
-    physical_mae: Mapping[str, float]
-    relative_l2: Mapping[str, float]
+    w_gr_squared: float
+    w_gr_absolute: float
+    bulk_dry_squared: float | None
+    bulk_dry_absolute: float | None
+    bulk_wet_squared: float | None
+    bulk_wet_absolute: float | None
+    predicted_bulk_dry: float | None
+    reference_bulk_dry: float | None
+    predicted_bulk_wet: float | None
+    reference_bulk_wet: float | None
+    bulk_valid_count: int
+    bulk_unavailable_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TransientMetricSummary:
+    """Store grain-water and bulk-moisture results of one case population and scope, each case weighing equally."""
+
+    scope: str
     physical_w_gr_rmse: float
     physical_w_gr_mae: float
     bulk_dry_basis_rmse: float | None
@@ -65,7 +87,6 @@ class TransientMetricSummary:
     reference_bulk_wet_basis_mean: float | None
     bulk_moisture_valid_count: int
     bulk_moisture_unavailable_count: int
-    valid_counts: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,39 +147,31 @@ def _as_float64(
     return result
 
 
-def _mask_for(value: np.ndarray | torch.Tensor | None, *, shape: tuple[int, ...]) -> np.ndarray:
-    """Return one broadcast boolean validity mask aligned to a state tensor."""
-    if value is None:
-        return np.ones(shape, dtype=bool)
-    if isinstance(value, torch.Tensor):
-        raw = value.detach().cpu().numpy()
-    elif isinstance(value, np.ndarray):
-        raw = value
-    else:
-        msg = "valid_mask must be a numpy array, torch tensor, or None."
-        raise TypeError(msg)
-    if raw.dtype != np.bool_:
-        msg = "valid_mask must have boolean dtype."
-        raise TypeError(msg)
-    try:
-        result = np.broadcast_to(raw, shape)
-    except ValueError as error:
-        msg = "valid_mask must broadcast to prediction and reference shape."
-        raise ValueError(msg) from error
-    return np.array(result, dtype=bool, copy=True)
-
-
-def trapezoidal_cell_weights(spatial_mask: np.ndarray) -> np.ndarray:
-    """Return canonical structured-grid integration weights over valid cells."""
-    mask = np.asarray(spatial_mask)
-    if mask.dtype != np.bool_ or mask.ndim != _SPATIAL_MASK_RANK or not bool(mask.any()):
-        msg = "spatial_mask must be one non-empty boolean [Y,X] array."
+def trapezoidal_cell_weights(shape: tuple[int, ...]) -> np.ndarray:
+    """Return canonical structured-grid integration weights over one full ``(Y, X)`` grid."""
+    if len(shape) != _SPATIAL_RANK or min(shape) < 1:
+        msg = f"Cell weights require one non-empty (Y, X) grid shape, got {shape}."
         raise ValueError(msg)
-    weights = np.ones(mask.shape, dtype=np.float64)
+    weights = np.ones(shape, dtype=np.float64)
     weights[[0, -1], :] *= 0.5
     weights[:, [0, -1]] *= 0.5
-    weights[~mask] = 0.0
     return weights
+
+
+def grid_spacing(static_conditioning: np.ndarray) -> tuple[float, float]:
+    """Return the uniform (rows, columns) spacing in metres of one record's static ``x`` and ``y`` coordinate fields."""
+    static = np.asarray(static_conditioning, dtype=np.float64)
+    x_coordinates, y_coordinates = static[_STATIC_FIELDS.index("x")], static[_STATIC_FIELDS.index("y")]
+    return float(abs(y_coordinates[1, 0] - y_coordinates[0, 0])), float(abs(x_coordinates[0, 1] - x_coordinates[0, 0]))
+
+
+def state_field_statistics(prediction: np.ndarray, reference: np.ndarray, *, spacing: tuple[float, float]) -> np.ndarray:
+    """Return the physical field statistics of every state row, ``(rows, 4, len(CASE_STATISTICS))``."""
+    return learning.metrics.metrics.field_statistics(
+        torch.from_numpy(np.ascontiguousarray(prediction, dtype=np.float64)),
+        torch.from_numpy(np.ascontiguousarray(reference, dtype=np.float64)),
+        grid_spacing=spacing,
+    )
 
 
 def _surface_fraction(value: np.ndarray | torch.Tensor, *, target_shape: tuple[int, ...]) -> np.ndarray:
@@ -241,29 +254,12 @@ class TransientMetricAccumulator:
     """
 
     def __init__(self, *, scope: str) -> None:
-        """Initialize float64 sufficient statistics and the central macro metric."""
+        """Initialize float64 field, grain-water and bulk-moisture sufficient statistics."""
         if scope not in {"endpoint", "cumulative"}:
             msg = "scope must be either 'endpoint' or 'cumulative'."
             raise ValueError(msg)
-        definition = metrics.ResolvedMetric(
-            id=NORMALIZED_DRYING_GROUP_MACRO_RMSE,
-            kind="drying_group_macro_rmse",
-            space="normalized",
-            fields=_STATE_FIELDS,
-            field_indices=(0, 1, 2, 3),
-            reduction="group_macro_element_mean",
-            direction="minimize",
-            unit="1",
-            operator_dimensionality=2,
-            groups=(),
-            field_standard_deviations=(),
-        )
         self._scope = scope
-        self._normalized_macro = metrics.DryingGroupMacroRMSEMetric(definition, device=torch.device("cpu"))
-        self._squared_sums = np.zeros(len(_STATE_FIELDS), dtype=np.float64)
-        self._absolute_sums = np.zeros(len(_STATE_FIELDS), dtype=np.float64)
-        self._reference_squared_sums = np.zeros(len(_STATE_FIELDS), dtype=np.float64)
-        self._counts = np.zeros(len(_STATE_FIELDS), dtype=np.int64)
+        self._field_sums = np.zeros((len(_STATE_FIELDS), len(learning.metrics.metrics.CASE_STATISTICS)), dtype=np.float64)
         self._w_gr_squared_sum = 0.0
         self._w_gr_absolute_sum = 0.0
         self._w_gr_count = 0
@@ -282,71 +278,37 @@ class TransientMetricAccumulator:
     def update(
         self,
         *,
-        normalized_prediction: np.ndarray | torch.Tensor,
-        normalized_reference: np.ndarray | torch.Tensor,
         physical_prediction: np.ndarray | torch.Tensor,
         physical_reference: np.ndarray | torch.Tensor,
         f_surf: np.ndarray | torch.Tensor,
         rho_bu_dry: np.ndarray | torch.Tensor,
-        cell_weights: np.ndarray | torch.Tensor | None = None,
-        valid_mask: np.ndarray | torch.Tensor | None = None,
+        spacing: tuple[float, float],
     ) -> None:
         """
-        Add one batch of aligned normalized and physical reconstructed states.
+        Add aligned physical reconstructed states of one case on its full Evaluation grid.
 
         Parameters
         ----------
-        normalized_prediction, normalized_reference, physical_prediction, physical_reference
-            Arrays with matching shape ``(batch, 4, ...)`` in canonical state order.
+        physical_prediction, physical_reference
+            Arrays with matching shape ``(states, 4, Y, X)`` in canonical state order.
         f_surf
             Explicit physical surface fraction broadcastable to one moisture channel.
         rho_bu_dry
             Canonical dry-bulk-density field broadcastable across evaluated states.
-        cell_weights
-            Optional non-negative structured-grid integration weights.
-        valid_mask
-            Optional boolean mask broadcastable to every state channel.
+        spacing
+            Grid spacing in metres (rows, then columns) of the H1 statistics.
 
         """
-        normalized_pred = _as_float64(normalized_prediction, label="normalized_prediction")
-        normalized_ref = _as_float64(normalized_reference, label="normalized_reference")
         physical_pred = _as_float64(physical_prediction, label="physical_prediction")
         physical_ref = _as_float64(physical_reference, label="physical_reference")
-        if normalized_pred.shape != normalized_ref.shape or physical_pred.shape != physical_ref.shape:
-            msg = "Prediction and reference arrays must match within each representation."
+        if physical_pred.shape != physical_ref.shape:
+            msg = "Prediction and reference arrays must match."
             raise ValueError(msg)
-        if normalized_pred.shape != physical_pred.shape:
-            msg = "Normalized and physical arrays must have the same reconstructed-state shape."
-            raise ValueError(msg)
-        mask = _mask_for(valid_mask, shape=physical_pred.shape)
-        if not bool(mask.any()):
-            msg = "valid_mask must retain at least one state value."
-            raise ValueError(msg)
-        normalized_pred_tensor = torch.as_tensor(normalized_pred, dtype=torch.float64)
-        normalized_ref_tensor = torch.as_tensor(normalized_ref, dtype=torch.float64)
-        self._normalized_macro.update(
-            normalized_pred_tensor,
-            normalized_ref_tensor,
-            space="normalized",
-            batch_index=self._batch_index,
-            mask=torch.as_tensor(mask, dtype=torch.bool),
-        )
-        difference = physical_pred - physical_ref
-        for index in range(len(_STATE_FIELDS)):
-            selected = difference[:, index][mask[:, index]]
-            self._squared_sums[index] += float(np.square(selected, dtype=np.float64).sum(dtype=np.float64))
-            self._absolute_sums[index] += float(np.abs(selected).sum(dtype=np.float64))
-            selected_reference = physical_ref[:, index][mask[:, index]]
-            self._reference_squared_sums[index] += float(np.square(selected_reference, dtype=np.float64).sum(dtype=np.float64))
-            self._counts[index] += selected.size
+        self._field_sums += state_field_statistics(physical_pred, physical_ref, spacing=spacing).sum(axis=0)
         fraction = _surface_fraction(f_surf, target_shape=physical_pred[:, 2].shape)
         predicted_water = fraction * physical_pred[:, 2] + (1.0 - fraction) * physical_pred[:, 3]
         reference_water = fraction * physical_ref[:, 2] + (1.0 - fraction) * physical_ref[:, 3]
-        water_mask = mask[:, 2] & mask[:, 3]
-        water_difference = (predicted_water - reference_water)[water_mask]
-        if water_difference.size == 0:
-            msg = "valid_mask must retain paired surface and internal moisture values for w_gr."
-            raise ValueError(msg)
+        water_difference = predicted_water - reference_water
         self._w_gr_squared_sum += float(np.square(water_difference, dtype=np.float64).sum(dtype=np.float64))
         self._w_gr_absolute_sum += float(np.abs(water_difference).sum(dtype=np.float64))
         self._w_gr_count += int(water_difference.size)
@@ -357,20 +319,8 @@ class TransientMetricAccumulator:
             target_shape=spatial_shape,
             label="rho_bu_dry",
         )
-        integration_weights = (
-            np.ones(spatial_shape, dtype=np.float64)
-            if cell_weights is None
-            else _broadcast_spatial_field(
-                cell_weights,
-                target_shape=spatial_shape,
-                label="cell_weights",
-            )
-        )
-        if np.any(integration_weights < 0.0):
-            msg = "cell_weights must be non-negative."
-            raise ValueError(msg)
+        weights = trapezoidal_cell_weights(spatial_shape[-2:])
         for index in range(predicted_water.shape[0]):
-            weights = np.where(water_mask[index], integration_weights[index], 0.0)
             predicted_bulk = _bulk_moisture_values(
                 predicted_water[index],
                 dry_density[index],
@@ -401,14 +351,9 @@ class TransientMetricAccumulator:
 
     def state_dict(self) -> dict[str, object]:
         """Return JSON-compatible float64 sufficient statistics for exact merging."""
-        normalized_sums = self._normalized_macro._field_sums  # noqa: SLF001 -- canonical metric persistence
         return {
             "scope": self._scope,
-            "normalized_squared_sums": [float(value) for value in normalized_sums],
-            "squared_sums": self._squared_sums.tolist(),
-            "absolute_sums": self._absolute_sums.tolist(),
-            "reference_squared_sums": self._reference_squared_sums.tolist(),
-            "counts": self._counts.tolist(),
+            "field_statistics": self._field_sums.tolist(),
             "w_gr_squared_sum": self._w_gr_squared_sum,
             "w_gr_absolute_sum": self._w_gr_absolute_sum,
             "w_gr_count": self._w_gr_count,
@@ -430,13 +375,6 @@ class TransientMetricAccumulator:
         value: Mapping[str, object],
     ) -> TransientMetricAccumulator:
         """Recreate one accumulator from validated persisted sufficient statistics."""
-        vector_names = (
-            "normalized_squared_sums",
-            "squared_sums",
-            "absolute_sums",
-            "reference_squared_sums",
-            "counts",
-        )
         scalar_names = (
             "w_gr_squared_sum",
             "w_gr_absolute_sum",
@@ -454,7 +392,7 @@ class TransientMetricAccumulator:
             "bulk_moisture_valid_count",
             "bulk_moisture_unavailable_count",
         )
-        expected = {"scope", *vector_names, *scalar_names, *count_names}
+        expected = {"scope", "field_statistics", *scalar_names, *count_names}
         if set(value) != expected:
             msg = "Transient metric statistic fields do not match the persisted schema."
             raise ValueError(msg)
@@ -462,32 +400,14 @@ class TransientMetricAccumulator:
         if scope not in {"endpoint", "cumulative"}:
             msg = "Transient metric statistics scope is invalid."
             raise ValueError(msg)
-        vectors: dict[str, np.ndarray] = {}
-        for name in vector_names:
-            try:
-                raw = np.asarray(value[name], dtype=np.float64)
-            except (TypeError, ValueError) as error:
-                msg = f"Transient metric statistics {name} is not a real vector."
-                raise ValueError(msg) from error
-            if raw.shape != (len(_STATE_FIELDS),) or not np.isfinite(raw).all() or np.any(raw < 0.0):
-                msg = f"Transient metric statistics {name} is invalid."
-                raise ValueError(msg)
-            vectors[name] = raw
-        raw_counts = np.asarray(value["counts"])
-        if raw_counts.dtype.kind not in {"i", "u"} or np.any(raw_counts <= 0):
-            msg = "Transient metric statistic counts must be positive integers."
-            raise ValueError(msg)
         result = cls(scope=str(scope))
-        result._normalized_macro._field_sums = [  # noqa: SLF001 -- canonical metric restoration
-            float(item) for item in vectors["normalized_squared_sums"]
-        ]
-        result._normalized_macro._field_counts = [  # noqa: SLF001 -- canonical metric restoration
-            int(item) for item in raw_counts
-        ]
-        result._squared_sums = vectors["squared_sums"].copy()
-        result._absolute_sums = vectors["absolute_sums"].copy()
-        result._reference_squared_sums = vectors["reference_squared_sums"].copy()
-        result._counts = raw_counts.astype(np.int64, copy=True)
+        try:
+            # CaseStatistics admits the sums: finite, non-negative, a positive count for every field.
+            sums = np.asarray(value["field_statistics"], dtype=np.float64)
+            result._field_sums = learning.metrics.metrics.CaseStatistics("persisted", "persisted", _STATE_FIELDS, sums).sums.copy()
+        except (TypeError, ValueError) as error:
+            msg = "Transient metric statistics field_statistics is invalid."
+            raise ValueError(msg) from error
         scalar_values: dict[str, float] = {}
         for name in scalar_names:
             raw_scalar = value[name]
@@ -533,29 +453,7 @@ class TransientMetricAccumulator:
             msg = "Transient metric statistic scopes disagree."
             raise ValueError(msg)
         result = cls(scope=scope)
-        normalized_sums = np.sum(
-            [item._normalized_macro._field_sums for item in accumulators],  # noqa: SLF001 -- canonical metric merge
-            axis=0,
-        )
-        normalized_counts = np.sum(
-            [item._normalized_macro._field_counts for item in accumulators],  # noqa: SLF001 -- canonical metric merge
-            axis=0,
-        )
-        result._normalized_macro._field_sums = normalized_sums.tolist()  # noqa: SLF001 -- canonical metric merge
-        result._normalized_macro._field_counts = (  # noqa: SLF001 -- canonical metric merge
-            normalized_counts.astype(int).tolist()
-        )
-        for name in (
-            "_squared_sums",
-            "_absolute_sums",
-            "_reference_squared_sums",
-            "_counts",
-        ):
-            setattr(
-                result,
-                name,
-                np.sum([getattr(item, name) for item in accumulators], axis=0),
-            )
+        result._field_sums = np.sum([np.asarray(state["field_statistics"], dtype=np.float64) for state in states], axis=0)
         for name in (
             "_w_gr_squared_sum",
             "_w_gr_absolute_sum",
@@ -579,51 +477,88 @@ class TransientMetricAccumulator:
         result._batch_index = len(accumulators)
         return result
 
-    def finalize(self) -> TransientMetricSummary:
-        """Finalize complete-dataset metrics from the accumulated statistics."""
-        if self._batch_index == 0 or np.any(self._counts == 0) or self._w_gr_count == 0:
+    def case_statistics(self, case_id: str, material: str) -> learning.metrics.metrics.CaseStatistics:
+        """Return the accumulated field statistics as the statistics of one case."""
+        return learning.metrics.metrics.CaseStatistics(case_id, material, _STATE_FIELDS, self._field_sums.copy())
+
+    def case_moisture(self) -> CaseMoisture:
+        """Return the accumulated grain-water and bulk-moisture means as those of one case."""
+        if self._batch_index == 0 or self._w_gr_count == 0:
             msg = "Transient metric accumulation requires valid complete-dataset samples for every state."
             raise RuntimeError(msg)
-        normalized = self._normalized_macro.components()
-        physical_rmse = {
-            field: float(np.sqrt(total / count)) for field, total, count in zip(_STATE_FIELDS, self._squared_sums, self._counts, strict=True)
-        }
-        physical_mae = {field: float(total / count) for field, total, count in zip(_STATE_FIELDS, self._absolute_sums, self._counts, strict=True)}
-        relative_l2 = {
-            field: float(np.sqrt(squared_error / max(reference_squared, np.finfo(np.float64).eps)))
-            for field, squared_error, reference_squared in zip(
-                _STATE_FIELDS,
-                self._squared_sums,
-                self._reference_squared_sums,
-                strict=True,
-            )
-        }
         bulk_count = self._bulk_moisture_valid_count
-        bulk_dry_rmse = float(np.sqrt(self._bulk_dry_squared_sum / bulk_count)) if bulk_count else None
-        bulk_dry_mae = float(self._bulk_dry_absolute_sum / bulk_count) if bulk_count else None
-        bulk_wet_rmse = float(np.sqrt(self._bulk_wet_squared_sum / bulk_count)) if bulk_count else None
-        bulk_wet_mae = float(self._bulk_wet_absolute_sum / bulk_count) if bulk_count else None
-        return TransientMetricSummary(
+
+        def bulk_mean(total: float) -> float | None:
+            """Return a bulk-moisture total per valid state, or ``None`` without one."""
+            return total / bulk_count if bulk_count else None
+
+        return CaseMoisture(
             scope=self._scope,
-            normalized_drying_group_macro_rmse=self._normalized_macro.compute(),
-            normalized_rmse={field: float(normalized[field]) for field in _STATE_FIELDS},
-            physical_rmse=physical_rmse,
-            physical_mae=physical_mae,
-            relative_l2=relative_l2,
-            physical_w_gr_rmse=float(np.sqrt(self._w_gr_squared_sum / self._w_gr_count)),
-            physical_w_gr_mae=float(self._w_gr_absolute_sum / self._w_gr_count),
-            bulk_dry_basis_rmse=bulk_dry_rmse,
-            bulk_dry_basis_mae=bulk_dry_mae,
-            bulk_wet_basis_rmse=bulk_wet_rmse,
-            bulk_wet_basis_mae=bulk_wet_mae,
-            predicted_bulk_dry_basis_mean=(self._predicted_bulk_dry_sum / bulk_count if bulk_count else None),
-            reference_bulk_dry_basis_mean=(self._reference_bulk_dry_sum / bulk_count if bulk_count else None),
-            predicted_bulk_wet_basis_mean=(self._predicted_bulk_wet_sum / bulk_count if bulk_count else None),
-            reference_bulk_wet_basis_mean=(self._reference_bulk_wet_sum / bulk_count if bulk_count else None),
-            bulk_moisture_valid_count=bulk_count,
-            bulk_moisture_unavailable_count=self._bulk_moisture_unavailable_count,
-            valid_counts={field: int(count) for field, count in zip(_STATE_FIELDS, self._counts, strict=True)},
+            w_gr_squared=self._w_gr_squared_sum / self._w_gr_count,
+            w_gr_absolute=self._w_gr_absolute_sum / self._w_gr_count,
+            bulk_dry_squared=bulk_mean(self._bulk_dry_squared_sum),
+            bulk_dry_absolute=bulk_mean(self._bulk_dry_absolute_sum),
+            bulk_wet_squared=bulk_mean(self._bulk_wet_squared_sum),
+            bulk_wet_absolute=bulk_mean(self._bulk_wet_absolute_sum),
+            predicted_bulk_dry=bulk_mean(self._predicted_bulk_dry_sum),
+            reference_bulk_dry=bulk_mean(self._reference_bulk_dry_sum),
+            predicted_bulk_wet=bulk_mean(self._predicted_bulk_wet_sum),
+            reference_bulk_wet=bulk_mean(self._reference_bulk_wet_sum),
+            bulk_valid_count=bulk_count,
+            bulk_unavailable_count=self._bulk_moisture_unavailable_count,
         )
+
+
+def summarize_moisture(cases: Iterable[tuple[str, CaseMoisture]]) -> TransientMetricSummary:
+    """
+    Reduce the grain-water and bulk-moisture errors of one case population like every reported field metric.
+
+    Parameters
+    ----------
+    cases : Iterable[tuple[str, CaseMoisture]]
+        ``(material, case means)`` of every case of one scope.
+
+    Returns
+    -------
+    TransientMetricSummary
+        Each case's mean over its states (bulk moisture: over its valid states) averaged
+        equally over the cases of a material and over the materials
+        (:func:`learning.metrics.metrics.material_case_mean`); an RMSE takes its root after
+        that mean. A bulk value is ``None`` when a material has no valid bulk state; the
+        valid and unavailable bulk counts are state counts summed over the cases.
+
+    Raises
+    ------
+    ValueError
+        If no case is given or the cases mix scopes.
+
+    """
+    population = tuple(cases)
+    scopes = {moisture.scope for _material, moisture in population}
+    if len(scopes) != 1:
+        msg = "A moisture summary requires at least one case and one shared scope."
+        raise ValueError(msg)
+
+    def reduced(name: str, *, root: bool = False) -> float | None:
+        """Return the material-case mean of one case mean, its root for an RMSE."""
+        value = learning.metrics.metrics.material_case_mean((material, getattr(moisture, name)) for material, moisture in population)
+        return None if value is None else (math.sqrt(value) if root else value)
+
+    return TransientMetricSummary(
+        scope=scopes.pop(),
+        physical_w_gr_rmse=cast("float", reduced("w_gr_squared", root=True)),
+        physical_w_gr_mae=cast("float", reduced("w_gr_absolute")),
+        bulk_dry_basis_rmse=reduced("bulk_dry_squared", root=True),
+        bulk_dry_basis_mae=reduced("bulk_dry_absolute"),
+        bulk_wet_basis_rmse=reduced("bulk_wet_squared", root=True),
+        bulk_wet_basis_mae=reduced("bulk_wet_absolute"),
+        predicted_bulk_dry_basis_mean=reduced("predicted_bulk_dry"),
+        reference_bulk_dry_basis_mean=reduced("reference_bulk_dry"),
+        predicted_bulk_wet_basis_mean=reduced("predicted_bulk_wet"),
+        reference_bulk_wet_basis_mean=reduced("reference_bulk_wet"),
+        bulk_moisture_valid_count=sum(moisture.bulk_valid_count for _material, moisture in population),
+        bulk_moisture_unavailable_count=sum(moisture.bulk_unavailable_count for _material, moisture in population),
+    )
 
 
 def derive_target_censoring_diagnostics(

@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check named channels, physical inverse transforms, units, and mixed-unit rejection
+  - Check that a prediction that overflows on decoding counts as a non-finite validation case
 
 Design principles:
   - Metric-space routing transforms physical tensors exactly once
@@ -17,64 +18,16 @@ import copy
 import pytest
 import torch
 from support import configs
+from support.scaling import steady_scaling
 
 from src import domain, experiments, learning
 
 _TASK = domain.tasks.registry.get_task("steady_flow")
 _GROUP_OBJECTIVE = next(metric for metric in _TASK.default_metrics if metric.kind == "group_macro_rmse")
-_NORMALIZED_AGGREGATE = next(
-    metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "normalized" and metric.fields == _TASK.output_names
-)
+_NORMALIZED_FIELD_METRICS = tuple(metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "normalized")
 _PHYSICAL_FIELD_METRICS = tuple(
     metric for metric in _TASK.default_metrics if metric.kind == "rmse" and metric.space == "physical" and len(metric.fields) == 1
 )
-
-
-class AffineNormalizer:
-    """
-    Apply a scalar affine transform for observable metric-space checks.
-
-    Parameters
-    ----------
-    mean : float
-        Shared physical offset for every synthetic output channel.
-    standard_deviation : float
-        Shared scale. Tests use a positive value and do not model fitted statistics.
-
-    """
-
-    def __init__(self, mean: float, standard_deviation: float) -> None:
-        """Store affine normalization statistics."""
-        self.mean = mean
-        self.standard_deviation = standard_deviation
-
-    def transform(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Normalize one tensor."""
-        return (tensor - self.mean) / self.standard_deviation
-
-    def inverse_transform(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Inverse-normalize one tensor."""
-        return tensor * self.standard_deviation + self.mean
-
-
-class SyntheticProcessor:
-    """
-    Provide the minimal evaluation data-processor surface.
-
-    The helper preserves physical targets and exposes only an output normalizer.
-    it is not a production preprocessor and owns no learned or serialized state.
-    """
-
-    def __init__(self, normalizer: AffineNormalizer) -> None:
-        """Store the synthetic output normalizer."""
-        self.out_normalizer = normalizer
-
-    def eval(self) -> None:
-        """Enter evaluation mode."""
-
-    def preprocess(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Preserve the physical target in evaluation mode."""
-        return {"x": batch["x"], "y": batch["y"]}
 
 
 class UnitErrorModel(torch.nn.Module):
@@ -96,41 +49,92 @@ def _metrics(*metric_ids: str) -> dict[str, learning.metrics.metrics.DatasetMetr
     return learning.metrics.metrics.build_evaluation_metrics(
         config,
         device=torch.device("cpu"),
-        output_standard_deviations=torch.full((_TASK.out_channels,), 2.0),
+        output_scales=torch.full((_TASK.out_channels,), 2.0),
     )
 
 
 def test_normalized_and_physical_rmse_are_space_correct_once() -> None:
     """
-    Evaluate unit normalized error through a processor with physical scale two.
+    Evaluate unit normalized error through a Train scaling with physical scale two.
 
     Normalized metrics must remain one and each physical field RMSE must become
     two exactly once, protecting against missing or duplicate inverse transforms.
     """
     metrics = _metrics(
         _GROUP_OBJECTIVE.id,
-        _NORMALIZED_AGGREGATE.id,
-        *(metric.id for metric in _PHYSICAL_FIELD_METRICS),
+        *(metric.id for metric in (*_NORMALIZED_FIELD_METRICS, *_PHYSICAL_FIELD_METRICS)),
     )
-    normalizer = AffineNormalizer(mean=10.0, standard_deviation=2.0)
-    processor = SyntheticProcessor(normalizer)
+    scaling = steady_scaling((3, 4), state_mean=10.0, state_std=2.0)
     raw_batch = {
         "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
         "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
+        "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
     }
     values = learning.training.loop.eval_one_epoch(
         UnitErrorModel(),
         [raw_batch],  # type: ignore[arg-type]
         metrics,
         torch.device("cpu"),
-        processor,
+        scaling,
     )
 
     assert values[_GROUP_OBJECTIVE.id] == pytest.approx(1.0)
-    assert values[_NORMALIZED_AGGREGATE.id] == pytest.approx(1.0)
-    assert {metric.id: values[metric.id] for metric in _PHYSICAL_FIELD_METRICS} == pytest.approx(
-        {metric.id: 2.0 for metric in _PHYSICAL_FIELD_METRICS}
+    for expected, definitions in ((1.0, _NORMALIZED_FIELD_METRICS), (2.0, _PHYSICAL_FIELD_METRICS)):
+        ids = tuple(metric.id for metric in definitions)
+        assert {metric_id: values[metric_id] for metric_id in ids} == pytest.approx(dict.fromkeys(ids, expected))
+
+
+def test_validation_produces_the_curated_relative_l2_above_the_reference_floors() -> None:
+    """
+    The curated ``physical_relative_l2`` has a producer: references of 10 and physical errors of 2 give 0.2.
+
+    The steady lifecycle test excludes this key, because its tiny references lie below the TaskSpec floors
+    and the metric then has no finite value, which keeps it out of the event.
+    """
+    metrics = _metrics("physical_relative_l2")
+    raw_batch = {
+        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
+        "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
+    }
+    values = learning.training.loop.eval_one_epoch(
+        UnitErrorModel(),
+        [raw_batch],  # type: ignore[arg-type]
+        metrics,
+        torch.device("cpu"),
+        steady_scaling((3, 4), state_mean=10.0, state_std=2.0),
     )
+
+    assert values["physical_relative_l2"] == pytest.approx(0.2)
+
+
+class _OverflowingCaseModel(torch.nn.Module):
+    """Return a finite normalized output whose second case overflows when decoded to physical units."""
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Return normalized ones for the first case and 1e30 for the second."""
+        output = torch.ones((inputs.shape[0], _TASK.out_channels, *inputs.shape[-2:]), device=inputs.device)
+        output[1] = 1.0e30
+        return output
+
+
+def test_a_finite_normalized_prediction_that_overflows_on_decoding_is_a_non_finite_case() -> None:
+    """A state scale of 1e10 decodes the finite 1e30 to inf: validation counts the case and reports no value instead of raising."""
+    raw_batch = {
+        "x": torch.zeros((2, _TASK.in_channels, 3, 4)),
+        "y": torch.full((2, _TASK.out_channels, 3, 4), 10.0),
+        "meta": {"simulation_case_id": ["case-a", "case-b"], "material_family": ["lentil", "pea"]},
+    }
+    values = learning.training.loop.eval_one_epoch(
+        _OverflowingCaseModel(),
+        [raw_batch],  # type: ignore[arg-type]
+        _metrics(_GROUP_OBJECTIVE.id, *(metric.id for metric in _PHYSICAL_FIELD_METRICS)),
+        torch.device("cpu"),
+        steady_scaling((3, 4), state_mean=10.0, state_std=1.0e10),
+    )
+
+    assert values == {learning.training.loop.NONFINITE_CASES_KEY: 1.0}
+    assert not learning.training.loop.validation_eligible(values, _GROUP_OBJECTIVE.id)
 
 
 def test_physical_units_and_named_channel_selection() -> None:
@@ -147,8 +151,9 @@ def test_physical_units_and_named_channel_selection() -> None:
         tuple(torch.full((1, 2, 2), errors[field]) for field in _TASK.output_names),
         dim=1,
     )
+    cases = learning.metrics.metrics.CaseMembership(("case-a",), ("lentil",))
     for metric in metrics.values():
-        metric.update(pred, target, space="physical", batch_index=0)
+        metric.update(pred, target, space="physical", batch_index=0, cases=cases)
 
     for definition in _PHYSICAL_FIELD_METRICS:
         field = definition.fields[0]
@@ -181,5 +186,5 @@ def test_incompatible_physical_aggregate_is_rejected() -> None:
         "objective": {"id": "physical_rmse_all"},
     }
 
-    with pytest.raises(ValueError, match="incompatible units"):
+    with pytest.raises(ValueError, match="exactly one field; selected units"):
         configs.resolve(raw)

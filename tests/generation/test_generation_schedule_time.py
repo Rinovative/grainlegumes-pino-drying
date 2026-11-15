@@ -70,7 +70,7 @@ def test_short_output_preserves_full_schedule_and_sampled_case_inputs(generation
     assert record.regular_output_schedule is not None
     assert record.canonical_schedule.shape[0] == 169
     np.testing.assert_array_equal(record.regular_output_schedule[:, 0], [0.0, 1.0, 2.0, 3.0])
-    assert {p.name: p.read_bytes() for p in original_case.input_paths} == {p.name: p.read_bytes() for p in bounded_case.input_paths}
+    assert original_case.case_payload["input_files"] == bounded_case.case_payload["input_files"]
 
 
 @pytest.mark.parametrize("invalid", ["missing_provenance", "insufficient_coverage", "different_interval", "steady_profile"])

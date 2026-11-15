@@ -13,7 +13,6 @@ This module does NOT:
 from __future__ import annotations
 
 import json
-import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -186,7 +185,6 @@ def test_direct_cli_builds_artifacts_after_strict_completion_on_training_device(
         == 0
     )
     assert artifact_cli_call["device_policy"] == "cuda"
-    assert artifact_cli_call["evaluation_spatial_stride"] == 1
     assert artifact_cli_call["dataset_root"] == tmp_path / "raw"
 
 
@@ -244,8 +242,6 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
                 str(output_root),
                 "--device",
                 "cuda",
-                "--evaluation-spatial-stride",
-                "2",
             ]
         )
         == 0
@@ -258,17 +254,7 @@ def test_artifact_cli_delegates_bounded_transient_scope_to_noncanonical_output(
         "case_ids": ["case-a", "case-c"],
         "one_case": False,
         "device_policy": "cuda",
-        "evaluation_spatial_stride": 2,
     }
-
-
-@pytest.mark.parametrize("value", ["0", "-1", "2.0", "02", "+2", "x"])
-def test_artifact_cli_rejects_malformed_or_nonpositive_evaluation_stride(value: str) -> None:
-    """Reject ambiguous or invalid Evaluation-grid stride syntax before delegation."""
-    with pytest.raises(SystemExit):
-        cli_build_artifacts.main(
-            ["--runs-root", "unused", "--evaluation-spatial-stride", value],
-        )
 
 
 def test_direct_cli_opt_out_skips_only_post_training_artifacts(
@@ -298,16 +284,10 @@ def test_direct_cli_opt_out_skips_only_post_training_artifacts(
     assert calls == ["training"]
 
 
-def test_budget_unmet_continuation_uses_saved_effective_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Print the exact saved leaf so original plan overrides need no manual repetition."""
+def test_matched_cli_forwards_its_plan_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Forward every plan override to the run service, which owns their resolution."""
     config_path = configs.write_yaml(tmp_path / "config folder" / "matched plan.yaml", {})
     run_dir = tmp_path / "leaf folder" / "B run"
-    run_dir.mkdir(parents=True)
-    configs.write_yaml(common.paths.resolve_run_config_path(run_dir), {"training": {"epochs": 8}})
     train_dataset = "lentil_four_hour__c3f0__selected dataset"
     calls: dict[str, object] = {}
 
@@ -316,18 +296,9 @@ def test_budget_unmet_continuation_uses_saved_effective_config(
         calls.update(kwargs)
         return {
             "run_dir": run_dir,
-            "result": {
-                "status": "budget_unmet",
-                "train_seconds": 0.5,
-                "target_train_seconds": 1.0,
-                "completed_epoch": 2,
-                "global_step": 3,
-            },
+            "result": {"status": "completed", "best_epoch": 1, "best_metric": 0.5},
             "stage_runs": {"a0": tmp_path / "A0", "b": run_dir},
-            "stage_outcomes": {
-                "a0": {"result": {"status": "completed"}},
-                "b": {"result": {"status": "budget_unmet"}},
-            },
+            "stage_outcomes": {"a0": {"result": {"status": "completed"}}, "b": {"result": {"status": "completed"}}},
             "device_resolution": SimpleNamespace(device=torch.device("cpu")),
         }
 
@@ -351,7 +322,7 @@ def test_budget_unmet_continuation_uses_saved_effective_config(
                 "none",
             ]
         )
-        == 2
+        == 0
     )
 
     assert calls["train_dataset"] == train_dataset
@@ -359,28 +330,12 @@ def test_budget_unmet_continuation_uses_saved_effective_config(
     assert calls["train_seconds"] == 1
     assert calls["rollout_length"] == 4
     assert calls["lr_scale"] == pytest.approx(0.5)
-    output = capsys.readouterr().out
-    continuation_line = next(line for line in output.splitlines() if line.startswith("Continuation inside"))
-    command = shlex.split(continuation_line.split(": ", maxsplit=1)[1])
-    assert command[:3] == ["python", "-m", "src.experiments.cli.cli_train"]
-    assert command[3] == "--resume"
-    assert command[command.index("--resume") + 1] == str(run_dir)
-    resumed_args = cli_train._build_parser().parse_args(command[3:])
-    assert resumed_args.config_path is None
-    assert resumed_args.train_dataset is None
-    assert resumed_args.epochs is None
-    assert resumed_args.train_seconds is None
-    assert resumed_args.rollout_length is None
-    assert resumed_args.lr_scale is None
-    assert resumed_args.train_stages is None
-    assert Path(resumed_args.resume) == run_dir
-    assert resumed_args.max_epochs == 8
 
 
 @pytest.mark.parametrize(
     "overrides",
-    [["--rollout-length", "0"], ["--epochs", "0"], ["--max-epochs", "0"]],
-    ids=["rollout-length", "epochs", "max-epochs"],
+    [["--rollout-length", "0"], ["--epochs", "0"]],
+    ids=["rollout-length", "epochs"],
 )
 def test_train_cli_rejects_non_positive_budgets_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
@@ -501,23 +456,41 @@ def test_post_training_line_reports_invalid_predictions_and_the_duration_parts(
         assert part in final
 
 
-def test_budget_unmet_status_names_the_operational_cap(capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run that stops before its budget says it hit an operational cap, with the epochs it ran."""
-    run_dir = Path("run")
-    outcome = {"run_dir": run_dir, "result": {"status": "budget_unmet", "completed_epoch": 7}, "device_resolution": _cuda_zero_resolution()}
+@pytest.mark.parametrize(
+    ("result", "exit_code", "line"),
+    [
+        (
+            {"status": "no_eligible_checkpoint", "best_epoch": None, "training_outcome": {"eligible_points": 0, "budget_progress": 1.0}},
+            2,
+            "Training status: no_eligible_checkpoint | unsuccessful: no eligible checkpoint (0 eligible validation points)",
+        ),
+        (
+            {"status": "diverged", "best_epoch": 2, "best_metric": 0.5, "training_outcome": {"eligible_points": 2, "budget_progress": 0.25}},
+            0,
+            "Training status: diverged | best epoch 2 | best metric 5.000e-01 | diverged at 25.0 % of the budget",
+        ),
+    ],
+    ids=["no-eligible-checkpoint", "diverged"],
+)
+def test_the_status_line_names_the_end_status_of_the_run(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, result: dict[str, Any], exit_code: int, line: str
+) -> None:
+    """A run without an eligible checkpoint exits 2; a diverged run keeps its best and names how much budget it spent."""
+    outcome = {"run_dir": Path("run"), "result": result, "device_resolution": _cuda_zero_resolution()}
     monkeypatch.setattr(experiments.run, "run_experiment", lambda *_args, **_kwargs: outcome)
-    monkeypatch.setattr(experiments.config.loader, "load_yaml", lambda _path: {"training": {"epochs": 7}})
 
-    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == 2
+    assert cli_train.main(["experiment.yaml", "--artifacts", "none"]) == exit_code
 
-    assert "Training status: budget_unmet after 7 epochs (operational cap)" in capsys.readouterr().out
+    assert line in capsys.readouterr().out
 
 
-def test_run_admission_rejection_reports_saved_and_requested_epochs(capsys: pytest.CaptureFixture[str]) -> None:
-    """Name both epoch counts instead of the ambiguous ``epoch 5 of 4``."""
-    cli_train._print_existing_run_admission({"reason": "different settings", "completed_epoch": 5, "target_epoch": 4, "status": "completed"})
+def test_run_admission_rejection_reports_the_saved_epochs(capsys: pytest.CaptureFixture[str]) -> None:
+    """Name the saved run's completed epochs next to the rejection reason."""
+    cli_train._print_existing_run_admission({"reason": "different settings", "completed_epoch": 5, "status": "completed"})
 
-    assert "saved 5 epochs, requested 4" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "different settings" in error
+    assert "saved 5 epochs" in error
 
 
 def _capture_post_training_rebuild_flags(monkeypatch: pytest.MonkeyPatch, outcome: dict[str, object]) -> dict[Path, object]:
@@ -647,7 +620,7 @@ def test_optuna_dry_run_resolves_artificial_plan_without_side_effects(
     plan = json.loads(capsys.readouterr().out)
     study_dir = output_root / "steady_flow" / "synthetic_train_override" / "optuna" / f"{study_name}__ep-3__rev-short"
     assert plan["device_policy"] == "cpu"
-    assert plan["semantic_signature"]["payload"]["scientific_base_config"]["training"]["epochs"] == 3
+    assert plan["semantic_signature"]["payload"]["scientific_base_config"]["training"]["budget_epochs"] == 3
     assert plan["study_dir"] == str(study_dir)
     assert plan["trial_root"] == str(study_dir / "trials")
     assert plan["storage"] == f"sqlite:///{study_dir / f'{study_name}.db'}"
@@ -780,8 +753,7 @@ def test_saved_effective_resume_cli_uses_run_config_without_repeating_overrides(
         }
 
     monkeypatch.setattr(experiments.run, "run_experiment", run)
-    assert cli_train.main(["--resume", str(run_dir), "--max-epochs", "12", "--artifacts", "none"]) == 0
+    assert cli_train.main(["--resume", str(run_dir), "--artifacts", "none"]) == 0
     assert Path(str(calls["path"])) == run_dir / "config.yaml"
     assert calls["resume"] == str(run_dir)
-    assert calls["max_epochs"] == 12
     assert all(calls[key] is None for key in ("epochs", "train_dataset", "train_seconds", "rollout_length", "lr_scale"))

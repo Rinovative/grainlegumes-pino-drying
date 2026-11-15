@@ -4,9 +4,10 @@ Responsibilities:
   - Build truthful continuous, categorical, and constant field-map definitions
   - Preserve exact comparison boundaries and semantic colormap selection
   - Supply Matplotlib-ready normalization and rendering keyword arguments
+  - Give the robust percentile range of a state or an error, the one display scale rule of the Evaluation maps
 
 Design principles:
-  - Eleven visible colors require twelve strictly increasing continuous boundaries
+  - A data-derived scale has eleven visible colors on twelve strictly increasing boundaries; a locked round scale has 9 to 13 bands
   - Scientific values remain continuous and caller-owned arrays are never modified
   - Locked comparison scales preserve every boundary rather than only extrema
   - Every returned definition owns a fresh colormap and normalizer and read-only boundary arrays
@@ -32,6 +33,9 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 N_COLOR_BINS: Final = 11
+MIN_BANDS: Final = 9  # a locked round scale has 9 to 13 bands (``analysis_ui_plot_layout.rounded_boundaries``)
+MAX_BANDS: Final = 13
+DISPLAY_PERCENTILES: Final = (5.0, 95.0)  # owner 14.11.: a few extreme cells must not flatten a map
 _CONTINUOUS_BOUNDARY_COUNT = N_COLOR_BINS + 1
 
 
@@ -122,8 +126,8 @@ def build_field_map(
     """
     Build one exact semantic field-map definition without changing scientific values.
 
-    Continuous definitions always contain exactly eleven colors and twelve strictly
-    increasing boundaries. Categorical and constant definitions retain truthful
+    Continuous definitions contain eleven colors and twelve strictly increasing
+    boundaries, or one color per band of locked round boundaries (9 to 13 bands). Categorical and constant definitions retain truthful
     cardinality instead of fabricating eleven intervals.
     """
     resolved = _semantic(semantic)
@@ -142,8 +146,8 @@ def build_field_map(
             raise ValueError(msg)
         return _constant(numeric, metadata, colormap_name)
     boundaries, locked = _boundaries(numeric, resolved, locked_boundaries)
-    boundaries = _validate_continuous_boundaries(boundaries)
-    extend = _locked_extend(numeric, boundaries) if locked else "neither"
+    boundaries = boundaries if locked else _validate_continuous_boundaries(boundaries)  # locked ones were validated by ``_locked``
+    extend = locked_extend(numeric, boundaries) if locked else "neither"
     return _continuous(resolved, metadata, locked, extend, boundaries, _colormap_name(resolved, field, colormap_name))
 
 
@@ -227,11 +231,12 @@ def _locked(locked: FieldMapDefinition | Sequence[float] | np.ndarray, semantic:
         raise ValueError(msg)
     source = locked.boundaries if isinstance(locked, FieldMapDefinition) else locked
     boundaries = np.asarray(source, dtype=np.float64).reshape(-1)
-    if boundaries.size != _CONTINUOUS_BOUNDARY_COUNT or not np.isfinite(boundaries).all() or not np.all(np.diff(boundaries) > 0.0):
-        msg = "Locked continuous field-map boundaries must contain twelve finite strictly increasing values."
+    if not MIN_BANDS < boundaries.size <= MAX_BANDS + 1 or not np.isfinite(boundaries).all() or not np.all(np.diff(boundaries) > 0.0):
+        msg = f"Locked continuous field-map boundaries must contain {MIN_BANDS + 1} to {MAX_BANDS + 1} finite strictly increasing values."
         raise ValueError(msg)
+    centre = (boundaries.size - 1) // 2  # the first boundary above the neutral band of an odd band count
     if semantic in {FieldMapSemantic.LINEAR_SIGNED, FieldMapSemantic.SIGNED_ERROR} and (
-        not np.isclose(boundaries[0], -boundaries[-1]) or not boundaries[5] < 0 < boundaries[6]
+        not np.isclose(boundaries[0], -boundaries[-1]) or boundaries.size % 2 != 0 or not boundaries[centre] < 0 < boundaries[centre + 1]
     ):
         msg = "Locked signed boundaries must be symmetric with a neutral center interval around zero."
         raise ValueError(msg)
@@ -241,8 +246,26 @@ def _locked(locked: FieldMapDefinition | Sequence[float] | np.ndarray, semantic:
     return boundaries
 
 
-def _locked_extend(values: np.ndarray, boundaries: np.ndarray) -> FieldMapExtend:
-    """Expose locked-scale underflow or overflow without adding color intervals."""
+def percentile_scale(values: np.ndarray, kind: Literal["state", "signed", "magnitude"]) -> tuple[float, float] | None:
+    """
+    Return the robust display range of the finite ``values`` (``None`` without any); values beyond it get the bar's arrows.
+
+    A ``state`` runs from the 5th to the 95th percentile, a ``signed`` error symmetric to the larger absolute one of the
+    two, a ``magnitude`` (absolute or normalized error) from 0 to the 95th percentile. The range may be degenerate.
+    """
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return None
+    lower, upper = (float(value) for value in np.percentile(finite, DISPLAY_PERCENTILES))
+    if kind == "signed":
+        reach = max(abs(lower), abs(upper))
+        return -reach, reach
+    return (lower, upper) if kind == "state" else (0.0, upper)
+
+
+def locked_extend(values: np.ndarray, boundaries: np.ndarray) -> FieldMapExtend:
+    """Return the colour-bar arrows for values below the first or above the last boundary, without adding colour intervals."""
     below = bool(np.any(values < boundaries[0]))
     above = bool(np.any(values > boundaries[-1]))
     if below and above:
@@ -319,7 +342,7 @@ def _continuous(
     """Build continuous rendering state with read-only boundaries and fresh Matplotlib objects."""
     field, unit, transform, scope, policy = metadata
     boundaries = _readonly(values)
-    cmap = _new_semantic_colormap(cmap_name, N_COLOR_BINS)
+    cmap = _new_semantic_colormap(cmap_name, boundaries.size - 1)
     return FieldMapDefinition(
         semantic,
         field,

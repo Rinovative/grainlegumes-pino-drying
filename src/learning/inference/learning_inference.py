@@ -3,14 +3,14 @@
 Responsibilities:
   - Resolve the saved task contract and reconstruct the semantic model kind
   - Load saved model weights only when the run's recorded model digest equals the running model code
-  - Load saved normalizer state into a data processor
+  - Rebuild the saved Train scaling on the inference device
   - Reopen each saved split part through the shared runtime factory and refuse drift from its saved identity
   - Build deterministic split-aware evaluation datasets and dataloaders
   - Validate saved field contracts against model and dataset channels
 
 Design principles:
   - Inference mirrors the saved training configuration
-  - The exact normalizer state admitted by evaluable-run validation is reconstructed without refitting
+  - The exact scaling state admitted by evaluable-run validation is rebuilt without refitting
   - Saved split indices are applied before evaluation loaders are built
   - Field order checks fail fast on incompatible artifacts
 
@@ -29,13 +29,13 @@ Notes:
         last_checkpoint.pt
         split_indices.pt
         summary.json
-    Only completed runs are admitted; resume a budget_unmet or interrupted run to completion first.
+    Only completed runs are admitted; resume an interrupted run to completion first.
     Inference sequence:
       1. Load the saved resolved configuration
       2. Reconstruct the model and load best-checkpoint weights
-      3. Restore the admitted normalizer state without refitting
+      3. Rebuild the admitted Train scaling without refitting
       4. Admit the requested saved train, evaluation, or OOD membership, reopen its parts by Dataset ID and apply it
-      5. Build the deterministic loader and return it with the model, processor, and device
+      5. Build the deterministic loader and return it with the model, scaling, and device
 
 """
 
@@ -58,7 +58,6 @@ from ..models import learning_models_factory  # noqa: TID252
 if TYPE_CHECKING:
     from collections.abc import Sized
 
-    from neuralop.data.transforms.data_processors import DefaultDataProcessor
 
 # ======================================================================
 # RUN CONTRACT
@@ -328,12 +327,12 @@ def load_inference_context_with_resolution(
     dataset_root: str | Path | None = None,
     split: SplitRole | str = "id_test",
     batch_size: int = 1,
-) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
+) -> tuple[nn.Module, DataLoader, datasets.preprocessing.normalization.TrainScaling, torch.device]:
     """
     Rebuild a split-aware inference context on one service-resolved device.
 
     This lower-level service reconstructs the model from ``config.yaml``, loads
-    weights from ``best_checkpoint.pt``, restores the saved ``normalizer.pt`` data processor
+    weights from ``best_checkpoint.pt``, rebuilds the saved ``normalizer.pt`` Train scaling
     state, loads `split_indices.pt`, and builds a deterministic loader for the
     requested saved split. It never refits preprocessing statistics during
     inference.
@@ -358,13 +357,13 @@ def load_inference_context_with_resolution(
 
     Returns
     -------
-    tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]
+    tuple[nn.Module, DataLoader, TrainScaling, torch.device]
         model : nn.Module
             Loaded neural operator model.
         loader : DataLoader
             Deterministic evaluation loader over the selected saved split.
-        processor : DefaultDataProcessor
-            Preprocessing pipeline loaded from `normalizer.pt`.
+        scaling : TrainScaling
+            Train scaling rebuilt from `normalizer.pt`.
         device : torch.device
             Device used for inference.
 
@@ -418,7 +417,7 @@ def load_inference_context_with_resolution(
     model.load_state_dict(best_checkpoint["model_state_dict"], strict=True)
     model = model.to(device)
 
-    processor = datasets.preprocessing.normalization.data_processor_from_state(evaluable_run["normalizer_state"], device=device)
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(evaluable_run["normalizer_state"]).to(device)
 
     source_dataset = datasets.preprocessing.splits.combine_identity_datasets(_open_split_sources(split_selection, dataset_root=current_dataset_root))
     # ------------------------------
@@ -438,7 +437,7 @@ def load_inference_context_with_resolution(
     selected_dataset = IndexedSubset(source_dataset, split_selection.indices)
     loader = _build_eval_loader(selected_dataset, batch_size=batch_size)
 
-    return model, loader, processor, device
+    return model, loader, scaling, device
 
 
 def load_inference_context(
@@ -448,7 +447,7 @@ def load_inference_context(
     split: SplitRole | str = "id_test",
     batch_size: int = 1,
     device_policy: str = "auto",
-) -> tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]:
+) -> tuple[nn.Module, DataLoader, datasets.preprocessing.normalization.TrainScaling, torch.device]:
     """
     Resolve a device once and rebuild a complete saved-run inference context.
 
@@ -468,8 +467,8 @@ def load_inference_context(
 
     Returns
     -------
-    tuple[nn.Module, DataLoader, DefaultDataProcessor, torch.device]
-        Loaded model, saved-membership-ordered loader, saved processor, and concrete device.
+    tuple[nn.Module, DataLoader, TrainScaling, torch.device]
+        Loaded model, saved-membership-ordered loader, saved Train scaling, and concrete device.
 
     """
     resolution = learning_device.resolve_device(

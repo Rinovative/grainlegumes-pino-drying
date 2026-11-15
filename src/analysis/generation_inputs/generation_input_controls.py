@@ -1,15 +1,16 @@
 """Build local canonical-dataset selectors for generation-input views.
 
 Responsibilities:
-  - Bind Dataset A, Case A, Dataset B, and Case B controls
+  - Bind Dataset A, Case A, Dataset B, and Case B selectors and navigators to the shared selection
   - Default both datasets together and select the first two unique cases
-  - Restrict A/B choices to compatible simulation profiles
-  - Provide a local optional A/B map-scale lock and dataset-overview selector
+  - Restrict Dataset B to the simulation profile of Dataset A
+  - Provide a local optional A/B map-scale lock, a dataset-overview selector, atlas field checkboxes, and campaign-outcome filters
 
 Design principles:
   - Visible labels are concise while values retain canonical immutable keys
   - Selector changes rerender automatically without an update button
   - Case arrays and empirical means load only when the active view renders
+  - Every control comes from the control standard and is placed in panel rows, datasets in collapsed groups by sampling regime
 
 This module does NOT:
   - Refresh discovery, construct tabs, render figures, or discover storage paths
@@ -21,9 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-import ipywidgets as widgets
-
-from src.analysis import ui
+from src.analysis import presentation, ui
 
 from . import generation_input_selection as shared_selection
 from . import generation_input_sources as sources
@@ -32,28 +31,11 @@ from .plots import generation_input_plot_atlas as atlas_plots
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    import ipywidgets as widgets
+
     from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 
-DATASET_SELECTOR_WIDTH_PX = 360
-DATASET_LABEL_WIDTH_PX = 78
-CASE_LABEL_WIDTH_PX = 54
-CASE_VALUE_WIDTH_PX = 63
-CASE_SELECTOR_WIDTH_PX = CASE_LABEL_WIDTH_PX + CASE_VALUE_WIDTH_PX
-CASE_STEP_WIDTH_PX = 40
-_DATASET_LAYOUT = widgets.Layout(
-    width=f"{DATASET_SELECTOR_WIDTH_PX}px",
-    max_width="100%",
-    flex=f"0 0 {DATASET_SELECTOR_WIDTH_PX}px",
-)
-_CASE_LAYOUT = widgets.Layout(
-    width=f"{CASE_SELECTOR_WIDTH_PX}px",
-    flex=f"0 0 {CASE_SELECTOR_WIDTH_PX}px",
-)
-_STEP_LAYOUT = widgets.Layout(width=f"{CASE_STEP_WIDTH_PX}px")
-_DATASET_STYLE = {"description_width": f"{DATASET_LABEL_WIDTH_PX}px"}
-_CASE_STYLE = {"description_width": f"{CASE_LABEL_WIDTH_PX}px"}
-_DATASET_KEY_LENGTH = 2
-_CASE_KEY_LENGTH = 3
+type ViewPopover = tuple[widgets.ToggleButton, widgets.DOMWidget]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +50,98 @@ class SelectedComparison:
     lock_scale: bool
 
 
+def _dataset_block(
+    catalog: sources.GenerationInputDatasetCatalog,
+    noun: str,
+    selected: sources.DatasetKey | None,
+    *,
+    profile_ids: Iterable[str] | None = None,
+) -> ui.selectors.ChoiceBlock:
+    """Return a one-of dataset block over the catalog's datasets, grouped by sampling regime."""
+    labels = {key: label for label, key in catalog.dataset_options(profile_ids=profile_ids)}
+    groups: dict[str, list[tuple[str, sources.DatasetKey]]] = {}
+    for dataset in catalog.datasets:
+        key = sources.dataset_key(dataset)
+        if key in labels:
+            groups.setdefault(dataset.sampling_regime, []).append((labels[key], key))
+    return ui.selectors.ChoiceBlock(
+        noun,
+        [(presentation.display_labels.regime_display_label(regime), items) for regime, items in groups.items()],
+        multiple=False,
+        selected=[selected] if selected in labels else [],
+    )
+
+
+def _dataset_key(block: ui.selectors.ChoiceBlock) -> sources.DatasetKey:
+    """Return the canonical key of a one-of dataset block's selection."""
+    return cast("sources.DatasetKey", block.selected()[0])
+
+
+def _case_numbers(catalog: sources.GenerationInputDatasetCatalog, dataset_key: sources.DatasetKey) -> dict[int, sources.CaseKey]:
+    """Return the immutable case key behind every admitted numeric case label of one dataset."""
+    numbers: dict[int, sources.CaseKey] = {}
+    for label, case_key in catalog.case_options(dataset_key):
+        try:
+            number = int(label)
+        except ValueError as error:
+            message = f"Generation-input case label must be numeric, got {label!r}."
+            raise ValueError(message) from error
+        if number in numbers:
+            message = f"Generation-input dataset contains duplicate case number {number}."
+            raise ValueError(message)
+        numbers[number] = case_key
+    return numbers
+
+
+class _CaseSelector:
+    """Bind one case navigator to the admitted sparse case numbers of a dataset and publish the cases a user selects."""
+
+    def __init__(
+        self,
+        catalog: sources.GenerationInputDatasetCatalog,
+        dataset_key: sources.DatasetKey,
+        case_key: sources.CaseKey,
+        *,
+        description: str,
+        status: ui.controls.StatusLine,
+        publish: Callable[[sources.CaseKey], None],
+    ) -> None:
+        """Create the navigator on ``case_key``; ``publish`` receives every case a user selects."""
+        self._catalog = catalog
+        self._publish = publish
+        self._keys: dict[int, sources.CaseKey] = {}
+        self._updating = False
+        numbers, selected = self._resolve(dataset_key, case_key)
+        self.navigator = ui.navigation.CaseNavigator(numbers, value=selected, description=description, status=status, on_change=self._changed)
+
+    def sync(self, dataset_key: sources.DatasetKey, case_key: sources.CaseKey) -> None:
+        """Show the case numbers of ``dataset_key`` with ``case_key`` selected, without publishing."""
+        numbers, selected = self._resolve(dataset_key, case_key)
+        self._updating = True
+        try:
+            # An unchanged navigator is left alone, so the warning of a corrected typed case stays on the status line.
+            if self.navigator.case_ids != numbers:
+                self.navigator.rebind(numbers, preserve=False, notify=False)
+            if self.navigator.value != selected:
+                self.navigator.step(numbers.index(selected) - self.navigator.position)
+        finally:
+            self._updating = False
+
+    def _resolve(self, dataset_key: sources.DatasetKey, case_key: sources.CaseKey) -> tuple[tuple[int, ...], int]:
+        """Rebuild the number-to-key mapping and return the numbers and the number of ``case_key``."""
+        self._keys = _case_numbers(self._catalog, dataset_key)
+        selected = [number for number, key in self._keys.items() if key == case_key]
+        if len(selected) != 1:
+            message = "Shared generation-input case is absent from its selected dataset."
+            raise ValueError(message)
+        return tuple(self._keys), selected[0]
+
+    def _changed(self, number: int) -> None:
+        """Publish a user-selected case number as its canonical case key."""
+        if not self._updating:
+            self._publish(self._keys[number])
+
+
 class FieldAtlasControls:
     """Bind a single admitted case and independently retained spatial fields."""
 
@@ -76,7 +150,7 @@ class FieldAtlasControls:
         catalog: sources.GenerationInputDatasetCatalog,
         selection_state: shared_selection.GenerationInputSelectionState,
     ) -> None:
-        """Use the common Case A selection without loading dataset means."""
+        """Use the common Case A selection and load only that case, never the dataset means."""
         if selection_state.catalog is not catalog:
             message = "Atlas controls require the selection state's admitted catalog."
             raise ValueError(message)
@@ -84,57 +158,41 @@ class FieldAtlasControls:
         self._state = selection_state
         self._callback: Callable[[], None] | None = None
         self._updating = False
-        self._atlas: atlas_plots.GeneratedFieldAtlas | None = None
-        self._loaded_key: sources.CaseKey | None = None
-        self._selected_fields: tuple[str, ...] | None = None
-        self.dataset = widgets.Dropdown(description="Dataset:", options=catalog.dataset_options(), layout=_DATASET_LAYOUT)
-        self.case = widgets.Dropdown(description="Case:", layout=_CASE_LAYOUT)
-        self.fields = ui.components.ChannelCheckboxState(
-            title="Spatial fields",
-            callback=self._changed,
-            selection_getter=lambda: self._selected_fields,
-            selection_setter=self._retain_fields,
+        selection = selection_state.selection
+        self.status = ui.controls.StatusLine()
+        self.dataset = _dataset_block(catalog, "Datensätze", selection.dataset_a_key)
+        self._case = _CaseSelector(
+            catalog, selection.dataset_a_key, selection.case_a_key, description="Case", status=self.status, publish=selection_state.select_case_a
         )
-        self._synchronize(selection_state.selection)
-        self.dataset.observe(self._dataset_changed, names="value")
-        self.case.observe(self._case_changed, names="value")
+        self._loaded_key = selection.case_a_key
+        self._atlas = atlas_plots.prepare_field_atlas(catalog.load(self._loaded_key))
+        self.fields = ui.controls.ChannelChecks(tuple(self._atlas.fields), labels=self._atlas.labels, title="Spatial fields")
+        self.rows = (ui.panel.row(self.dataset.header, self._case.navigator.widget), ui.panel.row(self.fields.widget))
+        self.popovers: tuple[ViewPopover, ...] = ((self.dataset.header, self.dataset.body),)
+        self.dataset.observe(self._dataset_changed)
+        self.fields.observe(self._changed)
         selection_state.observe(self._synchronize)
-
-    @property
-    def widget(self) -> widgets.VBox:
-        """Return one case row and the maintained independent field selector."""
-        return widgets.VBox((ui.components.ui_control_row(self.dataset, self.case), self.fields.container))
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind automatic rendering without eagerly opening scientific arrays."""
         self._callback = callback
-
-    def _retain_fields(self, selected: tuple[str, ...]) -> None:
-        """Keep explicit field choices through case and view changes."""
-        self._selected_fields = selected
 
     def _changed(self) -> None:
         """Notify the active view after a complete semantic state update."""
         if self._callback is not None and not self._updating:
             self._callback()
 
-    def _dataset_changed(self, _change: object) -> None:
+    def _dataset_changed(self) -> None:
         """Delegate canonical membership reconciliation to the shared owner."""
-        if not self._updating and self.dataset.value is not None:
-            self._state.select_dataset_a(self.dataset.value)
-
-    def _case_changed(self, _change: object) -> None:
-        """Select one admitted sparse case key through the shared owner."""
-        if not self._updating and self.case.value is not None:
-            self._state.select_case_a(self.case.value)
+        if not self._updating:
+            self._state.select_dataset_a(_dataset_key(self.dataset))
 
     def _synchronize(self, selection: shared_selection.GenerationInputSelection) -> None:
         """Update controls without recursive events or loading unrelated cases."""
         self._updating = True
         try:
-            self.dataset.value = selection.dataset_a_key
-            self.case.options = self._catalog.case_options(selection.dataset_a_key)
-            self.case.value = selection.case_a_key
+            self.dataset.select([selection.dataset_a_key])
+            self._case.sync(selection.dataset_a_key, selection.case_a_key)
         finally:
             self._updating = False
         self._changed()
@@ -142,46 +200,13 @@ class FieldAtlasControls:
     def selected_atlas(self) -> atlas_plots.GeneratedFieldAtlas:
         """Prepare arrays and full-grid scales only when the selected case changes."""
         key = self._state.selection.case_a_key
-        if self._atlas is None or self._loaded_key != key:
+        if self._loaded_key != key:
             self._atlas = atlas_plots.prepare_field_atlas(self._catalog.load(key))
             self._loaded_key = key
-            self.fields.rebind(tuple(self._atlas.fields), labels=self._atlas.labels)
+            removed = self.fields.rebind(tuple(self._atlas.fields), labels=self._atlas.labels)
+            if removed:
+                self.status.set(f"Unavailable fields removed: {', '.join(removed)}.", "warning")
         return self._atlas
-
-
-def _dropdown(
-    *,
-    description: str,
-    layout: widgets.Layout,
-) -> widgets.Dropdown:
-    """Create one compact local dropdown with explicit label width."""
-    return widgets.Dropdown(
-        description=description,
-        style=_DATASET_STYLE,
-        layout=layout,
-    )
-
-
-def _case_control(*, description: str) -> widgets.BoundedIntText:
-    """Create one compact directly editable numeric case selector."""
-    return widgets.BoundedIntText(
-        value=0,
-        min=0,
-        max=0,
-        description=description,
-        continuous_update=False,
-        style=_CASE_STYLE,
-        layout=_CASE_LAYOUT,
-    )
-
-
-def _step_button(description: str, tooltip: str) -> widgets.Button:
-    """Create one compact case-navigation button."""
-    return widgets.Button(
-        description=description,
-        tooltip=tooltip,
-        layout=_STEP_LAYOUT,
-    )
 
 
 class PairCaseControls:
@@ -208,194 +233,60 @@ class PairCaseControls:
         self._selection_state = selection_state
         self._callback: Callable[[], None] | None = None
         self._updating = True
-        self.dataset_a = _dropdown(description="Dataset A:", layout=_DATASET_LAYOUT)
-        self.case_a = _case_control(description="Case A:")
-        self.previous_a = _step_button("\u2190", "Previous case A")
-        self.following_a = _step_button("\u2192", "Next case A")
-        self.dataset_b = _dropdown(description="Dataset B:", layout=_DATASET_LAYOUT)
-        self.case_b = _case_control(description="Case B:")
-        self.previous_b = _step_button("\u2190", "Previous case B")
-        self.following_b = _step_button("\u2192", "Next case B")
-        self._case_keys_a: dict[int, sources.CaseKey] = {}
-        self._case_keys_b: dict[int, sources.CaseKey] = {}
-        self._last_valid_case_a = 0
-        self._last_valid_case_b = 0
-        self.scale_lock = (
-            widgets.Checkbox(
-                value=False,
-                description="Lock A/B color scale",
-                indent=False,
-                style={"description_width": "initial"},
-            )
-            if include_scale_lock
-            else None
+        selection = selection_state.selection
+        self.status = ui.controls.StatusLine()
+        self.dataset_a = _dataset_block(catalog, "Datensatz A", selection.dataset_a_key)
+        self._cases_a = _CaseSelector(
+            catalog, selection.dataset_a_key, selection.case_a_key, description="Case A", status=self.status, publish=selection_state.select_case_a
         )
-        self._apply_shared_selection(selection_state.selection)
-        self.dataset_a.observe(self._on_dataset_a_change, names="value")
-        self.dataset_b.observe(self._on_dataset_b_change, names="value")
-        self.case_a.observe(
-            lambda _change: self._on_case_change(self.case_a),
-            names="value",
+        self.case_a = self._cases_a.navigator
+        # Dataset B offers only Dataset A's profile, so every profile has its own block and the matching one is shown.
+        self._datasets_b = {
+            profile: _dataset_block(catalog, "Datensatz B", selection.dataset_b_key, profile_ids=(profile,)) for profile in catalog.profiles
+        }
+        self._cases_b = _CaseSelector(
+            catalog, selection.dataset_b_key, selection.case_b_key, description="Case B", status=self.status, publish=selection_state.select_case_b
         )
-        self.case_b.observe(
-            lambda _change: self._on_case_change(self.case_b),
-            names="value",
-        )
+        self.case_b = self._cases_b.navigator
+        self.scale_lock = ui.controls.scale_lock_checkbox(value=False, description="Lock A/B color scale") if include_scale_lock else None
+        rows = [
+            ui.panel.row(self.dataset_a.header, self.case_a.widget),
+            ui.panel.row(*(block.header for block in self._datasets_b.values()), self.case_b.widget),
+        ]
         if self.scale_lock is not None:
-            self.scale_lock.observe(self._on_value_change, names="value")
-        self.previous_a.on_click(lambda _button: self._step_case(self.case_a, -1))
-        self.following_a.on_click(lambda _button: self._step_case(self.case_a, 1))
-        self.previous_b.on_click(lambda _button: self._step_case(self.case_b, -1))
-        self.following_b.on_click(lambda _button: self._step_case(self.case_b, 1))
+            rows.append(ui.panel.row(self.scale_lock))
+        self.rows = tuple(rows)
+        self.popovers: tuple[ViewPopover, ...] = tuple((block.header, block.body) for block in (self.dataset_a, *self._datasets_b.values()))
+        self._apply_shared_selection(selection)
+        self.dataset_a.observe(self._on_dataset_a_change)
+        for block in self._datasets_b.values():
+            block.observe(self._on_dataset_b_change)
+        if self.scale_lock is not None:
+            self.scale_lock.observe(lambda _change: self._notify(), names="value")
         self._selection_state.observe(self._on_shared_selection)
 
     @property
-    def widget(self) -> widgets.VBox:
-        """Return two compact selector rows and an optional local scale lock."""
-        first = ui.components.ui_control_row(self.dataset_a, self.case_a, self.previous_a, self.following_a)
-        second = ui.components.ui_control_row(self.dataset_b, self.case_b, self.previous_b, self.following_b)
-        children: list[widgets.Widget] = [first, second]
-        if self.scale_lock is not None:
-            children.append(ui.components.ui_control_row(self.scale_lock))
-        return widgets.VBox(tuple(children))
+    def dataset_b(self) -> ui.selectors.ChoiceBlock:
+        """Return the Dataset B block of Dataset A's simulation profile."""
+        return self._datasets_b[self._selection_state.selection.dataset_a_key[0]]
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind the automatic render callback for semantic changes."""
         self._callback = callback
 
-    @staticmethod
-    def _dataset_key(dropdown: widgets.Dropdown) -> sources.DatasetKey | None:
-        """Return one valid selected dataset key or None."""
-        value = dropdown.value
-        if isinstance(value, tuple) and len(value) == _DATASET_KEY_LENGTH and all(isinstance(item, str) for item in value):
-            return cast("sources.DatasetKey", value)
-        return None
-
-    def _case_mapping(
-        self,
-        control: widgets.BoundedIntText,
-    ) -> dict[int, sources.CaseKey]:
-        """Return the immutable-key mapping owned by one numeric control."""
-        if control is self.case_a:
-            return self._case_keys_a
-        if control is self.case_b:
-            return self._case_keys_b
-        message = "Case controls must belong to this A/B selector."
-        raise ValueError(message)
-
-    def _case_key(
-        self,
-        control: widgets.BoundedIntText,
-    ) -> sources.CaseKey | None:
-        """Return the canonical key behind one valid visible case number."""
-        return self._case_mapping(control).get(int(control.value))
-
-    def _last_valid_case(self, control: widgets.BoundedIntText) -> int:
-        """Return the last valid number owned by one case control."""
-        if control is self.case_a:
-            return self._last_valid_case_a
-        if control is self.case_b:
-            return self._last_valid_case_b
-        message = "Case controls must belong to this A/B selector."
-        raise ValueError(message)
-
-    def _set_last_valid_case(
-        self,
-        control: widgets.BoundedIntText,
-        value: int,
-    ) -> None:
-        """Record the last valid typed number for one case control."""
-        if control is self.case_a:
-            self._last_valid_case_a = value
-        elif control is self.case_b:
-            self._last_valid_case_b = value
-        else:
-            message = "Case controls must belong to this A/B selector."
-            raise ValueError(message)
-
-    def _sync_case_buttons(self, control: widgets.BoundedIntText) -> None:
-        """Disable navigation arrows at the current available-case bounds."""
-        numbers = tuple(self._case_mapping(control))
-        if control is self.case_a:
-            previous, following = self.previous_a, self.following_a
-        else:
-            previous, following = self.previous_b, self.following_b
-        if not numbers or int(control.value) not in numbers:
-            previous.disabled = True
-            following.disabled = True
-            return
-        position = numbers.index(int(control.value))
-        previous.disabled = position == 0
-        following.disabled = position == len(numbers) - 1
-
-    def _step_case(self, control: widgets.BoundedIntText, delta: int) -> None:
-        """Move one numeric selector through admitted sparse case numbers."""
-        numbers = tuple(self._case_mapping(control))
-        if not numbers or int(control.value) not in numbers:
-            return
-        position = numbers.index(int(control.value))
-        target = max(0, min(len(numbers) - 1, position + delta))
-        control.value = numbers[target]
-
-    def _sync_case_control(
-        self,
-        control: widgets.BoundedIntText,
-        dataset_key: sources.DatasetKey,
-        selected_key: sources.CaseKey,
-    ) -> None:
-        """Rebuild one numeric widget from canonical admitted case keys."""
-        mapping = self._case_mapping(control)
-        mapping.clear()
-        for label, case_key in self._catalog.case_options(dataset_key):
-            try:
-                number = int(label)
-            except ValueError as error:
-                message = f"Generation-input case label must be numeric, got {label!r}."
-                raise ValueError(message) from error
-            if number in mapping:
-                message = f"Generation-input dataset contains duplicate case number {number}."
-                raise ValueError(message)
-            mapping[number] = case_key
-        selected_numbers = tuple(number for number, case_key in mapping.items() if case_key == selected_key)
-        if len(selected_numbers) != 1:
-            message = "Shared generation-input case is absent from its selected dataset."
-            raise ValueError(message)
-        numbers = tuple(mapping)
-        selected = selected_numbers[0]
-        control.disabled = not numbers
-        minimum = min(numbers, default=0)
-        maximum = max(numbers, default=0)
-        if minimum > control.max:
-            control.max = maximum
-            control.min = minimum
-        else:
-            control.min = minimum
-            control.max = maximum
-        control.value = selected
-        self._set_last_valid_case(control, selected)
-        self._sync_case_buttons(control)
-
     def _apply_shared_selection(
         self,
         value: shared_selection.GenerationInputSelection,
     ) -> None:
-        """Synchronize every local widget under one explicit observer guard."""
+        """Synchronize every local control under one explicit observer guard."""
         self._updating = True
         try:
-            self.dataset_a.options = self._catalog.dataset_options()
-            self.dataset_a.value = value.dataset_a_key
-            self.dataset_b.options = self._catalog.dataset_options(profile_ids=(value.dataset_a_key[0],))
-            self.dataset_b.value = value.dataset_b_key
-            self._sync_case_control(
-                self.case_a,
-                value.dataset_a_key,
-                value.case_a_key,
-            )
-            self._sync_case_control(
-                self.case_b,
-                value.dataset_b_key,
-                value.case_b_key,
-            )
+            self.dataset_a.select([value.dataset_a_key])
+            for profile, block in self._datasets_b.items():
+                ui.controls.set_visible(block.header, profile == value.dataset_a_key[0])
+            self._datasets_b[value.dataset_a_key[0]].select([value.dataset_b_key])
+            self._cases_a.sync(value.dataset_a_key, value.case_a_key)
+            self._cases_b.sync(value.dataset_b_key, value.case_b_key)
         finally:
             self._updating = False
 
@@ -424,43 +315,15 @@ class PairCaseControls:
         if not self._updating and self._callback is not None:
             self._callback()
 
-    def _on_dataset_a_change(self, _change: object) -> None:
+    def _on_dataset_a_change(self) -> None:
         """Publish one local Dataset A change to shared state."""
-        if self._updating:
-            return
-        dataset_key = self._dataset_key(self.dataset_a)
-        if dataset_key is not None:
-            self._selection_state.select_dataset_a(dataset_key)
+        if not self._updating:
+            self._selection_state.select_dataset_a(_dataset_key(self.dataset_a))
 
-    def _on_dataset_b_change(self, _change: object) -> None:
+    def _on_dataset_b_change(self) -> None:
         """Publish one local Dataset B change to shared state."""
-        if self._updating:
-            return
-        dataset_key = self._dataset_key(self.dataset_b)
-        if dataset_key is not None:
-            self._selection_state.select_dataset_b(dataset_key)
-
-    def _on_value_change(self, _change: object) -> None:
-        """Render after a genuinely view-local scale-lock change."""
-        self._notify()
-
-    def _on_case_change(self, control: widgets.BoundedIntText) -> None:
-        """Publish valid typed cases and restore rejected sparse numbers."""
-        if self._updating:
-            return
-        case_key = self._case_key(control)
-        if case_key is None:
-            self._updating = True
-            try:
-                control.value = self._last_valid_case(control)
-            finally:
-                self._updating = False
-            self._sync_case_buttons(control)
-            return
-        if control is self.case_a:
-            self._selection_state.select_case_a(case_key)
-        else:
-            self._selection_state.select_case_b(case_key)
+        if not self._updating:
+            self._selection_state.select_dataset_b(_dataset_key(self.dataset_b))
 
 
 class DatasetControls:
@@ -475,19 +338,12 @@ class DatasetControls:
         """Initialize one dataset selector with an immediate valid default."""
         self._catalog = catalog
         self._callback: Callable[[], None] | None = None
-        self.dataset = _dropdown(
-            description="Dataset:",
-            layout=_DATASET_LAYOUT,
-        )
         options = catalog.dataset_options(profile_ids=profile_ids)
-        self.dataset.options = options
-        self.dataset.value = options[0][1] if options else None
-        self.dataset.observe(self._on_value_change, names="value")
-
-    @property
-    def widget(self) -> widgets.HBox:
-        """Return the compact local dataset selector."""
-        return ui.components.ui_control_row(self.dataset)
+        self.dataset = _dataset_block(catalog, "Datensätze", options[0][1] if options else None, profile_ids=profile_ids)
+        self.status = ui.controls.StatusLine()
+        self.rows = (ui.panel.row(self.dataset.header),)
+        self.popovers: tuple[ViewPopover, ...] = ((self.dataset.header, self.dataset.body),)
+        self.dataset.observe(self._on_value_change)
 
     def set_callback(self, callback: Callable[[], None]) -> None:
         """Bind the automatic render callback for dataset changes."""
@@ -495,13 +351,13 @@ class DatasetControls:
 
     def selected_diagnostics(self) -> diagnostics.DatasetDiagnostics:
         """Load all unique cases and empirical summaries for the dataset."""
-        value = self.dataset.value
-        if not isinstance(value, tuple) or len(value) != _DATASET_KEY_LENGTH or not all(isinstance(item, str) for item in value):
+        selected = self.dataset.selected()
+        if len(selected) != 1:
             msg = "A valid generation-input dataset is required."
             raise ValueError(msg)
-        return self._catalog.dataset_diagnostics(cast("sources.DatasetKey", value))
+        return self._catalog.dataset_diagnostics(cast("sources.DatasetKey", selected[0]))
 
-    def _on_value_change(self, _change: object) -> None:
+    def _on_value_change(self) -> None:
         """Render after the selected dataset changes."""
         if self._callback is not None:
             self._callback()
@@ -513,17 +369,17 @@ class CampaignOutcomeControls:
     def __init__(self, catalog: sources.CampaignOutcomeCatalog) -> None:
         """Retain exact candidate selection independently of successful Dataset pools."""
         self.catalog = catalog
+        dropdown = ui.controls.dropdown
         campaigns = tuple(sorted({(row["task"], row["source_name"]) for row in catalog.rows}))
-        self.campaign = widgets.Dropdown(options=[(f"{task}/{name}", (task, name)) for task, name in campaigns], description="Campaign:")
-        self.material = widgets.Dropdown(
-            options=[("All materials", None), *((name, name) for name in sorted({row["material_family"] for row in catalog.rows}))],
-            description="Material:",
+        self.campaign = dropdown([(f"{task}/{name}", (task, name)) for task, name in campaigns], description="Campaign")
+        self.material = dropdown(
+            [("All materials", None), *((name, name) for name in sorted({row["material_family"] for row in catalog.rows}))], description="Material"
         )
-        self.outcome = widgets.Dropdown(
-            options=[("All outcomes", None), ("Successful", "successful"), ("Failed", "failed"), ("Pending", "pending")], description="Outcome:"
+        self.outcome = dropdown(
+            [("All outcomes", None), ("Successful", "successful"), ("Failed", "failed"), ("Pending", "pending")], description="Outcome"
         )
-        self.origin = widgets.Dropdown(
-            options=[("All origins", None), *((name, name) for name in sorted({row["origin"] for row in catalog.rows}))], description="Origin:"
+        self.origin = dropdown(
+            [("All origins", None), *((name, name) for name in sorted({row["origin"] for row in catalog.rows}))], description="Origin"
         )
         parameters = sorted(
             {
@@ -533,20 +389,20 @@ class CampaignOutcomeControls:
                 if isinstance((row.get("parameters") or {}).get(name), (int, float))
             }
         )
-        self.parameter = widgets.Dropdown(
-            options=[("No parameter plot", None), *((f"{name} [{unit}]", (name, unit)) for name, unit in parameters)], description="Parameter:"
+        self.parameter = dropdown(
+            [("No parameter plot", None), *((f"{name} [{unit}]", (name, unit)) for name, unit in parameters)], description="Parameter"
         )
-        self.case = widgets.Dropdown(description="Evidence:")
-        self.widget = widgets.VBox(
-            (
-                ui.components.ui_control_row(self.campaign, self.material),
-                ui.components.ui_control_row(self.outcome, self.origin),
-                ui.components.ui_control_row(self.case, self.parameter),
-            )
+        # Candidate evidence follows the filters, so its width covers every candidate the catalog can offer.
+        self.case = dropdown(self._case_options(), description="Evidence", width_texts=[_candidate_label(row) for row in catalog.rows])
+        self.status = ui.controls.StatusLine()
+        self.rows = (
+            ui.panel.row(self.campaign, self.material),
+            ui.panel.row(self.outcome, self.origin),
+            ui.panel.row(self.case, self.parameter),
         )
+        self.popovers: tuple[ViewPopover, ...] = ()
         self._callback: Callable[[], None] | None = None
         self._updating = False
-        self._rebind_case()
         for widget in (self.campaign, self.material, self.outcome, self.origin):
             widget.observe(self._filter_changed, names="value")
         for widget in (self.case, self.parameter):
@@ -556,8 +412,8 @@ class CampaignOutcomeControls:
         """Bind one active-view update."""
         self._callback = callback
 
-    def rows(self, *, all_outcomes: bool = False) -> tuple[dict[str, Any], ...]:
-        """Return metadata rows on exact user-selected campaign/material scope."""
+    def candidates(self, *, all_outcomes: bool = False) -> tuple[dict[str, Any], ...]:
+        """Return candidate metadata rows on exact user-selected campaign/material scope."""
         if self.campaign.value is None:
             return ()
         task, name = self.campaign.value
@@ -570,11 +426,14 @@ class CampaignOutcomeControls:
             origin=self.origin.value,
         )
 
+    def _case_options(self) -> list[tuple[str, tuple[str, str]]]:
+        """Return the evidence choices of the candidates that match the filters."""
+        return [(_candidate_label(row), (row["material_family"], row["case_id"])) for row in self.candidates()]
+
     def _rebind_case(self) -> None:
         """Preserve an exact selected candidate when filtering retains it."""
         previous = self.case.value
-        rows = self.rows()
-        options = [(f"{row['material_family']}/{row['case_id']} — {row['outcome']}", (row["material_family"], row["case_id"])) for row in rows]
+        options = self._case_options()
         self._updating = True
         try:
             self.case.options = options
@@ -592,3 +451,8 @@ class CampaignOutcomeControls:
         """Refresh a selected evidence record or optional parameter plot."""
         if not self._updating and self._callback is not None:
             self._callback()
+
+
+def _candidate_label(row: dict[str, Any]) -> str:
+    """Return the evidence choice text of one campaign candidate."""
+    return f"{row['material_family']}/{row['case_id']} — {row['outcome']}"

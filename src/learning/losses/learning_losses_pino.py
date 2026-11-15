@@ -4,7 +4,7 @@ Responsibilities:
   - Combine named data, momentum, continuity, and boundary contributions
   - Apply one explicit weight and deterministic epoch warmup per physics term
   - Construct physical tensor views once for domain-owned physics evaluators
-  - Expose current named components and reusable domain diagnostics
+  - Expose named components for every case of a batch and reusable domain diagnostics
 
 Design principles:
   - Named loss components remain stable across supervised and physics-enabled runs
@@ -20,40 +20,28 @@ This module does NOT:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 import torch
 from torch import Tensor, nn
 
 from src import domain
 
+from .learning_losses_state import StateErrorLoss, StateScaling
+
 PHYSICS_TERMS = ("momentum", "continuity", "boundary")
 
 
-class TensorNormalizer(Protocol):
-    """Define the normalizer surface required by physics loss composition."""
+class PhysicalScaling(StateScaling, Protocol):
+    """Define the Train-scaling surface that the data and physics terms need."""
 
-    def inverse_transform(self, tensor: Tensor) -> Tensor:
-        """Convert a normalized tensor to its physical/task representation."""
+    def decode_inputs(self, value: Tensor) -> Tensor:
+        """Return physical model inputs from standardized ones."""
         ...
 
-
-class SemanticDataLoss(nn.Module):
-    """Wrap a relative norm with one explicit non-negative semantic weight."""
-
-    def __init__(self, implementation: Any, *, weight: float) -> None:
-        """Validate the weight and retain the callable relative norm."""
-        super().__init__()
-        if weight < 0:
-            msg = f"Data-loss weight must be non-negative, got {weight}."
-            raise ValueError(msg)
-        self.implementation = implementation
-        self.weight = float(weight)
-        self.reduction = "sample_mean"
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        """Return the explicitly weighted relative data loss."""
-        return self.weight * self.implementation(pred, target)
+    def decode_state(self, value: Tensor) -> Tensor:
+        """Return physical states from standardized ones."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,8 +113,8 @@ class SemanticComposedLoss(nn.Module):
 
     Parameters
     ----------
-    data_loss : torch.nn.Module
-        Unweighted normalized-space supervised loss.
+    data_loss : StateErrorLoss
+        Group-weighted state loss of Train-scaled fields.
     data_weight : float
         Explicit supervised contribution weight.
     physics_enabled : bool
@@ -149,7 +137,7 @@ class SemanticComposedLoss(nn.Module):
     def __init__(
         self,
         *,
-        data_loss: nn.Module,
+        data_loss: StateErrorLoss,
         data_weight: float,
         physics_enabled: bool,
         physics_kind: str,
@@ -166,7 +154,7 @@ class SemanticComposedLoss(nn.Module):
         Validate composition inputs, resolve physics, and register epoch state.
 
         The zero-based warmup position becomes persistent module state, whereas
-        fitted normalizers and latest detached components remain runtime-only.
+        the Train scaling remains runtime-only.
         """
         super().__init__()
         if data_weight < 0:
@@ -189,33 +177,28 @@ class SemanticComposedLoss(nn.Module):
         self.schedules = {"momentum": momentum_weight, "continuity": continuity_weight, "boundary": boundary_weight}
         self.interior_crop = int(interior_crop)
         self._physics_evaluator = domain.physics.brinkman.resolve_physics_evaluator(physics_kind)
-        self.in_normalizer: TensorNormalizer | None = None
-        self.out_normalizer: TensorNormalizer | None = None
+        self.scaling: PhysicalScaling | None = None
         self.register_buffer("current_epoch", torch.zeros((), dtype=torch.long), persistent=True)
-        self._last_components: dict[str, Tensor] = {}
 
     @property
     def component_names(self) -> tuple[str, ...]:
         """Return the exact ordered named loss-component interface."""
-        return ("total", "data", *PHYSICS_TERMS)
+        terms = self.data_loss.terms
+        shares = [field for term in terms if len(term.fields) > 1 for field in term.fields]
+        return ("total", "data", *(f"data_{term.id}" for term in terms), *(f"data_{field}" for field in shares), *PHYSICS_TERMS)
 
-    def set_normalizers(
-        self,
-        *,
-        in_normalizer: TensorNormalizer,
-        out_normalizer: TensorNormalizer,
-    ) -> None:
+    def set_scaling(self, scaling: PhysicalScaling) -> None:
         """
-        Attach fitted normalizers used to construct physical physics views.
+        Attach the run's Train scaling: it weighs the velocity vector in the data term and rebuilds the physical views of the physics terms.
 
         Parameters
         ----------
-        in_normalizer, out_normalizer : TensorNormalizer
-            Fitted task input/output normalizers.
+        scaling : PhysicalScaling
+            Admitted Train scaling of the run on the training device.
 
         """
-        self.in_normalizer = in_normalizer
-        self.out_normalizer = out_normalizer
+        self.data_loss.set_scaling(scaling)
+        self.scaling = scaling
 
     def set_epoch(self, epoch: int) -> None:
         """
@@ -283,11 +266,11 @@ class SemanticComposedLoss(nn.Module):
             Reusable full-field and dimensionless scalar diagnostics.
 
         """
-        if self.in_normalizer is None or self.out_normalizer is None:
-            msg = "Physics diagnostics require fitted input and output normalizers."
+        if self.scaling is None:
+            msg = "Physics diagnostics require the run's Train scaling."
             raise RuntimeError(msg)
-        inputs_physical = self.in_normalizer.inverse_transform(x)
-        outputs_physical = self.out_normalizer.inverse_transform(pred)
+        inputs_physical = self.scaling.decode_inputs(x)
+        outputs_physical = self.scaling.decode_state(pred)
         return self._physics_evaluator(
             inputs_physical,
             outputs_physical,
@@ -298,7 +281,7 @@ class SemanticComposedLoss(nn.Module):
             interior_crop=self.interior_crop,
         )
 
-    def compute_components(
+    def unit_components(
         self,
         pred: Tensor,
         *,
@@ -307,12 +290,12 @@ class SemanticComposedLoss(nn.Module):
         epoch: int | None = None,
     ) -> dict[str, Tensor]:
         """
-        Compute named weighted loss components.
+        Compute named weighted loss components for every case of a batch.
 
         Parameters
         ----------
         pred : torch.Tensor
-            Normalized prediction tensor.
+            Normalized prediction tensor ``[U, C, Y, X]``, one case per unit.
         x : torch.Tensor or None
             Normalized task inputs, required only when physics is enabled.
         y : torch.Tensor
@@ -323,36 +306,38 @@ class SemanticComposedLoss(nn.Module):
         Returns
         -------
         dict[str, torch.Tensor]
-            Scalar ``total``, ``data``, ``momentum``, ``continuity``, and
-            ``boundary`` contributions.
+            ``total``, ``data``, the informational data parts (``data_<term id>`` and the field shares of vector terms, each
+            weighted by the data weight and not counted again in ``total``), ``momentum``, ``continuity``, and ``boundary``
+            contributions ``[U]``. The data term is each case's own value; a
+            physics term is the batch mean given to every case, so with equal case
+            weights its sum over the cases equals the sum of the per-case values.
 
         """
         if pred.shape != y.shape:
             msg = f"Prediction and target shapes must match, got {tuple(pred.shape)} and {tuple(y.shape)}."
             raise ValueError(msg)
         weights = self.component_weights(epoch=epoch)
-        components = {"data": weights["data"] * self.data_loss(pred, y)}
-        zero = pred.new_zeros(())
-        terms = dict.fromkeys(PHYSICS_TERMS, zero)
+        data_terms, data_shares = self.data_loss.unit_contributions_with_shares(pred, y)
+        components = {"data": weights["data"] * torch.stack(list(data_terms.values())).sum(dim=0)}
+        # Informational parts of the data loss: they are not added to the total.
+        components |= {f"data_{name}": weights["data"] * value for name, value in data_terms.items()}
+        components |= {f"data_{field}": weights["data"] * share for shares in data_shares.values() for field, share in shares.items()}
+        units = pred.shape[0]
+        terms = dict.fromkeys(PHYSICS_TERMS, pred.new_zeros(units))
         if self.physics_enabled:
             if x is None:
                 msg = "Physics-informed loss requires the normalized input tensor x."
                 raise ValueError(msg)
             diagnostics = self.compute_physics_diagnostics(pred, x=x)
             terms = {
-                "momentum": diagnostics.momentum_mse,
-                "continuity": diagnostics.continuity_mse,
-                "boundary": diagnostics.boundary_mse,
+                "momentum": diagnostics.momentum_mse.expand(units),
+                "continuity": diagnostics.continuity_mse.expand(units),
+                "boundary": diagnostics.boundary_mse.expand(units),
             }
         for term in PHYSICS_TERMS:
             components[term] = weights[term] * terms[term]
         total = components["data"] + components["momentum"] + components["continuity"] + components["boundary"]
         return {"total": total, **components}
-
-    @property
-    def last_components(self) -> dict[str, Tensor]:
-        """Return detached components from the most recent forward call."""
-        return dict(self._last_components)
 
     def forward(
         self,
@@ -361,18 +346,9 @@ class SemanticComposedLoss(nn.Module):
         *,
         x: Tensor | None = None,
         epoch: int | None = None,
-        **_kwargs: Any,
     ) -> Tensor:
-        """
-        Return the scalar total while caching detached named components.
-
-        ``y`` is mandatory. Physics-enabled compositions additionally require
-        ``x`` through :meth:`compute_components`. Extra keyword arguments are
-        accepted because the generic training loop supplies shared loss arguments.
-        """
+        """Return the scalar total averaged over the batch; ``y`` is mandatory and physics also needs ``x``."""
         if y is None:
             msg = "SemanticComposedLoss requires a target tensor y."
             raise ValueError(msg)
-        components = self.compute_components(pred, x=x, y=y, epoch=epoch)
-        self._last_components = {name: value.detach() for name, value in components.items()}
-        return components["total"]
+        return self.unit_components(pred, x=x, y=y, epoch=epoch)["total"].mean()

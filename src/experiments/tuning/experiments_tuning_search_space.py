@@ -26,10 +26,9 @@ from typing import Any, Literal, Protocol, cast
 SearchKind = Literal["categorical", "float", "int", "fixed"]
 
 _COMMON_SEARCH_PATH_KINDS: dict[str, frozenset[SearchKind]] = {
-    "data.batch_size": frozenset({"categorical", "int"}),
+    "training.units_per_update": frozenset({"categorical", "int"}),
     "optimizer.lr": frozenset({"categorical", "float"}),
     "optimizer.weight_decay": frozenset({"categorical", "float"}),
-    "training.gradient_accumulation_steps": frozenset({"categorical", "int"}),
 }
 _MODEL_SEARCH_PATH_KINDS: dict[str, dict[str, frozenset[SearchKind]]] = {
     "fno": {

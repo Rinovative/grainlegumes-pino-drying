@@ -3,7 +3,7 @@
 # Derived, not authored: concurrent_cases_per_node = site.cores_per_node // run.cores_per_case; node job memory = concurrent_cases_per_node * node_job.memory_per_case + node_job.node_memory_overhead.
 schema_kind: generation_execution
 run:  # What changes per Generation run; node_jobs, cores_per_case, timeout_seconds and max_admission_cases also have CLI flags.
-  node_jobs: 2  # Concurrent node jobs across all runs, 1 to 4 (per-user cap on the shared standard nodes).
+  node_jobs: 4  # Concurrent node jobs across all runs, 1 to 4 (per-user cap on the shared standard nodes).
   cores_per_case: 4  # CPU cores of one case step (k); concurrency per node job is site.cores_per_node // k.
   timeout_seconds: 3600  # Per-case wrapper limit in seconds; the orderly stop starts internals.graceful_stop_reserve_seconds earlier.
   retention: compact  # compact keeps canonical outputs and essential evidence; full also keeps the solved model and raw exports.
@@ -24,7 +24,7 @@ node_job:  # Slurm resources of one node job (one whole node, concurrent case st
   scheduler_options: []  # Extra long sbatch flags; memory, dependency, comment, node selection, GPUs and the allocation shape are pipeline-owned.
 site:  # The cluster; rarely changes.
   partition: standard  # Slurm partition of the node jobs.
-  cores_per_node: 32  # CPUs one node job requests (not exclusive); caps run.cores_per_case.
+  cores_per_node: 16  # CPUs one node job requests (not exclusive); caps run.cores_per_case.
   comsol_module: Comsol/v6.4  # Environment module loaded for COMSOL in the node jobs.
   comsol_executable: comsol  # COMSOL executable used in the node jobs.
   python_executable: /usr/bin/python3.12  # Python executable used in the node jobs.

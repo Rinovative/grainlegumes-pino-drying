@@ -82,12 +82,11 @@ def _prefix_objective(frame: pd.DataFrame, max_cases: int) -> tuple[Mapping[str,
         raise ValueError(msg)
     selected_count = min(max_cases, len(frame))
     selected = frame.iloc[:selected_count]
-    output_groups = [{"id": group_id, "fields": list(fields)} for group_id, fields in frame.attrs["output_groups"]]
     aggregate = contracts.aggregate_normalized_group_macro_rmse(
         selected,
-        output_groups=output_groups,
-        train_standard_deviations=frame.attrs["train_standard_deviations"],
-        normalization_denominator_floor=float(frame.attrs["normalization_denominator_floor"]),
+        output_groups=dataframe.require_complete_provenance(frame)["evaluator"]["output_groups"],
+        train_scales=frame.attrs["train_scales"],
+        reference_floors=frame.attrs["reference_floors"],
     )
     return aggregate, selected_count
 
@@ -167,7 +166,7 @@ def plot_capacity_accuracy(
     )
     axis.set_xscale("log")
     axis.set_xlabel("exact trainable parameter count")
-    axis.set_ylabel("normalized_group_macro_rmse [1] (lower is better)")
+    axis.set_ylabel("Normalized group macro RMSE [-] (lower is better)")
     axis.grid(alpha=0.25, which="both")
     figure.subplots_adjust(top=0.86, bottom=0.14, left=0.08, right=0.98)
     layout.title_over_axes(figure, figure_title, (axis,), y=0.96)
@@ -247,7 +246,7 @@ def plot_metadata_error_heatmap(
     parameter_labels = [presentation.metadata_label(parameter) for parameter in parameters]
     for axis, label, matrix in zip(axes[0], datasets, correlations, strict=True):
         image = axis.imshow(matrix, cmap="coolwarm", vmin=-1.0, vmax=1.0, aspect="auto")
-        axis.set_xticks(np.arange(len(fields)), [f"RMSE[{field.matplotlib_label}]" for field in fields])
+        axis.set_xticks(np.arange(len(fields)), [field.metric_label("RMSE") for field in fields])
         axis.set_yticks(np.arange(len(parameters)), parameter_labels)
         axis.set_title(count_headings[label] or label)
         for row, column in np.ndindex(matrix.shape):

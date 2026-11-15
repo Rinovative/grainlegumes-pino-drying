@@ -13,6 +13,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -52,6 +53,7 @@ def _mock_cuda_resolution() -> learning.device.DeviceResolution:
         pytorch_version=str(torch.__version__),
         cuda_index=_MOCK_CUDA_INDEX,
         cuda_device_name="Mock GPU 2",
+        cuda_build_version="12.1",
     )
     return learning.device.DeviceResolution(
         requested_policy="cuda",
@@ -83,8 +85,28 @@ def test_cpu_resolution_is_immutable_serializable_and_cuda_silent(
     assert resolution.cuda_index is None
     assert metadata["requested_policy"] == "cpu"
     assert metadata["resolved_device"] == "cpu"
-    assert not {"cuda_index", "cuda_device_name", "cuda_runtime_version"}.intersection(metadata)
+    assert not {"cuda_index", "cuda_device_name", "cuda_build_version"}.intersection(metadata)
     json.dumps(metadata)
+
+
+def test_driver_version_is_read_only_for_cuda_and_never_guessed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CPU attempt starts no process and records null; CUDA records the one driver version nvidia-smi reports, else null."""
+    answers: list[Any] = []
+
+    def nvidia_smi(argv: tuple[str, ...], **_kwargs: Any) -> Any:
+        assert argv[0] == "nvidia-smi"
+        answer = answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return subprocess.CompletedProcess(argv, 0, stdout=answer)
+
+    monkeypatch.setattr(learning.device.subprocess, "run", nvidia_smi)
+    assert learning.device.cuda_driver_version(learning.device.resolve_device("cpu")) is None
+
+    cuda = _mock_cuda_resolution()
+    answers.extend(["550.54.15\n550.54.15\n", "550.54.15\n535.1\n", FileNotFoundError("nvidia-smi"), subprocess.TimeoutExpired("nvidia-smi", 10)])
+    assert learning.device.cuda_driver_version(cuda) == "550.54.15"
+    assert [learning.device.cuda_driver_version(cuda) for _ in range(3)] == [None, None, None]
 
 
 def test_auto_resolution_falls_back_to_cpu_only_when_cuda_is_unavailable(

@@ -148,7 +148,7 @@ def _admission_report(
         run_dir,
         config,
         status=status,
-        completed_epoch=(config["training"]["epochs"] if completed_epoch is None else completed_epoch),
+        completed_epoch=(config["training"]["budget_epochs"] if completed_epoch is None else completed_epoch),
     )
     before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
     report = experiments.run.inspect_existing_run_admission(
@@ -201,7 +201,7 @@ def test_completed_admission_is_distinct_from_resume(
     )
 
     assert report["resume_compatibility"] == "completed"
-    assert report["completed_epoch"] == config["training"]["epochs"]
+    assert report["completed_epoch"] == config["training"]["budget_epochs"]
 
 
 def test_damaged_or_malformed_completed_run_fails_closed(
@@ -221,7 +221,7 @@ def test_damaged_or_malformed_completed_run_fails_closed(
         run_dir,
         config,
         status="completed",
-        completed_epoch=config["training"]["epochs"],
+        completed_epoch=config["training"]["budget_epochs"],
         include_best=False,
     )
 
@@ -358,18 +358,18 @@ def test_existing_target_that_cannot_continue_rejects_before_runtime_setup(
     assert after == before
 
 
-def test_training_code_drift_refuses_reuse_extension_and_resume_before_any_write(
+def test_training_code_drift_refuses_reuse_and_resume_before_any_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A run recorded by older training code is neither reported complete, extended nor resumed; nothing is written."""
+    """A run recorded by older training code is neither reported complete nor resumed; nothing is written."""
     output_root = tmp_path / "outputs"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
     config_path = _synthetic_config_path(tmp_path)
     with monkeypatch.context() as drift:
         run_state.drift_training_code(drift, "steady_flow")
         stale = _resolved_admission_config(output_root)
-    epochs = int(stale["training"]["epochs"])
+    epochs = int(stale["training"]["budget_epochs"])
     run_dir = common.paths.resolve_config_run_dir(stale, output_root=output_root)
     run_state.write_lightweight_run_state(run_dir, stale, status="completed", completed_epoch=epochs)
     monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("stale code must not train"))
@@ -379,8 +379,6 @@ def test_training_code_drift_refuses_reuse_extension_and_resume_before_any_write
 
     with pytest.raises(experiments.run.ExistingRunAdmissionError, match=changed):
         experiments.run.run_experiment(config_path, output_root=output_root)
-    with pytest.raises(ValueError, match=changed):
-        experiments.run.run_experiment(saved_config, resume=run_dir, max_epochs=epochs + 1)
     run_state_summary = common.paths.resolve_run_summary_path(run_dir)
     common.serialization.atomic_write_json(
         run_state_summary, {**json.loads(run_state_summary.read_text(encoding="utf-8")), "status": "interrupted", "completed_epoch": 1}
@@ -415,25 +413,30 @@ def test_prepared_resume_refuses_training_code_drift_before_any_write(tmp_path: 
     assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
-def test_rerunning_a_completed_run_returns_without_training(
+@pytest.mark.parametrize("end", ["completed", "diverged"])
+def test_rerunning_a_finished_run_returns_its_saved_outcome_without_training(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    end: str,
 ) -> None:
-    """A run that reached the requested epochs is reported complete; no run state is written or trained, only its binding repaired."""
+    """A finished run reports its saved end status, a divergence included; no run state is written or trained, only its binding repaired."""
     output_root = tmp_path / "outputs"
     monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
     config_path = _synthetic_config_path(tmp_path)
     config = _resolved_admission_config(output_root)
     run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
-    run_state.write_lightweight_run_state(run_dir, config, status="completed", completed_epoch=config["training"]["epochs"])
+    run_state.write_lightweight_run_state(run_dir, config, status="completed", completed_epoch=config["training"]["budget_epochs"])
+    divergence = "loss is non-finite" if end == "diverged" else None
+    training_outcome = {"status": end, "budget_progress": 0.5 if divergence else 1.0, "eligible_points": 1, "divergence": divergence}
     common.serialization.atomic_write_json(
         common.paths.resolve_run_summary_path(run_dir),
         {
             "status": "completed",
-            "completed_epoch": config["training"]["epochs"],
+            "completed_epoch": config["training"]["budget_epochs"],
             "best_epoch": 1,
             "best_metric": 0.25,
+            "training_outcome": training_outcome,
         },
     )
     before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
@@ -448,7 +451,7 @@ def test_rerunning_a_completed_run_returns_without_training(
     assert outcome["already_complete"] is True
     assert "already_complete" in capsys.readouterr().out
     assert outcome["run_dir"] == run_dir.resolve()
-    assert outcome["result"] == {"status": "completed", "best_epoch": 1, "best_metric": 0.25}
+    assert outcome["result"] == {"status": end, "training_outcome": training_outcome, "best_epoch": 1, "best_metric": 0.25}
     registry_state = output_root.relative_to(tmp_path) / ".state" / "identities"
     after = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
     assert {path: payload for path, payload in after.items() if not path.is_relative_to(registry_state)} == before
@@ -568,6 +571,7 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
             run_dir,
             first_resolution,
             started_at=first_started,
+            memory_batch=2,
         ),
     )
     first_session = experiments.run.read_run_summary(run_dir)["runtime_sessions"][0].copy()
@@ -582,6 +586,7 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
             run_dir,
             second_resolution,
             started_at=second_started,
+            memory_batch=2,
         ),
     )
 
@@ -592,6 +597,46 @@ def test_runtime_sessions_append_requested_and_resolved_facts_without_rewriting_
     assert summary["runtime_sessions"][1]["resolved_device"] == "cpu"
     assert summary["runtime_sessions"][1]["started_at"] == second_started.isoformat()
     assert summary["runtime_device"] == second_resolution.as_dict()
+    # A CPU attempt records no driver; its precision and its end entry stay null until its model exists and it ends.
+    assert summary["runtime_sessions"][1]["cuda_driver_version"] is None
+    assert summary["runtime_sessions"][1]["precision"] is None
+    assert set(summary["runtime_sessions"][1]["attempt"].values()) == {None}
+    assert (summary["elapsed_seconds"], summary["attempted_train_seconds"], summary["duration_coverage"]) == (None, None, "unknown_attempts")
+
+
+@pytest.mark.parametrize("earlier", ["no_history", "no_sessions_under_an_earlier_contract", "contract_without_history", "malformed_attempt"])
+def test_resume_refuses_a_summary_that_records_its_attempts_in_an_earlier_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, earlier: str
+) -> None:
+    """A run whose summary was not created under the current duration contract is not continued, also without any attempt."""
+    output_root = tmp_path / "outputs"
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    config = _resolved_admission_config(output_root)
+    run_dir = common.paths.resolve_config_run_dir(config, output_root=output_root)
+    run_state.write_lightweight_run_state(run_dir, config, status="interrupted", completed_epoch=1)
+    summary_path = common.paths.resolve_run_summary_path(run_dir)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    # The helper writes what a fresh run starts with: no sessions under the current contract.
+    assert (summary["runtime_sessions"], summary["duration_contract"]) == ([], experiments.run.RUN_DURATION_CONTRACT)
+    if earlier == "no_history":
+        # A summary created before attempts were recorded carries neither the session list nor the contract.
+        del summary["runtime_sessions"], summary["duration_contract"]
+    elif earlier == "contract_without_history":
+        # The current contract without its attempt history would let a resume publish totals of the new attempt alone.
+        del summary["runtime_sessions"]
+    elif earlier == "malformed_attempt":
+        # An ended attempt without its committed work cannot enter complete totals.
+        summary["runtime_sessions"] = [{"attempt": {"ended_at": "2025-01-02T03:04:00+00:00", "elapsed_seconds": 1.0, "train_seconds": 1.0}}]
+    else:
+        summary["duration_contract"] = {key: value for key, value in summary["duration_contract"].items() if key != "clock_source"}
+    common.serialization.atomic_write_json(summary_path, summary)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("an earlier schema must not train"))
+    before = {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()}
+
+    with pytest.raises(experiments.run.RunLifecycleError, match="earlier summary schema"):
+        experiments.run.run_experiment(common.paths.resolve_run_config_path(run_dir), resume=run_dir)
+
+    assert {item.relative_to(run_dir): item.read_bytes() for item in run_dir.rglob("*") if item.is_file()} == before
 
 
 def test_a_failure_before_the_runtime_session_exists_keeps_its_own_error(tmp_path: Path) -> None:
@@ -635,7 +680,7 @@ def test_runtime_session_records_validated_slurm_provenance(
     summary = experiments.run.transition_run_status(
         run_dir,
         "running",
-        updates=experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC)),
+        updates=experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC), memory_batch=2),
     )
 
     assert summary["runtime_sessions"][0]["slurm"] == provenance
@@ -643,7 +688,7 @@ def test_runtime_session_records_validated_slurm_provenance(
     provenance["source_worktree_sha256"] = "invalid"
     monkeypatch.setenv("ML_SLURM_PROVENANCE", json.dumps(provenance))
     with pytest.raises(experiments.run.RunLifecycleError, match="source_worktree_sha256"):
-        experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC))
+        experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC), memory_batch=2)
 
 
 @pytest.mark.parametrize(
@@ -679,33 +724,33 @@ def test_slurm_provenance_admits_exactly_the_two_source_transitions(
     resolution = experiments.run.learning.device.resolve_device("cpu")
 
     if admitted:
-        updates = experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC))
+        updates = experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC), memory_batch=2)
         assert updates["runtime_sessions"][-1]["slurm"]["source_transition"] == transition
     else:
         with pytest.raises(experiments.run.RunLifecycleError, match="source_transition"):
-            experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC))
+            experiments.run.runtime_session_updates(run_dir, resolution, started_at=datetime.now(UTC), memory_batch=2)
 
 
-def test_tracking_runtime_updates_are_atomic_and_session_scoped(
+def test_tracking_state_updates_merge_into_exactly_one_runtime_session(
     tmp_path: Path,
 ) -> None:
     """
-    Update tracking state inside one running session, then append a resume session.
+    Merge observer facts into one running session under the writer lease.
 
-    Atomic session mutation must preserve status history and earlier tracking facts,
-    keeping observer state scoped to the runtime session that produced it.
+    The update must keep status history and earlier tracking facts, change only the
+    named session, and refuse a session id that is not recorded exactly once.
     """
     run_dir = experiments.run.allocate_run_directory(tmp_path / "tracking-sessions")
     experiments.run.transition_run_status(run_dir, "initializing")
     resolution = experiments.run.learning.device.resolve_device("cpu")
-    first_started = datetime(2025, 1, 2, 3, 4, tzinfo=UTC)
     experiments.run.transition_run_status(
         run_dir,
         "running",
         updates=experiments.run.runtime_session_updates(
             run_dir,
             resolution,
-            started_at=first_started,
+            started_at=datetime(2025, 1, 2, 3, 4, tzinfo=UTC),
+            memory_batch=2,
             session_id="first-session",
             tracking_state={
                 "requested_mode": "online",
@@ -713,65 +758,50 @@ def test_tracking_runtime_updates_are_atomic_and_session_scoped(
             },
         ),
     )
-    updated = experiments.run.update_runtime_session(
-        run_dir,
-        "first-session",
-        {
-            "wandb_run_id": "opaque-run-id",
-            "last_logged_epoch": 2,
-            "status": "failed",
-            "failed_operation": "history",
-        },
-    )
-    first_session = copy.deepcopy(updated["runtime_sessions"][0])
-    history = copy.deepcopy(updated["status_history"])
+    history = copy.deepcopy(experiments.run.read_run_summary(run_dir)["status_history"])
 
-    appended = experiments.run.append_runtime_session(
-        run_dir,
-        resolution,
-        started_at=datetime(2025, 1, 2, 5, 6, tzinfo=UTC),
-        session_id="resume-session",
-        tracking_state={
-            "requested_mode": "online",
-            "wandb_run_id": "opaque-run-id",
-            "session_kind": "resume",
-            "status": "active",
-        },
-    )
+    with experiments.run.run_writer_lease(run_dir):
+        updated = experiments.run._update_runtime_session_locked(
+            run_dir,
+            "first-session",
+            {"wandb_run_id": "opaque-run-id", "last_logged_step": 2, "status": "failed", "failed_operation": "history"},
+        )
+        with pytest.raises(experiments.run.RunLifecycleError, match="Expected one runtime session"):
+            experiments.run._update_runtime_session_locked(run_dir, "other-session", {"status": "failed"})
 
-    assert appended["status"] == "running"
-    assert appended["status_history"] == history
-    assert appended["runtime_sessions"][0] == first_session
-    assert first_session["tracking"]["requested_mode"] == "online"
-    assert first_session["tracking"]["wandb_run_id"] == "opaque-run-id"
-    assert first_session["tracking"]["status"] == "failed"
-    assert first_session["tracking"]["failed_operation"] == "history"
-    assert appended["runtime_sessions"][1]["tracking"]["session_kind"] == "resume"
+    assert updated["status"] == "running"
+    assert updated["status_history"] == history
+    assert experiments.run.read_run_summary(run_dir)["runtime_sessions"] == updated["runtime_sessions"]
+    tracking_state = updated["runtime_sessions"][0]["tracking"]
+    assert tracking_state["requested_mode"] == "online"
+    assert tracking_state["wandb_run_id"] == "opaque-run-id"
+    assert tracking_state["status"] == "failed"
+    assert tracking_state["failed_operation"] == "history"
 
 
 def _resume_config(*, epochs: int = 4) -> dict[str, Any]:
     """Return fixed semantic sections used by resume identity tests."""
     raw = configs.direct_config()
-    raw["training"]["epochs"] = epochs
+    raw["training"]["budget_epochs"] = epochs
     return configs.resolve(raw)
 
 
-def test_resume_allows_only_duration_increase_and_runtime_location_changes() -> None:
+@pytest.mark.parametrize("epochs", [3, 7])
+def test_resume_keeps_the_budget_and_admits_runtime_location_changes(epochs: int) -> None:
     """
-    Increase terminal epochs while changing only device and output-root location.
+    Resume admits device and output-root relocation but no other budget.
 
-    Resume must accept retained/increased duration and operational relocation but
-    reject shortening, protecting completed progress from rollback.
+    The schedule and the validation points run over the budget, so neither a shorter
+    nor a longer one continues the saved run.
     """
     saved = _resume_config(epochs=4)
-    requested = _resume_config(epochs=7)
-    requested["run"]["device"] = "cuda"
-    requested["paths"]["output_root"] = "/new/output"
+    relocated = _resume_config(epochs=4)
+    relocated["run"]["device"] = "cuda"
+    relocated["paths"]["output_root"] = "/new/output"
 
-    assert experiments.run.validate_resume_config(requested, saved) == 7
-    assert experiments.run.validate_resume_config(saved, saved) == 4
-    with pytest.raises(ValueError, match="only retain or increase"):
-        experiments.run.validate_resume_config(_resume_config(epochs=3), saved)
+    experiments.run.validate_resume_config(relocated, saved)
+    with pytest.raises(ValueError, match="never extended or changed"):
+        experiments.run.validate_resume_config(_resume_config(epochs=epochs), saved)
 
 
 @pytest.mark.parametrize(
@@ -783,13 +813,13 @@ def test_resume_allows_only_duration_increase_and_runtime_location_changes() -> 
 )
 def test_resume_rejects_semantic_changes(section: str, replacement: Any) -> None:
     """
-    Replace each scientific continuation section while increasing allowed duration.
+    Replace each scientific continuation section of an otherwise identical request.
 
     Every parametrized section must fail resume compatibility, proving operational
     allowances cannot conceal task, data, model, loss, or optimization drift.
     """
     saved = _resume_config()
-    requested = _resume_config(epochs=6)
+    requested = _resume_config()
     if section == "data":
         requested["data"].update(replacement)
     else:
@@ -952,10 +982,10 @@ def test_start_and_saved_resume_reject_a_second_process_writer(
 
 
 @pytest.mark.parametrize("renamed", [False, True])
-def test_saved_effective_resume_service_preserves_exact_science_and_only_extends_cap(
+def test_saved_effective_resume_service_preserves_exact_science_and_refuses_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, renamed: bool
 ) -> None:
-    """Saved config admission delegates the exact resolved request without a raw-schema fallback."""
+    """Saved config admission delegates the exact resolved request; it takes no scientific override, not even another budget."""
     config = configs.resolve(configs.direct_config(), output_root=tmp_path)
     run_dir = common.paths.resolve_config_run_dir(config)
     source = configs.write_yaml(run_dir / "config.yaml", config)
@@ -973,10 +1003,9 @@ def test_saved_effective_resume_service_preserves_exact_science_and_only_extends
 
     monkeypatch.setattr(experiments.run, "_run_resolved_experiment", execute)
     original = source.read_bytes()
-    cap = int(config["training"]["epochs"]) + 1
-    experiments.run.run_experiment(source, resume=run_dir, max_epochs=cap)
+    experiments.run.run_experiment(source, resume=run_dir)
     requested = calls["requested"]
-    assert requested["training"]["epochs"] == cap
+    assert requested["training"] == config["training"]
     assert requested["model"] == config["model"]
     assert requested["data"] == config["data"]
     assert requested["run"]["layout"] == config["run"]["layout"]
@@ -985,8 +1014,8 @@ def test_saved_effective_resume_service_preserves_exact_science_and_only_extends
         experiments.run.run_experiment(source, resume=run_dir, train_dataset="different")
     with pytest.raises(ValueError, match="cannot override scientific"):
         experiments.run.run_experiment(source, resume=run_dir, seed=19)
-    with pytest.raises(ValueError, match="retain or increase"):
-        experiments.run.run_experiment(source, resume=run_dir, max_epochs=1)
+    with pytest.raises(ValueError, match="cannot override scientific"):
+        experiments.run.run_experiment(source, resume=run_dir, epochs=int(config["training"]["budget_epochs"]) + 1)
 
 
 def test_seed_override_selects_the_seed_leaf_and_seed_plan(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1005,36 +1034,39 @@ def test_seed_override_selects_the_seed_leaf_and_seed_plan(tmp_path: Path, monke
 
     (requested,) = calls
     assert requested["run"]["seed"] == requested["run"]["layout"]["seed"] == 19 != authored_seed
-    assert common.paths.resolve_config_run_dir(requested).name == "seed-19"
-    assert experiments.run.build_seed_plan(requested["run"]["seed"]) == experiments.run.build_seed_plan(19)
-    assert experiments.run.build_seed_plan(19) != experiments.run.build_seed_plan(authored_seed)
+    training = requested["training"]
+    group = f"seed-19__ep-{training['budget_epochs']}__k-{training['units_per_update']}__sch-cosine"
+    assert common.paths.resolve_config_run_dir(requested).name == group
+    assert experiments.run.build_seed_plan(requested["run"]["seed"], stage=None) == experiments.run.build_seed_plan(19, stage=None)
+    assert experiments.run.build_seed_plan(19, stage=None) != experiments.run.build_seed_plan(authored_seed, stage=None)
 
 
-def test_a0_epoch_budget_cannot_be_moved_by_an_operational_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A0's epochs are its scientific budget: resume keeps them, and --max-epochs never extends or reselects them."""
-    config = configs.resolve(configs.transient_stage_a_only_config(), output_root=tmp_path)
+@pytest.mark.parametrize("stage", ["steady", "b"])
+@pytest.mark.parametrize(("status", "refusal"), [("completed", "never extended"), ("unsuccessful", "not resumable")])
+def test_a_finished_run_is_never_extended_and_another_budget_is_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, status: str, refusal: str
+) -> None:
+    """A finished run is never resumed: the refusal precedes any write, its lock file included, and a longer budget names another run."""
+    monkeypatch.setenv("STORAGE_ROOT", str(tmp_path / "training"))
+    if stage == "steady":
+        raw, longer_raw = configs.direct_config(), configs.direct_config()
+        longer_raw["training"]["budget_epochs"] += 1
+        config, longer = (configs.resolve(item, output_root=tmp_path) for item in (raw, longer_raw))
+    else:
+        raw, longer_raw = configs.transient_matched_config(), configs.transient_matched_config()
+        longer_raw["training"]["b"]["train_seconds"] *= 2
+        config, longer = (dict(configs.resolve_plan(item, output_root=tmp_path).b) for item in (raw, longer_raw))
     run_dir = common.paths.resolve_config_run_dir(config)
-    source = configs.write_yaml(run_dir / "config.yaml", config)
-    calls: list[dict[str, Any]] = []
+    run_state.write_lightweight_run_state(run_dir, config, status=status, completed_epoch=1)
+    monkeypatch.setattr(experiments.run, "_execute_prepared_run_locked", lambda *_args, **_kwargs: pytest.fail("a finished run must not train"))
+    before = {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
 
-    def execute(requested: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
-        calls.append(requested)
-        return {"result": {"status": "completed"}, "run_dir": run_dir}
-
-    monkeypatch.setattr(experiments.run, "_run_resolved_experiment", execute)
-    saved_epochs = int(config["training"]["epochs"])
-
-    experiments.run.run_experiment(source, resume=run_dir, max_epochs=saved_epochs)
-    with pytest.raises(ValueError, match="scientific budget"):
-        experiments.run.run_experiment(source, resume=run_dir, max_epochs=saved_epochs + 2)
-    with pytest.raises(ValueError, match="cannot override scientific"):
-        experiments.run.run_experiment(source, resume=run_dir, lr_scale=0.5)
-    plan_path = configs.write_config(tmp_path, configs.transient_matched_config())
-    with pytest.raises(ValueError, match="scientific budget"):
-        experiments.run.run_experiment(plan_path, output_root=tmp_path / "fresh", train_stages=("a0",), max_epochs=9)
-
-    assert [requested["training"]["epochs"] for requested in calls] == [saved_epochs]
-    assert calls[0]["training"]["stage_schedule"]["total_epochs"] == saved_epochs
+    with pytest.raises((ValueError, experiments.run.RunLifecycleError), match=refusal):
+        experiments.run._run_resolved_experiment(config, config_path=common.paths.resolve_run_config_path(run_dir), resume=run_dir)
+    assert {item.relative_to(tmp_path): item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()} == before
+    assert not common.paths.resolve_run_lock_path(run_dir).exists()
+    assert common.paths.resolve_config_run_dir(longer) != run_dir
+    assert learning.training.checkpoint.config_digest(longer) != learning.training.checkpoint.config_digest(config)
 
 
 def test_optuna_trial_directory_is_not_resumed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,26 +1,26 @@
-"""Measure Train-fitted scaled increments, the Huber regime, and stored time steps.
+"""Measure Train-fitted scaled increments, their group-weighted loss shares, and stored time steps.
 
 Responsibilities:
   - Fit the transient scaling on the selected membership through the maintained scaling service
-  - Accumulate per-channel RMS, quantiles, exact zeros, the fraction above the Huber beta, and equal-weight loss shares
+  - Accumulate per-channel RMS, quantiles, exact zeros, and the share of the group-weighted state loss
   - Tabulate the stored time steps of every case with a uniformity flag
   - Scan transient reference cases once for the spectral, stride, increment, and time-step tables
 
 Design principles:
-  - Scaling, increments, and stride views reuse the training services unchanged
+  - Scaling, increments, loss, and stride views reuse the training services unchanged
   - Every count is exact; only the quantiles come from a fixed logarithmic histogram
-  - Statistics describe targets only: they are priors for the Huber and channel-weight ablations
+  - Statistics describe targets only: they show how the group weights balance the channels
 
 This module does NOT:
   - Persist a scaling artifact or reuse a run's scaling cache
-  - Choose the loss, its beta, or channel weights
+  - Choose the loss or its group weights
 
 Notes:
-  Huber term per element: torch huber_loss with delta = beta, as the transient loss applies it.
-  The equal-weight loss share of a channel is its mean Huber value of the scaled
-  increment, i.e. the loss of a zero-increment prediction, over the sum of all channels.
-  Quantiles report the upper edge of the histogram bin that reaches them (100 bins per
-  decade, relative width 2.3 %); values below the lowest edge report 0.
+  A scaled increment is the Train-scaled state error of a zero-increment prediction, so the
+  loss share of a channel is its weighted term of the maintained MSE state loss for that
+  prediction over the sum of all terms. Quantiles report the upper edge of the histogram bin
+  that reaches them (100 bins per decade, relative width 2.3 %); values below the lowest
+  edge report 0.
 
 """
 
@@ -32,9 +32,8 @@ from typing import TYPE_CHECKING, Any, Final, cast
 import numpy as np
 import pandas as pd
 import torch
-from torch.nn import functional
 
-from src import common, datasets
+from src import common, datasets, domain, learning
 from src.learning.transient import learning_transient_contracts as transient_contracts
 from src.learning.transient import learning_transient_scaling as transient_scaling
 
@@ -46,6 +45,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from torch import Tensor
+
+    from src.learning.losses.learning_losses_state import StateErrorLoss
 
     from .component_checks_sources import Membership, TransientReferenceCase
 
@@ -86,7 +87,7 @@ def fit_membership_scaling(
     config: Mapping[str, Any],
     storage_root: Path | str | None = None,
     max_cases: int | None = None,
-) -> transient_scaling.TransientScalingArtifact:
+) -> datasets.preprocessing.normalization.TrainScaling:
     """
     Fit the transient scaling on one membership exactly as training fits it on Train.
 
@@ -98,7 +99,7 @@ def fit_membership_scaling(
         Partition role whose leading cases are fitted.
     config : Mapping[str, Any]
         Maintained transient learning configuration; ``data.spatial_stride``,
-        ``scaling.mode``, ``input_profile`` and ``temporal`` are read.
+        ``input_profile`` and ``temporal`` are read.
     storage_root : pathlib.Path or str, optional
         Scientific storage root; defaults to the canonical resolution.
     max_cases : int, optional
@@ -106,8 +107,8 @@ def fit_membership_scaling(
 
     Returns
     -------
-    TransientScalingArtifact
-        In-memory scaling; its membership digest hashes the fitted case IDs.
+    TrainScaling
+        In-memory case-equal scaling; its membership digest hashes the fitted case IDs.
 
     """
     factory = datasets.runtime.factory
@@ -139,31 +140,43 @@ def fit_membership_scaling(
         )
         return transient_scaling.fit_transient_scaling(
             selected.iter_scaling_items(),
-            tensorizer=tensorizer,
+            preprocessing=datasets.preprocessing.normalization.preprocessing_spec(
+                _TASK_ID,
+                spatial_view=selected.spatial_representation().view_evidence(),
+                tensorizer=tensorizer.as_dict(),
+            ),
             dataset_identity=identity,
             train_membership_digest=common.serialization.canonical_json_sha256(list(case_ids)),
             horizon=selected.configured_regular_horizon,
-            scale_mode=config["scaling"]["mode"],
         )
     finally:
         selected.close()
 
 
-def scaled_increment_statistics(batches: Iterable[Tensor], *, channels: Sequence[str], beta: float) -> pd.DataFrame:
+def scaled_increment_statistics(batches: Iterable[Tensor], *, channels: Sequence[str], loss: StateErrorLoss) -> pd.DataFrame:
     """
     Accumulate per-channel statistics of scaled increments ``[transition, channel, y, x]``.
+
+    Parameters
+    ----------
+    batches : Iterable[Tensor]
+        Scaled increments, each the Train-scaled state error of a zero-increment prediction.
+    channels : Sequence[str]
+        State channels in tensor order; each must be one error term of ``loss``.
+    loss : StateErrorLoss
+        Maintained group-weighted state loss whose terms give the loss shares.
 
     Returns
     -------
     pandas.DataFrame
         Index ``channel``; columns ``count``, ``rms``, ``q50``, ``q90``, ``q99``
-        and ``max`` of the magnitude, ``zero_fraction``,
-        ``above_beta_fraction`` (strictly above ``beta``) and ``loss_share``.
+        and ``max`` of the magnitude, ``zero_fraction`` and ``loss_share``.
 
     """
     size = len(channels)
     count = np.zeros(size)
-    square, zeros, above, huber, peak = (np.zeros(size) for _ in range(5))
+    square, zeros, peak = (np.zeros(size) for _ in range(3))
+    weighted_terms: dict[str, float] = dict.fromkeys(channels, 0.0)
     histogram = np.zeros((size, len(_HISTOGRAM_EDGES) + 1))
     for batch in batches:
         values = batch.movedim(1, 0).reshape(size, -1).to(torch.float64)
@@ -171,8 +184,9 @@ def scaled_increment_statistics(batches: Iterable[Tensor], *, channels: Sequence
         count += values.shape[1]
         square += values.square().sum(dim=1).numpy()
         zeros += (values == 0).sum(dim=1).numpy()
-        above += (magnitude > beta).sum(dim=1).numpy()
-        huber += functional.huber_loss(values, torch.zeros_like(values), reduction="none", delta=beta).sum(dim=1).numpy()
+        with torch.no_grad():
+            for term, value in loss.term_contributions(torch.zeros_like(batch), batch).items():
+                weighted_terms[term] += float(value) * values.shape[1]
         peak = np.maximum(peak, magnitude.amax(dim=1).numpy())
         bins = torch.bucketize(magnitude, _HISTOGRAM_EDGES)
         histogram += np.stack([torch.bincount(row, minlength=histogram.shape[1]).numpy() for row in bins])
@@ -185,9 +199,8 @@ def scaled_increment_statistics(batches: Iterable[Tensor], *, channels: Sequence
         table[f"q{round(100 * quantile)}"] = np.minimum(upper[reached], peak)
     table["max"] = peak
     table["zero_fraction"] = zeros / count
-    table["above_beta_fraction"] = above / count
-    mean_huber = huber / count
-    table["loss_share"] = mean_huber / mean_huber.sum() if mean_huber.sum() > 0 else np.nan
+    total = sum(weighted_terms.values())
+    table["loss_share"] = [weighted_terms[channel] / total for channel in channels] if total > 0 else np.nan
     return table
 
 
@@ -221,9 +234,8 @@ def time_step_table(times: Mapping[str, np.ndarray]) -> pd.DataFrame:
 def scan_transient_cases(
     cases: Iterable[TransientReferenceCase],
     *,
-    scaling: transient_scaling.TransientScalingArtifact,
+    scaling: datasets.preprocessing.normalization.TrainScaling,
     spatial_stride: int,
-    beta: float,
     settings: pd.DataFrame,
 ) -> TransientComponentTables:
     """
@@ -233,12 +245,10 @@ def scan_transient_cases(
     ----------
     cases : Iterable[TransientReferenceCase]
         Membership cases, e.g. from :func:`component_checks_sources.iter_transient_reference_cases`.
-    scaling : TransientScalingArtifact
-        Scaling fitted on the same membership.
+    scaling : TrainScaling
+        Scaling fitted on the same membership; it also scales the loss terms.
     spatial_stride : int
         Training stride of the spectral and increment views.
-    beta : float
-        Maintained Huber transition scale.
     settings : pandas.DataFrame
         :func:`component_checks_spectral.maintained_mode_settings` of the task.
 
@@ -257,7 +267,9 @@ def scan_transient_cases(
             yield scaling.encode_delta(states[1:] - states[:-1])
 
     channels = tuple(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.dynamic_state)
-    increments = scaled_increment_statistics(scaled(), channels=channels, beta=beta)
+    loss = learning.losses.factory.build_data_loss(domain.tasks.registry.get_task(_TASK_ID), "mse")
+    loss.set_scaling(scaling)
+    increments = scaled_increment_statistics(scaled(), channels=channels, loss=loss)
     return TransientComponentTables(
         spectral=pd.concat(spectral_rows, ignore_index=True),
         stride=pd.concat(stride_rows, ignore_index=True),

@@ -121,7 +121,7 @@ def _grid(case: TransientReferenceCase) -> _Grid:
     if np.any(dx <= 0) or np.any(dy <= 0):
         msg = "Transient coordinates must increase along x and y."
         raise ValueError(msg)
-    weights = evaluation.transient_metrics.trapezoidal_cell_weights(np.ones(x.shape, dtype=bool)) * float(dx.mean()) * float(dy.mean())
+    weights = evaluation.transient_metrics.trapezoidal_cell_weights(x.shape) * float(dx.mean()) * float(dy.mean())
     return _Grid(x_row=x_row, cell_area_weights=weights)
 
 

@@ -2,8 +2,9 @@
 
 Responsibilities:
   - Classify raw scaled outputs, physical increments and reconstructed states
-  - Apply the phi range [0, 1.10] and exclude the 2x2 spatial corner blocks from physical invalidity
+  - Apply the task's physical-bound diagnostic to admitted reconstructed states
   - Locate invalid predictions and retain stage and channel denominators
+  - Keep each channel's first physical-bound violation (step, transition and time) per record and per case
   - Validate persisted record diagnostics and aggregate unique prediction chains
 
 Design principles:
@@ -27,13 +28,11 @@ import numpy as np
 
 from src import common
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
+from src.domain.tasks import domain_task_transient_drying as drying
 
 from . import evaluation_prediction_validity as validity_contract
 
 STATE_ORDER: Final = tuple(field.name for field in transient_contract.TRANSIENT_STEP_CONTRACT.dynamic_state)
-TEMPERATURE_RANGE_K: Final = (0.0, 2_000.0)
-PHI_RANGE: Final = (0.0, 1.10)
-EXCLUDED_CORNER_BLOCK: Final = 2
 _STATUS_PRECEDENCE: Final[dict[str, int]] = {status: rank for rank, status in enumerate(validity_contract.PREDICTION_VALIDITY_STATUSES)}
 _STAGE_NAMES: Final = (
     "raw_scaled_model_output",
@@ -83,29 +82,18 @@ def _times(value: Any, *, length: int) -> np.ndarray:
 
 
 def prediction_physical_invalid_mask(states: Any) -> np.ndarray:
-    """Return finite reconstructed values outside maintained field domains."""
-    array = _prediction_array(states, label="reconstructed_states")
-    finite = np.isfinite(array)
-    invalid = np.zeros(array.shape, dtype=bool)
-    lower, upper = TEMPERATURE_RANGE_K
-    invalid[:, 0] = finite[:, 0] & ((array[:, 0] < lower) | (array[:, 0] > upper))
-    invalid[:, 1] = finite[:, 1] & ((array[:, 1] < PHI_RANGE[0]) | (array[:, 1] > PHI_RANGE[1]))
-    invalid[:, 2:] = finite[:, 2:] & (array[:, 2:] < 0.0)
-    block = EXCLUDED_CORNER_BLOCK
-    for rows in (slice(None, block), slice(-block, None)):
-        for columns in (slice(None, block), slice(-block, None)):
-            invalid[..., rows, columns] = False
-    return invalid
+    """Return finite reconstructed values of one admitted [L,4,Y,X] array outside the task's field domains."""
+    return drying.physical_invalid_mask(_prediction_array(states, label="reconstructed_states"))
 
 
 def _physical_contract() -> dict[str, Any]:
     """Return the persisted physical-validity rule."""
     return {
-        "T_kelvin_inclusive": list(TEMPERATURE_RANGE_K),
-        "phi_inclusive": list(PHI_RANGE),
+        "T_kelvin_inclusive": list(drying.TEMPERATURE_RANGE_K),
+        "phi_inclusive": list(drying.PHI_RANGE),
         "w_surf_minimum_inclusive": 0.0,
         "w_int_minimum_inclusive": 0.0,
-        "excluded_corner_block": EXCLUDED_CORNER_BLOCK,
+        "excluded_corner_block": drying.EXCLUDED_CORNER_BLOCK,
     }
 
 
@@ -168,6 +156,52 @@ def _first_invalid(
                 "spatial_index": [y_index, x_index],
             }
     return None
+
+
+def _first_bound_violations(
+    *,
+    physical_invalid: np.ndarray,
+    available: np.ndarray,
+    times: np.ndarray,
+    origin_index: int,
+) -> dict[str, dict[str, Any] | None]:
+    """Return each state channel's first computed step with a finite value outside its physical bounds."""
+    computed = int(available.sum())
+    result: dict[str, dict[str, Any] | None] = {}
+    for channel_index, channel in enumerate(STATE_ORDER):
+        steps = np.flatnonzero(physical_invalid[:computed, channel_index].any(axis=(-2, -1)))
+        step = int(steps[0]) + 1 if steps.size else None
+        result[channel] = (
+            None if step is None else {"rollout_step": step, "transition_index": origin_index + step - 1, "physical_time": float(times[step])}
+        )
+    return result
+
+
+def _validate_first_bound_violations(value: object, *, channels: Mapping[str, Any], computed_steps: int, origin_index: int) -> None:
+    """Require one first violation exactly for each channel with counted bound violations, inside the computed steps."""
+    if not isinstance(value, Mapping) or set(value) != set(STATE_ORDER):
+        msg = "Prediction validity first bound violation evidence must name every state channel."
+        raise ValueError(msg)
+    for channel in STATE_ORDER:
+        entry = value[channel]
+        counted = int(channels[channel]["physically_invalid_finite_count"]) > 0
+        if entry is None and not counted:
+            continue
+        if (
+            entry is None
+            or not counted
+            or not isinstance(entry, Mapping)
+            or set(entry) != {"rollout_step", "transition_index", "physical_time"}
+            or isinstance(entry["rollout_step"], bool)
+            or not isinstance(entry["rollout_step"], Integral)
+            or not 1 <= int(entry["rollout_step"]) <= computed_steps
+            or entry["transition_index"] != origin_index + int(entry["rollout_step"]) - 1
+            or isinstance(entry["physical_time"], bool)
+            or not isinstance(entry["physical_time"], Real)
+            or not np.isfinite(float(entry["physical_time"]))
+        ):
+            msg = f"Prediction validity first bound violation of {channel!r} contradicts its counts or coordinates."
+            raise ValueError(msg)
 
 
 def build_prediction_validity(
@@ -253,6 +287,9 @@ def build_prediction_validity(
             mode=mode,
             origin_index=int(origin_index),
         ),
+        "first_bound_violation": _first_bound_violations(
+            physical_invalid=physical_invalid, available=available, times=times, origin_index=int(origin_index)
+        ),
         "physical_contract": _physical_contract(),
     }
     common.serialization.canonical_json_sha256(result)
@@ -279,6 +316,7 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         "channels",
         "stages",
         "first_invalid",
+        "first_bound_violation",
         "physical_contract",
     }
     if set(document) != required:
@@ -408,6 +446,9 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
         elif first["stage"] != "reconstructed_state" or channels[str(first["channel"])]["physically_invalid_finite_count"] < 1:
             msg = "Prediction validity first physical invalidity lacks counted evidence."
             raise ValueError(msg)
+    _validate_first_bound_violations(
+        document["first_bound_violation"], channels=channels, computed_steps=computed_steps, origin_index=int(document["origin_index"])
+    )
     contract = document["physical_contract"]
     if contract != _physical_contract():
         msg = "Prediction validity physical contract is invalid."
@@ -416,6 +457,9 @@ def validate_prediction_validity_document(  # noqa: C901, PLR0912
     document["channels"] = channels
     document["stages"] = admitted_stages
     document["first_invalid"] = None if first is None else dict(first)
+    document["first_bound_violation"] = {
+        channel: None if entry is None else dict(entry) for channel, entry in document["first_bound_violation"].items()
+    }
     return document
 
 
@@ -478,6 +522,11 @@ def validate_persisted_state_prediction_validity(
     if document["channels"] != _channel_counts(states, available, physical_invalid=physical_invalid):
         msg = "Prediction validity reconstructed counts contradict persisted states."
         raise ValueError(msg)
+    if document["first_bound_violation"] != _first_bound_violations(
+        physical_invalid=physical_invalid, available=available, times=times, origin_index=int(origin_index)
+    ):
+        msg = "Prediction validity first bound violations contradict persisted states."
+        raise ValueError(msg)
     # Decoding scales by positive finite factors and reconstruction adds a finite current state:
     # NaN passes through unchanged, while overflow can only add infinities of either sign.
     for channel in STATE_ORDER:
@@ -526,6 +575,17 @@ def validate_persisted_state_prediction_validity(
         msg = "Prediction validity first-invalid evidence contradicts the persisted states."
         raise ValueError(msg)
     return document
+
+
+def _earliest_bound_violations(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any] | None]:
+    """Return per channel the earliest first bound violation over a case's records, by physical time then transition."""
+    result: dict[str, dict[str, Any] | None] = {}
+    for channel in STATE_ORDER:
+        entries = [
+            cast("Mapping[str, Any]", entry) for entry in (record["first_bound_violation"][channel] for record in records) if entry is not None
+        ]
+        result[channel] = None if not entries else dict(min(entries, key=lambda item: (float(item["physical_time"]), int(item["transition_index"]))))
+    return result
 
 
 def aggregate_case_prediction_validity(
@@ -597,6 +657,7 @@ def aggregate_case_prediction_validity(
         "channels": sum_channels([cast("Mapping[str, Any]", value["channels"]) for value in admitted]),
         "stages": stage_summary,
         "first_invalid": first_invalid,
+        "first_bound_violation": _earliest_bound_violations(admitted),
     }
     common.serialization.canonical_json_sha256(result)
     return result

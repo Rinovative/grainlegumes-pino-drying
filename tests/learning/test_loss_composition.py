@@ -1,13 +1,15 @@
 """Protect semantic supervised/physics loss composition and deterministic warmup.
 
 Responsibilities:
-  - Check named supervised/physics components, warmup, normalization, telemetry, and monitor
+  - Check named per-case supervised/physics components, warmup, normalization, telemetry, and monitor
     failures
-  - Check that the relative H1 data loss treats boundaries as non-periodic and differentiates in metres
+  - Check the group-weighted state loss of both tasks, its velocity vector term, and its absolute H1
+    option in metres
   - Check that every physics term carries gradients through the normalizers to the prediction
+  - Check that a steady PI update gives the same step for any memory split of its cases
 
 Design principles:
-  - Actual sample counts weight epoch evidence; disabled physics has explicit zero components
+  - Disabled physics has explicit zero components
 
 This module does NOT:
   - Verify domain equation values or evaluation metric algebra
@@ -15,8 +17,8 @@ This module does NOT:
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -25,6 +27,7 @@ from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
 from src import domain, learning
+from src.datasets.runtime import dataset_runtime_units as units
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -52,12 +55,49 @@ class _ListMappingDataset(Dataset[dict[str, torch.Tensor]]):
         return self.samples[index]
 
 
-class IdentityNormalizer:
-    """Return tensors unchanged for synthetic physical-space tests."""
+@dataclass(frozen=True)
+class _StateGroup:
+    """Expose state channel names and Train scales like a scaling group."""
 
-    def inverse_transform(self, tensor: torch.Tensor) -> torch.Tensor:
+    names: tuple[str, ...]
+    scale: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _StateScales:
+    """Expose Train state scales for synthetic physical-space tests; inputs and states decode unchanged."""
+
+    names: tuple[str, ...]
+    values: tuple[float, ...]
+
+    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
         """Return the input tensor unchanged."""
-        return tensor
+        return value
+
+    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+        """Return the state tensor unchanged."""
+        return value
+
+    def group(self, name: str) -> _StateGroup:
+        """Return the state group."""
+        assert name == "state"
+        return _StateGroup(self.names, torch.tensor(self.values, dtype=torch.float64))
+
+
+class IdentityScaling:
+    """Decode tensors unchanged for synthetic physical-space tests; every state has Train scale one."""
+
+    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
+        """Return the input tensor unchanged."""
+        return value
+
+    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+        """Return the state tensor unchanged."""
+        return value
+
+    def group(self, name: str) -> _StateGroup:
+        """Return unit Train scales for the steady states."""
+        return _StateScales(_TASK.output_names, (1.0,) * len(_TASK.output_names)).group(name)
 
 
 class ChannelAffineNormalizer:
@@ -80,6 +120,27 @@ class ChannelAffineNormalizer:
     def inverse_transform(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return the physical tensor of a normalized one."""
         return tensor * self.standard_deviation + self.mean
+
+
+class AffineScaling:
+    """Decode inputs and states through test-owned per-channel affines."""
+
+    def __init__(self, inputs: ChannelAffineNormalizer, outputs: ChannelAffineNormalizer) -> None:
+        """Store the input and state affines."""
+        self.inputs = inputs
+        self.outputs = outputs
+
+    def decode_inputs(self, value: torch.Tensor) -> torch.Tensor:
+        """Return physical inputs."""
+        return self.inputs.inverse_transform(value)
+
+    def decode_state(self, value: torch.Tensor) -> torch.Tensor:
+        """Return physical states."""
+        return self.outputs.inverse_transform(value)
+
+    def group(self, name: str) -> _StateGroup:
+        """Return the state affine's scales as the Train state scales."""
+        return _StateScales(_TASK.output_names, tuple(self.outputs.standard_deviation.flatten().tolist())).group(name)
 
 
 _TARGET_WEIGHTS = {"momentum": 2.0, "continuity": 4.0, "boundary": 3.0}
@@ -148,6 +209,11 @@ def _manufactured_batch(*, dtype: torch.dtype = torch.float32) -> tuple[torch.Te
     return inputs, prediction, target
 
 
+def _batch_components(loss: Any, pred: torch.Tensor, **kwargs: Any) -> dict[str, torch.Tensor]:
+    """Return every named component averaged over the equally sized cases of one batch."""
+    return {name: value.mean() for name, value in loss.unit_components(pred, **kwargs).items()}
+
+
 def test_disabled_physics_exposes_named_zero_components() -> None:
     """
     Compute a supervised loss from nonzero predictions with physics disabled.
@@ -159,12 +225,13 @@ def test_disabled_physics_exposes_named_zero_components() -> None:
         configs.direct_config(model_kind="fno", physics_enabled=False),
     )
     supervised_loss = learning.losses.factory.build_training_loss(supervised, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
+    supervised_loss.set_scaling(IdentityScaling())
     task = domain.tasks.registry.get_task(str(supervised["task"]))
     pred = torch.ones((2, task.out_channels, 8, 8))
     target = torch.zeros_like(pred)
-    components = supervised_loss.compute_components(pred, x=None, y=target)
+    components = _batch_components(supervised_loss, pred, x=None, y=target)
 
-    assert tuple(components) == ("total", "data", "momentum", "continuity", "boundary")
+    assert tuple(components) == ("total", "data", "data_p", "data_velocity", "data_u", "data_v", "momentum", "continuity", "boundary")
     assert tuple(components) == supervised_loss.component_names
     assert components["total"] == components["data"]
     for term in ("momentum", "continuity", "boundary"):
@@ -180,13 +247,17 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
     while explicit epoch state persists for deterministic resume.
     """
     loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
-    normalizer = IdentityNormalizer()
-    loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+    assert isinstance(loss, learning.losses.pino.SemanticComposedLoss)
+    loss.set_scaling(IdentityScaling())
     inputs, pred, target = _manufactured_batch()
 
-    start = loss.compute_components(pred, x=inputs, y=target, epoch=0)
-    midpoint = loss.compute_components(pred, x=inputs, y=target, epoch=2)
-    end = loss.compute_components(pred, x=inputs, y=target, epoch=4)
+    start = _batch_components(loss, pred, x=inputs, y=target, epoch=0)
+    midpoint = _batch_components(loss, pred, x=inputs, y=target, epoch=2)
+    end = _batch_components(loss, pred, x=inputs, y=target, epoch=4)
+    per_case = loss.unit_components(pred, x=inputs, y=target, epoch=4)
+    assert all(value.shape == (pred.shape[0],) for value in per_case.values())
+    # A physics term is the batch mean given to every case, so its case mean is the batch value.
+    assert torch.equal(per_case["momentum"], per_case["momentum"][:1].expand(pred.shape[0]))
 
     for term in ("momentum", "continuity", "boundary"):
         assert start[term].item() == 0.0
@@ -201,109 +272,134 @@ def test_physics_composition_weighting_and_linear_warmup() -> None:
 
     loss.set_epoch(_MIDPOINT_EPOCH)
     forward_total = loss(pred, x=inputs, y=target)
-    assert forward_total == loss.last_components["total"]
     assert forward_total == pytest.approx(midpoint["total"])
     assert int(loss.state_dict()["current_epoch"].item()) == _MIDPOINT_EPOCH
     with pytest.raises(ValueError, match="non-negative integer"):
         loss.set_epoch(-1)
 
 
-def test_relative_h1_ignores_the_wrap_between_opposite_boundaries() -> None:
+def _constant_errors(errors: Sequence[float], *, shape: tuple[int, int] = (5, 7)) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a two-sample prediction and target whose Train-scaled error is one constant per channel."""
+    target = torch.randn((2, len(errors), *shape), generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    offsets = torch.tensor(errors, dtype=torch.float64).view(1, -1, 1, 1)
+    return target + offsets, target
+
+
+def test_steady_state_loss_weights_pressure_and_the_velocity_vector_by_half() -> None:
     """
-    Score the same interior error on a ramp and on a tent with equal slope and mean square.
+    Score constant scaled errors with distinct Train scales.
 
-    A periodic H1 would add the ramp's end-to-end jump to its gradient norm and
-    shrink its relative error several-fold; the non-periodic norm scores both alike.
+    Pressure and the velocity vector each weigh 1/2; the vector term divides the summed
+    physical squared errors by the summed squared Train scales, (E_u + E_v) / (s_u^2 + s_v^2).
     """
-    size = 64
-    y_grid = torch.linspace(0.0, 1.0, size, dtype=torch.float64)[:, None].expand(size, size)
-    ramp = y_grid
-    # Offset chosen so the tent's mean square matches the ramp's 1/3.
-    triangle = (0.5 + math.sqrt(1.25)) / 2.0 - (y_grid - 0.5).abs()
-    bump = 0.01 * torch.exp(-(((y_grid - 0.5) / 0.1) ** 2))
-    loss = learning.losses.factory.build_data_loss(
-        "relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(1.0 / size, 1.0 / size)
-    )
+    scales = {"p": 2.0, "u": 3.0, "v": 4.0}
+    errors = {"p": 0.5, "u": 1.5, "v": -2.0}
+    loss = learning.losses.factory.build_data_loss(_TASK, "mse")
+    loss.set_scaling(_StateScales(_TASK.output_names, tuple(scales[name] for name in _TASK.output_names)))
+    prediction, target = _constant_errors([errors[name] for name in _TASK.output_names])
 
-    def relative_h1(target: torch.Tensor) -> float:
-        return float(loss((target + bump)[None, None], target[None, None]))
+    physical = {name: (scales[name] * errors[name]) ** 2 for name in scales}
+    velocity = (physical["u"] + physical["v"]) / (scales["u"] ** 2 + scales["v"] ** 2)
+    contributions = loss.term_contributions(prediction, target)
 
-    assert relative_h1(ramp) == pytest.approx(relative_h1(triangle), rel=0.05)
+    assert set(contributions) == {"p", "velocity"}
+    assert float(contributions["p"]) == pytest.approx(0.5 * errors["p"] ** 2)
+    assert float(contributions["velocity"]) == pytest.approx(0.5 * velocity)
+    assert float(loss(prediction, target)) == pytest.approx(0.5 * errors["p"] ** 2 + 0.5 * velocity)
+    unscaled = learning.losses.factory.build_data_loss(_TASK, "mse")
+    with pytest.raises(RuntimeError, match="set_scaling"):
+        unscaled(prediction, target)
 
 
-def _quadratic_relative_h1_reference(spacing_y: float, spacing_x: float, shape: tuple[int, int]) -> tuple[torch.Tensor, torch.Tensor, float]:
+def test_steady_data_parts_split_the_data_loss_without_changing_the_total() -> None:
     """
-    Return a quadratic target, its perturbed prediction and the analytic relative H1 on that physical grid.
+    Split the weighted data loss into p and velocity and the velocity into its u and v shares.
 
-    Quadratics are differentiated exactly by the central and the third-order one-sided stencils, so
-    the analytic gradients in metres equal the discrete ones at every grid point.
+    Each field's share is its physical squared error over the summed squared Train scales of the
+    vector, times the term weight 1/2; the parts sum to their parent up to float rounding.
     """
-    height, width = shape
-    y = (torch.arange(height, dtype=torch.float64) * spacing_y)[:, None].expand(height, width)
-    x = (torch.arange(width, dtype=torch.float64) * spacing_x)[None, :].expand(height, width)
-    target = 1.0 + 2.0 * y + 3.0 * x + y**2 + x * y
-    error = 0.1 * (y**2 + 2.0 * x * y + x)
-    target_fields = (target, 2.0 + 2.0 * y + x, 3.0 + y)
-    error_fields = (error, 0.1 * (2.0 * y + 2.0 * x), 0.1 * (2.0 * y + 1.0))
-    numerator = sum(float((field**2).sum()) for field in error_fields)
-    denominator = sum(float((field**2).sum()) for field in target_fields)
-    return target, target + error, math.sqrt(numerator) / math.sqrt(denominator)
+    scales = {"p": 2.0, "u": 3.0, "v": 4.0}
+    errors = {"p": 0.5, "u": 1.5, "v": -2.0}
+    data_weight = 0.7
+    state_scales = _StateScales(_TASK.output_names, tuple(scales[name] for name in _TASK.output_names))
+    state_loss = learning.losses.factory.build_data_loss(_TASK, "mse")
+    state_loss.set_scaling(state_scales)
+    prediction, target = _constant_errors([errors[name] for name in _TASK.output_names])
+
+    contributions, shares = state_loss.unit_contributions_with_shares(prediction, target)
+
+    vector_scale = scales["u"] ** 2 + scales["v"] ** 2
+    assert set(shares) == {"velocity"}
+    for field in ("u", "v"):
+        expected = 0.5 * (scales[field] * errors[field]) ** 2 / vector_scale
+        assert torch.allclose(shares["velocity"][field], torch.full_like(shares["velocity"][field], expected))
+    assert torch.allclose(shares["velocity"]["u"] + shares["velocity"]["v"], contributions["velocity"])
+    assert all(torch.equal(value, contributions[name]) for name, value in state_loss.unit_term_contributions(prediction, target).items())
+
+    request = configs.direct_config(model_kind="fno", physics_enabled=False)
+    request["loss"]["data"]["weight"] = data_weight
+    loss = learning.losses.factory.build_training_loss(configs.resolve(request), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
+    loss.set_scaling(state_scales)
+    components = loss.unit_components(prediction, x=None, y=target)
+    own_terms, own_shares = loss.data_loss.unit_contributions_with_shares(prediction, target)
+
+    assert tuple(components) == loss.component_names
+    for name, value in own_terms.items():
+        assert torch.allclose(components[f"data_{name}"], data_weight * value)
+    for field, value in own_shares["velocity"].items():
+        assert torch.allclose(components[f"data_{field}"], data_weight * value)
+    assert not torch.allclose(components["data_u"], components["data_v"])
+    assert torch.allclose(components["data_p"] + components["data_velocity"], components["data"])
+    assert torch.allclose(components["data_u"] + components["data_v"], components["data_velocity"])
+    assert torch.equal(components["total"], components["data"])
 
 
-def test_relative_h1_differentiates_in_metres_rows_then_columns() -> None:
+def test_transient_state_loss_weights_temperature_humidity_and_both_moisture_compartments() -> None:
     """
-    Compare the factory loss with the analytic relative H1 of a quadratic on a non-square anisotropic grid.
+    Score constant scaled state errors of the drying states.
 
-    The spacing list is ordered (rows, columns); swapping it must change the value, so the loss
-    cannot silently differentiate on a unit square or with transposed axes.
+    Temperature and humidity weigh 1/3 each and the two moisture compartments 1/6 each,
+    with one named data component per term.
     """
-    spacing_y, spacing_x = 0.5, 0.25
-    target, prediction, expected = _quadratic_relative_h1_reference(spacing_y, spacing_x, (6, 9))
-    pair = (prediction[None, None], target[None, None])
+    task = domain.tasks.registry.get_task("transient_drying")
+    errors = {"T": 1.0, "phi": 2.0, "w_surf": 3.0, "w_int": 4.0}
+    weights = {"T": 1 / 3, "phi": 1 / 3, "w_surf": 1 / 6, "w_int": 1 / 6}
+    loss = learning.losses.transient.TransientStateLoss(data_loss=learning.losses.factory.build_data_loss(task, "mse"), data_weight=2.0)
+    prediction, target = _constant_errors([errors[name] for name in task.metric_names])
 
-    loss = learning.losses.factory.build_data_loss("relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(spacing_y, spacing_x))
-    swapped = learning.losses.factory.build_data_loss(
-        "relative_h1", space="normalized", operator_dimensionality=2, grid_spacing=(spacing_x, spacing_y)
-    )
+    components = {name: value.mean() for name, value in loss.unit_components(prediction, y=target).items()}
 
-    assert float(loss(*pair)) == pytest.approx(expected, rel=1e-9)
-    assert float(swapped(*pair)) != pytest.approx(expected, rel=1e-3)
-
-
-def test_relative_h1_requires_a_valid_physical_spacing() -> None:
-    """Reject a missing spacing for relative H1 and malformed spacings, while relative L2 ignores it."""
-    factory = learning.losses.factory
-    with pytest.raises(ValueError, match="requires grid_spacing"):
-        factory.build_data_loss("relative_h1", space="normalized", operator_dimensionality=2)
-    for invalid in ((0.003,), (0.003, float("nan"))):
-        with pytest.raises(ValueError, match="positive finite spacings"):
-            factory.build_relative_h1(2, reduction="mean", grid_spacing=invalid)
-    assert factory.build_data_loss("relative_l2", space="normalized", operator_dimensionality=2) is not None
+    assert loss.component_names == ("total", "data", "data_T", "data_phi", "data_w_surf", "data_w_int")
+    for name, error in errors.items():
+        assert float(components[f"data_{name}"]) == pytest.approx(2.0 * weights[name] * error**2)
+    assert float(components["total"]) == pytest.approx(2.0 * sum(weights[name] * error**2 for name, error in errors.items()))
 
 
-def test_relative_h1_metric_uses_the_loss_spacing() -> None:
+def test_h1_adds_the_weighted_squared_gradient_error_in_metres_without_wrap() -> None:
     """
-    Evaluate one sample through the steady metric and through the factory with the same spacing.
+    Add linear errors whose physical gradients are exact on a non-square anisotropic grid.
 
-    The metric averages the per-field values of its single sample like the data loss, so
-    identical fields give the loss value; the metric also requires a spacing at construction.
+    The H1 loss exceeds the MSE loss by the weighted squared gradient in metres (length scale 1 m);
+    a periodic derivative would add the end-to-end jump, and swapped spacings change the value.
     """
+    task = domain.tasks.registry.get_task("transient_drying")
     spacing = (0.5, 0.25)
-    target, prediction, expected = _quadratic_relative_h1_reference(*spacing, (6, 9))
-    metric_id = "normalized_relative_h1"
-    config = configs.resolve(configs.direct_config())
-    config["evaluation"]["metrics"] = [metric for metric in config["evaluation"]["metrics"] if metric["id"] == metric_id]
-    cpu = torch.device("cpu")
-    channels = len(_TASK.output_names)
-    pred = prediction.expand(1, channels, *prediction.shape)
-    true = target.expand(1, channels, *target.shape)
+    rows, columns = torch.meshgrid(torch.arange(6, dtype=torch.float64), torch.arange(9, dtype=torch.float64), indexing="ij")
+    y, x = rows * spacing[0], columns * spacing[1]
+    slopes = {"T": (1.0, 0.0), "phi": (0.0, 2.0), "w_surf": (3.0, -1.0), "w_int": (0.5, 0.5)}
+    error = torch.stack([slope_y * y + slope_x * x for slope_y, slope_x in slopes.values()])[None]
+    target = torch.zeros_like(error)
+    weights = {"T": 1 / 3, "phi": 1 / 3, "w_surf": 1 / 6, "w_int": 1 / 6}
+    gradient = sum(weights[name] * (slope_y**2 + slope_x**2) for name, (slope_y, slope_x) in slopes.items())
 
-    with pytest.raises(ValueError, match="requires grid_spacing"):
-        learning.metrics.metrics.build_evaluation_metrics(config, device=cpu)
-    metric = learning.metrics.metrics.build_evaluation_metrics(config, device=cpu, grid_spacing=spacing)[metric_id]
-    metric.update(pred, true, space="normalized", batch_index=0)
+    mse = learning.losses.factory.build_data_loss(task, "mse")
+    h1 = learning.losses.factory.build_data_loss(task, "h1", grid_spacing=spacing)
+    swapped = learning.losses.factory.build_data_loss(task, "h1", grid_spacing=spacing[::-1])
 
-    assert metric.compute() == pytest.approx(expected, rel=1e-9)
+    assert float(h1(error, target)) == pytest.approx(float(mse(error, target)) + gradient, rel=1e-12)
+    assert float(swapped(error, target)) != pytest.approx(float(h1(error, target)), rel=1e-3)
+    with pytest.raises(ValueError, match="two positive finite grid spacings"):
+        learning.losses.factory.build_data_loss(task, "h1")
 
 
 def test_pi_model_families_share_one_dimensionless_loss_path() -> None:
@@ -316,12 +412,11 @@ def test_pi_model_families_share_one_dimensionless_loss_path() -> None:
     for model_kind in ("fno", "uno"):
         config = _physics_config(model_kind=model_kind)
         loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
-        normalizer = IdentityNormalizer()
-        loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+        loss.set_scaling(IdentityScaling())
         inputs, pred, target = _manufactured_batch()
 
         diagnostics = loss.compute_physics_diagnostics(pred, x=inputs)
-        components = loss.compute_components(pred, x=inputs, y=target, epoch=4)
+        components = _batch_components(loss, pred, x=inputs, y=target, epoch=4)
         expected = {
             "momentum": diagnostics.momentum_mse,
             "continuity": diagnostics.continuity_mse,
@@ -350,14 +445,14 @@ def test_each_physics_term_backpropagates_through_the_normalizers_to_the_predict
     output_statistics = {"p": (0.1, 0.4), "u": (1e-6, 2e-5), "v": (-2e-6, 3e-5)}
     in_normalizer = ChannelAffineNormalizer(input_statistics)
     out_normalizer = ChannelAffineNormalizer([output_statistics[name] for name in _TASK.output_names])
-    loss.set_normalizers(in_normalizer=in_normalizer, out_normalizer=out_normalizer)
+    loss.set_scaling(AffineScaling(in_normalizer, out_normalizer))
     physical_inputs, physical_prediction, target = _manufactured_batch(dtype=torch.float64)
     inputs = in_normalizer.transform(physical_inputs)
     prediction = out_normalizer.transform(physical_prediction).requires_grad_(True)
     direction = torch.randn(prediction.shape, generator=torch.Generator().manual_seed(11), dtype=torch.float64)
 
     def weighted_term(value: torch.Tensor) -> torch.Tensor:
-        return loss.compute_components(value, x=inputs, y=target, epoch=4)[term]
+        return _batch_components(loss, value, x=inputs, y=target, epoch=4)[term]
 
     component = weighted_term(prediction)
     assert component.requires_grad
@@ -389,145 +484,49 @@ def test_invalid_physics_loss_settings_fail_through_public_factory() -> None:
         learning.losses.factory.build_training_loss(warmup_config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
 
 
-class _IdentityScaleModel(torch.nn.Module):
-    """
-    Expose one trainable scalar for epoch-aggregation tests.
-
-    Callers use zero learning rate so predictions reveal only batch weighting.
-    this helper is not a model-accuracy fixture.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.scale = torch.nn.Parameter(torch.ones(()))
-
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """Scale a synthetic batch while retaining an autograd path."""
-        return self.scale * value
-
-
-class _SyntheticComponentLoss(torch.nn.Module):
-    """Return batch-mean components whose unequal final batch is observable."""
-
-    physics_enabled = False
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.last_components: dict[str, torch.Tensor] = {}
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        y: torch.Tensor | None = None,
-        *,
-        x: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return a batch mean and expose detached total/data components."""
-        del x
-        if y is None:
-            msg = "target required"
-            raise ValueError(msg)
-        value = (pred - y).mean()
-        self.last_components = {"total": value.detach(), "data": value.detach()}
-        return value
-
-
-class _SyntheticPhysicsComponentLoss(_SyntheticComponentLoss):
-    """Expose the three physics components and fixed applied-weight telemetry."""
-
-    physics_enabled = True
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        y: torch.Tensor | None = None,
-        *,
-        x: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return fixed-ratio named physics components from one batch mean."""
-        del x
-        if y is None:
-            msg = "target required"
-            raise ValueError(msg)
-        data = (pred - y).mean()
-        momentum = 2.0 * data
-        boundary = 3.0 * data
-        continuity = 4.0 * data
-        total = data + momentum + boundary + continuity
-        self.last_components = {
-            "total": total.detach(),
-            "data": data.detach(),
-            "momentum": momentum.detach(),
-            "boundary": boundary.detach(),
-            "continuity": continuity.detach(),
-        }
-        return total
-
-    def telemetry_state(self) -> dict[str, float]:
-        """Return fixed applied-weight telemetry for epoch aggregation."""
-        return {
-            "weight_momentum": 0.25,
-            "warmup_momentum_fraction": 0.75,
-            "weight_continuity": 0.125,
-            "warmup_continuity_fraction": 0.75,
-            "weight_boundary": 0.5,
-            "warmup_boundary_fraction": 1.0,
-        }
-
-
-def test_epoch_loss_components_are_weighted_by_actual_sample_count() -> None:
-    """
-    Train over a two-sample batch followed by one unequal-valued singleton.
-
-    Every named component and fixed physics telemetry must use actual sample count,
-    preventing a partial batch from receiving equal weight to a full batch.
-    """
-    samples = [{"x": torch.full((1, 1, 1), value), "y": torch.zeros((1, 1, 1))} for value in (1.0, 3.0, 9.0)]
-    loader = DataLoader(_ListMappingDataset(samples), batch_size=2, shuffle=False)
-    model = _IdentityScaleModel()
-    optimizer = SGD(model.parameters(), lr=0.0)
-
-    values = learning.training.loop.train_one_epoch(
+def _steady_update(memory_batch: int) -> tuple[torch.Tensor, dict[str, float]]:
+    """Train one steady PI update over four cases split into microbatches of ``memory_batch``; return the stepped weights."""
+    inputs, _pred, _target = _manufactured_batch(dtype=torch.float64)
+    targets = 1e-5 * torch.randn((4, len(_TASK.output_names), *inputs.shape[-2:]), generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+    samples = [{"x": inputs[0], "y": target} for target in targets]
+    sampler = units.UnitSampler(unit_kind="case", cases=range(4), keys=None, units_per_update=4, memory_batch=memory_batch, seed=0)
+    sampler.begin_epoch(0)
+    loader = DataLoader(_ListMappingDataset(samples), batch_sampler=sampler)
+    model = torch.nn.Conv2d(len(_TASK.input_names), len(_TASK.output_names), 1, bias=False, dtype=torch.float64)
+    with torch.no_grad():
+        model.weight.copy_(1e-6 * torch.randn(model.weight.shape, generator=torch.Generator().manual_seed(7), dtype=torch.float64))
+    loss = learning.losses.factory.build_training_loss(_physics_config(), device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
+    loss.set_scaling(IdentityScaling())
+    # Four committed passes over the four cases end the four-epoch warm-up, so the update applies the target weights.
+    values = learning.training.loop.train_update_groups(
         model,
         loader,
-        optimizer,
-        _SyntheticComponentLoss(),
+        SGD(model.parameters(), lr=1.0),
+        loss,
         torch.device("cpu"),
+        learning.training.loop._SteadyUnits(None, torch.device("cpu")),
+        budget=learning.training.budget.StageBudget(unit="units", total=20, units=16, validated_point=16),
     )
+    return model.weight.detach().clone(), values
 
-    assert values["train/loss_total"] == pytest.approx(13.0 / 3.0)
-    assert values["train/loss_data"] == pytest.approx(13.0 / 3.0)
-    assert values["train/loss_total"] != pytest.approx((2.0 + 9.0) / 2.0)
-    assert values["optimizer_steps"] == 2.0
-    assert values["system/train_duration_seconds"] > 0.0
-    assert values["system/train_samples_per_second"] > 0.0
-    assert not any("momentum" in key or "continuity" in key for key in values)
 
-    physics_model = _IdentityScaleModel()
-    physics_values = learning.training.loop.train_one_epoch(
-        physics_model,
-        loader,
-        SGD(physics_model.parameters(), lr=0.0),
-        _SyntheticPhysicsComponentLoss(),
-        torch.device("cpu"),
-    )
-    assert set(physics_values) == {
-        "train/loss_total",
-        "train/loss_data",
-        "physics/train/loss_momentum",
-        "physics/train/loss_continuity",
-        "physics/train/loss_boundary",
-        "physics/train/momentum_weight",
-        "physics/train/continuity_weight",
-        "physics/train/boundary_weight",
-        "system/train_duration_seconds",
-        "system/train_samples_per_second",
-        "optimizer_steps",
-        "committed_optimizer_groups",
-        "gradient_predictions",
-    }
-    assert physics_values["physics/train/loss_continuity"] == pytest.approx(4.0 * 13.0 / 3.0)
-    assert physics_values["physics/train/continuity_weight"] == 0.125
+def test_steady_update_gradient_does_not_depend_on_the_memory_split() -> None:
+    """
+    Train one update of four cases at once and case by case with the PI loss.
+
+    The case losses and the batch-mean physics terms enter divided by the planned
+    four units, so a 1 x 4 and a 4 x 1 memory split give the same step, and the
+    epoch telemetry reports the units, cases and physics terms of the update.
+    """
+    whole, values = _steady_update(4)
+    split, split_values = _steady_update(1)
+
+    assert torch.allclose(whole, split, rtol=1e-10, atol=1e-18)
+    assert split_values["train/loss_total"] == pytest.approx(values["train/loss_total"], rel=1e-10)
+    assert (values["train/updates"], values["train/microbatches"], split_values["train/microbatches"]) == (1.0, 1.0, 4.0)
+    assert (values["train/units_per_update"], values["train/distinct_cases_per_update"], values["gradient_predictions"]) == (4.0, 4.0, 4.0)
+    assert values["physics/train/loss_momentum"] > 0.0
+    assert values["physics/train/continuity_weight"] == _TARGET_WEIGHTS["continuity"]
 
 
 class _ManufacturedMonitorModel(torch.nn.Module):
@@ -574,8 +573,7 @@ def test_physics_monitor_is_bounded_and_reports_the_three_terms() -> None:
                 ),
             )
             loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"), grid_spacing=_GRID_SPACING)
-            normalizer = IdentityNormalizer()
-            loss.set_normalizers(in_normalizer=normalizer, out_normalizer=normalizer)
+            loss.set_scaling(IdentityScaling())
             model = _ManufacturedMonitorModel()
 
             values = learning.training.loop.evaluate_physics_monitor(
@@ -583,7 +581,7 @@ def test_physics_monitor_is_bounded_and_reports_the_three_terms() -> None:
                 loader,
                 loss,
                 torch.device("cpu"),
-                data_processor=None,
+                scaling=None,
                 max_cases=2,
             )
 
@@ -624,7 +622,7 @@ def test_physics_monitor_wraps_numerics_as_scientific_evaluation_with_cause() ->
             loader,
             _FailingMonitorLoss(),
             torch.device("cpu"),
-            data_processor=None,
+            scaling=None,
             max_cases=1,
         )
     assert isinstance(captured.value.__cause__, ValueError)

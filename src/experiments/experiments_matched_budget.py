@@ -1,8 +1,10 @@
 """Publish immutable B training-time receipts for matched A0/B/A1 comparisons.
 
 Responsibilities:
-  - Bind completed B work to the exact parent identity and common A0 handoff
-  - Validate receipt schema, positive finite training time, and identity digests
+  - Bind finished B work, measured on the optimisation clock of its admitted terminal budget, to the exact parent identity and A0 handoff
+  - Record B's actual seconds and end status (completed, diverged, no eligible checkpoint), so A1 always gets them
+  - Carry B's budget progress and eligible points, the comparison's one source of B's end
+  - Validate receipt schema, end status, finite training time (zero only after a first-group divergence), and identity digests
   - Publish one receipt and admit it before its selected A1 continuation
 
 Design principles:
@@ -26,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from src import common
+from src.learning.training import learning_training_budget as stage_budget
 
 from . import experiments_run_identity as run_identity
 
@@ -34,12 +37,20 @@ _SCHEMA_KIND = "matched_a1_b_train_budget"
 _SHA256_LENGTH = 64
 _PROTOCOL_MATCHED = "matched_a1_b"
 _CLOCK_SECONDS = "train_seconds"
+# B's end: its budget with an eligible checkpoint, a non-finite training loss, or its budget without an eligible checkpoint.
+B_END_STATUSES = ("completed", "diverged", "no_eligible_checkpoint")
 
 
-def _positive_seconds(value: object) -> float:
-    """Return an exact finite measured duration, independent of device type."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
-        msg = "Committed B train_seconds must be positive and finite."
+def _seconds(value: object, *, status: object) -> float:
+    """Return B's exact finite measured seconds; zero only for a B that diverged before its first committed group."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+        or (value == 0 and status != "diverged")
+    ):
+        msg = "Committed B train_seconds must be finite and positive, or zero for a B that diverged in its first group."
         raise ValueError(msg)
     return float(value)
 
@@ -49,24 +60,30 @@ def build_b_receipt(
     parent_identity_sha256: str,
     a0_handoff_sha256: str,
     b_config: Mapping[str, Any],
-    b_summary: Mapping[str, Any],
+    finished_b: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind terminal B optimization work to its exact common A0 branch point."""
+    """
+    Bind terminal B optimization work and B's end status to its exact common A0 branch point.
+
+    ``finished_b`` is B as ``experiments_run.validate_finished_run`` admitted it: its summary
+    and the terminal budget its training outcome was checked against. The receipt records
+    B's actual committed optimisation seconds also when B diverged or has no eligible
+    checkpoint, so A1 always trains exactly these seconds. Example: B diverges at 30 % of its
+    budget; the receipt holds those seconds and A1 trains them; a B that diverged in its
+    first group holds 0 seconds, and its A1 runs no update.
+    """
     protocol = b_config["training"].get("matched_a1_b")
-    if protocol is None:
-        msg = "A B budget receipt requires the matched_a1_b training protocol."
+    if protocol is None or protocol["role"] != "b":
+        msg = "A B budget receipt requires matched B training under the matched_a1_b protocol."
         raise ValueError(msg)
-    if protocol["role"] != "b" or b_summary.get("status") != "completed":
-        msg = "A B budget receipt requires completed matched B training."
-        raise ValueError(msg)
+    b_summary = finished_b["summary"]
+    budget = finished_b["terminal_budget"]
+    outcome = b_summary["training_outcome"]
     controller = b_summary.get("terminal_controller")
-    if not isinstance(controller, Mapping) or not controller.get("budget_complete"):
-        msg = "Completed B lacks a terminal committed budget controller."
+    if not isinstance(controller, Mapping) or not isinstance(budget, stage_budget.StageBudget) or budget.unit != _CLOCK_SECONDS:
+        msg = "Finished B lacks its terminal controller or a terminal budget measured on the optimisation clock in train_seconds."
         raise ValueError(msg)
-    train_seconds = _positive_seconds(controller.get("train_seconds"))
-    if controller.get("clock_kind") != _CLOCK_SECONDS:
-        msg = "Completed B controller clock differs from its exact protocol."
-        raise ValueError(msg)
+    train_seconds = _seconds(budget.train_seconds, status=outcome["status"])
     payload = {
         "schema_kind": _SCHEMA_KIND,
         "protocol": _PROTOCOL_MATCHED,
@@ -84,12 +101,15 @@ def build_b_receipt(
         "objective": b_config["evaluation"]["objective"],
         "initialization": protocol["initialization"],
         "train_seconds": train_seconds,
+        # B's end as the comparison reads it, also when B has no artifact of its own.
+        "b_status": outcome["status"],
+        "b_budget_progress": outcome["budget_progress"],
+        "b_eligible_points": outcome["eligible_points"],
         "optimizer_steps": controller["post_handoff_optimizer_steps"],
         "optimizer_groups": controller["post_handoff_optimizer_steps"],
         "terminal_epoch": b_summary["terminal_epoch"],
-        "terminal_batch_cursor": controller.get("batch_cursor"),
         "best_epoch": b_summary["best_epoch"],
-        "best_checkpoint_sha256": b_summary["best_checkpoint_sha256"],
+        "best_checkpoint_sha256": b_summary.get("best_checkpoint_sha256"),
         "last_checkpoint_sha256": b_summary["last_checkpoint_sha256"],
     }
     return {**payload, "receipt_sha256": common.serialization.canonical_json_sha256(payload)}
@@ -110,11 +130,37 @@ def validate_b_receipt(value: object) -> dict[str, Any]:
     if not isinstance(digest, str) or digest != common.serialization.canonical_json_sha256(payload):
         msg = "B train budget receipt digest mismatch."
         raise ValueError(msg)
-    seconds = _positive_seconds(value.get("train_seconds"))
+    status = value.get("b_status")
+    # Only B's selected checkpoint may be absent, exactly when B has none.
+    if status not in B_END_STATUSES or (status == "completed" and value.get("best_checkpoint_sha256") is None):
+        msg = "B train budget receipt lacks B's end status or its selected checkpoint (receipts without b_status are no longer accepted)."
+        raise ValueError(msg)
+    if status == "no_eligible_checkpoint" and value.get("best_checkpoint_sha256") is not None:
+        msg = "B train budget receipt names a selected checkpoint although B has no eligible one."
+        raise ValueError(msg)
+    seconds = _seconds(value.get("train_seconds"), status=status)
     if value.get("budget_value") != seconds:
         msg = "Matched A1/B receipt budget_value must equal train_seconds."
         raise ValueError(msg)
-    for key in ("parent_identity_sha256", "a0_handoff_sha256", "best_checkpoint_sha256", "last_checkpoint_sha256"):
+    progress, eligible_points = value.get("b_budget_progress"), value.get("b_eligible_points")
+    if (
+        isinstance(progress, bool)
+        or not isinstance(progress, (int, float))
+        or not 0.0 <= progress <= 1.0
+        or isinstance(eligible_points, bool)
+        or not isinstance(eligible_points, int)
+        or (eligible_points > 0) != (value.get("best_checkpoint_sha256") is not None)
+    ):
+        msg = "B train budget receipt budget progress or eligible points are invalid."
+        raise ValueError(msg)
+    # A B without a committed group has no last checkpoint.
+    tokens = ["parent_identity_sha256", "a0_handoff_sha256", *(["last_checkpoint_sha256"] if seconds > 0 else [])]
+    if seconds == 0 and value.get("last_checkpoint_sha256") is not None:
+        msg = "B train budget receipt names a last checkpoint although B committed no group."
+        raise ValueError(msg)
+    if value.get("best_checkpoint_sha256") is not None:
+        tokens.append("best_checkpoint_sha256")
+    for key in tokens:
         token = value.get(key)
         if not isinstance(token, str) or len(token) != _SHA256_LENGTH or any(ch not in "0123456789abcdef" for ch in token):
             msg = f"B train budget receipt {key} is invalid."

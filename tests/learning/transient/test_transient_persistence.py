@@ -26,7 +26,11 @@ from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader, TensorDataset
 
 from src import common, learning
+from src.datasets.runtime.dataset_runtime_units import UnitSampler
 from src.learning.transient import learning_transient_history as history
+
+_WORK = {"optimizer_steps": 1, "gradient_predictions": 2, "units": 2, "update_distinct_cases": 2}
+_UPDATE_WORK = [[2, 2, 2]]
 
 
 class _StatefulLoss(nn.Module):
@@ -70,7 +74,6 @@ def _identity(label: str = "transient-persistence") -> dict[str, Any]:
         "task": "transient_drying",
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
-        "resume_contract_digest": digest("resume"),
         "dataset_ids": {"train": "synthetic-train", "material_ood": "synthetic-material-ood", "parameter_ood": "synthetic-parameter-ood"},
         "dataset_fingerprints": {"train": digest("train"), "material_ood": digest("material-ood"), "parameter_ood": digest("parameter-ood")},
         "split_contract_digest": digest("split"),
@@ -179,26 +182,37 @@ def test_live_callback_classifies_nonfinite_metric_as_numerical_failure_without_
     assert len(json.loads(history.history_path(tmp_path).read_text(encoding="utf-8"))["epochs"]) == 1
 
 
-def _components(seed: int) -> tuple[nn.Module, AdamW, _StatefulLoss, DataLoader[Any]]:
-    """Build compact stateful CPU components for exact restore."""
+def _validated_budget(point: int) -> learning.training.budget.StageBudget:
+    """Return a 20-unit budget validated at the given point, with deterministic clock seconds."""
+    budget = learning.training.budget.StageBudget(unit="units", total=20)
+    budget.record_group(units=point, train_seconds=0.5 * point)
+    budget.record_validation()
+    return budget
+
+
+def _components(seed: int, *, epochs: int = 1) -> tuple[nn.Module, AdamW, _StatefulLoss, DataLoader[Any]]:
+    """Build compact stateful CPU components whose unit sampler has committed ``epochs`` complete epochs."""
     torch.manual_seed(seed)
     model = nn.Linear(2, 1)
     optimizer = AdamW(model.parameters(), lr=0.01)
     loss = _StatefulLoss(float(seed))
-    generator = torch.Generator().manual_seed(seed + 1)
-    loader = DataLoader(TensorDataset(torch.ones(4, 2), torch.zeros(4, 1)), batch_size=2, shuffle=True, generator=generator)
-    x, y = next(iter(loader))
-    optimizer.zero_grad(set_to_none=True)
-    torch.mean((model(x) - y).square()).backward()
-    optimizer.step()
+    sampler = UnitSampler(unit_kind="transition", cases=(0, 0, 1, 1), keys=None, units_per_update=2, memory_batch=2, seed=seed + 1)
+    loader = DataLoader(TensorDataset(torch.ones(4, 2), torch.zeros(4, 1)), batch_sampler=sampler)
+    for epoch in range(epochs):
+        sampler.begin_epoch(epoch)
+        for x, y in loader:
+            optimizer.zero_grad(set_to_none=True)
+            torch.mean((model(x) - y).square()).backward()
+            optimizer.step()
+            sampler.advance(len(x))
     return model, optimizer, loss, loader
 
 
-def _loader_generator_state(loader: DataLoader[Any]) -> torch.Tensor:
-    """Return one explicitly configured loader generator state."""
-    generator = loader.generator
-    assert generator is not None
-    return generator.get_state()
+def _sampler_state(loader: DataLoader[Any]) -> dict[str, Any]:
+    """Return the persisted state of a loader's unit sampler."""
+    sampler = loader.batch_sampler
+    assert isinstance(sampler, UnitSampler)
+    return sampler.state_dict()
 
 
 def _assert_equal(left: Any, right: Any) -> None:
@@ -240,14 +254,17 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
         loss=source_loss,
         best_metric=0.5,
         best_epoch=1,
-        objective_history=[{"epoch": 1, "objective_id": "mse", "value": 0.5}],
+        objective_history=[{"point": 1, "epoch": 1, "objective_id": "mse", "value": 0.5, "bound_violations": {}}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
-        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
+        training_work=_WORK,
+        update_work=_UPDATE_WORK,
+        budget=_validated_budget(1),
         adapter=source_adapter,
     )
     model, optimizer, loss, loader = _components(20)
     adapter = _Adapter(9)
+    budget = learning.training.budget.StageBudget(unit="units", total=20)
     restored = learning.training.checkpoint.restore_checkpoint(
         payload,
         expected_identity=identity,
@@ -256,21 +273,27 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
         scheduler=None,
         loss=loss,
         train_loader=loader,
+        budget=budget,
         adapter=adapter,
         adapter_expected=True,
     )
+    assert budget.state_dict() == _validated_budget(1).state_dict()
     assert restored["global_step"] == 1
     assert adapter.value == source_adapter.value
     _assert_equal(model.state_dict(), source_model.state_dict())
+    _assert_equal(_sampler_state(loader), _sampler_state(source_loader))
 
     failing = copy.deepcopy(payload)
     failing["adapter_state_dict"] = {"value": 7, "fail": True}
+    # Move the live budget away from the saved state so a partial restore would show.
+    budget.record_group(units=3, train_seconds=1.0)
     before = {
         "model": copy.deepcopy(model.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
         "loss": copy.deepcopy(loss.state_dict()),
-        "loader": _loader_generator_state(loader).clone(),
+        "loader": _sampler_state(loader),
         "adapter": adapter.state_dict(),
+        "budget": budget.state_dict(),
         "python": random.getstate(),
         "numpy": copy.deepcopy(np.random.get_state()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         "torch": torch.get_rng_state().clone(),
@@ -284,13 +307,15 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
             scheduler=None,
             loss=loss,
             train_loader=loader,
+            budget=budget,
             adapter=adapter,
             adapter_expected=True,
         )
+    _assert_equal(before["budget"], budget.state_dict())
     _assert_equal(before["model"], model.state_dict())
     _assert_equal(before["optimizer"], optimizer.state_dict())
     _assert_equal(before["loss"], loss.state_dict())
-    assert torch.equal(before["loader"], _loader_generator_state(loader))
+    _assert_equal(before["loader"], _sampler_state(loader))
     _assert_equal(before["adapter"], adapter.state_dict())
     _assert_equal(before["python"], random.getstate())
     _assert_equal(before["numpy"], np.random.get_state())  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
@@ -300,7 +325,7 @@ def test_v2_adapter_restore_is_exact_and_late_failure_rolls_back_every_state() -
 def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     """Continue common optimization/RNG state while the target stage owns fresh adapter state."""
     identity = _identity("handoff")
-    source_model, source_optimizer, source_loss, source_loader = _components(30)
+    source_model, source_optimizer, source_loss, source_loader = _components(30, epochs=2)
     source_adapter = _Adapter(4)
     payload = learning.training.checkpoint.make_checkpoint(
         role="best",
@@ -314,21 +339,35 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
         loss=source_loss,
         best_metric=0.2,
         best_epoch=2,
-        objective_history=[{"epoch": 2, "objective_id": "mse", "value": 0.2}],
+        objective_history=[{"point": 2, "epoch": 2, "objective_id": "mse", "value": 0.2, "bound_violations": {}}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
-        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
+        training_work=_WORK,
+        update_work=_UPDATE_WORK,
+        budget=_validated_budget(2),
         adapter=source_adapter,
     )
-    model, optimizer, loss, loader = _components(40)
+    # A best never carries schedule state, so a continuation cannot inherit A0's schedule.
+    assert payload["scheduler_state_dict"] is None
+    model, optimizer, loss, loader = _components(40, epochs=0)
     target_adapter = _Adapter(9)
+    before = copy.deepcopy(model.state_dict())
+    with pytest.raises(ValueError, match="schedule state"):
+        learning.training.checkpoint.restore_handoff_checkpoint(
+            {**payload, "scheduler_state_dict": {"kind": "cosine", "start_rate": 1.0e-3}},
+            expected_source_identity=identity,
+            model=model,
+            optimizer=optimizer,
+            loss=loss,
+            train_loader=loader,
+        )
+    _assert_equal(before, model.state_dict())
 
     restored = learning.training.checkpoint.restore_handoff_checkpoint(
         payload,
         expected_source_identity=identity,
         model=model,
         optimizer=optimizer,
-        scheduler=None,
         loss=loss,
         train_loader=loader,
     )
@@ -336,7 +375,10 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
     _assert_equal(model.state_dict(), source_model.state_dict())
     _assert_equal(optimizer.state_dict(), source_optimizer.state_dict())
     _assert_equal(loss.state_dict(), source_loss.state_dict())
-    assert torch.equal(_loader_generator_state(loader), _loader_generator_state(source_loader))
+    # The continuation adopts only the teacher's generator stream; its own order starts at a fresh epoch.
+    target, source = _sampler_state(loader), _sampler_state(source_loader)
+    assert target["generator_state"] == source["generator_state"]
+    assert (target["epoch"], target["permutation"], target["cursor"]) == (-1, [], 0)
     assert target_adapter.value == 9
     assert restored["source_global_step"] == 5
     assert restored["restored_common_state"]["global_step"] == 5
@@ -351,7 +393,6 @@ def test_handoff_restore_preserves_complete_common_state_and_fresh_adapter(monke
             expected_source_identity=identity,
             model=model,
             optimizer=optimizer,
-            scheduler=None,
             loss=loss,
             train_loader=loader,
         )
@@ -374,13 +415,15 @@ def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
         loss=source_loss,
         best_metric=0.3,
         best_epoch=1,
-        objective_history=[{"epoch": 1, "objective_id": "mse", "value": 0.3}],
+        objective_history=[{"point": 1, "epoch": 1, "objective_id": "mse", "value": 0.3, "bound_violations": {}}],
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
-        training_work={"optimizer_steps": 1, "gradient_predictions": 2},
+        training_work=_WORK,
+        update_work=_UPDATE_WORK,
+        budget=_validated_budget(1),
         adapter=_Adapter(5),
     )
-    assert set(payload).isdisjoint({"optimizer_state_dict", "python_rng_state", "train_loader_generator_state", "next_epoch"})
+    assert set(payload).isdisjoint({"optimizer_state_dict", "python_rng_state", "train_sampler_state_dict", "next_epoch"})
     model, optimizer, loss, loader = _components(60)
     before = copy.deepcopy(model.state_dict())
 
@@ -390,7 +433,6 @@ def test_handoff_restore_rejects_an_evaluation_best_before_mutation() -> None:
             expected_source_identity=identity,
             model=model,
             optimizer=optimizer,
-            scheduler=None,
             loss=loss,
             train_loader=loader,
         )

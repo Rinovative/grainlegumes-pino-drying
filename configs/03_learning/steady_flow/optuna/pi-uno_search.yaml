@@ -1,23 +1,25 @@
 # Role: steady_flow Optuna study; its experiment section states only what differs from base.yaml and the U-NO defaults. Edit: freely.
-# Physics-informed U-NO weight search: 20 trials of 300 epochs on validation; model and learning rate are the supervised U-NO twin's (uno_search); copy the selected weights into the pi-uno experiment under experiments/architecture_comparison/ and rename it: its name lists the weights (`w`) and warm-up (`wu`) the file sets (configs/README.md), and every other value comes from base.yaml.
+# Physics-informed U-NO weight search: 20 trials of half the 600-epoch budget on validation; model and learning rate are the supervised U-NO twin's (uno_search); copy the selected weights into the pi-uno experiment under experiments/architecture_comparison/ and rename it: its name lists the weights (`w`) and warm-up (`wu`) the file sets (configs/README.md), and every other value comes from base.yaml.
 
 study:
   n_trials: 20  # Maximum number of trials requested for the study.
   seed: 9  # Seed controlling Optuna sampling/pruning randomness.
+  budget_fraction: 0.5  # Trial budget as a fraction of the budget K (training.budget_epochs): 300 of 600 passes, each trial with its own cosine.
   sampler:
     kind: tpe  # Optuna sampler family used to propose trial values.
     multivariate: true  # Allow the TPE sampler to model parameter interactions.
   pruner:
     kind: median  # Optuna pruning rule for stopping unpromising trials.
-    n_startup_trials: 5  # Trials completed before pruning decisions begin.
-    n_warmup_steps: 100  # Reported objective steps (validated epochs) required before pruning can occur; equals the physics warm-up.
-    interval_steps: 2  # Objective-step interval between pruning checks; the study contract requires it to equal training.evaluation_interval.
+    n_startup_trials: 5  # Completed trials before pruning decisions begin.
+    n_min_trials: 5  # Trials that must have reported at the same validation point before a trial can be pruned there.
+    n_warmup_steps: 7  # Start point: point 7 is 105 of 300 epochs, the first validation point after the 100-epoch physics warm-up.
+    interval_steps: 1  # Validation-point interval between pruning checks.
 
 # One entry per searched config path: name (Optuna parameter name), kind (categorical or float) and its values or low, high and log (default false).
 search_space:
-  loss.physics.momentum_weight.target: {name: mom_weight, kind: float, low: 1.0e-2, high: 1.0e+2, log: true}  # Two decades around the starting weight.
-  loss.physics.continuity_weight.target: {name: cont_weight, kind: float, low: 1.0e+1, high: 1.0e+5, log: true}  # Two decades around the starting weight.
-  loss.physics.boundary_weight.target: {name: bc_weight, kind: float, low: 1.0e+0, high: 1.0e+4, log: true}  # Two decades around the starting weight.
+  loss.physics.momentum_weight.target: {name: mom_weight, kind: float, low: 1.0e-3, high: 1.0e+1, log: true}  # Two decades around the starting weight.
+  loss.physics.continuity_weight.target: {name: cont_weight, kind: float, low: 1.0e-1, high: 1.0e+3, log: true}  # Two decades around the starting weight.
+  loss.physics.boundary_weight.target: {name: bc_weight, kind: float, low: 1.0e-1, high: 1.0e+3, log: true}  # Two decades around the starting weight.
 
 experiment:
   model:
@@ -37,19 +39,17 @@ experiment:
       derivatives:
         kind: physical  # Derivative backend: physical is central finite differences on the grid, spectral adds Fourier continuation.
       momentum_weight:
-        target: 1.0  # Search base value: target multiplier for the dimensionless Brinkman momentum residual.
+        target: 1.0e-1  # Search base value: target multiplier for the dimensionless Brinkman momentum residual.
         warmup:
           epochs: 100  # Epochs over which the momentum weight ramps linearly to its target; fixed for all three weights.
       continuity_weight:
-        target: 1.0e+3  # Search base value: target multiplier for the dimensionless cross-section flux balance.
+        target: 1.0e+1  # Search base value: target multiplier for the dimensionless cross-section flux balance.
         warmup:
           epochs: 100  # Epochs over which the continuity weight ramps linearly to its target.
       boundary_weight:
-        target: 1.0e+2  # Search base value: target multiplier for the dimensionless pressure-boundary residual.
+        target: 1.0e+1  # Search base value: target multiplier for the dimensionless pressure-boundary residual.
         warmup:
           epochs: 100  # Epochs over which the boundary weight ramps linearly to its target.
-  training:
-    epochs: 300  # Trial epoch budget, shorter than the final run to rank configurations cheaply.
   tracking:
     wandb:
       workflow: optuna_trial  # Workflow label attached to tracking metadata.

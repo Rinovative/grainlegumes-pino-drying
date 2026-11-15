@@ -7,7 +7,8 @@ Responsibilities:
   - Compose two-column distributions, pressure lines, and embedded summaries
 
 Design principles:
-  - B-minus-A remains physical, symmetric, and exactly centred at zero
+  - B-minus-A remains physical, symmetric, and exactly centred at zero; maps, differences and distributions use the
+    shared display scales (relative humidity in %, its differences in pp) under the active label style
   - Distribution axes never participate in map colorbar geometry
   - Incompatible grids are reported without interpolation or resampling
 
@@ -27,6 +28,7 @@ from matplotlib.transforms import Bbox
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
 from src.analysis.presentation import analysis_display_grid as display_grid
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_histograms as histograms
 from src.analysis.ui import tables
 
@@ -100,15 +102,13 @@ def _draw_distribution(
     *,
     same_dataset: bool,
 ) -> None:
-    """Draw A/B field distributions and unambiguous dataset-mean markers."""
-    lower, upper = _histogram_bounds(
-        first.fields[quantity],
-        second.fields[quantity],
-    )
+    """Draw A/B field distributions and unambiguous dataset-mean markers on the display scale."""
+    first_values, second_values = layout.display_field(first, quantity), layout.display_field(second, quantity)
+    lower, upper = _histogram_bounds(first_values, second_values)
     bins = tuple(float(value) for value in np.linspace(lower, upper, 31))
     histograms.plot_histogram(
         axis,
-        first.fields[quantity].ravel(),
+        first_values.ravel(),
         bins=bins,
         alpha=0.44,
         color=layout.DATASET_A_COLOR,
@@ -116,14 +116,16 @@ def _draw_distribution(
     )
     histograms.plot_histogram(
         axis,
-        second.fields[quantity].ravel(),
+        second_values.ravel(),
         bins=bins,
         alpha=0.44,
         color=layout.DATASET_B_COLOR,
         label=_case_plot_label(second, "B"),
     )
-    first_mean = mean_a.field_summary_means[(quantity, "mean")]
-    second_mean = mean_b.field_summary_means[(quantity, "mean")]
+    first_mean, second_mean = (
+        diagnostics.display_value(quantity, dataset.field_summary_means[(quantity, "mean")], diagnostics.FIELD_UNITS[quantity])
+        for dataset in (mean_a, mean_b)
+    )
     if same_dataset:
         axis.axvline(
             first_mean,
@@ -153,7 +155,7 @@ def _draw_distribution(
     )
     axis.set_ylabel("Cell count", fontsize=layout.MAP_LAYOUT.label_size)
     axis.set_title(
-        f"{diagnostics.FIELD_LABELS[quantity]} distribution",
+        f"{layout.quantity_label(quantity)} distribution",
         fontsize=layout.MAP_LAYOUT.axis_title_size,
     )
     axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)
@@ -285,15 +287,16 @@ def _draw_comparison_map_row(
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> None:
     """Draw one actual-case A/B/difference row with independent colorbars."""
-    difference = diagnostics.compatible_field_difference(
-        first,
-        second,
-        quantity,
+    difference = field_labels.display_values(
+        diagnostics.compatible_field_difference(first, second, quantity),
+        diagnostics.FIELD_UNITS[quantity],
+        field=quantity,
+        quantity_kind="difference",
     )
     first_norm, second_norm = layout.comparison_norms(
         quantity,
-        first.fields[quantity],
-        second.fields[quantity],
+        layout.display_field(first, quantity),
+        layout.display_field(second, quantity),
         lock_scale=lock_scale,
     )
     difference_norm = layout.signed_norm(difference)
@@ -301,7 +304,7 @@ def _draw_comparison_map_row(
         axes[0],
         first,
         quantity,
-        title=(f"Case {first.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
+        title=(f"Case {first.case.case_index}\n{layout.quantity_label(quantity)}"),
         norm=first_norm,
         display_spatial_stride=display_spatial_stride,
     )
@@ -309,7 +312,7 @@ def _draw_comparison_map_row(
         axes[1],
         second,
         quantity,
-        title=(f"Case {second.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
+        title=(f"Case {second.case.case_index}\n{layout.quantity_label(quantity)}"),
         norm=second_norm,
         display_spatial_stride=display_spatial_stride,
     )
@@ -318,7 +321,7 @@ def _draw_comparison_map_row(
         first.fields["x"],
         first.fields["y"],
         difference,
-        title=(f"Case {second.case.case_index} - Case {first.case.case_index}\n{diagnostics.FIELD_LABELS[quantity]}"),
+        title=(f"Case {second.case.case_index} - Case {first.case.case_index}\n{layout.quantity_label(quantity)}"),
         norm=difference_norm,
         display_spatial_stride=display_spatial_stride,
     )
@@ -345,7 +348,7 @@ def _draw_comparison_map_row(
         figure,
         difference_image,
         axes[2],
-        label=colorbar_label,
+        label=layout.quantity_colorbar_label(quantity, difference=True),
     )
 
 

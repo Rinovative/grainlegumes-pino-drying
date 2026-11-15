@@ -80,6 +80,7 @@ DATASET_CONVERSION_PROJECTIONS = {
         name="dataset_conversion_transient_drying",
         files=(
             *_CONVERSION_FILES,
+            "datasets/contracts/dataset_contracts_grid.py",
             "datasets/contracts/dataset_contracts_transient.py",
             "datasets/packages/dataset_packages_trajectory.py",
             "datasets/packages/dataset_packages_transient_shards.py",
@@ -341,7 +342,8 @@ def inspect_dataset_reproduction(task: str, dataset_id: str, *, storage_root: Pa
         case_root = common.paths.resolve_generation_campaign_case_directory(
             location.task, location.campaign_name, location.material, location.case_id, storage_root=storage
         )
-        raw_record = common.paths.resolve_generation_case_inputs_directory(case_root) / common.paths.GENERATION_CASE_PAYLOAD_FILENAME
+        inputs_directory = common.paths.resolve_generation_case_inputs_directory(case_root)
+        raw_record = inputs_directory / common.paths.GENERATION_CASE_PAYLOAD_FILENAME
         raw = _read_record(raw_record)
         execution = _read_record(common.paths.resolve_generation_result_evidence_directory(hdf5.parent) / "execution_provenance.json")
         campaign_root = common.paths.resolve_generation_campaign_directory(location.task, location.campaign_name, storage_root=storage)
@@ -402,6 +404,7 @@ def inspect_dataset_reproduction(task: str, dataset_id: str, *, storage_root: Pa
                 if raw
                 else None,
                 "raw_case_record": str(raw_record),
+                "raw_input_store": str(inputs_directory / common.paths.GENERATION_INPUT_STORE_FILENAME),
                 "solver_environment": execution.get("invocation") if execution else None,
             }
         )
@@ -455,7 +458,8 @@ def inspect_dataset_reproduction(task: str, dataset_id: str, *, storage_root: Pa
                 "and matching dependencies; no COMSOL is needed."
             ),
             "source_regeneration": (
-                "The retained campaign configuration, exact inputs and COMSOL model are required; "
+                "The retained campaign configuration, exact inputs (each case's inputs.h5, rendered into the COMSOL CSVs "
+                "that input_files identifies) and COMSOL model are required; "
                 "execute the ordinary Generation workflow through Slurm only after resource authorization."
             ),
             "environment_boundary": (

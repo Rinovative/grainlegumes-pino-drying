@@ -2,7 +2,10 @@
 
 Responsibilities:
   - Admit immutable A0, B, and A1 lineage evidence for comparison
-  - Verify receipt-matched training time and safe-boundary completion
+  - Verify receipt-matched training time and safe-boundary completion, or a stage's divergence with its signed shortfall
+  - Admit a diverged A0 with its best eligible checkpoint as the common handoff, reporting its end like the other arms'
+  - Admit a B or A1 without an eligible checkpoint by its end status, budget progress and eligible points, without a result
+  - Bind every B and A1 arm to the one shared receipt and to the selected A0's handoff
   - Calculate paired airflow-degradation metrics and retain truthful unavailable C evidence
 
 Design principles:
@@ -23,11 +26,19 @@ from numbers import Real
 _COMPUTE_TOLERANCE = 1.0e-9
 _TRAINING_ARM_COUNT = 3
 _MINIMUM_SHARED_MEMBERSHIP_RUNS = 2
+# A stage's end: its budget with an eligible checkpoint, a non-finite training loss, or no eligible checkpoint.
+_END_STATUSES = frozenset({"completed", "diverged", "no_eligible_checkpoint"})
 
 
 @dataclass(frozen=True, slots=True)
 class TrainingArmEvidence:
-    """Store immutable lineage and post-handoff compute evidence for one training arm."""
+    """
+    Store immutable lineage and post-handoff compute evidence for one training arm with a result.
+
+    ``safe_boundary_overrun`` is the signed difference actual - planned; it is negative
+    only for a diverged arm, which ends before its budget. B's status, budget progress and
+    eligible points come from its receipt, the other arms' from their own training outcome.
+    """
 
     arm: str
     parent_id: str
@@ -41,12 +52,34 @@ class TrainingArmEvidence:
     planned_post_handoff_compute: float
     actual_post_handoff_compute: float
     safe_boundary_overrun: float
-    clock_kind: str = "cuda_device_seconds"
+    clock_kind: str = "units"
     budget_complete: bool = True
+    training_status: str = "completed"
+    budget_progress: float = 1.0
+    eligible_points: int = 1
     best_within_budget_checkpoint_id: str = "best_within_budget"
     parent_experiment_sha256: str | None = None
     receipt_sha256: str | None = None
     a0_handoff_sha256: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UnavailableArm:
+    """
+    Store a B or A1 arm without an eligible checkpoint: its end and the receipt it shares, but no result.
+
+    Such an arm has no artifact, so its evidence is B's receipt (B) or its own training
+    outcome (A1); it enters the comparison with an unavailable result instead of a refusal.
+    Like an arm with a result, it is bound to the shared receipt and to the selected A0's
+    handoff that the receipt names.
+    """
+
+    arm: str
+    training_status: str
+    budget_progress: float
+    eligible_points: int
+    receipt_sha256: str
+    a0_handoff_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,11 +94,11 @@ class SharedRoleMembership:
 
 @dataclass(frozen=True, slots=True)
 class LineageComparison:
-    """Store admitted lineage arms and explicit primary/separate comparisons."""
+    """Store admitted lineage arms, each with its end status, and the explicit primary/separate comparisons."""
 
     a0: TrainingArmEvidence
-    a1: TrainingArmEvidence
-    b: TrainingArmEvidence
+    a1: TrainingArmEvidence | UnavailableArm
+    b: TrainingArmEvidence | UnavailableArm
     primary_comparison: str
     separate_comparison: str
 
@@ -133,12 +166,13 @@ def validate_shared_role_membership(
 def matched_lineage_mismatch(
     *,
     a0: TrainingArmEvidence,
-    a1: TrainingArmEvidence,
-    b: TrainingArmEvidence,
+    a1: TrainingArmEvidence | UnavailableArm,
+    b: TrainingArmEvidence | UnavailableArm,
 ) -> str | None:
-    """Return why three valid arms are not one matched A0/A1/B set, or ``None`` when they are."""
+    """Return why three valid arms are not one matched A0/A1/B set, or ``None`` when they are; unavailable arms bind by receipt."""
     if (a0.arm, a1.arm, b.arm) != ("A0", "A1", "B"):
         return "Matched lineage comparison requires distinct A0, A1, and B arms."
+    available = [item for item in (a0, a1, b) if isinstance(item, TrainingArmEvidence)]
     for name in (
         "parent_id",
         "architecture_id",
@@ -148,60 +182,101 @@ def matched_lineage_mismatch(
         "scaling_id",
         "boundary_representation_id",
     ):
-        values = {getattr(item, name) for item in (a0, a1, b)}
+        values = {getattr(item, name) for item in available}
         if len(values) != 1 or not next(iter(values)):
             return f"Matched A0/B/A1 immutable lineage evidence disagrees for {name}."
-    if not b.parent_experiment_sha256 or b.parent_experiment_sha256 != a1.parent_experiment_sha256:
+    if (
+        isinstance(b, TrainingArmEvidence)
+        and isinstance(a1, TrainingArmEvidence)
+        and (not b.parent_experiment_sha256 or b.parent_experiment_sha256 != a1.parent_experiment_sha256)
+    ):
         return "Matched B/A1 must share their exact branch parent identity."
     return None
+
+
+def _validate_arm_end(item: TrainingArmEvidence | UnavailableArm) -> None:
+    """Admit one arm's end: a result exactly with eligible points, never a result after no eligible checkpoint."""
+    eligible_points, status = item.eligible_points, item.training_status
+    has_result = isinstance(item, TrainingArmEvidence)
+    if (
+        status not in _END_STATUSES
+        or isinstance(eligible_points, bool)
+        or not isinstance(eligible_points, int)
+        or not 0.0 <= float(item.budget_progress) <= 1.0
+        or (eligible_points > 0) != has_result
+        or (has_result and status == "no_eligible_checkpoint")
+        or (not has_result and status == "completed")
+    ):
+        msg = f"{item.arm} end is inconsistent: a result needs eligible points, and no eligible checkpoint means no result."
+        raise ValueError(msg)
 
 
 def validate_matched_a1_b_lineage_comparison(
     *,
     a0: TrainingArmEvidence,
-    a1: TrainingArmEvidence,
-    b: TrainingArmEvidence,
+    a1: TrainingArmEvidence | UnavailableArm,
+    b: TrainingArmEvidence | UnavailableArm,
 ) -> LineageComparison:
-    """Admit the real A0/B/A1 branch and B-receipt-matched training time."""
+    """
+    Admit the real A0/B/A1 branch and B-receipt-matched training time, reporting each arm's end.
+
+    A diverged arm keeps its best eligible checkpoint and a negative actual - planned; a
+    diverged A0 stays the common handoff with zero post-handoff compute and reports its status.
+    A B or A1 without an eligible checkpoint enters as an :class:`UnavailableArm` bound by the
+    shared receipt, so the comparison reports its status instead of refusing the set.
+    """
     mismatch = matched_lineage_mismatch(a0=a0, a1=a1, b=b)
     if mismatch is not None:
         raise ValueError(mismatch)
     if a0.parent_experiment_sha256 is not None:
         msg = "Shared A0 identity must remain independent of a B/A1 branch."
         raise ValueError(msg)
-    if a0.clock_kind not in {"cuda_device_seconds", "optimizer_steps"} or (
+    if a0.clock_kind != "units" or (
         _positive(a0.planned_post_handoff_compute, label="A0 planned compute") != 0.0
         or _positive(a0.actual_post_handoff_compute, label="A0 actual compute") != 0.0
         or _positive(a0.safe_boundary_overrun, label="A0 safe-boundary overrun") != 0.0
-        or not a0.budget_complete
+        or not (a0.budget_complete or a0.training_status == "diverged")
         or not a0.best_within_budget_checkpoint_id
     ):
-        msg = "Matched A0 must be the completed common handoff with zero post-handoff compute."
+        msg = "Matched A0 must be the common handoff of a completed or diverged A0 with zero post-handoff compute."
         raise ValueError(msg)
-    if a0.receipt_sha256 is not None or a0.a0_handoff_sha256 is not None:
-        msg = "Matched A0 cannot carry a B train budget receipt."
+    if a0.receipt_sha256 is not None or not a0.a0_handoff_sha256:
+        msg = "Matched A0 must carry its own handoff and no B train budget receipt."
         raise ValueError(msg)
-    if not b.receipt_sha256 or b.receipt_sha256 != a1.receipt_sha256 or not b.a0_handoff_sha256 or b.a0_handoff_sha256 != a1.a0_handoff_sha256:
-        msg = "Matched B/A1 must share the exact immutable B receipt and A0 handoff."
+    available = [item for item in (b, a1) if isinstance(item, TrainingArmEvidence)]
+    # Every B/A1 arm, with or without a result, names the selected A0's handoff through the one shared receipt.
+    if not b.receipt_sha256 or b.receipt_sha256 != a1.receipt_sha256 or any(item.a0_handoff_sha256 != a0.a0_handoff_sha256 for item in (b, a1)):
+        msg = "Matched B/A1 must share the exact immutable B receipt and the selected A0's handoff."
         raise ValueError(msg)
-    if not a0.strategy or not a1.strategy or not b.strategy or a1.strategy == b.strategy:
+    if (
+        not a0.strategy
+        or any(not item.strategy for item in available)
+        or (len(available) == len((b, a1)) and available[0].strategy == available[1].strategy)
+    ):
         msg = "Matched B and A1 require distinct rollout and teacher-forced strategies."
         raise ValueError(msg)
-    for item in (b, a1):
+    for item in (a0, b, a1):
+        _validate_arm_end(item)
+    for item in available:
         planned = _positive(item.planned_post_handoff_compute, label=f"{item.arm} planned train_seconds")
         actual = _positive(item.actual_post_handoff_compute, label=f"{item.arm} actual train_seconds")
-        overrun = _positive(item.safe_boundary_overrun, label=f"{item.arm} train_seconds overrun")
+        overrun = float(item.safe_boundary_overrun)
+        # A diverged arm ends before its budget, so only its signed difference actual - planned may be negative.
+        ended = item.budget_complete and actual >= planned
         if (
             item.clock_kind != "train_seconds"
-            or planned <= 0.0
-            or actual < planned
+            or not math.isfinite(overrun)
             or abs(overrun - (actual - planned)) > _COMPUTE_TOLERANCE
-            or not item.budget_complete
+            or not (ended or item.training_status == "diverged")
             or not item.best_within_budget_checkpoint_id
         ):
-            msg = f"{item.arm} lacks completed matched train_seconds evidence."
+            msg = f"{item.arm} lacks completed or diverged matched train_seconds evidence."
             raise ValueError(msg)
-    if b.actual_post_handoff_compute != a1.planned_post_handoff_compute:
+    if (
+        isinstance(b, TrainingArmEvidence)
+        and isinstance(a1, TrainingArmEvidence)
+        and b.actual_post_handoff_compute != a1.planned_post_handoff_compute
+    ):
         msg = "A1 planned train_seconds must equal B's receipt-backed committed train_seconds."
         raise ValueError(msg)
     return LineageComparison(a0, a1, b, "B_vs_A1", "B_vs_A0")

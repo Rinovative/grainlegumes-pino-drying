@@ -23,6 +23,7 @@ from src import common
 
 _PAIR = "b-a1__budget-600s__rollout-8__lr-1"
 _BUDGET = 40
+_SEED_GROUP = f"seed-9__ep-{_BUDGET}__k-16__sch-cosine"
 
 
 def _config(
@@ -42,6 +43,8 @@ def _config(
         "seed": 9,
         "revision": None,
         "budget_epochs": _BUDGET,
+        "units_per_update": 16,
+        "schedule": "cosine",
         "stage": stage,
         "pair": pair,
         "trial": None,
@@ -195,10 +198,10 @@ def test_storage_selection_controls_the_dataset_lifecycle_root(
 
 
 def test_run_layout_shares_a0_group_and_separates_pairs(tmp_path: Path) -> None:
-    """A0 is shared by the seed group, named by its epoch budget, while every B/A1 pair owns its directory."""
+    """A0 is shared by the seed group, named by its budget, k and schedule, while every B/A1 pair owns its directory."""
     output_root = tmp_path / "03_experiments"
     branch = "b" * 16
-    group = output_root / f"transient_drying/lentil-train1/architecture_comparison/fno_m12x12_h8_l2/seed-9__a0ep-{_BUDGET}"
+    group = output_root / f"transient_drying/lentil-train1/architecture_comparison/fno_m12x12_h8_l2/{_SEED_GROUP}"
     other_pair = "b-a1__budget-300s__rollout-8__lr-1"
 
     def run_dir(stage: str, pair: str | None = None) -> Path:
@@ -218,7 +221,7 @@ def test_single_run_revision_and_explicit_output_root_override(tmp_path: Path) -
     configured_root = tmp_path / "configured"
     explicit_root = tmp_path / "explicit"
     config = _config(configured_root, stage="single")
-    seed_dir = f"transient_drying/lentil-train1/architecture_comparison/fno_m12x12_h8_l2/seed-9__a0ep-{_BUDGET}"
+    seed_dir = f"transient_drying/lentil-train1/architecture_comparison/fno_m12x12_h8_l2/{_SEED_GROUP}"
 
     assert common.paths.resolve_config_run_dir(config) == configured_root / seed_dir
     assert common.paths.resolve_config_run_dir(config, output_root=explicit_root) == explicit_root / seed_dir
@@ -226,12 +229,13 @@ def test_single_run_revision_and_explicit_output_root_override(tmp_path: Path) -
     assert common.paths.resolve_config_run_dir(revised) == configured_root / f"{seed_dir}__rev-fixed-loss"
 
 
-def test_steady_run_directory_carries_no_epoch_budget(tmp_path: Path) -> None:
-    """A run without an identity-bearing budget keeps the plain seed directory because its epochs extend it in place."""
-    steady = _config(tmp_path, stage="single", budget_epochs=None)
+@pytest.mark.parametrize("change", [{"budget_epochs": 80}, {"units_per_update": 4}, {"schedule": "constant"}])
+def test_a_steady_run_with_another_budget_k_or_schedule_is_another_run(tmp_path: Path, change: dict[str, Any]) -> None:
+    """Budget, k and schedule name every run, a steady one included, so another value never lands in the same directory."""
+    steady = {"task": "steady_flow", "stage": "single"}
 
-    assert common.paths.resolve_config_run_dir(steady).name == "seed-9"
-    assert common.paths.resolve_config_run_dir(_config(tmp_path, stage="single", budget_epochs=None, revision="x")).name == "seed-9__rev-x"
+    assert common.paths.resolve_config_run_dir(_config(tmp_path, **steady)).name == _SEED_GROUP
+    assert common.paths.resolve_config_run_dir(_config(tmp_path, **steady, **change)).name != _SEED_GROUP
 
 
 def test_trial_layout_and_study_directory_follow_the_dataset_and_revision(tmp_path: Path) -> None:
@@ -289,9 +293,11 @@ def test_dataset_and_generation_resolvers_reject_unsafe_names(tmp_path: Path) ->
         ({"trial": "0001__fno"}, "Only single-stage runs of family 'optuna'"),
         ({"family": "optuna"}, "Only single-stage runs of family 'optuna'"),
         ({"family": "optuna", "trial": "0001__fno"}, "Only single-stage runs of family 'optuna'"),
-        ({"family": "optuna", "trial": "0001__fno", "stage": "single", "budget_epochs": None}, "requires run.layout.budget_epochs"),
+        ({"budget_epochs": None}, "positive integer"),
         ({"budget_epochs": 0}, "positive integer"),
         ({"budget_epochs": "40"}, "positive integer"),
+        ({"units_per_update": 0}, "positive integer"),
+        ({"schedule": "cosine/x"}, "single non-empty path component"),
     ],
 )
 def test_run_layout_rejects_invalid_identity_and_stage_combinations(
@@ -308,12 +314,12 @@ def test_run_layout_rejects_invalid_identity_and_stage_combinations(
 
 
 def test_run_layout_requires_the_exact_contract_keys(tmp_path: Path) -> None:
-    """Extra or missing layout fields cannot silently alter saved-run identity."""
-    config = _config(tmp_path)
-    config["run"]["layout"].pop("branch_id")
-
-    with pytest.raises(ValueError, match=r"run\.layout must contain"):
-        common.paths.resolve_config_run_dir(config)
+    """Extra or missing layout fields cannot silently alter saved-run identity; an earlier layout without k and schedule is refused."""
+    for missing in ("branch_id", "units_per_update", "schedule"):
+        config = _config(tmp_path)
+        config["run"]["layout"].pop(missing)
+        with pytest.raises(ValueError, match=r"run\.layout must contain"):
+            common.paths.resolve_config_run_dir(config)
 
     config = _config(tmp_path)
     config["run"]["layout"]["dataset_id"] = "unused"

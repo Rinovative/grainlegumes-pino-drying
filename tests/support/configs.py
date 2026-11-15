@@ -92,30 +92,30 @@ def direct_config(
             "train_dataset": "synthetic_train",
             "material_ood_datasets": ["synthetic_ood"],
             "train_subset": None,
-            "batch_size": 2,
+            "evaluation_batch_size": 2,
             "num_workers": 0,
             "pin_memory": True,
             "persistent_workers": False,
+            "spatial_stride": 1,
         },
         "model": {"kind": model_kind, "params": model_params},
         "loss": {
-            "data": {"kind": "relative_h1", "space": "normalized", "weight": 1.0},
+            "data": {"kind": "h1", "weight": 1.0},
             "physics": physics,
         },
         "evaluation": {"objective": {"id": "normalized_group_macro_rmse"}},
         "optimizer": {"kind": "adamw", "lr": 1.0e-3, "weight_decay": 0.0, "betas": [0.9, 0.999], "second_moment_floor": 1.0e-6},
-        "scheduler": {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 2, "min_lr": 1.0e-6},
+        "scheduler": {"kind": "cosine"},
         "training": {
-            "epochs": 3,
-            "evaluation_interval": 1,
-            "ood_evaluation_interval": 1,
+            "budget_epochs": 3,
+            "units_per_update": 2,
+            "memory_batch": 2,
         },
         "tracking": {
             "wandb": {
                 "mode": wandb_mode,
                 "workflow": workflow,
-                "monitor": {"interval": 1, "max_cases": 2},
-                "upload": {"evaluation_artifacts": False},
+                "monitor": {"max_cases": 2},
             }
         },
     }
@@ -178,7 +178,7 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
             "train_dataset": "synthetic_transient_train",
             "material_ood_datasets": ["synthetic_transient_ood"],
             "train_subset": None,
-            "batch_size": 2,
+            "evaluation_batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
             "persistent_workers": False,
@@ -186,16 +186,8 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
         },
         "input_profile": "canonical_physics_complete",
         "temporal": temporal,
-        "scaling": {"mode": "state_std"},
         "loss": {
-            "data": {
-                "kind": "huber",
-                "space": "scaled_increment",
-                "weight": 1.0,
-                "beta": 1.0,
-                "channel_weights": [1.0, 1.0, 1.0, 1.0],
-                "state_aux_weight": 0.0,
-            },
+            "data": {"kind": "mse", "weight": 1.0},
             "physics": {"enabled": False},
         },
         "evaluation": {
@@ -204,17 +196,12 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
             }
         },
         "optimizer": {"kind": "adamw", "lr": 1.0e-3, "weight_decay": 0.0},
-        "scheduler": {
-            "kind": "reduce_on_plateau",
-            "factor": 0.5,
-            "patience": 2,
-            "min_lr": 1.0e-6,
-        },
+        "scheduler": {"kind": "cosine"},
         "tracking": {
             "wandb": {
                 "mode": "disabled",
                 "workflow": "train",
-                "monitor": {"enabled": False, "interval": 1, "max_cases": 1},
+                "monitor": {"enabled": False, "max_cases": 1},
             }
         },
         "model": {
@@ -224,17 +211,11 @@ def _transient_base(*, model_kind: str, seed: int, temporal: dict[str, Any]) -> 
     }
 
 
-def _teacher_forced_stage(*, model_kind: str) -> dict[str, Any]:
-    """Return the A0 sampling and curriculum that A1 inherits."""
+def _teacher_forced_sampling(*, model_kind: str) -> dict[str, Any]:
+    """Return the A0 sampling that A1 inherits; teacher forcing draws no rollout horizon, so neither stage has a curriculum."""
     if model_kind == "rno":
-        return {
-            "sampling": {"mode": "trajectory", "rollout_length": 4},
-            "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
-        }
-    return {
-        "sampling": {"mode": "one_step_transition"},
-        "curriculum": {"lengths": [1], "milestone_fractions": [0.0]},
-    }
+        return {"mode": "trajectory", "rollout_length": 4}
+    return {"mode": "one_step_transition"}
 
 
 def transient_matched_config(
@@ -243,33 +224,24 @@ def transient_matched_config(
     seed: int = 17,
 ) -> dict[str, Any]:
     """Return a compact artificial authored matched A0 -> {B, A1} plan owned by the tests."""
-    a0 = {
-        "max_epochs": 4,
-        "evaluation_interval": 1,
-        "ood_evaluation_interval": 1,
-        "gradient_accumulation_steps": 1,
-        **_teacher_forced_stage(model_kind=model_kind),
-    }
+    a0 = {"budget_epochs": 4, "sampling": _teacher_forced_sampling(model_kind=model_kind)}
     b_sampling: dict[str, Any] = {"mode": "rollout_window", "rollout_length": 4, "window_stride": 4, "window_offset": 0}
     if model_kind == "rno":
         b_sampling = {"mode": "trajectory", "rollout_length": 4}
     b = {
-        "max_epochs": 3,
         "train_seconds": 0.25,
         "lr_scale": 1.0,
-        "evaluation_interval": 1,
-        "ood_evaluation_interval": 1,
-        "gradient_accumulation_steps": 1,
         "sampling": b_sampling,
         "curriculum": {"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]},
     }
     config = _transient_base(model_kind=model_kind, seed=seed, temporal={"temporal_conditioning": {"kind": "none"}})
     config["training"] = {
         "mode": "matched_a1_b",
-        "continuation_evaluations": 4,
+        "units_per_update": 2,
+        "memory_batch": 2,
         "a0": a0,
         "b": b,
-        "a1": {"max_epochs": 3, "match_to": "b.train_seconds", "lr_scale": 1.0},
+        "a1": {"match_to": "b.train_seconds", "lr_scale": 1.0},
     }
     return config
 
@@ -279,23 +251,20 @@ def transient_stage_a_only_config(
     model_kind: str = "fno",
     seed: int = 17,
 ) -> dict[str, Any]:
-    """Return a compact artificial single-stage A0 request, as an Optuna study base owns it."""
-    a0 = _teacher_forced_stage(model_kind=model_kind)
+    """Return a compact artificial single-stage A0 request, the form an Optuna study projects from its matched plan."""
     epochs = 4
     config = _transient_base(
         model_kind=model_kind,
         seed=seed,
-        temporal={"sampling": a0["sampling"], "temporal_conditioning": {"kind": "none"}},
+        temporal={"sampling": _teacher_forced_sampling(model_kind=model_kind), "temporal_conditioning": {"kind": "none"}},
     )
     config["training"] = {
-        "epochs": epochs,
-        "stage_schedule": {"mode": "stage_a_only", "budget_unit": "epochs", "total_epochs": epochs},
-        "evaluation_interval": 1,
-        "ood_evaluation_interval": 1,
+        "budget_epochs": epochs,
+        "stage_schedule": {"mode": "stage_a_only", "budget_unit": "units", "budget_epochs": epochs},
         "stage": "a",
         "comparison_arm": "a0",
-        "gradient_accumulation_steps": 1,
-        "curriculum": a0["curriculum"],
+        "units_per_update": 2,
+        "memory_batch": 2,
         "teacher_handoff": None,
     }
     return config
@@ -308,10 +277,11 @@ def optuna_config(
     multivariate: bool = True,
     role: str | None = None,
 ) -> dict[str, Any]:
-    """Return a compact artificial Optuna request with explicit search semantics."""
+    """Return a compact artificial Optuna request with explicit search semantics; its trials train the whole budget K."""
     study: dict[str, Any] = {
         "seed": 29,
         "n_trials": 2,
+        "budget_fraction": 1.0,
         "sampler": {"kind": "tpe", "multivariate": multivariate},
         "pruner": {
             "kind": "median",
@@ -348,11 +318,11 @@ def optuna_config(
     }
 
 
-def optuna_transient_a0_config() -> dict[str, Any]:
-    """Return a compact artificial transient A0 Optuna request: the stage_a_only study mode over a single-stage base."""
+def optuna_transient_a0_config(*, model_kind: str = "fno") -> dict[str, Any]:
+    """Return a compact artificial transient A0 Optuna request: the stage_a_only study mode over a matched plan."""
     request = optuna_config()
     request["study"]["mode"] = "stage_a_only"
-    request["experiment"] = transient_stage_a_only_config()
+    request["experiment"] = transient_matched_config(model_kind=model_kind)
     request["experiment"]["data"]["material_ood_datasets"] = []
     request["experiment"]["tracking"]["wandb"]["workflow"] = "optuna_trial"
     return request

@@ -4,16 +4,18 @@ Responsibilities:
   - Load steady tensor payloads in authoritative TaskSpec channel order
   - Expose immutable identity-bound runtime selections without tensor copies
   - Apply exact experiment case selections to verified package samples
+  - Serve every item in the endpoint-preserving view of the configured spatial stride
   - Bind the payload's embedded provenance to its admitted manifest and carry the manifest binding
 
 Design principles:
   - TaskSpec remains the sole learned-channel contract
   - Payload fingerprints are verified before runtime access
-  - Selection identity binds source fingerprint, selector, and ordered sample IDs
+  - Selection identity binds source fingerprint, selector, and ordered sample IDs; it never depends on the stride
+  - The shared grid contract resolves the stride the same way as for the transient task
 
 This module does NOT:
   - Resolve package lifecycle paths or orchestrate DataLoaders
-  - Fit normalizers, choose experiment splits, or build tensor payloads
+  - Fit scaling, choose experiment splits, or build tensor payloads
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src import domain
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.packages import dataset_packages_manifest as package_manifest
 
@@ -60,8 +63,8 @@ class SteadyFlowItem(TypedDict):
 class SteadyFlowDataset(Dataset[SteadyFlowItem]):
     """Load and verify one steady tensor payload in authoritative task order."""
 
-    def __init__(self, data_path: Path | str, *, task: TaskSpec) -> None:
-        """Load one exact payload and verify its complete content fingerprint."""
+    def __init__(self, data_path: Path | str, *, task: TaskSpec, spatial_stride: int = 1) -> None:
+        """Load one exact payload, verify its complete content fingerprint and resolve the strided grid view."""
         path = Path(data_path)
         if not path.is_file() or path.is_symlink():
             message = f"Steady training dataset is missing or unsafe: {path}."
@@ -82,6 +85,9 @@ class SteadyFlowDataset(Dataset[SteadyFlowItem]):
         )
         self.inputs = payload["inputs"]
         self.outputs = payload["outputs"]
+        self._spatial_representation = grid_contract.resolve_spatial_representation(
+            (int(self.identity.spatial_shape[0]), int(self.identity.spatial_shape[1])), spatial_stride
+        )
         self.manifest_binding: identity.ManifestBinding | None = None
 
     @property
@@ -89,19 +95,24 @@ class SteadyFlowDataset(Dataset[SteadyFlowItem]):
         """Return the identity the tensor payload states about itself, as bound into splits."""
         return {"fingerprint": self.identity.fingerprint, "spatial_shape": list(self.identity.spatial_shape)}
 
+    def spatial_representation(self) -> grid_contract.SpatialRepresentation:
+        """Return the exact canonical-grid index representation of the configured stride."""
+        return self._spatial_representation
+
     def __len__(self) -> int:
         """Return the verified ordered steady sample count."""
         return self.identity.sample_count
 
     def __getitem__(self, index: int) -> SteadyFlowItem:
-        """Return one task-ordered pair and a defensive metadata copy."""
+        """Return one task-ordered pair in the strided grid view and a defensive metadata copy."""
         raw_meta = self.data["source_metadata"][index]
         if not isinstance(raw_meta, Mapping):
             message = f"Steady source_metadata[{index}] must be a mapping: {self.path}."
             raise TypeError(message)
+        stride = self._spatial_representation.spatial_stride
         return {
-            "x": self.inputs[index],
-            "y": self.outputs[index],
+            "x": self.inputs[index][:, ::stride, ::stride],
+            "y": self.outputs[index][:, ::stride, ::stride],
             "meta": cast("SteadyFlowMetadata", deepcopy(dict(raw_meta))),
         }
 
@@ -162,6 +173,7 @@ def create_dataset(
     data_path: Path | str,
     *,
     task: TaskSpec | None = None,
+    spatial_stride: int = 1,
 ) -> SteadyFlowDataset:
     """
     Construct the verified steady runtime Dataset implementation.
@@ -173,6 +185,8 @@ def create_dataset(
     task : TaskSpec | None, optional
         Exact learned-data contract. The registered steady-flow task is used
         when omitted.
+    spatial_stride : int, optional
+        Endpoint-preserving grid stride of every served item; it must tile the grid exactly.
 
     Returns
     -------
@@ -181,7 +195,7 @@ def create_dataset(
 
     """
     resolved_task = domain.tasks.registry.get_task("steady_flow") if task is None else task
-    return SteadyFlowDataset(data_path, task=resolved_task)
+    return SteadyFlowDataset(data_path, task=resolved_task, spatial_stride=spatial_stride)
 
 
 def _case_positions(

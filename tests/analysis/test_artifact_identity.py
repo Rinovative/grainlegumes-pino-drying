@@ -51,14 +51,8 @@ def _current_generic_frame(*, metadata: object, index: int = 0, source_index: in
                 "npz_path": "case_0003.npz",
                 "meta": metadata,
                 "inference_time_ms": None,
-                "rel_l2": 0.0,
-                "rel_h1": 0.0,
-                "physical_sse_target": 0.0,
-                "physical_count_target": 1,
-                "physical_rmse_target": 0.0,
-                "normalized_sse_target": 0.0,
-                "normalized_count_target": 1,
-                "normalized_rmse_target": 0.0,
+                **{column: 1 if "count" in column else 0.0 for column in analysis.artifacts.contracts.case_statistic_columns("target")},
+                **dict.fromkeys(analysis.artifacts.contracts.case_metric_columns(("target",)), 0.0),
                 "prediction_validity": json.dumps(validity_contract.build_field_prediction_validity(np.zeros((1, 1, 1)), channels=("target",))),
             }
         ],
@@ -92,7 +86,7 @@ def test_dataframe_reader_rejects_every_unexpected_column() -> None:
 
 def test_dataframe_reader_rejects_missing_and_duplicate_columns() -> None:
     """Reject missing evidence and duplicate columns through exact schema admission."""
-    missing = _current_generic_frame(metadata="{}").drop(columns="normalized_sse_target")
+    missing = _current_generic_frame(metadata="{}").drop(columns="physical_squared_error_target")
     with pytest.raises(ValueError, match="schema mismatch"):
         analysis.evaluation.dataframe.build_eval_df(missing)
 
@@ -212,12 +206,11 @@ def _identity_provenance() -> dict[str, Any]:
         "normalizer": {
             "sha256": "normalizer-a",
             "fit_split": "train",
-            "output_normalization": "per_channel_standardization",
-            "output_standard_deviations": {"first": 1.0, "second": 2.0},
-            "denominator_floor": 1.0e-6,
+            "normalization": "case_equal_train_channel_scaling",
+            "output_scales": {"first": 1.0, "second": 2.0},
         },
         "evaluator": {
-            "metrics": [{"id": "rel_l2", "fields": ["first", "second"]}],
+            "metrics": [{"id": "physical_relative_l2", "fields": ["first", "second"]}],
             "objective": {
                 **analysis.evaluation.dataframe.PRIMARY_OBJECTIVE_DEFINITION,
                 "fields": "all",
@@ -231,8 +224,7 @@ def _identity_provenance() -> dict[str, Any]:
                 {"id": "second_group", "fields": ["second"]},
             ],
             "physics_kind": "steady_brinkman",
-            "group_objective_evidence": {"reduction": "equal_group_mean"},
-            "predictive_metrics": {"rel_l2": "per_case"},
+            "metric_evidence": {"reduction": "material_case_mean", "reference_floors": {"first": 1.0, "second": 1.0}},
         },
         "physics": {
             "task_id": "synthetic",
@@ -344,45 +336,6 @@ def test_artifact_target_rejects_broad_and_out_of_run_paths(tmp_path: Path) -> N
     for save_root in (run_dir / "analysis", run_dir / "analysis" / "material_ood", tmp_path / "outside"):
         with pytest.raises(ValueError, match="exact artifact target"):
             analysis.artifacts.service._validated_artifact_target(run_dir=run_dir, save_root=save_root)
-
-
-def test_upload_gate_requires_an_explicit_complete_current_artifact(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The upload gate returns what the shared role validator admits and refuses what it refuses."""
-    from src.analysis.evaluation import evaluation_artifact_loader as loader  # noqa: PLC0415
-
-    run_dir = tmp_path / "run"
-    artifact_root = common.paths.resolve_id_analysis_dir(run_dir)
-    artifact_root.mkdir(parents=True)
-    service = analysis.artifacts.service
-    monkeypatch.setattr(service.experiments.run, "validate_completed_run", lambda _run_dir: {"config": {}})
-    monkeypatch.setattr(service.experiments.config.loader, "validate_resolved_task_contract", lambda _config: SimpleNamespace(id="steady_flow"))
-    monkeypatch.setattr(
-        analysis.artifacts.plan,
-        "artifact_plan_from_completed",
-        lambda *_args, **_kwargs: SimpleNamespace(roles=(SimpleNamespace(split="eval", dataset_name="dataset"),)),
-    )
-    frame = pd.DataFrame()
-    frame.attrs["artifact_provenance"] = {"artifact_kind": "steady_field"}
-    calls: list[dict[str, Any]] = []
-
-    def admit(_run_dir: Path, _completed: Any, **kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return SimpleNamespace(frame=frame)
-
-    monkeypatch.setattr(loader, "admit_role_artifact", admit)
-    assert service.validate_artifact_upload_source(run_dir=run_dir, artifact_root=artifact_root) == {"artifact_kind": "steady_field"}
-    assert calls == [{"selection_role": "id", "root": artifact_root.resolve(), "evaluation_spatial_stride": 1}]
-
-    def refuse(*_args: Any, **_kwargs: Any) -> Any:
-        msg = "Artifact output manifest does not match the current payload files."
-        raise ValueError(msg)
-
-    monkeypatch.setattr(loader, "admit_role_artifact", refuse)
-    with pytest.raises(service.ArtifactCacheError, match="output manifest"):
-        service.validate_artifact_upload_source(run_dir=run_dir, artifact_root=artifact_root)
 
 
 def test_rebuild_rejects_symlink_escape(tmp_path: Path) -> None:
@@ -497,6 +450,8 @@ _TRIAL_LAYOUT = {
     "seed": 17,
     "revision": None,
     "budget_epochs": 3,
+    "units_per_update": 2,
+    "schedule": "cosine",
     "stage": "single",
     "pair": None,
     "trial": "0001__fno_m2x2_h4_l1__lr-0p001",

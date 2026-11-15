@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from src.analysis.generation_inputs import generation_input_diagnostics as diagnostics
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.ui import tables
 
 from . import generation_input_plot_layout as layout
@@ -267,7 +268,7 @@ def schedule_comparison(
                     label=f"Mean B, n = {mean_b.case_count}",
                 )
             axis.set_ylabel(
-                f"{name} [{diagnostics.display_unit(name, unit)}]",
+                f"{field_labels.field_label(name, mathtext=True)} [{diagnostics.display_unit(name, unit)}]",
                 fontsize=layout.MAP_LAYOUT.label_size,
             )
             axis.tick_params(labelsize=layout.MAP_LAYOUT.tick_size)

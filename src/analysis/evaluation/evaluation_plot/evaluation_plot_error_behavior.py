@@ -9,7 +9,8 @@ Responsibilities:
 Design principles:
   - Learned fields, groups, order, and units come from admitted TaskSpec evidence
   - Complete and bounded-prefix reductions are reused through EvaluationSession
-  - Local relative error normalizes each case field by its own reference RMS
+  - Local relative error normalizes each case field by its own reference RMS; cases below the field's floor are left
+    out and their count is shown
   - Percentile clipping changes display scales only, never numerical summaries
 
 This module does NOT:
@@ -49,6 +50,7 @@ _DISTRIBUTION_DEFAULT_CASE_LIMIT = 50
 _TARGET_MAGNITUDE_DEFAULT_CASE_LIMIT = 50
 _MINIMUM_KDE_SAMPLES = 2
 _BAND_LABELS = ("0-5 %", "5-10 %", "10-20 %", "20-40 %", ">40 %")
+_UNAVAILABLE_CASE_NOTE = "Unavailable: a field reference below its floor, or a non-finite prediction"
 
 
 def _finite(frame: pd.DataFrame, column: str, *, limit: int | None = None) -> np.ndarray:
@@ -59,6 +61,11 @@ def _finite(frame: pd.DataFrame, column: str, *, limit: int | None = None) -> np
         msg = f"{column} must not contain a negative value."
         raise ValueError(msg)
     return values
+
+
+def _case_support_text(label: str, available: int, total: int) -> str:
+    """Return how many cases one per-case distribution shows and how many it leaves out as unavailable."""
+    return f"{label}: {available} of {total} cases, {total - available} unavailable"
 
 
 def _display_fields(datasets: Mapping[str, pd.DataFrame]) -> tuple[presentation.DisplayField, ...]:
@@ -80,6 +87,14 @@ def _full_array(summary: sessions.FullEvaluationSummary, field: presentation.Dis
         return np.asarray(getattr(summary.magnitudes[_magnitude_id(field)], attribute))
     values = cast("np.ndarray", getattr(summary, attribute))
     return np.asarray(values[summary.grid.fields.index(field.component_fields[0])])
+
+
+def _relative_unavailable_cases(summary: sessions.FullEvaluationSummary, field: presentation.DisplayField) -> int:
+    """Return the number of cases below the reference floor of one learned field or magnitude."""
+    if field.is_magnitude:
+        return summary.magnitudes[_magnitude_id(field)].local_relative_unavailable_cases
+    counts = cast("np.ndarray", summary.local_relative_unavailable_cases)
+    return int(counts[summary.grid.fields.index(field.component_fields[0])])
 
 
 def _case_means(
@@ -118,13 +133,11 @@ def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure
     if not names:
         msg = "At least one artifact frame is required."
         raise ValueError(msg)
-    metrics = (("Relative L2", "rel_l2"), ("Relative H1", "rel_h1"))
+    metrics = (("Relative L2", "physical_relative_l2"), ("Relative H1", "physical_relative_h1"))
     populations = {column: [_finite(datasets[name], column) for name in names] for _label, column in metrics}
-    # A dataset without one finite case stays in the comparison, is drawn nowhere and says so in the legend.
+    # Every dataset names, per norm, the cases it shows and the unavailable ones; one without any is drawn nowhere.
     display_names = tuple(
-        f"{display_name}: unavailable (0 finite of {len(datasets[name])} cases)"
-        if all(populations[column][index].size == 0 for _label, column in metrics)
-        else display_name
+        "\n".join((display_name, *(_case_support_text(label, populations[column][index].size, len(datasets[name])) for label, column in metrics)))
         for index, (name, display_name) in enumerate(zip(names, display_names, strict=True))
     )
     palette = [plt.get_cmap("tab10")(index % 10) for index in range(len(names))]
@@ -178,6 +191,7 @@ def plot_global_error_metrics(*, datasets: Mapping[str, pd.DataFrame]) -> Figure
         [Line2D([0], [0], color=color, linewidth=8) for color in palette],
         display_names,
         loc="upper left",
+        title=_UNAVAILABLE_CASE_NOTE,
     )
     figure.subplots_adjust(top=0.90)
     layout.title_over_axes(figure, title, plot_axes, y=0.97)
@@ -225,7 +239,18 @@ def plot_predictive_error_distributions(
         if not summary.used_count:
             layout.mark_empty_prefix(global_axis, local_axis, case_count=summary.case_count)
         else:
-            _plot_ecdf(global_axis, _finite(frame, "rel_l2", limit=count), color="black")
+            relative_l2 = _finite(frame, "physical_relative_l2", limit=count)
+            if relative_l2.size:
+                _plot_ecdf(global_axis, relative_l2, color="black")
+            global_axis.text(
+                0.02,
+                0.02,
+                f"{_case_support_text('Relative L2', relative_l2.size, count)}\n{_UNAVAILABLE_CASE_NOTE}",
+                transform=global_axis.transAxes,
+                fontsize="small",
+                va="bottom",
+            )
+        below_floor: list[str] = []
         for field in fields if summary.used_count else ():
             local = _prefix_field(summary, field, "local_relative_error")
             local_axis.plot(
@@ -235,8 +260,19 @@ def plot_predictive_error_distributions(
                 linewidth=2.0,
                 label=field.matplotlib_label,
             )
+            if local.unavailable_case_count:
+                below_floor.append(f"{field.matplotlib_label}: {local.unavailable_case_count}")
+        if below_floor:
+            local_axis.text(
+                0.02,
+                0.02,
+                "Cases below the reference floor, left out: " + ", ".join(below_floor),
+                transform=local_axis.transAxes,
+                fontsize="small",
+                va="bottom",
+            )
         global_axis.set_title(count_headings[dataset_label] or dataset_label)
-        global_axis.set_xlabel("Casewise channel-balanced relative L2 [-]")
+        global_axis.set_xlabel("Casewise group-weighted relative L2 [-]")
         local_axis.set_xlabel("Pointwise |error| / case reference-field RMS [-]")
         for axis in (global_axis, local_axis):
             axis.set_xscale("symlog", linthresh=1e-6)
@@ -312,9 +348,15 @@ def _map_figure(
     metric_label: str,
     title: str,
     relative_percent: bool = False,
+    signed: bool = False,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
-    """Render one four-row spatial statistic family."""
+    """
+    Render one four-row spatial statistic family.
+
+    A ``signed`` statistic is drawn on the symmetric 5th to 95th percentile scale of the selected models and cases, blue-white-red, with
+    arrows for the values beyond.
+    """
     dataframe.validate_comparison(datasets)
     fields = _display_fields(datasets)
     with sessions.scoped_session(datasets) as active_session:
@@ -329,18 +371,49 @@ def _map_figure(
             label: _full_array(summaries[id(frame)], field, attribute) * (100.0 if relative_percent else 1.0) for label, frame in datasets.items()
         }
         colorbar_unit = "%" if relative_percent else field.unit
-        definition = field_maps.build_field_map(
-            np.concatenate([values.ravel() for values in full.values()]),
-            semantic=field_maps.FieldMapSemantic.RELATIVE_ERROR if relative_percent else field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
-            field=field.key,
-            unit=colorbar_unit,
-            display_transform=metric_label,
-            comparison_scope="selected Evaluation models",
-            bound_policy="full selected model/case grids",
+        # A relative mean map is all NaN when every case lies below the field's reference floor.
+        available = np.concatenate([values[np.isfinite(values)] for values in full.values()])
+        semantic = (
+            field_maps.FieldMapSemantic.SIGNED_ERROR
+            if signed
+            else field_maps.FieldMapSemantic.RELATIVE_ERROR
+            if relative_percent
+            else field_maps.FieldMapSemantic.ABSOLUTE_ERROR
+        )
+        boundaries = layout.error_boundaries(available, signed=signed) if available.size else None
+        definition = (
+            field_maps.build_field_map(
+                np.append(available, boundaries[[0, -1]]),  # the scale's own ends keep a uniform (all-zero) statistic from being a constant map
+                semantic=semantic,
+                field=field.key,
+                unit=colorbar_unit,
+                display_transform=metric_label,
+                comparison_scope="selected Evaluation models",
+                locked_boundaries=boundaries,
+                bound_policy="rounded 5th to 95th percentile, symmetric" if signed else "0 to the rounded 95th percentile",
+            )
+            if boundaries is not None
+            else None
         )
         for column, (label, frame) in enumerate(datasets.items()):
             summary = summaries[id(frame)]
             values = full[label]
+            heading = count_headings[label] or label
+            prefix = f"{heading}\n" if row == 0 else ""
+            below_floor = _relative_unavailable_cases(summary, field) if relative_percent else 0
+            suffix = f"\n{below_floor} of {summary.sample_count} cases below the reference floor, left out" if below_floor else ""
+            axes[row, column].set_title(f"{prefix}{field.matplotlib_label} {metric_label}{suffix}", fontsize=11)
+            axes[row, column].set_aspect("equal")
+            if definition is None or not np.isfinite(values).any():
+                axes[row, column].text(
+                    0.5,
+                    0.5,
+                    "Unavailable: every case lies below the reference floor" if relative_percent else "Unavailable: no finite values",
+                    ha="center",
+                    va="center",
+                    transform=axes[row, column].transAxes,
+                )
+                continue
             indices = display_grid.display_indices(values.shape, display_spatial_stride)
             x_grid, y_grid = summary.grid.coordinates
             image = axes[row, column].contourf(
@@ -349,13 +422,10 @@ def _map_figure(
                 display_grid.display_sample(values, indices),
                 **definition.contourf_kwargs(),
             )
-            heading = count_headings[label] or label
-            prefix = f"{heading}\n" if row == 0 else ""
-            axes[row, column].set_title(f"{prefix}{field.matplotlib_label} {metric_label}", fontsize=11)
-            axes[row, column].set_aspect("equal")
-            layout.add_map_colorbar(
+            colorbar = layout.add_map_colorbar(
                 figure, image, axes[row, column], label=f"[{field_labels.display_unit(colorbar_unit, quantity_kind='difference')}]"
             )
+            layout.set_fixed_decimal_ticks(colorbar, layout.error_ticks(definition.boundaries, signed=signed))
     first_summary = summaries[id(next(iter(datasets.values())))]
     layout.apply_map_grid_axis_labels(
         axes,
@@ -373,7 +443,17 @@ def plot_mean_error_maps(
     error_mode: str = error_diagnostics.DEFAULT_ERROR_MODE,
     display_spatial_stride: display_grid.DisplayStride = "auto",
 ) -> Figure:
-    """Plot one selected mean-error representation in the fixed layout."""
+    """Plot one selected mean-error representation in the fixed layout; the signed one is the mean of prediction minus reference."""
+    if error_mode == error_diagnostics.SIGNED_ERROR:
+        return _map_figure(
+            datasets=datasets,
+            max_cases=max_cases,
+            attribute="signed_error_mean",
+            metric_label="mean signed error",
+            title="Mean signed error maps",
+            signed=True,
+            display_spatial_stride=display_spatial_stride,
+        )
     if error_mode == error_diagnostics.NORMALIZED_ABSOLUTE_ERROR:
         return _plot_normalized_mean_error_maps(datasets=datasets, max_cases=max_cases, display_spatial_stride=display_spatial_stride)
     if error_mode == "MAE":
@@ -421,16 +501,22 @@ def _plot_normalized_mean_error_maps(
                 reason = str(error)
         if reason is None:
             all_values = [_full_array(summaries[id(other)], field, "absolute_error_mean") / common_scale.value for other in datasets.values()]
-            definition = field_maps.build_field_map(
-                np.concatenate([item.ravel() for item in all_values] + [np.array((0.0, 1.0))]),
-                semantic=field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
-                field=field.key,
-                unit="1",
-                display_transform="train_state_std_normalized_absolute_error",
-                comparison_scope=common_scale.dataset_identity,
-                locked_boundaries=np.linspace(0.0, 1.0, 12),
-                bound_policy="fixed 0..1 with extension",
-            )
+            pooled = np.concatenate([item.ravel() for item in all_values])
+            pooled = pooled[np.isfinite(pooled)]
+            if not pooled.size:
+                reason = "no finite mean error"
+            else:
+                boundaries = layout.error_boundaries(pooled, signed=False)
+                definition = field_maps.build_field_map(
+                    np.append(pooled, boundaries[[0, -1]]),
+                    semantic=field_maps.FieldMapSemantic.ABSOLUTE_ERROR,
+                    field=field.key,
+                    unit="1",
+                    display_transform="train_state_std_normalized_absolute_error",
+                    comparison_scope=common_scale.dataset_identity,
+                    locked_boundaries=boundaries,
+                    bound_policy="0 to the rounded 95th percentile, shared by the models",
+                )
         for column, (label, frame) in enumerate(datasets.items()):
             axis = axes[row, column]
             axis.set_title(f"{field.matplotlib_label} normalized absolute error" + (f"\n{label}" if row == 0 else ""))
@@ -448,7 +534,10 @@ def _plot_normalized_mean_error_maps(
                 **definition.contourf_kwargs(),
             )
             axis.set_aspect("equal")
-            layout.add_map_colorbar(figure, image, axis, label=f"|e|/s_train [{field_labels.display_unit('1')}]")
+            colorbar = layout.add_map_colorbar(
+                figure, image, axis, label=f"{error_diagnostics.NORMALIZED_ERROR_SYMBOL} [{field_labels.display_unit('1')}]"
+            )
+            layout.set_fixed_decimal_ticks(colorbar, layout.error_ticks(definition.boundaries, signed=False))
     first_summary = summaries[id(next(iter(datasets.values())))]
     layout.apply_map_grid_axis_labels(
         axes,

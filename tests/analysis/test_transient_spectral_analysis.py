@@ -183,7 +183,7 @@ def test_transient_spectra_use_final_valid_stored_state_and_shared_channels() ->
     row = frame.iloc[0]
     np.testing.assert_allclose(
         spectra._field_values(frame, row, "T"),
-        row["state_trajectories"]["T"][1],
+        row["state_trajectories"]["T"][1] - 273.15,  # the final valid state on its display scale; the mean removal drops the offset
     )
     np.testing.assert_allclose(
         spectra._field_values(frame, row, "U"),

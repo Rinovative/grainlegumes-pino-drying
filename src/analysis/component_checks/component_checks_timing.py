@@ -81,7 +81,7 @@ def time_physics_loss(
     Parameters
     ----------
     inputs, outputs : torch.Tensor
-        Physical float32 BCHW batch, e.g. reference cases tiled to the training batch size.
+        Physical float32 BCHW batch, e.g. reference cases tiled to the training memory batch.
     input_fields, output_fields : Sequence[str]
         Task channel declarations.
     backends : Sequence[DerivativeBackend]

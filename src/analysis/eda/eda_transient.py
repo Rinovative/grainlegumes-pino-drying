@@ -43,7 +43,7 @@ _TARGET_GAP_SIGN: Final = "positive_still_too_wet_negative_below_target"
 _MINIMUM_STATE_COUNT: Final = 2
 _MINIMUM_SCHEDULE_NODE_COUNT: Final = 2
 _SPATIAL_STATE_NDIM: Final = 3
-_ROLLOUT_TARGET_NDIM: Final = 4
+_STATE_SEQUENCE_NDIM: Final = 4
 _BOUNDARY_SEQUENCE_NDIM: Final = 2
 _FLOAT32_TIME_TOLERANCE_MULTIPLIER: Final = 4.0
 _FRACTION_ROUNDOFF_TOLERANCE: Final = 4.0 * math.ulp(1.0)
@@ -344,39 +344,6 @@ def supported_schedule_series(
         values=np.ascontiguousarray(supported_values),
         final_time_hours=final_time,
     )
-
-
-def trajectory_table(
-    frame: pd.DataFrame,
-    case_id: str,
-    *,
-    channels: Sequence[str] | None = None,
-) -> pd.DataFrame:
-    """Return per-channel spatial summaries over the full physical trajectory."""
-    row = _case_row(frame, case_id)
-    selected = resolve_dynamic_channels(frame, channels)
-    physical_time = np.asarray(row["time"]["regular_state_hours"], dtype=np.float64)
-    records: list[dict[str, Any]] = []
-    _names, units = _state_contract()
-    for name in selected:
-        values = np.asarray(row["state_trajectories"][name], dtype=np.float64)
-        for index, time_value in enumerate(physical_time):
-            field = values[index]
-            records.append(
-                {
-                    "case_id": str(case_id),
-                    "physical_time_hours": float(time_value),
-                    "channel": name,
-                    "unit": units[name],
-                    "spatial_mean": float(np.mean(field)),
-                    "spatial_minimum": float(np.min(field)),
-                    "spatial_maximum": float(np.max(field)),
-                }
-            )
-    result = pd.DataFrame.from_records(records)
-    result.attrs["time_control"] = "none_full_trajectory_uses_x_axis"
-    result.attrs["channel_selection"] = "multi_default_all"
-    return result
 
 
 def aggregate_exact_series(
@@ -758,22 +725,23 @@ def _numpy(value: Any) -> np.ndarray:
 
 
 def _runtime_transitions(item: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Normalize one one-step or rollout item into physical transitions."""
+    """Normalize one one-step or rollout item into physical transitions between its stored states."""
     state = _numpy(item["state"]).astype(np.float32, copy=False)
-    target = _numpy(item["target"]).astype(np.float32, copy=False)
+    next_states = _numpy(item["next_state"]).astype(np.float32, copy=False)
     boundary = _numpy(item["boundary"]).astype(np.float32, copy=False)
-    if target.ndim == _SPATIAL_STATE_NDIM:
-        target = target[np.newaxis, ...]
+    if next_states.ndim == _SPATIAL_STATE_NDIM:
+        next_states = next_states[np.newaxis, ...]
     if boundary.ndim == 1:
         boundary = boundary[np.newaxis, ...]
     time = item["time"]
     t_n = np.atleast_1d(_numpy(time["t_n"]).astype(np.float64, copy=False))
     t_np1 = np.atleast_1d(_numpy(time["t_n_plus_1"]).astype(np.float64, copy=False))
     dt = np.atleast_1d(_numpy(time["dt"]).astype(np.float64, copy=False))
-    length = target.shape[0]
+    length = next_states.shape[0]
     if (
         state.ndim != _SPATIAL_STATE_NDIM
-        or target.ndim != _ROLLOUT_TARGET_NDIM
+        or next_states.ndim != _STATE_SEQUENCE_NDIM
+        or next_states.shape[1:] != state.shape
         or boundary.ndim != _BOUNDARY_SEQUENCE_NDIM
         or boundary.shape[0] != length
         or t_n.shape != (length,)
@@ -782,32 +750,18 @@ def _runtime_transitions(item: Mapping[str, Any]) -> list[dict[str, Any]]:
     ):
         msg = "Transient runtime item tensor and time shapes are inconsistent."
         raise ValueError(msg)
-    records = []
-    current = state
-    stored_states = _numpy(item["state_sequence"]).astype(np.float32, copy=False) if "state_sequence" in item else None
-    if stored_states is not None and (
-        stored_states.shape != (length + 1, *state.shape)
-        or not np.array_equal(stored_states[0], state)
-        or not np.array_equal(stored_states[1:] - stored_states[:-1], target)
-    ):
-        message = "Exact stored state sequence disagrees with the runtime increment contract."
-        raise ValueError(message)
-    for index in range(length):
-        following = current + target[index] if stored_states is None else stored_states[index + 1]
-        records.append(
-            {
-                "t_n": float(t_n[index]),
-                "t_n_plus_1": float(t_np1[index]),
-                "dt": float(dt[index]),
-                "state": np.ascontiguousarray(current),
-                "next_state": np.ascontiguousarray(following),
-                "target": np.ascontiguousarray(target[index]),
-                "boundary": np.ascontiguousarray(boundary[index]),
-                "exact_next_state": stored_states is not None,
-            }
-        )
-        current = following
-    return records
+    states = np.concatenate((state[np.newaxis, ...], next_states), axis=0)
+    return [
+        {
+            "t_n": float(t_n[index]),
+            "t_n_plus_1": float(t_np1[index]),
+            "dt": float(dt[index]),
+            "state": np.ascontiguousarray(states[index]),
+            "next_state": np.ascontiguousarray(states[index + 1]),
+            "boundary": np.ascontiguousarray(boundary[index]),
+        }
+        for index in range(length)
+    ]
 
 
 def frame_from_transient_items(
@@ -842,7 +796,7 @@ def frame_from_transient_items(
             key = (transition["t_n"], transition["t_n_plus_1"])
             previous = entry["transitions"].get(key)
             if previous is not None:
-                for name in ("state", "next_state", "target", "boundary"):
+                for name in ("state", "next_state", "boundary"):
                     if not np.array_equal(previous[name], transition[name]):
                         msg = f"Duplicate transient runtime transition disagrees for {case_id!r}."
                         raise ValueError(msg)
@@ -893,11 +847,9 @@ def frame_from_transient_items(
             ):
                 msg = f"Transient runtime item EDA requires one contiguous transition chain for {case_id!r}."
                 raise ValueError(msg)
-            if not np.array_equal(transition["state"] - previous["state"], previous["target"]):
+            if not np.array_equal(transition["state"], previous["next_state"]):
                 msg = f"Transient runtime state disagrees across adjacent transitions for {case_id!r}."
                 raise ValueError(msg)
-            previous["next_state"] = transition["state"]
-            previous["exact_next_state"] = True
         state_times = np.asarray(
             [transitions[0]["t_n"], *(transition["t_n_plus_1"] for transition in transitions)],
             dtype=np.float64,
@@ -912,9 +864,6 @@ def frame_from_transient_items(
         rows.append(
             {
                 "state_trajectories": {name: np.ascontiguousarray(states[:, index]) for index, name in enumerate(state_names)},
-                "target_increments": {
-                    f"delta_{name}": np.stack([transition["target"][index] for transition in transitions]) for index, name in enumerate(state_names)
-                },
                 "static_fields": {name: np.ascontiguousarray(static[index]) for index, name in enumerate(static_names)},
                 "boundary_intervals": {
                     name: np.asarray(
@@ -962,9 +911,7 @@ def frame_from_transient_items(
                     "dataset_id": metadata.get("dataset_id"),
                     "source_batch_id": metadata.get("source_batch_id"),
                     "backend": backend,
-                    "state_evidence": "exact stored states"
-                    if transitions[-1]["exact_next_state"]
-                    else "stored current states; final endpoint reconstructed from float32 increment",
+                    "state_evidence": "exact stored states",
                 },
             }
         )

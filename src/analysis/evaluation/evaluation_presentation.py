@@ -28,12 +28,13 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import pandas as pd
 
+from src.analysis.presentation import analysis_moisture_display as moisture_display
 from src.analysis.presentation.analysis_field_labels import (
+    VELOCITY_MAGNITUDE_KEY,
     VELOCITY_MAGNITUDE_LABEL,
-    VELOCITY_MAGNITUDE_MATHTEXT,
-    display_unit,
     field_label,
     has_declared_field_metadata,
+    metric_label,
 )
 
 from . import evaluation_dataframe as dataframe
@@ -103,7 +104,7 @@ class TransientChannelResolution:
     @property
     def labels(self) -> Mapping[str, str]:
         """Return key-to-label widget text with authoritative displayed units."""
-        return {field.key: f"{field.label} [{display_unit(field.unit)}]" for field in self.fields}
+        return {field.key: moisture_display.channel_label(field.key, field.label, field.unit) for field in self.fields}
 
 
 _PARAMETER_PRESENTATION = (
@@ -160,11 +161,18 @@ class DisplayField:
         return len(self.component_fields) > 1
 
     @property
+    def _table_key(self) -> str:
+        """Return the shared field-table key that names this display field."""
+        return VELOCITY_MAGNITUDE_KEY if self.is_magnitude and self.key == "velocity_magnitude" else self.label
+
+    @property
     def matplotlib_label(self) -> str:
-        """Return the canonical Matplotlib label for this display field."""
-        if self.is_magnitude and self.key == "velocity_magnitude":
-            return VELOCITY_MAGNITUDE_MATHTEXT
-        return self.label
+        """Return the Matplotlib label of this display field in the active label style."""
+        return field_label(self._table_key, mathtext=True)
+
+    def metric_label(self, metric: str) -> str:
+        """Return a metric of this display field in the active label style, such as ``RMSE(p)``."""
+        return metric_label(metric, self._table_key, mathtext=True)
 
 
 def _field_units(frame: pd.DataFrame) -> dict[str, str]:
@@ -424,7 +432,11 @@ def _transient_frame_channels(frame: pd.DataFrame) -> TransientChannelResolution
     for field in (*known_order, *future_order):
         field_metadata = metadata.get(field, {})
         label_value = field_metadata.get("label")
-        label = label_value if isinstance(label_value, str) and label_value else (field_label(field) if has_declared_field_metadata(field) else None)
+        label = (
+            label_value
+            if isinstance(label_value, str) and label_value
+            else (field_label(field, control=True) if has_declared_field_metadata(field) else None)
+        )
         contract_unit = contract_units.get(field)
         unit: str | None
         if contract_unit is not None:
@@ -473,7 +485,7 @@ def _transient_frame_channels(frame: pd.DataFrame) -> TransientChannelResolution
     if supports_bulk:
         derived = TransientDisplayField(
             key="w_gr",
-            label=field_label("w_gr"),
+            label=field_label("w_gr", control=True),
             unit=next(iter(moisture_units)),
             stored=False,
             dependencies=("w_surf", "w_int", "f_surf"),

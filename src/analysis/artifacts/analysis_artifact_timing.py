@@ -2,19 +2,20 @@
 
 Responsibilities:
   - Measure synchronized neural forward passes after explicit warmup
-  - Validate COMSOL timing snapshots and runtime comparison schemas
+  - Pair each steady case's batch-amortized forward with its COMSOL solver and process times and its solver hardware
+  - Derive and validate the steady speed-ups as ratios of sums over the paired cases
   - Own the required non-identity timing block of both tasks' completion markers and write it into unpublished stages
 
 Design principles:
   - Timing evidence is bound to run and membership but never part of scientific artifact identity
   - Timing is written into the stage before publication, so a timing failure publishes nothing
-  - Device synchronization and inference dtype are recorded explicitly
-  - Unavailable COMSOL evidence remains an explicit validated state
+  - Device synchronization, inference dtype, batch size and solver hardware are recorded explicitly
+  - A missing COMSOL time leaves its case unpaired and counted, never zero; speed-ups are rebuilt on admission
 
 This module does NOT:
   - Select runs, datasets, checkpoints, or artifact memberships
   - Generate Parquet or NPZ scientific payloads
-  - Upload runtime evidence or mutate tracking workspaces
+  - Own the transient timing report (``evaluation_transient_timing``)
 """
 
 from __future__ import annotations
@@ -24,60 +25,63 @@ import math
 import platform
 import sys
 import time
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Final
 
-import numpy as np
 import torch
 
-from src import common, generation
+from src import common
 
 from . import analysis_artifact_contracts as contracts
 from . import analysis_artifact_performance as artifact_performance
 
+if TYPE_CHECKING:
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
+    from src.generation.runtime.generation_runtime_timing import CaseTimingEvidence
+
 TIMING_KEY = "timing"
-SIMULATION_TIMING_SCHEMA_KIND = "simulation_batch_timing"
 RUNTIME_COMPARISON_SCHEMA_KIND = "comsol_neural_operator_runtime_comparison"
 WARMUP_PASSES = 1
 MEASUREMENT_CLOCK = "time.perf_counter_ns"
 CASE_DURATION_ATTRIBUTION = "equal_share_of_observed_batch_forward_duration"
-_RUNTIME_COMPARISON_BOUNDARIES = {
-    "reference_component": "comsol_process_s",
-    "surrogate_component": "batch_amortized_neural_operator_forward_s",
-    "reference_boundary": "Measured COMSOL process wall time; includes overhead beyond solver studies",
-    "surrogate_boundary": "Synchronized warmed loader-batch forward wall time divided equally among batch cases",
-    "comparison_scope": (
-        "COMSOL process / batch-amortized model forward duration ratio; "
-        "distinct boundaries, not isolated single-case latency or a like-for-like solver speedup"
-    ),
+SURROGATE_BOUNDARY = "Synchronized warmed loader-batch forward wall time divided equally among batch cases"
+# Each steady speed-up divides one COMSOL clock, summed over the paired cases, by the same cases' summed forward time.
+STEADY_SPEEDUPS: Final = {
+    "solver_speedup": ("comsol_solver_s", "COMSOL stationary study top-level Solution time from its solver log"),
+    "process_speedup": ("comsol_process_s", "Measured COMSOL process wall time; includes process overhead beyond the solver study"),
 }
-_SHA256_HEX_LENGTH = 64
-_SUMMARY_FIELDS = {"count", "mean", "median", "p10", "p90"}
+_NEURAL_CASE_FIELDS = frozenset({"case_id", "source_index", "batch_amortized_neural_operator_forward_s"})
+_SOLVER_CASE_FIELDS = frozenset({"comsol_solver_s", "comsol_process_s", "solver_hostname", "solver_requested_cores"})
+_COMPARISON_FIELDS = frozenset(
+    {
+        "schema_kind",
+        "split_role",
+        "dataset_identity",
+        "model_identity",
+        "neural_runtime",
+        "measurement",
+        "surrogate_boundary",
+        "cases",
+        "speedups",
+        "solver_hardware",
+    }
+)
+_MEASUREMENT_FIELDS = frozenset({"clock", "batch_size", "case_duration_attribution", "warmup_passes", "cuda_synchronized"})
 _SPLIT_ROLES = ("eval", "material_ood", "parameter_ood")
 
 
-def _duration(value: Any, *, label: str, positive: bool = True) -> float:
+def _duration(value: Any, *, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         msg = f"{label} must be a real scalar."
         raise TypeError(msg)
     result = float(value)
-    if not math.isfinite(result) or result < 0.0 or (positive and result <= 0.0):
-        relation = "positive" if positive else "non-negative"
-        msg = f"{label} must be finite and {relation}."
+    if not math.isfinite(result) or result <= 0.0:
+        msg = f"{label} must be finite and positive."
         raise ValueError(msg)
     return result
-
-
-def _require_sha256(value: Any, *, label: str) -> str:
-    if not isinstance(value, str):
-        msg = f"{label} must be text."
-        raise TypeError(msg)
-    if len(value) != _SHA256_HEX_LENGTH or any(character not in "0123456789abcdef" for character in value):
-        msg = f"{label} must be a lowercase SHA-256."
-        raise ValueError(msg)
-    return value
 
 
 def _require_text(value: Any, *, label: str) -> str:
@@ -87,24 +91,66 @@ def _require_text(value: Any, *, label: str) -> str:
     return value
 
 
-def _summary(values: Sequence[float]) -> dict[str, float | int | None]:
-    checked = [_duration(value, label="summary duration") for value in values]
-    if not checked:
-        return {"count": 0, "mean": None, "median": None, "p10": None, "p90": None}
-    array = np.asarray(checked, dtype=np.float64)
+def _count(value: Any, *, label: str, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        msg = f"{label} must be an integer."
+        raise TypeError(msg)
+    if value < minimum:
+        msg = f"{label} must be at least {minimum}."
+        raise ValueError(msg)
+    return value
+
+
+def _available_seconds(value: float | None) -> float | None:
+    """Return one persisted COMSOL clock, or None when Generation did not record a positive duration."""
+    return float(value) if value is not None and math.isfinite(value) and value > 0.0 else None
+
+
+def _validate_case(value: Any, *, position: int) -> dict[str, Any]:
+    """Validate one paired case record; an absent COMSOL clock stays None."""
+    if not isinstance(value, Mapping) or set(value) != _NEURAL_CASE_FIELDS | _SOLVER_CASE_FIELDS:
+        msg = f"Runtime comparison case {position} has invalid fields."
+        raise ValueError(msg)
+    label = f"cases[{position}]"
+    clocks = {
+        component: None if value[component] is None else _duration(value[component], label=f"{label}.{component}")
+        for component, _boundary in STEADY_SPEEDUPS.values()
+    }
     return {
-        "count": len(checked),
-        "mean": float(np.mean(array)),
-        "median": float(np.percentile(array, 50.0)),
-        "p10": float(np.percentile(array, 10.0)),
-        "p90": float(np.percentile(array, 90.0)),
+        "case_id": _require_text(value["case_id"], label=f"{label}.case_id"),
+        "source_index": _count(value["source_index"], label=f"{label}.source_index", minimum=0),
+        "batch_amortized_neural_operator_forward_s": _duration(
+            value["batch_amortized_neural_operator_forward_s"], label=f"{label}.batch_amortized_neural_operator_forward_s"
+        ),
+        **clocks,
+        "solver_hostname": _require_text(value["solver_hostname"], label=f"{label}.solver_hostname"),
+        "solver_requested_cores": _count(value["solver_requested_cores"], label=f"{label}.solver_requested_cores"),
     }
 
 
-def _validate_summary(value: Any, *, expected: Mapping[str, Any], label: str) -> None:
-    if not isinstance(value, Mapping) or set(value) != _SUMMARY_FIELDS or dict(value) != dict(expected):
-        msg = f"{label} must be derived from the validated per-case values."
-        raise ValueError(msg)
+def _paired_speedup(cases: Sequence[Mapping[str, Any]], component: str, boundary: str) -> dict[str, Any]:
+    """Return Σ COMSOL time / Σ surrogate time over the cases that have this COMSOL clock, with the unpaired count."""
+    paired = [case for case in cases if case[component] is not None]
+    reference = math.fsum(float(case[component]) for case in paired)
+    surrogate = math.fsum(float(case["batch_amortized_neural_operator_forward_s"]) for case in paired)
+    return {
+        "reference_component": component,
+        "reference_boundary": boundary,
+        "paired_case_count": len(paired),
+        "unavailable_case_count": len(cases) - len(paired),
+        "reference_seconds_sum": reference if paired else None,
+        "surrogate_seconds_sum": surrogate if paired else None,
+        "ratio_of_sums": reference / surrogate if paired else None,
+    }
+
+
+def _derived_runtime(cases: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Derive the speed-ups and the solver hardware census from validated case records."""
+    hardware = Counter((str(case["solver_hostname"]), int(case["solver_requested_cores"])) for case in cases)
+    return {
+        "speedups": {name: _paired_speedup(cases, component, boundary) for name, (component, boundary) in STEADY_SPEEDUPS.items()},
+        "solver_hardware": [{"hostname": host, "requested_cores": cores, "case_count": count} for (host, cores), count in sorted(hardware.items())],
+    }
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -140,7 +186,7 @@ def warm_up_forward(
     *,
     representative_batch: Mapping[str, Any],
     model: Any,
-    processor: Any,
+    scaling: TrainScaling,
     device: torch.device,
     passes: int = WARMUP_PASSES,
 ) -> None:
@@ -148,23 +194,13 @@ def warm_up_forward(
     if isinstance(passes, bool) or not isinstance(passes, int) or passes <= 0:
         msg = "Warmup passes must be a positive integer."
         raise ValueError(msg)
-    processor_eval = getattr(processor, "eval", None)
-    preprocess = getattr(processor, "preprocess", None)
-    if not callable(processor_eval) or not callable(preprocess):
-        msg = "Forward warmup requires an evaluation-capable data processor."
+    raw_inputs = representative_batch.get("x")
+    if not isinstance(raw_inputs, torch.Tensor) or raw_inputs.ndim == 0 or raw_inputs.shape[0] <= 0:
+        msg = "Forward warmup requires a non-empty tensor batch under key 'x'."
         raise TypeError(msg)
     model.eval()
     with torch.inference_mode():
-        processor_eval()
-        processed = preprocess(dict(representative_batch))
-        if not isinstance(processed, Mapping):
-            msg = "Forward warmup processor output must be a mapping."
-            raise TypeError(msg)
-        normalized_inputs = processed.get("x")
-        if not isinstance(normalized_inputs, torch.Tensor) or normalized_inputs.ndim == 0 or normalized_inputs.shape[0] <= 0:
-            msg = "Forward warmup requires a non-empty preprocessed tensor batch under key 'x'."
-            raise TypeError(msg)
-        normalized_inputs = normalized_inputs.to(device)
+        normalized_inputs = scaling.encode_inputs(raw_inputs.to(device))
         for _ in range(passes):
             synchronize_device(device)
             model(normalized_inputs)
@@ -220,7 +256,7 @@ def _validate_neural_runtime(value: Any) -> dict[str, Any]:
         "inference_dtype",
         "torch_num_threads",
     }
-    cuda = {"cuda_index", "cuda_device_name", "cuda_runtime_version"}
+    cuda = {"cuda_index", "cuda_device_name", "cuda_build_version"}
     device_type = runtime.get("device_type")
     expected = base | (cuda if device_type == "cuda" else set())
     if device_type not in {"cpu", "cuda"} or set(runtime) != expected:
@@ -249,89 +285,18 @@ def _validate_neural_runtime(value: Any) -> dict[str, Any]:
             msg = "neural_runtime.cuda_index must be a non-negative integer."
             raise TypeError(msg)
         _require_text(runtime.get("cuda_device_name"), label="neural_runtime.cuda_device_name")
-        _require_text(runtime.get("cuda_runtime_version"), label="neural_runtime.cuda_runtime_version")
+        _require_text(runtime.get("cuda_build_version"), label="neural_runtime.cuda_build_version")
     return runtime
 
 
-def validate_simulation_batch_timing(value: Any) -> dict[str, Any]:
-    """Validate current profile-qualified simulation-batch timing evidence."""
-    if not isinstance(value, Mapping):
-        msg = "Simulation batch timing must be a mapping."
-        raise TypeError(msg)
-    payload = dict(value)
-    required = {
-        "schema_kind",
-        "simulation_profile",
-        "batch_id",
-        "batch_manifest_sha256",
-        "cases",
-        "aggregates",
+def solver_case_timing(evidence: CaseTimingEvidence) -> dict[str, Any]:
+    """Project one admitted Generation case timing onto the steady comparison's COMSOL clocks and solver hardware."""
+    return {
+        "comsol_solver_s": _available_seconds(evidence.stationary_airflow_solver_seconds),
+        "comsol_process_s": _available_seconds(evidence.comsol_process_seconds),
+        "solver_hostname": evidence.solver_hostname,
+        "solver_requested_cores": evidence.solver_requested_cores,
     }
-    if set(payload) != required or payload.get("schema_kind") != SIMULATION_TIMING_SCHEMA_KIND:
-        msg = "Simulation batch timing has an invalid schema."
-        raise ValueError(msg)
-    if payload.get("simulation_profile") not in generation.contracts.available_profile_ids():
-        msg = "Simulation batch timing has an unsupported simulation_profile."
-        raise ValueError(msg)
-    _require_text(payload.get("batch_id"), label="simulation batch_id")
-    _require_sha256(
-        payload.get("batch_manifest_sha256"),
-        label="simulation batch_manifest_sha256",
-    )
-    raw_cases = payload.get("cases")
-    if not isinstance(raw_cases, list):
-        msg = "Simulation batch timing cases must be a JSON array."
-        raise TypeError(msg)
-    cases: list[dict[str, Any]] = []
-    case_ids: list[str] = []
-    for position, value_case in enumerate(raw_cases):
-        if not isinstance(value_case, Mapping) or set(value_case) != {"case_id", "comsol_process_seconds"}:
-            msg = f"Simulation batch timing case {position} has invalid fields."
-            raise ValueError(msg)
-        case_id = _require_text(value_case.get("case_id"), label=f"simulation case {position} case_id")
-        duration = _duration(value_case.get("comsol_process_seconds"), label=f"simulation case {position} elapsed duration")
-        case_ids.append(case_id)
-        cases.append({"case_id": case_id, "comsol_process_seconds": duration})
-    if len(case_ids) != len(set(case_ids)):
-        msg = "Simulation batch timing case IDs must be unique."
-        raise ValueError(msg)
-    summary = _summary([case["comsol_process_seconds"] for case in cases])
-
-    def source_optional(value: float | None) -> float | list[Any]:
-        return [] if value is None else value
-
-    expected_aggregates = {
-        "measured_case_count": summary["count"],
-        "mean_s": source_optional(summary["mean"]),
-        "median_s": source_optional(summary["median"]),
-        "p10_s": source_optional(summary["p10"]),
-        "p90_s": source_optional(summary["p90"]),
-    }
-    aggregates = payload.get("aggregates")
-    if not isinstance(aggregates, Mapping) or set(aggregates) != set(expected_aggregates):
-        msg = "Simulation timing aggregates must be derived from valid case records."
-        raise ValueError(msg)
-    measured_count = aggregates["measured_case_count"]
-    if isinstance(measured_count, bool) or not isinstance(measured_count, int) or measured_count != expected_aggregates["measured_case_count"]:
-        msg = "Simulation timing aggregates.measured_case_count must equal the validated case count as an integer."
-        raise ValueError(msg)
-    for field in ("mean_s", "median_s", "p10_s", "p90_s"):
-        actual = aggregates[field]
-        expected_value = expected_aggregates[field]
-        if isinstance(expected_value, list):
-            valid = actual == []
-        else:
-            valid = (
-                isinstance(expected_value, Real)
-                and not isinstance(actual, bool)
-                and isinstance(actual, Real)
-                and math.isfinite(float(actual))
-                and math.isclose(float(actual), float(expected_value), rel_tol=1e-12, abs_tol=1e-12)
-            )
-        if not valid:
-            msg = "Simulation timing aggregates must be derived from valid case records."
-            raise ValueError(msg)
-    return payload
 
 
 def runtime_dataset_identity(provenance: Mapping[str, Any]) -> dict[str, Any]:
@@ -362,89 +327,51 @@ def build_runtime_comparison(
     neural_runtime: Mapping[str, Any],
     batch_size: int,
     cases: Sequence[Mapping[str, Any]],
-    comsol_timing: Mapping[str, Any] | None,
-    batch_manifest_sha256: str | None,
-    unavailable_reason: str | None,
+    solver_cases: Mapping[str, Mapping[str, Any]],
     warmup_passes: int = WARMUP_PASSES,
 ) -> dict[str, Any]:
-    """Build one case-matched comparison from amortized loader-batch forwards."""
-    if split_role not in _SPLIT_ROLES:
-        msg = f"Runtime comparison split_role must be one of {list(_SPLIT_ROLES)}."
-        raise ValueError(msg)
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
-        msg = "Runtime comparison batch_size must be positive."
-        raise ValueError(msg)
-    if isinstance(warmup_passes, bool) or not isinstance(warmup_passes, int) or warmup_passes <= 0:
-        msg = "Runtime comparison warmup_passes must be positive."
-        raise ValueError(msg)
-    neural_cases: list[dict[str, Any]] = []
-    for position, raw_case in enumerate(cases):
-        if not isinstance(raw_case, Mapping) or set(raw_case) != {"case_id", "source_index", "batch_amortized_neural_operator_forward_s"}:
+    """
+    Pair every measured steady case with its COMSOL clocks and solver hardware and derive the speed-ups.
+
+    Parameters
+    ----------
+    split_role : str
+        Artifact split the cases belong to.
+    dataset_identity, model_identity : Mapping[str, Any]
+        Exact Dataset and checkpoint identities the comparison binds.
+    neural_runtime : Mapping[str, Any]
+        Surrogate hardware and software record from :func:`neural_runtime_metadata`.
+    batch_size : int
+        Loader batch size whose synchronized forward is shared equally among its cases.
+    cases : Sequence[Mapping[str, Any]]
+        Measured neural cases (``case_id``, ``source_index``, ``batch_amortized_neural_operator_forward_s``) in split order.
+    solver_cases : Mapping[str, Mapping[str, Any]]
+        :func:`solver_case_timing` record of every measured case, keyed by package case ID.
+    warmup_passes : int, optional
+        Untimed forward passes before measurement.
+
+    Returns
+    -------
+    dict[str, Any]
+        Validated comparison: per-case records, each speed-up as Σ COMSOL time / Σ surrogate time over the cases
+        that have that COMSOL clock (with the unpaired count), and the solver hardware census.
+
+    Raises
+    ------
+    ValueError
+        If a measured case lacks its solver record or any record is invalid.
+
+    """
+    records: list[dict[str, Any]] = []
+    for position, case in enumerate(cases):
+        if not isinstance(case, Mapping) or set(case) != _NEURAL_CASE_FIELDS:
             msg = f"Neural timing case {position} has invalid fields."
             raise ValueError(msg)
-        case_id = _require_text(raw_case.get("case_id"), label=f"Neural timing case {position} case_id")
-        source_index = raw_case.get("source_index")
-        if isinstance(source_index, bool) or not isinstance(source_index, int) or source_index < 0:
-            msg = f"Neural timing case {position} source_index must be non-negative."
-            raise TypeError(msg)
-        neural_cases.append(
-            {
-                "case_id": case_id,
-                "source_index": source_index,
-                "batch_amortized_neural_operator_forward_s": _duration(
-                    raw_case.get("batch_amortized_neural_operator_forward_s"),
-                    label=f"Neural timing case {position} forward duration",
-                ),
-            }
-        )
-    if not neural_cases:
-        msg = "Runtime comparison requires at least one measured neural case."
-        raise ValueError(msg)
-    if len({case["case_id"] for case in neural_cases}) != len(neural_cases) or len({case["source_index"] for case in neural_cases}) != len(
-        neural_cases
-    ):
-        msg = "Neural timing case IDs and source indices must be unique."
-        raise ValueError(msg)
-
-    comsol_by_id: dict[str, float] = {}
-    if comsol_timing is None:
-        if batch_manifest_sha256 is not None or not isinstance(unavailable_reason, str) or not unavailable_reason:
-            msg = "Unavailable comparison requires only a non-empty reason."
+        solver = solver_cases.get(str(case["case_id"]))
+        if solver is None:
+            msg = f"Neural timing case {case['case_id']!r} has no Generation solver timing."
             raise ValueError(msg)
-        comparison: dict[str, Any] = {"status": "unavailable", "reason": unavailable_reason}
-    else:
-        if unavailable_reason is not None or batch_manifest_sha256 is None:
-            msg = "Available comparison requires a manifest digest and no unavailable reason."
-            raise ValueError(msg)
-        simulation_timing = validate_simulation_batch_timing(comsol_timing)
-        expected_digest = _require_sha256(batch_manifest_sha256, label="batch_manifest_sha256")
-        if simulation_timing["batch_manifest_sha256"] != expected_digest:
-            msg = "Simulation timing does not bind the dataset-authoritative batch manifest."
-            raise ValueError(msg)
-        comsol_by_id = {case["case_id"]: float(case["comsol_process_seconds"]) for case in simulation_timing["cases"]}
-        comparison = {
-            "status": "available",
-            "simulation_profile": simulation_timing["simulation_profile"],
-            "batch_id": simulation_timing["batch_id"],
-            "batch_manifest_sha256": expected_digest,
-        }
-
-    records: list[dict[str, Any]] = []
-    matched_comsol: list[float] = []
-    duration_ratios: list[float] = []
-    forward_values: list[float] = []
-    for case in neural_cases:
-        forward_s = float(case["batch_amortized_neural_operator_forward_s"])
-        comsol_s = comsol_by_id.get(str(case["case_id"]))
-        forward_values.append(forward_s)
-        if comsol_s is None:
-            duration_ratio = None
-        else:
-            duration_ratio = comsol_s / forward_s
-            matched_comsol.append(comsol_s)
-            duration_ratios.append(duration_ratio)
-        records.append({**case, "comsol_process_s": comsol_s, "comsol_process_to_batch_amortized_forward_ratio": duration_ratio})
-
+        records.append(_validate_case({**case, **solver}, position=position))
     payload = {
         "schema_kind": RUNTIME_COMPARISON_SCHEMA_KIND,
         "split_role": split_role,
@@ -458,38 +385,22 @@ def build_runtime_comparison(
             "warmup_passes": warmup_passes,
             "cuda_synchronized": neural_runtime.get("device_type") == "cuda",
         },
-        "boundaries": dict(_RUNTIME_COMPARISON_BOUNDARIES),
-        "comparison": comparison,
+        "surrogate_boundary": SURROGATE_BOUNDARY,
         "cases": records,
-        "aggregates": {
-            "batch_amortized_neural_operator_forward_s": _summary(forward_values),
-            "comsol_process_s": _summary(matched_comsol),
-            "comsol_process_to_batch_amortized_forward_ratio": _summary(duration_ratios),
-        },
+        **_derived_runtime(records),
     }
     return validate_runtime_comparison(payload)
 
 
-def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
-    """Validate identities, amortized measurements, matches, and aggregates."""
+def validate_runtime_comparison(value: Any) -> dict[str, Any]:
+    """Validate identities, measurement, every paired case and the rebuilt speed-ups of one steady runtime comparison."""
     if not isinstance(value, Mapping):
         msg = "Runtime comparison must be a mapping."
         raise TypeError(msg)
     payload = dict(value)
-    required = {
-        "schema_kind",
-        "split_role",
-        "dataset_identity",
-        "model_identity",
-        "neural_runtime",
-        "measurement",
-        "boundaries",
-        "comparison",
-        "cases",
-        "aggregates",
-    }
-    if set(payload) != required or payload.get("schema_kind") != RUNTIME_COMPARISON_SCHEMA_KIND:
-        msg = "Runtime comparison has an invalid schema."
+    schema = (payload.get("schema_kind"), payload.get("surrogate_boundary"))
+    if set(payload) != _COMPARISON_FIELDS or schema != (RUNTIME_COMPARISON_SCHEMA_KIND, SURROGATE_BOUNDARY):
+        msg = "Runtime comparison has an invalid schema; rerun the exact target with --rebuild."
         raise ValueError(msg)
     if payload.get("split_role") not in _SPLIT_ROLES:
         msg = f"Runtime comparison split_role must be one of {list(_SPLIT_ROLES)}."
@@ -506,126 +417,29 @@ def validate_runtime_comparison(value: Any) -> dict[str, Any]:  # noqa: C901, PL
     )
     runtime = _validate_neural_runtime(payload.get("neural_runtime"))
     measurement = payload.get("measurement")
-    measurement_fields = {
-        "clock",
-        "batch_size",
-        "case_duration_attribution",
-        "warmup_passes",
-        "cuda_synchronized",
-    }
-    if not isinstance(measurement, Mapping) or set(measurement) != measurement_fields:
-        msg = "Runtime comparison measurement has invalid fields."
-        raise ValueError(msg)
-    measured_batch_size = measurement.get("batch_size")
     if (
-        measurement.get("clock") != MEASUREMENT_CLOCK
-        or isinstance(measured_batch_size, bool)
-        or not isinstance(measured_batch_size, int)
-        or measured_batch_size <= 0
+        not isinstance(measurement, Mapping)
+        or set(measurement) != _MEASUREMENT_FIELDS
+        or measurement.get("clock") != MEASUREMENT_CLOCK
         or measurement.get("case_duration_attribution") != CASE_DURATION_ATTRIBUTION
+        or measurement.get("cuda_synchronized") is not (runtime["device_type"] == "cuda")
     ):
-        msg = "Runtime comparison must describe amortized perf_counter_ns loader-batch timing."
+        msg = "Runtime comparison must describe synchronized, amortized perf_counter_ns loader-batch timing."
         raise ValueError(msg)
-    passes = measurement.get("warmup_passes")
-    if isinstance(passes, bool) or not isinstance(passes, int) or passes <= 0:
-        msg = "Runtime comparison warmup passes must be positive."
-        raise TypeError(msg)
-    if measurement.get("cuda_synchronized") is not (runtime["device_type"] == "cuda"):
-        msg = "Runtime comparison CUDA synchronization metadata is inconsistent."
-        raise ValueError(msg)
-    if payload.get("boundaries") != _RUNTIME_COMPARISON_BOUNDARIES:
-        msg = "Runtime comparison must disclose its distinct process and batch-amortized forward boundaries."
-        raise ValueError(msg)
-
-    comparison = payload.get("comparison")
-    if not isinstance(comparison, Mapping):
-        msg = "Runtime comparison descriptor must be a mapping."
-        raise TypeError(msg)
-    status = comparison.get("status")
-    if status == "unavailable":
-        if set(comparison) != {"status", "reason"}:
-            msg = "Unavailable comparison descriptor has invalid fields."
-            raise ValueError(msg)
-        _require_text(comparison.get("reason"), label="comparison.reason")
-    elif status == "available":
-        if set(comparison) != {"status", "simulation_profile", "batch_id", "batch_manifest_sha256"}:
-            msg = "Available comparison descriptor has invalid fields."
-            raise ValueError(msg)
-        if comparison.get("simulation_profile") not in generation.contracts.available_profile_ids():
-            msg = "Available comparison simulation_profile is unsupported."
-            raise ValueError(msg)
-        _require_text(comparison.get("batch_id"), label="comparison.batch_id")
-        _require_sha256(comparison.get("batch_manifest_sha256"), label="comparison.batch_manifest_sha256")
-    else:
-        msg = "Runtime comparison status must be available or unavailable."
-        raise ValueError(msg)
-
+    _count(measurement["batch_size"], label="measurement.batch_size")
+    _count(measurement["warmup_passes"], label="measurement.warmup_passes")
     raw_cases = payload.get("cases")
     if not isinstance(raw_cases, list) or not raw_cases:
         msg = "Runtime comparison cases must be a non-empty JSON array."
         raise ValueError(msg)
-    case_ids: list[str] = []
-    source_indices: list[int] = []
-    forwards: list[float] = []
-    process_durations: list[float] = []
-    duration_ratios: list[float] = []
-    for position, raw_case in enumerate(raw_cases):
-        required_case = {
-            "case_id",
-            "source_index",
-            "batch_amortized_neural_operator_forward_s",
-            "comsol_process_s",
-            "comsol_process_to_batch_amortized_forward_ratio",
-        }
-        if not isinstance(raw_case, Mapping) or set(raw_case) != required_case:
-            msg = f"Runtime comparison case {position} has invalid fields."
-            raise ValueError(msg)
-        case_id = _require_text(raw_case.get("case_id"), label=f"cases[{position}].case_id")
-        source_index = raw_case.get("source_index")
-        if isinstance(source_index, bool) or not isinstance(source_index, int) or source_index < 0:
-            msg = f"cases[{position}].source_index must be non-negative."
-            raise TypeError(msg)
-        forward_s = _duration(
-            raw_case.get("batch_amortized_neural_operator_forward_s"), label=f"cases[{position}].batch_amortized_neural_operator_forward_s"
-        )
-        process_value = raw_case.get("comsol_process_s")
-        ratio_value = raw_case.get("comsol_process_to_batch_amortized_forward_ratio")
-        if process_value is None or ratio_value is None:
-            if (process_value is None) != (ratio_value is None):
-                msg = f"Runtime comparison case {position} has an incomplete match."
-                raise ValueError(msg)
-            process_s = None
-            duration_ratio = None
-        else:
-            if status != "available":
-                msg = f"Unavailable comparison cannot contain matched case {position}."
-                raise ValueError(msg)
-            process_s = _duration(process_value, label=f"cases[{position}].comsol_process_s")
-            duration_ratio = _duration(ratio_value, label=f"cases[{position}].comsol_process_to_batch_amortized_forward_ratio")
-            if not math.isclose(duration_ratio, process_s / forward_s, rel_tol=1e-12, abs_tol=0.0):
-                msg = f"Runtime comparison case {position} duration ratio is invalid."
-                raise ValueError(msg)
-            process_durations.append(process_s)
-            duration_ratios.append(duration_ratio)
-        case_ids.append(case_id)
-        source_indices.append(source_index)
-        forwards.append(forward_s)
-    if len(case_ids) != len(set(case_ids)) or len(source_indices) != len(set(source_indices)):
+    cases = [_validate_case(item, position=position) for position, item in enumerate(raw_cases)]
+    if len({case["case_id"] for case in cases}) != len(cases) or len({case["source_index"] for case in cases}) != len(cases):
         msg = "Runtime comparison case IDs and source indices must be unique."
         raise ValueError(msg)
-    aggregates = payload.get("aggregates")
-    if not isinstance(aggregates, Mapping) or set(aggregates) != {
-        "batch_amortized_neural_operator_forward_s",
-        "comsol_process_s",
-        "comsol_process_to_batch_amortized_forward_ratio",
-    }:
-        msg = "Runtime comparison aggregates have invalid fields."
+    derived = _derived_runtime(cases)
+    if payload["speedups"] != derived["speedups"] or payload["solver_hardware"] != derived["solver_hardware"]:
+        msg = "Runtime comparison speed-ups and solver hardware must be the ratio of sums and census of its paired cases."
         raise ValueError(msg)
-    _validate_summary(aggregates["batch_amortized_neural_operator_forward_s"], expected=_summary(forwards), label="forward aggregate")
-    _validate_summary(aggregates["comsol_process_s"], expected=_summary(process_durations), label="COMSOL aggregate")
-    _validate_summary(
-        aggregates["comsol_process_to_batch_amortized_forward_ratio"], expected=_summary(duration_ratios), label="process-to-forward ratio aggregate"
-    )
     return payload
 
 

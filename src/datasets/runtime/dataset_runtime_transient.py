@@ -8,7 +8,7 @@ Responsibilities:
 
 Design principles:
   - One admitted trajectory index drives every runtime sampling mode
-  - Delta targets are derived from canonical absolute endpoint states
+  - Every item carries the stored next states it ends at, never a reconstruction from increments
   - Source HDF5 files are opened and closed per read; opened shards stay mapped for the process lifetime
   - Worker serialization never carries open shard mappings
 
@@ -33,6 +33,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src import common
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 from src.datasets.packages import dataset_packages_transient_shards as transient_shards
@@ -88,7 +89,7 @@ class TransientItem(TypedDict):
     boundary: torch.Tensor
     scalars: torch.Tensor
     time: TransientTime
-    target: torch.Tensor
+    next_state: torch.Tensor
     metadata: TransientMetadata
 
 
@@ -154,11 +155,11 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         self.source_root = common.paths.get_storage_root(storage_root=source_root).expanduser().resolve()
         self.payload = trajectory.load_transient_index(self.index_path)
         self.sampling = sampling
-        self.spatial_stride = transient_contract.validate_spatial_stride(spatial_stride)
+        self.spatial_stride = grid_contract.validate_spatial_stride(spatial_stride)
         self.storage_backend = storage_backend
         self.manifest_binding: identity.ManifestBinding | None = None
         self._spatial_view: tuple[tuple[int, int], tuple[int, int]] | None = None
-        self._spatial_representation: transient_contract.TransientSpatialRepresentation | None = None
+        self._spatial_representation: grid_contract.SpatialRepresentation | None = None
         if sample_indices is None:
             selected = tuple(range(len(self.payload["samples"])))
         else:
@@ -201,16 +202,16 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 message = f"Transient source spatial tensor rank is invalid: {path}."
                 raise trajectory.TransientDataContractError(message)
             canonical = (int(fields.shape[2]), int(fields.shape[3]))
-        effective = transient_contract.resolve_spatial_view(canonical, self.spatial_stride)
+        effective = grid_contract.resolve_spatial_view(canonical, self.spatial_stride)
         self._spatial_view = (canonical, effective)
         return self._spatial_view
 
-    def spatial_representation(self) -> transient_contract.TransientSpatialRepresentation:
+    def spatial_representation(self) -> grid_contract.SpatialRepresentation:
         """Return the cached exact canonical-grid index representation."""
         if self._spatial_representation is not None:
             return self._spatial_representation
         canonical, effective = self.spatial_view()
-        representation = transient_contract.resolve_spatial_representation(
+        representation = grid_contract.resolve_spatial_representation(
             canonical,
             self.spatial_stride,
         )
@@ -261,20 +262,15 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 message = "Transient rollout windows and trajectories require consecutive regular transitions from one case."
                 raise trajectory.TransientDataContractError(message)
             if whole:
-                # A trainer window length requires at least one complete window per trajectory.
-                if rollout_length is None or self.sampling.window_starts(len(positions)):
-                    references.append(_ItemReference(case_index=case_index, sample_positions=tuple(positions)))
+                references.append(_ItemReference(case_index=case_index, sample_positions=tuple(positions)))
                 continue
             if rollout_length is None:
                 message = "Validated rollout sampling is missing its rollout length."
                 raise RuntimeError(message)
-            starts = self.sampling.window_starts(len(positions))
             references.extend(
-                _ItemReference(case_index=case_index, sample_positions=tuple(positions[start : start + rollout_length])) for start in starts
+                _ItemReference(case_index=case_index, sample_positions=tuple(positions[start : start + length]))
+                for start, length in self.sampling.windows(len(positions))
             )
-        if not references:
-            message = f"Transient selection has no complete rollout window for sampling {self.sampling.as_dict()}."
-            raise ValueError(message)
         return tuple(references)
 
     def _validate_case_source(self, case: Mapping[str, Any]) -> Path:
@@ -320,14 +316,12 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
         return len(self._item_references)
 
     def item_transition_counts(self) -> tuple[int, ...]:
-        """Return the regular transition count of every item; whole trajectories may differ."""
+        """Return the regular transition count of every item; whole trajectories and short-case windows may differ."""
         return tuple(len(reference.sample_positions) for reference in self._item_references)
 
-    def cases_without_items(self) -> tuple[str, ...]:
-        """Return selected package cases whose transitions yield no item under this sampling, such as a too-short window."""
-        selected = {int(self.payload["samples"][position]["case_index"]) for position in self.sample_indices}
-        covered = {reference.case_index for reference in self._item_references}
-        return tuple(str(self.payload["cases"][index]["package_case_id"]) for index in sorted(selected - covered))
+    def item_case_indices(self) -> tuple[int, ...]:
+        """Return the package case index of every item; every selected case owns at least one item."""
+        return tuple(reference.case_index for reference in self._item_references)
 
     def _validate_runtime_source(self, case_index: int) -> Path:
         """Reject a source whose stat or hash changed after dataset admission."""
@@ -457,7 +451,6 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
             path=source_label,
             validate_values=validate_values,
         )
-        target_sequence = states[1:] - states[:-1]
         boundary = self._finite_tensor(
             boundary_array,
             label="boundary conditioning",
@@ -515,7 +508,7 @@ class TransientPhysicalDataset(Dataset[TransientItem]):
                 "t_n_plus_1": t_n_plus_1[0] if one_step else t_n_plus_1,
                 "dt": dt[0] if one_step else dt,
             },
-            "target": target_sequence[0] if one_step else target_sequence,
+            "next_state": states[1] if one_step else states[1:],
             "metadata": {
                 "dataset_id": str(self.payload["dataset_id"]),
                 "dataset_name": str(self.payload["dataset_name"]),
@@ -632,7 +625,7 @@ class TransientPTShardDataset(TransientPhysicalDataset):
             message = "Transient shard state tensor rank is invalid."
             raise trajectory.TransientDataContractError(message)
         canonical = (int(states.shape[2]), int(states.shape[3]))
-        effective = transient_contract.resolve_spatial_view(canonical, self.spatial_stride)
+        effective = grid_contract.resolve_spatial_view(canonical, self.spatial_stride)
         observed = (canonical, effective)
         if self._spatial_view is not None and self._spatial_view != observed:
             message = "Transient shard cases do not share one canonical spatial view."
@@ -746,6 +739,9 @@ class TransientPTShardDataset(TransientPhysicalDataset):
                 spatial_states = case_payload["states"][:, :, ::stride, ::stride]
                 spatial_static = case_payload["static"][:, ::stride, ::stride].contiguous()
                 active_case_index = reference.case_index
+            if spatial_states is None:
+                message = "Transient scaling case admission did not produce stored states."
+                raise RuntimeError(message)
             yield self._materialize_shard_reference(
                 reference,
                 active_shard,

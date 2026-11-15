@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import math
 import random
 from typing import TYPE_CHECKING, Any
@@ -22,11 +23,13 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pytest
 import torch
+from support import configs
 from torch import nn
 from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader, Dataset
 
 from src import domain, experiments, learning
+from src.datasets.runtime.dataset_runtime_units import UnitSampler
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,11 +48,10 @@ _CONTINUATION_KEYS = frozenset(
         "numpy_rng_state",
         "torch_cpu_rng_state",
         "torch_cuda_rng_states",
-        "train_loader_generator_state",
         "train_sampler_state_dict",
     }
 )
-_NO_WORK = {"optimizer_steps": 0, "gradient_predictions": 0}
+_NO_WORK = {"optimizer_steps": 0, "gradient_predictions": 0, "units": 0, "update_distinct_cases": 0}
 
 
 class _MappingDataset(Dataset[dict[str, torch.Tensor]]):
@@ -106,9 +108,13 @@ class _DatasetMSE:
         """Return the global element-mean squared error."""
         return self.total / self.count
 
+    def components(self) -> dict[str, float]:
+        """Return no components, like a field metric without unavailable cases."""
+        return {}
+
 
 class _NonFiniteMetric(_DatasetMSE):
-    """Metric used to prove non-finite objectives fail closed."""
+    """Metric used to prove a non-finite objective is never eligible."""
 
     def compute(self) -> float:
         """Return NaN to exercise non-finite objective admission."""
@@ -160,9 +166,10 @@ class _StatefulLoss(nn.Module):
         """Persist the completed training epoch in module state."""
         self.epoch_index.fill_(epoch_index)
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Return mean squared error while retaining serializable epoch state."""
-        return torch.mean((pred - target).square())
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return every case's mean squared error while retaining serializable epoch state."""
+        del x
+        return {"total": (pred - y).square().flatten(1).mean(dim=1)}
 
 
 class _WarmupStatefulLoss(_StatefulLoss):
@@ -176,6 +183,21 @@ class _WarmupStatefulLoss(_StatefulLoss):
             "weight_continuity": 3.0 * fraction,
             "weight_boundary": 2.0 * fraction,
         }
+
+
+class _DivergingLoss(_StatefulLoss):
+    """Return NaN from the given training epoch on (set_epoch counts from zero)."""
+
+    def __init__(self, diverge_at_epoch: int) -> None:
+        super().__init__()
+        self.diverge_at_epoch = diverge_at_epoch
+
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return the MSE until the divergence epoch, then NaN on the prediction graph."""
+        components = super().unit_components(pred, x=x, y=y)
+        if int(self.epoch_index.item()) >= self.diverge_at_epoch:
+            return {"total": components["total"] * math.nan}
+        return components
 
 
 class _NonFiniteTrainingLoss(nn.Module):
@@ -193,10 +215,10 @@ class _NonFiniteTrainingLoss(nn.Module):
         super().__init__()
         self.value = value
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Attach the prescribed non-finite scalar to the prediction graph."""
-        del target
-        return pred.sum() * 0.0 + self.value
+    def unit_components(self, pred: torch.Tensor, *, x: torch.Tensor, y: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Attach the prescribed non-finite value of every case to the prediction graph."""
+        del x, y
+        return {"total": pred.flatten(1).sum(dim=1) * 0.0 + self.value}
 
 
 def _objective(*, direction: str = "minimize") -> dict[str, Any]:
@@ -211,23 +233,29 @@ def _objective(*, direction: str = "minimize") -> dict[str, Any]:
     }
 
 
-def _config(epochs: int, *, direction: str = "minimize", evaluation_interval: int = 2) -> dict[str, Any]:
+def _config(epochs: int, *, direction: str = "minimize") -> dict[str, Any]:
     """Return the minimal resolved training contract used by loop tests."""
     return {
         "task": "steady_flow",
         "run": {"device": "cpu"},
-        "training": {
-            "epochs": epochs,
-            "evaluation_interval": evaluation_interval,
-            "ood_evaluation_interval": evaluation_interval,
-        },
+        "training": {"budget_epochs": epochs},
         "evaluation": {"objective": _objective(direction=direction)},
         "tracking": {
             "wandb": {
-                "monitor": {"enabled": False, "interval": evaluation_interval, "max_cases": 1},
+                "monitor": {"enabled": False, "max_cases": 1},
             }
         },
     }
+
+
+def _budget(epochs: int) -> learning.training.budget.StageBudget:
+    """
+    Return a budget of ``epochs`` passes over the twelve cases.
+
+    The sampler updates once per epoch, so every epoch end crosses at least one of the
+    20 validation points and validates exactly once, and the global step equals the epoch.
+    """
+    return learning.training.budget.StageBudget(unit="units", total=learning.training.budget.units_budget(epochs, len(_MappingDataset())))
 
 
 def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[str, Any]:
@@ -246,7 +274,6 @@ def _identity(run: str = "synthetic", *, direction: str = "minimize") -> dict[st
         "task": "steady_flow",
         "task_contract_digest": digest("task"),
         "effective_config_digest": digest("config"),
-        "resume_contract_digest": digest("resume"),
         "dataset_ids": {"train": f"{run}-train-dataset", "material_ood": f"{run}-ood-dataset", "parameter_ood": f"{run}-pood-dataset"},
         "dataset_fingerprints": {"train": digest("train"), "material_ood": digest("ood"), "parameter_ood": digest("pood")},
         "split_contract_digest": digest("split-contract"),
@@ -267,25 +294,46 @@ def _components(seed: int) -> tuple[nn.Module, Optimizer, Any, nn.Module, DataLo
     """
     Construct deterministically seeded model, optimizer, scheduler, loss, and loaders.
 
-    The training loader owns an explicit generator whose state is part of exact
+    The training loader is driven by a unit sampler whose state is part of exact
     checkpoint continuation. All components remain CPU-local and synthetic.
     """
     experiments.run.seed_process(seed, device=torch.device("cpu"))
     dataset = _MappingDataset()
-    generator = torch.Generator().manual_seed(seed + 1)
-    train_loader = DataLoader(dataset, batch_size=3, shuffle=True, generator=generator)
+    train_loader = DataLoader(dataset, batch_sampler=_sampler(seed + 1))
     eval_loader = DataLoader(dataset, batch_size=4, shuffle=False)
     model = nn.Sequential(nn.Linear(2, 8), nn.Tanh(), nn.Dropout(0.2), nn.Linear(8, 2))
     optimizer = SGD(model.parameters(), lr=0.05, momentum=0.8)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=0)
+    scheduler = learning.training.optim.CosineSchedule(optimizer, start_rate=0.05)
     return model, optimizer, scheduler, _StatefulLoss(), train_loader, eval_loader
 
 
-def _loader_generator(loader: DataLoader[Any]) -> torch.Generator:
-    """Return the generator explicitly configured on a training loader."""
-    generator = loader.generator
-    assert generator is not None
-    return generator
+def _sampler(seed: int) -> UnitSampler:
+    """Return the unit sampler of the twelve steady cases: one update of all twelve per epoch, in microbatches of four."""
+    return UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=12, memory_batch=4, seed=seed)
+
+
+def _commit_epoch(loader: DataLoader[Any]) -> None:
+    """Commit every update group of the sampler's next epoch without training."""
+    sampler = loader.batch_sampler
+    assert isinstance(sampler, UnitSampler)
+    sampler.begin_epoch(sampler.epoch + 1)
+    for group in sampler.groups():
+        sampler.advance(len(group.items))
+
+
+def _mse_step(model: nn.Module, optimizer: Optimizer, loss: Any) -> None:
+    """Take one optimizer step on the first three cases."""
+    dataset = _MappingDataset()
+    optimizer.zero_grad()
+    loss.unit_components(model(dataset.x[:3]), x=dataset.x[:3], y=dataset.y[:3])["total"].mean().backward()
+    optimizer.step()
+
+
+def _sampler_state(loader: DataLoader[Any]) -> dict[str, Any]:
+    """Return the persisted state of a training loader's unit sampler."""
+    sampler = loader.batch_sampler
+    assert isinstance(sampler, UnitSampler)
+    return sampler.state_dict()
 
 
 def _run(
@@ -294,8 +342,7 @@ def _run(
     epochs: int,
     seed: int,
     resume_from: Path | None = None,
-    epoch_end_callback: Callable[[int, dict[str, float]], None] | None = None,
-    training_work: dict[str, int] | None = None,
+    event_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> tuple[dict[str, Any], nn.Module, Optimizer, Any, nn.Module, DataLoader[Any]]:
     """
     Execute one synthetic training segment, optionally from ``last_checkpoint.pt``.
@@ -316,11 +363,19 @@ def _run(
         scheduler=scheduler,
         save_dir=run_dir,
         resume_from=resume_from,
-        epoch_end_callback=epoch_end_callback,
+        event_callback=event_callback,
         checkpoint_identity=_identity(),
-        training_work=training_work,
+        budget=_budget(epochs),
     )
     return result, model, optimizer, scheduler, loss, train_loader
+
+
+def _without_clock(values: dict[str, Any]) -> dict[str, Any]:
+    """Drop the measured operational timing and optimisation seconds, which vary between invocations, from a result or budget."""
+    kept = {key: value for key, value in values.items() if key not in {"operational_timing", "train_seconds"}}
+    if "budget" in kept:
+        kept["budget"] = _without_clock(kept["budget"])
+    return kept
 
 
 def _assert_nested_equal(left: Any, right: Any) -> None:
@@ -345,11 +400,11 @@ def _assert_nested_equal(left: Any, right: Any) -> None:
         assert left == right
 
 
-def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) -> None:
+def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Compare one uninterrupted four-epoch run with a two-plus-two exact resume.
+    Compare one uninterrupted four-epoch run with a run interrupted after epoch 2 and resumed.
 
-    Model, optimizer, scheduler, loss warmup, loader epoch, RNG, objective, and
+    Model, optimizer, cosine rates, budget, loss warmup, loader epoch, RNG, objective, and
     history state must match, proving ``last_checkpoint.pt`` is sufficient continuation.
     """
     full_dir = tmp_path / "full"
@@ -357,34 +412,50 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
     full_dir.mkdir()
     resumed_dir.mkdir()
 
-    full_result, full_model, full_optimizer, full_scheduler, full_loss, full_loader = _run(full_dir, epochs=4, seed=151)
+    full_rates: list[float] = []
+    full_result, full_model, full_optimizer, full_scheduler, full_loss, full_loader = _run(
+        full_dir, epochs=4, seed=151, event_callback=lambda _step, values: full_rates.append(values["optimization/learning_rate"])
+    )
     resume_observations: list[tuple[int, float, float, float]] = []
+    resumed_rates: list[float] = []
 
-    def capture_resume_epoch(epoch: int, values: dict[str, float]) -> None:
+    def capture_resume_epoch(step: int, values: dict[str, float]) -> None:
+        resumed_rates.append(values["optimization/learning_rate"])
         resume_observations.append(
             (
-                epoch,
-                values["system/epoch_duration_seconds"],
+                step,
+                values["system/event_duration_seconds"],
                 values["system/train_duration_seconds"],
                 values["system/train_samples_per_second"],
             )
         )
+        if step == 2 and len(resume_observations) == 2:
+            raise _StopRunError
 
-    _run(
-        resumed_dir,
-        epochs=2,
-        seed=151,
-        epoch_end_callback=capture_resume_epoch,
-    )
+    # Every event publishes a last, so the interruption after epoch 2 leaves its exact state.
+    monkeypatch.setattr(learning.training.loop, "LAST_CHECKPOINT_INTERVAL_SECONDS", 0.0)
+    with pytest.raises(_StopRunError):
+        _run(resumed_dir, epochs=4, seed=151, event_callback=capture_resume_epoch)
+    # The interrupted last holds the rate of its own committed progress, not the one its last group trained with.
+    interrupted = torch.load(resumed_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    interrupted_progress = interrupted["budget_state_dict"]["units"] / interrupted["budget_state_dict"]["total"]
+    assert interrupted_progress == 0.5
+    assert interrupted["optimizer_state_dict"]["param_groups"][0]["lr"] == 0.05 * learning.training.optim.cosine_factor(interrupted_progress)
     resumed_result, resumed_model, resumed_optimizer, resumed_scheduler, resumed_loss, resumed_loader = _run(
         resumed_dir,
         epochs=4,
         seed=999,
         resume_from=resumed_dir / "last_checkpoint.pt",
-        epoch_end_callback=capture_resume_epoch,
+        event_callback=capture_resume_epoch,
     )
 
-    assert [epoch for epoch, _epoch_duration, _train_duration, _throughput in resume_observations] == [1, 2, 3, 4]
+    assert [step for step, _event_duration, _train_duration, _throughput in resume_observations] == [1, 2, 3, 4]
+    assert resumed_rates == full_rates
+    # Each event reports η(p) of the committed progress (one epoch of four per event), so the budget end reports 0.
+    expected_rates = [0.05 * learning.training.optim.cosine_factor(epoch / 4) for epoch in range(1, 5)]
+    assert full_rates == pytest.approx(expected_rates, abs=1e-15)
+    assert full_rates[-1] == 0.0
+    assert all(earlier > later for earlier, later in itertools.pairwise(full_rates))
     assert all(
         math.isfinite(value) and value > 0.0
         for _epoch, epoch_duration, train_duration, throughput in resume_observations
@@ -393,20 +464,22 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
     # Direct operational clocks vary between invocations; every scientific
     # result and all model/optimizer/checkpoint/RNG states remain exact below.
     assert resumed_result["operational_timing"]["scope"] == full_result["operational_timing"]["scope"]
-    assert {key: value for key, value in resumed_result.items() if key != "operational_timing"} == {
-        key: value for key, value in full_result.items() if key != "operational_timing"
-    } | {
+    assert _without_clock(resumed_result) == _without_clock(full_result) | {
         "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "last_checkpoint_path": str(resumed_dir / "last_checkpoint.pt"),
     }
-    # Four epochs of four three-sample groups; the resumed segment continues the counts of its checkpoint.
-    assert resumed_result["training_work"] == full_result["training_work"] == {"optimizer_steps": 16, "gradient_predictions": 48}
+    # Four epochs of one twelve-case group; the resumed segment continues the counts of its checkpoint.
+    work = resumed_result["training_work"]
+    assert work == full_result["training_work"]
+    assert (work["optimizer_steps"], work["gradient_predictions"], work["units"]) == (4, 48, 48)
+    # Per update: units, distinct cases, supervised transitions; the resumed segment appends to its checkpoint's record.
+    assert resumed_result["update_work"] == full_result["update_work"] == [[12, 12, 12]] * 4
     _assert_nested_equal(full_model.state_dict(), resumed_model.state_dict())
     _assert_nested_equal(full_optimizer.state_dict(), resumed_optimizer.state_dict())
     _assert_nested_equal(full_scheduler.state_dict(), resumed_scheduler.state_dict())
     _assert_nested_equal(full_loss.state_dict(), resumed_loss.state_dict())
-    assert torch.equal(_loader_generator(full_loader).get_state(), _loader_generator(resumed_loader).get_state())
+    _assert_nested_equal(_sampler_state(full_loader), _sampler_state(resumed_loader))
 
     full_last = torch.load(full_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
     resumed_last = torch.load(resumed_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
@@ -420,27 +493,52 @@ def test_uninterrupted_and_resumed_training_are_state_identical(tmp_path: Path) 
         "python_rng_state",
         "numpy_rng_state",
         "torch_cpu_rng_state",
-        "train_loader_generator_state",
+        "train_sampler_state_dict",
         "training_work",
+        "update_work",
+        "scheduler_state_dict",
     ):
         _assert_nested_equal(full_last[key], resumed_last[key])
+    assert _without_clock(full_last["budget_state_dict"]) == _without_clock(resumed_last["budget_state_dict"])
+    assert full_last["budget_state_dict"]["validated_point"] == learning.training.budget.VALIDATION_POINTS
 
 
-def test_caller_owned_training_work_holds_the_committed_counts_when_an_epoch_callback_stops_the_run(tmp_path: Path) -> None:
-    """A run stopped from its epoch callback, as an Optuna prune does, leaves the counts of every committed epoch with its caller."""
+def test_caller_owned_attempt_work_holds_the_work_of_the_newest_last_when_an_event_callback_stops_the_run(tmp_path: Path) -> None:
+    """A run stopped from its event callback leaves its caller the work it started from and the work its newest last checkpoint holds."""
 
-    def stop_after_the_second_epoch(epoch: int, _values: dict[str, float]) -> None:
-        if epoch == 2:
+    def stop_after_the_second_epoch(step: int, _values: dict[str, float]) -> None:
+        if step == 2:
             raise _StopRunError
 
-    work: dict[str, int] = {}
-    run_dir = tmp_path / "stopped"
-    run_dir.mkdir()
+    work = learning.training.loop.AttemptWork()
+    model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(151)
+    budget = _budget(4)
     with pytest.raises(_StopRunError):
-        _run(run_dir, epochs=4, seed=151, epoch_end_callback=stop_after_the_second_epoch, training_work=work)
+        learning.training.loop.train_loop(
+            config=_config(4),
+            device=torch.device("cpu"),
+            model=model,
+            optimizer=optimizer,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            train_loss=loss,
+            # Epoch 2 brings no new best, so only epoch 1 has a last checkpoint when the run stops.
+            eval_metrics={"mse": _ObjectiveStreamMetric([0.5, 0.6, 0.7, 0.8])},
+            save_dir=tmp_path,
+            event_callback=stop_after_the_second_epoch,
+            checkpoint_identity=_identity("attempt-work"),
+            attempt_work=work,
+            budget=budget,
+        )
 
-    # Two epochs of four three-sample groups.
-    assert work == {"optimizer_steps": 8, "gradient_predictions": 24}
+    assert work.at_start == {"optimizer_steps": 0, "gradient_predictions": 0, "units": 0, "update_distinct_cases": 0, "train_seconds": 0.0}
+    last = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    durable = work.durable
+    assert durable is not None
+    assert durable == {**last["training_work"], "train_seconds": last["budget_state_dict"]["train_seconds"]}
+    # One epoch of one twelve-case group is committed; the second was computed and a resume trains it again.
+    assert (last["training_work"]["optimizer_steps"], last["training_work"]["units"]) == (1, 12)
+    assert budget.train_seconds > durable["train_seconds"] > 0.0
 
 
 class _StopRunError(Exception):
@@ -448,16 +546,14 @@ class _StopRunError(Exception):
 
 
 @pytest.mark.parametrize(
-    ("epochs", "evaluation_interval", "values", "seconds_per_epoch", "best_epochs", "last_epochs"),
+    ("epochs", "values", "seconds_per_epoch", "best_epochs", "last_epochs"),
     [
-        pytest.param(5, 1, [0.5, 0.6, 0.4, 0.45, 0.47], 0.0, [1, 3], [1, 3, 5], id="new-best-and-terminal"),
-        pytest.param(4, 1, [0.5, 0.6, 0.7, 0.8], 1000.0, [1], [1, 3, 4], id="interval-elapsed"),
-        pytest.param(5, 2, [0.5, 0.6, 0.7], 0.0, [2], [1, 2, 5], id="first-epoch-without-best"),
+        pytest.param(5, [0.5, 0.6, 0.4, 0.45, 0.47], 0.0, [1, 3], [1, 3, 5], id="new-best-and-terminal"),
+        pytest.param(4, [0.5, 0.6, 0.7, 0.8], 1000.0, [1], [1, 3, 4], id="interval-elapsed"),
     ],
 )
 def test_last_is_published_at_new_bests_elapsed_intervals_and_the_terminal_epoch_only(
     epochs: int,
-    evaluation_interval: int,
     values: list[float],
     seconds_per_epoch: float,
     best_epochs: list[int],
@@ -483,7 +579,7 @@ def test_last_is_published_at_new_bests_elapsed_intervals_and_the_terminal_epoch
     monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record)
     monkeypatch.setattr(learning.training.loop.time, "monotonic", lambda: clock[0])
     result = learning.training.loop.train_loop(
-        config=_config(epochs, evaluation_interval=evaluation_interval),
+        config=_config(epochs),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -492,8 +588,9 @@ def test_last_is_published_at_new_bests_elapsed_intervals_and_the_terminal_epoch
         train_loss=loss,
         eval_metrics={"mse": _ObjectiveStreamMetric(values)},
         save_dir=tmp_path,
-        epoch_end_callback=observe,
+        event_callback=observe,
         checkpoint_identity=_identity("last-cadence"),
+        budget=_budget(epochs),
     )
 
     assert result["status"] == "completed"
@@ -505,10 +602,10 @@ def test_last_is_published_at_new_bests_elapsed_intervals_and_the_terminal_epoch
 
 def test_interrupted_run_resumes_from_its_newest_last_and_trains_later_epochs_again(tmp_path: Path) -> None:
     """
-    Interrupt after an epoch without a ``last`` and resume from the older ``last``.
+    Interrupt after epoch 3 and resume from the newest ``last``.
 
-    The best is not newer than that ``last``, and the resumed run trains the lost
-    epoch again and ends in the uninterrupted run's exact terminal state.
+    The best is not newer than that ``last``, and the resumed run trains every epoch
+    after it again and ends in the uninterrupted run's exact terminal state.
     """
     full_dir = tmp_path / "full"
     resumed_dir = tmp_path / "resumed"
@@ -524,21 +621,20 @@ def test_interrupted_run_resumes_from_its_newest_last_and_trains_later_epochs_ag
             raise RuntimeError(message)
 
     with pytest.raises(RuntimeError, match="synthetic interruption"):
-        _run(resumed_dir, epochs=5, seed=151, epoch_end_callback=interrupt_after_third)
-    # Evaluation every second epoch: epoch 1 publishes the first last, epoch 2 the first best with its last, epoch 3 neither.
-    assert flags == [1.0, 1.0, 0.0]
+        _run(resumed_dir, epochs=5, seed=151, event_callback=interrupt_after_third)
+    # Epoch 1 publishes the first best with the first last; a later epoch without a new best publishes neither.
+    newest_last = max(epoch for epoch, flag in enumerate(flags, start=1) if flag == 1.0)
+    assert flags[0] == 1.0
     last = torch.load(resumed_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
     best = torch.load(resumed_dir / "best_checkpoint.pt", map_location="cpu", weights_only=False)
-    assert last["completed_epoch"] == 2
+    assert last["completed_epoch"] == newest_last
     assert best["best_epoch"] <= last["completed_epoch"]
 
     resumed_result, resumed_model, resumed_optimizer, _scheduler, _loss, _loader = _run(
         resumed_dir, epochs=5, seed=999, resume_from=resumed_dir / "last_checkpoint.pt"
     )
 
-    assert {key: value for key, value in resumed_result.items() if key != "operational_timing"} == {
-        key: value for key, value in full_result.items() if key != "operational_timing"
-    } | {
+    assert _without_clock(resumed_result) == _without_clock(full_result) | {
         "checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "best_checkpoint_path": str(resumed_dir / "best_checkpoint.pt"),
         "last_checkpoint_path": str(resumed_dir / "last_checkpoint.pt"),
@@ -551,7 +647,7 @@ def _streamed_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[st
     """Train one evaluation-every-epoch segment whose objective stream fixes every new best."""
     model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(37)
     return learning.training.loop.train_loop(
-        config=_config(3, evaluation_interval=1),
+        config=_config(3),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -561,6 +657,7 @@ def _streamed_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[st
         eval_metrics={"mse": _ObjectiveStreamMetric(values)},
         save_dir=run_dir,
         checkpoint_identity=_identity("paired-publication"),
+        budget=_budget(3),
         **kwargs,
     )
 
@@ -590,7 +687,7 @@ def test_failed_last_write_of_a_new_best_epoch_keeps_the_previous_best_and_last_
 
     monkeypatch.setattr(torch, "save", fail_second_last)
     with pytest.raises(OSError, match="injected last-write failure"):
-        _streamed_loop(tmp_path, [0.5, 0.4], epoch_end_callback=keep_pair)
+        _streamed_loop(tmp_path, [0.5, 0.4], event_callback=keep_pair)
     monkeypatch.undo()
 
     assert {name: (tmp_path / name).read_bytes() for name in previous} == previous
@@ -640,7 +737,7 @@ def test_failure_between_the_two_renames_leaves_a_best_newer_than_last_that_fina
 def _trial_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[str, Any]:
     """Train the streamed segment as an Optuna trial, whose config records a trial layout."""
     model, optimizer, _scheduler, loss, train_loader, eval_loader = _components(37)
-    config = _config(3, evaluation_interval=1)
+    config = _config(3)
     config["run"]["layout"] = {"trial": "0000__study"}
     return learning.training.loop.train_loop(
         config=config,
@@ -653,6 +750,7 @@ def _trial_loop(run_dir: Path, values: list[float], **kwargs: Any) -> dict[str, 
         eval_metrics={"mse": _ObjectiveStreamMetric(values)},
         save_dir=run_dir,
         checkpoint_identity=_identity("trial"),
+        budget=_budget(3),
         **kwargs,
     )
 
@@ -669,7 +767,7 @@ def test_trial_publishes_each_new_best_by_one_rename_and_never_a_last(tmp_path: 
         real_save(*publications)
 
     monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record)
-    result = _trial_loop(tmp_path, [0.5, 0.4, 0.6], epoch_end_callback=lambda _epoch, metrics: flags.append(metrics["checkpoint/last_published"]))
+    result = _trial_loop(tmp_path, [0.5, 0.4, 0.6], event_callback=lambda _epoch, metrics: flags.append(metrics["checkpoint/last_published"]))
 
     assert (result["status"], result["best_epoch"], result["last_checkpoint_path"], result["next_epoch"]) == ("completed", 2, None, None)
     assert published == [("best", 1), ("best", 2)]
@@ -693,7 +791,7 @@ def test_failed_best_rename_of_a_trial_keeps_the_best_it_already_reported(tmp_pa
 
     monkeypatch.setattr(type(tmp_path), "replace", fail_second_best_rename)
     with pytest.raises(OSError, match="injected best-rename failure"):
-        _trial_loop(tmp_path, [0.5, 0.4], epoch_end_callback=lambda epoch, metrics: reported.append((epoch, metrics["id/mse"])))
+        _trial_loop(tmp_path, [0.5, 0.4], event_callback=lambda epoch, metrics: reported.append((epoch, metrics["id/mse"])))
     monkeypatch.undo()
 
     best = torch.load(tmp_path / "best_checkpoint.pt", map_location="cpu", weights_only=False)
@@ -759,7 +857,7 @@ def test_resume_at_the_final_epoch_boundary_finalizes_without_training(tmp_path:
         epochs=2,
         seed=999,
         resume_from=tmp_path / "last_checkpoint.pt",
-        epoch_end_callback=lambda epoch, _values: events.append(epoch),
+        event_callback=lambda epoch, _values: events.append(epoch),
     )
 
     assert resumed["status"] == "completed"
@@ -804,7 +902,6 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
     # A steady best is never continued, so it keeps no optimizer, scheduler, RNG, or loader state.
     assert (best["payload_kind"], last["payload_kind"]) == ("evaluation", "full")
     assert _CONTINUATION_KEYS.isdisjoint(best)
-    assert "batch_progress" not in best
     assert _CONTINUATION_KEYS.issubset(last)
     with pytest.raises(ValueError, match="role mismatch"):
         learning.training.checkpoint.load_checkpoint(
@@ -817,34 +914,47 @@ def test_best_and_last_have_distinct_enforced_roles(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("mismatch", ["config", "numerical_environment"])
+@pytest.mark.parametrize("mismatch", ["config", "numerical_environment", "former_resume_contract", "other_a0_lineage"])
 def test_schema_or_identity_failure_precedes_runtime_mutation(tmp_path: Path, mismatch: str) -> None:
     """
     Replace the saved checkpoint identity before restoring into fresh components.
 
     Validation must fail before any model parameter changes, protecting runtime
-    state from partial application of an incompatible continuation payload.
+    state from partial application of an incompatible continuation payload. A
+    checkpoint of the former identity contract, whose resume digest left out the
+    epoch budget so that a run could be extended, is such a payload, and so is a
+    B checkpoint whose own settings are unchanged but whose A0 lineage differs.
     """
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     _run(run_dir, epochs=2, seed=7)
     payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    expected = _identity()
     if mismatch == "config":
         payload["identity"] = _identity("other")
+    elif mismatch == "other_a0_lineage":
+        saved_b = dict(configs.resolve_plan(configs.transient_matched_config()).b)
+        other_b = copy.deepcopy(saved_b)
+        other_b["run"]["layout"]["a0_id"] = "f" * 16
+        payload["identity"]["effective_config_digest"] = learning.training.checkpoint.config_digest(saved_b)
+        expected["effective_config_digest"] = learning.training.checkpoint.config_digest(other_b)
+    elif mismatch == "former_resume_contract":
+        payload["identity"] = {**payload["identity"], "identity_contract_sha256": "0" * 64, "resume_contract_digest": "1" * 64}
     else:
         payload["identity"]["numerical_environment"]["numpy"] = "changed-numerical-runtime"
 
     model, optimizer, scheduler, loss, train_loader, _ = _components(99)
     before = copy.deepcopy(model.state_dict())
-    with pytest.raises(ValueError, match="identity is incompatible"):
+    with pytest.raises(ValueError, match=r"identity is incompatible|identity keys do not match"):
         learning.training.checkpoint.restore_checkpoint(
             payload,
-            expected_identity=_identity(),
+            expected_identity=expected,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             loss=loss,
             train_loader=train_loader,
+            budget=_budget(2),
         )
     _assert_nested_equal(before, model.state_dict())
 
@@ -858,22 +968,28 @@ def test_non_finite_training_loss_precedes_backward(value: float) -> None:
     """
     Vary training loss across NaN and infinity before backward.
 
-    Each non-finite category must fail with parameters, gradients, and optimizer
-    state untouched, preventing invalid arithmetic from entering an update.
+    Each non-finite category ends the stretch as a divergence with parameters, gradients,
+    and optimizer state untouched: the faulty update is neither applied nor skipped over.
     """
     model, optimizer, _scheduler, _loss, train_loader, _eval_loader = _components(73)
     model_before = copy.deepcopy(model.state_dict())
     optimizer_before = copy.deepcopy(optimizer.state_dict())
 
-    with pytest.raises(FloatingPointError, match="non-finite before backward"):
-        learning.training.loop.train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            _NonFiniteTrainingLoss(value),
-            torch.device("cpu"),
-        )
+    train_loader.batch_sampler.begin_epoch(0)  # type: ignore[union-attr]
+    budget = _budget(4)
+    result = learning.training.loop.train_update_groups(
+        model,
+        train_loader,
+        optimizer,
+        _NonFiniteTrainingLoss(value),
+        torch.device("cpu"),
+        learning.training.loop._SteadyUnits(None, torch.device("cpu")),
+        budget=budget,
+    )
 
+    assert "non-finite before backward" in result["divergence"]
+    assert result["optimizer_steps"] == 0.0
+    assert budget.units == 0
     _assert_nested_equal(model_before, model.state_dict())
     _assert_nested_equal(optimizer_before, optimizer.state_dict())
     assert all(parameter.grad is None for parameter in model.parameters())
@@ -889,6 +1005,7 @@ def test_cpu_checkpoint_ignores_unrelated_host_cuda_rng(
     determined by the resolved runtime device rather than unrelated host capability.
     """
     model, optimizer, scheduler, loss, train_loader, _ = _components(81)
+    _commit_epoch(train_loader)
 
     def unexpected_cuda_capture(*_args: Any, **_kwargs: Any) -> torch.Tensor:
         msg = "CPU checkpoint queried CUDA RNG"
@@ -912,6 +1029,8 @@ def test_cpu_checkpoint_ignores_unrelated_host_cuda_rng(
         train_loader=train_loader,
         runtime_device=torch.device("cpu"),
         training_work=_NO_WORK,
+        update_work=[],
+        budget=_budget(4),
     )
 
     assert payload["torch_cuda_rng_states"] == []
@@ -925,6 +1044,7 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
     values, preserving portability when checkpoints move away from GPU hosts.
     """
     source_model, source_optimizer, source_scheduler, source_loss, source_loader, _ = _components(82)
+    _commit_epoch(source_loader)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
         payload_kind="full",
@@ -941,6 +1061,8 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
         training_work=_NO_WORK,
+        update_work=[],
+        budget=_budget(4),
     )
     payload["torch_cuda_rng_states"] = [torch.get_rng_state().clone()]
 
@@ -953,6 +1075,7 @@ def test_cpu_restore_is_portable_when_checkpoint_contains_cuda_rng() -> None:
         scheduler=scheduler,
         loss=loss,
         train_loader=train_loader,
+        budget=_budget(4),
     )
 
     assert restored["global_step"] == 0
@@ -963,15 +1086,13 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
     """
     Inject an invalid loss state after all earlier checkpoint components validate.
 
-    Restore must roll back model, optimizer, scheduler, loss, loader generator,
+    Restore must roll back model, optimizer, scheduler, loss, unit sampler,
     and every process RNG exactly, proving continuation is transactional.
     """
     source_model, source_optimizer, source_scheduler, source_loss, source_loader, _ = _components(84)
-    source_batch = next(iter(source_loader))
-    source_optimizer.zero_grad()
-    source_loss(source_model(source_batch["x"]), source_batch["y"]).backward()
-    source_optimizer.step()
-    source_scheduler.step(0.25)
+    _commit_epoch(source_loader)
+    _mse_step(source_model, source_optimizer, source_loss)
+    source_scheduler.advance(0.25)
     source_loss.set_epoch(3)
     payload = learning.training.checkpoint.make_checkpoint(
         role="last",
@@ -989,22 +1110,25 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
         train_loader=source_loader,
         runtime_device=torch.device("cpu"),
         training_work=_NO_WORK,
+        update_work=[],
+        budget=_budget(4),
     )
     payload["loss_state_dict"] = {"unexpected": torch.tensor(1.0)}
 
     model, optimizer, scheduler, loss, train_loader, _ = _components(85)
-    destination_batch = next(iter(train_loader))
-    optimizer.zero_grad()
-    loss(model(destination_batch["x"]), destination_batch["y"]).backward()
-    optimizer.step()
-    scheduler.step(2.0)
+    _commit_epoch(train_loader)
+    _mse_step(model, optimizer, loss)
+    scheduler.advance(0.5)
     loss.set_epoch(7)
+    budget = _budget(4)
+    budget.record_group(units=12, train_seconds=1.0)
     before = {
         "model": copy.deepcopy(model.state_dict()),
         "optimizer": copy.deepcopy(optimizer.state_dict()),
         "scheduler": copy.deepcopy(scheduler.state_dict()),
+        "budget": budget.state_dict(),
         "loss": copy.deepcopy(loss.state_dict()),
-        "loader": _loader_generator(train_loader).get_state().clone(),
+        "loader": _sampler_state(train_loader),
         "python_rng": random.getstate(),
         "numpy_rng": copy.deepcopy(np.random.get_state()),  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
         "torch_rng": torch.get_rng_state().clone(),
@@ -1019,52 +1143,119 @@ def test_late_restore_failure_rolls_back_every_runtime_state() -> None:
             scheduler=scheduler,
             loss=loss,
             train_loader=train_loader,
+            budget=budget,
         )
 
     _assert_nested_equal(before["model"], model.state_dict())
     _assert_nested_equal(before["optimizer"], optimizer.state_dict())
     _assert_nested_equal(before["scheduler"], scheduler.state_dict())
+    _assert_nested_equal(before["budget"], budget.state_dict())
     _assert_nested_equal(before["loss"], loss.state_dict())
-    assert torch.equal(before["loader"], _loader_generator(train_loader).get_state())
+    _assert_nested_equal(before["loader"], _sampler_state(train_loader))
     _assert_nested_equal(before["python_rng"], random.getstate())
     _assert_nested_equal(before["numpy_rng"], np.random.get_state())  # noqa: NPY002 -- checkpoint and seeding tests exercise the process-global RNG state
     assert torch.equal(before["torch_rng"], torch.get_rng_state())
 
 
-def test_non_finite_objective_never_creates_a_loadable_best(tmp_path: Path) -> None:
+def test_non_finite_objective_is_never_eligible_and_training_continues(tmp_path: Path) -> None:
     """
-    Evaluate one training epoch with a metric that returns NaN.
+    Evaluate one training epoch with a metric that returns NaN at every validation point.
 
-    The loop must raise and publish neither best nor last checkpoint, preventing
-    a non-finite selection objective from creating a loadable completed state.
+    No point is eligible, training still runs its whole budget, no best checkpoint is
+    published, and the run ends as ``no_eligible_checkpoint`` with zero eligible points.
     """
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(5)
 
-    with pytest.raises(FloatingPointError, match="non-finite"):
-        learning.training.loop.train_loop(
-            config={
-                "task": "steady_flow",
-                "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
-                "evaluation": {"objective": _objective()},
-                "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
-            },
-            device=torch.device("cpu"),
-            model=model,
-            optimizer=optimizer,
-            train_loader=train_loader,
-            eval_loader=eval_loader,
-            train_loss=loss,
-            eval_metrics={"mse": _NonFiniteMetric()},
-            scheduler=scheduler,
-            save_dir=run_dir,
-            checkpoint_identity=_identity(),
-        )
+    result = learning.training.loop.train_loop(
+        config={
+            "task": "steady_flow",
+            "run": {"device": "cpu"},
+            "training": {"budget_epochs": 1},
+            "evaluation": {"objective": _objective()},
+            "tracking": {"wandb": {"monitor": {"enabled": False, "max_cases": 1}}},
+        },
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=loss,
+        eval_metrics={"mse": _NonFiniteMetric()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        checkpoint_identity=_identity(),
+        budget=_budget(1),
+    )
 
+    assert result["status"] == "no_eligible_checkpoint"
+    assert result["training_outcome"]["eligible_points"] == 0
+    assert result["budget"]["validated_point"] == learning.training.budget.VALIDATION_POINTS
+    assert result["best_metric"] is None
+    assert all(entry["value"] is None for entry in result["objective_history"])
     assert not (run_dir / "best_checkpoint.pt").exists()
-    assert not (run_dir / "last_checkpoint.pt").exists()
+    assert (run_dir / "last_checkpoint.pt").exists()
+
+
+@pytest.mark.parametrize("eligible", [True, False], ids=("best-eligible", "none-eligible"))
+def test_divergence_ends_the_run_at_its_budget_fraction_with_the_best_eligible_checkpoint(tmp_path: Path, eligible: bool) -> None:
+    """
+    A NaN training loss in the third of four epochs ends the run as diverged at 50 % of its budget.
+
+    Its result is the best eligible checkpoint of the two validated epochs; without an eligible
+    point it has none and is reported unsuccessful by its missing best.
+    """
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    model, optimizer, scheduler, _loss, train_loader, eval_loader = _components(17)
+    result = learning.training.loop.train_loop(
+        config=_config(4),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=_DivergingLoss(diverge_at_epoch=2),
+        eval_metrics={"mse": _DatasetMSE() if eligible else _NonFiniteMetric()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        checkpoint_identity=_identity(),
+        budget=_budget(4),
+    )
+
+    outcome = result["training_outcome"]
+    assert result["status"] == "diverged"
+    assert outcome["budget_progress"] == pytest.approx(0.5)
+    assert outcome["eligible_points"] == (2 if eligible else 0)
+    assert "non-finite before backward" in outcome["divergence"]
+    assert result["global_step"] == 2
+    assert (result["best_epoch"] in {1, 2}) is eligible
+    assert (run_dir / "best_checkpoint.pt").exists() is eligible
+    assert (run_dir / "last_checkpoint.pt").exists()
+
+    # A crash after the terminal last checkpoint and before the summary: the resume finalizes the
+    # divergence its last checkpoint records, with a loss that would now train, and runs no update.
+    model, optimizer, scheduler, _loss, train_loader, eval_loader = _components(17)
+    resumed = learning.training.loop.train_loop(
+        config=_config(4),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        eval_loader=eval_loader,
+        train_loss=_DivergingLoss(diverge_at_epoch=100),
+        eval_metrics={"mse": _DatasetMSE() if eligible else _NonFiniteMetric()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        resume_from=run_dir / "last_checkpoint.pt",
+        checkpoint_identity=_identity(),
+        budget=_budget(4),
+    )
+    assert resumed["status"] == "diverged"
+    assert resumed["training_outcome"] == outcome
+    assert resumed["global_step"] == result["global_step"]
+    assert resumed["best_epoch"] == result["best_epoch"]
 
 
 @pytest.mark.parametrize(
@@ -1095,7 +1286,7 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
     observed_learning_rates: list[float] = []
 
     result = learning.training.loop.train_loop(
-        config=_config(2, direction=direction, evaluation_interval=1),
+        config=_config(2, direction=direction),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -1104,8 +1295,9 @@ def test_objective_direction_and_strict_ties_control_persisted_best(
         train_loss=loss,
         eval_metrics={"mse": _ObjectiveStreamMetric(values)},
         save_dir=run_dir,
-        epoch_end_callback=lambda _epoch, metrics: observed_learning_rates.append(metrics["optimization/learning_rate"]),
+        event_callback=lambda _epoch, metrics: observed_learning_rates.append(metrics["optimization/learning_rate"]),
         checkpoint_identity=identity,
+        budget=_budget(2),
     )
 
     assert observed_learning_rates == [0.05, 0.05]
@@ -1149,6 +1341,7 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
     _run(run_dir, epochs=1, seed=23)
     evaluation_best = torch.load(run_dir / "best_checkpoint.pt", map_location="cpu", weights_only=False)
     model, optimizer, scheduler, loss, train_loader, _ = _components(23)
+    _commit_epoch(train_loader)
     full_best = learning.training.checkpoint.make_checkpoint(
         role="best",
         payload_kind="full",
@@ -1165,6 +1358,8 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
         train_loader=train_loader,
         runtime_device=torch.device("cpu"),
         training_work=_NO_WORK,
+        update_work=[],
+        budget=learning.training.budget.StageBudget(**evaluation_best["budget_state_dict"]),
     )
     missing = {key: value for key, value in evaluation_best.items() if key != "loss_state_dict"}
     extra = {**evaluation_best, "optimizer_state_dict": optimizer.state_dict()}
@@ -1192,9 +1387,21 @@ def test_best_payload_kind_and_exact_key_set_fail_closed(tmp_path: Path) -> None
             validate(payload, kind)
 
 
-def test_writer_admits_continuation_state_only_in_full_payloads() -> None:
-    """A last checkpoint is always full, and an evaluation best records no batch progress."""
-    model, optimizer, scheduler, loss, train_loader, _ = _components(29)
+def test_full_payloads_bind_the_unit_sampler_state_and_refuse_loader_generator_payloads() -> None:
+    """
+    Write a last checkpoint before and after its epoch's first committed group.
+
+    A last checkpoint is always full; its sampler state must lie on a committed group of
+    its completed epoch, a payload that carries a loader generator instead of the
+    unit sampler state is refused, and its per-update rows must sum to its work counts.
+    """
+    model, optimizer, scheduler, loss, _train_loader, _ = _components(29)
+    train_loader = DataLoader(
+        _MappingDataset(), batch_sampler=UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=3, memory_batch=2, seed=30)
+    )
+    budget = _budget(4)
+    budget.record_group(units=3, train_seconds=1.0)
+    assert budget.record_validation() == 1
     common: dict[str, Any] = {
         "identity": _identity(),
         "completed_epoch": 1,
@@ -1205,21 +1412,42 @@ def test_writer_admits_continuation_state_only_in_full_payloads() -> None:
         "loss": loss,
         "best_metric": 0.5,
         "best_epoch": 1,
-        "objective_history": [{"epoch": 1, "objective_id": "mse", "value": 0.5}],
+        "objective_history": [{"point": 1, "epoch": 1, "objective_id": "mse", "value": 0.5, "bound_violations": {"w_surf": {"case_a": 2.5}}}],
         "train_loader": train_loader,
         "runtime_device": torch.device("cpu"),
-        "training_work": _NO_WORK,
+        "training_work": {"optimizer_steps": 1, "gradient_predictions": 3, "units": 3, "update_distinct_cases": 3},
+        "update_work": [[3, 3, 3]],
+        "budget": budget,
     }
+
+    def validate(payload: dict[str, Any]) -> dict[str, Any]:
+        return learning.training.checkpoint.validate_checkpoint(
+            payload, expected_identity=_identity(), expected_role="last", payload_kind="full", scheduler_expected=True, require_best=True
+        )
 
     with pytest.raises(ValueError, match="a last checkpoint is always full"):
         learning.training.checkpoint.make_checkpoint(role="last", payload_kind="evaluation", **common)
-    with pytest.raises(ValueError, match="records no batch continuation progress"):
-        learning.training.checkpoint.make_checkpoint(
-            role="best",
-            payload_kind="evaluation",
-            batch_progress={"epoch": 1, "cursor": 2, "size": 4, "complete": False},
-            **common,
-        )
+    with pytest.raises(ValueError, match="does not belong to a committed group"):
+        validate(learning.training.checkpoint.make_checkpoint(role="last", payload_kind="full", **common))
+
+    sampler = train_loader.batch_sampler
+    assert isinstance(sampler, UnitSampler)
+    sampler.begin_epoch(0)
+    sampler.advance(3)
+    partial = learning.training.checkpoint.make_checkpoint(role="last", payload_kind="full", **common)
+    assert validate(partial)["next_epoch"] == 1
+    legacy = {key: value for key, value in partial.items() if key != "train_sampler_state_dict"}
+    legacy["train_loader_generator_state"] = torch.Generator().get_state()
+    with pytest.raises(ValueError, match=r"Missing keys: \['train_sampler_state_dict'\]"):
+        validate(legacy)
+    with pytest.raises(ValueError, match="disagrees with its training_work"):
+        validate({**partial, "update_work": [[3, 3, 3], [3, 3, 3]]})
+    # A point's per-case bound evidence is required and holds finite hours only.
+    entry = partial["objective_history"][0]
+    missing = {key: value for key, value in entry.items() if key != "bound_violations"}
+    for history_entry in (missing, {**entry, "bound_violations": {"w_surf": {"case_a": math.nan}}}):
+        with pytest.raises(ValueError, match=r"exactly point|bound_violations must map"):
+            validate({**partial, "objective_history": [history_entry]})
 
 
 def test_completed_epoch_callback_preserves_evaluation_cadence(
@@ -1227,29 +1455,28 @@ def test_completed_epoch_callback_preserves_evaluation_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Train three epochs with evaluation interval two and inspect each callback payload.
+    Train a one-epoch budget in four groups of three units, so every group crosses five of the 20 points.
 
-    With a per-epoch ``last`` cadence, callbacks must follow safe checkpoint publication
-    every epoch, include training state always, and expose objective values only at
-    actual evaluation epochs.
+    Each group ends with one validation mid-epoch at the last point it crossed, after the
+    safe ``last`` publication; the crossed points before it are recorded once as skipped,
+    and point 20 is the budget end.
     """
     monkeypatch.setattr(learning.training.loop, "LAST_CHECKPOINT_INTERVAL_SECONDS", 0)
     run_dir = tmp_path / "callback-cadence"
     run_dir.mkdir()
-    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(28)
+    model, optimizer, scheduler, loss, _train_loader, eval_loader = _components(28)
+    train_loader = DataLoader(
+        _MappingDataset(), batch_sampler=UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=3, memory_batch=2, seed=29)
+    )
     observed: list[tuple[int, dict[str, float]]] = []
 
-    def capture(completed_epoch: int, values: dict[str, float]) -> None:
-        payload = torch.load(
-            run_dir / "last_checkpoint.pt",
-            map_location="cpu",
-            weights_only=False,
-        )
-        assert payload["completed_epoch"] == completed_epoch
-        observed.append((completed_epoch, dict(values)))
+    def capture(step: int, values: dict[str, float]) -> None:
+        payload = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+        assert payload["global_step"] == step
+        observed.append((step, dict(values)))
 
     result = learning.training.loop.train_loop(
-        config=_config(3, evaluation_interval=2),
+        config=_config(1),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -1259,35 +1486,31 @@ def test_completed_epoch_callback_preserves_evaluation_cadence(
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
         save_dir=run_dir,
-        epoch_end_callback=capture,
+        event_callback=capture,
         checkpoint_identity=_identity("callback-cadence"),
+        budget=_budget(1),
     )
 
-    assert [epoch for epoch, _values in observed] == [1, 2, 3]
-    assert "mse" not in observed[0][1]
-    assert "id/mse" in observed[1][1]
-    assert "id/mse" in observed[2][1]
-    assert all("train/loss_total" in values for _epoch, values in observed)
-    assert all("global_step" in values for _epoch, values in observed)
-    assert [entry["epoch"] for entry in result["objective_history"]] == [2, 3]
+    assert [step for step, _values in observed] == [1, 2, 3, 4]
+    assert [values["validation/point"] for _step, values in observed] == [5.0, 10.0, 15.0, 20.0]
+    assert [values["epoch"] for _step, values in observed] == [1.0] * 4
+    assert all("id/mse" in values and "train/loss_total" in values for _step, values in observed)
+    assert [(entry["point"], entry["epoch"]) for entry in result["objective_history"]] == [(5, 1), (10, 1), (15, 1), (20, 1)]
+    assert result["budget"]["skipped_points"] == [point for point in range(1, 20) if point % 5 != 0]
+    assert result["completed_epoch"] == 1
 
 
-def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
+def test_id_ood_and_physics_follow_the_same_validation_points(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Compute each due phase once and forward all results in one epoch payload."""
-    run_dir = tmp_path / "independent-cadences"
+    """Compute ID, OOD and the physics monitor once at every validation point and forward them in one event payload."""
+    run_dir = tmp_path / "shared-points"
     run_dir.mkdir()
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(101)
     ood_loader = DataLoader(_MappingDataset(), batch_size=4, shuffle=False)
-    config = _config(6, evaluation_interval=2)
-    config["training"]["ood_evaluation_interval"] = 3
-    config["tracking"]["wandb"]["monitor"] = {
-        "enabled": True,
-        "interval": 4,
-        "max_cases": 2,
-    }
+    config = _config(3)
+    config["tracking"]["wandb"]["monitor"] = {"enabled": True, "max_cases": 2}
     id_epochs: list[int] = []
     ood_epochs: list[int] = []
     physics_calls = 0
@@ -1299,11 +1522,12 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
         loader: DataLoader[Any],
         _metrics: dict[str, Any],
         _device: torch.device,
-        _processor: Any,
+        _scaling: Any,
+        **_kwargs: Any,
     ) -> dict[str, float]:
         target = id_epochs if loader is eval_loader else ood_epochs
         target.append(active_epoch)
-        return {"mse": float(active_epoch)}
+        return {"mse": float(active_epoch), "nonfinite_cases": 0.0}
 
     def record_physics(*_args: Any, **_kwargs: Any) -> dict[str, float]:
         nonlocal physics_calls
@@ -1334,20 +1558,18 @@ def test_id_ood_and_physics_share_one_predicate_with_independent_cadences(
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
         save_dir=run_dir,
-        epoch_end_callback=capture,
-        checkpoint_identity=_identity("independent-cadences"),
+        event_callback=capture,
+        checkpoint_identity=_identity("shared-points"),
+        budget=_budget(3),
     )
 
-    assert id_epochs == [2, 4, 6]
-    assert ood_epochs == [3, 6]
-    assert physics_calls == 2
-    assert [epoch for epoch, payload in observed.items() if "id/mse" in payload] == [2, 4, 6]
-    assert [epoch for epoch, payload in observed.items() if "material_ood/mse" in payload] == [3, 6]
+    assert id_epochs == ood_epochs == [1, 2, 3]
+    assert physics_calls == 3
+    for key in ("id/mse", "material_ood/mse", "physics/id/momentum_residual_mse"):
+        assert [epoch for epoch, payload in observed.items() if key in payload] == [1, 2, 3]
     # An empty part is not evaluated: no metric, objective difference or duration key of it.
     assert not any("parameter_ood" in key for payload in observed.values() for key in payload)
-    assert [epoch for epoch, payload in observed.items() if "physics/id/momentum_residual_mse" in payload] == [4, 6]
-    assert observed[4]["physics/id/momentum_residual_mse"] == 1.0
-    assert observed[6]["physics/id/momentum_residual_mse"] == 2.0
+    assert [observed[epoch]["physics/id/momentum_residual_mse"] for epoch in (1, 2, 3)] == [1.0, 2.0, 3.0]
 
 
 def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) -> None:
@@ -1357,7 +1579,7 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
     model, optimizer, scheduler, loss, train_loader, eval_loader = _components(41)
     observed: list[dict[str, float]] = []
     result = learning.training.loop.train_loop(
-        config=_config(2, evaluation_interval=1),
+        config=_config(2),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -1368,8 +1590,9 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
         eval_metrics={"mse": _ObjectiveStreamMetric([0.4, 0.1, 0.7, 0.3, 0.9, 0.2])},
         scheduler=scheduler,
         save_dir=run_dir,
-        epoch_end_callback=lambda _epoch, values: observed.append(dict(values)),
+        event_callback=lambda _epoch, values: observed.append(dict(values)),
         checkpoint_identity=_identity("id-ood-selection"),
+        budget=_budget(2),
     )
 
     assert [entry["value"] for entry in result["objective_history"]] == [0.4, 0.3]
@@ -1381,7 +1604,17 @@ def test_ood_diagnostics_never_control_selection_or_scheduler(tmp_path: Path) ->
     assert [values["parameter_ood/mse"] for values in observed] == [0.7, 0.2]
     assert [values["parameter_ood/objective_difference"] for values in observed] == pytest.approx([0.3, -0.1])
     assert result["terminal_epoch"] == 2
-    assert set(result["terminal_metrics"]) == {"train/loss_total", "train/loss_data"}
+    assert set(result["terminal_metrics"]) == {
+        "train/loss_total",
+        "train/loss_data",
+        "train/updates",
+        "train/units_per_update",
+        "train/distinct_cases_per_update",
+        "train/supervised_transitions_per_update",
+        "train/last_group_units",
+        "train/microbatches",
+        "train/forward_transitions",
+    }
 
 
 def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
@@ -1394,7 +1627,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
     model, optimizer, scheduler, _loss, train_loader, eval_loader = _components(43)
     train_loss = _WarmupStatefulLoss()
     result = learning.training.loop.train_loop(
-        config=_config(2, evaluation_interval=1),
+        config=_config(2),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -1405,6 +1638,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         scheduler=scheduler,
         save_dir=run_dir,
         checkpoint_identity=_identity("selected-best"),
+        budget=_budget(2),
     )
     assert result["best_epoch"] == 1
     best = learning.training.checkpoint.load_checkpoint(
@@ -1431,19 +1665,19 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         loader: DataLoader[Any],
         _metrics: dict[str, Any],
         _device: torch.device,
-        _processor: Any,
+        _scaling: Any,
     ) -> dict[str, float]:
         assert_best_state(current)
         if loader is eval_loader:
-            return {"mse": 0.2, **id_science_metrics}
-        return {"mse": 0.6, **ood_science_metrics}
+            return {"mse": 0.2, "nonfinite_cases": 0.0, **id_science_metrics}
+        return {"mse": 0.6, "nonfinite_cases": 0.0, **ood_science_metrics}
 
     def selected_physics(
         current: nn.Module,
         loader: DataLoader[Any],
         _loss_fn: nn.Module,
         _device: torch.device,
-        _processor: Any,
+        _scaling: Any,
         *,
         max_cases: int,
     ) -> dict[str, float]:
@@ -1458,7 +1692,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
 
     monkeypatch.setattr(learning.training.loop, "eval_one_epoch", selected_eval)
     monkeypatch.setattr(learning.training.loop, "evaluate_physics_monitor", selected_physics)
-    selected_config = _config(2, evaluation_interval=1)
+    selected_config = _config(2)
     selected_config["loss"] = {
         "physics": {
             "enabled": True,
@@ -1478,7 +1712,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
             **{metric_id: _DatasetMSE() for metric_id in science_metric_ids},
         },
         device=torch.device("cpu"),
-        data_processor=None,
+        scaling=None,
         checkpoint_identity=_identity("selected-best"),
         best_checkpoint_path=run_dir / "best_checkpoint.pt",
         scheduler_expected=True,
@@ -1506,7 +1740,7 @@ def test_selected_checkpoint_evaluation_uses_one_best_state_for_all_science(
         ood_loaders={"material_ood": ood_loader},
         eval_metrics={"mse": _DatasetMSE()},
         device=torch.device("cpu"),
-        data_processor=None,
+        scaling=None,
         checkpoint_identity=_identity("selected-best"),
         best_checkpoint_path=run_dir / "best_checkpoint.pt",
         scheduler_expected=True,
@@ -1523,41 +1757,39 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
     """Exclude evaluation, monitoring, checkpoints, and W&B from train duration."""
     run_dir = tmp_path / "timing-boundary"
     run_dir.mkdir()
-    model, optimizer, scheduler, loss, train_loader, eval_loader = _components(91)
+    model, optimizer, scheduler, loss, _train_loader, eval_loader = _components(91)
+    # One update of all twelve cases in one microbatch: the update path reads the clock at the group start and around its one load.
+    train_loader = DataLoader(
+        _MappingDataset(), batch_sampler=UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=12, memory_batch=12, seed=0)
+    )
     events: list[str] = []
-    ticks = iter(float(value) for value in range(8))
+    ticks = itertools.count()
     observed: dict[str, float] = {}
     real_eval = learning.training.loop.eval_one_epoch
     real_save = learning.training.checkpoint.save_checkpoints
-    real_scheduler_step = type(scheduler).step
 
     def clock() -> float:
         events.append("clock")
-        return next(ticks)
+        return float(next(ticks))
 
     def record_eval(*args: Any, **kwargs: Any) -> dict[str, float]:
         events.append("evaluation")
         return real_eval(*args, **kwargs)
 
-    def record_scheduler(instance: Any, value: float) -> None:
-        events.append("scheduler")
-        real_scheduler_step(instance, value)
-
     def record_checkpoint(*publications: tuple[dict[str, Any], Path]) -> None:
         events.append("checkpoint")
         real_save(*publications)
 
-    def record_epoch(_epoch: int, metrics: dict[str, float]) -> None:
+    def record_event(_step: int, metrics: dict[str, float]) -> None:
         events.extend(("physics_monitor", "wandb_logging"))
         observed.update(metrics)
 
     monkeypatch.setattr(learning.training.loop.time, "perf_counter", clock)
     monkeypatch.setattr(learning.training.loop, "eval_one_epoch", record_eval)
-    monkeypatch.setattr(type(scheduler), "step", record_scheduler)
     monkeypatch.setattr(learning.training.checkpoint, "save_checkpoints", record_checkpoint)
 
     learning.training.loop.train_loop(
-        config=_config(1, evaluation_interval=1),
+        config=_config(1),
         device=torch.device("cpu"),
         model=model,
         optimizer=optimizer,
@@ -1567,22 +1799,20 @@ def test_training_timer_excludes_post_training_epoch_lifecycle(
         eval_metrics={"mse": _DatasetMSE()},
         scheduler=scheduler,
         save_dir=run_dir,
-        epoch_end_callback=record_epoch,
+        event_callback=record_event,
         checkpoint_identity=_identity("timing-boundary"),
+        budget=_budget(1),
     )
 
-    clock_positions = [index for index, event in enumerate(events) if event == "clock"]
-    assert len(clock_positions) == 8
-    train_stop = clock_positions[3]
-    epoch_stop = clock_positions[6]
-    assert all(events.index(event) > train_stop for event in ("evaluation", "scheduler"))
-    assert all(events.index(event) > epoch_stop for event in ("physics_monitor", "wandb_logging"))
-    # The new best is written with its last after the epoch duration and before the observers.
-    assert epoch_stop < events.index("checkpoint") < events.index("physics_monitor")
-    assert observed["system/train_duration_seconds"] == 1.0
-    assert observed["system/train_samples_per_second"] == 12.0
-    assert observed["system/epoch_duration_seconds"] == 5.0
-    assert observed["system/session_elapsed_seconds"] == 7.0
+    # Each clock reading returns its own index, so a duration counts the readings it spans.
+    readings_before_evaluation = events[: events.index("evaluation")].count("clock")
+    readings_before_observers = events[: events.index("physics_monitor")].count("clock")
+    train = observed["system/train_duration_seconds"]
+    assert 0.0 < train <= readings_before_evaluation - 1
+    assert train < observed["system/event_duration_seconds"] <= readings_before_observers
+    # The new best is written with its last after the event duration and before the observers.
+    assert events.index("evaluation") < events.index("checkpoint") < events.index("physics_monitor")
+    assert observed["system/train_samples_per_second"] == 12.0 / train
 
 
 def test_missing_best_prevents_successful_loop_completion(
@@ -1609,9 +1839,9 @@ def test_missing_best_prevents_successful_loop_completion(
             config={
                 "task": "steady_flow",
                 "run": {"device": "cpu"},
-                "training": {"epochs": 1, "evaluation_interval": 1, "ood_evaluation_interval": 1},
+                "training": {"budget_epochs": 1},
                 "evaluation": {"objective": _objective()},
-                "tracking": {"wandb": {"monitor": {"enabled": False, "interval": 1, "max_cases": 1}}},
+                "tracking": {"wandb": {"monitor": {"enabled": False, "max_cases": 1}}},
             },
             device=torch.device("cpu"),
             model=model,
@@ -1623,7 +1853,101 @@ def test_missing_best_prevents_successful_loop_completion(
             scheduler=scheduler,
             save_dir=run_dir,
             checkpoint_identity=_identity("missing-best"),
+            budget=_budget(1),
         )
 
     assert not (run_dir / "best_checkpoint.pt").exists()
     assert (run_dir / "last_checkpoint.pt").is_file()
+
+
+def _subset_run(
+    run_dir: Path,
+    positions: list[int],
+    *,
+    resume_from: Path | None = None,
+    stop_after: int | None = None,
+    loss: _StatefulLoss | None = None,
+) -> dict[str, Any]:
+    """Train 12 Train cases of an 18-case full set for two full-set passes in groups of six, recording the warm-up position per event."""
+    run_dir.mkdir(exist_ok=True)
+    model, optimizer, scheduler, _default_loss, _train_loader, eval_loader = _components(23)
+    active_loss = _StatefulLoss() if loss is None else loss
+    sampler = UnitSampler(unit_kind="case", cases=range(12), keys=None, units_per_update=6, memory_batch=3, seed=24, full_set_units=18)
+
+    def record(_epoch: int, _values: dict[str, float]) -> None:
+        positions.append(int(active_loss.epoch_index.item()))
+        if len(positions) == stop_after:
+            raise _StopRunError
+
+    return learning.training.loop.train_loop(
+        config=_config(2),
+        device=torch.device("cpu"),
+        model=model,
+        optimizer=optimizer,
+        train_loader=DataLoader(_MappingDataset(), batch_sampler=sampler),
+        eval_loader=eval_loader,
+        train_loss=active_loss,
+        eval_metrics={"mse": _DatasetMSE()},
+        scheduler=scheduler,
+        save_dir=run_dir,
+        resume_from=resume_from,
+        event_callback=record,
+        checkpoint_identity=_identity("subset-warmup"),
+        budget=learning.training.budget.StageBudget(unit="units", total=learning.training.budget.units_budget(2, 18)),
+    )
+
+
+def test_warmup_counts_full_set_passes_per_group_across_a_mid_epoch_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set the loss warm-up per group from committed full-set passes; a resume inside a subset epoch applies the same positions."""
+    uninterrupted: list[int] = []
+    _subset_run(tmp_path / "full", uninterrupted)
+    # Six groups of six units start at 0, 6, ..., 30 committed units: 0 or 1 pass of the 18-case full set. The second
+    # pass begins inside the second subset epoch, which a sampler-epoch count would miss.
+    assert uninterrupted == [0, 0, 0, 1, 1, 1]
+
+    monkeypatch.setattr(learning.training.loop, "LAST_CHECKPOINT_INTERVAL_SECONDS", 0.0)
+    resumed: list[int] = []
+    with pytest.raises(_StopRunError):
+        _subset_run(tmp_path / "resumed", resumed, stop_after=3)
+    _subset_run(tmp_path / "resumed", resumed, resume_from=tmp_path / "resumed" / "last_checkpoint.pt")
+
+    assert resumed == uninterrupted
+
+
+def test_divergence_at_a_warmup_boundary_keeps_the_committed_position(tmp_path: Path) -> None:
+    """Keep the warm-up position of the last committed group when the group that starts the second full-set pass diverges."""
+    positions: list[int] = []
+    # The fourth group starts at 18 committed units, position 1, and diverges there.
+    result = _subset_run(tmp_path, positions, loss=_DivergingLoss(diverge_at_epoch=1))
+
+    assert result["training_outcome"]["status"] == "diverged"
+    last = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert int(last["loss_state_dict"]["epoch_index"]) == positions[-1] == 0
+
+
+def test_validation_bound_evidence_survives_checkpoint_resume_and_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Carry each point's per-case bound evidence from validation through the last checkpoint, a resume and the terminal result."""
+    real_eval = learning.training.loop.eval_one_epoch
+    evaluations = itertools.count(1)
+
+    def eval_with_bounds(*args: Any, bound_cases: dict[str, dict[str, float]] | None = None) -> dict[str, float]:
+        values = real_eval(*args)
+        # The ID evaluation of each point reports one violating case of its own.
+        if bound_cases is not None:
+            bound_cases["T"] = {f"case-{next(evaluations)}": 1.5}
+        return values
+
+    def stop_after_second_point(step: int, _values: dict[str, float]) -> None:
+        if step == 2:
+            raise _StopRunError
+
+    monkeypatch.setattr(learning.training.loop, "eval_one_epoch", eval_with_bounds)
+    monkeypatch.setattr(learning.training.loop, "LAST_CHECKPOINT_INTERVAL_SECONDS", 0.0)
+    with pytest.raises(_StopRunError):
+        _run(tmp_path, epochs=4, seed=151, event_callback=stop_after_second_point)
+    interrupted = torch.load(tmp_path / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert [entry["bound_violations"] for entry in interrupted["objective_history"]] == [{"T": {"case-1": 1.5}}, {"T": {"case-2": 1.5}}]
+
+    result, *_ = _run(tmp_path, epochs=4, seed=999, resume_from=tmp_path / "last_checkpoint.pt")
+
+    assert [entry["bound_violations"] for entry in result["objective_history"]] == [{"T": {f"case-{point}": 1.5}} for point in range(1, 5)]

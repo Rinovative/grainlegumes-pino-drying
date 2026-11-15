@@ -2,7 +2,7 @@
 
 Responsibilities:
   - Name every proposed criterion threshold once
-  - Reduce the crop, timing, mode-truncation, stride, and increment tables to one row per component
+  - Reduce the crop, timing, mode-truncation, and stride tables to one row per component
   - Mark components whose tables were not measured instead of guessing them
 
 Design principles:
@@ -31,7 +31,6 @@ MODES_LOWER_BOUND_ERROR: Final = 1e-3
 MODES_SUFFICIENT_ERROR: Final = 1e-4
 PADDING_NO_EFFECT_RELATIVE: Final = 0.10
 STRIDE_FLOOR_MAX: Final = 1e-3
-HUBER_ABOVE_BETA_MAX: Final = 0.0
 NOT_MEASURED: Final = "not measured"
 
 
@@ -123,23 +122,13 @@ def _stride_row(stride: pd.DataFrame | None) -> dict[str, str]:
     measured, status = [], []
     for value, rows in stride.groupby("stride"):
         if (rows["status"] != "admissible").any():
-            measured.append(f"stride {value}: refused by the endpoint rule")
+            measured.append(f"stride {value}: refused by the tiling rule")
             status.append(f"stride {value}: refused")
             continue
         worst = float(rows["max_normalized_rmse"].max())
         measured.append(f"stride {value}: {worst:.3g}")
         status.append(f"stride {value}: {'admissible' if worst <= STRIDE_FLOOR_MAX else 'not admissible'}")
     return _row("Spatial stride", "; ".join(measured), criterion, "; ".join(status))
-
-
-def _huber_row(increments: pd.DataFrame | None) -> dict[str, str]:
-    """Return whether any scaled increment reaches the linear Huber branch."""
-    criterion = f"Huber = MSE prior if the fraction above beta is {HUBER_ABOVE_BETA_MAX:g}"
-    if increments is None:
-        return _row("Huber regime", NOT_MEASURED, criterion, NOT_MEASURED)
-    largest = float(increments["above_beta_fraction"].max())
-    status = "Huber = MSE prior" if largest <= HUBER_ABOVE_BETA_MAX else "Huber linear branch reached"
-    return _row("Huber regime", f"largest fraction above beta {largest:.3g}", criterion, status)
 
 
 def summary_table(
@@ -179,6 +168,5 @@ def summary_table(
         *_mode_rows("transient", transient_modes),
         _padding_row("transient", transient_modes),
         _stride_row(None if transient is None else transient.stride),
-        _huber_row(None if transient is None else transient.increments),
     ]
     return pd.DataFrame(rows).set_index("component")

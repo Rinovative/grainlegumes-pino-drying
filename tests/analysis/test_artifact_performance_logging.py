@@ -38,7 +38,7 @@ def _reporter(*, total_cases: int, device: str = "cpu") -> performance.ArtifactP
 
 
 def test_snapshot_records_case_forward_and_runtime_evidence() -> None:
-    """Accumulate every completed case and forward call across phases."""
+    """Accumulate every completed case and forward call across phases into the final forward average."""
     reporter = _reporter(total_cases=4)
     reporter.startup()
     with reporter.phase("inference"):
@@ -51,7 +51,6 @@ def test_snapshot_records_case_forward_and_runtime_evidence() -> None:
                 timed_forward_calls=1370,
                 model_forward_seconds=0.01,
             )
-    reporter.inference_summary()
     for phase in ("metrics", "publication"):
         with reporter.phase(phase):
             pass
@@ -60,7 +59,20 @@ def test_snapshot_records_case_forward_and_runtime_evidence() -> None:
 
     assert snapshot["counts"]["case_count"] == 4
     assert snapshot["counts"]["forward_call_count"] == 4 * 1370
+    assert snapshot["measurements"]["average_forward_milliseconds"] == pytest.approx(1000.0 * 0.04 / (4 * 1370))
     assert snapshot["runtime"] == {"device": "cpu", "dtype": "float32"}
+
+
+def test_reused_stage_records_no_forward_average() -> None:
+    """Report no forward average for a target whose cases were all admitted from a complete stage."""
+    reporter = _reporter(total_cases=2)
+    reporter.case_reused(case_id="case_0001", material="lentil")
+    reporter.case_reused(case_id="case_0002", material="lentil")
+
+    snapshot = reporter.done()
+
+    assert snapshot["counts"]["reused_case_count"] == 2
+    assert "average_forward_milliseconds" not in snapshot["measurements"]
 
 
 def test_cuda_snapshot_uses_pytorch_memory_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -138,7 +150,6 @@ def test_finished_phases_print_one_line_each_and_fast_cases_print_no_progress(ca
 
     reporter.finish_work_phase("inference")
     reporter.case_completed(case_id="case_0002", material="lentil", forward_calls=3, timed_forward_calls=3, model_forward_seconds=0.01)
-    reporter.inference_summary()
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     assert "inference" in lines[0]

@@ -367,12 +367,6 @@ class ArtifactProgressReporter:
             model_forward_seconds=0.0,
         )
 
-    def inference_summary(self) -> None:
-        """Record operational inference timing measurements that the completion line reports."""
-        average_ms = 1000.0 * self._model_forward_seconds / self._timed_forward_calls if self._timed_forward_calls > 0 else 0.0
-        self.recorder.set_measurement("model_forward_seconds", self._model_forward_seconds)
-        self.recorder.set_measurement("average_forward_milliseconds", average_ms)
-
     def update_cuda_peaks(self) -> None:
         """Sample allocator peaks once without resetting them."""
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -383,11 +377,15 @@ class ArtifactProgressReporter:
         )
 
     def final_snapshot(self) -> dict[str, Any]:
-        """Finalize throughput and memory evidence without printing."""
+        """Finalize throughput, forward timing and memory evidence without printing."""
         self.update_cuda_peaks()
         total = self.recorder.elapsed_seconds
         rate = self._completed_cases / (total / 60.0) if total > 0.0 else 0.0
         self.recorder.set_measurement("cases_per_minute", rate)
+        # A target admitted from a complete stage timed no forward call, so it records no forward average at all.
+        if self._timed_forward_calls > 0:
+            self.recorder.set_measurement("model_forward_seconds", self._model_forward_seconds)
+            self.recorder.set_measurement("average_forward_milliseconds", 1000.0 * self._model_forward_seconds / self._timed_forward_calls)
         return self.recorder.snapshot()
 
     def done(self, snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -401,10 +399,11 @@ class ArtifactProgressReporter:
         peaks = [f"RSS peak {'unavailable' if rss_peak is None else f'{rss_peak / _GIBIBYTE:.2f} GiB'}"]
         if gpu_peak is not None:
             peaks.insert(0, f"GPU peak {gpu_peak / _GIBIBYTE:.2f} GiB")
+        forward = measurements.get("average_forward_milliseconds")
+        forward_text = "" if forward is None else f" | forward avg {float(forward):.2f} ms"
         self._print(
             f"artifacts done | {self._completed_cases} cases | total {common.console.format_duration(float(validated['total_seconds']))}"
-            f" | {float(measurements.get('cases_per_minute', 0.0)):.2f} cases/min"
-            f" | forward avg {float(measurements.get('average_forward_milliseconds', 0.0)):.2f} ms | {' | '.join(peaks)}"
+            f" | {float(measurements.get('cases_per_minute', 0.0)):.2f} cases/min{forward_text} | {' | '.join(peaks)}"
             f" | out {console.display_path(self.output_root)}"
         )
         return validated

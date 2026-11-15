@@ -33,7 +33,7 @@ IdMembership: TypeAlias = generation.contracts.IdMembership  # noqa: UP040 -- pu
 DatasetFieldPurpose = Literal["conditioning", "target", "archive"]
 SpatialShapeSemantics = Literal["runtime_dataset_identity", "runtime_source_hdf5"]
 TemporalSemantics = Literal["static_snapshot", "fixed_step_transition"]
-TargetSemantics = Literal["direct_task_outputs", "next_state_minus_current_state"]
+TargetSemantics = Literal["direct_task_outputs", "stored_next_state"]
 DatasetContract = domain.tasks.spec.TaskSpec | transient_contract.TransientStepContract
 
 PACKAGE_REGIMES: Final = cast("tuple[PackageRegime, ...]", generation.contracts.evaluation_regimes())
@@ -250,9 +250,9 @@ def _transient_inspection(
             _CHANNEL_SAMPLE_LAYOUT,
         ),
         DatasetGroupInspection(
+            "next_state",
             "target",
-            "target",
-            _transient_fields(contract.target_increments, role="target_increment"),
+            _transient_fields(contract.dynamic_state, role="next_state"),
             _SPATIAL_SAMPLE_LAYOUT,
         ),
         DatasetGroupInspection(
@@ -281,8 +281,8 @@ def _transient_inspection(
             sampling_modes=contract.sampling_modes,
         ),
         storage_representation=contract.canonical_storage_representation,
-        target_semantics="next_state_minus_current_state",
-        target_derivation=contract.target_derivation_stage,
+        target_semantics="stored_next_state",
+        target_derivation="generated_reference_fields",
         spatial_shape_semantics="runtime_source_hdf5",
     )
 

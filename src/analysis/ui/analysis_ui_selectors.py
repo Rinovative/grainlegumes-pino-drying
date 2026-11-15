@@ -1,0 +1,309 @@
+"""Select runs and datasets through one collapsed line «<noun>: k von n gewählt» whose body lists the choices by group.
+
+Responsibilities:
+  - Show grouped choices as checkboxes (several) or one-of buttons (one), with a summary line that counts the selection
+  - List unavailable choices in disabled groups with each item's reason
+  - Group runs by architecture in the fixed run-selector order, full names one per line
+  - Keep runs without valid architecture metadata visible and disabled under «Metadaten fehlen»
+  - Group datasets by role or sampling regime and offer the switch «Materialien je Rolle zusammenfassen» where pooling is valid
+
+Design principles:
+  - The summary counts selectable items only and reads «k von n gewählt» for single and multiple choice alike (F3)
+  - No «alle» or «keine» buttons, and every body starts closed (Q20, Q22)
+  - The pooling switch is enabled only where the view's reduction is material-balanced; elsewhere it is disabled with its reason
+  - Selection changes notify observers once, programmatic state changes can stay silent
+
+This module does NOT:
+  - Load runs or frames, admit roles, or recompute objectives
+  - Resolve pooled choices itself; it delegates to the dataset-selection service
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from html import escape
+from typing import TYPE_CHECKING, Final
+
+import ipywidgets as widgets
+
+from src.analysis import presentation
+
+from . import analysis_ui_controls as controls
+from . import analysis_ui_panel as panel
+from . import analysis_ui_style as style
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Hashable, Iterable, Sequence
+
+    from src.analysis.presentation.analysis_dataset_selection import DatasetChoice, DatasetInventory
+
+    Group = tuple[str, Sequence[tuple[str, Hashable]]]
+    DisabledGroup = tuple[str, Sequence[tuple[str, str]]]
+
+MISSING_METADATA_GROUP: Final = "Metadaten fehlen"
+UNAVAILABLE_GROUP: Final = "Nicht verfügbar"
+POOL_LABEL: Final = "Materialien je Rolle zusammenfassen"
+_ONE_OF_ALLOWANCE_CH: Final = 4
+
+
+def _heading(text: str) -> panel.Row:
+    """Return the bold heading row of one group."""
+    label = widgets.HTML(f"<b>{escape(text)}</b>", layout=widgets.Layout(width=f"{style.GRID.snap(style.text_px(text))}px", flex="0 0 auto"))
+    return panel.row(label)
+
+
+def _one_of(label: str, value: bool) -> widgets.ToggleButton:
+    """Return one button of a one-of choice, as wide as its full text."""
+    return widgets.ToggleButton(
+        value=value,
+        description=label,
+        tooltip=label,
+        layout=widgets.Layout(width=f"{style.GRID.snap(style.text_px(label, allowance_ch=_ONE_OF_ALLOWANCE_CH))}px", flex="0 0 auto"),
+    )
+
+
+def _disabled_item(label: str, reason: str, *, multiple: bool) -> widgets.Widget:
+    """Return a disabled choice that names why it cannot be selected."""
+    text = f"{label} — {reason}"
+    item = controls.checkbox(text, value=False, tooltip=reason) if multiple else _one_of(text, False)
+    item.disabled = True
+    return item
+
+
+class ChoiceBlock:
+    """
+    The collapsed line «<noun>: k von n gewählt» whose body lists grouped choices.
+
+    ``header`` is one element of a panel row and ``body`` its popover; pass ``(header, body)`` to the panel's
+    ``popovers``. Several choices use checkboxes, one choice uses one-of buttons. ``boxes`` maps each selectable key
+    to its widget. ``per_line`` puts every item on its own line (long names); ``footer`` rows follow the groups.
+    """
+
+    def __init__(
+        self,
+        noun: str,
+        groups: Sequence[Group],
+        *,
+        multiple: bool,
+        selected: Iterable[Hashable],
+        disabled_groups: Sequence[DisabledGroup] = (),
+        per_line: bool = False,
+        footer: Sequence[widgets.Widget] = (),
+    ) -> None:
+        """
+        Create the block with ``selected`` checked and the body closed.
+
+        A single choice without a selected key selects its first item.
+
+        Raises
+        ------
+        ValueError
+            If a key repeats, a selected key is not selectable, or a single choice gets more than one key.
+
+        """
+        self.noun = noun
+        self.multiple = multiple
+        keys = [key for _heading_text, items in groups for _label, key in items]
+        if len(set(keys)) != len(keys):
+            message = f"{noun}: every choice needs its own key."
+            raise ValueError(message)
+        chosen = list(dict.fromkeys(selected))
+        unknown = [key for key in chosen if key not in keys]
+        if unknown:
+            message = f"{noun}: selected keys {unknown!r} are not selectable."
+            raise ValueError(message)
+        if not multiple:
+            if len(chosen) > 1:
+                message = f"{noun}: a single choice takes at most one selected key, got {chosen!r}."
+                raise ValueError(message)
+            chosen = chosen or keys[:1]
+        self._callbacks: list[Callable[[], None]] = []
+        self._silent = False
+        self.boxes: dict[Hashable, widgets.Checkbox | widgets.ToggleButton] = {}
+        rows: list[widgets.Widget] = []
+        for heading, items in groups:
+            rows.append(_heading(heading))
+            group_boxes: list[widgets.Widget] = []
+            for label, key in items:
+                box = controls.checkbox(label, value=key in chosen) if multiple else _one_of(label, key in chosen)
+                box.observe(lambda change, key=key: self._changed(key, change), names="value")
+                self.boxes[key] = box
+                group_boxes.append(box)
+            rows.extend([panel.row(box) for box in group_boxes] if per_line else [panel.row(*group_boxes)])
+        for heading, disabled_items in disabled_groups:
+            rows.append(_heading(heading))
+            rows.extend(panel.row(_disabled_item(label, reason, multiple=multiple)) for label, reason in disabled_items)
+        rows.extend(footer)
+        self.header, self.body = panel.disclosure(self._summary(), widgets.VBox(tuple(rows)))
+
+    def selected(self) -> tuple[Hashable, ...]:
+        """Return the selected keys in display order."""
+        return tuple(key for key, box in self.boxes.items() if box.value)
+
+    def select(self, keys: Iterable[Hashable]) -> None:
+        """Select exactly ``keys``; observers are called once."""
+        self._set(keys)
+        self._notify()
+
+    def observe(self, callback: Callable[[], None]) -> None:
+        """Call ``callback()`` after every change of the selection."""
+        self._callbacks.append(callback)
+
+    def _set(self, keys: Iterable[Hashable]) -> None:
+        wanted = set(keys)
+        unknown = wanted - set(self.boxes)
+        if unknown:
+            message = f"{self.noun}: keys {sorted(map(repr, unknown))} are not selectable."
+            raise ValueError(message)
+        if not self.multiple and len(wanted) != 1 and self.boxes:
+            message = f"{self.noun}: a single choice needs exactly one key."
+            raise ValueError(message)
+        self._silent = True
+        try:
+            for key, box in self.boxes.items():
+                box.value = key in wanted
+        finally:
+            self._silent = False
+        self.header.summary = self._summary()
+
+    def _summary(self) -> str:
+        count = sum(bool(box.value) for box in self.boxes.values()) if self.boxes else 0
+        return f"{self.noun}: {count} von {len(self.boxes)} gewählt"
+
+    def _changed(self, key: Hashable, change: dict[str, object]) -> None:
+        if self._silent:
+            return
+        if not self.multiple:
+            if not change["new"]:
+                # A single choice cannot be emptied: pressing the selected button again keeps it selected.
+                self._silent = True
+                try:
+                    self.boxes[key].value = True
+                finally:
+                    self._silent = False
+                return
+            self._silent = True
+            try:
+                for other, box in self.boxes.items():
+                    if other != key:
+                        box.value = False
+            finally:
+                self._silent = False
+        self._notify()
+
+    def _notify(self) -> None:
+        self.header.summary = self._summary()
+        for callback in tuple(self._callbacks):
+            callback()
+
+
+@dataclass(frozen=True, slots=True)
+class RunOption:
+    """One selectable run: its full name, its architecture family from the saved config, its key, and a metadata issue."""
+
+    name: str
+    family: str | None
+    key: Hashable
+    issue: str | None = None
+
+
+class RunSelector(ChoiceBlock):
+    """
+    «Läufe: k von n gewählt» with one heading per architecture in the order FNO, U-NO, RNO, PI-FNO, PI-U-NO.
+
+    Run names stand in full, one per line, because they carry the key parameters. A run whose family is missing or
+    unknown stays visible and disabled under «Metadaten fehlen» with its issue; it never makes the selector fail.
+    """
+
+    def __init__(self, runs: Sequence[RunOption], *, multiple: bool, selected: Iterable[Hashable] = ()) -> None:
+        """Create the selector over ``runs`` with ``selected`` chosen (a single choice defaults to its first run)."""
+        known = {spec.family: spec.label for spec in presentation.visual_semantics.ARCHITECTURES}
+        groups: list[Group] = []
+        for spec in presentation.visual_semantics.ARCHITECTURES:
+            members = sorted((run for run in runs if run.family == spec.family), key=lambda run: run.name)
+            if members:
+                groups.append((spec.label, [(run.name, run.key) for run in members]))
+        missing = [
+            (run.name, run.issue or ("Architektur fehlt" if run.family is None else f"unbekannte Architektur {run.family!r}"))
+            for run in runs
+            if run.family not in known
+        ]
+        super().__init__(
+            "Läufe",
+            groups,
+            multiple=multiple,
+            selected=selected,
+            disabled_groups=[(MISSING_METADATA_GROUP, missing)] if missing else (),
+            per_line=True,
+        )
+
+
+class DatasetSelector(ChoiceBlock):
+    """
+    «Datensätze: k von n gewählt» with one heading per group of the inventory (form 2, by role).
+
+    Unavailable items stand disabled under «Nicht verfügbar» with their reason. A poolable inventory gets the switch
+    «Materialien je Rolle zusammenfassen» as the last body row: enabled when ``pool_reason`` is None, else disabled
+    with that one-line reason. ``choices()`` resolves the selection into the datasets the view draws.
+    """
+
+    def __init__(
+        self,
+        inventory: DatasetInventory,
+        *,
+        multiple: bool,
+        selected: Iterable[Hashable],
+        pooled: bool = False,
+        pool_reason: str | None = None,
+    ) -> None:
+        """Create the selector; ``pooled`` takes effect only where the switch is enabled."""
+        self.inventory = inventory
+        self.pool_toggle: widgets.ToggleButton | None = None
+        footer: list[widgets.Widget] = []
+        if inventory.poolable:
+            self.pool_toggle = controls.toggle(POOL_LABEL, value=pooled and pool_reason is None)
+            self.pool_toggle.disabled = pool_reason is not None
+            elements: list[widgets.Widget] = [self.pool_toggle]
+            if pool_reason is not None:
+                self.pool_toggle.tooltip = pool_reason
+                elements.append(widgets.HTML(escape(pool_reason), layout=widgets.Layout(width=f"{style.GRID.snap(style.text_px(pool_reason))}px")))
+            footer.append(panel.row(*elements))
+        groups = [
+            (inventory.group_labels[group], [(item.label, item.key) for item in inventory.items if item.group == group])
+            for group in inventory.group_order
+        ]
+        unavailable = [(item.label, reason) for item, reason in inventory.unavailable]
+        super().__init__(
+            "Datensätze",
+            [group for group in groups if group[1]],
+            multiple=multiple,
+            selected=selected,
+            disabled_groups=[(UNAVAILABLE_GROUP, unavailable)] if unavailable else (),
+            footer=footer,
+        )
+        if self.pool_toggle is not None:
+            self.pool_toggle.observe(lambda _change: None if self._silent else self._notify(), names="value")
+
+    @property
+    def pool_enabled(self) -> bool:
+        """Return whether this view offers the pooling switch enabled."""
+        return self.pool_toggle is not None and not self.pool_toggle.disabled
+
+    @property
+    def pooled(self) -> bool:
+        """Return whether the selected materials of each group are drawn as one dataset."""
+        return self.pool_enabled and bool(self.pool_toggle is not None and self.pool_toggle.value)
+
+    def choices(self) -> tuple[DatasetChoice, ...]:
+        """Return the datasets the view draws, pooled per group only where the switch is enabled and on."""
+        return presentation.dataset_selection.resolve_choices(self.inventory, self.selected(), pooled=self.pooled)
+
+    def set_state(self, selected: Iterable[Hashable], pooled: bool) -> None:
+        """Set the selection and the switch without notifying observers; ``pooled`` is ignored where the switch is disabled."""
+        self._set(selected)
+        if self.pool_enabled and self.pool_toggle is not None:
+            self._silent = True
+            try:
+                self.pool_toggle.value = pooled
+            finally:
+                self._silent = False

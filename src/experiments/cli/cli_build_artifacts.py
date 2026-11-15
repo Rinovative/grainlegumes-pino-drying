@@ -24,19 +24,6 @@ from pathlib import Path
 from . import cli_device
 
 
-def _positive_spatial_stride(value: str) -> int:
-    """Parse one exact positive artifact Evaluation spatial stride."""
-    try:
-        stride = int(value)
-    except ValueError as error:
-        message = "--evaluation-spatial-stride must be a positive integer"
-        raise argparse.ArgumentTypeError(message) from error
-    if stride < 1 or str(stride) != value:
-        message = "--evaluation-spatial-stride must be a canonical positive integer"
-        raise argparse.ArgumentTypeError(message)
-    return stride
-
-
 def _build_parser() -> argparse.ArgumentParser:
     """Build the artifact-generation parser."""
     parser = argparse.ArgumentParser(
@@ -76,12 +63,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Selected run name under the resolved runs root. May be repeated.",
     )
     cli_device.add_device_argument(parser, default="auto")
-    parser.add_argument(
-        "--evaluation-spatial-stride",
-        type=_positive_spatial_stride,
-        default=1,
-        help="Artifact Evaluation-grid stride on the canonical source grid; defaults to the original grid (1).",
-    )
     parser.add_argument(
         "--rebuild",
         action="store_true",
@@ -173,7 +154,6 @@ def main(argv: list[str] | None = None) -> int:
                 case_ids=args.case_ids,
                 one_case=args.one_case,
                 device_policy=args.device,
-                evaluation_spatial_stride=args.evaluation_spatial_stride,
             )
             print(f"artifacts done: scoped transient artifact for {len(scoped.case_ids)} case(s) in {scoped.root}")
             return 0
@@ -188,7 +168,6 @@ def main(argv: list[str] | None = None) -> int:
                 run_names=args.run_names,
                 device_policy=args.device,
                 rebuild=args.rebuild,
-                evaluation_spatial_stride=args.evaluation_spatial_stride,
             )
             result_count += len(results)
     except Exception as error:  # noqa: BLE001

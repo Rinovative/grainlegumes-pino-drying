@@ -30,11 +30,6 @@ _COORDINATE_RANK = 3
 _MINIMUM_AXIS_LENGTH = 1
 _AUTO_MEDIUM_AXIS = 400
 _AUTO_LARGE_AXIS = 800
-COMMON_GRID_ARTIFACT_COMMAND = (
-    "./scripts/slurm_ml.sh --mode gpu --partition gpu --cpus-per-task 4 "
-    "--mem 32G --time 02:00:00 --gres gpu:rtx6000ada:1 artifacts "
-    "--run-dir <run-dir> --evaluation-spatial-stride 1"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +39,6 @@ class SpatialGridIdentity:
     shape: tuple[int, int]
     coordinate_digest: str
     coordinate_units: tuple[str, str]
-    artifact_stride: int
     source_shape: tuple[int, int]
     axis_indices: tuple[tuple[int, ...], tuple[int, ...]]
     field_order: tuple[str, ...]
@@ -101,7 +95,6 @@ def spatial_grid_identity(
     *,
     coordinate_units: tuple[str, str],
     field_order: tuple[str, ...],
-    artifact_stride: int = 1,
     source_shape: tuple[int, int] | None = None,
     axis_indices: tuple[tuple[int, ...], tuple[int, ...]] | None = None,
 ) -> SpatialGridIdentity:
@@ -121,7 +114,7 @@ def spatial_grid_identity(
     shape = (int(array.shape[1]), int(array.shape[2]))
     source = shape if source_shape is None else source_shape
     indices = (tuple(range(shape[0])), tuple(range(shape[1]))) if axis_indices is None else axis_indices
-    if artifact_stride < 1 or len(indices[0]) != shape[0] or len(indices[1]) != shape[1]:
+    if len(indices[0]) != shape[0] or len(indices[1]) != shape[1]:
         msg = "Artifact index map does not match the coordinate shape."
         raise ValueError(msg)
     if any(
@@ -142,7 +135,6 @@ def spatial_grid_identity(
         shape=shape,
         coordinate_digest=digest.hexdigest(),
         coordinate_units=coordinate_units,
-        artifact_stride=artifact_stride,
         source_shape=source,
         axis_indices=indices,
         field_order=field_order,
@@ -154,8 +146,5 @@ def require_common_grid(left: SpatialGridIdentity, right: SpatialGridIdentity) -
     """Reject direct comparisons that differ in any spatial representation fact."""
     if left != right:
         changed = tuple(item.name for item in fields(SpatialGridIdentity) if getattr(left, item.name) != getattr(right, item.name))
-        msg = (
-            f"Incompatible Evaluation grids: {', '.join(changed)} differ. "
-            f"Build each artifact on one explicit common grid with: {COMMON_GRID_ARTIFACT_COMMAND}"
-        )
+        msg = f"Incompatible Evaluation grids: {', '.join(changed)} differ."
         raise ValueError(msg)

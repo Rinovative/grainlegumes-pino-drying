@@ -1,109 +1,59 @@
-"""Protect adapter-owned lifecycle aggregation contracts.
+"""Protect adapter-owned evaluation aggregation contracts.
 
 Responsibilities:
-  - Check transition-weighted accumulation, budget stops, and rollout scoring with the one-step guardrail view
+  - Check rollout scoring with the one-step guardrail view
   - Check that physical moisture telemetry accumulates in float64 and stays finite for finite float32 predictions
+  - Check that grain-moisture validation errors are reduced per case, then over cases and materials
+  - Check that one non-finite case, physical or standardized, leaves a validation without metric values, and the
+    per-channel bound diagnostics
 
 Design principles:
-  - The first committed budget-crossing optimizer group ends admission of later work
+  - Fixed evaluation views isolate the aggregation from rollout numerics
 
 This module does NOT:
   - Resolve stage plans or allocate parent experiment records
+  - Test the training update path; the unit-update tests own it
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import replace
+from typing import Any
 
 import pytest
 import torch
 from torch import nn
-from torch.optim.sgd import SGD
 
 from src.learning.training import learning_training_adapter as adapter_contract
 from src.learning.training import learning_training_loop as loop
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@dataclass
-class _Step:
-    loss: torch.Tensor
-    components: dict[str, torch.Tensor]
-    sample_count: int
-    processed_target_transitions: int
-    forward_transitions: int
-    consumed_items: int
-
-
-class _Adapter:
-    gradient_accumulation_steps = 3
-
-    def __init__(self) -> None:
-        self.work: list[adapter_contract.OptimizerWork] = []
-
-    def prepare_batch(self, raw: dict[str, torch.Tensor], *, device: torch.device, training: bool) -> dict[str, torch.Tensor]:
-        del training
-        return {key: value.to(device) for key, value in raw.items()}
-
-    def training_steps(self, model: nn.Module, batch: dict[str, torch.Tensor], loss: nn.Module) -> Iterator[_Step]:
-        del loss
-        value = (model(batch["x"]) - batch["y"]).square().mean()
-        yield _Step(value, {"total": value, "custom": value * 2.0}, 1, int(batch["transitions"]), 7, 1)
-
-    def record_optimizer_work(self, work: adapter_contract.OptimizerWork) -> None:
-        self.work.append(work)
-
-    def should_stop(self) -> bool:
-        return False
-
-
-class _BudgetAdapter(_Adapter):
-    gradient_accumulation_steps = 1
-
-    def should_stop(self) -> bool:
-        return bool(self.work)
-
-
-class _WindowAdapter(_Adapter):
-    """Yield three windows per loader batch, each computed after the preceding update."""
-
-    gradient_accumulation_steps = 1
-
-    def __init__(self, *, stop_after: int | None = None) -> None:
-        super().__init__()
-        self.stop_after = stop_after
-        self.weights_seen: list[float] = []
-
-    def training_steps(self, model: nn.Module, batch: dict[str, torch.Tensor], loss: nn.Module) -> Iterator[_Step]:
-        del loss
-        for window in range(3):
-            self.weights_seen.append(float(model.weight.detach().item()))
-            value = (model(batch["x"]) - batch["y"]).square().mean()
-            yield _Step(value, {"total": value}, 1, 1, 1, 1 if window == 2 else 0)
-
-    def should_stop(self) -> bool:
-        return self.stop_after is not None and len(self.work) >= self.stop_after
+from src.learning.transient import learning_transient_adapter as transient_adapter
 
 
 class _Metric:
     id = "metric"
     space = "normalized"
+    requires_cases = True
 
     def reset(self) -> None:
         self.values: list[float] = []
         self.masks: list[torch.Tensor | None] = []
 
-    def update(self, pred: torch.Tensor, target: torch.Tensor, *, space: str, batch_index: int, mask: torch.Tensor | None = None) -> None:
-        del space, batch_index
+    def update(self, pred: torch.Tensor, target: torch.Tensor, *, space: str, batch_index: int, cases: Any, mask: torch.Tensor | None = None) -> None:
+        del space, batch_index, cases
         self.values.extend((pred - target).flatten().tolist())
         self.masks.append(mask)
 
     def compute(self) -> float:
         return float(sum(abs(value) for value in self.values) / len(self.values))
+
+    def components(self) -> dict[str, float]:
+        return {}
+
+
+def _batch(*case_ids: str, material: str = "lentil") -> dict[str, Any]:
+    """Return one loader batch that carries only the case membership of its rows."""
+    return {"metadata": {"simulation_case_id": list(case_ids), "material_family": [material] * len(case_ids)}}
 
 
 class _EvalAdapter:
@@ -128,6 +78,8 @@ class _EvalAdapter:
             one_step_physical_prediction=one_step,
             sample_count=2,
             processed_target_transitions=4,
+            case_complete=torch.ones(2, dtype=torch.bool),
+            bound_violations={},
             valid_mask=mask,
             f_surf=torch.full((2, 2), 0.5),
         )
@@ -161,11 +113,13 @@ def test_adapter_moisture_telemetry_stays_finite_for_finite_float32_predictions(
         one_step_physical_prediction=physical_prediction,
         sample_count=1,
         processed_target_transitions=2,
+        case_complete=torch.ones(1, dtype=torch.bool),
+        bound_violations={},
         valid_mask=torch.ones(1, 2, 1, 1, 1, dtype=torch.bool),
         f_surf=f_surf,
     )
 
-    values = loop._eval_adapter_one_epoch(nn.Identity(), [object()], {"metric": _Metric()}, torch.device("cpu"), _FixedViewsAdapter(views))
+    values = loop._eval_adapter_one_epoch(nn.Identity(), [_batch("a")], {"metric": _Metric()}, torch.device("cpu"), _FixedViewsAdapter(views))
 
     fraction = f_surf.double().reshape(1, 2, 1, 1)
     expected = (
@@ -187,81 +141,136 @@ def test_adapter_moisture_telemetry_stays_finite_for_finite_float32_predictions(
     assert values["physical/w_gr_mae"] == pytest.approx(float(expected.abs().mean()), rel=1e-6)
 
 
-def test_adapter_accumulation_weights_transitions_and_keeps_components() -> None:
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.fill_(1.0)
-    optimizer = SGD(model.parameters(), lr=1.0)
-    adapter = _Adapter()
-    train_loader: Any = [
-        {"x": torch.tensor([[1.0]]), "y": torch.zeros(1, 1), "transitions": torch.tensor(1)},
-        {"x": torch.tensor([[2.0]]), "y": torch.zeros(1, 1), "transitions": torch.tensor(3)},
-    ]
-    values = loop.train_one_epoch(
-        model,
-        train_loader,
-        optimizer,
-        nn.MSELoss(),
-        torch.device("cpu"),
-        adapter=adapter,
+class _BatchViewsAdapter(_EvalAdapter):
+    """Return the evaluation views each test batch carries."""
+
+    def evaluation_step(self, model: nn.Module, batch: Any) -> adapter_contract.AdapterEvaluationViews:
+        del model
+        return batch["views"]
+
+
+def _moisture_case(case_id: str, *, length: int, error: float) -> dict[str, Any]:
+    """Return one single-case batch whose grain moisture misses the zero reference by ``error`` at every state."""
+    target = torch.zeros(1, length, 4, 1, 1)
+    prediction = target.clone()
+    prediction[:, :, 2:] = error
+    views = adapter_contract.AdapterEvaluationViews(
+        normalized_prediction=target,
+        normalized_target=target,
+        physical_prediction=prediction,
+        physical_target=target,
+        one_step_normalized_prediction=target,
+        one_step_physical_prediction=prediction,
+        sample_count=1,
+        processed_target_transitions=length,
+        case_complete=torch.ones(1, dtype=torch.bool),
+        bound_violations={},
+        f_surf=torch.full((1, length), 0.5),
     )
-    assert torch.allclose(model.weight.detach(), torch.tensor([[-5.5]]))
-    assert values["train/loss_custom"] == 6.5
-    assert values["transient/train/processed_target_transitions"] == 4.0
-    assert values["transient/train/optimizer_groups"] == 1.0
-    # Training work counts the gradient-carrying target transitions, never the no-gradient warm-up forwards.
-    assert values["transient/train/forward_transitions"] == 14.0
-    assert (values["committed_optimizer_groups"], values["gradient_predictions"]) == (1.0, 4.0)
-    assert adapter.work[0].processed_target_transitions == 4
-    assert adapter.work[0].optimizer_device_seconds is None
+    return {**_batch(case_id), "views": views}
 
 
-def test_adapter_stops_after_first_budget_crossing_optimizer_group() -> None:
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.fill_(1.0)
-    optimizer = SGD(model.parameters(), lr=0.1)
-    adapter = _BudgetAdapter()
-    train_loader: Any = [{"x": torch.tensor([[1.0]]), "y": torch.zeros(1, 1), "transitions": torch.tensor(1)} for _ in range(4)]
+def test_grain_moisture_validation_averages_each_case_before_the_cases_like_the_artifacts() -> None:
+    """Errors 1 over one state and 3 over three states give MAE 2 and RMSE sqrt(5), not the pooled 2.5 and sqrt(7)."""
+    batches = [_moisture_case("short", length=1, error=1.0), _moisture_case("long", length=3, error=3.0)]
 
-    values = loop.train_one_epoch(
-        model,
-        train_loader,
-        optimizer,
-        nn.MSELoss(),
-        torch.device("cpu"),
-        adapter=adapter,
-    )
+    values = loop._eval_adapter_one_epoch(nn.Identity(), batches, {"metric": _Metric()}, torch.device("cpu"), _BatchViewsAdapter())
 
-    assert len(adapter.work) == 1
-    assert values["transient/train/optimizer_groups"] == 1.0
-    assert values["transient/train/microbatches"] == 1.0
-    assert values["optimizer_steps"] == 1.0
+    assert values["physical/w_gr_mae"] == pytest.approx(2.0)
+    assert values["physical/w_gr_rmse"] == pytest.approx(math.sqrt(5.0))
+
+
+def test_a_finite_physical_rollout_whose_standardized_view_overflows_is_a_non_finite_case() -> None:
+    """A complete case whose standardized prediction is inf is counted like an incomplete one, and the validation reports no value."""
+    views = _EvalAdapter().evaluation_step(nn.Identity(), None)
+    normalized = views.normalized_prediction.clone()
+    normalized[1, 0] = math.inf
+    adapter = _FixedViewsAdapter(replace(views, normalized_prediction=normalized))
+
+    values = loop._eval_adapter_one_epoch(nn.Identity(), [_batch("a", "b")], {"metric": _Metric()}, torch.device("cpu"), adapter)
+
+    assert values == {"nonfinite_cases": 1.0}
 
 
 def test_adapter_evaluation_scores_the_rollout_and_guards_with_the_one_step_view() -> None:
     metric = _Metric()
-    eval_loader: Any = [object()]
+    eval_loader: Any = [_batch("a", "b")]
     values = loop._eval_adapter_one_epoch(nn.Identity(), eval_loader, {"metric": metric}, torch.device("cpu"), _EvalAdapter())
     assert values["metric"] == 5.0
     assert values["guardrail/one_step/metric"] == 1.0
+    assert values["nonfinite_cases"] == 0.0
     assert metric.masks[0] is not None
 
 
-def test_windowed_loader_batches_step_after_every_window_and_stop_at_the_budget() -> None:
-    """Each window is computed after the previous update; a completed budget stops mid-batch."""
-    for stop_after, expected_groups in ((None, 6), (4, 4)):
-        model = nn.Linear(1, 1, bias=False)
-        model.weight.data.fill_(1.0)
-        adapter = _WindowAdapter(stop_after=stop_after)
-        train_loader: Any = [{"x": torch.ones(1, 1), "y": torch.zeros(1, 1), "transitions": torch.tensor(1)} for _ in range(2)]
-        values = loop.train_one_epoch(
-            model,
-            train_loader,
-            SGD(model.parameters(), lr=0.1),
-            nn.MSELoss(),
-            torch.device("cpu"),
-            adapter=adapter,
-        )
+class _IncompleteSecondBatchAdapter(_EvalAdapter):
+    """Return a first batch with a moisture violation of row 0 and a second batch with one non-finite case and a violation of row 1."""
 
-        assert len(adapter.work) == expected_groups
-        assert values["transient/train/microbatches"] == float(expected_groups)
-        assert len(set(adapter.weights_seen)) == expected_groups
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def evaluation_step(self, model: nn.Module, batch: Any) -> adapter_contract.AdapterEvaluationViews:
+        views = super().evaluation_step(model, batch)
+        self.calls += 1
+        if self.calls == 1:
+            return replace(views, bound_violations={"w_surf": (4.0, None), "T": (None, None)})
+        return replace(views, case_complete=torch.tensor([True, False]), bound_violations={"w_surf": (None, 2.5), "T": (None, None)})
+
+
+def test_one_non_finite_case_leaves_the_validation_without_metric_values_but_counts_every_case() -> None:
+    """A validation with one non-finite case is not eligible; per-case bound evidence is still collected, and the aggregates derive from it."""
+    bound_cases: dict[str, dict[str, float]] = {}
+    values = loop._eval_adapter_one_epoch(
+        nn.Identity(),
+        [_batch("a", "b"), _batch("c", "d")],
+        {"metric": _Metric()},
+        torch.device("cpu"),
+        _IncompleteSecondBatchAdapter(),
+        bound_cases=bound_cases,
+    )
+
+    assert bound_cases == {"w_surf": {"a": 4.0, "d": 2.5}}
+    assert values == {
+        "nonfinite_cases": 1.0,
+        "bounds/w_surf/violating_cases": 2.0,
+        "bounds/w_surf/first_violation_hours": 2.5,
+        "bounds/T/violating_cases": 0.0,
+    }
+    assert not loop.validation_eligible(values, "metric")
+    assert not loop.validation_eligible({"nonfinite_cases": 0.0, "metric": math.nan}, "metric")
+    assert loop.validation_eligible({"nonfinite_cases": 0.0, "metric": 0.5}, "metric")
+
+
+class _NonFiniteOneStepAdapter(_EvalAdapter):
+    """Return a finite autonomous trajectory whose teacher-forced one-step diagnostic is non-finite."""
+
+    def evaluation_step(self, model: nn.Module, batch: Any) -> adapter_contract.AdapterEvaluationViews:
+        views = super().evaluation_step(model, batch)
+        one_step = views.one_step_physical_prediction.clone()
+        one_step[1, 0] = math.inf
+        return replace(views, one_step_normalized_prediction=one_step, one_step_physical_prediction=one_step)
+
+
+def test_a_non_finite_one_step_diagnostic_never_affects_eligibility() -> None:
+    """The one-step view only loses its guardrail value; the autonomous trajectory decides completeness."""
+    values = loop._eval_adapter_one_epoch(nn.Identity(), [_batch("a", "b")], {"metric": _Metric()}, torch.device("cpu"), _NonFiniteOneStepAdapter())
+
+    assert values["nonfinite_cases"] == 0.0
+    assert values["metric"] == 5.0
+    assert "guardrail/one_step/metric" not in values
+    assert loop.validation_eligible(values, "metric")
+
+
+def test_bound_violations_return_each_cases_first_time_without_clamping() -> None:
+    """Negative moisture in two cases at different times; the corners stay excluded and a third case has no violation."""
+    prediction = torch.zeros(3, 3, 4, 5, 5)
+    prediction[:, :, 0] = 300.0
+    prediction[0, 1:, 2, 2, 2] = -1.0e-6
+    prediction[1, 2, 2, 2, 3] = -2.0
+    prediction[1, 0, 2, 0, 0] = -5.0  # corner block, excluded
+    times = torch.tensor([[1.0, 2.0, 3.0]] * 3)
+
+    violations = transient_adapter._bound_violations(prediction, times)
+
+    assert violations["w_surf"] == (2.0, 3.0, None)
+    assert violations["T"] == (None, None, None)
+    assert prediction[0, 1, 2, 2, 2].item() == pytest.approx(-1.0e-6)

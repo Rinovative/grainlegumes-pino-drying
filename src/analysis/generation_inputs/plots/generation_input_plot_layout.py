@@ -9,7 +9,8 @@ Responsibilities:
 Design principles:
   - Colorbar geometry follows settled map-axis geometry after canvas drawing
   - Every map retains its own axes-coupled colorbar
-  - Presentation helpers never transform or clip displayed scientific values
+  - Presentation helpers never clip displayed scientific values; fields reach maps only through the shared display
+    conversion (relative humidity in %), and labelled in the active label style with one unit rule for axes and colour bars
 
 This module does NOT:
   - Load generation inputs, derive fields, or select cases
@@ -91,13 +92,6 @@ DATASET_A_COLOR: Final = "tab:blue"
 DATASET_B_COLOR: Final = "tab:orange"
 DATASET_MEAN_COLOR: Final = "0.30"
 _COLORBAR_BINDINGS: WeakKeyDictionary[Figure, list[MapColorbarBinding]]
-_COMPACT_QUANTITY_LABELS: Final = {
-    "K_anisotropy": "Anisotropy ratio",
-    "X_0_db_field": "Dry-basis moisture",
-    "phi_eq": "Equilibrium RH",
-    "rho_bu_dry": "Dry bulk density",
-    "w_gr0": "Initial water content",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +234,15 @@ def draw_array_map(
     return image
 
 
+def display_field(record: diagnostics.GenerationInputDiagnostics, quantity: str) -> np.ndarray:
+    """Return one generated field read-only on its display scale, such as equilibrium relative humidity in % RH."""
+    stored = record.fields[quantity]
+    values = np.asarray(diagnostics.display_value(quantity, stored, diagnostics.FIELD_UNITS[quantity]))
+    if values is not stored:  # a converted copy; the stored evidence array keeps its own flags
+        values.setflags(write=False)
+    return values
+
+
 def draw_map(
     axis: Axes,
     record: diagnostics.GenerationInputDiagnostics,
@@ -253,7 +256,7 @@ def draw_map(
     if quantity not in diagnostics.display_field_names(record):
         message = f"Unknown generation-input map quantity {quantity!r}."
         raise ValueError(message)
-    values = record.fields[quantity]
+    values = display_field(record, quantity)
     resolved_norm = physical_norm(quantity, values) if norm is None else norm
     return draw_array_map(
         axis,
@@ -326,20 +329,22 @@ def map_colorbar_bindings(figure: Figure) -> tuple[MapColorbarBinding, ...]:
     return tuple(_bindings(figure))
 
 
+def quantity_label(quantity: str) -> str:
+    """Return one quantity's label in the active style; a quantity without a shared symbol keeps its concise name."""
+    if field_labels.has_declared_field_metadata(quantity):
+        return field_labels.field_label(quantity, mathtext=True)
+    return diagnostics.field_name(quantity)
+
+
+def quantity_colorbar_label(quantity: str, *, difference: bool = False) -> str:
+    """Return only the display unit of a map's values or differences, as each map title owns the quantity; one unit rule for axes and bars."""
+    unit = diagnostics.FIELD_UNITS[quantity]
+    return f"[{field_labels.display_unit(unit, field=quantity, quantity_kind='difference' if difference else 'absolute')}]" if unit else ""
+
+
 def quantity_axis_label(quantity: str) -> str:
-    """Return one concise physical quantity and canonical unit label."""
-    label = _COMPACT_QUANTITY_LABELS.get(
-        quantity,
-        diagnostics.FIELD_LABELS[quantity],
-    )
-    unit = diagnostics.FIELD_UNITS[quantity]
-    return f"{label} [{unit}]" if unit else label
-
-
-def quantity_colorbar_label(quantity: str) -> str:
-    """Return only the display unit because each map title owns the quantity."""
-    unit = diagnostics.FIELD_UNITS[quantity]
-    return f"[{field_labels.display_unit(unit)}]" if unit else ""
+    """Return one concise physical quantity and display unit label."""
+    return f"{quantity_label(quantity)} {quantity_colorbar_label(quantity)}".rstrip()
 
 
 def align_axis_to_references(

@@ -12,6 +12,7 @@ This module does NOT:
 
 import numpy as np
 import pytest
+from support.transient_evaluation import scaling_state
 
 from src.analysis.presentation import analysis_error_diagnostics as diagnostics
 
@@ -19,9 +20,9 @@ from src.analysis.presentation import analysis_error_diagnostics as diagnostics
 def _steady_provenance(scale: float = 2.0, dataset: str = "train-dataset", fit_split: str = "train") -> dict:
     return {
         "normalizer": {
-            "output_standard_deviations": {"p": scale},
+            "output_scales": {"p": scale},
             "fit_split": fit_split,
-            "output_normalization": "train_fitted_per_channel_standardization",
+            "normalization": "case_equal_train_channel_scaling",
             "sha256": "a" * 64,
         },
         "dataset": {"name": dataset},
@@ -59,11 +60,20 @@ def test_original_steady_modes_keep_actual_meanings() -> None:
     reference = np.array([[3.0, 4.0]])
     prediction = np.array([[4.0, 2.0]])
     mae = diagnostics.selected_error_map(reference, prediction, mode="MAE", field="p", physical_unit="Pa")
-    relative = diagnostics.selected_error_map(reference, prediction, mode="Relative [%]", field="p", physical_unit="Pa")
+    relative = diagnostics.selected_error_map(reference, prediction, mode="Relative [%]", field="p", physical_unit="Pa", reference_floor=1.0)
     assert mae.map_values is not None
     assert relative.map_values is not None
     np.testing.assert_array_equal(mae.map_values, [[1.0, 2.0]])
     np.testing.assert_allclose(relative.map_values, np.array([[1.0, 2.0]]) / np.sqrt(12.5) * 100.0, rtol=1e-10)
+
+
+def test_a_relative_map_below_the_field_floor_is_unavailable_never_stabilised() -> None:
+    """A reference RMS below the field's floor leaves the relative map unavailable with its reason, never a finite value."""
+    below = diagnostics.selected_error_map(
+        np.array([[0.0, 0.0]]), np.array([[1.0, 2.0]]), mode="Relative [%]", field="p", physical_unit="Pa", reference_floor=1.0
+    )
+    assert below.map_values is None
+    assert "floor" in str(below.reason)
 
 
 def test_incompatible_or_missing_scales_and_nonfinite_support_are_unavailable() -> None:
@@ -87,53 +97,24 @@ def test_incompatible_or_missing_scales_and_nonfinite_support_are_unavailable() 
     assert "Non-finite" in str(invalid.reason)
 
 
-def test_transient_state_std_is_used_even_for_delta_rms_training_and_derived_is_unavailable() -> None:
-    """Reconstructed state errors use persisted state_std, never delta_rms."""
-    state = {
-        "state_std": [2.0, 0.25],
-        "delta_rms": [0.01, 0.02],
-        "scale_mode": "delta_rms",
-        "train_membership_digest": "train",
-        "state_names": ["T", "phi"],
-    }
-    temperature = diagnostics.transient_reference_scale(state, field="T", unit="K", state_order=("T", "phi"), dataset_identity="train")
+def test_transient_scale_reads_the_saved_group_scale_with_identity_checks() -> None:
+    """State fields and w_gr use their group's saved Train scale; derived fields and foreign identities stay unavailable."""
+    state = scaling_state(membership_digest="b" * 64)
+    temperature = diagnostics.transient_reference_scale(state, field="T", unit="K", dataset_identity="b" * 64)
     assert isinstance(temperature, diagnostics.ReferenceScale)
     np.testing.assert_allclose(temperature.value, 2.0)
-    contradicted = diagnostics.transient_reference_scale(
-        state,
-        field="T",
-        unit="K",
-        state_order=("T", "phi"),
-        dataset_identity="train",
-        expected_scaler_identity="different",
-    )
+    grain = diagnostics.transient_reference_scale(state, field="w_gr", unit="1", dataset_identity="b" * 64)
+    assert isinstance(grain, diagnostics.ReferenceScale)
+    assert grain.source == "saved_run_normalizer.groups.grain_moisture"
+    contradicted = diagnostics.transient_reference_scale(state, field="T", unit="K", dataset_identity="b" * 64, expected_scaler_identity="c" * 64)
     assert isinstance(contradicted, str)
     assert "contradicts" in contradicted
-    derived = diagnostics.transient_reference_scale(state, field="X_db", unit="1", state_order=("T", "phi"), dataset_identity="train")
-    assert isinstance(derived, str)
-    assert "derived" in derived
-
-
-def test_transient_w_gr_scale_needs_the_persisted_grain_moisture_std_and_the_same_identity_checks() -> None:
-    """w_gr is normalized by the saved train scale; older scaling states stay unavailable with their own reason."""
-    state = {"state_std": [2.0, 0.25], "train_membership_digest": "train", "state_names": ["T", "phi"], "grain_moisture_std": 0.05}
-    kwargs = {"field": "w_gr", "unit": "1", "state_order": ("T", "phi"), "dataset_identity": "train"}
-    scale = diagnostics.transient_reference_scale(state, **kwargs)
-    assert isinstance(scale, diagnostics.ReferenceScale)
-    assert scale.source == "saved_run_normalizer.grain_moisture_std"
-    np.testing.assert_allclose(scale.value, 0.05)
-    contradicted = diagnostics.transient_reference_scale(state, **kwargs, expected_scaler_identity="different")
-    assert isinstance(contradicted, str)
-    assert "contradicts" in contradicted
-    foreign = diagnostics.transient_reference_scale({**state, "train_membership_digest": "other"}, **kwargs)
+    foreign = diagnostics.transient_reference_scale(state, field="T", unit="K", dataset_identity="c" * 64)
     assert isinstance(foreign, str)
     assert "membership" in foreign
-    non_positive = diagnostics.transient_reference_scale({**state, "grain_moisture_std": 0.0}, **kwargs)
-    assert isinstance(non_positive, str)
-    assert "strictly positive" in non_positive
-    older = diagnostics.transient_reference_scale({key: value for key, value in state.items() if key != "grain_moisture_std"}, **kwargs)
-    assert isinstance(older, str)
-    assert "predates the persisted w_gr train scale" in older
+    derived = diagnostics.transient_reference_scale(state, field="X_db", unit="1", dataset_identity="b" * 64)
+    assert isinstance(derived, str)
+    assert "derived" in derived
 
 
 def test_reference_scale_rejects_non_train_direct_construction_and_field_mismatch() -> None:

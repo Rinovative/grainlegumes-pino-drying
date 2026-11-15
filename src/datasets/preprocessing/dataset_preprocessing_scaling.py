@@ -12,10 +12,11 @@ Design principles:
     changed fit or application code refits once per Dataset while a loss-only change reuses the entry
   - The artifact identity stays data-only: a restored run artifact is admitted against its recorded evidence, never the running code
   - A cache entry whose identity or producer disagrees with its key is refused, never reused or silently refitted
-  - The task owns its fitted state and preprocessing specification; this module owns identity, cache and envelope
+  - ``normalization`` owns the one fitted state format and preprocessing specification of both tasks; this module owns
+    identity, cache and envelope
 
 This module does NOT:
-  - Compute statistics or reconstruct processors (normalization owns steady, learning owns transient state)
+  - Compute statistics or rebuild the fitted state (``normalization`` owns both, the transient fit lives in learning)
   - Choose split membership or construct DataLoaders
   - Write run directories; the run lifecycle persists the admitted artifact
 """

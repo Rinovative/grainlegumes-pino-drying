@@ -1,12 +1,12 @@
 """
-Completed-epoch training, optimization, and persistence services.
+Budget-driven training, optimization, and persistence services.
 
 Provides:
 - adapter: task-owned training-step, evaluation-view and optimizer-work contracts
+- budget: stage budgets in units or optimisation seconds and their validation points
 - checkpoint: atomic checkpoint and continuation-state persistence
-- events: phase-aware progress and metric event contracts
-- loop: training and evaluation epoch execution
-- optim: optimizer and scheduler construction
+- loop: training and evaluation execution
+- optim: optimizer and learning-rate schedule construction
 """
 
 from __future__ import annotations
@@ -16,19 +16,19 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import learning_training_adapter as adapter
+    from . import learning_training_budget as budget
     from . import learning_training_checkpoint as checkpoint
-    from . import learning_training_events as events
     from . import learning_training_loop as loop
     from . import learning_training_optim as optim
 
 _MODULES = {
     "adapter": "learning_training_adapter",
+    "budget": "learning_training_budget",
     "checkpoint": "learning_training_checkpoint",
-    "events": "learning_training_events",
     "loop": "learning_training_loop",
     "optim": "learning_training_optim",
 }
-__all__ = ["adapter", "checkpoint", "events", "loop", "optim"]
+__all__ = ["adapter", "budget", "checkpoint", "loop", "optim"]
 
 
 def __getattr__(name: str) -> object:

@@ -1,46 +1,68 @@
-"""Protect the physical steady-grid spacing handed to the relative H1 loss and metric.
+"""Protect the physical grid spacing handed to the H1 state loss and the relative H1 metric.
 
 Responsibilities:
-  - Check that the spacing comes from the physical coordinate channels as (rows, columns) in metres
-  - Check that an OOD Evaluation case on another grid spacing is refused
+  - Check that the spacing comes from the physical coordinate channels as (rows, columns) in metres, for both tasks
+  - Check that an Evaluation Dataset on another coordinate grid is refused from manifest metadata alone
 
 Design principles:
   - Synthetic samples on a small anisotropic grid replace published Datasets
 
 This module does NOT:
-  - Verify the relative H1 algebra, coordinate-grid validation or the run lifecycle
+  - Verify the H1 algebra, coordinate-grid validation or the run lifecycle
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from src import domain, experiments
+from src import datasets, domain, experiments
 
 _TASK = domain.tasks.registry.get_task("steady_flow")
 _CONFIG = {"task": _TASK.id}
 _SPACING_Y, _SPACING_X = 0.5, 0.25
 
 
-def _loader(*, spacing_y: float = _SPACING_Y, spacing_x: float = _SPACING_X) -> SimpleNamespace:
-    """Return a loader stand-in whose one sample carries physical coordinate channels on a 4 x 6 grid."""
-    inputs = torch.zeros(_TASK.in_channels, 4, 6)
-    inputs[_TASK.input_names.index("x")] = (torch.arange(6) * spacing_x)[None, :].expand(4, 6)
-    inputs[_TASK.input_names.index("y")] = (torch.arange(4) * spacing_y)[:, None].expand(4, 6)
-    return SimpleNamespace(dataset=[{"x": inputs}])
+def _coordinates(names: tuple[str, ...], *, spacing_y: float, spacing_x: float) -> torch.Tensor:
+    """Return zero channels ``names`` on a 4 x 6 grid whose ``x`` and ``y`` channels hold physical coordinates."""
+    values = torch.zeros(len(names), 4, 6)
+    values[names.index("x")] = (torch.arange(6) * spacing_x)[None, :].expand(4, 6)
+    values[names.index("y")] = (torch.arange(4) * spacing_y)[:, None].expand(4, 6)
+    return values
 
 
 def test_spacing_is_rows_then_columns_in_metres() -> None:
-    """Return the y spacing first and the x spacing second, also when OOD Evaluation shares the grid."""
-    spacing = experiments.run._steady_grid_spacing(_CONFIG, _loader(), _loader())
+    """Return the y spacing first and the x spacing second."""
+    loader = SimpleNamespace(dataset=[{"x": _coordinates(_TASK.input_names, spacing_y=_SPACING_Y, spacing_x=_SPACING_X)}])
 
-    assert spacing == pytest.approx((_SPACING_Y, _SPACING_X))
+    assert experiments.run._grid_spacing(_CONFIG, loader) == pytest.approx((_SPACING_Y, _SPACING_X))
 
 
-def test_ood_evaluation_on_another_spacing_is_refused() -> None:
-    """Refuse an OOD Evaluation case whose grid spacing differs from the training grid."""
-    with pytest.raises(ValueError, match="training spacing"):
-        experiments.run._steady_grid_spacing(_CONFIG, _loader(), _loader(spacing_x=2 * _SPACING_X))
+def test_transient_spacing_comes_from_the_static_coordinate_channels() -> None:
+    """Read the transient grid from the physical coordinates of the static conditioning."""
+    names = tuple(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.static_spatial_conditioning)
+    loader = SimpleNamespace(dataset=[{"static": _coordinates(names, spacing_y=_SPACING_Y, spacing_x=_SPACING_X)}])
+
+    assert experiments.run._grid_spacing({"task": "transient_drying"}, loader) == pytest.approx((_SPACING_Y, _SPACING_X))
+
+
+def test_an_evaluation_dataset_on_another_coordinate_grid_is_refused() -> None:
+    """The Train grid spacing serves every case, so an Evaluation Dataset must share the Train coordinate axes."""
+    identity = datasets.contracts.identity
+    train = identity.ManifestBinding(
+        dataset_id="train",
+        dataset_digest="d" * 64,
+        channel_contract_digest="c" * 64,
+        case_ids=("a",),
+        physical_sources={"a": ("a", "simulation_a")},
+        materials={"a": "lentil"},
+        design_kinds={"a": "train"},
+        case_partition=None,
+        grid_axes_sha256="1" * 64,
+    )
+    identity.require_train_grid(train, [replace(train, dataset_id="same_grid")])
+    with pytest.raises(ValueError, match="does not share the coordinate grid"):
+        identity.require_train_grid(train, [replace(train, dataset_id="other_grid", grid_axes_sha256="2" * 64)])

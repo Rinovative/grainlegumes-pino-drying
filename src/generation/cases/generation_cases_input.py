@@ -9,6 +9,7 @@ Responsibilities:
 Design principles:
   - One batch metadata and raw location serves EDA and later COMSOL execution
   - Existing cases are reused only after complete manifest and byte validation
+  - Each manifest case record carries the input store's sha256 and size as storage integrity outside case.json
   - Conflicting or incomplete canonical evidence always fails closed
 
 This module does NOT:
@@ -274,6 +275,7 @@ def _case_record(directory: Path) -> dict[str, Any]:
         "case_json_sha256": hashlib.sha256(serialized).hexdigest(),
         "seed_evidence_sha256": common.serialization.canonical_json_sha256(payload["seed_evidence"]),
         "input_files": payload["input_files"],
+        "input_store": case_service.measure_input_store(directory).as_dict(),
     }
 
 

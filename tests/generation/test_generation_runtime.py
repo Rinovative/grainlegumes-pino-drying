@@ -1277,6 +1277,16 @@ def test_compact_case_uses_solved_output_but_omits_model_from_publication(
         source_export_dataset = handle.get("provenance/source_exports_json")
         assert isinstance(source_export_dataset, h5py.Dataset)
         raw_source_exports: Any = source_export_dataset[()]
+        input_files_dataset = handle.get("provenance/input_files_json")
+        assert isinstance(input_files_dataset, h5py.Dataset)
+        raw_input_files: Any = input_files_dataset[()]
+    raw_case = generation.runtime.raw_case_directory(config, 1, storage_root=storage)
+    raw_payload = json.loads((raw_case / "case.json").read_text(encoding="utf-8"))
+    published_input_files = raw_input_files.decode("utf-8") if isinstance(raw_input_files, bytes) else str(raw_input_files)
+    assert json.loads(published_input_files) == raw_payload["input_files"]
+    assert set(raw_payload["input_files"]) == {"fields.csv"}
+    terminal = generation.runtime.admit_completed_case(config, 1, storage_root=storage, validation_depth="routine")
+    assert [artifact.relative_path for artifact in terminal.raw_artifacts] == ["case.json", "inputs.h5"]
     source_export_text = raw_source_exports.decode("utf-8") if isinstance(raw_source_exports, bytes) else str(raw_source_exports)
     source_exports = json.loads(source_export_text)
     assert source_exports
@@ -1514,7 +1524,7 @@ def test_two_concurrent_cases_keep_inputs_exports_and_workspaces_isolated(
             case_index,
             storage_root=storage,
         )
-        / "fields.csv"
+        / "inputs.h5"
         for case_index in (1, 2)
     ]
     assert all(path.is_file() for path in retained_inputs)

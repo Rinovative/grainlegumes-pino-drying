@@ -5,11 +5,15 @@ Responsibilities:
   - Order the union of selected-dataset fields by shared scientific semantics
   - Identify the compatible dataset subset for each requested field
   - Extract direct or nested spatial values without fabricating missing data
+  - Convert one case's field values, means and state trajectories to their displayed scale and label them
 
 Design principles:
   - Dataset and task schemas remain the source of field names, roles, and units
   - Mixed selections preserve unavailable combinations as explicit omissions
   - Transient state extraction uses retained stored positions without resampling
+  - Display follows the shared field labels in the active label style (phi in %, temperature in °C; ``% RH`` and
+    ``% w.b.`` only in the name style and in control texts); water densities show as wet-basis moisture with the case's
+    own retained dry bulk density, and their means are bulk wet-basis values
 
 This module does NOT:
   - Discover datasets, construct widgets, or choose presentation views
@@ -28,6 +32,7 @@ import numpy as np
 from src import domain, generation
 from src.analysis.presentation import analysis_channel_semantics as channel_semantics
 from src.analysis.presentation import analysis_field_labels as field_labels
+from src.analysis.presentation import analysis_moisture_display as moisture_display
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -351,28 +356,71 @@ def field_representation(frame: pd.DataFrame, field: str) -> str:
     return value
 
 
-def field_display_unit(frame: pd.DataFrame, field: str) -> str:
-    """Return the unit of the values actually displayed for one field."""
+def field_value_unit(frame: pd.DataFrame, field: str) -> str:
+    """Return the unit of one field's values before display conversion: its stored unit, or 1 for a dimensionless representation."""
     if field_representation(frame, field) in _DIMENSIONLESS_REPRESENTATIONS:
         return "1"
     return field_unit(frame, field)
 
 
-def field_display_values(
+def field_display_unit(
     frame: pd.DataFrame,
     field: str,
-    values: Sequence[float] | np.ndarray,
     *,
-    quantity_kind: field_labels.TemperatureQuantityKind = "absolute",
+    quantity_kind: field_labels.QuantityKind = "absolute",
+    control: bool = False,
+) -> str:
+    """Return the presentation unit of one field's displayed values or differences, such as ``%`` or ``pp`` (``% RH`` in a control)."""
+    if moisture_display.is_moisture_field(field):
+        return moisture_display.moisture_unit(difference=quantity_kind == "difference", control=control)
+    if field_representation(frame, field) in _DIMENSIONLESS_REPRESENTATIONS:
+        return field_labels.display_unit("1", quantity_kind=quantity_kind)
+    return field_labels.display_unit(field_unit(frame, field), field=field, quantity_kind=quantity_kind, control=control)
+
+
+def _dry_bulk_density(frame: pd.DataFrame, row: pd.Series) -> np.ndarray:
+    """Return one case's retained dry bulk density, which converts its water densities to wet-basis moisture."""
+    return field_values(frame, row, "rho_bu_dry")
+
+
+def field_display_values(
+    frame: pd.DataFrame,
+    row: pd.Series,
+    field: str,
+    values: Sequence[float] | np.ndarray,
 ) -> np.ndarray:
-    """Return a non-mutating display array on the field's presentation scale."""
+    """Return a non-mutating display array of one case's field values; water densities become % w.b. with the case's density."""
+    if moisture_display.is_moisture_field(field):
+        return moisture_display.wet_basis_percent(values, _dry_bulk_density(frame, row))
     if field_representation(frame, field) in _DIMENSIONLESS_REPRESENTATIONS:
         return np.array(values, dtype=np.float64, copy=True)
-    return field_labels.display_values(
-        values,
-        field_unit(frame, field),
-        quantity_kind=quantity_kind,
-    )
+    return field_labels.display_values(values, field_unit(frame, field), field=field)
+
+
+def field_display_mean(frame: pd.DataFrame, row: pd.Series, field: str, values: Sequence[float] | np.ndarray) -> float:
+    """
+    Return the displayed mean of one case's field values over every given cell.
+
+    Water densities give the bulk wet-basis percent 100 Σw/(Σρ_bu,dry + Σw) over their cells with physical water,
+    never a mean of cell percentages; other fields average their finite displayed values.
+    """
+    raw = np.asarray(values, dtype=np.float64)
+    shown = field_display_values(frame, row, field, raw)
+    if moisture_display.is_moisture_field(field):
+        return moisture_display.bulk_wet_basis_percent(raw, _dry_bulk_density(frame, row), np.isfinite(shown))
+    return float(np.nanmean(shown))
+
+
+def field_display_trajectory(frame: pd.DataFrame, row: pd.Series, field: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return one case's stored state times [h] and the displayed spatial mean, minimum and maximum of a dynamic field at each."""
+    if not is_dynamic_field(frame, field):
+        message = f"EDA trajectories require a dynamic transient state, got {field!r}."
+        raise ValueError(message)
+    raw = field_values(frame, row, field)
+    shown = field_display_values(frame, row, field, raw)
+    means = np.asarray([field_display_mean(frame, row, field, state) for state in raw])
+    times = np.asarray(row["time"]["regular_state_hours"], dtype=np.float64)
+    return times, means, np.nanmin(shown, axis=(-2, -1)), np.nanmax(shown, axis=(-2, -1))
 
 
 def field_quantity_label(
@@ -380,13 +428,10 @@ def field_quantity_label(
     field: str,
     *,
     mathtext: bool = False,
+    control: bool = False,
 ) -> str:
-    """Return one shared formula-or-fallback label with display unit."""
-    return field_labels.field_label_with_unit(
-        field,
-        field_display_unit(frame, field),
-        mathtext=mathtext,
-    )
+    """Return one shared field label in the active style, or for a ``control`` text the symbol or moisture words, with its display unit."""
+    return f"{moisture_display.display_name(field, mathtext=mathtext, control=control)} [{field_display_unit(frame, field, control=control)}]"
 
 
 def resolved_field_labels(
@@ -404,6 +449,7 @@ def resolved_field_labels(
             reference,
             field,
             mathtext=mathtext,
+            control=True,
         )
     return labels
 

@@ -1,21 +1,20 @@
-"""Define transient rollout curricula and strict stage-budget accounting.
+"""Define transient rollout curricula and per-stage compute accounting.
 
 Responsibilities:
-  - Select continuous self-fed rollout horizons and valid window origins
-  - Persist private random sampling state at epoch boundaries
-  - Bind A0, B, and A1 comparison arms to immutable teacher-handoff evidence
-  - Account completed optimizer work under epoch or measured train_seconds budgets
-  - Mark equally spaced validation points of a measured train_seconds budget
+  - Draw one self-fed rollout horizon and one valid origin per window, capped at short windows
+  - Persist private random sampling state at update-group boundaries
+  - Bind A0, B, and A1 comparison arms to immutable teacher-handoff and B-receipt evidence
+  - Account completed optimizer work: steps, microbatches, transitions, peak memory and validation time
   - Admit a completed stage's terminal controller and curriculum values against its final history record
 
 Design principles:
-  - Curriculum progress follows the stage-epoch or matched train_seconds control
+  - Curriculum progress is the stage budget fraction committed before an update group
   - Shorter horizons retain positive probability after later milestones
-  - Completed groups retain measured compute and transition accounting; budget completion follows the selected control
+  - Completed groups retain transition accounting; their time is only on the stage budget's optimisation clock
 
 This module does NOT:
   - Load teacher files, run model forwards, or mutate optimizers
-  - Treat optimizer steps, device seconds, and committed training time as interchangeable
+  - Own the stage budget or its validation points; ``learning.training.budget`` does
 """
 
 from __future__ import annotations
@@ -23,40 +22,23 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar, Final, Literal, overload
 
 import torch
 
 TrainingStage = Literal["stage_a_teacher_forcing", "stage_b_self_fed"]
 ComparisonArm = Literal["A0", "B", "A1"]
-ClockKind = Literal["cuda_device_seconds", "optimizer_steps", "train_seconds"]
-BudgetControl = Literal["stage_epochs", "train_seconds"]
 DEFAULT_ROLLOUT_LENGTHS: Final = (2, 4, 8, 16, 32)
 DEFAULT_MILESTONE_FRACTIONS: Final = (0.0, 0.2, 0.4, 0.6, 0.8)
 # Immutable controller semantics shared by checkpoint admission and the stage digest.
-_CONTROLLER_IDENTITY_FIELDS: Final = (
-    "arm",
-    "stage",
-    "clock_kind",
-    "config_digest",
-    "budget_control",
-    "planned_stage_epochs",
-    "teacher_handoff",
-    "planned_train_seconds",
-    "matched_receipt_sha256",
-    "evaluation_points",
-)
+_CONTROLLER_IDENTITY_FIELDS: Final = ("arm", "stage", "config_digest", "teacher_handoff", "matched_receipt_sha256")
 _SHA256_LENGTH: Final = 64
 # Every other terminal controller and curriculum value is kept in each completed-epoch history record under its adapter
 # telemetry name, which is the value's own name unless renamed here.
-_TERMINAL_VALUES_NOT_IN_HISTORY: Final = frozenset(
-    {"arm", "stage", "clock_kind", "budget_control", "planned_train_seconds", "train_seconds", "matched_receipt_sha256", "batch_cursor"}
-)
+_TERMINAL_VALUES_NOT_IN_HISTORY: Final = frozenset({"arm", "stage", "matched_receipt_sha256"})
 _TERMINAL_HISTORY_RENAMES: Final = {
-    "crossing_epoch": "budget_crossing_epoch",
-    "crossing_microbatch": "budget_crossing_microbatch",
     "active_stage": "curriculum_active_stage",
     "max_horizon": "curriculum_max_horizon",
     "draw_index": "curriculum_draw_index",
@@ -115,30 +97,10 @@ def _canonical_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_budget_state(state: Mapping[str, Any]) -> None:
-    """Apply the controller's arm, stage, clock, budget and work-counter rules that need no handoff or digest identity."""
+def _validate_controller_state(state: Mapping[str, Any]) -> None:
+    """Apply the controller's arm, stage, receipt and work-counter rules that need no handoff or digest identity."""
     if state["arm"] not in {"A0", "B", "A1"} or state["stage"] not in {"stage_a_teacher_forcing", "stage_b_self_fed"}:
         msg = "Transient comparison arm or stage is unsupported."
-        raise ValueError(msg)
-    if state["clock_kind"] not in {"cuda_device_seconds", "optimizer_steps", "train_seconds"}:
-        msg = "Transient accounting clock kind is unsupported."
-        raise ValueError(msg)
-    if state["budget_control"] not in {"stage_epochs", "train_seconds"}:
-        msg = "Transient budget control is unsupported."
-        raise ValueError(msg)
-    if (state["budget_control"] == "train_seconds") != (state["clock_kind"] == "train_seconds"):
-        msg = "Measured train_seconds budgets require the train_seconds clock and vice versa."
-        raise ValueError(msg)
-    completed_stage_epochs = _nonnegative_int(state["completed_stage_epochs"], label="completed_stage_epochs")
-    if state["budget_control"] == "stage_epochs":
-        if state["planned_stage_epochs"] is None:
-            msg = "Epoch-budgeted transient stages require planned_stage_epochs."
-            raise ValueError(msg)
-        if completed_stage_epochs > _positive_int(state["planned_stage_epochs"], label="planned_stage_epochs"):
-            msg = "completed_stage_epochs exceeds planned_stage_epochs."
-            raise ValueError(msg)
-    elif state["planned_stage_epochs"] is not None or completed_stage_epochs != 0:
-        msg = "Time-budgeted stages cannot carry epoch-budget state."
         raise ValueError(msg)
     if state["stage"] == "stage_b_self_fed" and state["arm"] != "B":
         msg = "Self-fed Stage B requires arm B."
@@ -146,29 +108,13 @@ def _validate_budget_state(state: Mapping[str, Any]) -> None:
     if state["stage"] == "stage_a_teacher_forcing" and state["arm"] == "B":
         msg = "Arm B requires self-fed Stage B."
         raise ValueError(msg)
-    for label in ("post_handoff_optimizer_device_seconds", "wall_seconds", "validation_seconds", "train_seconds"):
-        _finite_nonnegative(state[label], label=label, allow_none=label == "post_handoff_optimizer_device_seconds")
-    for label in (
-        "post_handoff_optimizer_steps",
-        "processed_target_transitions",
-        "forward_transitions",
-        "batch_cursor",
-    ):
+    _finite_nonnegative(state["validation_seconds"], label="validation_seconds")
+    for label in ("post_handoff_optimizer_steps", "processed_target_transitions", "forward_transitions"):
         _nonnegative_int(state[label], label=label)
-    if state["budget_control"] == "train_seconds":
-        planned = _finite_nonnegative(state["planned_train_seconds"], label="planned_train_seconds")
-        if planned <= 0:
-            msg = "Matched B/A1 train_seconds target must be positive."
-            raise ValueError(msg)
-        if state["arm"] == "A1":
-            _sha256(state["matched_receipt_sha256"], label="matched_receipt_sha256")
-    elif (
-        state["planned_train_seconds"] is not None
-        or state["train_seconds"] != 0
-        or state["matched_receipt_sha256"] is not None
-        or state["batch_cursor"]
-    ):
-        msg = "Epoch-budgeted controllers cannot carry matched train_seconds state."
+    if state["arm"] == "A1":
+        _sha256(state["matched_receipt_sha256"], label="matched_receipt_sha256")
+    elif state["matched_receipt_sha256"] is not None:
+        msg = "Only A1 trains for a B receipt's seconds."
         raise ValueError(msg)
 
 
@@ -245,7 +191,7 @@ class RolloutCurriculum:
         if lengths == (1,):
             pass
         elif not lengths or tuple(sorted(set(lengths))) != lengths or any(length not in allowed for length in lengths):
-            msg = "Curriculum lengths must be the Stage-A one-step horizon or increasing members of 2, 4, 8, 16, 32, optionally 64."
+            msg = "Curriculum lengths must be the one-step horizon or increasing members of 2, 4, 8, 16, 32, optionally 64."
             raise ValueError(msg)
         elif lengths[: len(DEFAULT_ROLLOUT_LENGTHS)] != DEFAULT_ROLLOUT_LENGTHS and lengths != DEFAULT_ROLLOUT_LENGTHS[: len(lengths)]:
             msg = "Curriculum lengths must retain the canonical ordered prefix."
@@ -304,49 +250,44 @@ class RolloutCurriculumState:
         generator.manual_seed(_nonnegative_int(seed, label="seed"))
         return cls(curriculum=curriculum, generator=generator)
 
-    def select(self, *, progress: float, available_length: int, batch_size: int) -> tuple[int, torch.Tensor]:
-        """Draw one horizon and per-sample valid origins across temporal strata."""
-        _positive_int(available_length, label="available_length")
-        _positive_int(batch_size, label="batch_size")
-        active_stage = self.curriculum.active_stage(progress)
-        active_maximum = self.curriculum.lengths[active_stage]
-        if active_maximum > available_length:
-            message = "The active curriculum maximum horizon does not fit the supplied rollout window."
-            raise ValueError(message)
+    def draw(self, *, progress: float, available_lengths: Sequence[int]) -> tuple[tuple[int, int], ...]:
+        """
+        Draw one horizon and one valid origin for every window, in the given order.
+
+        Each horizon is drawn uniformly from the lengths eligible at ``progress`` and
+        capped at its window's length, so a window shorter than the drawn horizon is
+        rolled out over its whole length. Returns ``(horizon, origin)`` per window.
+        """
         eligible = self.curriculum.eligible_lengths(progress)
-        horizon = eligible[int(torch.randint(len(eligible), (1,), generator=self.generator).item())]
-        origins = self._sample_origins(available_length=available_length, horizon=horizon, batch_size=batch_size)
-        self.draw_index += 1
+        draws: list[tuple[int, int]] = []
+        for length in available_lengths:
+            available = _positive_int(length, label="available_length")
+            horizon = min(eligible[int(torch.randint(len(eligible), (1,), generator=self.generator).item())], available)
+            draws.append((horizon, self._sample_origin(available_length=available, horizon=horizon)))
+            self.draw_index += 1
         self.progress = float(progress)
         self.active_stage = self.curriculum.active_stage(progress)
         self.max_horizon = self.curriculum.lengths[self.active_stage]
         self.completed_milestones = tuple(
             index for index, milestone in enumerate(self.curriculum.milestone_fractions) if progress + 1.0e-12 >= milestone
         )
-        return horizon, origins
+        return tuple(draws)
 
-    def _sample_origins(self, *, available_length: int, horizon: int, batch_size: int) -> torch.Tensor:
+    def _sample_origin(self, *, available_length: int, horizon: int) -> int:
         """
-        Sample valid early/middle/late origins without padding or replacement rules.
+        Sample one valid early, middle or late origin without padding.
 
-        The stratum of each sample rotates with the persisted draw index, so
-        consecutive draws cover all three strata for every batch size,
-        including the single-trajectory batches of a rare trajectory length.
+        The stratum rotates with the persisted draw index, so consecutive windows
+        cover all three strata whatever the group size.
         """
         maximum = available_length - horizon
-        if maximum < 0:
-            msg = "Rollout horizon exceeds available sequence length."
-            raise ValueError(msg)
         if maximum == 0:
-            return torch.zeros(batch_size, dtype=torch.long)
+            return 0
         edges = ((0, maximum // 3), (maximum // 3 + 1, (2 * maximum) // 3), ((2 * maximum) // 3 + 1, maximum))
-        draws: list[int] = []
-        for index in range(batch_size):
-            low, high = edges[(self.draw_index + index) % len(edges)]
-            if low > high:
-                low, high = 0, maximum
-            draws.append(int(torch.randint(low, high + 1, (1,), generator=self.generator).item()))
-        return torch.tensor(draws, dtype=torch.long)
+        low, high = edges[self.draw_index % len(edges)]
+        if low > high:
+            low, high = 0, maximum
+        return int(torch.randint(low, high + 1, (1,), generator=self.generator).item())
 
     def state_dict(self) -> dict[str, Any]:
         """Return exact CPU generator and curriculum continuation state."""
@@ -399,39 +340,25 @@ class RolloutCurriculumState:
 
 @dataclass(slots=True)
 class MatchedComputeController:
-    """Account completed optimizer work and derive the configured transient budget boundary."""
+    """Account a transient stage's completed optimizer work, its teacher provenance and its in-budget selection."""
 
     arm: ComparisonArm
     stage: TrainingStage
-    clock_kind: ClockKind
     config_digest: str
-    budget_control: BudgetControl = "stage_epochs"
-    planned_stage_epochs: int | None = None
-    completed_stage_epochs: int = 0
     teacher_handoff: TeacherHandoffIdentity | None = None
-    post_handoff_optimizer_device_seconds: float | None = None
     post_handoff_optimizer_steps: int = 0
     microbatches: int = 0
     processed_target_transitions: int = 0
     forward_transitions: int = 0
-    wall_seconds: float = 0.0
     validation_seconds: float = 0.0
     peak_cuda_memory_bytes: int | None = None
-    budget_complete: bool = False
-    crossing_epoch: int | None = None
-    crossing_microbatch: int | None = None
     best_within_budget_metric: float | None = None
     best_within_budget_epoch: int | None = None
-    planned_train_seconds: float | None = None
-    train_seconds: float = 0.0
     matched_receipt_sha256: str | None = None
-    batch_cursor: int = 0
-    evaluation_points: int | None = None
-    evaluated_points: int = 0
 
     def __post_init__(self) -> None:
-        """Validate immutable arm, clock, identity, and budget semantics."""
-        _validate_budget_state({name: getattr(self, name) for name in self.__dataclass_fields__})
+        """Validate immutable arm, identity and work-counter semantics."""
+        _validate_controller_state({name: getattr(self, name) for name in self.__dataclass_fields__})
         _sha256(self.config_digest, label="config_digest")
         if self.arm == "A0" and self.teacher_handoff is not None:
             msg = "A0 must remain unmatched and cannot consume a teacher handoff."
@@ -440,130 +367,40 @@ class MatchedComputeController:
             msg = "B and A1 arms require immutable teacher-handoff identity."
             raise ValueError(msg)
         _nonnegative_int(self.microbatches, label="microbatches")
-        self._validate_evaluation_points()
-
-    @property
-    def progress(self) -> float:
-        """Return bounded progress under the configured budget owner."""
-        if self.budget_control == "stage_epochs":
-            if self.planned_stage_epochs is None:
-                return 0.0
-            return min(1.0, self.completed_stage_epochs / self.planned_stage_epochs)
-        return min(1.0, self.train_seconds / (self.planned_train_seconds or 1.0))
-
-    def _validate_evaluation_points(self) -> None:
-        """Admit budget evaluation points only for measured train_seconds budgets."""
-        _nonnegative_int(self.evaluated_points, label="evaluated_points")
-        if self.evaluation_points is None:
-            if self.evaluated_points:
-                msg = "Controllers without budget evaluation points cannot record evaluated points."
-                raise ValueError(msg)
-        elif self.budget_control != "train_seconds":
-            msg = "Budget evaluation points apply only to measured train_seconds budgets."
-            raise ValueError(msg)
-        elif _positive_int(self.evaluation_points, label="evaluation_points") < self.evaluated_points:
-            msg = "evaluated_points exceeds evaluation_points."
-            raise ValueError(msg)
-
-    @property
-    def budget_evaluation_due(self) -> bool:
-        """Return whether the measured budget crossed an equally spaced point not yet validated.
-
-        Points sit at ``k / evaluation_points`` of the planned train_seconds, so B and
-        A1 see the same number of selection opportunities at the same budget fractions.
-        """
-        if self.evaluation_points is None:
-            return False
-        return math.floor(self.progress * self.evaluation_points) > self.evaluated_points
-
-    def record_budget_evaluation(self) -> None:
-        """Mark every budget point reached so far as validated."""
-        if self.evaluation_points is not None:
-            self.evaluated_points = min(self.evaluation_points, math.floor(self.progress * self.evaluation_points))
-
-    def begin_epoch(self, *, epoch_index: int, total_epochs: int) -> None:
-        """Advance completed-epoch progress without completing the active epoch early."""
-        if self.budget_control != "stage_epochs":
-            return
-        epoch = _nonnegative_int(epoch_index, label="epoch_index")
-        total = _positive_int(total_epochs, label="total_epochs")
-        if total != self.planned_stage_epochs:
-            msg = "Runtime total_epochs conflicts with the persisted stage budget."
-            raise ValueError(msg)
-        if epoch < self.completed_stage_epochs or epoch >= total:
-            msg = "Runtime epoch progression conflicts with persisted stage-budget state."
-            raise ValueError(msg)
-        self.completed_stage_epochs = epoch
 
     def record_completed_work(
         self,
         *,
-        optimizer_device_seconds: float | None,
         microbatches: int,
         processed_target_transitions: int,
         forward_transitions: int,
-        wall_seconds: float,
-        epoch_index: int,
-        microbatch_index: int,
         peak_cuda_memory_bytes: int | None = None,
-        train_seconds: float | None = None,
-        batch_cursor: int | None = None,
     ) -> None:
-        """Account one completed optimizer group with its measured compute and logical transition evidence."""
-        if self.budget_complete:
-            message = "Transient optimizer work cannot continue after the configured budget boundary."
-            raise RuntimeError(message)
+        """Account one completed optimizer group's logical transition evidence; its time is on the stage budget's clock."""
         _nonnegative_int(microbatches, label="microbatches")
         _nonnegative_int(processed_target_transitions, label="processed_target_transitions")
         _nonnegative_int(forward_transitions, label="forward_transitions")
-        wall = _finite_nonnegative(wall_seconds, label="wall_seconds")
-        if self.clock_kind == "cuda_device_seconds":
-            seconds = _finite_nonnegative(optimizer_device_seconds, label="optimizer_device_seconds")
-            self.post_handoff_optimizer_device_seconds = (self.post_handoff_optimizer_device_seconds or 0.0) + seconds
-        elif optimizer_device_seconds is not None and self.clock_kind != "train_seconds":
-            message = "CPU transient accounting must not report optimizer device seconds."
-            raise ValueError(message)
         self.post_handoff_optimizer_steps += 1
         self.microbatches += microbatches
         self.processed_target_transitions += processed_target_transitions
         self.forward_transitions += forward_transitions
-        self.wall_seconds += wall
-        if self.clock_kind == "train_seconds":
-            if train_seconds is None or batch_cursor is None:
-                msg = "Matched train_seconds work requires measured duration and batch cursor."
-                raise ValueError(msg)
-            self.train_seconds += _finite_nonnegative(train_seconds, label="train_seconds")
-            self.batch_cursor = _nonnegative_int(batch_cursor, label="batch_cursor")
         if peak_cuda_memory_bytes is not None:
             self.peak_cuda_memory_bytes = max(
                 self.peak_cuda_memory_bytes or 0, _nonnegative_int(peak_cuda_memory_bytes, label="peak_cuda_memory_bytes")
             )
-        if self.budget_control == "train_seconds" and not self.budget_complete and self.progress >= 1.0:
-            self.budget_complete = True
-            self.crossing_epoch = _nonnegative_int(epoch_index, label="epoch_index")
-            self.crossing_microbatch = _nonnegative_int(microbatch_index, label="microbatch_index")
 
     def record_validation_work(self, seconds: float) -> None:
-        """Accumulate completed validation wall time outside the primary budget."""
+        """Accumulate completed validation wall time outside the optimisation clock."""
         self.validation_seconds += _finite_nonnegative(seconds, label="validation_seconds")
 
     def record_within_budget_evaluation(self, metric: float, *, epoch_index: int) -> None:
-        """Record one finite selection metric within the configured budget boundary."""
+        """Record one finite selection metric; the loop validates only within the stage budget."""
         if not math.isfinite(metric):
             return
         epoch = _nonnegative_int(epoch_index, label="epoch_index")
         if self.best_within_budget_metric is None or metric < self.best_within_budget_metric:
             self.best_within_budget_metric = float(metric)
             self.best_within_budget_epoch = epoch
-        if self.budget_control == "stage_epochs":
-            if self.planned_stage_epochs is None or epoch + 1 > self.planned_stage_epochs:
-                msg = "Evaluation epoch exceeds the configured stage budget."
-                raise ValueError(msg)
-            self.completed_stage_epochs = epoch + 1
-            if self.completed_stage_epochs == self.planned_stage_epochs:
-                self.budget_complete = True
-                self.crossing_epoch = epoch
-                self.crossing_microbatch = None
 
     def state_dict(self) -> dict[str, Any]:
         """Return strict checkpointable controller evidence."""
@@ -593,34 +430,39 @@ class MatchedComputeController:
 @dataclass(frozen=True, slots=True)
 class TransientTrainingSpec:
     """
-    Bind one transient stage to a model, controller, and curriculum.
+    Bind one transient stage to a model, controller and, in Stage B, its curriculum.
 
-    ``trajectory_window`` is the window length the RNO cuts from whole
-    trajectories: its hidden state carries across consecutive windows while
-    gradients stop at each window boundary. Stateless models leave it ``None``.
+    Only Stage B draws self-fed rollout horizons, so only Stage B has a curriculum and
+    its seed; teacher-forced Stage A has neither. ``trajectory_window`` is the window
+    length the RNO cuts from whole trajectories: its hidden state carries across
+    consecutive windows while gradients stop at each window boundary. Stateless models
+    leave it ``None``.
     """
 
     stage: TrainingStage
     model_kind: str
     controller: MatchedComputeController
-    curriculum_seed: int
-    gradient_accumulation_steps: int = 1
-    curriculum: RolloutCurriculum = field(default_factory=RolloutCurriculum)
+    curriculum: RolloutCurriculum | None
+    curriculum_seed: int | None
     trajectory_window: int | None = None
 
     def __post_init__(self) -> None:
-        """Reject incompatible stage, controller, and horizon selections."""
+        """Reject incompatible stage, controller, curriculum and horizon selections."""
         if self.model_kind not in {"fno", "uno", "rno"}:
             msg = "Transient model_kind must be fno, uno, or rno."
             raise ValueError(msg)
-        _positive_int(self.gradient_accumulation_steps, label="gradient_accumulation_steps")
-        _nonnegative_int(self.curriculum_seed, label="curriculum_seed")
+        self_fed = self.stage == "stage_b_self_fed"
+        if self_fed != (self.curriculum is not None) or self_fed != (self.curriculum_seed is not None):
+            msg = "Exactly Stage B draws rollout horizons and has a curriculum and its seed; Stage A has neither."
+            raise ValueError(msg)
+        if self.curriculum_seed is not None:
+            _nonnegative_int(self.curriculum_seed, label="curriculum_seed")
         if (self.model_kind == "rno") != (self.trajectory_window is not None):
             msg = "Exactly the recurrent RNO trains on trajectory windows."
             raise ValueError(msg)
         if self.trajectory_window is not None:
             _positive_int(self.trajectory_window, label="trajectory_window")
-            if self.curriculum.lengths[-1] > self.trajectory_window:
+            if self.curriculum is not None and self.curriculum.lengths[-1] > self.trajectory_window:
                 msg = "Curriculum horizons must fit the trajectory window."
                 raise ValueError(msg)
         if self.stage != self.controller.stage:
@@ -640,8 +482,7 @@ class TransientTrainingSpec:
             {
                 "stage": self.stage,
                 "model_kind": self.model_kind,
-                "gradient_accumulation_steps": self.gradient_accumulation_steps,
-                "curriculum": self.curriculum.as_dict(),
+                "curriculum": None if self.curriculum is None else self.curriculum.as_dict(),
                 "curriculum_seed": self.curriculum_seed,
                 "trajectory_window": self.trajectory_window,
                 "controller_identity": {
@@ -668,26 +509,22 @@ def validate_terminal_evidence(
     controller : Mapping[str, Any]
         Terminal controller values without the handoff and digest identity, which the stage checkpoint binds.
     curriculum : Mapping[str, Any]
-        Terminal ``active_stage``, ``max_horizon`` and ``draw_index``.
+        Terminal ``active_stage``, ``max_horizon`` and ``draw_index`` of a Stage B; empty for Stage A, which has no curriculum.
     final_record : Mapping[str, float]
         Last admitted completed-epoch history record; empty when the history holds none.
 
     Raises
     ------
     ValueError
-        If the budget is incomplete, a value breaks the controller's state rules, or a value
-        disagrees with the final record.
+        If a value breaks the controller's state rules or disagrees with the final record.
 
     Notes
     -----
     The adapter telemetry records only non-null values, so a recorded value absent from the
-    final record must be null.
+    final record must be null. The stage budget's completion is the checkpoint's own evidence.
 
     """
-    if controller["budget_complete"] is not True:
-        msg = "A completed transient stage must record a complete budget."
-        raise ValueError(msg)
-    _validate_budget_state(controller)
+    _validate_controller_state(controller)
     for key, value in {**controller, **curriculum}.items():
         name = _TERMINAL_HISTORY_RENAMES.get(key, key)
         if key not in _TERMINAL_VALUES_NOT_IN_HISTORY and final_record.get(f"transient/{name}") != value:

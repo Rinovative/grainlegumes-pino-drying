@@ -4,7 +4,7 @@ Responsibilities:
   - Read hash-admitted timing and status sidecars from completed-case evidence
   - Bind runtime values to the admitted case and batch identities
   - Preserve physical duration, target attainment, and censoring separately from runtime
-  - Expose persisted solver timing and explicit component availability without parsing logs
+  - Expose persisted solver timing, the solver host and requested cores, and explicit component availability without parsing logs
   - Expose when a case first reached the stall rule's minimum simulated time, with absence kept explicit
 
 Design principles:
@@ -99,6 +99,8 @@ class CaseTimingEvidence:
     generation_compute_end_to_end_seconds: None
     comsol_solver_timing: comsol_timing.ComsolSolverTiming
     component_timing_availability: tuple[tuple[str, str], ...]
+    solver_hostname: str
+    solver_requested_cores: int
 
     def as_dict(self) -> dict[str, Any]:
         """Return a defensive JSON-compatible representation."""
@@ -129,6 +131,8 @@ class CaseTimingEvidence:
             "generation_compute_end_to_end_seconds": None,
             "comsol_solver_timing": self.comsol_solver_timing.as_dict(),
             "component_timing_availability": dict(self.component_timing_availability),
+            "solver_hostname": self.solver_hostname,
+            "solver_requested_cores": self.solver_requested_cores,
         }
 
 
@@ -292,6 +296,10 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
     if timing.get("exit_code") != 0 or timing.get("timed_out") is not False:
         msg = "Case timing does not represent a successful completed COMSOL process."
         raise ValueError(msg)
+    hostname, cores = timing.get("hostname"), timing.get("requested_cores")
+    if not isinstance(hostname, str) or not hostname or isinstance(cores, bool) or not isinstance(cores, int) or cores < 1:
+        msg = "Case timing must name the solver host and its positive requested core count."
+        raise ValueError(msg)
     if status.get("schema_kind") != _STATUS_SCHEMA_KIND:
         msg = "Case status does not use the current simulation_case_status schema."
         raise ValueError(msg)
@@ -362,5 +370,7 @@ def load_case_timing(case: TerminalCaseEvidence, *, batch: _CompletedTimingBatch
         generation_compute_end_to_end_seconds=None,
         comsol_solver_timing=solver_timing,
         component_timing_availability=components,
+        solver_hostname=hostname,
+        solver_requested_cores=cores,
         **values,
     )

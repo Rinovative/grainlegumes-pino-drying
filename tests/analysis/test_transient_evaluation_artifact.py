@@ -37,13 +37,11 @@ from src.analysis.artifacts import analysis_artifact_plan as artifact_plan
 from src.analysis.artifacts import analysis_artifact_service as artifact_service
 from src.analysis.artifacts import analysis_artifact_timing as artifact_timing
 from src.analysis.artifacts import analysis_artifact_transient as artifact_generator
-from src.analysis.evaluation import evaluation_artifact_loader
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.analysis.evaluation import evaluation_transient_artifact as artifact
 from src.analysis.evaluation import evaluation_transient_rollout as rollout
 from src.analysis.evaluation import evaluation_transient_session as transient_session
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
-from src.analysis.presentation import analysis_presentation_curated as curated
 from src.learning.inference import learning_inference_transient as inference
 
 if TYPE_CHECKING:
@@ -84,7 +82,7 @@ def _items() -> list[dict[str, Any]]:
                 "t_n_plus_1": torch.tensor(float(index + 1)),
                 "dt": torch.tensor(1.0),
             },
-            "target": torch.from_numpy(states[index + 1] - states[index]),
+            "next_state": torch.from_numpy(states[index + 1]),
             "metadata": {
                 "dataset_id": "transient_dataset",
                 "dataset_name": "transient_dataset",
@@ -112,14 +110,14 @@ def _items() -> list[dict[str, Any]]:
 
 
 def _spatial_identity(static: np.ndarray | None = None) -> dict[str, Any]:
-    """Return exact 2x2 source-grid identity for compact sequence fixtures."""
+    """Return the exact unit-stride source-grid identity of compact sequence fixtures (2x2 by default)."""
     conditioning = _items()[0]["static"].numpy() if static is None else np.asarray(static, dtype=np.float32)
-    representation = datasets.contracts.transient.resolve_spatial_representation((2, 2), 1)
+    grid = (int(conditioning.shape[-2]), int(conditioning.shape[-1]))
+    representation = datasets.contracts.grid.resolve_spatial_representation(grid, 1)
     return artifact.build_transient_spatial_identity(
         representation,
-        reference_states=np.zeros((2, len(artifact.STATE_ORDER), 2, 2), dtype=np.float32),
+        reference_states=np.zeros((2, len(artifact.STATE_ORDER), *grid), dtype=np.float32),
         static_conditioning=conditioning,
-        spatial_mask=np.ones((2, 2), dtype=bool),
     )
 
 
@@ -151,7 +149,7 @@ def _identity(*, model_kind: str = "rno") -> dict[str, Any]:
         "spatial_representation": _spatial_identity(),
         "training_airflow_source": "comsol_reference",
         "inference_airflow_source": "comsol_reference",
-        "stage_identity": {"stage": "B"},
+        "stage_identity": {"stage": "b", "comparison_arm": "b"},
         "training_strategy": "rollout",
         "curriculum_identity": {"active_stage": 0},
         "parent_checkpoint": {"source_checkpoint_sha256": "e" * 64},
@@ -201,7 +199,7 @@ def _context() -> inference.TransientInferenceContext:
             "Any",
             SimpleNamespace(
                 spatial_shape=(2, 2),
-                horizon=168.0,
+                regular_horizon=168.0,
                 device=torch.device("cpu"),
             ),
         ),
@@ -225,12 +223,33 @@ def _qualified_identity(case_id: str, material: str) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
+    ("stage", "curriculum", "admitted"),
+    [("a", None, True), ("b", None, False), ("b", {}, False), ("a", {"active_stage": 0}, False)],
+    ids=["stage-a-none", "stage-b-none", "stage-b-empty", "stage-a-curriculum"],
+)
+def test_only_a_stage_b_sequence_identity_carries_a_curriculum(stage: str, curriculum: dict[str, Any] | None, admitted: bool) -> None:
+    """Only Stage B draws rollout horizons: its sequence names its curriculum, a teacher-forced Stage A names none."""
+    stage_identity = {"stage": stage, "comparison_arm": stage if stage == "b" else "a0"}
+    identity = {**_identity(), "stage_identity": stage_identity, "curriculum_identity": curriculum}
+
+    if admitted:
+        assert artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")["curriculum_identity"] is None
+    else:
+        with pytest.raises(artifact.TransientSequenceArtifactError, match="curriculum_identity"):
+            artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")
+
+
+@pytest.mark.parametrize(
     "mutate",
-    [lambda identity: identity.update(dataset_backend="pt_shards"), lambda identity: identity.update(pt_payload_identity="")],
-    ids=["dataset-backend", "empty-payload-identity"],
+    [
+        lambda identity: identity.update(dataset_backend="pt_shards"),
+        lambda identity: identity.update(pt_payload_identity=""),
+        lambda identity: identity["spatial_representation"].update(spatial_mask_identity={"shape": [2, 2], "dtype": "bool", "sha256": "0" * 64}),
+    ],
+    ids=["dataset-backend", "empty-payload-identity", "old-spatial-mask"],
 )
 def test_sequence_identity_rejects_dataset_backend_and_requires_payload_identity(mutate: Any) -> None:
-    """A sequence identity names its PT payload and carries no storage-backend field."""
+    """A sequence identity names its PT payload and carries neither a storage backend nor an old artifact's spatial mask."""
     identity = _identity()
     assert artifact.validate_sequence_identity(identity, case_id=_CASE_ID, dataset_role="id")["pt_payload_identity"] == "a" * 64
     mutate(identity)
@@ -359,10 +378,9 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
     )
     scaling = SimpleNamespace(
         digest="c" * 64,
-        scale_mode="state_std",
         spatial_shape=(2, 2),
         horizon=168.0,
-        tensorizer=SimpleNamespace(as_dict=lambda: {"input_profile": "profile"}),
+        preprocessing={"tensorizer": {"input_profile": "profile"}},
     )
     monkeypatch.setattr(
         artifact_generator.experiments.config.loader,
@@ -370,7 +388,7 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
         lambda _config: task,
     )
     monkeypatch.setattr(
-        artifact_generator.TransientScalingArtifact,
+        artifact_generator.datasets.preprocessing.normalization.TrainScaling,
         "from_state_dict",
         lambda _state: scaling,
     )
@@ -378,9 +396,9 @@ def test_base_identity_distinguishes_qualified_package_and_local_generation_case
         artifact_generator,
         "_lineage",
         lambda _completed: {
-            "stage_identity": {"stage": "A0"},
+            "stage_identity": {"stage": "a", "comparison_arm": "a0"},
             "training_strategy": "teacher_forced",
-            "curriculum_identity": {"active_stage": 0},
+            "curriculum_identity": None,  # teacher-forced Stage A draws no rollout horizon
             "parent_checkpoint": {"source_checkpoint_sha256": "d" * 64},
             "stage_a_handoff": {"source_checkpoint_sha256": "d" * 64},
             "matched_compute_manifest": {"planned": {}, "actual": {}},
@@ -481,13 +499,13 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
             pytest.fail("wrong package")
         return manifest
 
-    monkeypatch.setattr(artifact_generator.datasets.packages, "load_package_manifest_evidence", load_evidence)
+    monkeypatch.setattr(artifact_plan.datasets.packages, "load_package_manifest_evidence", load_evidence)
 
     def resolve(_task: str, selector: dict[str, Any], **_kwargs: Any) -> Any:
         calls.append(selector)
         return admitted
 
-    monkeypatch.setattr(artifact_generator.generation.publication.catalog, "resolve_raw_case_reference", resolve)
+    monkeypatch.setattr(artifact_plan.generation.publication.catalog, "resolve_raw_case_reference", resolve)
     role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
@@ -497,9 +515,9 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
         case_ids_by_source=((package_case_id,),),
         membership_digests=("a" * 64,),
     )
-    sources = artifact_generator._generation_case_sources(role, storage_root=tmp_path)
+    sources = artifact_plan.generation_case_sources(role, task="transient_drying", storage_root=tmp_path)
     assert sources == {package_case_id: admitted}
-    assert calls == [{key: source[key] for key in artifact_generator._SOURCE_SELECTOR_KEYS}]
+    assert calls == [{key: source[key] for key in artifact_plan._SOURCE_SELECTOR_KEYS}]
 
     times = np.asarray([0.0, 1.0, 2.0], dtype=np.float64)
     reference = np.arange(3 * len(artifact.STATE_ORDER) * 4, dtype=np.float32).reshape(3, len(artifact.STATE_ORDER), 2, 2)
@@ -527,7 +545,6 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
         static_conditioning=static,
         boundary_conditioning=boundary,
         scalar_conditioning=scalars,
-        spatial_mask=np.ones((2, 2), dtype=np.float32),
         metadata={},
     )
     case_record = {
@@ -557,11 +574,11 @@ def test_transient_artifact_reopens_exact_manifest_source_without_terminal_paren
 def test_transient_artifact_rejects_manifest_source_drift(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Reject a current Dataset whose saved source design no longer re-admits."""
     package_case_id = _CASE_ID
-    source = dict.fromkeys(artifact_generator._SOURCE_SELECTOR_KEYS, "a" * 64)
+    source = dict.fromkeys(artifact_plan._SOURCE_SELECTOR_KEYS, "a" * 64)
     manifest = {"source_case_identities": [{"package_case_id": package_case_id, "source": source, "design": {"origin": "primary"}}]}
-    monkeypatch.setattr(artifact_generator.datasets.packages, "load_package_manifest_evidence", lambda *_args, **_kwargs: manifest)
+    monkeypatch.setattr(artifact_plan.datasets.packages, "load_package_manifest_evidence", lambda *_args, **_kwargs: manifest)
     monkeypatch.setattr(
-        artifact_generator.generation.publication.catalog,
+        artifact_plan.generation.publication.catalog,
         "resolve_raw_case_reference",
         lambda *_args, **_kwargs: SimpleNamespace(source_identity=source, design_provenance={"origin": "replacement"}),
     )
@@ -575,7 +592,7 @@ def test_transient_artifact_rejects_manifest_source_drift(monkeypatch: pytest.Mo
         membership_digests=("a" * 64,),
     )
     with pytest.raises(ValueError, match="design evidence drifted"):
-        artifact_generator._generation_case_sources(role, storage_root=tmp_path)
+        artifact_plan.generation_case_sources(role, task="transient_drying", storage_root=tmp_path)
 
 
 def test_transient_artifact_projects_generation_target_completion() -> None:
@@ -633,79 +650,37 @@ def test_transient_artifact_projects_generation_target_completion() -> None:
             )
 
 
-def test_artifact_metric_normalization_uses_scaler_runtime_placement() -> None:
-    """Move portable record arrays to the scaler contract and return CPU arrays."""
-
-    class CapturingScaling:
-        device = torch.device("cpu")
-        dtype = torch.float32
-
-        def __init__(self) -> None:
-            self.observed: list[tuple[torch.device, torch.dtype]] = []
-
-        def encode_state(self, value: torch.Tensor) -> torch.Tensor:
-            self.observed.append((value.device, value.dtype))
-            return value + 1.0
-
-    scaling = CapturingScaling()
-    normalized = artifact_generator._normalized_metric_state(
-        np.zeros((2, 4, 1, 1), dtype=np.float64),
-        scaling=cast("Any", scaling),
-    )
-
-    assert scaling.observed == [(scaling.device, scaling.dtype)]
-    assert isinstance(normalized, np.ndarray)
-    assert normalized.dtype == np.float32
-    assert np.all(normalized == 1.0)
-
-
-def test_artifact_metric_statistics_reuse_cumulative_normalization_and_spatial_weights(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Derive endpoint metrics by slicing one normalized trajectory and one weight grid."""
-    normalization_shapes: list[tuple[int, ...]] = []
-    weight_calls: list[np.ndarray] = []
-
-    def normalize(value: np.ndarray, *, scaling: object) -> np.ndarray:
-        del scaling
-        normalization_shapes.append(value.shape)
-        return np.asarray(value, dtype=np.float32)
-
-    def weights(mask: np.ndarray) -> np.ndarray:
-        weight_calls.append(mask)
-        return np.ones(mask.shape, dtype=np.float64)
-
-    monkeypatch.setattr(artifact_generator, "_normalized_metric_state", normalize)
-    monkeypatch.setattr(artifact_generator.transient_metrics, "trapezoidal_cell_weights", weights)
-    predicted = np.zeros((3, 4, 2, 2), dtype=np.float32)
-    predicted[:, 0] = 300.0
-    predicted[:, 1] = 0.5
-    predicted[:, 2:] = 1.0
-    reference = predicted.copy()
-    static = np.ones((7, 2, 2), dtype=np.float32)
+def test_artifact_metric_statistics_cover_every_predicted_state_and_the_endpoint_on_the_full_grid() -> None:
+    """The cumulative scope sums the physical statistics of both predicted states, the endpoint scope only the last one."""
+    reference = np.zeros((3, 4, *transient_evaluation.GRID_SHAPE), dtype=np.float32)
+    reference[:, 0] = 300.0
+    reference[:, 1] = 0.5
+    reference[:, 2:] = 1.0
+    predicted = reference.copy()
+    predicted[1:, 0] += np.asarray([1.0, 3.0], dtype=np.float32)[:, None, None]
     record = SimpleNamespace(
         predicted_states=predicted,
         reference_states=reference,
-        spatial_mask=np.ones((2, 2), dtype=bool),
         scalar_conditioning=np.asarray([1.0, 0.5, 0.25], dtype=np.float32),
-        static_conditioning=static,
+        static_conditioning=transient_evaluation.static_conditioning(),
         available_horizon=2,
         prediction_available=np.ones(2, dtype=bool),
     )
 
-    statistics = artifact_generator._record_metric_statistics(
-        cast("Any", record),
-        scaling=cast("Any", object()),
-    )
+    statistics = artifact_generator._record_metric_statistics(cast("Any", record))
 
-    cumulative_statistics = cast("dict[str, Any]", statistics["cumulative"]["statistics"])
-    endpoint_statistics = cast("dict[str, Any]", statistics["endpoint"]["statistics"])
-    assert normalization_shapes == [(2, 4, 2, 2), (2, 4, 2, 2)]
-    assert len(weight_calls) == 1
     assert statistics["cumulative"]["available"] is True
     assert statistics["endpoint"]["available"] is True
-    assert cumulative_statistics["counts"] == [8, 8, 8, 8]
-    assert endpoint_statistics["counts"] == [4, 4, 4, 4]
+    cases = {
+        scope: artifact_generator.transient_metrics.TransientMetricAccumulator.from_state_dict(
+            cast("dict[str, Any]", statistics[scope]["statistics"])
+        ).case_statistics("case", "lentil")
+        for scope in ("cumulative", "endpoint")
+    }
+    cells = transient_evaluation.GRID_SHAPE[0] * transient_evaluation.GRID_SHAPE[1]
+    assert (cases["cumulative"].sums[0, 0], cases["endpoint"].sums[0, 0]) == (2 * cells, cells)
+    assert cases["cumulative"].errors().field_mse["T"] == pytest.approx((1.0 + 9.0) / 2.0)
+    assert cases["endpoint"].errors().field_mse["T"] == pytest.approx(9.0)
 
 
 def test_protocol_identity_covers_complete_transient_evaluation_configuration() -> None:
@@ -714,213 +689,6 @@ def test_protocol_identity_covers_complete_transient_evaluation_configuration() 
     first = artifact.evaluation_protocol_identity({"objective": objective, "metrics": [{"id": "metric"}], "rollout": {"origins": "early"}})
     second = artifact.evaluation_protocol_identity({"objective": objective, "metrics": [{"id": "metric"}], "rollout": {"origins": "all"}})
     assert first != second
-
-
-def _run_plan(run_dir: Path, *, task: str, with_additional: bool) -> artifact_plan.ArtifactPlan:
-    """Return a one-source artifact plan with an optional one-source material-OOD role."""
-
-    def role(split: Any, dataset_role: Any, dataset_id: str) -> artifact_plan.ArtifactRolePlan:
-        return artifact_plan.ArtifactRolePlan(
-            split=split,
-            dataset_role=dataset_role,
-            dataset_name=dataset_id,
-            source_dataset_ids=(dataset_id,),
-            source_identities=({"dataset_id": dataset_id},),
-            case_ids_by_source=((_CASE_ID,),),
-            membership_digests=("a" * 64,),
-        )
-
-    ood_roles: dict[artifact_plan.ArtifactSplit, artifact_plan.ArtifactRolePlan] = (
-        {"material_ood": role("material_ood", "material_ood", "material_dataset")} if with_additional else {}
-    )
-    id_role = role("eval", "id", "id_dataset")
-    return artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task=task, id_role=id_role, ood_roles=ood_roles)
-
-
-def _patch_publication_lifecycle(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    config: dict[str, Any],
-    task_id: str,
-    tracking_session: Any,
-    events: list[str],
-) -> None:
-    """Replace the completed-run observer lifecycle with bounded local fakes."""
-    summary = {
-        "status": "completed",
-        "completed_epoch": 3,
-        "global_step": 12,
-        "selected_epoch": 2,
-        "selected_metrics": {},
-        "terminal_epoch": 3,
-        "terminal_metrics": {},
-    }
-    monkeypatch.setattr(artifact_service, "_load_run_config", lambda _run_dir: config)
-    monkeypatch.setattr(
-        artifact_service.experiments.config.loader,
-        "validate_resolved_task_contract",
-        lambda _config: SimpleNamespace(id=task_id),
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "initial_tracking_state",
-        lambda _config: {},
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "append_runtime_session",
-        lambda *_args, **_kwargs: events.append("append_runtime_session"),
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "read_run_summary",
-        lambda _run_dir: summary,
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.run,
-        "update_runtime_session",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.tracking,
-        "persisted_wandb_identity",
-        lambda _summary: ("fake-run-id", 3),
-    )
-
-    def initialize(*_args: Any, **_kwargs: Any) -> Any:
-        events.append("initialize_wandb")
-        return tracking_session
-
-    monkeypatch.setattr(
-        artifact_service.experiments.tracking,
-        "initialize_wandb",
-        initialize,
-    )
-
-
-@pytest.mark.parametrize(
-    ("mode", "upload_enabled"),
-    [("disabled", True), ("offline", False)],
-)
-def test_unconfigured_transient_publication_has_no_observer_side_effects(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-    mode: str,
-    upload_enabled: bool,
-) -> None:
-    """Keep resolved W&B mode and upload policy as the only publication gates."""
-    config = {
-        "tracking": {
-            "wandb": {
-                "mode": mode,
-                "upload": {"evaluation_artifacts": upload_enabled},
-            }
-        }
-    }
-    monkeypatch.setattr(artifact_service, "_load_run_config", lambda _run_dir: config)
-    monkeypatch.setattr(
-        artifact_service.experiments.config.loader,
-        "validate_resolved_task_contract",
-        lambda _config: pytest.fail("unconfigured publication resolved its task"),
-    )
-    monkeypatch.setattr(
-        artifact_service.experiments.tracking,
-        "initialize_wandb",
-        lambda *_args, **_kwargs: pytest.fail("unconfigured publication initialized W&B"),
-    )
-    artifact_service._upload_published_artifacts(
-        plan=_run_plan(tmp_path / "run", task="transient_drying", with_additional=False),
-        device_resolution=cast("Any", object()),
-        id_frame=pd.DataFrame(),
-    )
-
-
-@pytest.mark.parametrize("task", ["steady_flow", "transient_drying"])
-def test_artifact_publication_validates_every_role_before_uploading_its_provenance(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Any,
-    task: str,
-) -> None:
-    """Both tasks bind every role frame to its validated source, reduce and log one bounded summary, then steady adds media."""
-    events: list[str] = []
-    frames = {"eval": pd.DataFrame({"value": [1.0]}), "material_ood": pd.DataFrame({"value": [2.0]})}
-    for split, frame in frames.items():
-        frame.attrs["artifact_provenance"] = {"split": split}
-
-    def validate(*, artifact_root: Any, **_kwargs: Any) -> dict[str, Any]:
-        events.append(f"validate_{artifact_root.name}")
-        return {"split": artifact_root.name}
-
-    class FakeTransientSession:
-        def __init__(self, frames_by_role: dict[str, pd.DataFrame]) -> None:
-            assert list(frames_by_role) == ["id", "material_ood"]
-
-        def wandb_publication_summary(self) -> dict[str, bool | float | int | str]:
-            events.append("reduce_summary")
-            return {"evaluation/0/id/autonomous_full/full/cumulative/normalized_drying_group_macro_rmse": 0.25}
-
-        def close(self) -> None:
-            pass
-
-    def reduce_steady(role_frames: Mapping[str, pd.DataFrame]) -> dict[str, int]:
-        assert list(role_frames) == ["id", "material_ood"]
-        assert role_frames["id"] is frames["eval"]
-        assert role_frames["material_ood"] is frames["material_ood"]
-        events.append("reduce_summary")
-        return {"evaluation/id/valid_case_count": 1}
-
-    tracking_session = SimpleNamespace(
-        log_evaluation_summary=lambda _evidence: events.append("log_summary"),
-        upload_files=lambda files: events.append(f"upload_{files['artifact_provenance'].parent.name}"),
-        upload_post_artifact=lambda **kwargs: events.append(f"media_{kwargs['artifact_root'].name}"),
-        finish=lambda **_kwargs: events.append("finish_wandb"),
-    )
-    config = {"tracking": {"wandb": {"mode": "offline", "upload": {"evaluation_artifacts": True}}}}
-    monkeypatch.setattr(artifact_service, "_artifact_save_root", lambda *, split, **_kwargs: tmp_path / split)
-    monkeypatch.setattr(artifact_service, "validate_artifact_upload_source", validate)
-    monkeypatch.setattr(transient_session, "TransientEvaluationSession", FakeTransientSession)
-    monkeypatch.setattr(artifact_service, "_steady_wandb_summary", reduce_steady)
-    monkeypatch.setattr(curated, "render_curated_analysis", lambda **_kwargs: SimpleNamespace(media_files={}, tables={}))
-    _patch_publication_lifecycle(monkeypatch, config=config, task_id=task, tracking_session=tracking_session, events=events)
-    patched_initialize = artifact_service.experiments.tracking.initialize_wandb
-    initializations: list[dict[str, Any]] = []
-
-    def record_initialization(*args: Any, **kwargs: Any) -> Any:
-        initializations.append(kwargs)
-        return patched_initialize(*args, **kwargs)
-
-    monkeypatch.setattr(artifact_service.experiments.tracking, "initialize_wandb", record_initialization)
-    plan = _run_plan(tmp_path / "run", task=task, with_additional=True)
-    artifact_service._upload_published_artifacts(
-        plan=plan,
-        device_resolution=cast("Any", object()),
-        id_frame=frames["eval"],
-        ood_frames={"material_ood": frames["material_ood"]},
-    )
-
-    # The resumed session projects the OOD parts the run was trained with, as the training session does.
-    assert [tuple(call["ood_roles"]) for call in initializations] == [("material_ood",)]
-    assert events == [
-        "validate_eval",
-        "validate_material_ood",
-        "reduce_summary",
-        "append_runtime_session",
-        "initialize_wandb",
-        "upload_eval",
-        "upload_material_ood",
-        "log_summary",
-        *(["media_eval"] if task == "steady_flow" else []),
-        "finish_wandb",
-    ]
-
-    frames["material_ood"].attrs["artifact_provenance"] = {"split": "stale"}
-    with pytest.raises(artifact_service.ArtifactCacheError, match="not the validated upload source"):
-        artifact_service._upload_published_artifacts(
-            plan=plan,
-            device_resolution=cast("Any", object()),
-            id_frame=frames["eval"],
-            ood_frames={"material_ood": frames["material_ood"]},
-        )
 
 
 def test_scoped_role_selection_preserves_saved_order_and_rejects_unknown_cases() -> None:
@@ -1004,13 +772,15 @@ def test_scoped_dataset_load_checks_the_fixed_partition_against_the_full_saved_m
     ("training_stage", "comparison_arm"),
     [("a", "a0"), ("b", "b")],
 )
-def test_artifact_evaluation_grid_resolution_defaults_original_and_honors_explicit_two(
+def test_artifact_evaluation_grid_is_always_the_full_canonical_grid(
     monkeypatch: pytest.MonkeyPatch,
     training_stage: str,
     comparison_arm: str,
 ) -> None:
-    """Reconcile stride-two Training evidence from the admitted split with original-grid default artifact inference."""
-    monkeypatch.setattr(artifact_generator.TransientScalingArtifact, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(3, 4)))
+    """Reconcile stride-two Training evidence from the admitted split; artifact inference always runs on the full grid."""
+    monkeypatch.setattr(
+        artifact_generator.datasets.preprocessing.normalization.TrainScaling, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(3, 4))
+    )
     view = {"spatial_stride": 2, "canonical_ny": 5, "canonical_nx": 7, "effective_ny": 3, "effective_nx": 4}
     completed = {
         "config": {
@@ -1022,102 +792,20 @@ def test_artifact_evaluation_grid_resolution_defaults_original_and_honors_explic
         "normalizer_state": {},
     }
 
-    training, default_evaluation = artifact_generator.resolve_transient_artifact_spatial_representations(completed)
-    _, sampled_evaluation = artifact_generator.resolve_transient_artifact_spatial_representations(
-        completed,
-        evaluation_spatial_stride=2,
-    )
+    training, evaluation = artifact_generator.resolve_transient_artifact_spatial_representations(completed)
 
     assert training.spatial_stride == 2
     assert training.represented_shape == (3, 4)
-    assert default_evaluation.spatial_stride == 1
-    assert default_evaluation.represented_shape == (5, 7)
-    assert sampled_evaluation.spatial_stride == 2
-    assert sampled_evaluation.represented_shape == (3, 4)
-    monkeypatch.setattr(artifact_generator.TransientScalingArtifact, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(5, 7)))
+    assert evaluation.spatial_stride == 1
+    assert evaluation.represented_shape == (5, 7)
+    monkeypatch.setattr(
+        artifact_generator.datasets.preprocessing.normalization.TrainScaling, "from_state_dict", lambda _state: SimpleNamespace(spatial_shape=(5, 7))
+    )
     with pytest.raises(ValueError, match="fitted scaling shape"):
         artifact_generator.resolve_transient_artifact_spatial_representations(completed)
 
 
-def test_evaluation_grid_variants_have_disjoint_rebuild_and_lock_targets(tmp_path: Path) -> None:
-    """Keep canonical and lower-grid cache publication independently recoverable."""
-    run_dir = tmp_path / "run"
-    canonical = artifact_service._artifact_save_root(
-        run_dir=run_dir,
-        dataset_name="dataset",
-        split="eval",
-    )
-    sampled = artifact_service._artifact_save_root(
-        run_dir=run_dir,
-        dataset_name="dataset",
-        split="eval",
-        evaluation_spatial_stride=2,
-    )
-    sampled_ood = artifact_service._artifact_save_root(
-        run_dir=run_dir,
-        dataset_name="dataset",
-        split="material_ood",
-        evaluation_spatial_stride=2,
-    )
-
-    assert canonical == run_dir / "analysis" / "id"
-    assert sampled == run_dir / "analysis" / "grid_s2" / "id"
-    assert sampled_ood == run_dir / "analysis" / "grid_s2" / "material_ood" / "dataset"
-    assert artifact_service._artifact_lock_path(run_dir=run_dir, save_root=canonical) != artifact_service._artifact_lock_path(
-        run_dir=run_dir,
-        save_root=sampled,
-    )
-
-
-def test_transient_upload_admission_resolves_exact_grid_variant(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Revalidate a noncanonical upload target through its transient role and stride."""
-    run_dir = tmp_path / "run"
-    artifact_root = run_dir / "analysis" / "grid_s2" / "id"
-    artifact_root.mkdir(parents=True)
-    role = artifact_plan.ArtifactRolePlan(
-        split="eval",
-        dataset_role="id",
-        dataset_name="dataset",
-        source_dataset_ids=("dataset",),
-        source_identities=({"dataset_id": "dataset"},),
-        case_ids_by_source=((_CASE_ID,),),
-        membership_digests=("a" * 64,),
-    )
-    plan = artifact_plan.ArtifactPlan(run_dir=run_dir, run_name="run", task="transient_drying", id_role=role, ood_roles={})
-    completed = {"config": {"task": "transient_drying"}}
-    observed: dict[str, object] = {}
-
-    def admit(_run_dir: Path, admitted: object, **kwargs: object) -> SimpleNamespace:
-        observed.update(kwargs, completed=admitted)
-        frame = pd.DataFrame()
-        frame.attrs["artifact_provenance"] = {"validated": True}
-        return SimpleNamespace(frame=frame)
-
-    monkeypatch.setattr(artifact_service.experiments.run, "validate_completed_run", lambda _run_dir: completed)
-    monkeypatch.setattr(
-        artifact_service.experiments.config.loader,
-        "validate_resolved_task_contract",
-        lambda _config: SimpleNamespace(id="transient_drying"),
-    )
-    monkeypatch.setattr(artifact_plan, "artifact_plan_from_completed", lambda *_args, **_kwargs: plan)
-    monkeypatch.setattr(evaluation_artifact_loader, "admit_role_artifact", admit)
-
-    provenance = artifact_service.validate_artifact_upload_source(
-        run_dir=run_dir,
-        artifact_root=artifact_root,
-    )
-
-    assert provenance == {"validated": True}
-    assert observed["completed"] is completed
-    assert observed["selection_role"] == "id"
-    assert observed["root"] == artifact_root.resolve()
-    assert observed["evaluation_spatial_stride"] == 2
-
-
-def test_grid_identity_distinguishes_equal_shapes_with_different_indices_or_coordinates() -> None:
+def test_grid_identity_distinguishes_equal_shapes_with_different_coordinates() -> None:
     """Reject shape-only grid equality while leaving canonical scientific arrays unchanged."""
     state = np.zeros((2, len(artifact.STATE_ORDER), 3, 3), dtype=np.float32)
     static = np.zeros((len(artifact.STATIC_ORDER), 3, 3), dtype=np.float32)
@@ -1127,37 +815,18 @@ def test_grid_identity_distinguishes_equal_shapes_with_different_indices_or_coor
     )
     static[artifact.STATIC_ORDER.index("x")] = x_coordinates
     static[artifact.STATIC_ORDER.index("y")] = y_coordinates
-    mask = np.ones((3, 3), dtype=bool)
     state_before = state.copy()
     static_before = static.copy()
-    sampled_source = datasets.contracts.transient.resolve_spatial_representation((5, 5), 2)
-    compact_source = datasets.contracts.transient.resolve_spatial_representation((3, 3), 1)
+    source = artifact.full_grid_representation((3, 3))
 
-    sampled_identity = artifact.build_transient_spatial_identity(
-        sampled_source,
-        reference_states=state,
-        static_conditioning=static,
-        spatial_mask=mask,
-    )
-    different_indices = artifact.build_transient_spatial_identity(
-        compact_source,
-        reference_states=state,
-        static_conditioning=static,
-        spatial_mask=mask,
-    )
+    identity = artifact.build_transient_spatial_identity(source, reference_states=state, static_conditioning=static)
     shifted_static = static.copy()
     shifted_static[artifact.STATIC_ORDER.index("x"), 1, 1] += 0.125
-    different_coordinates = artifact.build_transient_spatial_identity(
-        sampled_source,
-        reference_states=state,
-        static_conditioning=shifted_static,
-        spatial_mask=mask,
-    )
+    different_coordinates = artifact.build_transient_spatial_identity(source, reference_states=state, static_conditioning=shifted_static)
 
-    assert sampled_identity["evaluation_shape"] == different_indices["evaluation_shape"] == [3, 3]
-    assert sampled_identity["grid_identity_sha256"] != different_indices["grid_identity_sha256"]
-    assert sampled_identity["grid_identity_sha256"] != different_coordinates["grid_identity_sha256"]
-    assert sampled_identity["reference_grid_identity_sha256"] == sampled_identity["prediction_grid_identity_sha256"]
+    assert identity["evaluation_shape"] == different_coordinates["evaluation_shape"] == [3, 3]
+    assert identity["grid_identity_sha256"] != different_coordinates["grid_identity_sha256"]
+    assert identity["reference_grid_identity_sha256"] == identity["prediction_grid_identity_sha256"]
     assert np.array_equal(state, state_before)
     assert np.array_equal(static, static_before)
 
@@ -1635,9 +1304,10 @@ def test_nonfinite_evaluation_completes_all_modes_with_unavailable_target(
     assert evaluated.model_calls == 7
 
 
-def _cache_test_record(case_id: str, *, mode: artifact.EvaluationMode) -> artifact.TransientSequenceRecord:
-    """Build one minimal strict record for case-payload cache coverage."""
-    static = np.zeros((len(artifact.STATIC_ORDER), 2, 2), dtype=np.float32)
+def _cache_test_record(case_id: str, *, mode: artifact.EvaluationMode, grid: tuple[int, int] = (2, 2)) -> artifact.TransientSequenceRecord:
+    """Build one minimal strict record for case-payload cache coverage on a unit-spaced grid."""
+    static = np.zeros((len(artifact.STATIC_ORDER), *grid), dtype=np.float32)
+    static[0], static[1] = np.meshgrid(np.arange(grid[1], dtype=np.float32), np.arange(grid[0], dtype=np.float32))
     identity = _identity()
     identity["case_id"] = case_id
     identity["spatial_representation"] = _spatial_identity(static)
@@ -1664,10 +1334,7 @@ def _cache_test_record(case_id: str, *, mode: artifact.EvaluationMode) -> artifa
         "predicted_final_time": 1.0,
     }
     physical_times = np.asarray([0.0, 1.0], dtype=np.float64)
-    reference_states = np.zeros(
-        (2, len(artifact.STATE_ORDER), 2, 2),
-        dtype=np.float32,
-    )
+    reference_states = np.zeros((2, len(artifact.STATE_ORDER), *grid), dtype=np.float32)
     predicted_states = reference_states.copy()
     prediction_fields = _prediction_fields(
         predicted_states=predicted_states,
@@ -1695,7 +1362,6 @@ def _cache_test_record(case_id: str, *, mode: artifact.EvaluationMode) -> artifa
         prediction_nonfinite_mask=prediction_fields["prediction_nonfinite_mask"],
         prediction_physical_invalid_mask=(prediction_fields["prediction_physical_invalid_mask"]),
         prediction_validity=prediction_fields["prediction_validity"],
-        spatial_mask=np.ones((2, 2), dtype=bool),
         temporal_mask=np.ones(2, dtype=bool),
         static_conditioning=static,
         boundary_conditioning=np.zeros((1, len(artifact.BOUNDARY_ORDER)), dtype=np.float32),
@@ -1787,6 +1453,44 @@ def test_prediction_validity_classifies_each_finite_field_domain(
     assert validity["channels"][channel]["physically_invalid_finite_count"] == 1
     assert validity["first_invalid"]["channel"] == channel
     assert states[0, channel_index, 2, 2] == value
+
+
+def test_each_channel_keeps_its_own_first_bound_violation_in_records_and_case_summaries() -> None:
+    """T leaves its bounds at step 1 and w_surf at step 3 of one chain; a second chain moves w_surf's first time earlier."""
+    states = np.ones((3, len(artifact.STATE_ORDER), 6, 6), dtype=np.float32)
+    states[:, 0] = 300.0
+    states[:, 1] = 0.5
+    states[0:, 0, 2, 2] = 3000.0
+    states[2, 2, 3, 3] = -1.0
+    zeros = np.zeros_like(states)
+
+    def record(values: np.ndarray, origin: int) -> dict[str, Any]:
+        return transient_validity.build_prediction_validity(
+            scaled_model_outputs=zeros,
+            decoded_physical_increments=zeros,
+            reconstructed_states=values,
+            prediction_available=np.ones(3, dtype=bool),
+            physical_times=np.arange(origin, origin + 4, dtype=np.float64),
+            mode="rolling_origin",
+            origin_index=origin,
+        )
+
+    first = record(states, 0)
+    assert first["first_bound_violation"]["T"] == {"rollout_step": 1, "transition_index": 0, "physical_time": 1.0}
+    assert first["first_bound_violation"]["w_surf"] == {"rollout_step": 3, "transition_index": 2, "physical_time": 3.0}
+    assert first["first_bound_violation"]["phi"] is None
+    assert first["first_invalid"]["channel"] == "T"
+    earlier = states.copy()
+    earlier[:, 0] = 300.0
+    earlier[0, 2, 3, 3] = -1.0
+    second = record(earlier, 1)
+    summary = transient_validity.aggregate_case_prediction_validity(case_id="case", records=[first, second])
+    assert summary["first_bound_violation"]["w_surf"] == {"rollout_step": 1, "transition_index": 1, "physical_time": 2.0}
+    assert summary["first_bound_violation"]["T"] == first["first_bound_violation"]["T"]
+    tampered = json.loads(json.dumps(first))
+    tampered["first_bound_violation"]["w_surf"] = None
+    with pytest.raises(ValueError, match="first bound violation"):
+        transient_validity.validate_prediction_validity_document(tampered)
 
 
 def _validity_states(grid: int = 6) -> np.ndarray:
@@ -1927,15 +1631,13 @@ def test_nonfinite_artifact_roundtrip_preserves_raw_values_and_unavailable_metri
 ) -> None:
     """Round-trip IEEE diagnostics without filtering them into ordinary metrics."""
     record = _nonfinite_cache_test_record(_CASE_ID)
-    monkeypatch.setattr(
-        artifact_generator,
-        "_normalized_metric_state",
-        lambda *_args, **_kwargs: pytest.fail("non-finite prediction reached ordinary metric normalization"),
-    )
-    statistics = artifact_generator._record_metric_statistics(
-        record,
-        scaling=cast("Any", object()),
-    )
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            artifact_generator.transient_metrics.TransientMetricAccumulator,
+            "update",
+            lambda *_args, **_kwargs: pytest.fail("non-finite prediction reached the ordinary metric accumulator"),
+        )
+        statistics = artifact_generator._record_metric_statistics(record)
     for scope in ("cumulative", "endpoint"):
         assert statistics[scope]["available"] is False
         assert statistics[scope]["statistics"] is None
@@ -2256,9 +1958,7 @@ def test_records_of_one_stored_chain_share_one_read_only_rebuilt_array(tmp_path:
     index.close()
 
 
-def test_finite_physical_invalidity_remains_eligible_for_raw_error_metrics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_finite_physical_invalidity_remains_eligible_for_raw_error_metrics() -> None:
     """Separate physical warnings from arithmetic availability."""
     predicted = np.zeros((2, 4, 2, 2), dtype=np.float32)
     predicted[:, 0] = 300.0
@@ -2278,49 +1978,28 @@ def test_finite_physical_invalidity_remains_eligible_for_raw_error_metrics(
     )
     assert validity["status"] == (validity_contract.FINITE_BUT_PHYSICALLY_INVALID)
 
-    def normalize(value: np.ndarray, *, scaling: object) -> np.ndarray:
-        del scaling
-        return np.asarray(value, dtype=np.float32)
-
-    monkeypatch.setattr(
-        artifact_generator,
-        "_normalized_metric_state",
-        normalize,
-    )
+    static = np.ones((7, *interior.shape[-2:]), dtype=np.float32)
+    static[0], static[1] = np.meshgrid(np.arange(interior.shape[-1], dtype=np.float32), np.arange(interior.shape[-2], dtype=np.float32))
     record = SimpleNamespace(
-        predicted_states=predicted,
-        reference_states=np.broadcast_to(predicted[0], predicted.shape).copy(),
-        spatial_mask=np.ones((2, 2), dtype=bool),
+        predicted_states=interior,
+        reference_states=np.broadcast_to(interior[0], interior.shape).copy(),
         scalar_conditioning=np.asarray([1.0, 0.5, 0.25], dtype=np.float32),
-        static_conditioning=np.ones((7, 2, 2), dtype=np.float32),
+        static_conditioning=static,
         available_horizon=1,
         prediction_available=np.ones(1, dtype=bool),
     )
-    statistics = artifact_generator._record_metric_statistics(
-        cast("Any", record),
-        scaling=cast("Any", object()),
-    )
+    statistics = artifact_generator._record_metric_statistics(cast("Any", record))
     assert statistics["cumulative"]["available"] is True
     assert statistics["cumulative"]["statistics"] is not None
 
 
-def test_artifact_record_identity_changes_with_exact_evaluation_grid() -> None:
-    """Bind record identity to exact stride/index evidence, not array shape alone."""
+def test_artifact_refuses_an_identity_that_still_records_an_evaluation_stride() -> None:
+    """An artifact written with the removed stride field fails the spatial-identity schema instead of being read."""
     record = _cache_test_record(_CASE_ID, mode="autonomous_full")
-    representation = datasets.contracts.transient.resolve_spatial_representation((3, 3), 2)
-    alternative_spatial = artifact.build_transient_spatial_identity(
-        representation,
-        reference_states=record.reference_states,
-        static_conditioning=record.static_conditioning,
-        spatial_mask=record.spatial_mask,
-    )
-    alternative_identity = {**record.identity, "spatial_representation": alternative_spatial}
-    alternative = replace(record, identity=alternative_identity).validated()
+    spatial = {**record.identity["spatial_representation"], "evaluation_spatial_stride": 1}
 
-    assert record.identity["spatial_representation"]["evaluation_spatial_stride"] == 1
-    assert alternative.identity["spatial_representation"]["evaluation_spatial_stride"] == 2
-    assert record.reference_states.shape == alternative.reference_states.shape
-    assert record.record_id != alternative.record_id
+    with pytest.raises(artifact.TransientSequenceArtifactError, match="spatial representation fields do not match the schema"):
+        replace(record, identity={**record.identity, "spatial_representation": spatial}).validated()
 
 
 def test_artifact_rejects_reference_prediction_grid_identity_disagreement() -> None:
@@ -2580,6 +2259,8 @@ def _resumable_timing_case() -> dict[str, Any]:
         precision="float32",
         pt_payload_identity="a" * 64,
         warmup_passes=1,
+        solver_hostname="solver-node",
+        solver_requested_cores=8,
     )
     return artifact_generator.asdict(timing_case)
 
@@ -2655,6 +2336,8 @@ def _role_timing_block() -> tuple[dict[str, Any], dict[str, Any]]:
         precision="float32",
         pt_payload_identity="a" * 64,
         warmup_passes=1,
+        solver_hostname="solver-node",
+        solver_requested_cores=8,
     )
     validity = {"status": "VALID"}
     report = artifact_generator.transient_timing.build_transient_timing_report((timing_case,))
@@ -2821,7 +2504,7 @@ def _run_all_completed_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         )
     monkeypatch.setattr(artifact_generator, "_load_role_datasets", lambda *_args, **_kwargs: pytest.fail("all-completed resume loaded Dataset"))
     monkeypatch.setattr(
-        artifact_generator, "_generation_case_sources", lambda *_args, **_kwargs: pytest.fail("all-completed resume loaded generation sources")
+        artifact_plan, "generation_case_sources", lambda *_args, **_kwargs: pytest.fail("all-completed resume loaded generation sources")
     )
     monkeypatch.setattr(artifact_generator, "_materialize_case", lambda *_args, **_kwargs: pytest.fail("all-completed resume materialized a case"))
 
@@ -3284,7 +2967,9 @@ def test_independent_transient_artifact_binds_exact_content_identity(
                 "model_label": "fno_m2x2_h4_l1",
                 "seed": 9,
                 "revision": None,
-                "budget_epochs": None,
+                "budget_epochs": 3,
+                "units_per_update": 2,
+                "schedule": "cosine",
                 "stage": stage,
                 "pair": None,
                 "trial": None,
@@ -3294,13 +2979,13 @@ def test_independent_transient_artifact_binds_exact_content_identity(
         },
         "paths": {"output_root": str(tmp_path)},
     }
-    monkeypatch.setattr(artifact_generator.learning.training.checkpoint, "resume_contract_digest", common.serialization.canonical_json_sha256)
+    monkeypatch.setattr(artifact_generator.learning.training.checkpoint, "config_digest", common.serialization.canonical_json_sha256)
     completed = {
         "run_dir": tmp_path / "relocated-independent" if relocated else common.paths.resolve_config_run_dir(config),
         "summary": {},
         "config": config,
         "scientific_run_name": "scientific-run",
-        "checkpoint_identity": {"resume_contract_digest": common.serialization.canonical_json_sha256(config)},
+        "checkpoint_identity": {"effective_config_digest": common.serialization.canonical_json_sha256(config)},
     }
     evidence = artifact_generator._parent_experiment_evidence(completed)
     assert evidence["kind"] == "independent"
@@ -3408,6 +3093,8 @@ def test_generator_timing_adapter_preserves_stable_runtime_and_payload_evidence(
         generation_timing={
             "comsol_process_seconds": 30.0,
             "generation_compute_end_to_end_seconds": 60.0,
+            "solver_hostname": "solver-node",
+            "solver_requested_cores": 8,
             "component_timing_availability": {
                 "transient_drying_solver_seconds": "not_persisted",
             },
@@ -3431,7 +3118,7 @@ def test_generator_timing_adapter_preserves_stable_runtime_and_payload_evidence(
         case_id="case",
         benchmark=benchmark,
         expected_model_calls=4,
-        generation_timing={},
+        generation_timing={"solver_hostname": "solver-node", "solver_requested_cores": 8},
         pt_identity="b" * 64,
         runtime_metadata={
             "resolved_device": "cpu",
@@ -3702,7 +3389,7 @@ def test_role_validator_binds_each_record_to_its_owning_split_part(foreign: dict
 
 
 def test_role_validator_admits_timing_only_when_it_matches_the_sequence_records(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Role admission, not the later upload, refuses incomplete component evidence and a payload identity foreign to the sequence record."""
+    """Role admission refuses incomplete component evidence and a payload identity foreign to the sequence record."""
     role = artifact_plan.ArtifactRolePlan(
         split="eval",
         dataset_role="id",
@@ -3735,6 +3422,8 @@ def test_role_validator_rejects_an_optuna_trial_before_binding_any_evidence() ->
         "seed": 17,
         "revision": None,
         "budget_epochs": 3,
+        "units_per_update": 2,
+        "schedule": "cosine",
         "stage": "single",
         "pair": None,
         "trial": "0001__fno_m2x2_h4_l1__lr-0p001",
@@ -3758,7 +3447,7 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     from src import analysis  # noqa: PLC0415
 
     root = tmp_path / "saved-predictions"
-    record = _cache_test_record(_CASE_ID, mode="autonomous_full")
+    record = _cache_test_record(_CASE_ID, mode="autonomous_full", grid=transient_evaluation.GRID_SHAPE)
     static = record.static_conditioning.copy()
     static[artifact.STATIC_ORDER.index("rho_bu_dry")] = 100.0
     scalars = record.scalar_conditioning.copy()
@@ -3773,8 +3462,7 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     provenance["evaluation"].update(fixture["evaluation"])
     provenance["timing"] = fixture["timing"]
     provenance["dataset"].update(metadata.attrs["artifact_provenance"]["dataset"])
-    fitted_scaling = artifact_generator.TransientScalingArtifact.from_state_dict(transient_evaluation.scaling_state())
-    statistics = artifact_generator._record_metric_statistics(record, scaling=fitted_scaling)
+    statistics = artifact_generator._record_metric_statistics(record)
     artifact.write_transient_sequence_artifact(
         root,
         dataset_name="transient_dataset",
@@ -3800,8 +3488,8 @@ def test_saved_prediction_comparison_viewers_are_read_only(
     monkeypatch.setattr(common.paths, "get_storage_root", lambda: tmp_path)
     export_state: dict[str, Any] = {"fig": None}
     viewer = analysis.evaluation.panel._make_transient_runtime_viewer(session=evaluation, kind="tradeoff", export_state=export_state)
-    assert isinstance(viewer, widgets.Box)
-    selector = viewer.children[0]
+    assert isinstance(viewer, analysis.ui.panel.ViewPanel)
+    selector = cast("widgets.Box", viewer.rows[0]).children[0]
     assert isinstance(selector, widgets.Dropdown)
     for _label, value in selector.options:
         selector.value = value
@@ -3815,7 +3503,7 @@ def test_saved_prediction_comparison_viewers_are_read_only(
         export_plot_name="saved_sample",
         export_title="Saved prediction comparison",
     )
-    assert isinstance(sample, widgets.VBox)
+    assert isinstance(sample, analysis.ui.panel.ViewPanel)
     assert index.cache_size == 1
     after = {path.relative_to(tmp_path): common.serialization.file_sha256(path) for path in tmp_path.rglob("*") if path.is_file()}
     assert after == before  # Interacting neither writes figures nor changes scientific inputs.

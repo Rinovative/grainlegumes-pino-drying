@@ -1,14 +1,15 @@
 """Bind generated-output EDA widgets to shared catalog selection state.
 
 Responsibilities:
-  - Present one panel-level dataset selector over the complete catalog
-  - Bind optional case navigation for child views without selector duplication
+  - Present one panel-level dataset selector over the complete catalog, grouped by sampling regime
+  - Bind the case navigator of one child view without selector duplication
   - Expose only profile-compatible selected views and lazy frames to each view
   - Report concise compatibility and case-availability status
 
 Design principles:
   - Widget values mirror canonical selection keys owned by eda_selection
   - Dataset changes rerender automatically without apply controls
+  - A deactivated child view skips shared-state sync and rendering until activated
   - Full batch and profile identities remain available as selector tooltips
 
 This module does NOT:
@@ -20,64 +21,48 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-import ipywidgets as widgets
+from src.analysis import presentation, ui
 
-from src.analysis import ui
+from . import eda_selection as selection
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping
 
     import pandas as pd
 
-    from . import eda_selection as selection
+
+def _inventory(catalog: selection.GeneratedOutputEDACatalog) -> presentation.dataset_selection.DatasetInventory:
+    """Return the catalog's datasets grouped by sampling regime; a published package groups under its task."""
+    items = []
+    group_labels: dict[str, str] = {}
+    for view in catalog.views:
+        if isinstance(view, selection.GeneratedOutputEDAView):
+            group, material = view.batch.sampling_regime, view.batch.material_family
+            group_labels[group] = presentation.display_labels.regime_display_label(group)
+        else:
+            group, material = view.task_id, ""
+            group_labels[group] = presentation.display_labels.task_display_label(group)
+        items.append(presentation.dataset_selection.DatasetItem(view.key, material, group, view.label))
+    return presentation.dataset_selection.DatasetInventory(items, group_order=tuple(group_labels), group_labels=group_labels, poolable=False)
 
 
-class GeneratedOutputDatasetControl:
-    """Bind the sole panel-level dataset selector to global EDA selection state."""
+def dataset_selector(
+    selection_state: selection.GeneratedOutputSelectionState, *, commit: Callable[[tuple[str, ...]], None] | None = None
+) -> ui.selectors.DatasetSelector:
+    """
+    Build the sole panel-level dataset selector and keep it and the shared selection in step in both directions.
 
-    def __init__(self, *, selection_state: selection.GeneratedOutputSelectionState) -> None:
-        """Build one concise globally unique dataset checkbox group."""
-        self._state = selection_state
-        self._catalog = selection_state.catalog
-        self._updating = True
-        labels = self._catalog.labels()
-        self._keys_by_label = {label: key for key, label in labels.items()}
-        selected = set(selection_state.selection.dataset_keys)
-        tooltips = {label: view.tooltip for label, key in self._keys_by_label.items() for view in (self._catalog.view(key),)}
-        self.group = cast(
-            "ui.components.CheckboxGroup",
-            ui.components.ui_checkbox_datasets(
-                dataset_names=list(self._keys_by_label),
-                default_on=[label for label, key in self._keys_by_label.items() if key in selected],
-                tooltips=tooltips,
-                natural_width=True,
-            ),
-        )
-        for checkbox in self.group.boxes.values():
-            checkbox.observe(self._dataset_changed, names="value")
-        self.widget = widgets.VBox(
-            (widgets.HTML("<b>Datasets</b>"), cast("widgets.Widget", self.group)),
-            layout=widgets.Layout(width="100%"),
-        )
-        selection_state.observe(self._state_changed)
-        self._updating = False
-
-    def _dataset_changed(self, _change: dict[str, object]) -> None:
-        """Install checked stable-order dataset keys in shared state."""
-        if self._updating:
-            return
-        checked = tuple(self._keys_by_label[label] for label, checkbox in self.group.boxes.items() if checkbox.value)
-        self._state.select_datasets(checked)
-
-    def _state_changed(self, current: selection.GeneratedOutputSelection) -> None:
-        """Reflect programmatic dataset changes without widget feedback."""
-        selected = set(current.dataset_keys)
-        self._updating = True
-        try:
-            for label, checkbox in self.group.boxes.items():
-                checkbox.value = self._keys_by_label[label] in selected
-        finally:
-            self._updating = False
+    A user's choice goes to ``commit`` (default: the selection state), so the panel can finish its own work after the
+    notification of the state has returned.
+    """
+    catalog = selection_state.catalog
+    selector = ui.selectors.DatasetSelector(_inventory(catalog), multiple=True, selected=selection_state.selection.dataset_keys)
+    for view in catalog.views:
+        selector.boxes[view.key].tooltip = view.tooltip
+    apply = selection_state.select_datasets if commit is None else commit
+    selector.observe(lambda: apply(cast("tuple[str, ...]", selector.selected())))
+    selection_state.observe(lambda current: selector.set_state(current.dataset_keys, pooled=False))
+    return selector
 
 
 class GeneratedOutputControls:
@@ -90,9 +75,8 @@ class GeneratedOutputControls:
         selection_state: selection.GeneratedOutputSelectionState,
         required_capabilities: Iterable[selection.GeneratedOutputCapability] = (),
         include_case: bool,
-        case_companions: Sequence[widgets.Widget] = (),
     ) -> None:
-        """Construct optional case controls for one explicitly compatible view."""
+        """Construct the optional case navigator for one explicitly compatible view."""
         if selection_state.catalog is not catalog:
             message = "Generated-output controls and state must use one catalog."
             raise ValueError(message)
@@ -101,36 +85,28 @@ class GeneratedOutputControls:
         self._required_capabilities = frozenset(required_capabilities)
         self._include_case = include_case
         self._callback: Callable[[], None] | None = None
+        self._active = True
         self._updating = True
-        self._last_valid_case: int | None = None
-        initial_cases = self._state.shared_case_numbers(required_capabilities=self._required_capabilities)
-        if not initial_cases:
-            compatible = self._state.selected_views(required_capabilities=self._required_capabilities)
-            initial_cases = compatible[0].case_numbers if compatible else (0,)
-        self.case, self.previous_case, self.next_case = ui.components.ui_step_case_index(
-            case_numbers=initial_cases,
-        )
-        self.case_row = ui.components.ui_compact_case_row(
-            self.case,
-            self.previous_case,
-            self.next_case,
-        )
-        self.status = widgets.HTML(
-            layout=widgets.Layout(display="none"),
-        )
-        navigation_children: tuple[widgets.Widget, ...] = (self.case_row, *tuple(case_companions)) if include_case else ()
-        self.navigation_row = ui.components.ui_control_row(*navigation_children)
-        children: list[widgets.Widget] = []
-        if navigation_children:
-            children.append(self.navigation_row)
-        children.append(self.status)
-        self.widget = widgets.VBox(tuple(children), layout=widgets.Layout(width="100%"))
-        self.case.observe(self._case_changed, names="value")
-        self.previous_case.on_click(lambda _button: self._step_case(-1))
-        self.next_case.on_click(lambda _button: self._step_case(1))
+        self._availability_shown = False
+        self.status = ui.controls.StatusLine()
+        self._case: ui.navigation.CaseNavigator | None = None
+        if include_case:
+            initial_cases = self._state.shared_case_numbers(required_capabilities=self._required_capabilities)
+            if not initial_cases:
+                compatible = self._state.selected_views(required_capabilities=self._required_capabilities)
+                initial_cases = compatible[0].case_numbers if compatible else (0,)
+            self._case = ui.navigation.CaseNavigator(initial_cases, status=self.status, on_change=self._case_changed)
         self._state.observe(self._state_changed)
         self._sync(self._state.selection)
         self._updating = False
+
+    @property
+    def case(self) -> ui.navigation.CaseNavigator:
+        """Return the case navigator of a view built with ``include_case=True``."""
+        if self._case is None:
+            message = "This view was built without case navigation."
+            raise ValueError(message)
+        return self._case
 
     @property
     def required_capabilities(self) -> frozenset[selection.GeneratedOutputCapability]:
@@ -186,36 +162,41 @@ class GeneratedOutputControls:
             return f"{compatible_count} compatible dataset(s); {omitted} unavailable for this diagnostic."
         return ""
 
+    def report_availability(self) -> None:
+        """Show the compatibility message and clear it once it no longer applies; other status text stays."""
+        message = self.availability_message()
+        if message or self._availability_shown:
+            self.status.set(message, "warning" if message else "normal")
+        self._availability_shown = bool(message)
+        if not self._include_case:
+            ui.controls.set_visible(self.status.widget, bool(message))
+
+    def deactivate(self) -> None:
+        """Ignore shared-state changes until the next activation."""
+        self._active = False
+
     def activate(self) -> None:
         """Synchronize and render this child view from the current global state."""
+        self._active = True
         self._sync(self._state.selection)
         if self._callback is not None:
             self._callback()
-
-    def _set_status_message(self, message: str) -> None:
-        """Show one compatibility message or collapse its empty placeholder."""
-        self.status.value = "" if not message else f"<p>{message}</p>"
-        self.status.layout.display = "none" if not message else "flex"
 
     def _shared_case_numbers(self) -> tuple[int, ...]:
         """Return exact shared cases for datasets compatible with this child view."""
         return self._state.shared_case_numbers(required_capabilities=self._required_capabilities)
 
     def _sync_case(self, current: selection.GeneratedOutputSelection) -> None:
-        """Synchronize typed case state and exact compatible-position bounds."""
-        if not self._include_case:
-            return
+        """Show the exact compatible case positions with the selected case chosen."""
         shared = self._shared_case_numbers()
-        selected = current.case_number if current.case_number is not None and current.case_number in shared else (shared[0] if shared else None)
-        if selected is None:
-            self.previous_case.disabled = True
-            self.next_case.disabled = True
+        if self._case is None or not shared:
             return
-        self.case.value = selected
-        self._last_valid_case = selected
-        position = shared.index(selected)
-        self.previous_case.disabled = position == 0
-        self.next_case.disabled = position == len(shared) - 1
+        selected = shared[0] if current.case_number is None or current.case_number not in shared else current.case_number
+        # An unchanged navigator is left alone, so the warning of a corrected typed case stays on the status line.
+        if self._case.case_ids != shared:
+            self._case.rebind(shared, preserve=False, notify=False)
+        if self._case.value != selected:
+            self._case.step(shared.index(selected) - self._case.position)
 
     def _sync(self, current: selection.GeneratedOutputSelection) -> None:
         """Reflect one state update without widget feedback loops."""
@@ -223,48 +204,19 @@ class GeneratedOutputControls:
         self._updating = True
         try:
             self._sync_case(current)
-            self._set_status_message(self.availability_message())
+            self.report_availability()
         finally:
             self._updating = previous
 
     def _state_changed(self, current: selection.GeneratedOutputSelection) -> None:
-        """Synchronize and rerender after any global dataset or case update."""
+        """Synchronize and rerender after any global dataset or case update while active."""
+        if not self._active:
+            return
         self._sync(current)
         if self._callback is not None:
             self._callback()
 
-    def _case_changed(self, _change: dict[str, object]) -> None:
-        """Accept one globally shared case number or restore the last valid value."""
-        if self._updating or not self._include_case:
-            return
-        requested = int(self.case.value)
-        try:
-            self._state.select_case(
-                requested,
-                required_capabilities=self._required_capabilities,
-            )
-        except ValueError:
-            self._updating = True
-            try:
-                if self._last_valid_case is not None:
-                    self.case.value = self._last_valid_case
-            finally:
-                self._updating = False
-            self._set_status_message(f"Case {requested} is unavailable for the selected datasets. Enter a shared case number or use the arrows.")
-        else:
-            self._set_status_message("")
-
-    def _step_case(self, delta: int) -> None:
-        """Move by one position in the exact compatible case-number intersection."""
-        if self._updating:
-            return
-        shared = self._shared_case_numbers()
-        current = self.selected_case_number
-        if not shared or current not in shared:
-            return
-        position = shared.index(current)
-        selected = shared[max(0, min(len(shared) - 1, position + delta))]
-        self._state.select_case(
-            selected,
-            required_capabilities=self._required_capabilities,
-        )
+    def _case_changed(self, number: int) -> None:
+        """Publish one case the navigator accepted to the shared state."""
+        if not self._updating:
+            self._state.select_case(number, required_capabilities=self._required_capabilities)

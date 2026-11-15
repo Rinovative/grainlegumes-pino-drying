@@ -9,6 +9,7 @@ Responsibilities:
 Design principles:
   - Each autonomous request resets from its explicit reference origin
   - Physical time, conditioning and reference trajectories remain case-bound
+  - Reference trajectories are the stored states the Dataset items carry, never reconstructed from increments
   - Generation-admitted target evidence remains distinct from prediction diagnostics
 
 This module does NOT:
@@ -65,7 +66,6 @@ class TransientEvaluationCase:
     static_conditioning: np.ndarray
     boundary_conditioning: np.ndarray
     scalar_conditioning: np.ndarray
-    spatial_mask: np.ndarray
     metadata: Mapping[str, Any]
 
     @property
@@ -142,11 +142,10 @@ def _scalar_float(value: Any, *, label: str) -> float:
     return float(array.reshape(-1)[0])
 
 
-def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
+def assemble_transient_evaluation_case(  # noqa: C901
     items: Sequence[Mapping[str, Any]],
     *,
     dataset_role: DatasetRole,
-    spatial_mask: np.ndarray | None = None,
 ) -> TransientEvaluationCase:
     """Assemble one exact contiguous case from ordered physical one-step items."""
     if not items or isinstance(items, (str, bytes)):
@@ -166,7 +165,7 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
     case_id: str | None = None
     final_time = math.nan
     for position, item in enumerate(items):
-        if not isinstance(item, Mapping) or set(item) != {"state", "static", "boundary", "scalars", "time", "target", "metadata"}:
+        if not isinstance(item, Mapping) or set(item) != {"state", "static", "boundary", "scalars", "time", "next_state", "metadata"}:
             message = f"Transient one-step item {position} does not match the Dataset item contract."
             raise ValueError(message)
         metadata = item["metadata"]
@@ -199,12 +198,12 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
             message = "Transient Evaluation items must form one contiguous transition chain."
             raise ValueError(message)
         state = _numpy(item["state"], label=f"item[{position}].state").astype(np.float32, copy=False)
-        target = _numpy(item["target"], label=f"item[{position}].target").astype(np.float32, copy=False)
+        next_state = _numpy(item["next_state"], label=f"item[{position}].next_state").astype(np.float32, copy=False)
         static = _numpy(item["static"], label=f"item[{position}].static").astype(np.float32, copy=False)
         boundary = _numpy(item["boundary"], label=f"item[{position}].boundary").astype(np.float32, copy=False)
         scalars = _numpy(item["scalars"], label=f"item[{position}].scalars").astype(np.float32, copy=False)
-        if state.ndim != _SPATIAL_STATE_RANK or state.shape[0] != len(STATE_ORDER) or target.shape != state.shape:
-            message = "Transient Evaluation state and increment must share [4,Y,X] shape."
+        if state.ndim != _SPATIAL_STATE_RANK or state.shape[0] != len(STATE_ORDER) or next_state.shape != state.shape:
+            message = "Transient Evaluation state and next state must share [4,Y,X] shape."
             raise ValueError(message)
         if (
             static.shape != (len(STATIC_ORDER), *state.shape[-2:])
@@ -213,9 +212,9 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
         ):
             message = "Transient Evaluation conditioning does not match the canonical Dataset field-group sizes."
             raise ValueError(message)
-        next_state = np.ascontiguousarray(state + target, dtype=np.float32)
-        if previous_next is not None and not np.allclose(state, previous_next, rtol=0.0, atol=2.0e-5):
-            message = "Consecutive Dataset transitions disagree at their shared absolute state."
+        # Both are the same stored state, so the chain must agree exactly.
+        if previous_next is not None and not np.array_equal(state, previous_next):
+            message = "Consecutive Dataset transitions disagree at their shared stored state."
             raise ValueError(message)
         t_n = _scalar_float(time.get("t_n"), label=f"item[{position}].time.t_n")
         t_next = _scalar_float(time.get("t_n_plus_1"), label=f"item[{position}].time.t_n_plus_1")
@@ -240,7 +239,7 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
         states.append(state)
         boundaries.append(boundary)
         times.append(t_next)
-        previous_next = next_state
+        previous_next = np.ascontiguousarray(next_state)
         previous_index = index_n
         final_time = t_next
     if case_id is None or first_static is None or first_scalars is None or first_metadata is None or previous_next is None:
@@ -252,14 +251,6 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
     if isinstance(expected_states, bool) or not isinstance(expected_states, int) or expected_states != state_array.shape[0]:
         message = "Assembled trajectory length contradicts Dataset case metadata."
         raise ValueError(message)
-    if spatial_mask is None:
-        admitted_mask = np.ones(state_array.shape[-2:], dtype=bool)
-    else:
-        admitted_mask = np.asarray(spatial_mask)
-        if admitted_mask.dtype != np.bool_ or admitted_mask.shape != state_array.shape[-2:] or not admitted_mask.any():
-            message = "Transient Evaluation spatial mask must be non-empty boolean [Y,X]."
-            raise ValueError(message)
-        admitted_mask = np.ascontiguousarray(admitted_mask)
     return TransientEvaluationCase(
         case_id=case_id,
         dataset_role=dataset_role,
@@ -268,7 +259,6 @@ def assemble_transient_evaluation_case(  # noqa: C901, PLR0912
         static_conditioning=np.ascontiguousarray(first_static),
         boundary_conditioning=np.stack(boundaries, axis=0),
         scalar_conditioning=np.ascontiguousarray(first_scalars),
-        spatial_mask=admitted_mask,
         metadata=first_metadata,
     )
 
@@ -595,10 +585,9 @@ def _wet_fraction_series(
     *,
     static: np.ndarray,
     scalars: np.ndarray,
-    mask: np.ndarray,
     target_wet_basis: float,
 ) -> np.ndarray:
-    """Return canonical dry-solid-mass fraction above the local wet-basis target."""
+    """Return canonical dry-solid-mass fraction above the local wet-basis target over the full Evaluation grid."""
     if not 0.0 < target_wet_basis < 1.0:
         message = "target_wet_basis must lie strictly inside (0, 1)."
         raise ValueError(message)
@@ -607,26 +596,22 @@ def _wet_fraction_series(
         message = "f_surf must lie in [0, 1]."
         raise ValueError(message)
     rho = np.asarray(static[_RHO_BULK_DENSITY_STATIC_INDEX], dtype=np.float64)
-    if np.any(rho[mask] <= 0.0):
-        message = "Packed-bed dry bulk density must be positive on the Evaluation mask."
+    if np.any(rho <= 0.0):
+        message = "Packed-bed dry bulk density must be positive on the Evaluation grid."
         raise ValueError(message)
-    cell_weights = transient_metrics.trapezoidal_cell_weights(mask)
-    admitted_rho = rho[mask]
-    admitted_weights = cell_weights[mask]
+    cell_weights = transient_metrics.trapezoidal_cell_weights(rho.shape)
     values: list[float] = []
-    dry_total = float(np.sum(admitted_rho * admitted_weights, dtype=np.float64))
+    dry_total = float(np.sum(rho * cell_weights, dtype=np.float64))
     for state in states:
         w_gr = f_surf * np.asarray(state[_SURFACE_MOISTURE_STATE_INDEX], dtype=np.float64) + (1.0 - f_surf) * np.asarray(
             state[_INTERNAL_MOISTURE_STATE_INDEX],
             dtype=np.float64,
         )
-        admitted_water = w_gr[mask]
-        if not bool(np.isfinite(admitted_water).all()) or np.any(admitted_water < 0.0):
+        if not bool(np.isfinite(w_gr).all()) or np.any(w_gr < 0.0):
             values.append(math.nan)
             continue
-        wet_basis = domain.moisture.wet_basis_moisture(admitted_water, admitted_rho)
-        wet = wet_basis > target_wet_basis
-        wet_dry_mass = float(np.sum(admitted_rho[wet] * admitted_weights[wet], dtype=np.float64))
+        wet = domain.moisture.wet_basis_moisture(w_gr, rho) > target_wet_basis
+        wet_dry_mass = float(np.sum(rho[wet] * cell_weights[wet], dtype=np.float64))
         values.append(wet_dry_mass / dry_total)
     return np.asarray(values, dtype=np.float64)
 
@@ -637,7 +622,6 @@ def _target_evidence(
     *,
     static: np.ndarray,
     scalars: np.ndarray,
-    mask: np.ndarray,
     target_wet_basis: float,
     target_fraction_limit: float,
     reference_completion: CanonicalTargetCompletion | None,
@@ -651,7 +635,6 @@ def _target_evidence(
         predicted,
         static=static,
         scalars=scalars,
-        mask=mask,
         target_wet_basis=target_wet_basis,
     )
 
@@ -750,7 +733,6 @@ def _record(
         times,
         static=case.static_conditioning,
         scalars=case.scalar_conditioning,
-        mask=case.spatial_mask,
         target_wet_basis=target_wet_basis,
         target_fraction_limit=target_fraction_limit,
         reference_completion=reference_completion,
@@ -781,7 +763,6 @@ def _record(
         prediction_nonfinite_mask=prediction_nonfinite,
         prediction_physical_invalid_mask=prediction_physical_invalid,
         prediction_validity=prediction_validity,
-        spatial_mask=case.spatial_mask,
         temporal_mask=np.ones(length + 1, dtype=bool),
         static_conditioning=case.static_conditioning,
         boundary_conditioning=case.boundary_conditioning[origin:stop],

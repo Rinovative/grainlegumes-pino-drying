@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from support import configs
 
-from src import common, learning
+from src import common, experiments, learning
 from src.experiments.config import experiments_config_loader as loader
 from src.experiments.config import experiments_config_preflight as preflight
 from src.experiments.config import experiments_config_transient_plan as plan_service
@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 
 _MODEL_KINDS = ("fno", "rno", "uno")
 _STRIDE_TWO = 2
-_TEACHER_FORCED_FIELDS = ("evaluation_interval", "ood_evaluation_interval", "gradient_accumulation_steps", "curriculum")
 
 
 def _resolve(raw: dict[str, Any]) -> plan_service.MatchedA1BPlan:
@@ -55,7 +54,9 @@ def test_plan_derives_ordered_children_with_teacher_and_receipt_binding() -> Non
     assert plan.a1["training"]["matched_a1_b"]["receipt_source_run_name"] == plan.b["run"]["name"]
     assert plan.b["training"]["matched_a1_b"]["train_seconds"] == pytest.approx(0.25)
     assert plan.a0["training"]["matched_a1_b"]["train_seconds"] is plan.a1["training"]["matched_a1_b"]["train_seconds"] is None
-    assert [config["training"]["matched_a1_b"]["evaluation_points"] for config in plan.stages] == [None, 4, 4]
+    # A0 states its budget in epochs of the full Train set; B and A1 run until B's train seconds, without an epoch cap.
+    assert "budget_epochs" in plan.a0["training"]
+    assert all("budget_epochs" not in config["training"] for config in (plan.b, plan.a1))
     for name, config in zip(("a0", "b", "a1"), plan.stages, strict=True):
         assert plan.stage(name) is config
         assert loader.validate_resolved_config(config)["run"]["name"] == config["run"]["name"]
@@ -65,17 +66,18 @@ def test_plan_derives_ordered_children_with_teacher_and_receipt_binding() -> Non
 
 @pytest.mark.parametrize("model_kind", ["fno", "rno"])
 def test_a1_inherits_the_teacher_forced_protocol_of_a0(model_kind: str) -> None:
-    """A1 continues A0 teacher-forced: only its epoch cap and learning-rate scale are its own."""
+    """A1 continues A0 teacher-forced: only its learning-rate scale is its own; every stage shares k and the memory batch."""
     raw = configs.transient_matched_config(model_kind=model_kind)
-    raw["training"]["a0"].update({"evaluation_interval": 2, "ood_evaluation_interval": 3, "gradient_accumulation_steps": 2})
-    raw["training"]["a1"]["max_epochs"] = 9
+    raw["training"].update({"units_per_update": 3, "memory_batch": 1})
     plan = _resolve(raw)
 
     assert plan.a1["temporal"]["sampling"] == plan.a0["temporal"]["sampling"] == raw["training"]["a0"]["sampling"]
-    for field in _TEACHER_FORCED_FIELDS:
-        assert plan.a1["training"][field] == plan.a0["training"][field] == raw["training"]["a0"][field]
-    assert plan.a1["training"]["epochs"] == 9
-    assert plan.a0["training"]["epochs"] == raw["training"]["a0"]["max_epochs"]
+    # Teacher forcing draws no rollout horizon: A0 and A1 have no curriculum, and only B has one.
+    assert "curriculum" not in plan.a0["training"]
+    assert "curriculum" not in plan.a1["training"]
+    for field in ("units_per_update", "memory_batch"):
+        assert [config["training"][field] for config in plan.stages] == [raw["training"][field]] * 3
+    assert plan.a0["training"]["budget_epochs"] == raw["training"]["a0"]["budget_epochs"]
     assert plan.b["temporal"]["sampling"] == raw["training"]["b"]["sampling"]
     assert plan.b["training"]["curriculum"] == raw["training"]["b"]["curriculum"]
 
@@ -86,11 +88,12 @@ def test_a1_inherits_the_teacher_forced_protocol_of_a0(model_kind: str) -> None:
         (lambda raw: raw["training"].pop("b"), "training"),
         (lambda raw: raw["training"].update(epochs=1), "training"),
         (lambda raw: raw["training"]["a0"].update(lr_scale=1.0), r"training\.a0"),
+        (lambda raw: raw["training"]["a0"].update(curriculum={"lengths": [2], "milestone_fractions": [0.0]}), r"training\.a0"),
         (lambda raw: raw["training"]["b"].update(teacher_handoff=None), r"training\.b"),
         (lambda raw: raw["training"]["a1"].update(sampling={"mode": "one_step_transition"}), r"training\.a1"),
         (lambda raw: raw["temporal"].update(sampling={"mode": "one_step_transition"}), "temporal"),
     ],
-    ids=["missing-b", "extra-training-key", "a0-extra-key", "b-extra-key", "a1-extra-key", "temporal-extra-key"],
+    ids=["missing-b", "extra-training-key", "a0-extra-key", "a0-curriculum", "b-extra-key", "a1-extra-key", "temporal-extra-key"],
 )
 def test_authored_plan_schema_is_exact(mutate: Callable[[dict[str, Any]], object], path: str) -> None:
     """Fail closed when an authored node omits or adds keys; A1 cannot author its own sampling."""
@@ -126,16 +129,15 @@ def test_continuation_lr_scale_must_be_positive_finite(stage: str, value: object
     [
         (lambda raw: raw["training"]["b"].update(train_seconds=0.0), "B train_seconds must be positive"),
         (lambda raw: raw["training"]["a1"].update(match_to="b.best_epoch_seconds"), "B's committed train_seconds"),
-        (lambda raw: raw["training"]["a0"].update(max_epochs=0), r"training\.a0\.max_epochs must be a positive integer"),
-        (lambda raw: raw["training"].update(continuation_evaluations=0), "continuation_evaluations must be a positive"),
-        (lambda raw: raw["data"].update(num_workers=2), "num_workers=0"),
+        (lambda raw: raw["training"]["a0"].update(budget_epochs=0), r"training\.a0\.budget_epochs must be a positive integer"),
+        (lambda raw: raw["training"].update(units_per_update=0), r"training\.units_per_update must be a positive"),
         (lambda raw: raw["data"].update(persistent_workers=True), "persistent_workers"),
         (lambda raw: raw.update(task="steady_flow"), "only for transient_drying"),
     ],
-    ids=["zero-seconds", "unmatched-receipt", "zero-epochs", "zero-evaluation-points", "worker-processes", "persistent-workers", "other-task"],
+    ids=["zero-seconds", "unmatched-receipt", "zero-a0-budget", "zero-units", "persistent-workers", "other-task"],
 )
 def test_matched_plan_rejects_unsupported_budgets_workers_and_tasks(mutate: Callable[[dict[str, Any]], object], match: str) -> None:
-    """Keep the exact partial-epoch continuation prerequisites explicit and fail-closed."""
+    """Keep the stage budgets, the update size and the loader settings explicit and fail-closed."""
     raw = configs.transient_matched_config()
     mutate(raw)
 
@@ -217,7 +219,6 @@ def test_spatial_stride_is_required_authored_and_resolved_and_distinguishes_runs
     assert stride_two.a0["data"]["spatial_stride"] == _STRIDE_TWO
     assert stride_two.a0["run"]["layout"]["a0_id"] != stride_one.a0["run"]["layout"]["a0_id"]
     assert checkpoint.config_digest(stride_one.a0) != checkpoint.config_digest(stride_two.a0)
-    assert checkpoint.resume_contract_digest(stride_one.a0) != checkpoint.resume_contract_digest(stride_two.a0)
 
 
 @pytest.mark.parametrize("value", [True, 1.5, 0, -1])
@@ -254,9 +255,8 @@ def test_removed_keys_are_rejected(mutate: Callable[[dict[str, Any]], object]) -
         lambda raw: raw["training"]["b"].update(train_seconds=2.0),
         lambda raw: raw["training"]["b"].update(lr_scale=0.5),
         lambda raw: raw["training"]["a1"].update(lr_scale=0.5),
-        lambda raw: raw["training"].update(continuation_evaluations=8),
     ],
-    ids=["train-seconds", "b-lr-scale", "a1-lr-scale", "evaluation-points"],
+    ids=["train-seconds", "b-lr-scale", "a1-lr-scale"],
 )
 def test_branch_settings_change_the_branch_but_never_the_shared_a0(mutate: Callable[[dict[str, Any]], object]) -> None:
     """B/A1 budget and continuation scale select a new branch of the same A0 checkpoint."""
@@ -281,21 +281,48 @@ def test_seed_remains_part_of_the_shared_a0_identity() -> None:
     assert first.b["run"]["layout"]["branch_id"] != second.b["run"]["layout"]["branch_id"]
 
 
-def test_every_matched_stage_shares_the_seed_group_named_by_the_a0_epoch_budget() -> None:
-    """B and A1 keep their own epoch caps but sit in the seed group of their A0's budget, so another A0 budget is another group."""
-    plan = _resolve(configs.transient_matched_config(seed=17))
-    longer_raw = configs.transient_matched_config(seed=17)
-    longer_raw["training"]["a0"]["max_epochs"] += 1
-    longer = _resolve(longer_raw)
-    budget = plan.a0["training"]["epochs"]
+@pytest.mark.parametrize("arm", ["b", "a1"])
+def test_a_continuation_from_another_a0_lineage_is_another_run(arm: str) -> None:
+    """B and A1 bind the A0 they start from: unchanged own settings on another A0 are refused on resume and at checkpoint admission."""
+    plan = _resolve(configs.transient_matched_config())
+    saved = dict(plan.b if arm == "b" else plan.a1)
+    other = copy.deepcopy(saved)
+    other["run"]["layout"]["a0_id"] = "f" * 16
+    checkpoint = learning.training.checkpoint
 
-    assert plan.b["training"]["epochs"] != budget
+    with pytest.raises(ValueError, match="a0_id"):
+        experiments.run.validate_resume_config(other, saved)
+    # Checkpoint admission compares the identity's effective config digest, the same identity resume compares.
+    assert checkpoint.config_digest(other) != checkpoint.config_digest(saved)
+    assert loader.allocation_digest(other) == checkpoint.config_digest(other)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "group"),
+    [
+        (lambda raw: raw["training"]["a0"].update(budget_epochs=raw["training"]["a0"]["budget_epochs"] + 1), "seed-17__ep-{e1}__k-{k}__sch-{s}"),
+        (lambda raw: raw["training"].update(units_per_update=raw["training"]["units_per_update"] + 1), "seed-17__ep-{e}__k-{k1}__sch-{s}"),
+    ],
+    ids=["a0-budget", "units-per-update"],
+)
+def test_every_matched_stage_shares_the_seed_group_named_by_a0_budget_k_and_schedule(mutate: Callable[[dict[str, Any]], object], group: str) -> None:
+    """B and A1 sit in the seed group of their A0's budget, k and schedule; another value is another A0 and another group."""
+    raw = configs.transient_matched_config(seed=17)
+    plan = _resolve(raw)
+    changed_raw = configs.transient_matched_config(seed=17)
+    mutate(changed_raw)
+    changed = _resolve(changed_raw)
+    budget, units = plan.a0["training"]["budget_epochs"], plan.a0["training"]["units_per_update"]
+    schedule = plan.a0["run"]["layout"]["schedule"]
+    reference_group = f"seed-17__ep-{budget}__k-{units}__sch-{schedule}"
+
     assert {config["run"]["layout"]["budget_epochs"] for config in plan.stages} == {budget}
-    assert {common.paths.resolve_config_experiment_dir(config).name for config in plan.stages} == {f"seed-17__a0ep-{budget}"}
-    assert all(f"__seed-17__a0ep-{budget}__" in f"{config['run']['name']}__" for config in plan.stages)
-    assert common.paths.resolve_config_experiment_dir(longer.a0).name == f"seed-17__a0ep-{budget + 1}"
-    assert common.paths.resolve_config_experiment_dir(longer.a0) != common.paths.resolve_config_experiment_dir(plan.a0)
-    assert longer.a0["run"]["layout"]["a0_id"] != plan.a0["run"]["layout"]["a0_id"]
+    assert {common.paths.resolve_config_experiment_dir(config).name for config in plan.stages} == {reference_group}
+    assert all(f"__{reference_group}__" in f"{config['run']['name']}__" for config in plan.stages)
+    expected = group.format(e=budget, e1=budget + 1, k=units, k1=units + 1, s=schedule)
+    assert {common.paths.resolve_config_experiment_dir(config).name for config in changed.stages} == {expected}
+    assert changed.a0["run"]["layout"]["a0_id"] != plan.a0["run"]["layout"]["a0_id"]
+    assert learning.training.checkpoint.config_digest(changed.a0) != learning.training.checkpoint.config_digest(plan.a0)
 
 
 def test_stage_a_only_config_resolves_as_the_single_stage_a0() -> None:
@@ -306,19 +333,25 @@ def test_stage_a_only_config_resolves_as_the_single_stage_a0() -> None:
     assert resolved["training"]["comparison_arm"] == "a0"
     assert resolved["training"]["teacher_handoff"] is None
     assert "matched_a1_b" not in resolved["training"]
-    assert resolved["training"]["epochs"] == resolved["training"]["stage_schedule"]["total_epochs"]
-    assert resolved["run"]["layout"]["budget_epochs"] == resolved["training"]["epochs"]
-    assert common.paths.resolve_config_experiment_dir(resolved).name == f"seed-17__a0ep-{resolved['training']['epochs']}"
+    assert resolved["training"]["budget_epochs"] == resolved["training"]["stage_schedule"]["budget_epochs"]
+    assert resolved["run"]["layout"]["budget_epochs"] == resolved["training"]["budget_epochs"]
+    training = resolved["training"]
+    group = f"seed-17__ep-{training['budget_epochs']}__k-{training['units_per_update']}__sch-{resolved['run']['layout']['schedule']}"
+    assert common.paths.resolve_config_experiment_dir(resolved).name == group
 
 
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda training: training.update(epochs=training["epochs"] + 1), "training.epochs must equal"),
+        (lambda training: training.update(budget_epochs=training["budget_epochs"] + 1), "training.budget_epochs must equal"),
         (lambda training: training["stage_schedule"].update(unexpected=1), "stage_a_only"),
-        (lambda training: training.update(comparison_arm="a1", teacher_handoff={"source_run_name": "a0"}), "Outside matched_a1_b"),
+        (
+            lambda training: training.update(comparison_arm="a1", teacher_handoff={"source_run_name": "a0"}) or training.pop("budget_epochs"),
+            "Outside matched_a1_b",
+        ),
+        (lambda training: training.update(curriculum={"lengths": [2, 4], "milestone_fractions": [0.0, 0.5]}), "only Stage B sets"),
     ],
-    ids=["epochs-differ-from-total", "schedule-extra-key", "continuation-arm"],
+    ids=["budget-differs-from-schedule", "schedule-extra-key", "continuation-arm", "teacher-forced-curriculum"],
 )
 def test_stage_a_only_protocol_is_exact(mutate: Callable[[dict[str, Any]], object], match: str) -> None:
     """Outside a matched plan only the exact stage-A-only A0 protocol is admitted."""

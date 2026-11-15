@@ -1,13 +1,13 @@
 """Render bounded line-oriented reporting for experiment lifecycles.
 
 Responsibilities:
-  - Report the run start block, one startup line, one line per epoch, and one end line with epochs run, stop reason and duration parts
+  - Report the run start block, one startup line, one line per training event, and one end line with epochs run, budget spent and duration parts
   - Report one line per finished Optuna trial plus the study start and end
   - Redact secrets from messages and complete traceback chains
 
 Design principles:
   - Scientific values are consumed from lifecycle payloads without recomputation
-  - Reporting uses genuine completed epochs and emits no default batch progress
+  - Reporting uses genuine training events (validation points, epoch and budget ends) and emits no default batch progress
   - Credential-bearing values are redacted and paths are shown relative to the storage root
 
 This module does NOT:
@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from src import common
+from src import common, learning
 
 from .config import experiments_config_loader as config_loader
 
@@ -101,11 +101,20 @@ def _line(text: str, *, to_stderr: bool = False) -> None:
     print(_redact_secrets(text), file=sys.stderr if to_stderr else sys.stdout, flush=True)
 
 
+def _budget_text(training: Mapping[str, Any]) -> str:
+    """Describe a stage budget: epochs of the full Train set, or B/A1 optimisation seconds."""
+    if "budget_epochs" in training:
+        return f"budget {training['budget_epochs']} epochs"
+    seconds = training["matched_a1_b"]["train_seconds"]
+    budget = "B's receipt" if seconds is None else common.console.format_duration(float(seconds))
+    return f"budget {budget} train_seconds"
+
+
 def _loss_composition(config: Mapping[str, Any]) -> str:
     """Describe the implemented active total-loss composition."""
     loss = config["loss"]
     data = loss["data"]
-    terms = [f"{data['weight']}*{data['kind']}[{data['space']}]"]
+    terms = [f"{data['weight']}*{data['kind']}[train_scaled_state]"]
     physics = loss["physics"]
     if bool(physics["enabled"]):
         for term, residual in (("momentum", "momentum"), ("continuity", "flux_balance"), ("boundary", "pressure_boundary")):
@@ -170,7 +179,7 @@ class ConsoleReporter:
             parts.append(f"scaler {scaler.get('state')}" + (f" (fit {common.console.format_duration(fit['seconds'])})" if fit else ""))
         if "model_cuda_ready" in self._phases:
             parts.append(f"model {common.console.format_duration(self._phases['model_cuda_ready'].get('seconds', 0.0))}")
-        parts.append(f"{self._phases['training_start'].get('batches_per_epoch')} batches/epoch")
+        parts.append(f"{self._phases['training_start'].get('updates_per_epoch')} updates/epoch")
         return "  ".join(parts)
 
     def startup(self, *, resolved_device: str) -> None:
@@ -188,18 +197,25 @@ class ConsoleReporter:
             f" | {'resumed run' if self.resume else 'new run'}{origin}"
         )
         workers = config_loader.effective_num_workers(int(data["num_workers"]))
-        _line(f"data {_text(data['train_dataset'])} | batch {data['batch_size']} | workers {workers}")
-        _line(f"model {model} | {optimizer['kind']} lr {_num(optimizer['lr'], digits=2)} {scheduler} | {training['epochs']} epochs")
+        _line(
+            f"data {_text(data['train_dataset'])} | k {training['units_per_update']} (memory {training['memory_batch']})"
+            f" | eval batch {data['evaluation_batch_size']} | workers {workers}"
+        )
+        _line(f"model {model} | {optimizer['kind']} lr {_num(optimizer['lr'], digits=2)} {scheduler} | {_budget_text(training)}")
         _line(
             f"loss {_loss_composition(self.config)} | select {self.objective_id} ({objective['direction']})"
-            f" | val every {training['evaluation_interval']}"
+            f" | validate at {learning.training.budget.VALIDATION_POINTS} budget points"
         )
 
-    def epoch(self, epoch: int, metrics: dict[str, float]) -> None:
-        """Print one line per completed epoch with the evaluation results that fell due."""
-        target = int(self.config["training"]["epochs"])
+    def event(self, step: int, metrics: dict[str, float]) -> None:
+        """Print one line per training event (validation point, epoch or budget end) with the results that fell due."""
+        points = learning.training.budget.VALIDATION_POINTS
+        point = f"point {int(metrics['validation/point']):>2}/{points}" if "validation/point" in metrics else " " * (7 + 2 * len(str(points)))
+        parts = [
+            f"epoch {int(metrics.get('epoch', 0))} step {step} {100.0 * metrics.get('budget/progress', 0.0):5.1f}% {point}",
+            f"loss {_num(metrics.get('train/loss_total'))}{_loss_components(metrics)}",
+        ]
         id_key = f"id/{self.objective_id}"
-        parts = [f"epoch {epoch:>{len(str(target))}}/{target}", f"loss {_num(metrics.get('train/loss_total'))}{_loss_components(metrics)}"]
         if id_key in metrics:
             parts.append(f"val {_num(metrics[id_key])}{' *best' if metrics.get('checkpoint/new_best') == 1.0 else ''}")
         for role, label in (("material_ood", "ood"), ("parameter_ood", "pood")):
@@ -212,10 +228,10 @@ class ConsoleReporter:
         if "optimization/scheduler_new_learning_rate" in metrics:
             learning_rate += f"->{_num(metrics['optimization/scheduler_new_learning_rate'], digits=2)}"
         parts.append(learning_rate)
-        if "system/epoch_duration_seconds" in metrics:
-            parts.append(common.console.format_duration(metrics["system/epoch_duration_seconds"]))
+        if "system/event_duration_seconds" in metrics:
+            parts.append(common.console.format_duration(metrics["system/event_duration_seconds"]))
         if "system/train_samples_per_second" in metrics:
-            parts.append(f"{metrics['system/train_samples_per_second']:.1f} samples/s")
+            parts.append(f"{metrics['system/train_samples_per_second']:.1f} units/s")
         self._training_seconds += metrics.get("system/train_duration_seconds", 0.0)
         self._validation_seconds += sum(
             value
@@ -225,14 +241,18 @@ class ConsoleReporter:
         _line("  ".join(parts))
 
     def final(self, result: Mapping[str, Any], *, total_wall_seconds: float) -> dict[str, float]:
-        """Print the end line with the epochs run, why training stopped and the duration parts; return the parts."""
-        target = result.get("target_train_seconds")
-        reason = "epoch budget" if target is None else f"train_seconds budget {common.console.format_duration(target)}"
+        """Print the end line with the epochs run, the budget spent and the duration parts; return the parts."""
+        budget = result["budget"]
+        spent = (
+            f"{budget['units']} of {budget['total']} units"
+            if budget["unit"] == "units"
+            else f"{common.console.format_duration(budget['train_seconds'])} of {common.console.format_duration(budget['total'])} train_seconds"
+        )
         parts = {"training": self._training_seconds, "validation": self._validation_seconds}
         if "training_start" in self._phases:
             parts = {"startup": self._phases["training_start"]["elapsed_seconds"], **parts}
         _line(
-            f"{result.get('status', 'completed')} after {result['completed_epoch']} of {self.config['training']['epochs']} epochs ({reason})"
+            f"{result.get('status', 'completed')} after {result['completed_epoch']} epochs ({spent})"
             f"  best epoch {result['best_epoch']}  {self.objective_id} {_num(result['best_metric'])}"
             f"  {duration_summary(total_wall_seconds, parts)}  run {display_path(self.run_dir)}"
         )
@@ -287,15 +307,17 @@ def optuna_study_event(status: str, **fields: Any) -> None:
     if status == "started":
         _line(
             f"study {_text(fields['study'])} started | {fields['task']} {fields['model_family']} | {fields['sampler']}/{fields['pruner']}"
-            f" | {fields['invocation_trials']} of {fields['configured_trials']} trials, max {fields['maximum_epochs']} epochs"
+            f" | {fields['invocation_trials']} of {fields['configured_trials']} trials,"
+            f" budget {fields['budget_epochs']} of K {fields['full_budget_epochs']} epochs"
             f" | {fields['continuation']} | storage {_text(fields['storage'])}"
         )
         return
     best = "no completed trial" if fields["best_trial"] is None else f"best trial {fields['best_trial']} {_num(fields['best_objective'])}"
+    counts = ", ".join(f"{count} {name}" for name, count in fields["trial_counts"].items() if count)
     _line(
-        f"study {_text(fields['study'])} {status} | {fields['attempted_trials']} trials ({fields['completed_trials']} completed,"
-        f" {fields['pruned_trials']} pruned, {fields['failed_trials']} failed) | {best}"
-        f" | {common.console.format_duration(fields['duration_seconds'])} | {_text(fields['best_parameters'])} | storage {_text(fields['storage'])}"
+        f"study {_text(fields['study'])} {status} | {fields['attempted_trials']} trials ({counts}) | {best}"
+        f" | {common.console.format_duration(fields['duration_seconds'])} (study {common.console.format_duration(fields['study_seconds'])})"
+        f" | {_text(fields['best_parameters'])} | storage {_text(fields['storage'])}"
         + ("" if fields.get("summary_file") is None else f" | summary {fields['summary_file']}"),
         to_stderr=status == "failed",
     )
@@ -310,9 +332,9 @@ def optuna_trial_event(
     objective: float | None = None,
     step: int | None = None,
 ) -> None:
-    """Print one line for a finished Optuna trial; pruning and duplicates are normal outcomes, any other state goes to stderr."""
+    """Print one line for a finished Optuna trial; pruned, diverged, ineligible and duplicate trials are normal, any other goes to stderr."""
     state = status if step is None or status == "completed" else f"{status}@{step}"
     _line(
         f"trial {trial:>3}  {state}  val {_num(objective)}  {common.console.format_duration(duration_seconds)}  {_text(sampled)}",
-        to_stderr=status not in {"completed", "duplicate"} and not status.endswith("pruned"),
+        to_stderr=status not in {"completed", "duplicate", "diverged", "no_eligible_checkpoint"} and not status.endswith("pruned"),
     )

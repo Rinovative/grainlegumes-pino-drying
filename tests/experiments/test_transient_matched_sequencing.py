@@ -199,13 +199,13 @@ def test_another_a0_epoch_budget_trains_in_its_own_seed_group_beside_the_first(
 ) -> None:
     """A0's epoch budget names its seed group, so a different budget needs no revision and never touches the first A0."""
     executions, _handoff_checks = _install_stage_fakes(monkeypatch)
-    budget_epochs = int(_requested_plan(tmp_path).a0["training"]["epochs"])
+    budget_epochs = int(_requested_plan(tmp_path).a0["training"]["budget_epochs"])
 
     first = run_service.run_experiment(config_path, device="cpu", output_root=tmp_path, train_stages=("a0",))
     other = run_service.run_experiment(config_path, device="cpu", output_root=tmp_path, train_stages=("a0",), epochs=budget_epochs + 1)
 
-    assert first["run_dir"].parent.name.endswith(f"__a0ep-{budget_epochs}")
-    assert other["run_dir"].parent.name.endswith(f"__a0ep-{budget_epochs + 1}")
+    assert f"__ep-{budget_epochs}__" in first["run_dir"].parent.name
+    assert f"__ep-{budget_epochs + 1}__" in other["run_dir"].parent.name
     assert first["run_dir"].parent.parent == other["run_dir"].parent.parent
     assert [arm for arm, _resume in executions] == ["a0", "a0"]
 

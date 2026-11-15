@@ -51,20 +51,21 @@ def _allocate(config: dict[str, Any], run_dir: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "same_experiment"),
     [
-        (lambda raw: raw["training"].update(epochs=raw["training"]["epochs"] + 5), True),
         (lambda raw: raw.update(run={**raw["run"], "revision": "rerun"}), True),
+        (lambda raw: raw["training"].update(budget_epochs=raw["training"]["budget_epochs"] + 5), False),
+        (lambda raw: raw["training"].update(units_per_update=raw["training"]["units_per_update"] + 1), False),
         (lambda raw: raw["run"].update(seed=raw["run"]["seed"] + 1), False),
         (lambda raw: raw["optimizer"].update(lr=raw["optimizer"]["lr"] * 2), False),
         (lambda raw: raw["data"].update(train_dataset="other_dataset"), False),
     ],
-    ids=["epochs", "revision", "seed", "optimizer", "dataset"],
+    ids=["revision", "epochs", "units-per-update", "seed", "optimizer", "dataset"],
 )
-def test_allocation_digest_ignores_epochs_and_labels_but_not_science(
+def test_allocation_digest_ignores_labels_but_binds_budget_k_and_science(
     tmp_path: Path,
     mutate: Callable[[dict[str, Any]], object],
     same_experiment: bool,
 ) -> None:
-    """Only a change of the training science makes an experiment new."""
+    """A revision label is no new experiment; another budget, k or any other science is."""
     raw = configs.direct_config()
     changed = copy.deepcopy(raw)
     mutate(changed)
@@ -75,28 +76,25 @@ def test_allocation_digest_ignores_epochs_and_labels_but_not_science(
 
 
 def test_transient_allocation_digest_binds_the_a0_budget_and_the_a0_of_each_continuation(tmp_path: Path) -> None:
-    """A0's epoch budget is identity; B and A1 belong to the A0 they start from, while their epoch caps stay progress."""
+    """A0's epoch budget is identity; B and A1 belong to the A0 they start from."""
     plan = configs.resolve_plan(configs.transient_matched_config(), output_root=tmp_path)
     longer_a0 = copy.deepcopy(dict(plan.a0))
-    longer_a0["training"]["epochs"] = int(plan.a0["training"]["epochs"]) + 1
+    longer_a0["training"]["budget_epochs"] = int(plan.a0["training"]["budget_epochs"]) + 1
     other_a0_b = copy.deepcopy(dict(plan.b))
     other_a0_b["run"]["layout"]["a0_id"] = "f" * 16
-    capped_b = copy.deepcopy(dict(plan.b))
-    capped_b["training"]["epochs"] = int(plan.b["training"]["epochs"]) + 1
 
     assert loader.allocation_digest(longer_a0) != loader.allocation_digest(plan.a0)
     assert loader.allocation_digest(other_a0_b) != loader.allocation_digest(plan.b)
-    assert loader.allocation_digest(capped_b) == loader.allocation_digest(plan.b)
 
 
 def test_resume_admission_refuses_another_a0_epoch_budget(tmp_path: Path) -> None:
-    """A saved A0 refuses another epoch budget before any run state is touched; the hint points at --epochs, which trains it beside it."""
+    """A saved A0 refuses another epoch budget before any run state is touched: its schedule and validation points run over it."""
     plan = configs.resolve_plan(configs.transient_matched_config(), output_root=tmp_path)
     requested = copy.deepcopy(dict(plan.a0))
-    requested["training"]["epochs"] = int(plan.a0["training"]["epochs"]) + 1
-    requested["training"]["stage_schedule"]["a0_max_epochs"] = requested["training"]["epochs"]
+    requested["training"]["budget_epochs"] = int(plan.a0["training"]["budget_epochs"]) + 1
+    requested["training"]["stage_schedule"]["a0_budget_epochs"] = requested["training"]["budget_epochs"]
 
-    with pytest.raises(ValueError, match=r"cannot change its epoch budget.*--epochs"):
+    with pytest.raises(ValueError, match=r"training\.budget_epochs.*never extended or changed"):
         experiments.run.validate_resume_config(requested, plan.a0)
 
 

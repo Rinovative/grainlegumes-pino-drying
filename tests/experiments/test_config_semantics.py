@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-_SYNTHETIC_BATCH_SIZE = 3
+_SYNTHETIC_UNITS_PER_UPDATE = 3
 
 
 @pytest.mark.parametrize("model_kind", ["fno", "uno"])
@@ -35,7 +35,7 @@ def test_minimal_direct_config_resolves_and_preserves_user_values(
 ) -> None:
     """Resolve representative model families without a production YAML fixture."""
     raw = configs.direct_config(model_kind=model_kind)
-    raw["data"]["batch_size"] = _SYNTHETIC_BATCH_SIZE
+    raw["training"]["units_per_update"] = _SYNTHETIC_UNITS_PER_UPDATE
     raw["optimizer"]["lr"] = 4.321e-3
 
     resolved = configs.resolve(raw)
@@ -46,7 +46,7 @@ def test_minimal_direct_config_resolves_and_preserves_user_values(
     assert resolved["model"]["params"]["out_channels"] == task.out_channels
     assert resolved["data"]["train_dataset"] == "synthetic_train"
     assert resolved["data"]["material_ood_datasets"] == ["synthetic_ood"]
-    assert resolved["data"]["batch_size"] == _SYNTHETIC_BATCH_SIZE
+    assert resolved["training"]["units_per_update"] == _SYNTHETIC_UNITS_PER_UPDATE
     assert resolved["optimizer"]["lr"] == pytest.approx(4.321e-3)
     assert resolved["evaluation"]["objective"]["id"] == "normalized_group_macro_rmse"
 
@@ -125,7 +125,6 @@ def test_scientific_change_updates_name_and_resume_identity() -> None:
 
     assert first["run"]["name"] == second["run"]["name"]  # Unoccupied readable labels; exact identities remain distinct.
     assert learning.training.checkpoint.config_digest(first) != (learning.training.checkpoint.config_digest(second))
-    assert learning.training.checkpoint.resume_contract_digest(first) != (learning.training.checkpoint.resume_contract_digest(second))
     with pytest.raises(ValueError, match=r"loss\.physics\.continuity_weight\.target"):
         experiments.run.validate_resume_config(second, first)
 
@@ -150,8 +149,8 @@ def test_runtime_location_changes_preserve_scientific_and_resume_identity(
         second["paths"]["output_root"] = replacement
 
     assert second["run"]["name"] == first["run"]["name"]
-    assert learning.training.checkpoint.resume_contract_digest(second) == (learning.training.checkpoint.resume_contract_digest(first))
-    assert experiments.run.validate_resume_config(second, first) == int(first["training"]["epochs"])
+    assert learning.training.checkpoint.config_digest(second) == learning.training.checkpoint.config_digest(first)
+    experiments.run.validate_resume_config(second, first)
 
 
 def test_reporting_and_data_worker_changes_preserve_training_identity() -> None:
@@ -175,37 +174,74 @@ def test_reporting_and_data_worker_changes_preserve_training_identity() -> None:
     operational["tracking"] = {"wandb": {"enabled": False, "project": "reporting-only"}}
 
     assert learning.training.checkpoint.config_digest(operational) == learning.training.checkpoint.config_digest(original)
-    assert learning.training.checkpoint.resume_contract_digest(operational) == (learning.training.checkpoint.resume_contract_digest(original))
 
 
 def test_objective_change_is_resume_incompatible() -> None:
     """Bind model selection semantics to persisted continuation identity."""
     first = configs.resolve(configs.direct_config())
     changed_raw = configs.direct_config()
-    changed_raw["evaluation"]["objective"] = {"id": "normalized_relative_h1"}
+    changed_raw["evaluation"]["objective"] = {"id": "physical_relative_h1"}
     second = configs.resolve(changed_raw)
 
-    assert learning.training.checkpoint.resume_contract_digest(first) != (learning.training.checkpoint.resume_contract_digest(second))
+    assert learning.training.checkpoint.config_digest(first) != learning.training.checkpoint.config_digest(second)
     with pytest.raises(ValueError, match=r"evaluation\.objective"):
         experiments.run.validate_resume_config(second, first)
 
 
-def test_transient_training_states_its_cadence_without_code_defaults() -> None:
-    """Refuse a transient request that omits a training value its base config owns."""
-    raw = configs.transient_stage_a_only_config()
-    raw["training"].pop("evaluation_interval")
+@pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
+def test_a_single_stage_run_states_its_budget_epochs(build: Callable[[], dict[str, Any]]) -> None:
+    """Refuse a steady or A0 request without its budget in epochs of the full Train set."""
+    raw = build()
+    raw["training"].pop("budget_epochs")
 
-    with pytest.raises((TypeError, ValueError), match="Transient training keys"):
+    with pytest.raises((TypeError, ValueError), match=r"budget_epochs|Transient training keys"):
         configs.resolve(raw)
+
+
+@pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
+def test_a_single_stage_run_refuses_the_former_duration_key(build: Callable[[], dict[str, Any]]) -> None:
+    """Refuse the former ``epochs`` key beside the budget."""
+    raw = build()
+    raw["training"]["epochs"] = 4
+
+    refusal = r"training contains unknown key.*epochs|training\.epochs does not apply|Transient training keys"
+    with pytest.raises((TypeError, ValueError), match=refusal):
+        configs.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    ("scheduler", "match"),
+    [
+        ({"kind": "cosine", "min_lr": 1.0e-5}, r"scheduler contains unknown key.*min_lr"),
+        ({"kind": "cosine", "factor": 0.5}, r"scheduler kind 'cosine' takes exactly \['kind'\]"),
+        ({"kind": "cosine", "patience": 3}, r"scheduler kind 'cosine' takes exactly \['kind'\]"),
+        ({"kind": "reduce_on_plateau", "factor": 0.5, "patience": 3, "min_lr": 1.0e-5}, r"scheduler contains unknown key.*min_lr"),
+        ({"kind": "reduce_on_plateau", "factor": 0.5}, r"scheduler kind 'reduce_on_plateau' takes exactly"),
+        ({"kind": "cosine_annealing"}, r"Unknown scheduler kind"),
+    ],
+    ids=["cosine-floor", "cosine-factor", "cosine-patience", "plateau-floor", "plateau-without-patience", "unknown"],
+)
+def test_the_scheduler_states_exactly_its_kind_keys_and_no_floor(scheduler: dict[str, Any], match: str) -> None:
+    """The cosine takes only its kind, the plateau comparison kind exactly factor and patience, and neither a floor."""
+    raw = configs.direct_config()
+    raw["scheduler"] = scheduler
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=match):
+        configs.resolve(raw)
+
+
+def test_the_plateau_comparison_kind_resolves_without_a_floor() -> None:
+    """The halve-on-plateau variant resolves with factor and patience only."""
+    raw = configs.direct_config()
+    raw["scheduler"] = {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 3}
+
+    assert configs.resolve(raw)["scheduler"] == {"kind": "reduce_on_plateau", "factor": 0.5, "patience": 3}
 
 
 @pytest.mark.parametrize(
     ("build", "path", "match"),
     [
         (configs.direct_config, ("run", "deterministic"), r"run\.deterministic must be boolean"),
-        (configs.direct_config, ("scheduler", "factor"), r"scheduler must state scheduler\.factor"),
-        (configs.direct_config, ("scheduler", "patience"), r"scheduler must state scheduler\.patience"),
-        (configs.direct_config, ("scheduler", "min_lr"), r"scheduler must state scheduler\.min_lr"),
         (configs.direct_config, ("model", "params", "positional_embedding"), r"model\.params is missing required key.*positional_embedding"),
         (configs.direct_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
         (configs.direct_config, ("data", "train_subset"), r"data\.train_subset is required"),
@@ -213,8 +249,7 @@ def test_transient_training_states_its_cadence_without_code_defaults() -> None:
         (configs.transient_stage_a_only_config, ("data", "train_subset"), r"data\.train_subset"),
         (configs.transient_stage_a_only_config, ("model", "params", "domain_padding"), r"model\.params is missing required key.*domain_padding"),
         (configs.direct_config, ("optimizer", "betas"), r"Config must state optimizer\.betas;"),
-        (configs.direct_config, ("tracking", "wandb", "monitor", "interval"), r"Config must state tracking\.wandb\.monitor\.interval;"),
-        (configs.transient_stage_a_only_config, ("loss", "data", "beta"), r"Config must state loss\.data\.beta;"),
+        (configs.transient_stage_a_only_config, ("loss", "data", "weight"), r"Config must state loss\.data\.weight;"),
         (configs.transient_stage_a_only_config, ("loss", "physics"), r"Config must state loss\.physics\.enabled;"),
     ],
 )
@@ -292,8 +327,8 @@ _RETIRED_ROLE = "additional" + "_evaluation"
 @pytest.mark.parametrize("build", [configs.direct_config, configs.transient_stage_a_only_config], ids=["steady", "transient"])
 @pytest.mark.parametrize(
     ("section", "old", "new"),
-    [("data", f"{_RETIRED_ROLE}_datasets", "material_ood_datasets"), ("training", f"{_RETIRED_ROLE}_interval", "ood_evaluation_interval")],
-    ids=["datasets", "interval"],
+    [("data", f"{_RETIRED_ROLE}_datasets", "material_ood_datasets")],
+    ids=["datasets"],
 )
 def test_renamed_ood_keys_are_refused_under_their_old_names(build: Callable[[], dict[str, Any]], section: str, old: str, new: str) -> None:
     """Refuse the former OOD key names instead of reading them as aliases."""
@@ -313,16 +348,20 @@ def test_renamed_ood_keys_are_refused_under_their_old_names(build: Callable[[], 
             "Unknown model identifier",
         ),
         (
-            lambda config: config["data"].update({"batch_size": 0}),
+            lambda config: config["training"].update({"units_per_update": 0}),
             "positive",
+        ),
+        (
+            lambda config: config["data"].update({"batch_size": 16}),
+            r"data contains unknown key.*batch_size",
         ),
         (
             lambda config: config["run"].update({"seed": True}),
             "integer",
         ),
         (
-            lambda config: config["training"].pop("evaluation_interval"),
-            r"training must state training\.evaluation_interval",
+            lambda config: config["training"].pop("units_per_update"),
+            r"training\.units_per_update",
         ),
         (
             lambda config: config["data"].update({"train_dataset": "01_generation/raw/batch/case.h5"}),
@@ -340,6 +379,28 @@ def test_invalid_config_fails_at_the_public_resolver(
 
     with pytest.raises((TypeError, ValueError), match=match):
         configs.resolve(raw)
+
+
+@pytest.mark.parametrize(
+    ("build", "data", "match"),
+    [
+        (configs.direct_config, {"kind": "huber", "weight": 1.0}, r"loss\.data\.kind 'huber' is not allowed"),
+        (configs.direct_config, {"kind": "relative_h1", "weight": 1.0}, r"loss\.data\.kind 'relative_h1' is not allowed"),
+        (configs.transient_stage_a_only_config, {"kind": "mse", "weight": 1.0, "state_aux_weight": 0.1}, r"loss\.data contains unknown key"),
+    ],
+    ids=("huber", "relative-h1", "state-aux"),
+)
+def test_data_losses_other_than_the_state_mse_or_h1_are_refused(build: Callable[[], dict[str, Any]], data: dict[str, Any], match: str) -> None:
+    """Refuse a Huber, relative-H1 or auxiliary-state loss, requested or in a saved run config, instead of training or reading another loss."""
+    raw = build()
+    raw["loss"]["data"] = data
+
+    with pytest.raises(experiments.config.loader.ConfigError, match=match):
+        configs.resolve(raw)
+    saved = configs.resolve(build())
+    saved["loss"]["data"] = data
+    with pytest.raises(experiments.config.loader.ConfigError, match=r"loss\.data"):
+        experiments.config.loader.validate_resolved_config(saved, verify_layout_identity=False)
 
 
 @pytest.mark.parametrize(

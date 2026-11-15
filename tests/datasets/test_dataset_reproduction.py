@@ -328,7 +328,7 @@ def test_inspection_exposes_parameters_and_recovery_without_tensor_loading(
         "static": [{"name": "x", "unit": "m"}],
         "boundary": [{"name": "T_in", "unit": "K"}],
         "scalars": [{"name": "k", "unit": "W/(m*K)"}],
-        "target": [{"name": "delta_T", "unit": "K"}],
+        "next_state": [{"name": "T", "unit": "K"}],
         "time": {"fields": [{"name": "dt", "unit": "h"}]},
         "storage": "absolute_physical_states",
         "tensor_dtype": "float32",
@@ -347,7 +347,7 @@ def test_inspection_exposes_parameters_and_recovery_without_tensor_loading(
     assert "Static: x (m)" in transient_readable
     assert "Boundary: T_in (K)" in transient_readable
     assert "Scalars: k (W/(m*K))" in transient_readable
-    assert "Targets: delta_T (K)" in transient_readable
+    assert "Next state: T (K)" in transient_readable
     assert "Solver environment: unavailable in inspection evidence" in transient_readable
     assert "Generation code snapshot: unavailable in inspection evidence" in transient_readable
     assert "Recorded Generation command: not recorded" in transient_readable

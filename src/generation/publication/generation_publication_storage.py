@@ -25,6 +25,7 @@ Notes:
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import tempfile
@@ -38,7 +39,6 @@ import h5py
 import numpy as np
 
 from src import common, domain
-from src.generation.cases import generation_cases_admission as input_admission
 from src.generation.cases import generation_cases_config as config_contract
 from src.generation.cases import generation_cases_fields as fields_service
 from src.generation.cases import generation_cases_schedule as schedule_service
@@ -657,17 +657,22 @@ def _schedule_values(
     case_payload: Mapping[str, Any],
     work_directory: Path,
 ) -> np.ndarray:
-    """Read the exact hash-admitted primitive schedule without re-proving authored science."""
+    """Read the hash-admitted schedule CSV that COMSOL consumed in its work directory, without re-proving authored science."""
     spec = case_payload["input_contract"]["schedule"]
     path = work_directory / spec["filename"]
     identity = case_payload["input_files"][path.name]
     if common.serialization.file_sha256(path) != identity["sha256"] or path.stat().st_size != identity["size_bytes"]:
         msg = "Schedule adapter bytes changed after case-input identity was computed."
         raise RuntimeError(msg)
-    header, values = input_admission.read_input_adapter_table(path, delimiter=spec["delimiter"])
-    if header != list(profiles.SCHEDULE_FIELDS):
+    rows = list(csv.reader(path.read_text(encoding="utf-8").splitlines(), delimiter=spec["delimiter"]))
+    if not rows or rows[0] != list(profiles.SCHEDULE_FIELDS):
         msg = "Schedule adapter does not match the configured primitive-column contract."
         raise ValueError(msg)
+    try:
+        values = np.asarray([[float(item) for item in row] for row in rows[1:]], dtype=np.float64)
+    except ValueError as error:
+        msg = f"Schedule adapter contains malformed values: {path}"
+        raise ValueError(msg) from error
     if (
         values.ndim != _TABLE_RANK
         or values.shape[0] < 1

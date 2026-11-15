@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from matplotlib.colors import BoundaryNorm
+from matplotlib.figure import Figure
 
 from src import common, datasets, domain, generation
 from src.analysis.eda import dataframe as eda_dataframe
@@ -31,7 +32,9 @@ from src.analysis.eda import eda_selection as selection
 from src.analysis.eda import eda_sources as sources
 from src.analysis.eda import eda_transient as transient
 from src.analysis.eda import eda_viewers as viewers
+from src.analysis.eda import eda_workspace as workspace
 from src.analysis.eda.plots import eda_plot_transient as transient_plots
+from src.analysis.ui import analysis_ui_controls as ui_controls
 from src.datasets.packages import dataset_packages_trajectory as trajectory
 
 
@@ -91,6 +94,14 @@ def _widget_by_description(widget: Any, description: str) -> Any:
     return matches[0]
 
 
+def _is_shown(widget: Any, description: str, hidden: bool = False) -> bool:
+    """Return whether the described widget exists and no box on its way from ``widget`` is hidden."""
+    hidden = hidden or widget.layout.display == "none"
+    if getattr(widget, "description", None) == description:
+        return not hidden
+    return any(_is_shown(child, description, hidden) for child in getattr(widget, "children", ()))
+
+
 def _adaptive_catalog(
     frames: tuple[tuple[str, pd.DataFrame], ...],
 ) -> selection.GeneratedOutputEDACatalog:
@@ -146,8 +157,8 @@ def test_physical_time_channel_and_view_control_contracts(
     render_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         viewers.ui.viewers,
-        "render_figure",
-        lambda **kwargs: render_calls.append(kwargs),
+        "render_view",
+        lambda *_args, **kwargs: render_calls.append(kwargs),
     )
     catalog = _adaptive_catalog((("Drying · Lentil · fg · ID", transient_frame),))
     state = selection.GeneratedOutputSelectionState(catalog)
@@ -158,11 +169,12 @@ def test_physical_time_channel_and_view_control_contracts(
         export_state={"fig": None, "plot_name": "snapshot", "title": "snapshot"},
         export_plot_name="snapshot",
         export_title="snapshot",
-    )
-    assert _widgets_by_description(snapshot_viewer, "Lock color scale") == []
-    time_control = _widget_by_description(snapshot_viewer, "Time [h]:")
+    ).widget
+    assert not _is_shown(snapshot_viewer, "Lock color scale")
+    assert _is_shown(snapshot_viewer, "Time [h]")
+    time_control = _widget_by_description(snapshot_viewer, "Time [h]")
     assert not any(isinstance(widget, widgets.Play) for widget in _walk_widgets(snapshot_viewer))
-    retained_channel = _widget_by_description(snapshot_viewer, "φ [-]")
+    retained_channel = _widget_by_description(snapshot_viewer, "φ [% RH]")
     retained_channel.value = False
     time_control.value = 1.1
     assert time_control.value == 1.0
@@ -177,15 +189,15 @@ def test_physical_time_channel_and_view_control_contracts(
         export_state=None,
         export_plot_name=None,
         export_title=None,
-    )
+    ).widget
     scope = next(widget for widget in _walk_widgets(trajectory_viewer) if isinstance(widget, widgets.ToggleButtons))
     assert scope.value == "aggregate"
-    assert _widgets_by_description(trajectory_viewer, "Cases:")
-    assert _widgets_by_description(trajectory_viewer, "Case:") == []
+    assert _is_shown(trajectory_viewer, "Cases")
+    assert not _is_shown(trajectory_viewer, "Case")
     scope.value = "single"
-    assert _widgets_by_description(trajectory_viewer, "Case:")
-    assert _widgets_by_description(trajectory_viewer, "Cases:") == []
-    assert not any(getattr(widget, "description", "") == "Time [h]:" for widget in _walk_widgets(trajectory_viewer))
+    assert _is_shown(trajectory_viewer, "Case")
+    assert not _is_shown(trajectory_viewer, "Cases")
+    assert not any(getattr(widget, "description", "") == "Time [h]" for widget in _walk_widgets(trajectory_viewer))
 
 
 def _walk_widgets(widget: Any) -> tuple[Any, ...]:
@@ -204,14 +216,10 @@ def test_spectral_scope_and_orientation_keep_functional_state(
     render_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         viewers.ui.viewers,
-        "render_figure",
-        lambda **kwargs: render_calls.append(kwargs),
+        "render_view",
+        lambda *_args, **kwargs: render_calls.append(kwargs),
     )
-    orientation = widgets.Dropdown(
-        options=("cross_stream_along_flow", "flow_across_cross_stream"),
-        value="cross_stream_along_flow",
-        description="Orientation:",
-    )
+    orientation = ui_controls.dropdown(("cross_stream_along_flow", "flow_across_cross_stream"), description="Orientation")
 
     viewer = viewers.make_spectral_view(
         catalog=catalog,
@@ -222,16 +230,16 @@ def test_spectral_scope_and_orientation_keep_functional_state(
         export_state=None,
         export_plot_name=None,
         export_title=None,
-    )
+    ).widget
     scope = next(widget for widget in _walk_widgets(viewer) if isinstance(widget, widgets.ToggleButtons))
     assert scope.value == "aggregate"
-    assert _widgets_by_description(viewer, "Cases:")
-    assert _widgets_by_description(viewer, "Case:") == []
+    assert _is_shown(viewer, "Cases")
+    assert not _is_shown(viewer, "Case")
     orientation.value = "flow_across_cross_stream"
     assert render_calls[-1]["kwargs"]["orientation"] == "flow_across_cross_stream"
     scope.value = "single"
-    assert _widgets_by_description(viewer, "Case:")
-    assert _widgets_by_description(viewer, "Cases:") == []
+    assert _is_shown(viewer, "Case")
+    assert not _is_shown(viewer, "Cases")
 
 
 def test_mixed_spatial_selection_keeps_union_channels_without_fabrication(
@@ -253,8 +261,8 @@ def test_mixed_spatial_selection_keeps_union_channels_without_fabrication(
     render_calls: list[dict[str, Any]] = []
     monkeypatch.setattr(
         viewers.ui.viewers,
-        "render_figure",
-        lambda **kwargs: render_calls.append(kwargs),
+        "render_view",
+        lambda *_args, **kwargs: render_calls.append(kwargs),
     )
     spatial_viewer = viewers.make_spatial_case_view(
         catalog=catalog,
@@ -262,7 +270,7 @@ def test_mixed_spatial_selection_keeps_union_channels_without_fabrication(
         export_state={"fig": None, "plot_name": "spatial", "title": "spatial"},
         export_plot_name="spatial",
         export_title="spatial",
-    )
+    ).widget
     assert isinstance(_widget_by_description(spatial_viewer, "p [Pa]"), widgets.Checkbox)
     resolution = transient_plots.capabilities.resolve_fields(
         {"Reference": transient_frame, "Reduced": reduced_frame},
@@ -278,6 +286,96 @@ def test_mixed_spatial_selection_keeps_union_channels_without_fabrication(
     state.select_datasets(tuple(view.key for view in catalog.views))
     assert isinstance(_widget_by_description(spatial_viewer, "p [Pa]"), widgets.Checkbox)
     assert render_calls
+
+
+def test_failing_field_resolution_is_shown_in_the_view_and_clears_the_export(transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Channel resolution after a selection change fails inside the view, not in the selection callback."""
+    monkeypatch.setattr(viewers.ui.viewers, "render_view", lambda *_args, **_kwargs: None)
+    catalog = _adaptive_catalog((("Reference", transient_frame), ("Second", transient_frame)))
+    state = selection.GeneratedOutputSelectionState(catalog)
+    state.select_datasets((catalog.views[0].key,))
+    export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "spatial", "title": "spatial"}
+    view = viewers.make_spatial_case_view(
+        catalog=catalog, selection_state=state, export_state=export_state, export_plot_name="spatial", export_title="spatial"
+    )
+    export_state["fig"] = Figure()
+
+    def unreadable(*_args: Any, **_kwargs: Any) -> None:
+        message = "fields unreadable"
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(viewers.capabilities, "resolve_fields", unreadable)
+    state.select_datasets(tuple(item.key for item in catalog.views))
+
+    assert view.failure.shown
+    assert "fields unreadable" in view.failure.widget.value
+    assert export_state["fig"] is None
+
+
+def test_failure_supersedes_a_render_in_flight(transient_frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A render that is still running when a newer selection fails cannot clear the failure or export the old selection."""
+    catalog = _adaptive_catalog((("Reference", transient_frame), ("Second", transient_frame)))
+    state = selection.GeneratedOutputSelectionState(catalog)
+    state.select_datasets((catalog.views[0].key,))
+    calls = 0
+
+    def unreadable(*_args: Any, **_kwargs: Any) -> None:
+        message = "fields unreadable"
+        raise RuntimeError(message)
+
+    def plot(**_kwargs: Any) -> Figure:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            monkeypatch.setattr(viewers.capabilities, "resolve_fields", unreadable)
+            state.select_datasets(tuple(item.key for item in catalog.views))
+        return Figure()
+
+    monkeypatch.setattr(viewers.plots.transient, "plot_spatial_field_comparison", plot)
+    export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "spatial", "title": "spatial"}
+    view = viewers.make_spatial_case_view(
+        catalog=catalog, selection_state=state, export_state=export_state, export_plot_name="spatial", export_title="spatial"
+    )
+    assert calls == 1
+    assert isinstance(export_state["fig"], Figure)
+
+    _widget_by_description(view.widget, "Lock color scale").value = True
+
+    assert calls == 2
+    assert view.failure.shown
+    assert export_state["fig"] is None
+
+
+def test_published_tensor_view_steps_stored_transitions_with_the_time_navigator(
+    transient_package: dict[str, Any],
+) -> None:
+    """A transient package shows the time navigator over its transition start times and names the transition it plots."""
+    prepared = workspace.prepare_published_dataset_eda_workspace(storage_root=transient_package["root"], max_cases=1)
+    assert prepared.selection_state is not None
+    package = prepared.catalog.views[0]
+    export_state: dict[str, Any] = {"fig": None, "figures": (), "plot_name": "tensor", "title": "Tensor"}
+
+    view = viewers.make_published_tensor_view(
+        catalog=prepared.catalog,
+        selection_state=prepared.selection_state,
+        export_state=export_state,
+        export_plot_name="tensor",
+        export_title="Tensor",
+    )
+    try:
+        assert not view.failure.shown
+        assert _is_shown(view.widget, "Time [h]")
+        assert isinstance(export_state["fig"], Figure)
+        time = package.load().iloc[0]["time"]
+        starts = tuple(float(value) for value in time["transition_t_n_hours"])
+        assert len(starts) > 1
+        _widget_by_description(view.widget, "Time [h]").value = starts[-1]
+        assert f"Time {starts[-1]:g} h" in view.status.text
+        assert "→" not in view.status.text
+        title = export_state["fig"].axes[0].get_title()
+        assert f"{starts[-1]:g} h → {float(time['transition_t_n_plus_1_hours'][-1]):g} h" in title
+    finally:
+        plt.close("all")
 
 
 def test_target_attainment_censoring_grouping_exclusions_and_runtime_separation(

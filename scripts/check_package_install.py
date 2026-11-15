@@ -171,7 +171,7 @@ assert (
     is dataset_packages_generated_batch.interpret_admitted_transient_source_case
 )
 assert datasets.contracts.identity.DatasetIdentity is dataset_contracts_identity.DatasetIdentity
-assert datasets.preprocessing.normalization.data_processor_from_state is dataset_preprocessing_normalization.data_processor_from_state
+assert datasets.preprocessing.normalization.TrainScaling is dataset_preprocessing_normalization.TrainScaling
 assert datasets.preprocessing.scaling.fit_or_load_scaling is dataset_preprocessing_scaling.fit_or_load_scaling
 assert datasets.packages.build_dataset_selection is dataset_packages.build_dataset_selection
 assert datasets.packages.discover_source_collections is dataset_packages_selection.discover_source_collections

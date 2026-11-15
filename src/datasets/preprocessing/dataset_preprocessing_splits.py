@@ -53,6 +53,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from src import common, domain
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition_contract
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
@@ -618,12 +619,12 @@ def _admit_spatial_view(value: Any) -> dict[str, int]:
     if not isinstance(value, Mapping) or set(value) != set(_SPATIAL_VIEW_KEYS):
         msg = "Transient split spatial_view has unexpected fields."
         raise ValueError(msg)
-    stride = transient_contract.validate_spatial_stride(value["spatial_stride"])
+    stride = grid_contract.validate_spatial_stride(value["spatial_stride"])
     axes = tuple(value[key] for key in _SPATIAL_VIEW_KEYS[1:])
     if any(isinstance(axis, bool) or not isinstance(axis, int) or axis < _MINIMUM_SPATIAL_AXIS_LENGTH for axis in axes):
         msg = "Transient split spatial-view axes must be integers >= 2."
         raise ValueError(msg)
-    if transient_contract.resolve_spatial_view((axes[0], axes[1]), stride) != (axes[2], axes[3]):
+    if grid_contract.resolve_spatial_view((axes[0], axes[1]), stride) != (axes[2], axes[3]):
         msg = "Transient split effective grid does not match its canonical grid and stride."
         raise ValueError(msg)
     return dict(value)

@@ -26,8 +26,7 @@ def test_transient_drying_registers_authoritative_profiles_and_metrics() -> None
     assert tuple(name for name in complete.fields if name in {"x", "y"}) == ("x", "y")
     assert task.field("x").representation == ("identity_before_train_normalization")
     assert task.field("y").representation == ("identity_before_train_normalization")
-    assert task.preprocessing.input_normalization == ("train_only_group_specific_scaling_with_unique_state_deduplication")
-    assert task.preprocessing.output_normalization == ("train_only_zero_preserving_per_channel_increment_scaling")
+    assert task.preprocessing.normalization == domain.tasks.registry.get_task("steady_flow").preprocessing.normalization
 
     assert task.output_names == ("delta_T", "delta_phi", "delta_w_surf", "delta_w_int")
     assert task.metric_names == ("T", "phi", "w_surf", "w_int")
@@ -36,12 +35,13 @@ def test_transient_drying_registers_authoritative_profiles_and_metrics() -> None
 
     objective = next(metric for metric in task.default_metrics if metric.id == "normalized_drying_group_macro_rmse")
     assert (objective.kind, objective.space, objective.fields, objective.reduction, objective.direction) == (
-        "drying_group_macro_rmse",
-        "normalized",
+        "group_macro_rmse",
+        "physical",
         task.metric_names,
-        "group_macro_element_mean",
+        "material_case_mean",
         "minimize",
     )
+    assert {term.id: term.weight for term in task.error_terms} == {"T": 1 / 3, "phi": 1 / 3, "w_surf": 1 / 6, "w_int": 1 / 6}
 
 
 def test_transient_task_serialization_and_steady_payload_compatibility() -> None:

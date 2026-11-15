@@ -3,22 +3,22 @@
 Responsibilities:
   - Keep disabled tracking free of SDK imports and tracking side effects
   - Persist opaque fresh identities and exact-resume identities locally first
-  - Publish bounded semantic config, completed-epoch history, summaries, and curated media
+  - Publish bounded semantic config, training-event history over the optimisation clock, and terminal summaries
   - Mirror authoritative ID, OOD, and physics event values without recomputation
   - Fail closed on requested online or offline observer failures
   - Keep the SDK console silent and the online SDK directory node-local, preserved in the run folder after an observer failure
-  - Keep built-in system telemetry secondary to scientific metrics
+  - Keep built-in system telemetry secondary to scientific metrics, and bound to the job's allocated GPUs
 
 Design principles:
   - Local config, split, normalizer, checkpoints, summaries and artifacts win
-  - W&B observes training and artifacts but never chooses or reconstructs them
-  - Normal histories contain genuine completed epochs only. Final results are summaries
+  - W&B observes training but never chooses or reconstructs local state
+  - Normal histories contain genuine training events (validation points, epoch and budget ends) only. Final results are summaries
   - Fresh and exact-resume sessions have strict fail-closed identity semantics
   - Secrets, arbitrary environment state and incidental absolute paths are absent
 
 This module does NOT:
   - Own training, checkpoint, scheduler, pruning, or local lifecycle decisions
-  - Upload raw datasets, resume-only checkpoints, arbitrary files, or cache internals
+  - Upload datasets, checkpoints, artifacts, or media (the SDK syncs only its own run metadata and system metrics)
   - Make remote availability or W&B state a prerequisite for local correctness
 """
 
@@ -27,7 +27,6 @@ from __future__ import annotations
 import copy
 import importlib
 import importlib.metadata
-import math
 import os
 import platform
 import re
@@ -39,7 +38,6 @@ from collections.abc import Callable, Collection, Mapping, MutableMapping, Seque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from numbers import Real
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -51,251 +49,11 @@ from . import experiments_wandb_schema as wandb_schema
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
 
-EpochEndCallback = Callable[[int, dict[str, float]], None]
+EventCallback = Callable[[int, dict[str, float]], None]
 TrackingStateUpdater = Callable[[Mapping[str, Any]], None]
 
-POST_ARTIFACT_MEDIA_KEYS = frozenset(
-    {
-        "run_summary_table",
-        "accuracy_physics_pareto",
-        "physics_residual_diagnostics",
-        "pressure_boundary_summary",
-        "spectral_fidelity",
-    }
-)
-_POST_ARTIFACT_FILE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".html", ".pdf"})
 _SECRET_KEY_PATTERN = re.compile(r"(?i)(WANDB_API_KEY|api[_-]?key|password|secret|token)(\s*[:=]\s*)([^\s,;]+)")
 _MAX_SAFE_ERROR_LENGTH = 600
-_MAX_EVALUATION_SUMMARY_ENTRIES = 512
-_MAX_EVALUATION_SUMMARY_TEXT = 512
-_TRANSIENT_EVALUATION_HORIZONS = "1|2|4|8|16|32|64|128|full"
-_TRANSIENT_EVALUATION_METRIC_KEY = re.compile(
-    rf"^evaluation/(?:0|[1-9][0-9]*)/(?:id|material_ood|parameter_ood)/(?:teacher_forced_one_step|autonomous_full|rolling_origin)/(?:{_TRANSIENT_EVALUATION_HORIZONS})/(?:cumulative|endpoint)/(?P<metric>[A-Za-z0-9_]+)$"
-)
-_TRANSIENT_EVALUATION_PIPELINE_KEY = re.compile(r"^evaluation/pipeline/(?:0|[1-9][0-9]*)/(?P<metric>[A-Za-z0-9_]+)$")
-_STEADY_EVALUATION_METRIC_KEY = re.compile(r"^evaluation/(?:id|material_ood|parameter_ood)/(?P<metric>[A-Za-z0-9_]+)$")
-_EVALUATION_DATASET_KEY = re.compile(r"^evaluation/identity/dataset/(?:id|material_ood|parameter_ood)/name$")
-_TRANSIENT_EVALUATION_SPEEDUP_KEY = re.compile(
-    r"^evaluation/timing/speedup/(?P<name>drying_only_solver_speedup|full_pipeline_solver_speedup|hybrid_component_speedup|comsol_process_speedup|generation_compute_end_to_end_speedup)/(?P<metric>available_count|unavailable_count|ratio_of_sums)$"
-)
-_EVALUATION_COMPONENT_KEY = re.compile(
-    r"^evaluation/timing/component/(?P<name>comsol_transient_drying_seconds|drying_no_rollout_model_seconds|dataset_materialization_seconds|batch_amortized_neural_operator_forward_seconds)/(?P<metric>available_count|median_seconds)$"
-)
-_SUPPORT_COUNT_METRICS = ("required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count")
-_STEADY_EVALUATION_COUNT_METRICS = frozenset({"valid_case_count", "nonfinite_case_count", *_SUPPORT_COUNT_METRICS})
-_STEADY_EVALUATION_SUMMARY_METRICS = frozenset(
-    {
-        *_STEADY_EVALUATION_COUNT_METRICS,
-        "normalized_group_macro_rmse",
-        *(f"{space}_rmse_{field}" for space in ("normalized", "physical") for field in ("p", "u", "v")),
-    }
-)
-_TRANSIENT_EVALUATION_SUMMARY_METRICS = frozenset(
-    {
-        "normalized_drying_group_macro_rmse",
-        "contributing_record_count",
-        "contributing_case_count",
-        "unavailable_case_count",
-        "elapsed_physical_time_median",
-        "physical_w_gr_rmse",
-        "physical_w_gr_mae",
-        "bulk_dry_basis_rmse",
-        "bulk_wet_basis_rmse",
-        "bulk_moisture_valid_count",
-        "bulk_moisture_unavailable_count",
-        "target_available_count",
-        "predicted_right_censored_count",
-        "target_time_error_count",
-        "target_time_error_mean",
-        "target_time_error_mae",
-        "target_gap_count",
-        "predicted_final_target_gap_mean",
-        "reference_final_target_gap_mean",
-        "target_final_gap_error_mean",
-        "target_final_gap_error_mae",
-        "nonfinite_values",
-        "negative_moisture_values",
-        "abnormal_increment_growth_count",
-        *_SUPPORT_COUNT_METRICS,
-        *(f"normalized_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
-        *(f"physical_rmse_{field}" for field in ("T", "phi", "w_surf", "w_int")),
-        *(f"physical_mae_{field}" for field in ("T", "phi", "w_surf", "w_int")),
-    }
-)
-_TRANSIENT_EVALUATION_COUNT_METRICS = frozenset(
-    {
-        "contributing_record_count",
-        "contributing_case_count",
-        "unavailable_case_count",
-        "bulk_moisture_valid_count",
-        "bulk_moisture_unavailable_count",
-        "target_available_count",
-        "predicted_right_censored_count",
-        "target_time_error_count",
-        "target_gap_count",
-        "nonfinite_values",
-        "negative_moisture_values",
-        "abnormal_increment_growth_count",
-        *_SUPPORT_COUNT_METRICS,
-    }
-)
-_TRANSIENT_EVALUATION_PIPELINE_METRICS = frozenset(
-    {
-        "drying_surrogate_error",
-        "c_available",
-        "complete_pipeline_error",
-        "airflow_substitution_discrepancy",
-        "signed_airflow_degradation",
-        "airflow_degradation_ratio",
-        "upstream_airflow_error",
-    }
-)
-_EVALUATION_HASH_IDENTITIES = frozenset(
-    {
-        "evaluation/identity/checkpoint_sha256",
-        "evaluation/identity/timing_evidence_sha256",
-        "evaluation/identity/dataset_sha256",
-        "evaluation/timing/hardware_identity_sha256",
-    }
-)
-_EVALUATION_EXACT_TEXT_IDENTITIES = {
-    "evaluation/identity/input_profile": frozenset({"canonical_physics_complete"}),
-    "evaluation/identity/model_kind": frozenset({"fno", "uno", "rno"}),
-    "evaluation/timing/precision": frozenset({"float32"}),
-}
-_EVALUATION_LOGICAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,254}$")
-_EVALUATION_SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_EVALUATION_DEVICE = re.compile(r"^(?:cpu|cuda(?::[0-9]+)?)(?:\|(?:cpu|cuda(?::[0-9]+)?))*$")
-
-
-def _is_nonnegative_int(value: Any) -> bool:
-    """Return whether one outbound aggregate is an exact non-negative integer."""
-    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
-
-
-def _is_finite_number(value: Any) -> bool:
-    """Return whether one outbound aggregate is a finite real non-boolean."""
-    return not isinstance(value, bool) and isinstance(value, Real) and math.isfinite(float(value))
-
-
-def _require_summary_number(key: str, value: Any, *, count: bool) -> None:
-    """Require one Evaluation count to be a non-negative integer and one aggregate to be finite."""
-    if count and not _is_nonnegative_int(value):
-        msg = f"Evaluation count {key!r} must be a non-negative integer."
-        raise TrackingError(msg)
-    if not count and not _is_finite_number(value):
-        msg = f"Evaluation aggregate {key!r} must be finite numeric evidence."
-        raise TrackingError(msg)
-
-
-def _validate_metric_entry(key: str, value: Any) -> bool:
-    """Validate one steady role, transient mode/horizon or pipeline aggregate key when recognized."""
-    for pattern, vocabulary, counts in (
-        (_STEADY_EVALUATION_METRIC_KEY, _STEADY_EVALUATION_SUMMARY_METRICS, _STEADY_EVALUATION_COUNT_METRICS),
-        (_TRANSIENT_EVALUATION_METRIC_KEY, _TRANSIENT_EVALUATION_SUMMARY_METRICS, _TRANSIENT_EVALUATION_COUNT_METRICS),
-    ):
-        metric_match = pattern.fullmatch(key)
-        if metric_match is not None:
-            if metric_match.group("metric") not in vocabulary:
-                return False
-            _require_summary_number(key, value, count=metric_match.group("metric") in counts)
-            return True
-
-    pipeline_match = _TRANSIENT_EVALUATION_PIPELINE_KEY.fullmatch(key)
-    if pipeline_match is None:
-        return False
-    metric = pipeline_match.group("metric")
-    if metric not in _TRANSIENT_EVALUATION_PIPELINE_METRICS:
-        return False
-    if metric == "c_available":
-        if not _is_nonnegative_int(value) or int(value) not in {0, 1}:
-            msg = "Transient Evaluation pipeline availability must be exactly 0 or 1."
-            raise TrackingError(msg)
-    elif not _is_finite_number(value):
-        msg = f"Transient Evaluation pipeline aggregate {key!r} must be finite numeric evidence."
-        raise TrackingError(msg)
-    return True
-
-
-def _validate_identity_entry(key: str, value: Any) -> bool:
-    """Validate one exact approved Dataset, model, or Training identity key."""
-    if key in _EVALUATION_HASH_IDENTITIES:
-        if not isinstance(value, str) or _EVALUATION_SHA256.fullmatch(value) is None:
-            msg = f"Evaluation identity {key!r} must be one SHA-256 digest."
-            raise TrackingError(msg)
-        return True
-    allowed = _EVALUATION_EXACT_TEXT_IDENTITIES.get(key)
-    if allowed is not None:
-        if value not in allowed:
-            msg = f"Evaluation identity {key!r} is unsupported."
-            raise TrackingError(msg)
-        return True
-    if key == "evaluation/identity/checkpoint_epoch":
-        if not _is_nonnegative_int(value):
-            msg = "Evaluation checkpoint epoch must be a non-negative integer."
-            raise TrackingError(msg)
-        return True
-    if _EVALUATION_DATASET_KEY.fullmatch(key) is not None:
-        if not isinstance(value, str) or _EVALUATION_LOGICAL_NAME.fullmatch(value) is None:
-            msg = "Evaluation Dataset identity must be one bounded logical name."
-            raise TrackingError(msg)
-        return True
-    return False
-
-
-def _validate_timing_entry(key: str, value: Any) -> bool:
-    """Validate one approved aggregate timing, device, or speedup entry."""
-    if key == "evaluation/timing/device":
-        if not isinstance(value, str) or _EVALUATION_DEVICE.fullmatch(value) is None:
-            msg = "Evaluation device identity is unsupported."
-            raise TrackingError(msg)
-        return True
-    if key == "evaluation/timing/warmup_passes":
-        if not _is_nonnegative_int(value):
-            msg = "Evaluation warm-up count must be a non-negative integer."
-            raise TrackingError(msg)
-        return True
-    if key == "evaluation/timing/component_composed":
-        if not isinstance(value, bool):
-            msg = "Transient Evaluation component-composed identity must be boolean."
-            raise TrackingError(msg)
-        return True
-
-    speedup_match = _TRANSIENT_EVALUATION_SPEEDUP_KEY.fullmatch(key)
-    if speedup_match is not None:
-        metric = speedup_match.group("metric")
-        if metric in {"available_count", "unavailable_count"}:
-            if not _is_nonnegative_int(value):
-                msg = f"Transient Evaluation speedup count {key!r} must be a non-negative integer."
-                raise TrackingError(msg)
-        elif not _is_finite_number(value) or float(value) <= 0.0:
-            msg = f"Transient Evaluation speedup {key!r} must be finite and positive."
-            raise TrackingError(msg)
-        return True
-
-    component_match = _EVALUATION_COMPONENT_KEY.fullmatch(key)
-    if component_match is None:
-        return False
-    metric = component_match.group("metric")
-    if metric == "available_count":
-        if not _is_nonnegative_int(value):
-            msg = f"Evaluation timing count {key!r} must be a non-negative integer."
-            raise TrackingError(msg)
-    elif not _is_finite_number(value) or float(value) < 0.0:
-        msg = f"Evaluation timing median {key!r} must be finite and non-negative."
-        raise TrackingError(msg)
-    return True
-
-
-def _validate_evaluation_summary_entry(key: Any, value: Any) -> str:
-    """Admit only the declared aggregate and identity publication vocabulary of both tasks."""
-    if not isinstance(key, str) or not key:
-        msg = "Evaluation summary keys must be non-empty text."
-        raise TrackingError(msg)
-    if _validate_metric_entry(key, value) or _validate_identity_entry(key, value) or _validate_timing_entry(key, value):
-        return key
-    msg = f"Unsupported Evaluation summary key {key!r}."
-    raise TrackingError(msg)
 
 
 def automatic_history_metric_definitions(
@@ -307,8 +65,8 @@ def automatic_history_metric_definitions(
     cuda_enabled: bool,
     optuna_trial: bool = False,
     task_id: str | None = None,
-    state_aux_enabled: bool = False,
     ood_roles: Collection[str] = (),
+    rollout_curriculum: bool = False,
 ) -> tuple[wandb_schema.MetricProjection, ...]:
     """Return the ordered curated history contract; the schema module owns sections and key names."""
     return wandb_schema.curated_metric_projections(
@@ -317,10 +75,10 @@ def automatic_history_metric_definitions(
         objective_id=objective_id,
         physics_training_enabled=physics_training_enabled,
         physics_monitor_enabled=physics_monitor_enabled,
-        state_aux_enabled=state_aux_enabled,
         ood_roles=ood_roles,
         cuda_enabled=cuda_enabled,
         optuna_trial=optuna_trial,
+        rollout_curriculum=rollout_curriculum,
     )
 
 
@@ -328,8 +86,8 @@ class TrackingError(RuntimeError):
     """
     Base class for failures owned by the optional tracking boundary.
 
-    These errors describe observer initialization, local offline persistence, or
-    upload-admission failure. They never represent local scientific-run validity.
+    These errors describe observer initialization or local offline persistence
+    failure. They never represent local scientific-run validity.
     """
 
 
@@ -346,15 +104,6 @@ class TrackingIOError(TrackingError):
     """Represent loss of records in an explicitly requested tracking mode."""
 
 
-class TrackingUploadError(TrackingError):
-    """
-    Represent rejection by the run-file or curated-media upload allowlist.
-
-    The error is raised before an SDK mutation for unsupported kinds, paths,
-    formats, cache ownership, or disabled checkpoint publication.
-    """
-
-
 class _WandbRun(Protocol):
     """Describe the SDK run surface used by the lifecycle adapter."""
 
@@ -363,23 +112,13 @@ class _WandbRun(Protocol):
     url: str | None
 
     def define_metric(self, name: str, **kwargs: Any) -> Any:
-        """Define one supported metric family and its epoch step contract."""
+        """Define one supported metric family and its x-axis contract."""
 
-    def log(self, data: Mapping[str, Any], *, step: int) -> None:
-        """Log one completed epoch."""
+    def log(self, data: Mapping[str, Any]) -> None:
+        """Log one training event; ``train_seconds`` in the data is the x-axis."""
 
     def finish(self, exit_code: int = 0) -> None:
         """Finalize the tracking run."""
-
-
-class _WandbArtifact(Protocol):
-    """Describe the bounded W&B artifact bundle surface."""
-
-    def add_file(self, path: str, *, name: str) -> None:
-        """Add one explicit rendered media file."""
-
-    def add(self, value: Any, name: str) -> None:
-        """Add one explicit prebuilt table object."""
 
 
 class _WandbModule(Protocol):
@@ -392,9 +131,6 @@ class _WandbModule(Protocol):
 
     def init(self, **kwargs: Any) -> _WandbRun | None:
         """Initialize one W&B run."""
-
-    def Table(self, *, columns: Sequence[str], data: Sequence[Sequence[object]]) -> Any:  # noqa: N802
-        """Build one W&B table from a neutral curated payload."""
 
 
 def _require_initialized_run(run: _WandbRun | None) -> _WandbRun:
@@ -550,7 +286,7 @@ def _build_transient_semantic_config(
             },
             "loader": {
                 key: copy.deepcopy(data_config.get(key))
-                for key in ("batch_size", "num_workers", "pin_memory", "persistent_workers", "spatial_stride")
+                for key in ("evaluation_batch_size", "num_workers", "pin_memory", "persistent_workers", "spatial_stride")
             },
             "split": split_payload,
             "normalization": scaling_payload,
@@ -615,7 +351,7 @@ def build_semantic_config(
         raise TypeError(msg)
     dataset_payload, split_payload = _split_semantics(split_indices, split_indices_sha256=split_indices_sha256)
     data_config = cast("Mapping[str, Any]", config["data"])
-    loader_keys = ("batch_size", "num_workers", "pin_memory", "persistent_workers")
+    loader_keys = ("evaluation_batch_size", "num_workers", "pin_memory", "persistent_workers")
     preprocessing = task_contract.get("preprocessing")
     physics_contract = task_contract.get("physics")
     if not isinstance(preprocessing, Mapping) or not isinstance(physics_contract, Mapping):
@@ -642,7 +378,7 @@ def build_semantic_config(
             "enabled": bool(monitor_config["enabled"]),
             "role": "id",
             "membership": "bounded_saved_evaluation_prefix",
-            "interval_epochs": int(monitor_config["interval"]),
+            "cadence": "validation_points",
             "max_cases": int(monitor_config["max_cases"]),
             "physics_kind": physics_contract.get("kind"),
             "equation_set": physics_contract.get("equation_set"),
@@ -656,15 +392,12 @@ def build_semantic_config(
     model_payload["variant"] = learning.models.naming.architecture_label(config)
     model_payload["parameter_counts"] = parameter_counts
     evaluation_payload = copy.deepcopy(dict(cast("Mapping[str, Any]", config["evaluation"])))
-    training_config = cast("Mapping[str, Any]", config["training"])
     evaluation_payload["roles"] = {
         "selection": "id",
         "id_interpretation": "in_distribution_validation",
         "diagnostic": ["material_ood", "parameter_ood", "physics"],
-        "event_model": "completed_epoch_interval_or_terminal",
-        "id_interval_epochs": int(training_config["evaluation_interval"]),
-        "ood_interval_epochs": int(training_config["ood_evaluation_interval"]),
-        "physics_interval_epochs": int(monitor_config["interval"]),
+        "event_model": "budget_validation_points",
+        "validation_points": learning.training.budget.VALIDATION_POINTS,
         "epoch_zero_evaluation": False,
     }
     source = _git_metadata()
@@ -754,9 +487,31 @@ def build_monitor_membership(
     }
 
 
-def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | None]:
+def allocated_gpu_ids(visible_devices: str | None) -> list[int] | None:
     """
-    Recover the sole W&B identity and latest successful epoch from local sessions.
+    Return the node GPU indices of the job's allocation for the W&B system monitor, or ``None`` to monitor every visible GPU.
+
+    Slurm exposes the allocated GPUs as ``CUDA_VISIBLE_DEVICES`` with node indices; on nodes without device isolation the
+    monitor otherwise records the other jobs' GPUs as well. Without the variable every GPU the process sees is its own.
+
+    Raises
+    ------
+    ValueError
+        If the variable names devices by anything but non-negative integer indices.
+
+    """
+    if visible_devices is None or not visible_devices.strip():
+        return None
+    entries = [entry.strip() for entry in visible_devices.split(",")]
+    if not all(entry.isdigit() for entry in entries):
+        msg = f"CUDA_VISIBLE_DEVICES must list integer GPU indices to bind the W&B system monitor, got {visible_devices!r}."
+        raise ValueError(msg)
+    return [int(entry) for entry in entries]
+
+
+def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | None, int | None]:
+    """
+    Recover the sole W&B identity and the latest successfully logged global step and validation point from local sessions.
 
     Parameters
     ----------
@@ -765,8 +520,8 @@ def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | Non
 
     Returns
     -------
-    tuple[str, int | None]
-        Persisted W&B run ID and maximum locally recorded logged epoch.
+    tuple[str, int | None, int | None]
+        Persisted W&B run ID, maximum locally recorded logged global step and maximum logged validation point.
 
     Raises
     ------
@@ -779,7 +534,8 @@ def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | Non
         msg = "Run summary runtime_sessions must be a list."
         raise TrackingInitializationError(msg)
     identities: set[str] = set()
-    last_epoch: int | None = None
+    last_step: int | None = None
+    last_point: int | None = None
     for raw_session in raw_sessions:
         if not isinstance(raw_session, Mapping):
             continue
@@ -789,19 +545,16 @@ def persisted_wandb_identity(summary: Mapping[str, Any]) -> tuple[str, int | Non
         run_id = state.get("wandb_run_id")
         if isinstance(run_id, str) and run_id:
             identities.add(run_id)
-        raw_epoch = state.get("last_logged_epoch")
-        if isinstance(raw_epoch, int) and not isinstance(raw_epoch, bool):
-            last_epoch = raw_epoch if last_epoch is None else max(last_epoch, raw_epoch)
+        raw_step = state.get("last_logged_step")
+        if isinstance(raw_step, int) and not isinstance(raw_step, bool):
+            last_step = raw_step if last_step is None else max(last_step, raw_step)
+        raw_point = state.get("last_logged_point")
+        if isinstance(raw_point, int) and not isinstance(raw_point, bool):
+            last_point = raw_point if last_point is None else max(last_point, raw_point)
     if len(identities) != 1:
         msg = f"Exact W&B resume requires one persisted run ID, found {len(identities)}."
         raise TrackingInitializationError(msg)
-    return next(iter(identities)), last_epoch
-
-
-def persisted_evaluation_summary_keys(summary: Mapping[str, Any]) -> frozenset[str]:
-    """Return every Evaluation summary key that any recorded runtime session published to W&B."""
-    states = (session.get("tracking") for session in summary.get("runtime_sessions", []) if isinstance(session, Mapping))
-    return frozenset(key for state in states if isinstance(state, Mapping) for key in state.get("evaluation_summary_keys", ()))
+    return next(iter(identities)), last_step, last_point
 
 
 @dataclass(slots=True)
@@ -809,7 +562,6 @@ class WandbSession:
     """Own one optional, fail-closed W&B mirror of authoritative local state."""
 
     _run: _WandbRun | None
-    _wandb: Any | None
     objective_id: str
     objective_direction: str
     evaluation_metric_ids: frozenset[str]
@@ -817,18 +569,15 @@ class WandbSession:
     run_id: str | None
     run_dir: Path
     run_name: str
-    task_id: str
-    upload_settings: Mapping[str, Any]
     semantic_config: Mapping[str, Any] = field(default_factory=dict)
     history_metric_definitions: tuple[wandb_schema.MetricProjection, ...] = ()
     state_updater: TrackingStateUpdater | None = None
-    _resumed_through_epoch: int | None = None
-    _published_summary_keys: frozenset[str] = frozenset()
-    _last_logged_epoch: int | None = None
+    _resumed_through_step: int | None = None
+    _resumed_through_point: int | None = None
+    _last_logged_step: int | None = None
     _finished: bool = False
     _observer_failed: bool = False
     _failed_operation: str | None = None
-    _uploaded_media: list[str] = field(default_factory=list)
     _local_root: Path | None = None
 
     def _preserve_local_state(self) -> None:
@@ -876,228 +625,50 @@ class WandbSession:
             raise self._operation_failure(error, operation=operation) from error
         return True
 
-    def log_epoch(self, epoch: int, metrics: Mapping[str, float]) -> None:
+    def log_event(self, step: int, metrics: Mapping[str, float]) -> None:
         """
-        Log one strictly increasing completed epoch with only approved keys.
+        Log one training event at its strictly increasing global step with only approved keys.
 
-        A resume trains the epochs after its restored ``last_checkpoint.pt`` again;
-        an epoch an earlier session already logged keeps its first values and is
-        not sent again, while the in-session order stays strict.
+        A resume trains the groups after its restored ``last_checkpoint.pt`` again;
+        the training series of a step an earlier session already logged keep
+        their first values and are not sent again, while the in-session order
+        stays strict. The validation series are identified by their
+        ``validation/point`` index instead: a point an earlier session logged is
+        not sent again, at any step, and a new point is sent even at a lower one.
+        The point is persisted before it is sent, so a crash in between loses at
+        most that point and never duplicates it. History is logged without W&B's
+        own step, which only counts calls; ``train_seconds`` (the optimisation clock) in the payload is the x-axis.
         """
+        # Checked before the disabled return, so runs without W&B also hold the producer to the axis contract.
+        if "budget/train_seconds" not in metrics:
+            msg = "W&B training-event history requires budget/train_seconds, the optimisation clock x-axis."
+            raise TrackingError(msg)
         if self._run is None or self._finished:
             return
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
-            msg = "W&B completed-epoch history requires an integer epoch >= 1."
+        if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+            msg = "W&B training-event history requires an integer global step >= 1."
             raise TrackingError(msg)
-        if self._last_logged_epoch is not None and epoch <= self._last_logged_epoch:
-            msg = f"W&B completed-epoch history cannot rewrite epoch {epoch}. The last successful epoch is {self._last_logged_epoch}."
+        if self._last_logged_step is not None and step <= self._last_logged_step:
+            msg = f"W&B training-event history cannot rewrite step {step}. The last successful step is {self._last_logged_step}."
             raise TrackingError(msg)
-        if self._resumed_through_epoch is not None and epoch <= self._resumed_through_epoch:
-            self._last_logged_epoch = epoch
-            return
+        raw_point = metrics.get("validation/point")
+        point = None if raw_point is None else int(raw_point)
+        send_training = self._resumed_through_step is None or step > self._resumed_through_step
+        send_validation = point is not None and (self._resumed_through_point is None or point > self._resumed_through_point)
 
-        payload: dict[str, float | int] = {"epoch": epoch}
+        payload: dict[str, float | int] = {"global_step": step, "train_seconds": float(metrics["budget/train_seconds"])}
         # Projection order, not producer order, so first-appearance panel ordering in W&B follows the layout of the sections.
         for definition in self.history_metric_definitions:
-            if definition.source_key in metrics:
+            if definition.source_key in metrics and (send_validation if definition.validation else send_training):
                 payload[definition.wandb_key] = float(metrics[definition.source_key]) * definition.multiplier
-
-        if self._run_operation(
-            "history",
-            lambda: cast("_WandbRun", self._run).log(payload, step=epoch),
-        ):
-            self._last_logged_epoch = epoch
-            self._persist({"last_logged_epoch": epoch})
-
-    def log_evaluation_summary(self, evidence: Mapping[str, Any]) -> None:
-        """Log one schema-restricted steady or transient Evaluation summary."""
-        if self._run is None or self._finished:
-            return
-        if not isinstance(evidence, Mapping) or not evidence or len(evidence) > _MAX_EVALUATION_SUMMARY_ENTRIES:
-            msg = f"W&B Evaluation summary must be one non-empty bounded mapping with at most {_MAX_EVALUATION_SUMMARY_ENTRIES} entries."
-            raise TrackingError(msg)
-        payload: dict[str, bool | float | int | str] = {}
-        for key, value in evidence.items():
-            admitted_key = _validate_evaluation_summary_entry(key, value)
-            if isinstance(value, (bool, int)):
-                payload[admitted_key] = value
-            elif isinstance(value, float):
-                if not math.isfinite(value):
-                    msg = f"W&B Evaluation summary value {admitted_key!r} must be finite."
-                    raise TrackingError(msg)
-                payload[admitted_key] = value
-            elif isinstance(value, str) and value and len(value) <= _MAX_EVALUATION_SUMMARY_TEXT:
-                payload[admitted_key] = value
-            else:
-                msg = f"W&B Evaluation summary value {admitted_key!r} must be a bounded boolean, integer, finite float, or non-empty string."
-                raise TrackingError(msg)
-
-        def update_summary() -> None:
-            """Replace the tracker-published Evaluation summary without writing history arrays."""
-            summary = cast("Any", getattr(self._run, "summary", None))
-            if not callable(getattr(summary, "update", None)):
-                msg_0 = "The active W&B run does not expose summary updates."
-                raise TrackingUploadError(msg_0)
-            stale = sorted((self._published_summary_keys - payload.keys()) & set(summary.keys()))
-            if stale and not hasattr(summary, "__delitem__"):
-                msg_1 = "The active W&B run does not expose summary key removal."
-                raise TrackingUploadError(msg_1)
-            for key in stale:
-                del summary[key]
-            summary.update(payload)
-
-        if self._run_operation("evaluation_summary", update_summary):
-            self._published_summary_keys = frozenset(payload)
-            self._persist(
-                {
-                    "evaluation_summary_keys": sorted(payload),
-                    "evaluation_summary_entry_count": len(payload),
-                }
-            )
-
-    def _validate_run_file(self, kind: str, path: Path) -> None:
-        """Admit only one completed artifact-provenance file under this run."""
-        if kind != "artifact_provenance":
-            msg = f"Unsupported tracked file kind {kind!r}."
-            raise TrackingUploadError(msg)
-        resolved = path.resolve()
-        try:
-            resolved.relative_to((self.run_dir / "analysis").resolve())
-        except ValueError as error:
-            msg = "Artifact provenance must be inside the current run analysis root."
-            raise TrackingUploadError(msg) from error
-        if resolved.name != "artifact_provenance.json":
-            msg = "Artifact provenance upload requires artifact_provenance.json."
-            raise TrackingUploadError(msg)
-        if not resolved.is_file():
-            msg = f"Tracked file is not complete: {resolved}"
-            raise FileNotFoundError(msg)
-
-    def upload_files(self, files: Mapping[str, Path]) -> None:
-        """Upload only explicitly selected evaluation provenance files."""
-        if self._run is None or self._finished or not files:
-            return
-        if not bool(self.upload_settings["evaluation_artifacts"]):
-            msg = "Evaluation-artifact upload is disabled by configuration."
-            raise TrackingUploadError(msg)
-        candidates = [(kind, Path(path)) for kind, path in files.items()]
-        for kind, candidate in candidates:
-            self._validate_run_file(kind, candidate)
-        raw_save = getattr(self._run, "save", None)
-        if not callable(raw_save):
-            error = TrackingUploadError("The active W&B run does not expose bounded file upload.")
-            raise self._operation_failure(error, operation="evaluation_provenance_upload")
-        save = cast("Callable[..., Any]", raw_save)
-        for _kind, candidate in candidates:
-
-            def upload_candidate(candidate: Path = candidate) -> None:
-                """Upload one prevalidated evaluation provenance file."""
-                save(
-                    str(candidate),
-                    base_path=str(self.run_dir),
-                    policy="now",
-                )
-
-            self._run_operation(
-                "evaluation_provenance_upload",
-                upload_candidate,
-            )
-        self._persist(
-            {"uploaded_provenance_files": sorted(str(candidate.resolve().relative_to(self.run_dir.resolve())) for _kind, candidate in candidates)}
-        )
-
-    def upload_post_artifact(
-        self,
-        *,
-        artifact_root: Path,
-        media_files: Mapping[str, Path] | None = None,
-        tables: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Upload the exact curated evaluation bundle without scanning a directory."""
-        files = dict(media_files or {})
-        table_values = dict(tables or {})
-        names = set(files).union(table_values)
-        unsupported = sorted(names.difference(POST_ARTIFACT_MEDIA_KEYS))
-        if unsupported:
-            msg = f"Unsupported post-artifact media key(s): {unsupported}."
-            raise TrackingUploadError(msg)
-        if names and not bool(self.upload_settings["evaluation_artifacts"]):
-            msg = "Evaluation-artifact upload is disabled by configuration."
-            raise TrackingUploadError(msg)
-        missing = sorted(POST_ARTIFACT_MEDIA_KEYS.difference(names))
-        if names and missing:
-            msg = f"Curated evaluation artifact is missing required key(s): {missing}."
-            raise TrackingUploadError(msg)
-        if set(files).intersection(table_values):
-            msg = "Post-artifact keys cannot identify both a file and a table."
-            raise TrackingUploadError(msg)
-        if "run_summary_table" in files:
-            msg = "run_summary_table must be supplied as an already-built table object."
-            raise TrackingUploadError(msg)
-        if any(name != "run_summary_table" for name in table_values):
-            msg = "Only run_summary_table accepts a table object."
-            raise TrackingUploadError(msg)
-        if not names or self._run is None or self._finished:
+        self._last_logged_step = step
+        if payload.keys() <= {"global_step", "train_seconds"}:  # only the hidden axes
             return
 
-        root = Path(artifact_root).resolve()
-        resolved_files: dict[str, Path] = {}
-        for name, raw_path in files.items():
-            candidate = Path(raw_path).resolve()
-            if candidate.is_relative_to(root):
-                msg = f"Curated media {name!r} must be rendered outside the immutable artifact cache."
-                raise TrackingUploadError(msg)
-            if candidate.suffix.lower() not in _POST_ARTIFACT_FILE_SUFFIXES or not candidate.is_file():
-                msg = f"Curated media {name!r} is not an allowed complete rendered file."
-                raise TrackingUploadError(msg)
-            resolved_files[name] = candidate
-
-        normalized_tables: dict[str, Any] = {}
-        for name, table in table_values.items():
-            value = table
-            if isinstance(table, Mapping) and set(table) == {"columns", "data"}:
-                columns = table["columns"]
-                data = table["data"]
-                if (
-                    not isinstance(columns, Sequence)
-                    or isinstance(columns, (str, bytes))
-                    or any(not isinstance(column, str) or not column for column in columns)
-                    or not isinstance(data, Sequence)
-                    or isinstance(data, (str, bytes))
-                ):
-                    msg = "Neutral run_summary_table payload must contain string columns and row data."
-                    raise TrackingUploadError(msg)
-                table_factory = getattr(self._wandb, "Table", None)
-                if not callable(table_factory):
-                    error = TrackingUploadError("The active W&B SDK cannot serialize the run summary table.")
-                    raise self._operation_failure(error, operation="evaluation_artifact_upload")
-                value = table_factory(columns=list(columns), data=list(data))
-            normalized_tables[name] = value
-
-        raw_artifact_factory = getattr(self._wandb, "Artifact", None)
-        raw_log_artifact = getattr(self._run, "log_artifact", None)
-        if not callable(raw_artifact_factory) or not callable(raw_log_artifact):
-            error = TrackingUploadError("The active W&B SDK does not expose evaluation artifact upload.")
-            raise self._operation_failure(error, operation="evaluation_artifact_upload")
-        artifact_factory = cast("Callable[..., _WandbArtifact]", raw_artifact_factory)
-        log_artifact = cast("Callable[..., None]", raw_log_artifact)
-
-        def upload_bundle() -> None:
-            """Create and publish the prevalidated bounded evaluation artifact."""
-            bundle = artifact_factory(
-                name=f"{self.task_id}-{self.run_name}-curated-media",
-                type="evaluation",
-                metadata={"wandb_run_id": self.run_id, "inventory": sorted(names)},
-            )
-            for name, path in resolved_files.items():
-                bundle.add_file(str(path), name=f"{name}{path.suffix.lower()}")
-            for name, table in normalized_tables.items():
-                bundle.add(table, name)
-            log_artifact(bundle, aliases=["latest"])
-
-        if self._run_operation("evaluation_artifact_upload", upload_bundle):
-            self._uploaded_media = sorted(names)
-            self._persist({"uploaded_media": self._uploaded_media})
+        if send_validation:
+            self._persist({"last_logged_point": point})
+        if self._run_operation("history", lambda: cast("_WandbRun", self._run).log(payload)) and send_training:
+            self._persist({"last_logged_step": step})
 
     def _terminal_summary(  # noqa: C901, PLR0912
         self,
@@ -1142,6 +713,9 @@ class WandbSession:
             if isinstance(normalization, Mapping):
                 summary["data/normalizer_sha256"] = normalization.get("artifact_sha256")
         tuning = self.semantic_config.get("tuning")
+        training_outcome = result.get("training_outcome") if result is not None else None
+        if isinstance(training_outcome, Mapping):
+            summary["run/outcome"] = str(training_outcome["status"])
         if isinstance(tuning, Mapping):
             for source, target in (
                 ("study_name", "tuning/study_name"),
@@ -1156,8 +730,11 @@ class WandbSession:
                     summary[target] = copy.deepcopy(tuning[source])
             summary["tuning/final_state"] = status
             summary["Optuna/trial_number"] = tuning.get("trial_number")
-            summary["Optuna/state"] = status
-            summary["Optuna/pruned"] = status in {"pruned", "nonfinite_pruned", "oom_pruned"}
+            # A trial whose training ended states its training outcome: a diverged or ineligible trial is pruned in its study.
+            trained = isinstance(training_outcome, Mapping) and status in {"completed", "unsuccessful"}
+            optuna_state = str(cast("Mapping[str, Any]", training_outcome)["status"]) if trained else status
+            summary["Optuna/state"] = optuna_state
+            summary["Optuna/pruned"] = optuna_state in wandb_schema.PRUNED_OUTCOMES
 
         if result is not None:
             for source, target in (
@@ -1256,15 +833,15 @@ def initialize_wandb(
     semantic_config: Mapping[str, Any] | None = None,
     resume: bool = False,
     persisted_run_id: str | None = None,
-    previous_last_logged_epoch: int | None = None,
-    previous_evaluation_summary_keys: Collection[str] = (),
+    previous_last_logged_step: int | None = None,
+    previous_last_logged_point: int | None = None,
     state_updater: TrackingStateUpdater | None = None,
     ood_roles: Collection[str],
 ) -> WandbSession:
     """Initialize the configured W&B mode with strict identity and metric rules.
 
     ``ood_roles`` names the non-empty OOD Evaluation parts the run was trained with (its split's ``ood_roles``); only those get W&B rows,
-    so every session of one run, including a resumed artifact upload, must pass the same parts.
+    so every session of one run, including a resumed one, must pass the same parts.
     """
     objective = cast("Mapping[str, Any]", config["evaluation"])["objective"]
     objective_mapping = cast("Mapping[str, Any]", objective)
@@ -1282,14 +859,12 @@ def initialize_wandb(
     path = Path(run_dir)
     run_name = str(cast("Mapping[str, Any]", config["run"])["name"])
     task_id = str(config["task"])
-    upload_settings = cast("Mapping[str, Any]", settings["upload"])
     monitor_settings = cast("Mapping[str, Any]", settings["monitor"])
     mode = str(settings["mode"])
     workflow = str(settings["workflow"])
 
     if mode == "disabled":
         return WandbSession(
-            None,
             None,
             objective_id,
             objective_direction,
@@ -1298,8 +873,6 @@ def initialize_wandb(
             None,
             path,
             run_name,
-            task_id,
-            upload_settings,
             semantic_config=copy.deepcopy(dict(semantic_config or {})),
         )
 
@@ -1370,8 +943,9 @@ def initialize_wandb(
         cuda_enabled=cuda_enabled,
         optuna_trial=workflow == "optuna_trial",
         task_id=task_id,
-        state_aux_enabled=float(cast("Mapping[str, Any]", cast("Mapping[str, Any]", config["loss"])["data"]).get("state_aux_weight", 0.0)) > 0.0,
         ood_roles=ood_roles,
+        # The resolved training section carries a curriculum only for the stage that draws rollout horizons (Stage B).
+        rollout_curriculum="curriculum" in cast("Mapping[str, Any]", config["training"]),
     )
 
     # Online SDK state lives on the process TMPDIR (node-local, removed at container exit) and is copied into the run folder
@@ -1382,6 +956,9 @@ def initialize_wandb(
         wandb = cast("_WandbModule", importlib.import_module("wandb"))
         # Process-wide: the credential line is printed before per-run settings apply.
         wandb.setup(settings=wandb.Settings(silent=True))
+        sdk_settings: dict[str, Any] = {"disable_git": True, "disable_code": True}
+        if cuda_enabled and (gpu_ids := allocated_gpu_ids(os.environ.get("CUDA_VISIBLE_DEVICES"))) is not None:
+            sdk_settings["x_stats_gpu_device_ids"] = gpu_ids
         sdk_run = _require_initialized_run(
             wandb.init(
                 project=str(settings["project"]),
@@ -1396,10 +973,7 @@ def initialize_wandb(
                 dir=str(local_root),
                 config=copy.deepcopy(dict(semantic_config or {})),
                 save_code=False,
-                settings={
-                    "disable_git": True,
-                    "disable_code": True,
-                },
+                settings=sdk_settings,
             )
         )
         required_tags = tuple(runtime_tags)
@@ -1408,12 +982,15 @@ def initialize_wandb(
         if merged_tags != existing_tags:
             sdk_run.tags = merged_tags
 
-        sdk_run.define_metric("epoch", hidden=True, summary="none")
+        sdk_run.define_metric("global_step", hidden=True, summary="none")
+        sdk_run.define_metric("train_seconds", hidden=True, summary="none")
+        for name in wandb_schema.SUMMARY_ONLY_KEYS:
+            sdk_run.define_metric(name, hidden=True)
         for definition in history_definitions:
             # summary=None keeps the SDK default, the last value under the history key; "none" keeps a series out of the summary.
             sdk_run.define_metric(
                 definition.wandb_key,
-                step_metric="epoch",
+                step_metric="train_seconds",
                 step_sync=False,
                 summary=None if definition.in_summary else "none",
             )
@@ -1440,7 +1017,6 @@ def initialize_wandb(
 
     return WandbSession(
         sdk_run,
-        wandb,
         objective_id,
         objective_direction,
         metric_ids,
@@ -1448,23 +1024,21 @@ def initialize_wandb(
         run_id,
         path,
         run_name,
-        task_id,
-        upload_settings,
         semantic_config=copy.deepcopy(dict(semantic_config or {})),
         history_metric_definitions=history_definitions,
         state_updater=state_updater,
-        _resumed_through_epoch=previous_last_logged_epoch,
-        _published_summary_keys=frozenset(previous_evaluation_summary_keys),
+        _resumed_through_step=previous_last_logged_step,
+        _resumed_through_point=previous_last_logged_point,
         _local_root=None if mode == "offline" else local_root,
     )
 
 
-def epoch_callback(
+def event_callback(
     session: WandbSession,
     optimizer: Optimizer | None = None,
-) -> EpochEndCallback | None:
+) -> EventCallback | None:
     """
-    Bind an enabled W&B session to completed-epoch telemetry.
+    Bind an enabled W&B session to training-event telemetry.
 
     Parameters
     ----------
@@ -1475,15 +1049,15 @@ def epoch_callback(
 
     Returns
     -------
-    EpochEndCallback | None
+    EventCallback | None
         Callback for the training loop, or ``None`` for a disabled session.
 
     """
     if not session.enabled:
         return None
 
-    def callback(epoch: int, metrics: dict[str, float]) -> None:
-        """Add the current optimizer rate and forward one completed-epoch payload."""
+    def callback(step: int, metrics: dict[str, float]) -> None:
+        """Add the current optimizer rate and forward one training-event payload."""
         values = dict(metrics)
         if "optimization/learning_rate" not in values and optimizer is not None:
             parameter_groups = optimizer.param_groups
@@ -1491,30 +1065,30 @@ def epoch_callback(
                 msg = "Cannot log W&B learning rate: optimizer has no parameter groups."
                 raise RuntimeError(msg)
             values["optimization/learning_rate"] = float(parameter_groups[0]["lr"])
-        session.log_epoch(epoch, values)
+        session.log_event(step, values)
 
     return callback
 
 
-def combine_epoch_callbacks(
-    *callbacks: EpochEndCallback | None,
-) -> EpochEndCallback | None:
+def combine_event_callbacks(
+    *callbacks: EventCallback | None,
+) -> EventCallback | None:
     """
-    Combine non-null completed-epoch consumers without changing their order.
+    Combine non-null training-event consumers without changing their order.
 
     Parameters
     ----------
-    *callbacks : EpochEndCallback | None
-        Scheduler-independent lifecycle callbacks such as Optuna reporting and W&B.
+    *callbacks : EventCallback | None
+        Scheduler-independent lifecycle callbacks such as console, Optuna reporting and W&B.
 
     Returns
     -------
-    EpochEndCallback | None
+    EventCallback | None
         Ordered composite, or ``None`` when every input is disabled.
 
     Notes
     -----
-    Exceptions propagate immediately, so later consumers do not observe an epoch
+    Exceptions propagate immediately, so later consumers do not observe an event
     rejected by an earlier authoritative consumer.
 
     """
@@ -1522,9 +1096,9 @@ def combine_epoch_callbacks(
     if not active:
         return None
 
-    def combined(epoch: int, metrics: dict[str, float]) -> None:
-        """Invoke lifecycle consumers in caller-specified order for one epoch."""
+    def combined(step: int, metrics: dict[str, float]) -> None:
+        """Invoke lifecycle consumers in caller-specified order for one event."""
         for callback in active:
-            callback(epoch, metrics)
+            callback(step, metrics)
 
     return combined

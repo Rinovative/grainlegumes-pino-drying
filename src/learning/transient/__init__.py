@@ -7,7 +7,7 @@ Provides:
 - curriculum: rollout and matched-compute contracts
 - rollout: differentiable teacher-forced and self-fed execution
 - tensorizer: physical-batch tensorization and reconstruction
-- scaling: train-only transient scaling artifacts
+- scaling: case-equal transient Train scaling fit
 - handoff: immutable transient teacher handoffs
 - history: durable transient completed-epoch history
 """

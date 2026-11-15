@@ -66,7 +66,7 @@ def _device_evidence(device: Mapping[str, Any]) -> dict[str, str | None]:
 
 def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
     """Extract transient scientific compatibility while excluding comparison policy."""
-    required = {"task", "task_contract", "input_profile", "temporal", "model", "loss", "optimizer", "scheduler", "scaling", "run", "data", "training"}
+    required = {"task", "task_contract", "input_profile", "temporal", "model", "loss", "optimizer", "scheduler", "run", "data", "training"}
     missing = required.difference(config)
     if missing:
         msg = f"Transient handoff config lacks compatibility roots {sorted(missing)}."
@@ -86,7 +86,6 @@ def compatibility_payload(config: Mapping[str, Any]) -> dict[str, Any]:
         "loss": copy.deepcopy(config["loss"]),
         "optimizer": copy.deepcopy(config["optimizer"]),
         "scheduler": copy.deepcopy(config["scheduler"]),
-        "scaling": copy.deepcopy(config["scaling"]),
         "deterministic": copy.deepcopy(run.get("deterministic")),
         "seed": copy.deepcopy(run.get("seed")),
         "datasets": {

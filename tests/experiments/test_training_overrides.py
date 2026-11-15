@@ -38,24 +38,23 @@ def test_matched_epochs_override_sets_only_the_a0_budget() -> None:
     plan = configs.resolve_plan(changed)
 
     assert raw == before
-    assert changed["training"]["a0"]["max_epochs"] == _EPOCHS
+    assert changed["training"]["a0"]["budget_epochs"] == _EPOCHS
     assert changed["training"]["b"] == raw["training"]["b"]
     assert changed["training"]["a1"] == raw["training"]["a1"]
-    assert plan.a0["training"]["epochs"] == _EPOCHS
-    assert plan.b["training"]["epochs"] == raw["training"]["b"]["max_epochs"]
-    assert plan.a1["training"]["epochs"] == raw["training"]["a1"]["max_epochs"]
+    assert plan.a0["training"]["budget_epochs"] == _EPOCHS
+    assert {config["run"]["layout"]["budget_epochs"] for config in plan.stages} == {_EPOCHS}
 
 
-def test_stage_a_only_epochs_override_keeps_schedule_total_equal_to_epochs() -> None:
-    """The schedule total and training.epochs are one budget, so the override must move both."""
+def test_stage_a_only_epochs_override_keeps_schedule_budget_equal_to_the_run_budget() -> None:
+    """The schedule's and the run's budget_epochs are one budget, so the override must move both."""
     raw = configs.transient_stage_a_only_config()
 
     changed = loader.apply_training_overrides(raw, epochs=_EPOCHS)
     resolved = configs.resolve(changed)
 
-    assert changed["training"]["epochs"] == changed["training"]["stage_schedule"]["total_epochs"] == _EPOCHS
-    assert raw["training"]["epochs"] == raw["training"]["stage_schedule"]["total_epochs"] != _EPOCHS
-    assert resolved["training"]["epochs"] == resolved["training"]["stage_schedule"]["total_epochs"] == _EPOCHS
+    assert changed["training"]["budget_epochs"] == changed["training"]["stage_schedule"]["budget_epochs"] == _EPOCHS
+    assert raw["training"]["budget_epochs"] == raw["training"]["stage_schedule"]["budget_epochs"] != _EPOCHS
+    assert resolved["training"]["budget_epochs"] == resolved["training"]["stage_schedule"]["budget_epochs"] == _EPOCHS
 
 
 def test_steady_epochs_override_changes_only_the_epoch_budget() -> None:
@@ -66,7 +65,7 @@ def test_steady_epochs_override_changes_only_the_epoch_budget() -> None:
     changed = loader.apply_training_overrides(raw, epochs=2)
 
     assert raw == before
-    assert changed["training"]["epochs"] == 2
+    assert changed["training"]["budget_epochs"] == 2
     assert {key: value for key, value in changed.items() if key != "training"} == {key: value for key, value in raw.items() if key != "training"}
 
 

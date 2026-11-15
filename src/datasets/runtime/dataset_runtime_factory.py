@@ -5,8 +5,7 @@ Responsibilities:
   - Dispatch steady and transient packages to their responsible runtimes
   - Bind every runtime to its admitted manifest (digest, ordered cases, fixed partition) the same way for both tasks
   - Open the canonical source HDF5 files of a transient package for whole-case physical reads
-  - Construct DataLoaders with safe worker and collation settings
-  - Form batches whose items share one key, such as a whole-trajectory length
+  - Construct DataLoaders with safe worker and collation settings, from a sampler or fixed batches
 
 Design principles:
   - View runtimes own their data contracts and selection behavior
@@ -21,15 +20,15 @@ This module does NOT:
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-import torch
 from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 
 from src import common
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 from src.datasets.contracts import dataset_contracts_views as views
@@ -41,6 +40,8 @@ from . import dataset_runtime_transient as transient
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import torch
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,13 +59,13 @@ class DatasetRequest:
         """Reject malformed view, source-case, or runtime requests."""
         common.paths.validate_logical_name(self.dataset_id, label="dataset_id")
         views.get_view(self.dataset_view)
+        grid_contract.validate_spatial_stride(self.spatial_stride)
         if self.dataset_view == "transient_drying":
             if not isinstance(self.transient_sampling, transient_contract.TransientSamplingSpec):
                 message = "Transient Dataset requests require one explicit transient_sampling specification."
                 raise TypeError(message)
-            transient_contract.validate_spatial_stride(self.spatial_stride)
-        elif self.transient_sampling is not None or self.spatial_stride != 1:
-            message = "Steady-flow Dataset requests cannot include transient_sampling or a non-unit spatial_stride."
+        elif self.transient_sampling is not None:
+            message = "Steady-flow Dataset requests cannot include transient_sampling."
             raise ValueError(message)
         if self.case_ids is not None and (
             not isinstance(self.case_ids, tuple)
@@ -101,32 +102,6 @@ class LoaderSettings:
         if self.num_workers == 0 and self.persistent_workers:
             message = "persistent_workers requires num_workers > 0."
             raise ValueError(message)
-
-
-class GroupedBatchSampler(Sampler[list[int]]):
-    """Shuffle all items once per epoch and batch only items that share one key."""
-
-    def __init__(self, keys: Sequence[Hashable], batch_size: int, generator: torch.Generator) -> None:
-        """Bind per-item keys, the batch size, and the explicit shuffle generator."""
-        if not keys:
-            message = "Grouped batching requires at least one item."
-            raise ValueError(message)
-        if not isinstance(generator, torch.Generator):
-            message = "Grouped batching requires an explicit torch.Generator."
-            raise TypeError(message)
-        self.keys = tuple(keys)
-        self.batch_size = batch_size
-        self.generator = generator
-        self._batch_count = len(group_batches(range(len(self.keys)), self.keys, batch_size))
-
-    def __iter__(self) -> Iterator[list[int]]:
-        """Yield one epoch of key-homogeneous batches from a fresh permutation."""
-        order = torch.randperm(len(self.keys), generator=self.generator).tolist()
-        return iter(group_batches(order, self.keys, self.batch_size))
-
-    def __len__(self) -> int:
-        """Return the per-epoch batch count, which does not depend on the permutation."""
-        return self._batch_count
 
 
 def _payload_path(manifest: Mapping[str, Any], *, storage_root: Path | str | None) -> Path:
@@ -172,7 +147,7 @@ def create_dataset(request: DatasetRequest) -> Dataset[steady.SteadyFlowItem] | 
     manifest = package_manifest.load_package_manifest(request.dataset_view, request.dataset_id, storage_root=request.storage_root)
     if request.dataset_view == "steady_flow":
         return steady.select_dataset(
-            steady.create_dataset(_payload_path(manifest, storage_root=request.storage_root)),
+            steady.create_dataset(_payload_path(manifest, storage_root=request.storage_root), spatial_stride=request.spatial_stride),
             manifest,
             case_ids=request.case_ids,
         )
@@ -227,53 +202,6 @@ def _collate_runtime_batch(batch: list[Any]) -> Any:
             key: _collate_steady_metadata([item[key] for item in items]) if key == "meta" else default_collate([item[key] for item in items])
             for key in keys
         }
-
-
-def group_batches(order: Sequence[int], keys: Sequence[Hashable] | None, batch_size: int) -> list[list[int]]:
-    """
-    Partition an item order into batches whose items share one key.
-
-    Parameters
-    ----------
-    order : Sequence[int]
-        Item indices in the order they should be consumed.
-    keys : Sequence[Hashable] or None
-        Key of every item index; ``None`` puts all items under one key.
-    batch_size : int
-        Maximum items per batch.
-
-    Returns
-    -------
-    list[list[int]]
-        Batches that keep the relative item order within each key; a batch
-        closes at ``batch_size`` items or at the end, and batches are ordered
-        by their first item. With one key this is consecutive chunking.
-
-    Raises
-    ------
-    ValueError
-        If ``batch_size`` is not a positive integer or an index has no key.
-
-    """
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
-        message = "batch_size must be a positive integer."
-        raise ValueError(message)
-    items = list(order)
-    if keys is None:
-        return [items[start : start + batch_size] for start in range(0, len(items), batch_size)]
-    if any(item < 0 or item >= len(keys) for item in items):
-        message = "Every batched item index needs one key."
-        raise ValueError(message)
-    open_batches: dict[Hashable, tuple[int, list[int]]] = {}
-    closed: list[tuple[int, list[int]]] = []
-    for position, item in enumerate(items):
-        first, batch = open_batches.setdefault(keys[item], (position, []))
-        batch.append(item)
-        if len(batch) == batch_size:
-            closed.append((first, batch))
-            del open_batches[keys[item]]
-    closed.extend(open_batches.values())
-    return [batch for _, batch in sorted(closed, key=lambda entry: entry[0])]
 
 
 def make_data_loader(

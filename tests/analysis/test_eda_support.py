@@ -99,24 +99,21 @@ def test_count_display_preserves_every_exact_time_and_support_change() -> None:
         plt.close(figure)
 
 
-def test_exact_state_sequences_do_not_invert_rounded_float32_increments() -> None:
-    """The actual endpoint survives a valid delta whose rounded inverse differs."""
+def test_transitions_keep_the_stored_states_where_float32_increments_do_not_add_back() -> None:
+    """Every transition starts and ends at stored states, never at a state plus a rounded increment."""
     states = np.asarray([np.full((4, 2, 2), value) for value in (0.35, 0.000123, 0.0001)], dtype=np.float32)
     increments = states[1:] - states[:-1]
     assert not np.array_equal(states[0] + increments[0], states[1])
     item = {
         "state": states[0],
-        "state_sequence": states,
-        "target": increments,
+        "next_state": states[1:],
         "boundary": np.zeros((2, 4), dtype=np.float32),
         "time": {"t_n": np.array([0.0, 1.0]), "t_n_plus_1": np.array([1.0, 2.0]), "dt": np.ones(2)},
     }
     records = transient._runtime_transitions(item)
-    np.testing.assert_array_equal(records[0]["next_state"], states[1])
-    np.testing.assert_array_equal(records[1]["state"], states[1])
-    item["target"] = np.zeros_like(increments)
-    with pytest.raises(ValueError, match="stored state sequence"):
-        transient._runtime_transitions(item)
+    for index, record in enumerate(records):
+        np.testing.assert_array_equal(record["state"], states[index])
+        np.testing.assert_array_equal(record["next_state"], states[index + 1])
 
 
 def test_published_tensor_scales_follow_signed_and_encoded_field_contracts() -> None:
@@ -143,6 +140,50 @@ def test_published_tensor_scales_follow_signed_and_encoded_field_contracts() -> 
                 assert boundaries[5] < 0 < boundaries[6]
             else:
                 np.testing.assert_allclose(np.diff(np.log(boundaries)), np.repeat(np.diff(np.log(boundaries))[0], 11))
+        finally:
+            plt.close(figure)
+
+
+def test_published_inlet_tensor_is_plotted_over_inlet_x_coordinates() -> None:
+    """The inlet edge y = min(y) is plotted against its x coordinates."""
+    x, y = np.meshgrid(np.array([0.0, 1.0, 2.0, 3.0]), np.array([0.0, 1.0]))
+    inlet = np.array([5.0, 6.0, 7.0, 8.0])
+    value = PublishedTensorValue("boundary", "input", "p_in_bc", "Pa", "identity", "inlet boundary", inlet)
+    figure = statistics.plot_published_tensor(value, x=x, y=y)
+    try:
+        line = figure.axes[0].lines[0]
+        np.testing.assert_array_equal(line.get_xdata(), x[0])
+        np.testing.assert_array_equal(line.get_ydata(), inlet)
+        assert figure.axes[0].get_xlabel() == "Inlet x [m]"
+        assert figure.axes[0].get_ylabel() == r"$p_{\mathrm{in,bc}}$ [Pa]"
+        assert figure.axes[0].get_title() == r"boundary: $p_{\mathrm{in,bc}}$"
+    finally:
+        plt.close(figure)
+
+
+def test_published_tensors_show_display_units_and_wet_basis_moisture() -> None:
+    """Water maps become wet-basis percent with the case density and require it; scalar phi and T read % and °C."""
+    x, y = np.meshgrid(np.arange(3.0), np.arange(2.0))
+    water = np.array([[100.0, 50.0, 0.0], [25.0, 100.0, 50.0]])
+    density = np.array([[400.0, 450.0, 500.0], [475.0, 400.0, 450.0]])
+    value = PublishedTensorValue("state", "input", "w_surf", "kg/m^3", "identity", "spatial", water)
+    figure = statistics.plot_published_tensor(value, x=x, y=y, rho_bu_dry=density)
+    try:
+        np.testing.assert_allclose(np.asarray(figure.axes[0].collections[0].get_array()).ravel(), (100.0 * water / (density + water)).ravel())
+        assert figure.axes[1].get_ylabel() == r"$X_{\mathrm{wb,surf}}$ [%]"
+        assert figure.axes[0].get_title() == r"state: $X_{\mathrm{wb,surf}}$"
+    finally:
+        plt.close(figure)
+    with pytest.raises(ValueError, match="dry bulk density"):
+        statistics.plot_published_tensor(value, x=x, y=y)
+    for name, unit, stored, shown in (
+        ("phi_in_bc", "1", 0.2, r"$\varphi_{\mathrm{in,bc}}$ = 20 [%]"),
+        ("T_in_bc", "K", 300.0, r"$T_{\mathrm{in,bc}}$ = 26.85 [°C]"),
+    ):
+        scalar = PublishedTensorValue("boundary", "input", name, unit, "identity", "transition boundary conditioning", np.asarray(stored))
+        figure = statistics.plot_published_tensor(scalar, x=x, y=y)
+        try:
+            assert figure.axes[0].texts[0].get_text().startswith(shown)
         finally:
             plt.close(figure)
 

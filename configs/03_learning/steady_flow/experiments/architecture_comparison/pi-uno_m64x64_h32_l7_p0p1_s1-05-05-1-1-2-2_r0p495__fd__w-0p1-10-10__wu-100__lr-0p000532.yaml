@@ -19,15 +19,15 @@ loss:
     derivatives:
       kind: physical  # Derivative backend: physical is central finite differences on the grid (suffix __fd), spectral adds Fourier continuation (suffix __spec).
     momentum_weight:
-      target: 1.0  # Target multiplier for the dimensionless Brinkman momentum residual; placeholder until the pi-uno_search study selects it.
+      target: 1.0e-1  # Target multiplier for the dimensionless Brinkman momentum residual; placeholder until the pi-uno_search study selects it.
       warmup:
         epochs: 100  # Epochs over which the momentum weight ramps linearly to its target.
     continuity_weight:
-      target: 1.0e+3  # Target multiplier for the dimensionless cross-section flux balance; placeholder until the pi-uno_search study selects it.
+      target: 1.0e+1  # Target multiplier for the dimensionless cross-section flux balance; placeholder until the pi-uno_search study selects it.
       warmup:
         epochs: 100  # Epochs over which the continuity weight ramps linearly to its target.
     boundary_weight:
-      target: 1.0e+2  # Target multiplier for the dimensionless pressure-boundary residual; placeholder until the pi-uno_search study selects it.
+      target: 1.0e+1  # Target multiplier for the dimensionless pressure-boundary residual; placeholder until the pi-uno_search study selects it.
       warmup:
         epochs: 100  # Epochs over which the boundary weight ramps linearly to its target.
 

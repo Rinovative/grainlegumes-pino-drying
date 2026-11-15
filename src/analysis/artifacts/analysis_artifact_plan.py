@@ -5,15 +5,17 @@ Responsibilities:
     parameter-OOD roles
   - Keep every OOD Evaluation source in split order with its identity, ordered cases, membership digest and assignment
   - Name each role's artifact Dataset and folder and project its shared provenance block
+  - Re-admit each role member's Generation source case through its saved Dataset manifest selector
 
 Design principles:
   - The persisted split, admitted by the one split loader, is the only membership authority
   - Both tasks share one role plan; task readers only open and check the parts it names
   - An empty OOD role is not planned, so it gets no folder, artifact or metric
   - Optuna trials are refused before any role is planned
+  - A member without exactly one admitted Generation source is refused, never skipped
 
 This module does NOT:
-  - Open Dataset payloads, run inference or write artifacts
+  - Open Dataset tensor payloads, run inference or write artifacts
   - Admit run bundles; callers pass already admitted completed-run evidence
 """
 
@@ -24,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from src import common, datasets
+from src import common, datasets, generation
 
 from . import analysis_artifact_contracts as contracts
 
@@ -33,6 +35,15 @@ ArtifactDatasetRole = Literal["id", "material_ood", "parameter_ood"]
 # Artifact splits in canonical order; an OOD split names its Dataset role and saved split role alike.
 ARTIFACT_SPLITS: tuple[ArtifactSplit, ...] = ("eval", "material_ood", "parameter_ood")
 ARTIFACT_DATASET_ROLES: tuple[ArtifactDatasetRole, ...] = ("id", "material_ood", "parameter_ood")
+_SOURCE_SELECTOR_KEYS = (
+    "campaign_name",
+    "campaign_digest",
+    "material_family",
+    "case_id",
+    "case_input_id",
+    "simulation_case_id",
+    "case_hdf5_sha256",
+)
 
 
 def dataset_role_of(split: ArtifactSplit) -> ArtifactDatasetRole:
@@ -160,6 +171,37 @@ def _role_plan(
         membership_digests=tuple(part.membership_digest for part in parts),
         evaluation_assignments=tuple(dict(item) for item in assignments),
     )
+
+
+def generation_case_sources(role: ArtifactRolePlan, *, task: str, storage_root: Path) -> dict[str, Any]:
+    """Re-admit every role member's Generation source case through its exact saved Dataset manifest selector."""
+    result: dict[str, Any] = {}
+    for dataset_id, selected_case_ids in zip(role.source_dataset_ids, role.case_ids_by_source, strict=True):
+        manifest = datasets.packages.load_package_manifest_evidence(task, dataset_id, storage_root=storage_root)
+        entries = manifest.get("source_case_identities")
+        if not isinstance(entries, list):
+            message = "Dataset manifest lacks current Source case identities."
+            raise TypeError(message)
+        by_case = {entry["package_case_id"]: entry for entry in entries}
+        if len(by_case) != len(entries):
+            message = "Dataset manifest repeats a package case identity."
+            raise ValueError(message)
+        for package_case_id in selected_case_ids:
+            if package_case_id in result or package_case_id not in by_case:
+                message = f"Artifact package case has no unique saved Source identity: {package_case_id!r}."
+                raise ValueError(message)
+            entry = by_case[package_case_id]
+            source = entry["source"]
+            admitted = generation.publication.catalog.resolve_raw_case_reference(
+                task,
+                {key: source[key] for key in _SOURCE_SELECTOR_KEYS},
+                storage_root=storage_root,
+            )
+            if admitted.source_identity != source or admitted.design_provenance != entry["design"]:
+                message = f"Package Source or design evidence drifted for {package_case_id!r}."
+                raise ValueError(message)
+            result[package_case_id] = admitted
+    return result
 
 
 def artifact_plan_from_completed(completed: Mapping[str, Any], *, run_dir: Path | str) -> ArtifactPlan:

@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 from torch import Tensor
-from torch.utils.data import RandomSampler, SequentialSampler, Subset
+from torch.utils.data import SequentialSampler, Subset
 
 from src import datasets
 from src.experiments import experiments_run as run_service
@@ -40,6 +40,7 @@ from src.experiments.config import experiments_config_loader as config_loader
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 _FULL_VALIDATION_RTOL = 3e-4
@@ -176,13 +177,13 @@ def _update_channel_moments(state: _ChannelMoments, tensor: Tensor) -> None:
 
 
 def _finalize_channel_moments(state: _ChannelMoments) -> tuple[Tensor, Tensor]:
-    """Return mean and Torch-compatible sample standard deviation."""
-    _require(state.count > 1, "channel statistics require at least two elements")
+    """Return mean and population standard deviation, the definition the Train scaling fits."""
+    _require(state.count > 0, "channel statistics require at least one element")
     _require(state.total is not None and state.total_sq is not None, "channel moment totals are absent")
     total = cast("Tensor", state.total)
     total_sq = cast("Tensor", state.total_sq)
     mean = total / state.count
-    variance = (total_sq - total.square() / state.count) / (state.count - 1)
+    variance = (total_sq - total.square() / state.count) / state.count
     return mean, variance.clamp_min(0).sqrt()
 
 
@@ -281,7 +282,7 @@ def _validate_loader_pass(
     loader: Any,
     role: str,
     expected_ids: tuple[str, ...],
-    processor: Any,
+    scaling: TrainScaling,
     raw_moments: dict[str, _ChannelMoments] | None = None,
     normalized_moments: dict[str, _ChannelMoments] | None = None,
 ) -> _LoaderPass:
@@ -289,6 +290,11 @@ def _validate_loader_pass(
     observed: list[str] = []
     final_batch_size = 0
     inverse_checked = False
+    input_mean, input_scale = scaling.input_affine()
+    affines = {
+        "input": (input_mean, input_scale, scaling.decode_inputs),
+        "output": (scaling.group("state").mean, scaling.state_scale, scaling.decode_state),
+    }
     for batch in loader:
         x = batch["x"]
         y = batch["y"]
@@ -300,16 +306,10 @@ def _validate_loader_pass(
             x.dtype == torch.float32 and y.dtype == torch.float32,
             f"{role} batch dtype changed",
         )
-        _require(
-            x.shape[1] == len(processor.in_normalizer.mean.reshape(-1)),
-            f"{role} input channels changed",
-        )
-        _require(
-            y.shape[1] == len(processor.out_normalizer.mean.reshape(-1)),
-            f"{role} output channels changed",
-        )
-        x_normalized = processor.in_normalizer.transform(x)
-        y_normalized = processor.out_normalizer.transform(y)
+        _require(x.shape[1] == input_mean.numel(), f"{role} input channels changed")
+        _require(y.shape[1] == scaling.state_scale.numel(), f"{role} output channels changed")
+        x_normalized = scaling.encode_inputs(x)
+        y_normalized = scaling.encode_state(y)
         _require(
             bool(torch.isfinite(x_normalized).all().item()),
             f"{role} normalized inputs are non-finite",
@@ -325,12 +325,10 @@ def _validate_loader_pass(
             _update_channel_moments(normalized_moments["input"], x_normalized)
             _update_channel_moments(normalized_moments["output"], y_normalized)
         if not inverse_checked:
-            for tensor_name, original, normalized, normalizer in (
-                ("input", x, x_normalized, processor.in_normalizer),
-                ("output", y, y_normalized, processor.out_normalizer),
-            ):
-                reconstructed = normalizer.inverse_transform(normalized)
-                rounding_scale = original.abs() + normalizer.mean.abs() + normalizer.std.abs() + 1.0
+            for tensor_name, original, normalized in (("input", x, x_normalized), ("output", y, y_normalized)):
+                mean, scale, decode = affines[tensor_name]
+                reconstructed = decode(normalized)
+                rounding_scale = original.abs() + mean.abs().view(1, -1, 1, 1) + scale.view(1, -1, 1, 1) + 1.0
                 rounding_bound = 32 * torch.finfo(original.dtype).eps * rounding_scale
                 _require(
                     bool(torch.all((reconstructed - original).abs() <= rounding_bound).item()),
@@ -347,6 +345,22 @@ def _validate_loader_pass(
         final_batch_size=final_batch_size,
         inverse_checked=inverse_checked,
     )
+
+
+def _fitted_channel_statistics(scaling: TrainScaling, names: tuple[str, ...]) -> tuple[Tensor, Tensor, Tensor]:
+    """Return float64 Train mean, raw std and a fitted-channel mask; a boundary input carries its state's statistics."""
+    boundary = datasets.preprocessing.normalization.STEADY_BOUNDARY_STATES
+    groups = (scaling.group("static"), scaling.group("state"))
+    means: list[float] = []
+    stds: list[float] = []
+    for name in names:
+        channel = boundary.get(name, name)
+        source = next(group for group in groups if channel in group.names)
+        index = source.names.index(channel)
+        means.append(float(source.mean[index]))
+        stds.append(float(source.std[index]))
+    fitted = torch.tensor([name not in boundary for name in names])
+    return torch.tensor(means, dtype=torch.float64), torch.tensor(stds, dtype=torch.float64), fitted
 
 
 def _membership_contract(
@@ -394,7 +408,9 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
     Execute complete read-only production data admission and validation of a steady-flow experiment.
 
     The independent checks recompute per-sample ``(x, y)`` per-channel
-    standardization and input-field identity. Transient drying scales
+    standardization and input-field identity. Every steady case covers the same
+    grid, so the pooled independent moments equal the case-equal Train fit; the
+    boundary input ``p_in_bc`` carries the statistics of ``p``. Transient drying scales
     deduplicated states, transitions and increments of trajectory items instead,
     so a transient request is refused before any data is loaded; its partition
     and scaling membership are admitted when the transient loaders are built.
@@ -421,7 +437,8 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         task.preprocessing.fit_split == "train",
         "normalizer ownership must be train-only",
     )
-    seed_plan = run_service.build_seed_plan(int(effective["run"]["seed"]))
+    # A steady run has no stage; a transient request was refused above.
+    seed_plan = run_service.build_seed_plan(int(effective["run"]["seed"]), stage=None)
     built = config_loader.create_dataloaders_from_config(
         effective,
         seed_plan=seed_plan,
@@ -432,9 +449,8 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         "ID test": built["id_test"],
         **{label: built[role] for role, label in _OOD_LABELS.items() if built[role] is not None},
     }
-    processor = built["data_processor"]
+    scaling: TrainScaling = built["scaling"]
     split = built["split_indices"]
-    normalizer_state = {key: value.detach().cpu().clone() for key, value in processor.state_dict().items()}
 
     id_contract = _validate_tensor_contract(loader=train_loader, role="ID", task=task)
     ood_contracts: dict[str, tuple[_DatasetContract, ...]] = {
@@ -460,36 +476,32 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         "ID train/validation/test overlap",
     )
 
-    generator = train_loader.generator
+    sampler = train_loader.batch_sampler
     _require(
-        isinstance(generator, torch.Generator),
-        "training loader has no explicit generator",
-    )
-    _require(
-        isinstance(train_loader.sampler, RandomSampler),
-        "training loader must use RandomSampler",
+        isinstance(sampler, datasets.runtime.units.UnitSampler),
+        "training loader must be driven by the resumable UnitSampler",
     )
     for label, loader in evaluation_loaders.items():
         _require(isinstance(loader.sampler, SequentialSampler), f"{label} loader must be stable")
-    sampler_state = generator.get_state().clone()
-    first_epoch_batches = tuple(tuple(batch) for batch in train_loader.batch_sampler)
-    sampler_after = generator.get_state().clone()
+    sampler_state = sampler.state_dict()
+    sampler.begin_epoch(0)
+    first_epoch_batches = tuple(tuple(batch) for batch in sampler)
+    sampler_after = sampler.state_dict()
     flat_positions = [position for batch in first_epoch_batches for position in batch]
     _require(
         sorted(flat_positions) == list(range(len(train_loader.dataset))),
         "training sampler epoch is not an exact permutation",
     )
-    generator.set_state(sampler_state)
-    replay_batches = tuple(tuple(batch) for batch in train_loader.batch_sampler)
+    sampler.load_state_dict(sampler_state)
+    sampler.begin_epoch(0)
+    replay_batches = tuple(tuple(batch) for batch in sampler)
     _require(
         replay_batches == first_epoch_batches,
-        "training sampler generator restore is not deterministic",
+        "training sampler state restore is not deterministic",
     )
-    _require(
-        torch.equal(generator.get_state(), sampler_after),
-        "restored sampler continuation state changed",
-    )
-    generator.set_state(sampler_state)
+    _require(sampler.state_dict() == sampler_after, "restored sampler continuation state changed")
+    sampler.load_state_dict(sampler_state)
+    sampler.begin_epoch(0)
 
     raw_moments = {
         "input": _ChannelMoments(),
@@ -504,28 +516,24 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
             loader=train_loader,
             role="ID train",
             expected_ids=expected["ID train"],
-            processor=processor,
+            scaling=scaling,
             raw_moments=raw_moments,
             normalized_moments=normalized_moments,
         )
     }
     for label, loader in evaluation_loaders.items():
-        passes[label] = _validate_loader_pass(loader=loader, role=label, expected_ids=expected[label], processor=processor)
+        passes[label] = _validate_loader_pass(loader=loader, role=label, expected_ids=expected[label], scaling=scaling)
 
     channel_records: list[ChannelStatisticsRecord] = []
-    for tensor_role, names, prefix in (
-        ("Input", task.input_names, "in_normalizer"),
-        ("Output", task.output_names, "out_normalizer"),
-    ):
+    for tensor_role, names in (("Input", task.input_names), ("Output", task.output_names)):
         key = tensor_role.lower()
         raw_mean, raw_std = _finalize_channel_moments(raw_moments[key])
         normalized_mean, normalized_std = _finalize_channel_moments(normalized_moments[key])
-        fitted_mean = normalizer_state[f"{prefix}.mean"].reshape(-1).to(torch.float64)
-        fitted_std = normalizer_state[f"{prefix}.std"].reshape(-1).to(torch.float64)
+        fitted_mean, fitted_std, fitted = _fitted_channel_statistics(scaling, names)
         _require(
             torch.allclose(
-                raw_mean,
-                fitted_mean,
+                raw_mean[fitted],
+                fitted_mean[fitted],
                 rtol=_FULL_VALIDATION_RTOL,
                 atol=_FULL_VALIDATION_ATOL,
             ),
@@ -533,19 +541,18 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         )
         _require(
             torch.allclose(
-                raw_std,
-                fitted_std,
+                raw_std[fitted],
+                fitted_std[fitted],
                 rtol=_FULL_VALIDATION_RTOL,
                 atol=_FULL_VALIDATION_ATOL,
             ),
             f"{tensor_role} train-only fitted scales disagree with independent pass",
         )
-        normalizer = processor.in_normalizer if prefix == "in_normalizer" else processor.out_normalizer
-        eps = float(normalizer.eps)
-        expected_scale = fitted_std / (fitted_std + eps)
-        nondegenerate = fitted_std > eps
+        floor = datasets.preprocessing.normalization.SCALE_FLOOR
+        expected_scale = fitted_std / fitted_std.clamp_min(floor)
+        nondegenerate = fitted & (fitted_std > floor)
         _require(
-            bool(torch.all(torch.abs(normalized_mean) <= _NORMALIZED_MEAN_ATOL).item()),
+            bool(torch.all(torch.abs(normalized_mean[fitted]) <= _NORMALIZED_MEAN_ATOL).item()),
             f"{tensor_role} normalized means are not near zero",
         )
         _require(
@@ -572,41 +579,30 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
                 )
             )
 
-    restored_processor = datasets.preprocessing.normalization.data_processor_from_state(
-        normalizer_state,
-        device="cpu",
-    )
+    normalization = datasets.preprocessing.normalization
+    persisted_state = scaling.state_dict()
     _require(
-        all(torch.equal(restored_processor.state_dict()[key], value) for key, value in normalizer_state.items()),
-        "persisted normalizer reconstruction changed state",
+        normalization.TrainScaling.from_state_dict(persisted_state).digest == scaling.digest,
+        "persisted scaling reconstruction changed state",
     )
-    zero_variance_state = {key: value.clone() for key, value in normalizer_state.items()}
-    zero_variance_state["in_normalizer.std"].zero_()
-    zero_variance_state["out_normalizer.std"].zero_()
-    zero_variance_processor = datasets.preprocessing.normalization.data_processor_from_state(
-        zero_variance_state,
-        device="cpu",
-    )
-    zero_input_normalizer = zero_variance_processor.in_normalizer
-    zero_output_normalizer = zero_variance_processor.out_normalizer
-    if zero_input_normalizer is None or zero_output_normalizer is None:
-        msg = "Reconstructed zero-variance processor must retain both normalizers."
-        raise RuntimeError(msg)
-    zero_input = zero_input_normalizer.transform(zero_variance_state["in_normalizer.mean"])
-    zero_output = zero_output_normalizer.transform(zero_variance_state["out_normalizer.mean"])
+    for group in persisted_state["groups"].values():
+        group["std"] = [0.0] * len(group["std"])
+    zero_variance = normalization.TrainScaling.from_state_dict(persisted_state)
+    zero_input = zero_variance.encode_inputs(zero_variance.input_affine()[0].view(1, -1, 1, 1))
+    zero_output = zero_variance.encode_state(zero_variance.group("state").mean.view(1, -1, 1, 1))
     _require(
         bool(torch.isfinite(zero_input).all().item()) and torch.equal(zero_input, torch.zeros_like(zero_input)),
-        "input zero-variance epsilon policy failed",
+        "input zero-variance scale floor failed",
     )
     _require(
         bool(torch.isfinite(zero_output).all().item()) and torch.equal(zero_output, torch.zeros_like(zero_output)),
-        "output zero-variance epsilon policy failed",
+        "output zero-variance scale floor failed",
     )
 
     coverage = tuple(
         LoaderCoverageRecord(
             loader=label,
-            sampler=type(loader.sampler).__name__,
+            sampler=type(loader.batch_sampler if label == "ID train" else loader.sampler).__name__,
             batches=len(loader),
             batch_size=loader.batch_size,
             final_batch=passes[label].final_batch_size,
@@ -633,14 +629,14 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
                 expected_ids=expected[label],
                 observed_ids=passes[label].observed_ids,
                 shape="BCHW",
-                policy="RandomSampler permutation" if label == "ID train" else "SequentialSampler",
+                policy="UnitSampler permutation" if label == "ID train" else "SequentialSampler",
             )
             for label in passes
         ),
     )
 
     first_split = split_contract
-    del built, train_loader, evaluation_loaders, processor, id_contract, ood_contracts
+    del built, train_loader, evaluation_loaders, scaling, id_contract, ood_contracts
     gc.collect()
     repeated = config_loader.create_dataloaders_from_config(
         effective,
@@ -673,12 +669,12 @@ def validate_full_data_pipeline(config: Mapping[str, Any]) -> FullDataValidation
         ),
         ValidationCheck(
             "Persisted state",
-            "split schema and normalizer reconstruction admitted",
+            "split schema and scaling reconstruction admitted",
             "PASS",
         ),
         ValidationCheck(
             "Zero-variance policy",
-            "production epsilon floor returns finite zeros",
+            "Train scale floor returns finite zeros",
             "PASS",
         ),
         ValidationCheck(

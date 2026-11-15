@@ -98,7 +98,8 @@ def build_synthetic_selection_provenance(
         "selection": {"kind": "exact"},
         "case_partition": _synthetic_partition(sample_ids, material_family=material_family, material_role=material_role),
         "plan_invocation": None,
-        "grid": {"shape": [8, 8], "axes_sha256": digest("grid")},
+        # Every synthetic Dataset lies on the same 8 x 8 coordinate grid.
+        "grid": {"shape": [8, 8], "axes_sha256": hashlib.sha256(b"synthetic 8 x 8 grid").hexdigest()},
         "source_case_identities": cases,
         "source_outcomes": [
             {
@@ -216,45 +217,19 @@ def build_synthetic_task() -> domain.tasks.spec.TaskSpec:
         tensor_layout=("batch", "channel", "y", "x"),
         operator_axes=(2, 3),
         normalization_axes=(0, 2, 3),
-        preprocessing=spec.PreprocessingSpec(
-            input_normalization="standard",
-            output_normalization="standard",
-            fit_split="train",
-        ),
-        data_losses=("relative_l2",),
+        preprocessing=spec.PreprocessingSpec(normalization=spec.TRAIN_SCALING_KIND, fit_split="train"),
+        reference_floors=(spec.ReferenceFloorSpec("response_a", 1.0e-6), spec.ReferenceFloorSpec("response_b", 1.0e-6)),
+        data_losses=("mse",),
         default_metrics=(
             spec.MetricSpec(
                 id="normalized_group_macro_rmse",
                 kind="group_macro_rmse",
                 space="physical",
                 fields=("response_a", "response_b"),
-                reduction="group_macro_element_mean",
+                reduction="material_case_mean",
                 direction="minimize",
             ),
-            spec.MetricSpec(
-                id="normalized_relative_l2",
-                kind="relative_l2",
-                space="normalized",
-                fields=("response_a", "response_b"),
-                reduction="sample_mean",
-                direction="minimize",
-            ),
-            spec.MetricSpec(
-                id="physical_rmse_response_a",
-                kind="rmse",
-                space="physical",
-                fields=("response_a",),
-                reduction="element_mean",
-                direction="minimize",
-            ),
-            spec.MetricSpec(
-                id="physical_rmse_response_b",
-                kind="rmse",
-                space="physical",
-                fields=("response_b",),
-                reduction="element_mean",
-                direction="minimize",
-            ),
+            *spec.field_metric_specs(("response_a", "response_b")),
         ),
         physics=spec.PhysicsSpec(
             kind="none",

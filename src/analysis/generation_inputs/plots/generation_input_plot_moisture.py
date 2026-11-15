@@ -94,25 +94,35 @@ def _case_relationship(
     statistics = diagnostics.field_statistics(record).loc["phi_eq"]
     startup = diagnostics.transient_evidence(record)[3]
     inlet = startup.variables["phi_in_bc"]
-    return (
-        float(cast("SupportsFloat", statistics["q05"])),
-        float(cast("SupportsFloat", statistics["median"])),
-        float(cast("SupportsFloat", statistics["q95"])),
-        inlet.start,
-        inlet.end,
+    return _relative_humidity_display(
+        (
+            float(cast("SupportsFloat", statistics["q05"])),
+            float(cast("SupportsFloat", statistics["median"])),
+            float(cast("SupportsFloat", statistics["q95"])),
+        ),
+        (inlet.start, inlet.end),
     )
+
+
+def _relative_humidity_display(bed: tuple[float, float, float], inlet: tuple[float, float]) -> tuple[float, float, float, float, float]:
+    """Return bed q05/median/q95 and inlet startup endpoints in the displayed % RH."""
+    unit = diagnostics.FIELD_UNITS["phi_eq"]  # bed and inlet relative humidity share the stored fraction unit
+    q05, median, q95 = (float(value) for value in diagnostics.display_value("phi_eq", np.asarray(bed), unit))
+    start, end = (float(value) for value in diagnostics.display_value("phi_in_bc", np.asarray(inlet), unit))
+    return q05, median, q95, start, end
 
 
 def _mean_relationship(
     dataset: diagnostics.DatasetDiagnostics,
 ) -> tuple[float, float, float, float, float]:
     """Return empirical means of per-case bed and inlet scalar summaries."""
-    return (
-        dataset.field_summary_means[("phi_eq", "q05")],
-        dataset.field_summary_means[("phi_eq", "median")],
-        dataset.field_summary_means[("phi_eq", "q95")],
-        float(dataset.boundary_means["phi_in_bc start"]),
-        float(dataset.boundary_means["phi_in_bc startup end"]),
+    return _relative_humidity_display(
+        (
+            dataset.field_summary_means[("phi_eq", "q05")],
+            dataset.field_summary_means[("phi_eq", "median")],
+            dataset.field_summary_means[("phi_eq", "q95")],
+        ),
+        (float(dataset.boundary_means["phi_in_bc start"]), float(dataset.boundary_means["phi_in_bc startup end"])),
     )
 
 
@@ -211,7 +221,7 @@ def _draw_inlet_bed_comparison(
     )
     axis.set_xticks(positions, labels)
     axis.set_ylabel(
-        "Relative humidity [1]",
+        layout.quantity_axis_label("phi_eq"),
         fontsize=layout.MAP_LAYOUT.label_size,
     )
     axis.set_title("Inlet vs bed-equilibrium RH", fontsize=layout.MAP_LAYOUT.axis_title_size)

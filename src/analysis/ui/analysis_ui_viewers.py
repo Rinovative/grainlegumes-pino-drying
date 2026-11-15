@@ -1,392 +1,319 @@
-"""Build interactive viewers for case-level and aggregate analysis plots.
+"""Build interactive viewers for aggregate analysis plots over the first cases of labelled datasets.
 
 Responsibilities:
-  - Render case-by-case Matplotlib figures inside widgets
+  - Render Matplotlib figures and other items into the plot slots of view panels
+  - Let only the newest requested render of a view publish its figure and export target
   - Show a failing view in place instead of raising it into the notebook
-  - Manage dataset and case navigation controls
+  - Manage dataset, case-count, and semantic view controls of the case-count viewer
   - Store current figures for notebook export
 
 Design principles:
   - Viewer callbacks receive explicit datasets and render functions
-  - Widget construction delegates to analysis_ui_components
+  - Widget construction delegates to the ui control, navigation, and panel modules
   - Panel-local export state is updated only around rendered figures
+  - A view panel publishes without a lock: a request supersedes the earlier ones before its plot runs, and its
+    publication runs no plot function and no callback, so a request re-entering the view wins and cannot deadlock
 
 This module does NOT:
   - Compose numbered notebook sections or choose scientific control vocabularies
   - Load artifacts directly or implement domain-specific plot mathematics
+  - Navigate single cases or draw case-level views; the case-count viewer draws separate datasets only
 """
 
 from __future__ import annotations
 
-import logging
-import traceback
-from html import escape
-from threading import Lock
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
-from weakref import WeakKeyDictionary
 
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
-from IPython.display import HTML, display
 from matplotlib.figure import Figure
 
-from . import analysis_ui_components as components
+from . import analysis_ui_controls as ui_controls
+from . import analysis_ui_navigation as navigation
+from . import analysis_ui_panel as panel
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Hashable, Mapping
 
     import pandas as pd
 
+    from .analysis_ui_selectors import DatasetSelector
+
+type ViewControl = widgets.ValueWidget | ui_controls.ChannelChecks
+
+
+EMPTY_SELECTION_MESSAGE = "Select at least one dataset."
+
 
 # =============================================================================
-# INTERNAL HELPERS (viewer-agnostic, no semantics)
+# VIEW-PANEL RENDERING (control standard)
 # =============================================================================
 
-_LOGGER = logging.getLogger(__name__)
-_RENDER_LOCK = Lock()
-_RENDER_GENERATIONS: WeakKeyDictionary[widgets.Output, int] = WeakKeyDictionary()
+
+@dataclass(frozen=True, slots=True)
+class _Export:
+    """The export target of one request: the panel-local state and the identity the request publishes under."""
+
+    state: dict[str, Any] | None
+    plot_name: str | None
+    title: str | None
 
 
-def show_render_failure(out: widgets.Output, error: BaseException) -> None:
-    """Replace the output content with one visible failure line and a collapsed traceback."""
-    _LOGGER.exception("View failed: %s", error, exc_info=error)
-    detail = escape("".join(traceback.format_exception(error)))
-    summary = escape(f"View failed — {type(error).__name__}: {error}")
-    with out:
-        out.clear_output(wait=True)
-        display(HTML(f"<p><b>{summary}</b></p><details><summary>Traceback</summary><pre>{detail}</pre></details>"))
+@dataclass(frozen=True, slots=True)
+class _Failure:
+    """The outcome of a request whose plot function raised, or that reports a failure directly."""
+
+    error: BaseException
 
 
-def clear_rendered_figure(
-    *,
-    out: widgets.Output,
-    message: str,
-    export_state: dict[str, Any] | None = None,
-    export_plot_name: str | None = None,
-    export_title: str | None = None,
-) -> None:
-    """Supersede in-flight rendering before clearing a legitimate empty view."""
-    with _RENDER_LOCK:
-        _RENDER_GENERATIONS[out] = _RENDER_GENERATIONS.get(out, 0) + 1
-        if export_state is not None:
-            previous = export_state.get("fig")
-            if isinstance(previous, Figure):
-                plt.close(previous)
-            export_state.update(
-                fig=None,
-                figures=(),
-                plot_name=export_plot_name,
-                title=export_title,
-                filename_stem=None,
-            )
-        with out:
-            out.clear_output(wait=True)
-            print(message)
+type _Outcome = list[Any] | _Failure
 
 
-def render_figure(
-    *,
-    out: widgets.Output,
+def _require_slot(view: panel.ViewPanel) -> panel.PlotSlot:
+    """Return the plot slot of ``view`` or refuse a panel without one."""
+    if view.slot is None:
+        message = "Rendering a view needs a panel with a plot slot."
+        raise ValueError(message)
+    return view.slot
+
+
+def _items(result: Any) -> list[Any]:
+    """Return the items of a plot result: the non-``None`` items of a tuple in their order, else the result itself."""
+    return [item for item in (result if isinstance(result, tuple) else (result,)) if item is not None]
+
+
+def _close_figures(outcome: _Outcome) -> None:
+    """Close the figures of ``outcome``; an exported figure stays readable for the export."""
+    if isinstance(outcome, list):
+        for item in outcome:
+            if isinstance(item, Figure):
+                plt.close(item)
+
+
+def _show_failure(view: panel.ViewPanel, error: BaseException, export: _Export) -> None:
+    """Show ``error`` in the plot's place under the request's export identity and release the export target (rule 12)."""
+    if export.state is not None:
+        export.state.update(plot_name=export.plot_name, title=export.title)
+    view.show_failure(error, export.state)
+
+
+def _show_items(view: panel.ViewPanel, items: list[Any], export: _Export) -> None:
+    """Export the first figure of ``items``, show every item in order in the plot slot, then clear a shown failure."""
+    figure = next((item for item in items if isinstance(item, Figure)), None)
+    if export.state is not None:
+        if export.state.get("fig") is not figure:
+            ui_controls.release_export(export.state)
+        export.state.update(fig=figure, figures=() if figure is None else (figure,), plot_name=export.plot_name, title=export.title)
+    try:
+        _require_slot(view).show(items)
+    finally:
+        _close_figures(items)
+    # Last, so that a render an observer of the failure display starts here publishes after this one.
+    view.clear_failure()
+
+
+def _publish(view: panel.ViewPanel, generation: int, outcome: _Outcome, export: _Export) -> bool:
+    """
+    Publish ``outcome`` of the request ``generation`` of ``view`` if it is still current; return whether it was published.
+
+    A request that is no longer current only closes its figures. A failure outcome, and any exception of the
+    publication itself, ends in the failure display with the export target released; nothing escapes.
+    """
+    if not view.current(generation):
+        _close_figures(outcome)
+        return False
+    try:
+        if isinstance(outcome, _Failure):
+            _show_failure(view, outcome.error, export)
+        else:
+            _show_items(view, outcome, export)
+    except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
+        _close_figures(outcome)
+        _show_failure(view, error, export)
+    return True
+
+
+def render_view(
+    view: panel.ViewPanel,
     plot_func: Callable[..., Any],
+    *,
     args: tuple[Any, ...] = (),
     kwargs: dict[str, Any] | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
-) -> None:
+) -> bool:
     """
-    Invoke and display one plot result inside an output widget.
+    Invoke ``plot_func`` and show its result in the plot slot of ``view``; only the newest request publishes (rule 3).
 
-    Parameters
-    ----------
-    out : ipywidgets.Output
-        Output area updated only after the latest requested render finishes.
-    plot_func : Callable[..., Any]
-        Callable returning a Matplotlib figure, a tuple whose first item is a
-        figure, another displayable value, or ``None``.
-    args : tuple[Any, ...], optional
-        Positional arguments forwarded unchanged.
-    kwargs : dict[str, Any] | None, optional
-        Keyword arguments forwarded unchanged.
-    export_state : dict[str, Any] | None, optional
-        Panel-local mutable state receiving the current rendered figure.
-    export_plot_name, export_title : str | None, optional
-        Stable export stem and display title owned by the active dropdown entry.
+    The result is one displayable item (a Matplotlib figure, a widget, a table, a string) or a tuple of items, shown in
+    their order without the ``None`` entries. The first figure becomes the export target; every figure is closed after
+    display. A failure of ``plot_func`` or of the publication replaces the plot with the failure display and releases
+    the export target; a later successful render gives the plot its place back.
 
-    Notes
-    -----
-    Recognized figures update only the explicitly supplied panel state, are
-    displayed, and are then closed to release GUI resources. A newer request
-    supersedes an older result before either display or export publication.
-    A failing callable is shown in place of its figure and clears the export
-    target; a later successful render replaces the failure.
-
+    The request supersedes every earlier one before ``plot_func`` runs, so a request made while it runs wins. Returns
+    whether the result was published: False when a newer request, hiding the view, or the end of its host's render
+    superseded it.
     """
-    with _RENDER_LOCK:
-        generation = _RENDER_GENERATIONS.get(out, 0) + 1
-        _RENDER_GENERATIONS[out] = generation
+    _require_slot(view)
+    export = _Export(export_state, export_plot_name, export_title)
+    generation = view.supersede()
+    outcome: _Outcome
     try:
-        result = plot_func(*args, **(kwargs or {}))
+        outcome = _items(plot_func(*args, **(kwargs or {})))
     except Exception as error:  # noqa: BLE001 -- UI boundary shows the failure in place
-        with _RENDER_LOCK:
-            if _RENDER_GENERATIONS.get(out) == generation:
-                if export_state is not None:
-                    previous = export_state.get("fig")
-                    if isinstance(previous, Figure):
-                        plt.close(previous)
-                    export_state.update(fig=None, figures=(), plot_name=export_plot_name, title=export_title)
-                show_render_failure(out, error)
+        outcome = _Failure(error)
+    return _publish(view, generation, outcome, export)
+
+
+def clear_view(
+    view: panel.ViewPanel,
+    message: str,
+    *,
+    export_state: dict[str, Any] | None = None,
+    export_plot_name: str | None = None,
+    export_title: str | None = None,
+) -> bool:
+    """Supersede pending renders, release the export target, and explain the empty view in the plot's place (rule 6)."""
+    _require_slot(view)
+    return _publish(view, view.supersede(), [message], _Export(export_state, export_plot_name, export_title))
+
+
+def fail_view(
+    view: panel.ViewPanel,
+    error: BaseException,
+    *,
+    export_state: dict[str, Any] | None = None,
+    export_plot_name: str | None = None,
+    export_title: str | None = None,
+) -> bool:
+    """Supersede pending renders and show ``error`` in the plot's place with the export target released (rule 12)."""
+    return _publish(view, view.supersede(), _Failure(error), _Export(export_state, export_plot_name, export_title))
+
+
+def _control_element(control: ViewControl) -> widgets.Widget:
+    """Return the row element of one view control."""
+    return control.widget if isinstance(control, ui_controls.ChannelChecks) else control
+
+
+def _view_control_value(control: ViewControl) -> Any:
+    """Return the value one view control passes to the plot."""
+    return control.selected if isinstance(control, ui_controls.ChannelChecks) else control.value
+
+
+def _observe_control(control: ViewControl, callback: Callable[[], None]) -> None:
+    """Call ``callback()`` after every change of one view control."""
+    if isinstance(control, ui_controls.ChannelChecks):
+        control.observe(callback)
+    elif isinstance(control, widgets.ValueWidget):
+        control.observe(lambda _change: callback(), names="value")
+    else:
+        message = f"A view control must be a value widget or ChannelChecks, got {type(control).__name__}."
+        raise TypeError(message)
+
+
+def _labelled_frames(datasets: Mapping[Hashable, pd.DataFrame], *, kind: str) -> dict[Hashable, pd.DataFrame]:
+    """Return the datasets as a dict and refuse an empty mapping or an empty frame."""
+    frames = dict(datasets)
+    if not frames or any(frame.empty for frame in frames.values()):
+        message = f"{kind} views require non-empty labelled datasets."
+        raise ValueError(message)
+    return frames
+
+
+def _require_separate_selector(selector: DatasetSelector | None, frames: Mapping[Hashable, pd.DataFrame]) -> None:
+    """Refuse a selector that may pool or that names datasets the view does not hold."""
+    if selector is None:
         return
-
-    fig: Figure | None = None
-    if isinstance(result, Figure):
-        fig = result
-    elif isinstance(result, tuple) and result and isinstance(result[0], Figure):
-        fig = result[0]
-    with _RENDER_LOCK:
-        if _RENDER_GENERATIONS.get(out) != generation:
-            if fig is not None:
-                plt.close(fig)
-            return
-        if export_state is not None:
-            previous = export_state.get("fig")
-            if isinstance(previous, Figure) and previous is not fig:
-                plt.close(previous)
-            export_state.update(fig=fig, figures=(fig,) if fig is not None else (), plot_name=export_plot_name, title=export_title)
-        with out:
-            out.clear_output(wait=True)
-            if fig is not None:
-                display(fig)
-                plt.close(fig)
-            elif result is not None:
-                display(result)
+    if selector.pool_enabled:
+        message = "Case viewers draw separate datasets; build their DatasetSelector with a pool_reason."
+        raise ValueError(message)
+    missing = [item.key for item in selector.inventory.items if item.key not in frames]
+    if missing:
+        message = f"The dataset selector offers keys without a frame: {missing!r}."
+        raise ValueError(message)
 
 
-def _attach_widget_rerender(
-    widgets_list: list[widgets.Widget],
-    render_func: Callable[[], None],
-) -> None:
-    """
-    Register one render callback on heterogeneous semantic controls.
-
-    Standard value widgets observe their ``value`` trait. Checkbox-group
-    containers are recognized through the public ``boxes`` mapping and each
-    checkbox is observed. Widgets without either contract are ignored.
-    """
-    for w in widgets_list:
-        # ---------------------------------------------
-        # Case 1: standard ValueWidget (Dropdown, Radio)
-        # ---------------------------------------------
-        if hasattr(w, "observe") and hasattr(w, "value"):
-            w.observe(lambda _: render_func(), names="value")
-            continue
-
-        # ---------------------------------------------
-        # Case 2: checkbox group (VBox with .boxes)
-        # ---------------------------------------------
-        boxes = getattr(w, "boxes", None)
-        if isinstance(boxes, dict):
-            for checkbox in boxes.values():
-                if isinstance(checkbox, widgets.Checkbox):
-                    checkbox.observe(lambda _: render_func(), names="value")
+def _selected_frames(frames: Mapping[Hashable, pd.DataFrame], selector: DatasetSelector | None) -> dict[Hashable, pd.DataFrame]:
+    """Return every frame, or the selected ones keyed by their dataset label."""
+    if selector is None:
+        return dict(frames)
+    return {choice.label: frames[choice.items[0].key] for choice in selector.choices() if choice.available}
 
 
-def _control_value(widget: widgets.Widget) -> Any:
-    """Return a normal value or an ordered tuple from a checkbox group."""
-    boxes = getattr(widget, "boxes", None)
-    if isinstance(boxes, dict):
-        return tuple(label for label, checkbox in boxes.items() if isinstance(checkbox, widgets.Checkbox) and checkbox.value)
-    if hasattr(widget, "value"):
-        return cast("widgets.ValueWidget", widget).value
-    msg = "Scientific controls must expose value or a checkbox-group boxes mapping."
-    raise TypeError(msg)
+def _selection_rows(selector: DatasetSelector | None) -> tuple[list[widgets.Widget], tuple[tuple[widgets.ToggleButton, widgets.DOMWidget], ...]]:
+    """Return the selection row and its popover when a selector is given."""
+    if selector is None:
+        return [], ()
+    return [panel.row(selector.header)], ((selector.header, selector.body),)
 
 
-# =============================================================================
-# CASECOUNT VIEWER (multi-case aggregations)
-# =============================================================================
-
-
-def make_casecount_viewer(
+def case_count_view(
     plot_func: Callable[..., Any],
     *,
-    datasets: dict[str, pd.DataFrame],
-    start_cases: int = 100,
-    step_size: int = 50,
-    extra_widgets: list[widgets.Widget] | None = None,
-    controls: Mapping[str, widgets.Widget] | None = None,
-    allow_dataset_selection: bool = False,
-    selector_title: str = "datasets",
+    datasets: Mapping[Hashable, pd.DataFrame],
+    start_cases: int,
+    step_size: int,
+    controls: Mapping[str, ViewControl] | None = None,
+    selector: DatasetSelector | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
+    resume_cases: int | None = None,
+    host: panel.ViewPanel | None = None,
     **plot_kwargs: Any,
-) -> widgets.VBox:
-    """Build and immediately render the shared-prefix control."""
-    if not datasets or any(frame.empty for frame in datasets.values()):
-        msg = "Case-count viewers require non-empty labelled datasets."
-        raise ValueError(msg)
-    if not isinstance(step_size, int) or isinstance(step_size, bool) or step_size <= 0:
-        msg = "step_size must be a positive integer."
-        raise ValueError(msg)
-    default_cases = min(len(df) for df in datasets.values())
-    max_cases_global = max(len(df) for df in datasets.values())
-    case_count, prev_btn, next_btn = components.ui_step_case_count(
-        start_cases=min(start_cases, default_cases),
-        min_cases=0,
-        max_cases=max_cases_global,
-        step_size=step_size,
-    )
-    selector = (
-        cast("components.CheckboxGroup", components.ui_checkbox_datasets(dataset_names=list(datasets)))
-        if allow_dataset_selection and len(datasets) > 1
-        else None
-    )
-    output = components.ui_output_plot()
-    extra_widgets = list(extra_widgets or [])
-    semantic_controls = dict(controls or {})
+) -> panel.ViewPanel:
+    """
+    Build a view that draws the first ``max_cases`` cases of the selected datasets and redraws on every change.
 
-    def _selected_datasets() -> dict[str, pd.DataFrame]:
-        """Return all frames or the historically checked subset in stable order."""
-        if selector is None:
-            return dict(datasets)
-        return {name: datasets[name] for name, checkbox in selector.boxes.items() if checkbox.value}
+    ``plot_func`` receives ``datasets`` (the selected frames, keyed by dataset label when a ``selector`` is given),
+    ``max_cases``, one keyword per entry of ``controls`` and ``plot_kwargs``. An empty selection clears the view with
+    an explanation. The count starts at ``start_cases``, limited to the shortest dataset; ``resume_cases``, the count a
+    former view of the same datasets showed, wins and is kept up to the longest dataset. Built inside the render of a
+    ``host`` view, the view publishes only while that host render is current and the host is shown.
+    """
+    frames = _labelled_frames(datasets, kind="Case-count")
+    if isinstance(step_size, bool) or not isinstance(step_size, int) or step_size <= 0:
+        message = "step_size must be a positive integer."
+        raise ValueError(message)
+    _require_separate_selector(selector, frames)
+    semantic = dict(controls or {})
+    export: dict[str, Any] = {"export_state": export_state, "export_plot_name": export_plot_name, "export_title": export_title}
+    view: panel.ViewPanel | None = None
 
-    def _render() -> None:
-        """Render the selected saved-membership prefix without a confirmation step."""
-        selected = _selected_datasets()
+    def request() -> None:
+        if view is not None:
+            view.request(render_now)
+
+    lengths = [len(frame) for frame in frames.values()]
+    count = navigation.CountControl(
+        value=max(1, min(start_cases, *lengths) if resume_cases is None else min(resume_cases, max(lengths))),
+        minimum=1,
+        maximum=max(lengths),
+        step=step_size,
+        on_change=lambda _count: request(),
+    )
+    rows, popovers = _selection_rows(selector)
+    rows.append(panel.row(count.widget, *(_control_element(control) for control in semantic.values())))
+    view = panel.ViewPanel(rows, slot=panel.PlotSlot(), popovers=popovers, host=host)
+
+    def render_now() -> None:
+        selected = _selected_frames(frames, selector)
         if not selected:
-            clear_rendered_figure(
-                out=output,
-                message=f"Select at least one {selector_title.strip().lower()}.",
-                export_state=export_state,
-                export_plot_name=export_plot_name,
-                export_title=export_title,
-            )
+            clear_view(cast("panel.ViewPanel", view), EMPTY_SELECTION_MESSAGE, **export)
             return
-        render_figure(
-            out=output,
-            plot_func=plot_func,
-            kwargs={
-                "datasets": selected,
-                "max_cases": int(case_count.value),
-                **{name: _control_value(widget) for name, widget in semantic_controls.items()},
-                **plot_kwargs,
-            },
-            export_state=export_state,
-            export_plot_name=export_plot_name,
-            export_title=export_title,
+        values = {name: _view_control_value(control) for name, control in semantic.items()}
+        render_view(
+            cast("panel.ViewPanel", view),
+            plot_func,
+            kwargs={"datasets": selected, "max_cases": count.value, **values, **plot_kwargs},
+            **export,
         )
 
-    def _step(delta: int) -> None:
-        """Change prefix size by one step within the shared bound."""
-        new_value = case_count.value + delta * step_size
-        case_count.value = max(1, min(max_cases_global, new_value))
-
-    prev_btn.on_click(lambda _: _step(-1))
-    next_btn.on_click(lambda _: _step(1))
-    case_count.observe(lambda _: _render(), names="value")
-    _attach_widget_rerender([*semantic_controls.values(), *extra_widgets], _render)
+    for control in semantic.values():
+        _observe_control(control, request)
     if selector is not None:
-        for checkbox in selector.boxes.values():
-            checkbox.observe(lambda _: _render(), names="value")
-
-    _render()
-    header_controls = [case_count, prev_btn, next_btn, *semantic_controls.values(), *extra_widgets]
-    if selector is not None:
-        header_controls.append(selector)
-    header = widgets.HBox(header_controls, layout=widgets.Layout(align_items="center"))
-    return widgets.VBox([header, output])
-
-
-def make_indexed_viewer(
-    plot_func: Callable[..., Any],
-    *,
-    datasets: dict[str, pd.DataFrame],
-    controls: Mapping[str, widgets.ValueWidget] | None = None,
-    dataset_selection: str = "dropdown",
-    max_positions: int | None = None,
-    index_to_kwargs: Callable[[int], Mapping[str, Any]] | None = None,
-    export_state: dict[str, Any] | None = None,
-    export_plot_name: str | None = None,
-    export_title: str | None = None,
-) -> widgets.VBox:
-    """Build a one-based case navigator over one selected model or all models."""
-    if not datasets or any(frame.empty for frame in datasets.values()):
-        msg = "Indexed viewers require non-empty labelled datasets."
-        raise ValueError(msg)
-    if dataset_selection not in {"all", "dropdown"}:
-        msg = "dataset_selection must be 'all' or 'dropdown'."
-        raise ValueError(msg)
-    if max_positions is not None and (isinstance(max_positions, bool) or not isinstance(max_positions, int) or max_positions <= 0):
-        msg = "max_positions must be a positive integer when supplied."
-        raise ValueError(msg)
-
-    semantic_controls = dict(controls or {})
-    dataset_dropdown = components.ui_dropdown_dataset(list(datasets)) if dataset_selection == "dropdown" and len(datasets) > 1 else None
-
-    def _selected_datasets() -> dict[str, pd.DataFrame]:
-        """Return one dropdown-selected frame or the complete ordered mapping."""
-        if dataset_dropdown is None:
-            return dict(datasets)
-        selected = dataset_dropdown.value
-        if not isinstance(selected, str):
-            msg = "Dataset dropdown must contain string values."
-            raise TypeError(msg)
-        return {selected: datasets[selected]}
-
-    def _position_count() -> int:
-        """Return the current safe navigation bound."""
-        count = min(len(frame) for frame in _selected_datasets().values())
-        return count if max_positions is None else min(count, max_positions)
-
-    case_index, previous, following = components.ui_step_case_index(n_cases=_position_count(), start_idx=0)
-    if not isinstance(case_index, widgets.BoundedIntText):
-        msg = "Indexed viewers require a bounded one-based case control."
-        raise TypeError(msg)
-    output = components.ui_output_plot()
-    state = {"updating": False}
-
-    def _render(_: object = None) -> None:
-        """Render the current index and semantic controls automatically."""
-        if state["updating"]:
-            return
-        zero_based = int(case_index.value) - 1
-        index_kwargs = {"row_position": zero_based} if index_to_kwargs is None else dict(index_to_kwargs(zero_based))
-        control_kwargs = {name: widget.value for name, widget in semantic_controls.items()}
-        render_figure(
-            out=output,
-            plot_func=plot_func,
-            kwargs={"datasets": _selected_datasets(), **index_kwargs, **control_kwargs},
-            export_state=export_state,
-            export_plot_name=export_plot_name,
-            export_title=export_title,
-        )
-
-    def _step(delta: int) -> None:
-        """Move within the current one-based position bound."""
-        case_index.value = max(1, min(case_index.max, case_index.value + delta))
-
-    def _select_dataset(_: object = None) -> None:
-        """Rebind the position range before rendering the selected model."""
-        state["updating"] = True
-        try:
-            case_index.max = _position_count()
-            case_index.value = min(case_index.value, case_index.max)
-        finally:
-            state["updating"] = False
-        _render()
-
-    previous.on_click(lambda _: _step(-1))
-    following.on_click(lambda _: _step(1))
-    case_index.observe(_render, names="value")
-    for widget in semantic_controls.values():
-        widget.observe(_render, names="value")
-    if dataset_dropdown is not None:
-        dataset_dropdown.observe(_select_dataset, names="value")
-
-    _render()
-    header_items: list[widgets.Widget] = [case_index, previous, following, *semantic_controls.values()]
-    if dataset_dropdown is not None:
-        header_items.append(dataset_dropdown)
-    return widgets.VBox([widgets.HBox(header_items), output])
+        selector.observe(request)
+    request()
+    return view

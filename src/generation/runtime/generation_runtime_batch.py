@@ -2668,24 +2668,29 @@ def _raw_publication_from_reference(
     if any(case_payload.get(key) != value for key, value in expected.items()):
         message = f"Batch-admitted raw reference disagrees with canonical case evidence: {directory}"
         raise RuntimeError(message)
+    try:
+        current_store = case_service.measure_input_store(directory)
+    except FileNotFoundError as error:
+        message = f"Batch-admitted raw case inputs are missing or unsafe: {error}"
+        raise RuntimeError(message) from error
+    if current_store != reference.store_identity:
+        message = f"Batch-admitted raw case inputs changed after admission: {directory / common.paths.GENERATION_INPUT_STORE_FILENAME}"
+        raise RuntimeError(message)
+    # The stored inputs are the one input artifact; input_files stays the identity of the CSVs rendered for COMSOL.
     raw_artifacts = [
         ArtifactEvidence(
             relative_path=common.paths.GENERATION_CASE_PAYLOAD_FILENAME,
             path=case_path.resolve(),
             sha256=reference.case_json_sha256,
             size_bytes=reference.case_json_size_bytes,
-        )
+        ),
+        ArtifactEvidence(
+            relative_path=common.paths.GENERATION_INPUT_STORE_FILENAME,
+            path=(directory / common.paths.GENERATION_INPUT_STORE_FILENAME).resolve(),
+            sha256=reference.store_identity.sha256,
+            size_bytes=reference.store_identity.size_bytes,
+        ),
     ]
-    for filename, identity in sorted(case_payload["input_files"].items()):
-        input_path = reference.case_directory / filename
-        raw_artifacts.append(
-            ArtifactEvidence(
-                relative_path=filename,
-                path=input_path.resolve(),
-                sha256=str(identity["sha256"]),
-                size_bytes=int(identity["size_bytes"]),
-            )
-        )
     return _PublicationEvidence(
         directory,
         "raw",

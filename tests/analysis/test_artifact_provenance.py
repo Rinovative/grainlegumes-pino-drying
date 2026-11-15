@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from support.scaling import steady_scaling
 from support.synthetic_task import synthetic_split_payload
 from torch import nn
 from torch.utils.data import DataLoader
@@ -44,47 +45,9 @@ _STEADY_INLET_PRESSURE = 2.0
 _NONFINITE_INDEX = (3, 4)
 
 
-class _IdentityNormalizer:
-    """Leave tensors unchanged while exposing unit fitted scales."""
-
-    def __init__(self, channels: int) -> None:
-        """Store unit channel scales in the saved-normalizer layout."""
-        self.std = torch.ones(1, channels, 1, 1)
-
-    def transform(self, value: torch.Tensor) -> torch.Tensor:
-        """Return normalized-space input unchanged."""
-        return value
-
-    def inverse_transform(self, value: torch.Tensor) -> torch.Tensor:
-        """Return physical-space output unchanged."""
-        return value
-
-
-class _IdentityProcessor:
-    """Model the fitted processor lifecycle used by online evaluation."""
-
-    def __init__(self, task: domain.tasks.spec.TaskSpec) -> None:
-        """Create task-shaped identity normalizers and call traces."""
-        self.in_normalizer = _IdentityNormalizer(task.in_channels)
-        self.out_normalizer = _IdentityNormalizer(task.out_channels)
-        self.training = True
-        self.preprocessed_batch_sizes: list[int] = []
-
-    def eval(self) -> None:
-        """Switch preprocessing to evaluation semantics."""
-        self.training = False
-
-    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
-        """Normalize complete-batch inputs while preserving physical targets."""
-        if self.training:
-            msg = "artifact preprocessing did not enter evaluation mode"
-            raise AssertionError(msg)
-        inputs = batch["x"]
-        if not isinstance(inputs, torch.Tensor):
-            msg = "fixture inputs must be tensors"
-            raise TypeError(msg)
-        self.preprocessed_batch_sizes.append(int(inputs.shape[0]))
-        return {**batch, "x": self.in_normalizer.transform(inputs)}
+def _identity_scaling() -> datasets.preprocessing.normalization.TrainScaling:
+    """Return a steady Train scaling with zero means and unit scales, so encoding leaves tensors unchanged."""
+    return steady_scaling(_STEADY_SHAPE)
 
 
 class _SteadyProjection(nn.Module):
@@ -162,11 +125,11 @@ def _attach_objective_contract(
             "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
             "objective": next(metric for metric in task.default_metrics if metric.kind == "group_macro_rmse").as_dict(all_fields=task.output_names),
             "output_groups": analysis.artifacts.contracts.output_group_payload(task.output_groups),
+            "metric_evidence": analysis.artifacts.contracts.metric_evidence_provenance(task),
         }
     )
     provenance["normalizer"] = {
-        "denominator_floor": 0.0,
-        "output_standard_deviations": dict.fromkeys(task.output_names, 1.0),
+        "output_scales": dict.fromkeys(task.output_names, 1.0),
     }
 
 
@@ -213,7 +176,12 @@ def _steady_artifact(
             "y": targets[start:stop],
             "source_index": torch.arange(start, stop),
             "split_local_index": torch.arange(start, stop),
-            "meta": source_meta or {"sample_id": sample_ids[start:stop]},
+            "meta": source_meta
+            or {
+                "sample_id": sample_ids[start:stop],
+                "simulation_case_id": list(case_ids[start:stop]),
+                "material_family": ["lentil"] * (stop - start),
+            },
         }
         for start, stop in itertools.pairwise(bounds)
     ]
@@ -241,7 +209,7 @@ def _steady_artifact(
         task=task,
         model=model,
         loader=loader,
-        processor=_IdentityProcessor(task),
+        scaling=_identity_scaling(),
         device=torch.device("cpu"),
         save_root=root,
         provenance=provenance,
@@ -332,12 +300,12 @@ def test_steady_artifact_stores_dimensionless_physics_semantics(tmp_path: Path) 
     assert row["pressure_boundary_mse"] == pytest.approx(row["pressure_inlet_mse"] + row["pressure_outlet_mean_square"])
 
 
-def test_steady_artifact_rel_h1_is_the_training_h1_on_the_cropped_interior(tmp_path: Path) -> None:
+def test_steady_artifact_relative_h1_is_the_shared_case_metric_in_metres(tmp_path: Path) -> None:
     """
-    Bind the artifact ``rel_h1`` to the shared NeuralOp H1 implementation.
+    Bind the artifact ``physical_relative_h1`` to the shared per-case relative H1.
 
-    Each field is cropped to the EVAL_PAD interior first; the metric is the mean over
-    fields of the loss-factory relative H1 with physical spacing (dy, dx) = (1/8, 1/5) m.
+    The case value is the group-weighted mean of the per-field relative H1 of the shared
+    statistics with the physical spacing (dy, dx) = (1/8, 1/5) m read from the inputs.
     """
     task = domain.tasks.steady_flow.STEADY_FLOW
     y_values = torch.linspace(0.0, 1.0, _STEADY_SHAPE[0])
@@ -349,13 +317,12 @@ def test_steady_artifact_rel_h1_is_the_training_h1_on_the_cropped_interior(tmp_p
 
     inputs = {"x": x_grid[None, None], "y": y_grid[None, None]}
     prediction = model(torch.cat([inputs[name] if name in inputs else torch.zeros_like(x_grid)[None, None] for name in task.input_names], dim=1))
-    crop = analysis.artifacts.contracts.EVAL_PAD
-    relative_h1 = learning.losses.factory.build_relative_h1(2, reduction="mean", grid_spacing=(0.125, 0.2))
-    expected = [
-        float(relative_h1(prediction[:, c : c + 1, crop:-crop, crop:-crop], target[:, c : c + 1, crop:-crop, crop:-crop]))
-        for c in range(task.out_channels)
-    ]
-    assert frame["rel_h1"].iloc[0] == pytest.approx(sum(expected) / len(expected), rel=1e-5)
+    metrics = learning.metrics.metrics
+    sums = metrics.field_statistics(prediction.double(), target.double(), grid_spacing=(0.125, 0.2))[0]
+    per_field = {
+        field: metrics.case_relative_norm(sums[index], norm="h1", floor=task.reference_floor(field)) for index, field in enumerate(task.output_names)
+    }
+    assert frame["physical_relative_h1"].iloc[0] == pytest.approx(metrics.group_weighted_mean(per_field, task.output_groups), rel=1e-5)
 
 
 @pytest.mark.parametrize("partition", [(2, 1), (1, 1, 1)], ids=("unequal", "single-case"))
@@ -377,7 +344,7 @@ def test_steady_artifact_rows_and_objective_do_not_depend_on_the_batch_partition
     split, _root, _provenance = _steady_artifact(tmp_path / "split", model, case_ids=case_ids, target=target, partition=partition)
 
     metric_columns = [column for column in whole.columns if whole[column].dtype.kind == "f"]
-    assert whole["rel_l2"].nunique() == len(case_ids)
+    assert whole["physical_relative_l2"].nunique() == len(case_ids)
     pd.testing.assert_frame_equal(split[metric_columns], whole[metric_columns], rtol=1e-6)
     whole_value = whole.attrs["artifact_provenance"]["aggregate"]["value"]
     assert split.attrs["artifact_provenance"]["aggregate"]["value"] == pytest.approx(whole_value, rel=1e-9)
@@ -390,7 +357,7 @@ def test_non_steady_task_is_rejected_by_artifact_generation(tmp_path: Path, synt
             task=synthetic_task,
             model=nn.Identity(),
             loader=[],
-            processor=_IdentityProcessor(synthetic_task),
+            scaling=_identity_scaling(),
             device=torch.device("cpu"),
             save_root=tmp_path / "target",
             provenance={},
@@ -425,9 +392,9 @@ def test_steady_artifact_publishes_a_nonfinite_case_with_counts_instead_of_value
     assert [document["status"] for document in documents] == [validity_contract.VALID, validity_contract.NONFINITE]
     assert documents[1]["channels"]["u"]["nan_count"] == 1
     assert documents[1]["first_invalid"] == {"kind": "NONFINITE", "channel": "u", "channel_index": 1, "spatial_index": list(_NONFINITE_INDEX)}
-    record_metrics = ["rel_l2", "momentum_residual_mse", "physical_sse_p", "normalized_rmse_v", "normalized_velocity_vector_rmse"]
+    record_metrics = ["physical_rmse_u", "momentum_residual_mse", "physical_squared_error_p", "normalized_rmse_v", "normalized_velocity_vector_rmse"]
     assert np.isfinite(frame.loc[0, record_metrics].to_numpy(dtype=float)).all()
-    assert np.isnan(frame.loc[1, record_metrics].to_numpy(dtype=float)).all()
+    assert np.isnan(frame.loc[1, [*record_metrics, "physical_relative_l2"]].to_numpy(dtype=float)).all()
     assert frame.loc[1, "physical_count_u"] == _STEADY_SHAPE[0] * _STEADY_SHAPE[1]
     with np.load(root / "npz" / f"{_OTHER_CASE_ID}.npz", allow_pickle=False) as payload:
         assert np.isnan(payload["pred"][1, *_NONFINITE_INDEX])
@@ -435,7 +402,8 @@ def test_steady_artifact_publishes_a_nonfinite_case_with_counts_instead_of_value
     stored = json.loads(analysis.artifacts.contracts.artifact_provenance_path(root).read_text(encoding="utf-8"))
     aggregate = stored["aggregate"]
     required = len(case_ids) * len(task.output_names) * _STEADY_SHAPE[0] * _STEADY_SHAPE[1]
-    assert (aggregate["available"], aggregate["value"], aggregate["field_statistics"], aggregate["group_statistics"]) == (False, None, None, None)
+    unavailable = (aggregate["value"], aggregate["field_metrics"], aggregate["relative_unavailable_cases"], aggregate["group_statistics"])
+    assert (aggregate["available"], *unavailable) == (False, None, None, None, None)
     assert [aggregate[name] for name in ("required_value_count", "computed_value_count", "finite_value_count", "nonfinite_value_count")] == [
         required,
         required,
@@ -753,7 +721,6 @@ def test_artifact_batch_preserves_distinct_grouped_runs_with_equal_leaf_names(
         ),
     )
     monkeypatch.setattr(service, "run_or_load_artifacts", lambda **kwargs: pd.DataFrame({"run": [str(kwargs["run_dir"])]}))
-    monkeypatch.setattr(service, "_upload_published_artifacts", lambda **_kwargs: None)
     monkeypatch.setattr(service, "cleanup_runtime", lambda _device: None)
     owners_file = tmp_path / "owners"
     monkeypatch.setenv("JOB_LOG_OWNERS_FILE", str(owners_file))

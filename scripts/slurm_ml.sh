@@ -4,8 +4,8 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/slurm_ml.sh [RESOURCES] train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--max-epochs N] [--continue-with-current-code]
-  scripts/slurm_ml.sh [RESOURCES] train --resume STAGE [--max-epochs N] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] train CONFIG [--epochs N] [--train-dataset ID] [--seed N] [--train-seconds N] [--rollout-length N] [--lr-scale X] [--revision LABEL] [--train-stages a0,b,a1] [--artifacts selected|none|all|a0,b,a1] [--continue-with-current-code]
+  scripts/slurm_ml.sh [RESOURCES] train --resume STAGE [--continue-with-current-code]
   scripts/slurm_ml.sh [RESOURCES] optuna CONFIG [--epochs N] [--train-dataset ID] [--revision LABEL] [Optuna CLI options] [--continue-with-current-code]
   scripts/slurm_ml.sh [RESOURCES] artifacts [artifact CLI options]
   scripts/slurm_ml.sh [RESOURCES] probe
@@ -15,8 +15,8 @@ Defaults: mode gpu (probe: cpu); 4 CPUs; cpu: partition standard, 16G; gpu: part
 32G, gres gpu:rtx6000ada:1; time 04:00:00 (train, optuna), 02:00:00 (artifacts), 00:10:00 (probe).
 GPU TYPE is v100, rtxa6000, or rtx6000ada. The probe checks the allocated
 container and ML CLIs without opening datasets or starting workloads.
-Rerunning train CONFIG continues an existing run automatically (more --epochs
-extends a steady run; another transient A0 --epochs trains beside it);
+Rerunning train CONFIG continues an interrupted run automatically; a finished
+run is never extended, and another --epochs trains a separate run beside it;
 train --resume STAGE continues one saved run from its own config.
 LABEL (--revision) names a deliberately separate run after its science changed
 (e.g. code or config content): [A-Za-z0-9][A-Za-z0-9._-]{0,63}.
@@ -182,7 +182,6 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
   revision_seen=false
   artifacts_seen=false
   train_stages_seen=false
-  max_epochs_seen=false
   epochs_seen=false
   train_dataset_seen=false
   train_seconds_seen=false
@@ -258,15 +257,6 @@ elif [[ "${operation}" == train || "${operation}" == optuna ]]; then
         semantic_args+=("$1" "$2")
         # Only the trained stages' leaves bind the source tree; unselected stages are read-only prerequisites.
         [[ "$1" != --train-stages ]] || preflight_override_args+=("$1" "$2")
-        shift 2
-        ;;
-      --max-epochs)
-        [[ "${operation}" == train ]] || fail 2 "--max-epochs is training-only."
-        [[ "${max_epochs_seen}" == false ]] || fail 2 "Duplicate --max-epochs."
-        (( $# >= 2 )) || fail 2 "--max-epochs requires a positive integer."
-        [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail 2 "--max-epochs requires a positive integer."
-        semantic_args+=("$1" "$2")
-        max_epochs_seen=true
         shift 2
         ;;
       --epochs)
@@ -347,7 +337,7 @@ else
   selection_seen=false
   while (( $# > 0 )); do
     case "$1" in
-      --task|--run-name|--case-id|--split|--evaluation-spatial-stride)
+      --task|--run-name|--case-id|--split)
         (( $# >= 2 )) || fail 2 "$1 requires a value."
         [[ -n "$2" ]] || fail 2 "$1 requires a value."
         [[ "$1" != --task ]] || selection_seen=true

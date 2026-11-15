@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check canonical input storage, source identity, dry runs, and complete campaign membership
+  - Check that generation, reuse, and transaction recovery keep only the HDF5 input store beside each case payload
 
 Design principles:
   - Persisted case membership and admitted source bytes govern execution
@@ -12,6 +13,7 @@ This module does NOT:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from types import SimpleNamespace
@@ -26,6 +28,7 @@ from src.generation.cli import cli_generation
 from src.generation.runtime import generation_runtime_preparation as runtime_preparation
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
 _FAKE_GIT_COMMIT = "a" * 40
@@ -55,6 +58,12 @@ def _load_config(
             "test",
         ),
     )
+
+
+def _assert_only_stored_inputs(references: Iterable[Any]) -> None:
+    """Require every admitted case input directory to hold its payload, reference, and input store and no CSV."""
+    for reference in references:
+        assert {path.name for path in reference.case_directory.iterdir()} == {"case.json", "input_reference.json", "inputs.h5"}
 
 
 def test_case_range_validation_rejects_overflow_and_non_integer_start(
@@ -100,7 +109,7 @@ def test_input_generation_is_exactly_equivalent_to_runtime_preparation(
     tmp_path: Path,
     profile_id: str,
 ) -> None:
-    """Prove exact case identity and adapter bytes across independent owners."""
+    """Prove exact case identity and rendered adapter bytes across independent owners; storage keeps only the input store."""
     config = _load_config(
         generation_config_factory,
         profile_id,
@@ -129,8 +138,12 @@ def test_input_generation_is_exactly_equivalent_to_runtime_preparation(
     reference = generation.cases.input_generation.admit_configured_input_references(config, storage_root=storage)[1]
     payload = json.loads((reference.case_directory / "case.json").read_text())
     assert payload["input_files"]
-    for filename in ("case.json", *sorted(payload["input_files"])):
-        assert (reference.case_directory / filename).read_bytes() == (prepared.work_directory / filename).read_bytes()
+    assert {path.name for path in reference.case_directory.iterdir()} == {"case.json", "input_reference.json", "inputs.h5"}
+    assert (reference.case_directory / "case.json").read_bytes() == (prepared.work_directory / "case.json").read_bytes()
+    for filename, identity in payload["input_files"].items():
+        rendered = (prepared.work_directory / filename).read_bytes()
+        assert {"sha256": hashlib.sha256(rendered).hexdigest(), "size_bytes": len(rendered)} == identity
+    assert not (prepared.work_directory / "inputs.h5").exists()
 
 
 def test_git_provenance_changes_case_json_but_not_scientific_case_ids(
@@ -187,6 +200,7 @@ def test_commit_only_change_reuses_the_input_batch_and_keeps_its_original_commit
     assert set(admitted) == set(config.case_indices)
     replay = inputs.generate_input_cases(config, len(config.case_indices), case_start=config.case_indices[0], storage_root=storage)
     assert (replay.generated_case_count, replay.reused_case_count) == (0, len(config.case_indices))
+    _assert_only_stored_inputs(admitted.values())
 
 
 @pytest.mark.parametrize("git_commit", ["A" * 40, "a" * 39, 7, None])
@@ -232,7 +246,9 @@ def test_transaction_recovery_after_a_commit_only_change_keeps_the_original_comm
 
     assert (recovered.generated_case_count, recovered.reused_case_count) == (0, len(config.case_indices))
     assert _batch_commit(recovered) == _FAKE_GIT_COMMIT
-    assert set(inputs.admit_configured_input_references(config, storage_root=storage, validation_depth="full")) == set(config.case_indices)
+    references = inputs.admit_configured_input_references(config, storage_root=storage, validation_depth="full")
+    assert set(references) == set(config.case_indices)
+    _assert_only_stored_inputs(references.values())
 
 
 def test_scientific_drift_still_refuses_an_existing_input_batch_under_a_new_commit(

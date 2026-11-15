@@ -3,6 +3,7 @@
 Responsibilities:
   - Build test-owned campaigns, templates, export mappings, and controllable fake solver processes
   - Expose plain builders so session-scoped fixtures can reuse the same synthetic inputs
+  - Re-encode a stored input container equivalently for identity-independence checks
   - Register the fake Slurm fixtures that node-mode campaign tests share
 
 Design principles:
@@ -20,6 +21,8 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import h5py
+import numpy as np
 import pytest
 import yaml
 
@@ -340,6 +343,32 @@ def lentil_generation_config(
         path,
         only_batch=generation.cases.config.build_batch_name(profile_id, _TEST_MATERIAL_FAMILY, FIXTURE_DESIGN_KIND),
     )
+
+
+def rewrite_input_store_equivalently(path: Path) -> None:
+    """Rewrite one stored input container with the same content but another HDF5 encoding: member order, chunking, compression."""
+
+    def read(parent: h5py.Group, name: str) -> Any:
+        member = parent[name]
+        assert isinstance(member, h5py.Dataset)
+        return member[()]
+
+    with h5py.File(path, "r") as source:
+        attributes = dict(source.attrs)
+        group = source["fields"]
+        assert isinstance(group, h5py.Group)
+        columns = [str(name) for name in np.asarray(group.attrs["columns"]).tolist()]
+        maps = {name: read(group, name) for name in columns}
+        tables = {name: read(source, name) for name in ("schedule", "scalars") if name in source}
+    path.unlink()
+    with h5py.File(path, "w", track_order=True) as target:
+        for name, table in tables.items():
+            target.create_dataset(name, data=table, chunks=True)
+        group = target.create_group("fields", track_order=True)
+        for name in reversed(columns):
+            group.create_dataset(name, data=maps[name], chunks=True, compression="gzip", shuffle=True)
+        group.attrs.create("columns", columns, dtype=h5py.string_dtype())
+        target.attrs.update(attributes)
 
 
 def successful_source_case(campaign_name: str, batch: Any, case_index: int, storage: Path, work_root: Path) -> dict[str, Any]:

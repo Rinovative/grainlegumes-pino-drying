@@ -47,6 +47,7 @@ def _binding(dataset_id: str, cases: dict[str, tuple[str, str]], *, kind: str | 
         materials={case_id: material for case_id, (material, _) in cases.items()},
         design_kinds={case_id: kind or _DESIGN_KINDS[case_id] for case_id in cases},
         case_partition=None,
+        grid_axes_sha256="a" * 64,
     )
 
 

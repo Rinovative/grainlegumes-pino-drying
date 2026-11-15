@@ -14,9 +14,11 @@ This module does NOT:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -434,6 +436,7 @@ def test_node_worker_mode_forwards_term_to_the_python_worker_and_returns_its_sta
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,  # its own process group, so cleanup also reaches workers the script started
     )
     try:
         deadline = time.monotonic() + 60
@@ -443,9 +446,10 @@ def test_node_worker_mode_forwards_term_to_the_python_worker_and_returns_its_sta
         process.send_signal(15)
         process.communicate(timeout=30)
     finally:
-        if process.poll() is None:
-            process.kill()
-            process.communicate()
+        # A failing run must not leave the looping fake worker behind on the login node.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
     assert process.returncode == 143
     assert "TERM-received" in command_log.read_text(encoding="utf-8")
 

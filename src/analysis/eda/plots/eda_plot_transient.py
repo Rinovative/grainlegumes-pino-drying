@@ -35,6 +35,7 @@ from src.analysis.eda import eda_transient as transient
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_field_maps as field_maps
+from src.analysis.presentation import analysis_moisture_display as moisture_display
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as layout
 from src.analysis.ui import analysis_ui_time as time_axis
@@ -164,6 +165,7 @@ def _draw_exact_schedule_split_axes(
             display_values = field_labels.display_values(
                 series.values,
                 field.unit,
+                field=field.name,
             )
             main, startup = _split_physical_time_support(
                 series.physical_time_hours,
@@ -194,6 +196,7 @@ def _draw_exact_schedule_split_axes(
             marker_value = field_labels.display_values(
                 (series.value_at(actual.physical_time),),
                 field.unit,
+                field=field.name,
             )[0]
             if actual.physical_time < _EARLY_OPERATION_END_HOURS:
                 marker_axis = startup_axes[field_index]
@@ -476,7 +479,7 @@ def _spatial_map_figure(
     dataset_labels = tuple(datasets)
     for field_index, field in enumerate(resolution.fields):
         compatible = set(resolution.datasets_by_field[field])
-        units = {capabilities.field_display_unit(datasets[label], field) for label in compatible}
+        units = {capabilities.field_value_unit(datasets[label], field) for label in compatible}
         representations = {capabilities.field_representation(datasets[label], field) for label in compatible}
         if len(units) != 1 or len(representations) != 1:
             message = f"Spatial field {field!r} has incompatible units or representations."
@@ -495,7 +498,7 @@ def _spatial_map_figure(
                 )
             else:
                 values = capabilities.field_values(frame, row, field)
-            values_by_label[label] = capabilities.field_display_values(frame, field, values)
+            values_by_label[label] = capabilities.field_display_values(frame, row, field, values)
         unit = next(iter(units))
         representation = next(iter(representations))
         shared_norm = spatial_field_scale(field, unit, representation, *values_by_label.values()) if lock_scale else None
@@ -544,16 +547,12 @@ def _spatial_map_figure(
                 figure,
                 image,
                 axis,
-                label=(
-                    "[" + field_labels.display_unit(capabilities.field_display_unit(frame, field)) + "]"
-                    if dataset_index == rightmost_compatible_index
-                    else ""
-                ),
+                label=(f"[{capabilities.field_display_unit(frame, field)}]" if dataset_index == rightmost_compatible_index else ""),
             )
             colorbar.set_ticks(normalization.ticks.tolist())
         layout.add_channel_row_label(
             map_axes[field_index, 0],
-            field_labels.field_label(field, mathtext=True),
+            moisture_display.display_name(field, mathtext=True),
             figure_x=(_TRANSIENT_ROW_LABEL_X if include_schedules else None),
         )
     _apply_eda_map_axis_labels(map_axes)
@@ -582,8 +581,10 @@ def _has_complete_schedules(datasets: Mapping[str, pd.DataFrame]) -> bool:
 
 
 def spatial_field_scale(field: str, unit: str, representation: str, *values: np.ndarray) -> field_maps.FieldMapDefinition:
-    """Build shared eleven-band scales from full, representation-aware arrays."""
+    """Build shared eleven-band scales from full, representation-aware arrays; masked unphysical water cells stay off the scale."""
     combined = np.concatenate(tuple(np.ravel(value) for value in values))
+    if moisture_display.is_moisture_field(field):
+        combined = combined[np.isfinite(combined)]
     semantic = field_maps.FieldMapSemantic.LINEAR_POSITIVE
     if field in {"Kxx", "Kyy", "K_min", "K_max"} and unit == "m^2":
         semantic = field_maps.FieldMapSemantic.LOG_POSITIVE
@@ -885,6 +886,7 @@ def _trajectory_figure(
                 median = field_labels.display_values(
                     series.values,
                     schedule_field.unit,
+                    field=schedule_field.name,
                 )
                 q90 = None
             else:
@@ -897,9 +899,9 @@ def _trajectory_figure(
                     selected_case_ids,
                     schedule_field.name,
                 )
-                q10 = field_labels.display_values(q10, schedule_field.unit)
-                median = field_labels.display_values(median, schedule_field.unit)
-                q90 = field_labels.display_values(q90, schedule_field.unit)
+                q10, median, q90 = (
+                    field_labels.display_values(values, schedule_field.unit, field=schedule_field.name) for values in (q10, median, q90)
+                )
             if contributors is not None:
                 _plot_contributors(main_counts[index], startup_counts[index], physical_time, contributors, color=colors[label])
             main_support, startup_support = _plot_split_time_series(
@@ -948,27 +950,8 @@ def _trajectory_figure(
         for label, frame in compatible.items():
             contributors = None
             if case_ids is not None:
-                table = transient.trajectory_table(
-                    frame,
-                    case_ids[label],
-                    channels=(field,),
-                )
-                physical_time = table["physical_time_hours"].to_numpy(dtype=float)
-                median = capabilities.field_display_values(
-                    frame,
-                    field,
-                    table["spatial_mean"].to_numpy(dtype=float),
-                )
-                lower = capabilities.field_display_values(
-                    frame,
-                    field,
-                    table["spatial_minimum"].to_numpy(dtype=float),
-                )
-                upper = capabilities.field_display_values(
-                    frame,
-                    field,
-                    table["spatial_maximum"].to_numpy(dtype=float),
-                )
+                row = capabilities.case_row(frame, case_ids[label])
+                physical_time, median, lower, upper = capabilities.field_display_trajectory(frame, row, field)
             else:
                 if max_cases is None:
                     message = "Aggregate trajectory plotting lost its case bound."
@@ -976,19 +959,9 @@ def _trajectory_figure(
                 times_by_case = []
                 means_by_case = []
                 for case_id in tuple(str(value) for value in frame.index[:max_cases]):
-                    table = transient.trajectory_table(
-                        frame,
-                        case_id,
-                        channels=(field,),
-                    )
-                    times_by_case.append(table["physical_time_hours"].to_numpy(dtype=float))
-                    means_by_case.append(
-                        capabilities.field_display_values(
-                            frame,
-                            field,
-                            table["spatial_mean"].to_numpy(dtype=float),
-                        )
-                    )
+                    case_times, case_means, *_extrema = capabilities.field_display_trajectory(frame, capabilities.case_row(frame, case_id), field)
+                    times_by_case.append(case_times)
+                    means_by_case.append(case_means)
                 physical_time, lower, median, upper, contributors = transient.aggregate_exact_series(
                     times_by_case,
                     means_by_case,
@@ -1269,14 +1242,14 @@ def plot_completion_target_analysis(
             positions = np.arange(position, position + count)
             moisture_axis.scatter(
                 positions,
-                rows["final_bulk_moisture_wb"],
+                field_labels.display_values(rows["final_bulk_moisture_wb"].to_numpy(dtype=float), "1", field="final_bulk_moisture_wb"),
                 color=colors[label],
                 marker="o",
                 alpha=0.85,
             )
             moisture_axis.scatter(
                 positions,
-                rows["target_moisture_wb"],
+                field_labels.display_values(rows["target_moisture_wb"].to_numpy(dtype=float), "1", field="target_moisture_wb"),
                 color=colors[label],
                 marker="_",
                 linewidths=2.0,
@@ -1297,11 +1270,13 @@ def plot_completion_target_analysis(
             )
             position += count
         moisture_axis.tick_params(axis="x", labelbottom=False)
-        moisture_axis.set_ylabel("Moisture [wb]")
+        moisture_axis.set_ylabel(
+            f"{moisture_display.display_name('w_gr', mathtext=True)} [{field_labels.display_unit('1', field='final_bulk_moisture_wb')}]"
+        )
         moisture_axis.set_title("Final bulk moisture and target")
         moisture_axis.grid(alpha=0.25)
         wet_fraction_axis.set_xlabel("Eligible case position")
-        wet_fraction_axis.set_ylabel("Wet fraction [1]")
+        wet_fraction_axis.set_ylabel("Wet fraction [-]")
         wet_fraction_axis.set_title("Final wet fraction and allowed limit")
         wet_fraction_axis.grid(alpha=0.25)
 

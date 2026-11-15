@@ -1,10 +1,12 @@
-"""Protect transient reconstructed-state metrics and scaled-increment loss.
+"""Protect the material-case selection objective and the transient state-loss construction.
 
 Responsibilities:
-  - Check masked global drying metrics, weighted increment losses, Huber, and state auxiliary terms
+  - Check that the group objective weighs materials equally whatever their case counts and cases equally whatever their lengths
+  - Check that the case-resolved objective metric and its transient components follow the objective
+  - Check case-resolved MAE accumulation and transient state-loss construction
 
 Design principles:
-  - Task weights and explicit reductions govern reconstructed-state and increment semantics
+  - Expected values are computed by hand from test-owned constant errors
 
 This module does NOT:
   - Construct steady physics losses or fit transient scales
@@ -20,201 +22,93 @@ import torch
 from src import domain, learning
 
 _TASK = domain.tasks.registry.get_task("transient_drying")
-_DRYING_METRIC = next(metric for metric in _TASK.default_metrics if metric.kind == "drying_group_macro_rmse")
+_OBJECTIVE = next(metric for metric in _TASK.default_metrics if metric.kind == "group_macro_rmse")
 _PHYSICAL_MAE = next(metric for metric in _TASK.default_metrics if metric.id == "physical_mae_T")
-_BATCH_INDEX = 7
-_HUBER_BETA = 0.5
+_SCALES = (2.0, 0.5, 4.0, 8.0)
+_WEIGHTS = (1 / 3, 1 / 3, 1 / 6, 1 / 6)
+_METRICS = learning.metrics.metrics
 
 
-def _metric(
-    definition: domain.tasks.spec.MetricSpec,
-) -> learning.metrics.metrics.DatasetMetric:
-    """Build one test-selected transient metric on CPU."""
-    config = {
-        "task": _TASK.id,
-        "evaluation": {
-            "metrics": [
-                definition.as_dict(all_fields=_TASK.metric_names),
-            ],
-        },
-    }
-    return learning.metrics.metrics.build_evaluation_metrics(
-        config,
-        device=torch.device("cpu"),
-    )[definition.id]
+def _metric(definition: domain.tasks.spec.MetricSpec) -> learning.metrics.metrics.DatasetMetric:
+    """Build one test-selected transient metric on CPU with test-owned Train scales."""
+    config = {"task": _TASK.id, "evaluation": {"metrics": [definition.as_dict(all_fields=_TASK.metric_names)]}}
+    return _METRICS.build_evaluation_metrics(config, device=torch.device("cpu"), output_scales=torch.tensor(_SCALES))[definition.id]
 
 
-def _loss_config(
-    *,
-    kind: str = "mse",
-    beta: float = 1.0,
-    channel_weights: list[float] | None = None,
-    state_aux_weight: float = 0.0,
-    physics_enabled: bool = False,
-) -> dict[str, object]:
-    """Return one minimal resolved transient loss selection."""
-    return {
-        "task": _TASK.id,
-        "loss": {
-            "data": {
-                "kind": kind,
-                "space": "scaled_increment",
-                "weight": 1.0,
-                "beta": beta,
-                "channel_weights": ([1.0, 1.0, 1.0, 1.0] if channel_weights is None else channel_weights),
-                "state_aux_weight": state_aux_weight,
-            },
-            "physics": {"enabled": physics_enabled},
-        },
-    }
+def _case_rows(errors: tuple[float, ...], *, steps: int) -> torch.Tensor:
+    """Return ``steps`` flattened state rows of one case with one constant physical error per field."""
+    return torch.tensor(errors, dtype=torch.float64).view(1, 4, 1, 1).expand(steps, 4, 2, 3)
 
 
-def test_drying_macro_uses_exact_weights_and_global_statistics() -> None:
-    """Weight global field RMSE as 1/3, 1/3, 1/6, and 1/6."""
-    metric = _metric(_DRYING_METRIC)
-    target = torch.zeros(3, 4, 2, 2)
-    field_errors = torch.tensor([3.0, 6.0, 9.0, 12.0])
-    prediction = field_errors.view(1, 4, 1, 1).expand_as(target)
-    metric.update(
-        prediction,
-        target,
-        space="normalized",
-        batch_index=_BATCH_INDEX,
+def _objective(field_mse: dict[str, float]) -> float:
+    """Return the hand-computed weighted sum of scaled term RMSEs for single-field drying terms."""
+    return sum(weight * math.sqrt(field_mse[name] / scale**2) for name, weight, scale in zip(_TASK.metric_names, _WEIGHTS, _SCALES, strict=True))
+
+
+def test_group_objective_weighs_materials_equally_whatever_their_case_counts_and_lengths() -> None:
+    """
+    Accumulate three cases of two materials, split across batches and of different lengths.
+
+    Each case's errors average over its own grid and time; cases of a material then count
+    equally, and both materials count equally although one has two cases and one has one.
+    """
+    metric = _metric(_OBJECTIVE)
+    assert isinstance(metric, _METRICS.GroupMacroRMSEMetric)
+    assert metric.requires_cases
+    long_case = _case_rows((1.0, 1.0, 1.0, 1.0), steps=6)
+    short_case = _case_rows((3.0, 3.0, 3.0, 3.0), steps=2)
+    other = _case_rows((2.0, 4.0, 6.0, 8.0), steps=3)
+    target = torch.zeros(11, 4, 2, 3, dtype=torch.float64)
+    # The long case arrives in two batches: its rows still form one case mean.
+    batches = (
+        (torch.cat((long_case[:4], short_case)), ("a1",) * 4 + ("a2",) * 2, ("A",) * 6),
+        (torch.cat((long_case[4:], other)), ("a1",) * 2 + ("b1",) * 3, ("A",) * 2 + ("B",) * 3),
     )
-    expected = 3.0 / 3.0 + 6.0 / 3.0 + 9.0 / 6.0 + 12.0 / 6.0
-    assert metric.compute() == pytest.approx(expected)
+    for index, (prediction, cases, materials) in enumerate(batches):
+        membership = _METRICS.CaseMembership(cases, materials)
+        metric.update(prediction, target[: len(cases)], space="physical", batch_index=index, cases=membership)
 
-    partitioned = _metric(_DRYING_METRIC)
-    for index, (pred_batch, target_batch) in enumerate(
-        zip(
-            prediction.split((1, 2)),
-            target.split((1, 2)),
-            strict=True,
-        )
-    ):
-        partitioned.update(
-            pred_batch,
-            target_batch,
-            space="normalized",
-            batch_index=index,
-        )
-    assert partitioned.compute() == pytest.approx(expected)
+    material_a = dict.fromkeys(_TASK.metric_names, 0.5 * (1.0 + 9.0))
+    material_b = dict(zip(_TASK.metric_names, (4.0, 16.0, 36.0, 64.0), strict=True))
+    population = {name: 0.5 * (material_a[name] + material_b[name]) for name in _TASK.metric_names}
+    objective = metric.objective()
+    assert (objective.case_count, objective.material_count) == (3, 2)
+    assert dict(objective.field_mse) == pytest.approx(population)
+    assert metric.compute() == pytest.approx(_objective(population))
+    components = metric.components()
+    assert components["T"] == pytest.approx(math.sqrt(population["T"]) / _SCALES[0])
+    assert components["grain_moisture"] == pytest.approx(0.5 * (components["w_surf"] + components["w_int"]))
+    with pytest.raises(ValueError, match="one case membership per batch row"):
+        metric.update(other, target[:3], space="physical", batch_index=2)
 
 
-def test_drying_macro_accumulates_masked_global_statistics() -> None:
-    """Use valid-mask counts rather than finalized batch averages."""
-    metric = _metric(_DRYING_METRIC)
-    assert isinstance(metric, learning.metrics.metrics.DryingGroupMacroRMSEMetric)
-    target = torch.zeros(2, 4, 1, 2)
-    prediction = torch.zeros_like(target)
-    prediction[0, :, 0, 0] = torch.tensor([3.0, 6.0, 9.0, 12.0])
-    prediction[1, :, 0, 1] = torch.tensor([6.0, 12.0, 18.0, 24.0])
-    mask = torch.tensor([[[[True, False]]], [[[False, True]]]])
-
-    metric.update(prediction, target, space="normalized", batch_index=0, mask=mask)
-
-    expected_fields = [
-        math.sqrt((3.0**2 + 6.0**2) / 2.0),
-        math.sqrt((6.0**2 + 12.0**2) / 2.0),
-        math.sqrt((9.0**2 + 18.0**2) / 2.0),
-        math.sqrt((12.0**2 + 24.0**2) / 2.0),
-    ]
-    expected = sum(weight * value for weight, value in zip((1.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0), expected_fields, strict=True))
-    assert metric.compute() == pytest.approx(expected)
-    assert metric.components()["grain_moisture_error"] == pytest.approx(
-        0.5 * (expected_fields[2] + expected_fields[3]),
-    )
-
-    with pytest.raises(ValueError, match="no valid"):
-        metric.update(
-            prediction,
-            target,
-            space="normalized",
-            batch_index=1,
-            mask=torch.zeros_like(mask),
-        )
+def test_group_objective_rejects_a_case_that_enters_twice() -> None:
+    """Refuse a population in which one case appears twice, so no case can double its weight."""
+    terms = _TASK.error_terms
+    case = _METRICS.CaseErrors("c1", "A", dict.fromkeys(_TASK.metric_names, 1.0))
+    with pytest.raises(ValueError, match="twice"):
+        _METRICS.group_objective((case, case), terms=terms, train_scales=dict(zip(_TASK.metric_names, _SCALES, strict=True)))
 
 
-def test_mae_accumulates_global_absolute_error() -> None:
-    """Finalize transient MAE from total absolute error and element count."""
+def test_mae_averages_each_case_over_its_states_before_the_materials() -> None:
+    """Finalize transient MAE as each case's mean absolute error over its states, then equal over cases and materials."""
     metric = _metric(_PHYSICAL_MAE)
-    first = torch.zeros(1, 4, 1, 2)
-    second = torch.zeros_like(first)
-    first[:, 0] = torch.tensor([1.0, -3.0])
-    second[:, 0] = torch.tensor([5.0, -7.0])
-    target = torch.zeros_like(first)
-    metric.update(first, target, space="physical", batch_index=0)
-    metric.update(second, target, space="physical", batch_index=1)
-    assert metric.compute() == pytest.approx(4.0)
+    first = torch.zeros(2, 4, 1, 2)
+    second = torch.zeros(1, 4, 1, 2)
+    first[:, 0, 0] = torch.tensor([[1.0, -3.0], [10.0, 10.0]])
+    second[:, 0, 0] = torch.tensor([5.0, -7.0])
+    metric.update(first, torch.zeros_like(first), space="physical", batch_index=0, cases=_METRICS.CaseMembership(("a1", "b1"), ("A", "B")))
+    metric.update(second, torch.zeros_like(second), space="physical", batch_index=1, cases=_METRICS.CaseMembership(("a1",), ("A",)))
+    assert metric.compute() == pytest.approx(0.5 * (4.0 + 10.0))
 
 
-def test_mse_reduces_every_nonchannel_axis_with_explicit_weights() -> None:
-    """Reduce BLCHW errors by channel before normalized weighted aggregation."""
-    weights = [1.0, 1.0, 2.0, 2.0]
-    loss = learning.losses.factory.build_training_loss(
-        _loss_config(channel_weights=weights),
-        device=torch.device("cpu"),
-    )
-    channel_errors = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    prediction = channel_errors.view(1, 1, 4, 1, 1).expand(2, 3, 4, 2, 2)
-    target = torch.zeros_like(prediction)
-    value = loss(prediction, target)
-    expected = sum(weight * error**2 for weight, error in zip(weights, channel_errors.tolist(), strict=True)) / sum(weights)
-    assert value == pytest.approx(expected)
-    assert tuple(loss.last_components) == ("total", "data", "data_T", "data_phi", "data_w_surf", "data_w_int", "state_aux")
-    assert loss.last_components["state_aux"].item() == 0.0
-
-
-def test_huber_and_optional_reconstructed_state_auxiliary_are_named() -> None:
-    """Apply positive-beta Huber data loss plus disabled-by-default state loss."""
-    loss = learning.losses.factory.build_training_loss(
-        _loss_config(
-            kind="huber",
-            beta=_HUBER_BETA,
-            state_aux_weight=0.25,
-        ),
-        device=torch.device("cpu"),
-    )
-    prediction = torch.ones(1, 2, 4, 1, 1)
-    target = torch.zeros_like(prediction)
-    predicted_state = torch.full_like(prediction, 2.0)
-    target_state = torch.zeros_like(prediction)
-    components = loss.compute_components(
-        prediction,
-        y=target,
-        predicted_state=predicted_state,
-        target_state=target_state,
-    )
-    expected_huber = _HUBER_BETA * (1.0 - 0.5 * _HUBER_BETA)
-    assert components["data"] == pytest.approx(expected_huber)
-    assert components["state_aux"] == pytest.approx(1.0)
-    assert components["total"] == pytest.approx(expected_huber + 1.0)
-
-
-def test_transient_loss_validation_skips_steady_physics_construction() -> None:
-    """Reject unsupported physics and malformed loss values at task ownership."""
-    loss = learning.losses.factory.build_training_loss(
-        _loss_config(),
-        device=torch.device("cpu"),
-    )
-    assert isinstance(
-        loss,
-        learning.losses.transient.TransientIncrementLoss,
-    )
+def test_transient_training_loss_is_the_data_only_state_loss() -> None:
+    """Build the transient state loss from the resolved selection and reject physics terms."""
+    config = {"task": _TASK.id, "loss": {"data": {"kind": "mse", "weight": 1.0}, "physics": {"enabled": False}}}
+    loss = learning.losses.factory.build_training_loss(config, device=torch.device("cpu"))
+    assert isinstance(loss, learning.losses.transient.TransientStateLoss)
     assert loss.physics_enabled is False
-
-    with pytest.raises(ValueError, match="positive finite"):
-        learning.losses.factory.build_training_loss(
-            _loss_config(kind="huber", beta=math.nan),
-            device=torch.device("cpu"),
-        )
     with pytest.raises(ValueError, match="data-only"):
         learning.losses.factory.build_training_loss(
-            _loss_config(physics_enabled=True),
-            device=torch.device("cpu"),
-        )
-    with pytest.raises(ValueError, match="four values"):
-        learning.losses.factory.build_training_loss(
-            _loss_config(channel_weights=[1.0, 1.0]),
-            device=torch.device("cpu"),
+            {**config, "loss": {"data": {"kind": "mse", "weight": 1.0}, "physics": {"enabled": True}}}, device=torch.device("cpu")
         )

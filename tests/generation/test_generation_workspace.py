@@ -100,7 +100,7 @@ def test_case_workspaces_are_unique_marked_and_support_spaces(
         marker = json.loads(prepared.workspace_marker.read_text(encoding="utf-8"))
         assert marker["case_id"] == prepared.bundle.case_id
         assert marker["work_directory"] == str(prepared.work_directory)
-        assert {path.name for path in prepared.bundle.input_paths} == {"fields.csv"}
+        assert (prepared.work_directory / "fields.csv").is_file()
         assert (prepared.work_directory / "model.mph").is_file()
         assert not (prepared.work_directory / "scalars.csv").exists()
         assert not (prepared.work_directory / "schedule.csv").exists()

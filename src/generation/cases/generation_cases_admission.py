@@ -1,21 +1,22 @@
 """Admit immutable canonical pre-execution input batches for inspection.
 
 Responsibilities:
-  - Validate input-generation manifests, case evidence, and adapter hashes
-  - Reconstruct column-major spatial fields on the declared Cartesian grid
+  - Validate input-generation manifests, case evidence, COMSOL input identities, and input-store integrity
+  - Load spatial, scalar, and schedule inputs from the stored HDF5 container on the declared Cartesian grid
   - Expose immutable lazy discovery records to analysis consumers
 
 Design principles:
   - Metadata is the sole discovery boundary; arbitrary raw directories are ignored
   - Persisted identities, lifecycle state, and adapter contracts fail closed
+  - Case directories without the input store are refused with a regeneration instruction
 
 This module does NOT:
   - Run COMSOL, infer missing raw inputs, or publish generation results
+  - Parse CSV inputs or convert CSV-only case directories
 """
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 from collections.abc import Mapping
@@ -35,8 +36,6 @@ from . import generation_cases_case as case_service
 from . import generation_cases_config as config_service
 from . import generation_cases_schedule as schedule_service
 
-_MINIMUM_ROWS = 2
-_SCALAR_COLUMNS = 3
 _SHA256_LENGTH = 64
 INPUT_BATCH_SCHEMA_KIND = "generation_input_batch"
 _INPUT_EXECUTION_ARTIFACT_NAMES = frozenset(
@@ -89,6 +88,7 @@ INPUT_CASE_RECORD_KEYS = frozenset(
         "case_json_sha256",
         "seed_evidence_sha256",
         "input_files",
+        "input_store",
     }
 )
 
@@ -190,6 +190,7 @@ class InputCaseReference:
     simulation_case_id: str
     case_json_sha256: str
     case_json_size_bytes: int
+    store_identity: case_service.InputStoreIdentity
     case_directory: Path
     parameter_metadata: Mapping[str, Any] | None
     _case_payload_json: str
@@ -304,95 +305,6 @@ def _admit_parameter_metadata(
     return MappingProxyType(result)
 
 
-def read_input_adapter_table(path: Path, *, delimiter: str) -> tuple[list[str], np.ndarray]:
-    """
-    Read one finite numeric Generation adapter table without schema inference.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Exact persisted adapter file.
-    delimiter : str
-        Canonical delimiter declared by the case input contract.
-
-    Returns
-    -------
-    tuple[list[str], numpy.ndarray]
-        Header names and a read-only two-dimensional float array.
-
-    Raises
-    ------
-    ValueError
-        If text, row-width, numeric, or finiteness validation fails.
-
-    """
-    try:
-        rows = list(csv.reader([line for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()], delimiter=delimiter))
-    except (OSError, UnicodeDecodeError) as error:
-        msg = f"Generation input adapter is not readable text: {path}"
-        raise ValueError(msg) from error
-    if len(rows) < _MINIMUM_ROWS:
-        msg_0 = f"Generation input adapter must contain a header and data: {path}"
-        raise ValueError(msg_0)
-    header = [item.strip() for item in rows[0]]
-    if not header or len(header) != len(set(header)) or any(len(row) != len(header) for row in rows[1:]):
-        msg_1 = f"Generation input adapter has duplicate headers or inconsistent row widths: {path}"
-        raise ValueError(msg_1)
-    try:
-        values = np.asarray([[float(item.strip()) for item in row] for row in rows[1:]], dtype=np.float64)
-    except ValueError as error:
-        msg_2 = f"Generation input adapter contains malformed values: {path}"
-        raise ValueError(msg_2) from error
-    if not np.isfinite(values).all():
-        msg_3 = f"Generation input adapter contains non-finite values: {path}"
-        raise ValueError(msg_3)
-    values.setflags(write=False)
-    return header, values
-
-
-def _input_path(directory: Path, payload: Mapping[str, Any], kind: str) -> Path:
-    spec = payload["input_contract"][kind]
-    path = directory / spec["filename"]
-    record = payload["input_files"].get(path.name)
-    if not path.is_file() or not isinstance(record, Mapping):
-        msg = f"Missing persisted {kind} input adapter: {path}"
-        raise ValueError(msg)
-    if path.stat().st_size != record.get("size_bytes") or common.serialization.file_sha256(path) != record.get("sha256"):
-        msg_0 = f"Persisted {kind} input adapter hash or size disagrees with case.json: {path}"
-        raise ValueError(msg_0)
-    return path
-
-
-def _admit_fields(directory: Path, payload: Mapping[str, Any]) -> dict[str, np.ndarray]:
-    """Reconstruct the writer's ``ravel(order="F")`` Cartesian representation."""
-    spec = payload["input_contract"]["spatial"]
-    header, values = read_input_adapter_table(_input_path(directory, payload, "spatial"), delimiter=spec["delimiter"])
-    if (
-        header != list(profiles.spatial_input_fields(payload["simulation_profile"]))
-        or header != list(spec["columns"])
-        or "x" not in header
-        or "y" not in header
-    ):
-        msg = "Spatial adapter header does not match the Cartesian case input contract."
-        raise ValueError(msg)
-    x_values, y_values = values[:, header.index("x")], values[:, header.index("y")]
-    nx, ny = len(np.unique(x_values)), len(np.unique(y_values))
-    if nx * ny != len(values):
-        msg_0 = "Spatial adapter does not contain an exact Cartesian grid."
-        raise ValueError(msg_0)
-    # Preserve configured axis direction: physical coordinates need not ascend.
-    x_axis, y_axis = x_values[::ny], y_values[:ny]
-    expected_x = np.repeat(x_axis, ny)
-    expected_y = np.tile(y_axis, nx)
-    if not np.array_equal(x_values, expected_x) or not np.array_equal(y_values, expected_y):
-        msg_1 = "Spatial adapter row order does not match canonical F-order serialization."
-        raise ValueError(msg_1)
-    result = {name: np.array(values[:, column].reshape((ny, nx), order="F"), copy=True) for column, name in enumerate(header)}
-    for value in result.values():
-        value.setflags(write=False)
-    return result
-
-
 def _stationary_value(payload: Mapping[str, Any], name: str) -> float:
     """Return one uniquely persisted finite stationary fixed value."""
     matches = [entry for entry in payload["stationary_fixed_values"] if entry.get("name") == name]
@@ -441,6 +353,7 @@ def admit_input_case(
     batch_storage_name: str | None = None,
     campaign_purpose: str | None = None,
     parameter_metadata: Mapping[str, Any] | None = None,
+    store_identity: case_service.InputStoreIdentity | None = None,
 ) -> AdmittedInputCase:
     """
     Validate and load one maintained-profile generated raw-input directory.
@@ -448,7 +361,7 @@ def admit_input_case(
     Parameters
     ----------
     directory : pathlib.Path | str
-        Directory containing the authoritative ``case.json``.
+        Directory containing the authoritative ``case.json`` and its HDF5 input store.
     source_id : str
         Logical input-generation or completed-batch identity.
     source_kind : str, optional
@@ -461,6 +374,8 @@ def admit_input_case(
         Manifest-validated canonical campaign purpose.
     parameter_metadata : Mapping[str, Any] | None, optional
         Canonical parameter descriptions and report symbols.
+    store_identity : InputStoreIdentity | None, optional
+        Manifest-recorded storage integrity the input store must match.
 
     Returns
     -------
@@ -495,32 +410,22 @@ def admit_input_case(
     ):
         msg = "case.json input or simulation identity is invalid."
         raise ValueError(msg)
-    fields = _admit_fields(directory, payload)
+    stored = case_service.read_case_inputs(directory, payload, store_identity=store_identity)
+    if list(stored.fields) != list(profiles.spatial_input_fields(profile_id)):
+        msg = "Spatial adapter header does not match the Cartesian case input contract."
+        raise ValueError(msg)
     scalars: Mapping[str, float] = MappingProxyType({})
     schedule: np.ndarray | None = None
     if profile_id == profiles.TRANSIENT_DRYING_PROFILE:
-        scalar_spec = payload["input_contract"]["scalar"]
-        scalar_path = _input_path(directory, payload, "scalar")
-        scalar_rows = list(csv.reader(scalar_path.read_text(encoding="utf-8").splitlines(), delimiter=scalar_spec["delimiter"]))
-        if (
-            not scalar_rows
-            or scalar_rows[0] != ["name", "value", "unit"]
-            or len(scalar_rows) < _MINIMUM_ROWS
-            or any(len(row) != _SCALAR_COLUMNS for row in scalar_rows[1:])
-        ):
-            msg_0 = "Scalar adapter header or row width is invalid."
-            raise ValueError(msg_0)
-        observed = tuple((str(row[0]), float(row[1]), str(row[2])) for row in scalar_rows[1:])
         entries = scalar_handoff.build_transient_scalar_entries(dict(payload["sampled_values"]), dict(payload["sampled_units"]))
-        if observed != tuple((entry.name, entry.value, entry.unit) for entry in entries):
+        if stored.scalars != tuple((entry.name, entry.value, entry.unit) for entry in entries):
             msg_1 = "Scalar adapter order, values, or units do not match canonical scalar handoff."
             raise ValueError(msg_1)
         scalars = MappingProxyType({entry.name: entry.value for entry in entries})
-        schedule_spec = payload["input_contract"]["schedule"]
-        schedule_header, schedule = read_input_adapter_table(_input_path(directory, payload, "schedule"), delimiter=schedule_spec["delimiter"])
-        if tuple(schedule_header) != profiles.SCHEDULE_FIELDS:
+        if tuple(payload["input_contract"]["schedule"]["columns"]) != profiles.SCHEDULE_FIELDS or stored.schedule is None:
             msg_2 = "Schedule adapter header is invalid."
             raise ValueError(msg_2)
+        schedule = stored.schedule
         _validate_schedule(payload, schedule)
     return AdmittedInputCase(
         source_id=source_id,
@@ -534,7 +439,7 @@ def admit_input_case(
         directory=directory,
         payload=_freeze_json_evidence(payload),
         parameter_metadata=_admit_parameter_metadata(parameter_metadata),
-        fields=MappingProxyType(fields),
+        fields=MappingProxyType(dict(stored.fields)),
         scalars=scalars,
         schedule=schedule,
     )
@@ -763,6 +668,9 @@ def _validate_input_case_record(
 ) -> Mapping[str, Any]:
     """Validate one manifest-selected case without rebuilding its batch."""
     manifest = envelope.manifest
+    if isinstance(record, Mapping) and isinstance(record.get("case_id"), str):
+        # Refuse CSV-only cases from before the input store with the store's regeneration instruction, before any generic record check.
+        case_service.require_input_store(_input_case_directory(envelope.raw_directory, record["case_id"]))
     if (
         not isinstance(record, Mapping)
         or set(record) != INPUT_CASE_RECORD_KEYS
@@ -773,6 +681,7 @@ def _validate_input_case_record(
         or not isinstance(record.get("case_json_sha256"), str)
         or not isinstance(record.get("seed_evidence_sha256"), str)
         or not isinstance(record.get("input_files"), Mapping)
+        or not isinstance(record.get("input_store"), Mapping)
     ):
         message = "Input-generation case identity or hash inventory is invalid."
         raise ValueError(message)
@@ -814,7 +723,7 @@ def _validate_input_case_record(
     if {entry.name for entry in entries} != {
         common.paths.GENERATION_CASE_PAYLOAD_FILENAME,
         common.paths.GENERATION_INPUT_REFERENCE_FILENAME,
-        *record["input_files"],
+        common.paths.GENERATION_INPUT_STORE_FILENAME,
     } or any(not entry.is_file() or entry.is_symlink() for entry in entries):
         _raise_for_execution_artifact(case_directory)
         message = f"Canonical raw case layout is invalid: {case_directory}"
@@ -875,6 +784,21 @@ def _load_input_batch_metadata(
     )
 
 
+def _is_hash_record(value: Any) -> bool:
+    """Return whether one value is an exact ``sha256``/``size_bytes`` identity record."""
+    if not isinstance(value, Mapping) or set(value) != {"sha256", "size_bytes"}:
+        return False
+    size_bytes, digest = value["size_bytes"], value["sha256"]
+    return (
+        not isinstance(size_bytes, bool)
+        and isinstance(size_bytes, int)
+        and size_bytes >= 0
+        and isinstance(digest, str)
+        and len(digest) == _SHA256_LENGTH
+        and all(character in "0123456789abcdef" for character in digest)
+    )
+
+
 def _bounded_case_records(
     records: tuple[Mapping[str, Any], ...],
     maximum: int | None,
@@ -916,26 +840,18 @@ def _case_reference(
     if common.serialization.canonical_json_sha256(case_payload.get("seed_evidence")) != record["seed_evidence_sha256"]:
         message = "Input source case.json disagrees with metadata hash inventory."
         raise ValueError(message)
-    for filename, identity in input_files.items():
-        path = case_directory / str(filename)
-        size_bytes = identity.get("size_bytes") if isinstance(identity, Mapping) else None
-        digest = identity.get("sha256") if isinstance(identity, Mapping) else None
-        if (
-            not path.is_file()
-            or path.is_symlink()
-            or not isinstance(identity, Mapping)
-            or set(identity) != {"sha256", "size_bytes"}
-            or isinstance(size_bytes, bool)
-            or not isinstance(size_bytes, int)
-            or size_bytes < 0
-            or not isinstance(digest, str)
-            or len(digest) != _SHA256_LENGTH
-            or any(character not in "0123456789abcdef" for character in digest)
-            or path.stat().st_size != size_bytes
-            or (validation_depth == "full" and common.serialization.file_sha256(path) != digest)
-        ):
-            message = f"Input source adapter hash or size disagrees with metadata: {path}"
-            raise ValueError(message)
+    if not all(_is_hash_record(identity) for identity in input_files.values()):
+        message = f"Input source COMSOL input identities are malformed: {case_directory}"
+        raise ValueError(message)
+    store = record["input_store"]
+    store_path = case_service.require_input_store(case_directory)
+    if (
+        not _is_hash_record(store)
+        or store_path.stat().st_size != store["size_bytes"]
+        or (validation_depth == "full" and common.serialization.file_sha256(store_path) != store["sha256"])
+    ):
+        message = f"Input source store hash or size disagrees with metadata: {store_path}"
+        raise ValueError(message)
     return InputCaseReference(
         source.source_id,
         source.source_kind,
@@ -952,6 +868,7 @@ def _case_reference(
         str(record["simulation_case_id"]),
         str(record["case_json_sha256"]),
         payload_path.stat().st_size,
+        case_service.InputStoreIdentity(sha256=store["sha256"], size_bytes=store["size_bytes"]),
         case_directory,
         parameter_metadata,
         json.dumps(case_payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
@@ -1165,4 +1082,5 @@ def admit_input_case_reference(
         batch_storage_name=reference.batch_storage_name,
         campaign_purpose=reference.campaign_purpose,
         parameter_metadata=reference.parameter_metadata,
+        store_identity=reference.store_identity,
     )

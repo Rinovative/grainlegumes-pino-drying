@@ -4,11 +4,13 @@ Responsibilities:
   - Define ordered transient input profiles and reconstructed-state metrics
   - Bind transient field units and representations to Dataset runtime semantics
   - Declare data-only training defaults without executable dataset selection
+  - Own the physical-bound diagnostic of reconstructed states shared by training validation and artifacts
 
 Design principles:
   - Increment outputs remain distinct from reconstructed evaluation fields
   - Input profiles preserve exact channel order and explicit coordinates
   - Physics selection is explicit even when no residual is supported
+  - A finite physical-bound violation is a diagnostic: it never stops a rollout, clamps a value or decides eligibility
 
 This module does NOT:
   - Materialize transient Dataset samples or normalize tensors
@@ -18,14 +20,21 @@ This module does NOT:
 
 from __future__ import annotations
 
+from typing import Final
+
+import numpy as np
+
 from .domain_task_spec import (
+    TRAIN_SCALING_KIND,
     FieldSpec,
     InputProfileSpec,
     MetricSpec,
     OutputGroupSpec,
     PhysicsSpec,
     PreprocessingSpec,
+    ReferenceFloorSpec,
     TaskSpec,
+    field_metric_specs,
 )
 
 _TRANSIENT_INPUTS = (
@@ -84,54 +93,24 @@ TRANSIENT_DRYING = TaskSpec(
     tensor_layout=("batch", "channel", "y", "x"),
     operator_axes=(2, 3),
     normalization_axes=(0, 2, 3),
-    preprocessing=PreprocessingSpec(
-        input_normalization="train_only_group_specific_scaling_with_unique_state_deduplication",
-        output_normalization="train_only_zero_preserving_per_channel_increment_scaling",
-        fit_split="train",
+    preprocessing=PreprocessingSpec(normalization=TRAIN_SCALING_KIND, fit_split="train"),
+    reference_floors=(
+        ReferenceFloorSpec("T", 1.0),
+        ReferenceFloorSpec("phi", 1.0e-3),
+        ReferenceFloorSpec("w_surf", 0.1),
+        ReferenceFloorSpec("w_int", 0.1),
     ),
-    data_losses=("huber", "mse"),
+    data_losses=("mse", "h1"),
     default_metrics=(
         MetricSpec(
             id="normalized_drying_group_macro_rmse",
-            kind="drying_group_macro_rmse",
-            space="normalized",
+            kind="group_macro_rmse",
+            space="physical",
             fields=("T", "phi", "w_surf", "w_int"),
-            reduction="group_macro_element_mean",
+            reduction="material_case_mean",
             direction="minimize",
         ),
-        *(
-            MetricSpec(
-                id=f"normalized_rmse_{field}",
-                kind="rmse",
-                space="normalized",
-                fields=(field,),
-                reduction="element_mean",
-                direction="minimize",
-            )
-            for field in ("T", "phi", "w_surf", "w_int")
-        ),
-        *(
-            MetricSpec(
-                id=f"physical_rmse_{field}",
-                kind="rmse",
-                space="physical",
-                fields=(field,),
-                reduction="element_mean",
-                direction="minimize",
-            )
-            for field in ("T", "phi", "w_surf", "w_int")
-        ),
-        *(
-            MetricSpec(
-                id=f"physical_mae_{field}",
-                kind="mae",
-                space="physical",
-                fields=(field,),
-                reduction="element_mean",
-                direction="minimize",
-            )
-            for field in ("T", "phi", "w_surf", "w_int")
-        ),
+        *field_metric_specs(("T", "phi", "w_surf", "w_int")),
     ),
     physics=PhysicsSpec(
         kind="none",
@@ -144,3 +123,31 @@ TRANSIENT_DRYING = TaskSpec(
     temporal_conditioning_kinds=("none", "normalized_current_time"),
     training_airflow_source="comsol_reference",
 )
+
+# Gross divergence screens of the reconstructed state (T, phi, w_surf, w_int), not physical admissibility; see docs/06.
+TEMPERATURE_RANGE_K: Final = (0.0, 2_000.0)
+PHI_RANGE: Final = (0.0, 1.10)
+EXCLUDED_CORNER_BLOCK: Final = 2
+
+
+def physical_invalid_mask(states: np.ndarray) -> np.ndarray:
+    """
+    Return the finite reconstructed values outside the maintained field domains.
+
+    ``states`` holds the channels ``(T, phi, w_surf, w_int)`` on axis ``-3`` and the
+    grid on the last two axes. Inclusive bounds: T in [0, 2000] K, phi in [0, 1.10],
+    non-negative moisture. The 2x2 corner blocks are excluded, and non-finite values
+    are never physically invalid (they are counted separately).
+    """
+    array = np.asarray(states)
+    finite = np.isfinite(array)
+    invalid = np.zeros(array.shape, dtype=bool)
+    lower, upper = TEMPERATURE_RANGE_K
+    invalid[..., 0, :, :] = finite[..., 0, :, :] & ((array[..., 0, :, :] < lower) | (array[..., 0, :, :] > upper))
+    invalid[..., 1, :, :] = finite[..., 1, :, :] & ((array[..., 1, :, :] < PHI_RANGE[0]) | (array[..., 1, :, :] > PHI_RANGE[1]))
+    invalid[..., 2:, :, :] = finite[..., 2:, :, :] & (array[..., 2:, :, :] < 0.0)
+    block = EXCLUDED_CORNER_BLOCK
+    for rows in (slice(None, block), slice(-block, None)):
+        for columns in (slice(None, block), slice(-block, None)):
+            invalid[..., rows, columns] = False
+    return invalid

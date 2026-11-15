@@ -1,49 +1,34 @@
-"""Provide reusable stored-time navigation and physical-time axis presentation.
+"""Provide validated stored-time coordinates, master-time resolution, and physical-time axis presentation.
 
 Responsibilities:
-  - Navigate canonical irregular time coordinates by stored position
-  - Display and accept authoritative physical time rather than step indices
+  - Validate canonical irregular time coordinates and form their exact union
   - Resolve comparison master timelines without interpolating scientific arrays
   - Format physical-time axes without resampling authoritative coordinates
 
 Design principles:
   - Physical time comes only from validated caller-supplied coordinates
-  - Typed values snap deterministically to the nearest available stored time
   - Axis conversion and locators never change stored scientific values
 
 This module does NOT:
   - Interpolate, align scientific arrays, or infer time coordinates
-  - Render figures, load artifacts, or own panel export state
+  - Navigate times (analysis_ui_navigation.py), render figures, load artifacts, or own panel export state
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
-import ipywidgets as widgets
 import matplotlib.ticker as mticker
 import numpy as np
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Iterable, Sequence
 
     from matplotlib.axes import Axes
 
 _HOURS_PER_DAY = 24.0
 _LONG_RANGE_DAY_THRESHOLD_HOURS = 72.0
-COMPACT_CONTROL_WIDTH = "390px"
-_TIME_FIELD_WIDTH = "150px"
-_TIME_BUTTON_WIDTH = "42px"
-
-
-@dataclass(frozen=True, slots=True)
-class TimeStepSelection:
-    """Describe one selected stored snapshot and its canonical physical time."""
-
-    position: int
-    display_index: int
-    physical_time: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +176,7 @@ def _validated_times(values: Iterable[float]) -> tuple[float, ...]:
     times = tuple(float(value) for value in values)
     array = np.asarray(times, dtype=np.float64)
     if array.ndim != 1 or array.size == 0 or not np.isfinite(array).all() or np.any(np.diff(array) <= 0.0):
-        message = "Time-step navigation requires finite, strictly increasing physical times."
+        message = "Stored physical-time coordinates must be finite and strictly increasing."
         raise ValueError(message)
     return times
 
@@ -228,167 +213,3 @@ def resolve_master_physical_time(
         exact_master_match=bool(actual == requested),
         final_hold=bool(position == len(times) - 1 and requested >= actual),
     )
-
-
-class TimeStepNavigator:
-    """Own one physical-time field and manual stored-position navigator."""
-
-    def __init__(
-        self,
-        physical_times: Iterable[float],
-        *,
-        callback: Callable[[TimeStepSelection], None] | None = None,
-        initial_time: float | None = None,
-    ) -> None:
-        """Construct controls in physical-time then double/single-arrow order."""
-        self._times = _validated_times(physical_times)
-        self._callback = callback
-        self._updating = False
-        self._last_selection: TimeStepSelection | None = None
-        self._position = self._nearest_position(initial_time) if initial_time is not None else 0
-        button_layout = widgets.Layout(width=_TIME_BUTTON_WIDTH)
-        self.time = widgets.FloatText(
-            value=self._times[self._position],
-            description="Time [h]:",
-            continuous_update=False,
-            style={"description_width": "initial"},
-            layout=widgets.Layout(width=_TIME_FIELD_WIDTH),
-            tooltip=("Typed values snap to the nearest available stored physical time; scientific fields are never interpolated."),
-        )
-        self.backward_ten = widgets.Button(
-            description="≪",
-            tooltip="Ten stored times backward",
-            layout=button_layout,
-        )
-        self.backward_one = widgets.Button(
-            description="←",
-            tooltip="Previous stored time",
-            layout=button_layout,
-        )
-        self.forward_one = widgets.Button(
-            description="→",
-            tooltip="Next stored time",
-            layout=button_layout,
-        )
-        self.forward_ten = widgets.Button(
-            description="≫",
-            tooltip="Ten stored times forward",
-            layout=button_layout,
-        )
-        self.widget = widgets.HBox(
-            (
-                self.time,
-                self.backward_ten,
-                self.backward_one,
-                self.forward_one,
-                self.forward_ten,
-            ),
-            layout=widgets.Layout(
-                align_items="center",
-                width=COMPACT_CONTROL_WIDTH,
-            ),
-        )
-        self.backward_ten.on_click(lambda _button: self.step(-10))
-        self.backward_one.on_click(lambda _button: self.step(-1))
-        self.forward_one.on_click(lambda _button: self.step(1))
-        self.forward_ten.on_click(lambda _button: self.step(10))
-        self.time.observe(self._time_changed, names="value")
-        self._synchronize_state()
-
-    @property
-    def physical_times(self) -> tuple[float, ...]:
-        """Return the currently bound canonical time coordinates."""
-        return self._times
-
-    @property
-    def selection(self) -> TimeStepSelection:
-        """Return the current zero-based position, display index, and time."""
-        return TimeStepSelection(
-            position=self._position,
-            display_index=self._position + 1,
-            physical_time=self._times[self._position],
-        )
-
-    def set_callback(
-        self,
-        callback: Callable[[TimeStepSelection], None] | None,
-    ) -> None:
-        """Replace the render callback without changing the current selection."""
-        self._callback = callback
-
-    def _nearest_position(self, physical_time: float | None) -> int:
-        """Resolve the closest stored time, preferring the earlier tie."""
-        if physical_time is None:
-            return 0
-        requested = float(physical_time)
-        if not np.isfinite(requested):
-            message = "A preserved physical time must be finite."
-            raise ValueError(message)
-        distances = np.abs(np.asarray(self._times, dtype=np.float64) - requested)
-        return int(np.argmin(distances))
-
-    def _synchronize_state(self) -> None:
-        """Synchronize physical-time value and arrow bounds."""
-        self._updating = True
-        try:
-            self.time.value = self._times[self._position]
-        finally:
-            self._updating = False
-        at_start = self._position == 0
-        at_end = self._position == len(self._times) - 1
-        self.backward_ten.disabled = at_start
-        self.backward_one.disabled = at_start
-        self.forward_one.disabled = at_end
-        self.forward_ten.disabled = at_end
-
-    def _emit(self) -> None:
-        """Notify the callback once for a changed accepted selection."""
-        selected = self.selection
-        if selected == self._last_selection:
-            return
-        self._last_selection = selected
-        if self._callback is not None:
-            self._callback(selected)
-
-    def _time_changed(self, _change: dict[str, Any]) -> None:
-        """Snap one typed physical time to the nearest authoritative position."""
-        if self._updating:
-            return
-        try:
-            self._position = self._nearest_position(float(self.time.value))
-        except (TypeError, ValueError):
-            self._synchronize_state()
-            return
-        self._synchronize_state()
-        self._emit()
-
-    def step(self, delta: int) -> None:
-        """Move by an integer number of stored positions within current bounds."""
-        if isinstance(delta, bool) or not isinstance(delta, int):
-            message = "Time-step movement must be an integer position delta."
-            raise TypeError(message)
-        position = max(0, min(len(self._times) - 1, self._position + delta))
-        if position == self._position:
-            return
-        self._position = position
-        self._synchronize_state()
-        self._emit()
-
-    def rebind(
-        self,
-        physical_times: Iterable[float],
-        *,
-        preserve_time: float | None = None,
-        notify: bool = True,
-    ) -> TimeStepSelection:
-        """Replace the grid, preserve a nearest valid time, and notify once."""
-        previous_time = self.selection.physical_time if preserve_time is None else preserve_time
-        self._times = _validated_times(physical_times)
-        self._position = self._nearest_position(previous_time)
-        self._synchronize_state()
-        if notify:
-            self._last_selection = None
-            self._emit()
-        else:
-            self._last_selection = self.selection
-        return self.selection

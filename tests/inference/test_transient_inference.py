@@ -13,21 +13,23 @@ This module does NOT:
 
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import pytest
 import torch
+from support.scaling import spatial_view, transient_scaling
 from torch import nn
 
-from src import datasets, domain, experiments, learning
+from src import experiments, learning
 from src.learning.inference import learning_inference_transient as transient
 from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient import learning_transient_rollout as rollout
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
-from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
 from src.learning.transient.learning_transient_tensorizer import TransientTensorizer
+
+if TYPE_CHECKING:
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
 
 
 class _IncrementModel(nn.Module):
@@ -75,56 +77,21 @@ class _SecondStepNonfiniteModel(_IncrementModel):
         return output
 
 
-def _scaling() -> TransientScalingArtifact:
-    spec = TransientTensorizerSpec(
-        input_profile="canonical_physics_complete",
-        temporal_conditioning=TemporalConditioningSpec("none"),
-    )
-    contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
-    names = tuple(
-        tuple(field.name for field in group)
-        for group in (
-            contract.dynamic_state,
-            contract.static_spatial_conditioning,
-            contract.step_boundary_conditioning,
-            contract.scalar_conditioning,
-        )
-    )
-    return TransientScalingArtifact(
-        task_contract_digest=domain.tasks.registry.get_task("transient_drying").contract_digest,
-        data_contract_digest=domain.tasks.registry.get_task("transient_drying").data_contract_digest,
-        tensorizer=spec,
-        dataset_identity={"synthetic": "inference"},
-        train_membership_digest="a" * 64,
-        scale_mode="state_std",
-        numerical_floor=SCALE_FLOOR,
-        unique_train_state_count=1,
-        unique_transition_count=1,
-        transition_count=1,
-        spatial_shape=(2, 3),
-        state_names=names[0],
-        static_names=names[1],
-        boundary_names=names[2],
-        scalar_names=names[3],
-        state_mean=torch.zeros(4),
-        state_std=torch.ones(4),
-        delta_rms=torch.ones(4),
-        increment_scale=torch.ones(4),
-        static_mean=torch.zeros(7),
-        static_std=torch.ones(7),
-        scalar_mean=torch.zeros(8),
-        scalar_std=torch.ones(8),
-        omega_boundary_mean=torch.tensor(0.0),
-        omega_boundary_std=torch.tensor(1.0),
-        horizon=8.0,
-    )
+def _scaling(view: dict[str, int] | None = None) -> TrainScaling:
+    """Return the unit transient scaling of the canonical complete profile, on a 2 x 3 grid by default."""
+    return transient_scaling(spatial_view((2, 3)) if view is None else view, dataset_identity={"synthetic": "inference"})
+
+
+def _tensorizer(scaling: TrainScaling) -> TransientTensorizer:
+    """Return the canonical complete-profile tensorizer that the support scaling binds."""
+    return TransientTensorizer(TransientTensorizerSpec("canonical_physics_complete", TemporalConditioningSpec("none")), scaling)
 
 
 def _context(model: nn.Module, *, model_kind: str = "fno") -> transient.TransientInferenceContext:
     scaling = _scaling()
     return transient.TransientInferenceContext(
         model=model.eval(),
-        tensorizer=TransientTensorizer(scaling.tensorizer, scaling),
+        tensorizer=_tensorizer(scaling),
         scaling=scaling,
         device=torch.device("cpu"),
         model_kind=model_kind,  # type: ignore[arg-type]
@@ -222,17 +189,7 @@ def test_stride_two_trained_rno_admits_original_grid_without_refitting_scaling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regress the real artifact failure through exact cross-grid model and scaler proof."""
-    base_scaling = _scaling()
-    scaling = replace(
-        base_scaling,
-        dataset_identity={
-            "synthetic": "stride-two-rno",
-            "spatial_stride": 2,
-            "canonical_spatial_shape": [251, 401],
-            "effective_spatial_shape": [126, 201],
-        },
-        spatial_shape=(126, 201),
-    )
+    scaling = _scaling(spatial_view((126, 201), stride=2, canonical=(251, 401)))
     model = _IncrementModel()
     observed_model_inputs: list[tuple[int, ...]] = []
 
@@ -294,7 +251,7 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reject retained modes that do not fit the requested grid before case inference."""
-    scaling = replace(_scaling(), spatial_shape=(126, 201))
+    scaling = _scaling(spatial_view((126, 201), stride=2, canonical=(251, 401)))
     model = _IncrementModel()
     completed = {
         "scientific_run_name": "run",
@@ -318,13 +275,11 @@ def test_cross_resolution_incompatibility_fails_before_model_setup(
         lambda *_args, **_kwargs: pytest.fail("incompatible preflight reached model setup"),
     )
 
-    with pytest.raises(ValueError, match=r"checkpoint=.*Training shape=.*Evaluation shape=.*modes") as error:
+    with pytest.raises(ValueError, match=r"checkpoint=.*Training shape=.*Evaluation shape=.*modes"):
         transient.build_transient_inference_context(
             completed=completed,
             evaluation_spatial_shape=(32, 48),
         )
-    # The advice names the resolved Training stride of the run, not a Dataset-identity field.
-    assert "--evaluation-spatial-stride 2" in str(error.value)
 
 
 def test_context_rejects_an_optuna_trial_before_reading_scaling_evidence() -> None:
@@ -499,7 +454,7 @@ def test_autonomous_rollout_preallocates_outputs_without_list_stack(
 
     scaling = SimpleNamespace(
         spatial_shape=(2, 3),
-        horizon=8.0,
+        regular_horizon=8.0,
         device=torch.device("cpu"),
     )
     context = transient.TransientInferenceContext(
@@ -563,7 +518,7 @@ def test_cuda_rollout_timing_preserves_model_call_boundaries_with_one_completion
             return 12.5
 
     request = _request(3)
-    scaling = SimpleNamespace(spatial_shape=(2, 3), horizon=8.0, device=torch.device("cpu"))
+    scaling = SimpleNamespace(spatial_shape=(2, 3), regular_horizon=8.0, device=torch.device("cpu"))
     context = transient.TransientInferenceContext(
         model=_IncrementModel().eval(),
         tensorizer=cast("Any", _Tensorizer()),
@@ -613,7 +568,7 @@ def test_cuda_runtime_prepares_cpu_request_and_retains_rollout_state() -> None:
     scaling = _scaling().to(device)
     context = transient.TransientInferenceContext(
         model=model,
-        tensorizer=TransientTensorizer(scaling.tensorizer, scaling),
+        tensorizer=_tensorizer(scaling),
         scaling=scaling,
         device=device,
         model_kind="fno",

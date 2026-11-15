@@ -60,10 +60,11 @@ Notes:
     dataset.pt for steady flow, or dataset.json plus transient_pt_shards/ for transient
     drying. Coordination state lives in .state/ (build locks, identity registry).
   Experiment layout (relative to the experiments root):
-    <task>/<dataset>/<family>/<config_name>/seed-<n>[__a0ep-<epochs>][__rev-<revision>]/
-    holds a steady run directly (without the A0 budget token); a transient seed
-    directory carries its A0 epoch budget and holds the shared A0 in a0/ and each
-    B/A1 pair in <pair>/{b,a1}/ beside the pair's experiment.json.
+    <task>/<dataset>/<family>/<config_name>/seed-<n>__ep-<epochs>__k-<k>__sch-<schedule>[__rev-<revision>]/
+    holds a steady run directly; a transient seed directory names A0's epoch budget
+    and holds the shared A0 in a0/ and each B/A1 pair in <pair>/{b,a1}/ beside the
+    pair's experiment.json. Budget, units per update and learning-rate schedule
+    name every run, because a run never changes them.
     <task>/<dataset>/optuna/<study>__ep-<epochs>[__rev-<revision>]/ holds the study
     database and summary and numbered trial runs in trials/<trial>/. The epoch
     budget names the unit because it is part of its scientific identity; a revision
@@ -129,6 +130,7 @@ GENERATION_EVIDENCE_DIRNAME = "evidence"
 GENERATION_ATTEMPTS_DIRNAME = "attempts"
 GENERATION_CASE_PAYLOAD_FILENAME = "case.json"
 GENERATION_INPUT_REFERENCE_FILENAME = "input_reference.json"
+GENERATION_INPUT_STORE_FILENAME = "inputs.h5"
 GENERATION_RESULT_HDF5_FILENAME = "case.h5"
 GENERATION_RESERVATION_STAGING_DIRNAME = "reservation-staging"
 GENERATION_INPUT_TRANSACTIONS_DIRNAME = "input-transactions"
@@ -155,6 +157,8 @@ _LAYOUT_KEYS = frozenset(
         "seed",
         "revision",
         "budget_epochs",
+        "units_per_update",
+        "schedule",
         "stage",
         "pair",
         "trial",
@@ -751,7 +755,7 @@ def resolve_generation_case_decision_path(case_directory: Path | str) -> Path:
 
 
 def resolve_generation_case_inputs_directory(case_directory: Path | str) -> Path:
-    """Return the immutable input directory of a case: payload, adapters, and input reference."""
+    """Return the immutable input directory of a case: payload, HDF5 input store, and input reference."""
     return Path(case_directory) / GENERATION_INPUTS_DIRNAME
 
 
@@ -1247,30 +1251,33 @@ def resolve_dataset_path(task: str, dataset_id: str, *, dataset_root: Path | str
     return resolve_dataset_dir(task, dataset_id, dataset_root=dataset_root) / filename
 
 
-def _require_epochs(epochs: object, *, label: str) -> int:
-    """Require the positive integer epoch budget that names a seed group or study directory."""
-    if type(epochs) is not int or epochs < 1:
-        message = f"{label} must be a positive integer, got {epochs!r}."
+def _positive_name_integer(value: object, *, label: str) -> int:
+    """Require the positive integer (epoch budget or units per update) that names a seed group or study directory."""
+    if type(value) is not int or value < 1:
+        message = f"{label} must be a positive integer, got {value!r}."
         raise ValueError(message)
-    return epochs
+    return value
 
 
-def seed_group_name(seed: int, revision: str | None = None, *, a0_epochs: int | None = None) -> str:
-    """Return the seed-group directory name, which is also the run-name seed segment.
+def seed_group_name(layout: Mapping[str, Any]) -> str:
+    """Return the seed-group directory name of a run layout, which is also the run-name seed segment.
 
-    The result is ``seed-<n>[__a0ep-<epochs>][__rev-<revision>]``. A transient seed
-    group passes its A0 epoch budget because that budget is part of the A0's
-    identity; steady runs pass none, as their epochs extend a run in place.
+    The result is ``seed-<n>__ep-<epochs>__k-<k>__sch-<schedule>[__rev-<revision>]``: the
+    budget in epochs of the full Train set (a transient seed group's A0 budget, which its
+    pairs share), the units per update and the learning-rate schedule. A run never changes
+    them, so another value is another run beside the first.
     """
-    name = f"seed-{seed}"
-    if a0_epochs is not None:
-        name = f"{name}__a0ep-{_require_epochs(a0_epochs, label='a0_epochs')}"
-    return name if revision is None else f"{name}__rev-{revision}"
+    name = (
+        f"seed-{layout['seed']}__ep-{_positive_name_integer(layout['budget_epochs'], label='run.layout.budget_epochs')}"
+        f"__k-{_positive_name_integer(layout['units_per_update'], label='run.layout.units_per_update')}"
+        f"__sch-{validate_logical_name(layout['schedule'], label='run.layout.schedule')}"
+    )
+    return name if layout["revision"] is None else f"{name}__rev-{layout['revision']}"
 
 
 def study_group_name(study: str, epochs: int, revision: str | None = None) -> str:
     """Return the study directory name ``<study>__ep-<epochs>[__rev-<revision>]``."""
-    name = f"{study}__ep-{_require_epochs(epochs, label='study epochs')}"
+    name = f"{study}__ep-{_positive_name_integer(epochs, label='study epochs')}"
     return name if revision is None else f"{name}__rev-{revision}"
 
 
@@ -1300,8 +1307,8 @@ def _config_layout(config: Mapping[str, Any]) -> Mapping[str, Any]:
     if type(layout["seed"]) is not int or layout["seed"] < 0:
         message = "run.layout.seed must be a non-negative integer."
         raise ValueError(message)
-    if layout["budget_epochs"] is not None:
-        _require_epochs(layout["budget_epochs"], label="run.layout.budget_epochs")
+    # Every run is named by its budget, units per update and schedule; an earlier layout without them is refused.
+    seed_group_name(layout)
     for key in ("a0_id", "branch_id"):
         value = layout[key]
         if key == "branch_id" and value is None:
@@ -1319,9 +1326,6 @@ def _config_layout(config: Mapping[str, Any]) -> Mapping[str, Any]:
     is_trial = layout["family"] == OPTUNA_FAMILY
     if is_trial != (layout["trial"] is not None) or (is_trial and layout["stage"] != "single"):
         message = f"Only single-stage runs of family {OPTUNA_FAMILY!r} carry a trial, and they require one."
-        raise ValueError(message)
-    if is_trial and layout["budget_epochs"] is None:
-        message = "An Optuna trial layout requires run.layout.budget_epochs, the epoch budget that names its study directory."
         raise ValueError(message)
     return layout
 
@@ -1354,7 +1358,7 @@ def resolve_config_experiment_dir(
         )
         return study / STUDY_TRIALS_DIRNAME / layout["trial"]
     family = resolve_config_family_dir(config, output_root=root)
-    return family / layout["config_name"] / seed_group_name(layout["seed"], layout["revision"], a0_epochs=layout["budget_epochs"])
+    return family / layout["config_name"] / seed_group_name(layout)
 
 
 def resolve_config_branch_dir(

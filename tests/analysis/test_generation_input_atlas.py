@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Check admitted map support, tensor fields, cyclic orientation, and selector reuse
+  - Check that axis and colour-bar units and quantity names come from one display rule and one name table
 
 Design principles:
   - Display sampling preserves full-grid scales and endpoints
@@ -22,6 +23,8 @@ from src.analysis.generation_inputs import generation_input_diagnostics as diagn
 from src.analysis.generation_inputs import generation_input_selection as selection
 from src.analysis.generation_inputs import generation_input_sources as sources
 from src.analysis.generation_inputs.plots import generation_input_plot_atlas as atlas_plots
+from src.analysis.generation_inputs.plots import generation_input_plot_layout as layout
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation.analysis_field_maps import FieldMapSemantic
 
 type ProfileRecords = dict[str, tuple[diagnostics.GenerationInputDiagnostics, diagnostics.GenerationInputDiagnostics]]
@@ -44,6 +47,17 @@ def test_atlas_keeps_true_support_and_exact_tensor_fields(profile_records: Profi
     assert atlas_plots.field_atlas(atlas, ()) is None
     plt.close(first)
     plt.close(second)
+
+
+def test_axis_and_colour_bar_units_share_one_display_rule_and_every_quantity_is_named() -> None:
+    """Dimensionless reads [-] and m^2 reads m² on an axis as on a colour bar; each quantity has one label."""
+    for quantity in diagnostics.FIELD_UNITS:
+        assert layout.quantity_label(quantity)
+        assert layout.quantity_axis_label(quantity).endswith(layout.quantity_colorbar_label(quantity))
+    assert layout.quantity_axis_label("eps_bed").endswith(" [-]")
+    assert layout.quantity_axis_label("Kxx").endswith(" [m²]")
+    assert layout.quantity_label("X_0_db_field") == field_labels.field_label("X_0_db_field", mathtext=True)
+    assert layout.quantity_label("K_anisotropy") == diagnostics.field_name("K_anisotropy")
 
 
 def test_constant_density_and_isotropic_direction_are_not_fabricated_maps(profile_records: ProfileRecords) -> None:
@@ -77,13 +91,11 @@ def test_axial_orientation_wraps_on_one_fixed_cyclic_scale(profile_records: Prof
 def test_atlas_field_toggles_reuse_admitted_case_and_scale_state(dataset_catalog: sources.GenerationInputDatasetCatalog) -> None:
     """A field toggle keeps exact case evidence without loading unrelated data."""
     state = selection.GenerationInputSelectionState(dataset_catalog)
-    local = controls.FieldAtlasControls(dataset_catalog, state)
     with patch.object(dataset_catalog, "load", wraps=dataset_catalog.load) as load:
+        local = controls.FieldAtlasControls(dataset_catalog, state)
         atlas = local.selected_atlas()
         assert local.fields.selected == tuple(atlas.fields)
-        group = local.fields.group
-        assert group is not None
-        group.boxes["Kxx"].value = False
+        local.fields.boxes["Kxx"].value = False
         assert "Kxx" not in local.fields.selected
         assert local.selected_atlas() is atlas
         load.assert_called_once_with(state.selection.case_a_key)

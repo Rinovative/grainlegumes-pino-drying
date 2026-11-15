@@ -48,7 +48,7 @@ The report describes "global, relative error measures computed over the spatial 
 <details>
 <summary>In VP2</summary>
 
-RMSE is reported per field and for the velocity vector in physical units; the dimensionless `rel_l2` and `rel_h1` average ratios computed separately for each field ([Steady case metrics](06_evaluation.md#steady-case-metrics)). Checkpoints, the scheduler and the studies use `normalized_group_macro_rmse`: the mean of the pressure RMSE divided by its Train standard deviation and the velocity-vector RMSE divided by the root of the summed Train variances of u and v, accumulated over the complete validation set, so neither the units nor a partial batch shift the weights ([Model selection](08_scientific_decisions.md#model-selection)).
+RMSE is reported per field and for the velocity vector in physical units; the dimensionless `rel_l2` and `rel_h1` average ratios computed separately for each field ([Steady case metrics](06_evaluation.md#steady-case-metrics)). Checkpoints, the plateau comparison schedule and the studies use `normalized_group_macro_rmse`: the mean of the pressure RMSE divided by its Train standard deviation and the velocity-vector RMSE divided by the root of the summed Train variances of u and v, accumulated over the complete validation set, so neither the units nor a partial batch shift the weights ([Model selection](08_scientific_decisions.md#model-selection)).
 
 </details>
 

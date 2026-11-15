@@ -9,6 +9,7 @@ Design principles:
   - Persisted arrays and exact tensor diagnostics determine availability
   - Missing stochastic fields are disclosed rather than regenerated
   - Constant density belongs to metadata, not a fabricated spatial map
+  - Fields show on their shared display scale (equilibrium relative humidity in %) under the active label style
 
 This module does NOT:
   - Discover files, run Generation, normalize model inputs, or compute errors
@@ -72,8 +73,8 @@ def prepare_field_atlas(record: diagnostics.GenerationInputDiagnostics) -> Gener
         if name == "rho_bu_dry" and np.all(values == values.flat[0]):
             notes.append(f"Constant dry bulk density: {float(values.flat[0]):g} kg/m³ (metadata).")
             continue
-        fields[name] = values
-        labels[name] = diagnostics.FIELD_LABELS[name]
+        fields[name] = layout.display_field(record, name)
+        labels[name] = layout.quantity_label(name)
         units[name] = diagnostics.FIELD_UNITS[name]
 
     # The major eigenvector direction is defined modulo 180 degrees. An exactly
@@ -155,6 +156,6 @@ def field_atlas(atlas: GeneratedFieldAtlas, selected: Sequence[str], *, display_
         axis.set_ylabel("y [m]")
         axis.set_title(atlas.labels[name])
         colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(f"[{field_labels.display_unit(atlas.units[name])}]")
+        colorbar.set_label(f"[{field_labels.display_unit(atlas.units[name], field=name)}]")
     figure.suptitle(f"Generated fields — case {atlas.record.case.case_index}")
     return figure

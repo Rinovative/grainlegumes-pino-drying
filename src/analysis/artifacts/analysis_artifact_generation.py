@@ -14,8 +14,8 @@ Design principles:
 
 This module does NOT:
   - Reconstruct models or choose the saved split membership to evaluate
-  - Reuse, rebuild, lock, or upload an existing artifact cache target
-  - Render interactive or curated scientific figures
+  - Reuse, rebuild, or lock an existing artifact cache target
+  - Render interactive scientific figures
 
 Notes:
   Artifact contract:
@@ -30,11 +30,13 @@ Notes:
       - source_dataset_id : source Dataset of the case (the material-OOD role may span several Datasets)
       - split_local_index : zero-based position in the saved split
       - npz_path          : path to the corresponding NPZ artifact
-      Relative field errors (dimensionless, channel-balanced):
-        - rel_l2            : channel-balanced mean relative L2 over TaskSpec outputs on the full domain
-        - rel_h1            : channel-balanced mean relative H1 (NeuralOp H1Loss as in training) over TaskSpec outputs on the EVAL_PAD interior
-      Physical diagnostics:
-        - physical_rmse_<field> : per-field RMSE over the full domain
+      Case statistics (float64 sums per TaskSpec output, learning.metrics.metrics.CASE_STATISTICS):
+        - physical_<statistic>_<field> : count, squared_error, absolute_error and reference_square on the
+          full grid; h1_count, h1_error and h1_reference on the H1 interior (derivatives in metres, l = 1 m)
+      Per-case metrics derived from them (contracts.case_metric_values):
+        - physical_rmse_<field>, normalized_rmse_<field> : case RMSE, physical and over the Train scale
+        - physical_relative_l2, physical_relative_h1 : group-weighted per-field relative norms; NaN when a
+          field's reference RMS is below its TaskSpec floor
         - physical_velocity_vector_rmse : vector RMSE over velocity components
         - physical_rmse_speed_magnitude : RMSE of velocity-group speed magnitude |u|
       Dimensionless physics residual metrics (scales from inputs only):
@@ -44,13 +46,6 @@ Notes:
         - pressure_inlet_mse            : mean_inlet((p-p_in_bc)**2) / dp**2
         - pressure_outlet_mean_square   : (mean_outlet(p) / dp)**2
         - pressure_boundary_mse         : sum of the preceding two terms
-      Global-reduction evidence (one pair of triplets per TaskSpec output):
-        - physical_sse_<field>     : float64 per-case physical squared-error sum
-        - physical_count_<field>   : exact selected physical element count
-        - physical_rmse_<field>    : per-case physical diagnostic
-        - normalized_sse_<field>   : float64 per-case normalized squared-error sum
-        - normalized_count_<field> : exact selected normalized element count
-        - normalized_rmse_<field>  : per-case normalized diagnostic
       Diagnostics:
         - kappa_names       : list of available permeability tensor components
         - meta              : JSON-safe metadata dictionary (stored as JSON string)
@@ -83,10 +78,10 @@ Notes:
         - meta         : JSON string with full metadata
     Completion provenance:
       Provenance publishes last and contains the scientific identity, exact output
-      digests, saved train-fitted output scales, task-owned output groups, the
-      aggregate normalized_group_macro_rmse finalized once from global physical
-      SSE/count evidence (counts instead of a value when any prediction is non-finite),
-      and the role-level prediction validity under evaluation.
+      digests, saved train-fitted output scales, task-owned output groups and reference
+      floors, the aggregate (normalized_group_macro_rmse with the per-field RMSE, MAE and
+      relative norms) finalized once from the case statistics (counts instead of values
+      when any prediction is non-finite), and the role-level prediction validity under evaluation.
 
 """
 
@@ -102,13 +97,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src import common, domain
+from src import common, domain, learning
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
-from src.learning import losses
 
 from . import contracts, timing
 
 if TYPE_CHECKING:
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
+
     from .analysis_artifact_performance import ArtifactProgressReporter
 
 # ============================================================================
@@ -116,125 +112,7 @@ if TYPE_CHECKING:
 # ============================================================================
 
 INTERNAL_KAPPA_NAMES = set(domain.permeability.INTERNAL_KAPPA_2D_ORDER) | set(domain.permeability.INTERNAL_KAPPA_3D_ORDER)
-_MIN_NORMALIZED_TENSOR_RANK = 3
 _MIN_BATCH_TENSOR_RANK = 2
-
-
-def normalized_case_statistics(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    output_fields: Iterable[str],
-) -> list[dict[str, float | int]]:
-    """
-    Return exact float64 normalized SSE/count/RMSE evidence per sample and field.
-
-    The subtraction and square are performed after conversion to float64. These
-    component-normalized values remain diagnostics and never define the grouped
-    selection objective, which is finalized from physical evidence and raw fitted
-    training scales.
-
-    Parameters
-    ----------
-    prediction, target : torch.Tensor
-        Matching normalized tensors in batch, channel, and spatial order.
-    output_fields : Iterable[str]
-        Unique TaskSpec output names aligned with the channel axis.
-
-    Returns
-    -------
-    list[dict[str, float | int]]
-        One row per case containing each field's exact normalized squared-error
-        sum, element count, and derived per-case RMSE. Non-finite predictions
-        yield non-finite values, which case admission classifies.
-
-    Raises
-    ------
-    ValueError
-        If tensor shapes/ranks or channel-to-field alignment disagree.
-
-    """
-    fields = tuple(output_fields)
-    if prediction.shape != target.shape or prediction.ndim < _MIN_NORMALIZED_TENSOR_RANK:
-        msg = (
-            "Normalized prediction and target must have matching "
-            f"batch/channel/spatial shapes, got {tuple(prediction.shape)} and {tuple(target.shape)}."
-        )
-        raise ValueError(msg)
-    if prediction.shape[1] != len(fields) or len(fields) != len(set(fields)):
-        msg = "Normalized artifact statistics require unique output fields matching the tensor channels."
-        raise ValueError(msg)
-    error_squared = (prediction.double() - target.double()).square()
-    rows: list[dict[str, float | int]] = []
-    for sample_index in range(prediction.shape[0]):
-        row: dict[str, float | int] = {}
-        for field_index, field_name in enumerate(fields):
-            sse_column, count_column, rmse_column = contracts.normalized_statistic_columns(field_name)
-            field_error = error_squared[sample_index, field_index]
-            squared_error_sum = float(field_error.sum().detach().cpu().item())
-            element_count = int(field_error.numel())
-            field_rmse = math.sqrt(squared_error_sum / element_count)
-            row[sse_column] = squared_error_sum
-            row[count_column] = element_count
-            row[rmse_column] = field_rmse
-        rows.append(row)
-    return rows
-
-
-def physical_case_statistics(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    output_fields: Iterable[str],
-) -> list[dict[str, float | int]]:
-    """
-    Return exact float64 physical SSE/count/RMSE evidence per sample and field.
-
-    Parameters
-    ----------
-    prediction, target : torch.Tensor
-        Matching physical tensors in batch, channel, and spatial order.
-    output_fields : Iterable[str]
-        Unique TaskSpec output names aligned with the channel axis.
-
-    Returns
-    -------
-    list[dict[str, float | int]]
-        One row per case containing physical squared-error sums, element counts,
-        and diagnostic RMSE values. Non-finite predictions yield non-finite
-        values, which case admission classifies.
-
-    Raises
-    ------
-    ValueError
-        If tensor shapes, ranks, or channel-to-field alignment disagree.
-
-    """
-    fields = tuple(output_fields)
-    if prediction.shape != target.shape or prediction.ndim < _MIN_NORMALIZED_TENSOR_RANK:
-        msg = (
-            "Physical prediction and target must have matching "
-            f"batch/channel/spatial shapes, got {tuple(prediction.shape)} and {tuple(target.shape)}."
-        )
-        raise ValueError(msg)
-    if prediction.shape[1] != len(fields) or len(fields) != len(set(fields)):
-        msg = "Physical artifact statistics require unique output fields matching the tensor channels."
-        raise ValueError(msg)
-    error_squared = (prediction.double() - target.double()).square()
-    rows: list[dict[str, float | int]] = []
-    for sample_index in range(prediction.shape[0]):
-        row: dict[str, float | int] = {}
-        for field_index, field_name in enumerate(fields):
-            sse_column, count_column, rmse_column = contracts.physical_statistic_columns(field_name)
-            field_error = error_squared[sample_index, field_index]
-            squared_error_sum = float(field_error.sum().detach().cpu().item())
-            element_count = int(field_error.numel())
-            field_rmse = math.sqrt(squared_error_sum / element_count)
-            row[sse_column] = squared_error_sum
-            row[count_column] = element_count
-            row[rmse_column] = field_rmse
-        rows.append(row)
-    return rows
 
 
 def _required_output_group(
@@ -254,10 +132,10 @@ def _required_output_group(
 def _objective_context(
     *,
     task: domain.tasks.spec.TaskSpec,
-    processor: Any,
+    scaling: TrainScaling,
     provenance: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], dict[str, float], float]:
-    """Return task groups, raw saved training scales, and diagnostic floor."""
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Return task groups and the saved Train state scales after checking them and the metric evidence against the task and scaling."""
     groups = contracts.output_group_payload(task.output_groups)
     flattened_fields = tuple(field for group in groups for field in group["fields"])
     if flattened_fields != task.output_names:
@@ -267,45 +145,26 @@ def _objective_context(
     if not isinstance(normalizer, Mapping):
         msg = "Artifact provenance must contain normalizer evidence."
         raise TypeError(msg)
-    raw_scales = normalizer.get("output_standard_deviations")
-    denominator_floor = normalizer.get("denominator_floor")
-    if isinstance(denominator_floor, bool) or not isinstance(denominator_floor, (int, float)):
-        msg = "Artifact normalizer denominator_floor must be a real scalar."
-        raise TypeError(msg)
-    if not math.isfinite(float(denominator_floor)) or float(denominator_floor) < 0.0:
-        msg = "Artifact normalizer denominator_floor must be finite and non-negative."
-        raise ValueError(msg)
-    if not isinstance(raw_scales, Mapping):
-        msg = "Artifact normalizer provenance must contain output_standard_deviations."
-        raise TypeError(msg)
-    scales = {field: float(raw_scales[field]) for field in task.output_names if field in raw_scales}
-    if set(scales) != set(task.output_names):
-        msg = "Artifact normalizer provenance scales do not cover TaskSpec outputs exactly."
-        raise ValueError(msg)
-    out_normalizer = getattr(processor, "out_normalizer", None)
-    if out_normalizer is None:
-        msg = "Artifact generation requires processor.out_normalizer."
-        raise TypeError(msg)
-    processor_scales = contracts.output_standard_deviations_from_state(
-        {"out_normalizer.std": getattr(out_normalizer, "std", None)},
-        output_fields=task.output_names,
-    )
-    if processor_scales != scales:
-        msg = "Artifact processor output scales contradict saved normalizer provenance."
+    scales = contracts.validated_train_scales(normalizer.get("output_scales"), fields=task.output_names)
+    if contracts.output_scales(scaling, output_fields=task.output_names) != scales:
+        msg = "Artifact scaling output scales contradict saved normalizer provenance."
         raise ValueError(msg)
     evaluator = provenance.get("evaluator")
     if not isinstance(evaluator, Mapping) or evaluator.get("output_groups") != groups:
         msg = "Artifact evaluator output groups contradict TaskSpec."
         raise ValueError(msg)
-    return groups, scales, float(denominator_floor)
+    if evaluator.get("metric_evidence") != contracts.metric_evidence_provenance(task):
+        msg = "Artifact evaluator metric evidence contradicts TaskSpec."
+        raise ValueError(msg)
+    return groups, scales
 
 
 def _group_case_metrics(
     *,
     task: domain.tasks.spec.TaskSpec,
-    physical_statistics: Mapping[str, float | int],
+    case_values: Mapping[str, float],
     output_groups: Iterable[Mapping[str, Any]],
-    train_standard_deviations: Mapping[str, float],
+    train_scales: Mapping[str, float],
 ) -> dict[str, float]:
     """Return task-declared physical and normalized group diagnostics for one case."""
     values: dict[str, float] = {}
@@ -314,15 +173,11 @@ def _group_case_metrics(
     }
     for group in output_groups:
         fields = tuple(group["fields"])
-        physical_mse_sum = sum(
-            float(physical_statistics[contracts.physical_statistic_columns(field)[0]])
-            / int(physical_statistics[contracts.physical_statistic_columns(field)[1]])
-            for field in fields
-        )
+        physical_mse_sum = sum(case_values[f"physical_rmse_{field}"] ** 2 for field in fields)
         normalized_id = metrics_by_signature.get(("group_rmse", fields))
         if normalized_id is not None:
-            variance_sum = sum(train_standard_deviations[field] ** 2 for field in fields)
-            values[normalized_id] = math.sqrt(physical_mse_sum / variance_sum)
+            scale_square_sum = sum(train_scales[field] ** 2 for field in fields)
+            values[normalized_id] = math.sqrt(physical_mse_sum / scale_square_sum)
         physical_id = metrics_by_signature.get(("vector_rmse", fields))
         if physical_id is not None:
             values[physical_id] = math.sqrt(physical_mse_sum)
@@ -334,14 +189,13 @@ def _provenance_with_aggregate(
     *,
     frame: pd.DataFrame,
     output_groups: Iterable[Mapping[str, Any]],
-    train_standard_deviations: Mapping[str, float],
-    normalization_denominator_floor: float,
+    train_scales: Mapping[str, float],
 ) -> dict[str, Any]:
     """
     Add the authoritative group aggregate and role prediction validity to generation provenance.
 
     Caller-supplied aggregate or evaluation results are rejected so only recomputed
-    physical Parquet SSE/count evidence, saved raw training scales and the per-row
+    physical Parquet SSE/count evidence, the saved Train state scales and the per-row
     validity documents can determine the published selection objective.
     """
     payload = dict(provenance)
@@ -351,8 +205,8 @@ def _provenance_with_aggregate(
     payload["aggregate"] = contracts.aggregate_normalized_group_macro_rmse(
         frame,
         output_groups=output_groups,
-        train_standard_deviations=train_standard_deviations,
-        normalization_denominator_floor=normalization_denominator_floor,
+        train_scales=train_scales,
+        reference_floors=payload["evaluator"]["metric_evidence"]["reference_floors"],
     )
     payload["evaluation"] = {"prediction_validity": validity_contract.table_role_prediction_validity(frame)}
     return payload
@@ -362,14 +216,15 @@ def _admitted_case_metrics(prediction: torch.Tensor, metrics: Mapping[str, float
     """
     Classify one physical prediction and admit its scalar metrics with the validity document.
 
-    A valid case must have finite metrics. A non-finite case keeps its element counts
-    and reports NaN for every other metric, so no missing value can read as a valid zero.
+    A valid case must have finite metrics, except a relative norm whose reference is below
+    its floor. A non-finite case keeps its element counts and reports NaN for every other
+    metric, so no missing value can read as a valid zero.
     """
     document = validity_contract.build_field_prediction_validity(prediction.squeeze(0).detach().cpu().numpy(), channels=task.output_names)
     counts = contracts.element_count_columns(task.output_names)
     if document["status"] == validity_contract.NONFINITE:
         metrics = {name: value if name in counts else math.nan for name, value in metrics.items()}
-    elif not np.isfinite(np.asarray(list(metrics.values()), dtype=float)).all():
+    elif not np.isfinite([value for name, value in metrics.items() if name not in contracts.RELATIVE_CASE_COLUMNS]).all():
         msg = "Artifact case produced non-finite scalar metrics from a finite prediction."
         raise FloatingPointError(msg)
     return {**metrics, "prediction_validity": json.dumps(document)}
@@ -461,28 +316,27 @@ def _iter_inferred_artifact_cases(
     loader: Iterable[Mapping[str, Any]],
     *,
     model: Any,
-    processor: Any,
+    scaling: TrainScaling,
     device: torch.device,
 ) -> Iterable[tuple[int, dict[str, Any]]]:
     """
     Infer each loader batch once and yield deterministic size-one case views.
 
-    The fitted processor follows the online evaluation lifecycle exactly: it is
-    switched to evaluation mode and preprocesses a copied raw batch before the
-    model receives the complete loader batch. Predictions and prepared tensors
-    are then sliced for one-row/one-NPZ storage without repeating model forwards.
-    Batch forward duration is divided equally among its cases as an amortized
-    throughput measurement.
+    The restored scaling follows the online evaluation lifecycle exactly: it
+    encodes the inputs of the complete loader batch on the device, the model
+    predicts encoded states, and the scaling decodes them to physical units.
+    Predictions and prepared tensors are then sliced for one-row/one-NPZ storage
+    without repeating model forwards. Batch forward duration is divided equally
+    among its cases as an amortized throughput measurement.
 
     Parameters
     ----------
     loader : Iterable[Mapping[str, Any]]
         Ordered batches containing compatible tensor ``x`` and ``y`` entries.
     model : Any
-        Evaluation-mode model receiving each complete preprocessed loader batch.
-    processor : Any
-        Fitted processor exposing ``eval()``, ``preprocess()``, and an output
-        normalizer.
+        Evaluation-mode model receiving each complete encoded loader batch.
+    scaling : TrainScaling
+        The run's restored Train scaling on ``device``.
     device : torch.device
         Concrete inference device used by online and artifact evaluation.
 
@@ -499,13 +353,6 @@ def _iter_inferred_artifact_cases(
         incompatible prediction and target shapes.
 
     """
-    processor_eval = getattr(processor, "eval", None)
-    preprocess = getattr(processor, "preprocess", None)
-    out_normalizer = getattr(processor, "out_normalizer", None)
-    if not callable(processor_eval) or not callable(preprocess) or out_normalizer is None:
-        msg = "Artifact generation requires an evaluation-capable fitted data processor."
-        raise TypeError(msg)
-
     case_position = 0
     model.eval()
     for batch_index, raw_batch in enumerate(loader):
@@ -528,27 +375,9 @@ def _iter_inferred_artifact_cases(
         _require_finite_artifact_tensor(raw_targets, label=f"Artifact batch {batch_index} raw targets")
 
         with torch.inference_mode():
-            processor_eval()
-            processed = preprocess(dict(raw_batch))
-            if not isinstance(processed, Mapping):
-                msg = f"Artifact processor must return a mapping, got {type(processed).__name__}."
-                raise TypeError(msg)
-            normalized_inputs = processed.get("x")
-            targets = processed.get("y")
-            if not isinstance(normalized_inputs, torch.Tensor) or not isinstance(targets, torch.Tensor):
-                msg = "Artifact processor output must contain tensor keys 'x' and 'y'."
-                raise TypeError(msg)
-            normalized_inputs = normalized_inputs.to(device)
-            targets = targets.to(device)
             inputs = raw_inputs.to(device)
-            if (
-                normalized_inputs.ndim < _MIN_BATCH_TENSOR_RANK
-                or targets.ndim < _MIN_BATCH_TENSOR_RANK
-                or normalized_inputs.shape[0] != batch_size
-                or targets.shape[0] != batch_size
-            ):
-                msg = "Artifact preprocessing must preserve the complete loader batch axis."
-                raise ValueError(msg)
+            targets = raw_targets.to(device)
+            normalized_inputs = scaling.encode_inputs(inputs)
             normalized_prediction, batch_forward_s = timing.measure_forward(
                 model=model,
                 normalized_inputs=normalized_inputs,
@@ -557,23 +386,12 @@ def _iter_inferred_artifact_cases(
             if not isinstance(normalized_prediction, torch.Tensor):
                 msg = "Artifact model output must be a tensor."
                 raise TypeError(msg)
-            normalized_target = out_normalizer.transform(targets)
-            prediction = out_normalizer.inverse_transform(normalized_prediction)
+            prediction = scaling.decode_state(normalized_prediction)
 
         # Predictions stay unchecked here: case admission classifies them without changing values.
-        tensors = {
-            "normalized inputs": normalized_inputs,
-            "physical targets": targets,
-            "normalized target": normalized_target,
-        }
-        for label, value in tensors.items():
-            _require_finite_artifact_tensor(value, label=f"Artifact batch {batch_index} {label}")
-        if prediction.shape != targets.shape or normalized_prediction.shape != normalized_target.shape:
-            msg = (
-                "Artifact prediction/target shapes disagree after complete-batch inference: "
-                f"physical={tuple(prediction.shape)}/{tuple(targets.shape)}, "
-                f"normalized={tuple(normalized_prediction.shape)}/{tuple(normalized_target.shape)}."
-            )
+        _require_finite_artifact_tensor(normalized_inputs, label=f"Artifact batch {batch_index} normalized inputs")
+        if prediction.shape != targets.shape:
+            msg = f"Artifact prediction/target shapes disagree after complete-batch inference: {tuple(prediction.shape)}/{tuple(targets.shape)}."
             raise RuntimeError(msg)
         if prediction.shape[0] != batch_size:
             msg = "Artifact model output must preserve the complete loader batch axis."
@@ -584,8 +402,6 @@ def _iter_inferred_artifact_cases(
             case = {
                 "x": inputs[case_offset : case_offset + 1],
                 "y": targets[case_offset : case_offset + 1],
-                "y_normalized": normalized_target[case_offset : case_offset + 1],
-                "prediction_normalized": normalized_prediction[case_offset : case_offset + 1],
                 "prediction": prediction[case_offset : case_offset + 1],
                 "amortized_forward_s": amortized_forward_s,
                 "forward_calls": int(case_offset == 0),
@@ -899,7 +715,7 @@ def infer_current_run_dir(save_root: Path) -> Path:
     Notes
     -----
     The result is used only for diagnostic metadata and logging. Model, loader,
-    processor, and device ownership remain explicit caller inputs.
+    scaling, and device ownership remain explicit caller inputs.
 
     """
     candidate = Path(save_root)
@@ -974,7 +790,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     task: domain.tasks.spec.TaskSpec,
     model: Any,
     loader: Iterable[Mapping[str, Any]],
-    processor: Any,
+    scaling: TrainScaling,
     device: torch.device,
     save_root: str | Path,
     provenance: Mapping[str, Any],
@@ -987,8 +803,8 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     Generate steady-Brinkman evaluation artifacts from saved-membership batches.
 
     Complete loader batches are preprocessed and inferred exactly once before
-    their case views are evaluated for channel-balanced relative errors, normalized
-    sufficient statistics, and dimensionless momentum, flux-balance, and
+    their case views are evaluated for the physical case statistics, the per-case
+    RMSE and relative norms, and dimensionless momentum, flux-balance, and
     pressure-boundary diagnostics. One NPZ is written per case and one Parquet row per membership.
 
     Parameters
@@ -999,8 +815,8 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         Reconstructed best-checkpoint neural operator.
     loader : Iterable[Mapping[str, Any]]
         Deterministic saved-split batches with explicit source/local identity.
-    processor : Any
-        Restored training input/output normalizers.
+    scaling : TrainScaling
+        The run's restored Train scaling on ``device``.
     device : torch.device
         Concrete inference device.
     save_root : str | pathlib.Path
@@ -1040,11 +856,12 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     save_root = Path(save_root)
     published_root = save_root if publication_root is None else Path(publication_root)
     expected_case_count = _artifact_complete_case_count(provenance)
-    output_groups, train_standard_deviations, normalization_denominator_floor = _objective_context(
+    output_groups, train_scales = _objective_context(
         task=task,
-        processor=processor,
+        scaling=scaling,
         provenance=provenance,
     )
+    reference_floors = {field: task.reference_floor(field) for field in task.output_names}
     velocity_group = _required_output_group(task, group_id="velocity")
     velocity_indices = tuple(task.output_names.index(field) for field in velocity_group.fields)
     velocity_units = {task.field(field).unit for field in velocity_group.fields}
@@ -1090,7 +907,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
     for idx, batch in _iter_inferred_artifact_cases(
         loader,
         model=model,
-        processor=processor,
+        scaling=scaling,
         device=device,
     ):
         split_local_index = _require_batch_scalar_int(batch, "split_local_index")
@@ -1106,8 +923,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
 
         x = batch["x"]
         y = batch["y"]
-        y_norm = batch["y_normalized"]
-        y_hat_norm = batch["prediction_normalized"]
         y_hat = batch["prediction"]
         inference_time_ms = None
 
@@ -1163,7 +978,6 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         # --------------------------------------------------
         y_hat_main = y_hat
         y_main = y
-        err_main = y_hat_main - y_main
         velocity_index_tensor = torch.tensor(velocity_indices, dtype=torch.long, device=y_hat.device)
         velocity_prediction = y_hat_main.index_select(1, velocity_index_tensor)
         velocity_target = y_main.index_select(1, velocity_index_tensor)
@@ -1175,72 +989,35 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         y_ext = torch.cat([y_main, U_gt], dim=1)
         err_ext = y_hat_ext - y_ext
 
-        # Physical diagnostics and global-reduction evidence
-        physical_statistics = physical_case_statistics(
-            y_hat_main,
-            y_main,
-            output_fields=task.output_names,
-        )[0]
-        group_metrics = _group_case_metrics(
-            task=task,
-            physical_statistics=physical_statistics,
-            output_groups=output_groups,
-            train_standard_deviations=train_standard_deviations,
-        )
-        physical_rmse_speed_magnitude = torch.sqrt(torch.mean((U - U_gt) ** 2)).item()
-
-        # Grid spacing from coordinate fields (physical)
+        # Physical case statistics on the full grid and the H1 interior, with derivatives in metres
         idx_x = task.input_names.index("x")
         idx_y = task.input_names.index("y")
         dx = float((x[0, idx_x, 0, 1] - x[0, idx_x, 0, 0]).abs().detach().cpu().item())
         dy = float((x[0, idx_y, 1, 0] - x[0, idx_y, 0, 0]).abs().detach().cpu().item())
-
-        metric_denominator_floor = 1e-12
-        relative_h1 = losses.factory.build_relative_h1(2, reduction="mean", grid_spacing=(dy, dx))
-
-        # ------------------------------------------------------------------
-        # Dimensionless relative L2/H1, normalized independently per field
-        # ------------------------------------------------------------------
-        rel_l2_per_channel: list[float] = []
-        rel_h1_per_channel: list[float] = []
-
-        for c in range(y_main.shape[1]):
-            e_c = err_main[:, c : c + 1]
-            r_c = y_main[:, c : c + 1]
-
-            # Relative L2 per channel (global norm ratio)
-            l2_e_c = torch.linalg.norm(e_c)
-            l2_r_c = torch.linalg.norm(r_c)
-            rel_l2_c = (l2_e_c / (l2_r_c + metric_denominator_floor)).item()
-            rel_l2_per_channel.append(float(rel_l2_c))
-
-            # Relative H1 per channel: the training/validation implementation on the EVAL_PAD interior
-            pad = contracts.EVAL_PAD
-            p_i, r_i = (t[..., pad:-pad, pad:-pad] if pad > 0 else t for t in (y_hat_main[:, c : c + 1], r_c))
-            rel_h1_c = relative_h1(p_i, r_i).item()
-            rel_h1_per_channel.append(float(rel_h1_c))
-
-        rel_l2 = float(np.mean(rel_l2_per_channel))
-        rel_h1 = float(np.mean(rel_h1_per_channel))
-        normalized_statistics = normalized_case_statistics(
-            y_hat_norm,
-            y_norm,
-            output_fields=task.output_names,
-        )[0]
+        sums = learning.metrics.metrics.field_statistics(y_hat_main, y_main, grid_spacing=(dy, dx))[0]
+        case_values = contracts.case_metric_values(
+            sums,
+            fields=task.output_names,
+            output_groups=task.output_groups,
+            train_scales=train_scales,
+            reference_floors=reference_floors,
+        )
         metric_values = _admitted_case_metrics(
             y_hat_main,
             {
-                "rel_l2": rel_l2,
-                "rel_h1": rel_h1,
-                "physical_rmse_speed_magnitude": physical_rmse_speed_magnitude,
+                "physical_rmse_speed_magnitude": torch.sqrt(torch.mean((U - U_gt) ** 2)).item(),
                 "momentum_residual_mse": momentum_residual_mse,
                 "flux_balance_mse": flux_balance_mse,
                 "pressure_boundary_mse": pressure_boundary_mse,
                 "pressure_inlet_mse": pressure_inlet_mse,
                 "pressure_outlet_mean_square": pressure_outlet_mean_square,
-                **physical_statistics,
-                **normalized_statistics,
-                **group_metrics,
+                **{
+                    column: float(value)
+                    for field, row in zip(task.output_names, sums, strict=True)
+                    for column, value in zip(contracts.case_statistic_columns(field), row, strict=True)
+                },
+                **case_values,
+                **_group_case_metrics(task=task, case_values=case_values, output_groups=output_groups, train_scales=train_scales),
             },
             task=task,
         )
@@ -1334,8 +1111,7 @@ def _generate_steady_flow_artifacts(  # noqa: PLR0915
         provenance,
         frame=df,
         output_groups=output_groups,
-        train_standard_deviations=train_standard_deviations,
-        normalization_denominator_floor=normalization_denominator_floor,
+        train_scales=train_scales,
     )
     _provenance_path, published_provenance = write_artifact_provenance(save_root, complete_provenance)
     df.attrs["artifact_provenance"] = published_provenance
@@ -1349,7 +1125,7 @@ def generate_artifacts(
     task: domain.tasks.spec.TaskSpec,
     model: Any,
     loader: Iterable[Mapping[str, Any]],
-    processor: Any,
+    scaling: TrainScaling,
     device: torch.device,
     save_root: str | Path,
     provenance: Mapping[str, Any],
@@ -1369,8 +1145,8 @@ def generate_artifacts(
         Reconstructed best-checkpoint model.
     loader : Iterable[Mapping[str, Any]]
         Deterministic saved-split batches with any positive batch size.
-    processor : Any
-        Restored training normalizer processor.
+    scaling : TrainScaling
+        The run's restored Train scaling on ``device``.
     device : torch.device
         Concrete inference device.
     save_root : str | pathlib.Path
@@ -1411,7 +1187,7 @@ def generate_artifacts(
             task=task,
             model=model,
             loader=loader,
-            processor=processor,
+            scaling=scaling,
             device=device,
             save_root=save_root,
             provenance=provenance,

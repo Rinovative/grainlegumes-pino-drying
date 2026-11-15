@@ -140,6 +140,9 @@ def _open_training(
             model_sha256=model_sha256,
             storage_root=source["storage"],
             split_indices=saved_split,
+            units_per_update=1,
+            memory_batch=1,
+            evaluation_batch_size=1,
             **kwargs,
         )
         return split, artifact
@@ -155,6 +158,8 @@ def _open_training(
         model_sha256=model_sha256,
         storage_root=str(source["storage"]),
         saved_split=saved_split,
+        units_per_update=1,
+        memory_batch=1,
         **kwargs,
     )
     for loader in (loaders.train, loaders.evaluation, loaders.material_ood, loaders.parameter_ood, loaders.id_test):

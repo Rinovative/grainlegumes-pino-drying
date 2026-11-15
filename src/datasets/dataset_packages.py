@@ -161,7 +161,7 @@ def format_dataset_inspection(report: Mapping[str, Any]) -> str:
             f"Static: {channels(channel_contract['static'])}",
             f"Boundary: {channels(channel_contract['boundary'])}",
             f"Scalars: {channels(channel_contract['scalars'])}",
-            f"Targets: {channels(channel_contract['target'])}",
+            f"Next state: {channels(channel_contract['next_state'])}",
             (
                 f"Time: {channels(channel_contract['time']['fields'])}; "
                 f"storage {channel_contract['storage']}; dtype {channel_contract['tensor_dtype']}"

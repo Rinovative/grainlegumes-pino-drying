@@ -119,10 +119,10 @@ def test_readonly_child_navigation_binds_saved_identity_and_admits_training_drif
     summary = {
         "status": "completed",
         "config_sha256": common.serialization.file_sha256(config_path),
-        "checkpoint_identity": {"resume_contract_digest": child["semantic_config_sha256"]},
+        "checkpoint_identity": {"effective_config_digest": child["semantic_config_sha256"]},
     }
     common.serialization.atomic_write_json(run_dir / "summary.json", summary)
-    monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", lambda _config: pytest.fail("Navigation must use saved identity"))
+    monkeypatch.setattr(identity.training_checkpoint, "config_digest", lambda _config: pytest.fail("Navigation must use saved identity"))
     assert identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path) == run_dir
     with monkeypatch.context() as drift:
         # Navigation is a historical read: it binds the recorded producer evidence, never the running code.
@@ -130,13 +130,13 @@ def test_readonly_child_navigation_binds_saved_identity_and_admits_training_drif
         assert identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path) == run_dir
 
     changed = copy.deepcopy(summary)
-    changed["checkpoint_identity"]["resume_contract_digest"] = "0" * 64
+    changed["checkpoint_identity"]["effective_config_digest"] = "0" * 64
     common.serialization.atomic_write_json(run_dir / "summary.json", changed)
     with pytest.raises(ValueError, match="immutable parent"):
         identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
     changed["checkpoint_identity"] = {}
     common.serialization.atomic_write_json(run_dir / "summary.json", changed)
-    with pytest.raises(ValueError, match="valid saved resume identity"):
+    with pytest.raises(ValueError, match="valid saved config identity"):
         identity.resolve_readonly_experiment_child(record, child, marker=marker, output_root=tmp_path)
     common.serialization.atomic_write_json(run_dir / "summary.json", summary)
     raw = copy.deepcopy(stage_a)
@@ -157,7 +157,7 @@ def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path:
     common.serialization.atomic_write_json(
         run_dir / "summary.json",
         {
-            "status": "budget_unmet",
+            "status": "interrupted",
             "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(stage_b)},
         },
     )
@@ -166,18 +166,36 @@ def test_incomplete_child_navigation_does_not_admit_completed_evidence(tmp_path:
         run_service.validate_completed_run(run_dir)
 
 
-def test_scientific_change_changes_content_identity_and_parent_location(tmp_path: Path) -> None:
-    """Change the identities, not the readable parent location, when a scientific parameter changes."""
+def test_another_k_is_another_experiment_with_its_own_identity_and_location(tmp_path: Path) -> None:
+    """Units per update belong to the run identity and its name, so another k never continues or shares the first parent."""
     original_raw = configs.transient_matched_config()
     changed_raw = copy.deepcopy(original_raw)
-    changed_raw["data"]["batch_size"] += 1
+    changed_raw["training"]["units_per_update"] += 1
     source = configs.write_yaml(tmp_path / "plan.yaml", original_raw)
     original = _record(_plan(tmp_path, original_raw), source)
     changed = _record(_plan(tmp_path, changed_raw), source)
 
     assert original["parent_identity_sha256"] != changed["parent_identity_sha256"]
     assert original["layout"]["a0_id"] != changed["layout"]["a0_id"]
-    assert identity.experiment_record_path(original, output_root=tmp_path) == identity.experiment_record_path(changed, output_root=tmp_path)
+    assert identity.experiment_record_path(original, output_root=tmp_path) != identity.experiment_record_path(changed, output_root=tmp_path)
+
+
+def test_memory_batch_is_execution_only_so_plans_differing_in_it_share_identity_and_resume_each_other(tmp_path: Path) -> None:
+    """The memory split changes only rounding: every identity, name and resume admission ignores it."""
+    original_raw = configs.transient_matched_config()
+    changed_raw = copy.deepcopy(original_raw)
+    changed_raw["training"]["memory_batch"] += 1
+    source = configs.write_yaml(tmp_path / "plan.yaml", original_raw)
+    original_stages, changed_stages = _plan(tmp_path, original_raw), _plan(tmp_path, changed_raw)
+
+    assert _record(original_stages, source)["parent_identity_sha256"] == _record(changed_stages, source)["parent_identity_sha256"]
+    for original, changed in zip(original_stages, changed_stages, strict=True):
+        assert original["training"]["memory_batch"] != changed["training"]["memory_batch"]
+        assert original["run"]["name"] == changed["run"]["name"]
+        assert original["run"]["layout"] == changed["run"]["layout"]
+        assert learning.training.checkpoint.config_digest(original) == learning.training.checkpoint.config_digest(changed)
+        run_service.validate_resume_config(changed, original)
+        run_service.validate_resume_config(original, changed)
 
 
 def test_persisted_parent_must_match_the_requested_identity(tmp_path: Path) -> None:
@@ -244,7 +262,7 @@ def test_same_pair_with_other_content_conflicts_at_the_parent_record(tmp_path: P
     source = configs.write_yaml(tmp_path / "plan.yaml", raw)
     identity.admit_fresh_transient_experiment_record(_record(first, source), output_root=tmp_path)
     changed = copy.deepcopy(raw)
-    changed["training"]["b"]["evaluation_interval"] += 1
+    changed["training"]["b"]["curriculum"]["milestone_fractions"] = [0.0, 0.25]
 
     second = _plan(tmp_path, changed)
 

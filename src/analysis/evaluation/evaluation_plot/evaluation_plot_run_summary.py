@@ -1,7 +1,8 @@
 """Summarize authoritative model accuracy, architecture, and physical tradeoffs.
 
 Responsibilities:
-  - Build provenance-backed run and architecture summary tables
+  - Build provenance-backed run, runtime and architecture summary tables
+  - Build the work table of completed stages from their summaries and their artifacts' inference times
   - Read normalized_group_macro_rmse only from validated aggregate evidence
   - Plot comparison-set-relative task and output-group diagnostics
   - Compare exact trainable capacity with authoritative aggregate accuracy
@@ -21,7 +22,7 @@ This module does NOT:
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, cast
 
@@ -30,13 +31,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
+from src.analysis.evaluation import evaluation_run_discovery as run_discovery
 from src.analysis.evaluation.evaluation_plot import evaluation_plot_layout as layout
+from src.analysis.presentation import analysis_field_labels as field_labels
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
+
+    from src.analysis.evaluation import evaluation_transient_timing as transient_timing
 
 _PHYSICS_LABELS = {
     "momentum_residual_mse": (r"momentum mean($(R_x^2+R_y^2)/G^2$)", "1"),
@@ -59,7 +63,12 @@ def _finite_quantile(frame: pd.DataFrame, column: str, quantile: float) -> float
     return float(np.quantile(values, quantile)) if values.size else float("nan")
 
 
-def _model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
+def _optional_value(value: float | None) -> float | str:
+    """Return a saved value, or ``unavailable`` (never zero) when its evidence is missing."""
+    return "unavailable" if value is None else float(value)
+
+
+def model_metadata(frame: pd.DataFrame) -> tuple[str, int, bool]:
     """
     Read model family, exact trainable count, and PI flag.
 
@@ -127,7 +136,7 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
         unavailable = None if aggregate["available"] else validity_contract.unavailable_text(aggregate)
         fields = tuple(frame.attrs["output_fields"])
         units = dataframe.field_units(frame)
-        family, trainable, physics_enabled = _model_metadata(frame)
+        family, trainable, physics_enabled = model_metadata(frame)
         row: dict[str, Any] = {
             "label": label,
             "dataset_role": dataframe.dataset_role(frame),
@@ -137,20 +146,22 @@ def build_run_summary_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFram
             "trainable_parameters": trainable,
             "physics_enabled": physics_enabled,
             "normalized_group_macro_rmse": unavailable or float(aggregate["value"]),
-            "relative_l2_median": _finite_quantile(frame, "rel_l2", 0.5),
-            "relative_l2_q90": _finite_quantile(frame, "rel_l2", 0.9),
-            "relative_h1_median": _finite_quantile(frame, "rel_h1", 0.5),
-            "relative_h1_q90": _finite_quantile(frame, "rel_h1", 0.9),
             "dataset_name": dataset["name"],
             "sample_count": len(frame),
             "config_digest": str(run["effective_config_digest"]),
             "checkpoint_digest": str(run["best_checkpoint_sha256"]),
         }
+        field_metrics, unavailable_cases = aggregate["field_metrics"], aggregate["relative_unavailable_cases"]
         for field in fields:
-            row[f"normalized_rmse_{field}"] = unavailable or float(aggregate["field_statistics"][field]["normalized_rmse"])
-            physical_column = contracts.physical_statistic_columns(field)[2]
-            row[f"physical_rmse_{field}_median [{units[field]}]"] = _finite_quantile(frame, physical_column, 0.5)
-            row[f"physical_rmse_{field}_q90 [{units[field]}]"] = _finite_quantile(frame, physical_column, 0.9)
+            row[f"normalized_rmse_{field}"] = unavailable or float(field_metrics[f"normalized_rmse_{field}"])
+            row[f"physical_mae_{field} [{units[field]}]"] = unavailable or float(field_metrics[f"physical_mae_{field}"])
+            row[f"physical_rmse_{field}_median [{units[field]}]"] = _finite_quantile(frame, f"physical_rmse_{field}", 0.5)
+            row[f"physical_rmse_{field}_q90 [{units[field]}]"] = _finite_quantile(frame, f"physical_rmse_{field}", 0.9)
+        # A relative norm is unavailable, never zero, when a material has no case whose reference reaches the floor.
+        for norm in ("l2", "h1"):
+            for metric_id in (f"physical_relative_{norm}", *(f"physical_relative_{norm}_{field}" for field in fields)):
+                row[metric_id] = unavailable or _optional_value(field_metrics[metric_id])
+                row[f"{metric_id}_unavailable_cases"] = unavailable or int(unavailable_cases[metric_id])
         for group_id, _group_fields in frame.attrs["output_groups"]:
             for space in ("normalized", "physical"):
                 row[f"{space}_group_rmse_{group_id}"] = unavailable or float(aggregate["group_statistics"][group_id][f"{space}_rmse"])
@@ -228,6 +239,90 @@ def plot_run_summary_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.V
     if any(count_headings.values()):
         visible = visible.rename(index={label: count_headings[label] for label in datasets})
     return _styled_table(visible, title=title)
+
+
+def build_runtime_table(datasets: Mapping[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Build one row per labelled steady artifact from its admitted runtime comparison.
+
+    Each speed-up is Σ COMSOL time / Σ batch-amortized forward time over the cases that have that COMSOL clock; the
+    unpaired cases are counted, and a speed-up without any paired case reads ``unavailable``, never zero.
+    """
+    rows: list[dict[str, Any]] = []
+    for label, frame in datasets.items():
+        report = _provenance(frame)["timing"]["report"]
+        runtime = report["neural_runtime"]
+        row: dict[str, Any] = {
+            "label": label,
+            "dataset_role": dataframe.dataset_role(frame),
+            "batch_size": report["measurement"]["batch_size"],
+            "surrogate_hardware": f"{runtime['resolved_device']} · {runtime.get('cuda_device_name') or runtime['processor']}",
+            "solver_hardware": "; ".join(
+                f"{item['hostname']}, {item['requested_cores']} cores ({item['case_count']} cases)" for item in report["solver_hardware"]
+            ),
+        }
+        for name, speedup in report["speedups"].items():
+            row[f"{name} [-]"] = _optional_value(speedup["ratio_of_sums"])
+            row[f"{name} paired cases"] = speedup["paired_case_count"]
+            row[f"{name} unavailable cases"] = speedup["unavailable_case_count"]
+            row[f"{name} Σ {speedup['reference_component']}"] = _optional_value(speedup["reference_seconds_sum"])
+            row[f"{name} Σ surrogate forward [s]"] = _optional_value(speedup["surrogate_seconds_sum"])
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("label")
+
+
+def plot_runtime_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
+    """Show the steady speed-ups with their paired and unavailable case counts, batch size and hardware."""
+    return _styled_table(build_runtime_table(datasets), title="Runtime and speed-up (ratio of sums over paired cases)")
+
+
+def transient_inference_seconds(report: transient_timing.TransientTimingReport) -> float | None:
+    """Return the mean over cases of each case's median drying-rollout model-call seconds, or ``None`` when no case has one."""
+    medians = [float(np.median(values)) for case in report.cases if (values := case.repetitions.get("drying_no_rollout_model_seconds"))]
+    return float(np.mean(medians)) if medians else None
+
+
+def build_work_table(stages: Mapping[str, tuple[Mapping[str, Any], float | None]]) -> pd.DataFrame:
+    """
+    Build one row per labelled completed stage from its summary and inference seconds per case.
+
+    The rows are ``run_discovery.stage_work_row``; a value the run did not record reads
+    ``unavailable``, never zero.
+    """
+    rows = []
+    for label, (summary, seconds) in stages.items():
+        row = run_discovery.stage_work_row(summary, inference_seconds_per_case=seconds)
+        rows.append({"label": label, **{name: run_discovery.UNAVAILABLE if value is None else value for name, value in row.items()}})
+    return pd.DataFrame.from_records(rows).set_index("label")
+
+
+def build_frame_work_table(frames: Mapping[str, pd.DataFrame], inference: Callable[[str, pd.DataFrame], float | None]) -> pd.DataFrame:
+    """
+    Build one work row per completed run of the labelled frames, named by its first frame.
+
+    The frames of one run (its roles) carry the summary the loader attached; the row takes the
+    inference seconds per case of that first frame's artifact.
+    """
+    stages: dict[str, tuple[Mapping[str, Any], float | None]] = {}
+    runs: set[tuple[object, object]] = set()
+    for label, frame in frames.items():
+        summary = frame.attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR]
+        run = (summary.get("run_name"), summary.get("ended_at"))
+        if run not in runs:
+            runs.add(run)
+            stages[label] = (summary, inference(label, frame))
+    return build_work_table(stages)
+
+
+def _steady_inference_seconds(_label: str, frame: pd.DataFrame) -> float:
+    """Return the mean batch-amortized forward seconds per case of a steady artifact."""
+    cases = _provenance(frame)["timing"]["report"]["cases"]
+    return float(np.mean([case["batch_amortized_neural_operator_forward_s"] for case in cases]))
+
+
+def plot_work_table(*, datasets: Mapping[str, pd.DataFrame]) -> widgets.VBox:
+    """Show the work quantities of every steady run, with its mean batch-amortized forward seconds per case."""
+    return _styled_table(build_frame_work_table(datasets, _steady_inference_seconds), title="Work per stage")
 
 
 def plot_relative_comparison_scoreboard(*, datasets: Mapping[str, pd.DataFrame]) -> Figure:
@@ -430,7 +525,6 @@ def _add_data_configuration(
             (
                 ("train_dataset", "Data · Training dataset"),
                 ("material_ood_datasets", "Data · Material-OOD datasets"),
-                ("batch_size", "Data · Batch size"),
             ),
         )
     _copy_configuration_fields(
@@ -454,7 +548,6 @@ def _add_optimization_configuration(row: dict[str, Any], config: Mapping[str, An
                 data_loss,
                 (
                     ("kind", "Optimization · Data loss"),
-                    ("space", "Optimization · Data-loss space"),
                     ("weight", "Optimization · Data-loss weight"),
                 ),
             )
@@ -480,12 +573,18 @@ def _add_optimization_configuration(row: dict[str, Any], config: Mapping[str, An
                 ("kind", "Optimization · Scheduler"),
                 ("factor", "Optimization · Scheduler factor"),
                 ("patience", "Optimization · Scheduler patience"),
-                ("min_lr", "Optimization · Minimum learning rate"),
             ),
         )
     training = config.get("training")
     if isinstance(training, Mapping):
-        _copy_configuration_fields(row, training, (("epochs", "Optimization · Training epochs"),))
+        _copy_configuration_fields(
+            row,
+            training,
+            (
+                ("budget_epochs", "Optimization · Budget epochs"),
+                ("units_per_update", "Optimization · Units per update"),
+            ),
+        )
 
 
 def _add_physics_configuration(
@@ -664,7 +763,7 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
             if primary < 0.0 or physics_value < 0.0:
                 msg = f"Pareto metrics must be non-negative. {label!r} supplied {primary}, {physics_value}."
                 raise ValueError(msg)
-            _family, _count, physics_enabled = _model_metadata(frame)
+            _family, _count, physics_enabled = model_metadata(frame)
             role = dataframe.dataset_role(frame)
             color = colors(index % colors.N)
             axis.scatter(
@@ -685,8 +784,8 @@ def plot_accuracy_physics_pareto(*, datasets: Mapping[str, pd.DataFrame]) -> Fig
                 fontsize=8,
             )
         axis.set_yscale("log")
-        axis.set_xlabel("Normalized task error [1]")
-        axis.set_ylabel(f"Median {metric_label} [{unit}]")
+        axis.set_xlabel(f"Normalized task error [{field_labels.display_unit('1')}]")
+        axis.set_ylabel(f"Median {metric_label} [{field_labels.display_unit(unit)}]")
         axis.set_title(metric)
         axis.grid(True, which="both", linestyle="--", alpha=0.3)
     handles, labels = axes[0].get_legend_handles_labels()

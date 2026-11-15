@@ -2,7 +2,7 @@
 Training-free component checks on published reference fields.
 
 Provides:
-- increments: Train-fitted scaled-increment statistics, Huber regime, and stored time steps
+- increments: Train-fitted scaled-increment statistics, group-weighted loss shares, and stored time steps
 - plots: static figures of residual, derivative, sensitivity, balance, and mode tables
 - sources: read-only membership-filtered steady and transient reference-case loading
 - spectral: Fourier-mode truncation floors with domain padding and spatial-stride floors

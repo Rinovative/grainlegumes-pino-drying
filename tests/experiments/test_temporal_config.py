@@ -103,4 +103,3 @@ def test_sampling_and_conditioning_changes_update_run_and_resume_identity() -> N
 
     for changed in (rollout, no_conditioning):
         assert learning.training.checkpoint.config_digest(one_step) != learning.training.checkpoint.config_digest(changed)
-        assert learning.training.checkpoint.resume_contract_digest(one_step) != learning.training.checkpoint.resume_contract_digest(changed)

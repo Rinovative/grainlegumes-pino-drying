@@ -36,17 +36,22 @@ if TYPE_CHECKING:
     )
 
 
+def _seconds_budget(total: float, spent: float) -> dict[str, Any]:
+    """Return one completed B or A1 budget on the optimisation clock."""
+    return {"unit": "train_seconds", "total": total, "units": 6, "train_seconds": spent, "validated_point": 20, "skipped_points": []}
+
+
 def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     output_root = tmp_path / "outputs"
     pair = "b-a1__budget-12p5s__rollout-1__lr-1"
-    group = output_root / "transient_drying" / "dataset" / "matched" / "fno_m2x2_h4_l1" / "seed-9"
+    group = output_root / "transient_drying" / "dataset" / "matched" / "fno_m2x2_h4_l1" / "seed-9__ep-3__k-2__sch-cosine"
     branch = group / pair
     runs = {"a0": group / "a0", "b": branch / "b", "a1": branch / "a1"}
     for path in runs.values():
         path.mkdir(parents=True)
     monkeypatch.setattr(
         artifact.learning.training.checkpoint,
-        "resume_contract_digest",
+        "config_digest",
         lambda config: common.serialization.canonical_json_sha256({"arm": config["training"]["comparison_arm"]}),
     )
 
@@ -64,7 +69,9 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
                     "model_label": "fno_m2x2_h4_l1",
                     "seed": 9,
                     "revision": None,
-                    "budget_epochs": None,
+                    "budget_epochs": 3,
+                    "units_per_update": 2,
+                    "schedule": "cosine",
                     "stage": arm,
                     "pair": None if arm == "a0" else pair,
                     "trial": None,
@@ -105,7 +112,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
             f"stage_{arm}": {
                 "path": "../a0" if arm == "a0" else arm,
                 "run_name": arm,
-                "semantic_config_sha256": artifact.learning.training.checkpoint.resume_contract_digest(configs[arm]),
+                "semantic_config_sha256": artifact.learning.training.checkpoint.config_digest(configs[arm]),
             }
             for arm in runs
         },
@@ -125,12 +132,9 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
     manifest.write_text(json.dumps({"source_run_name": "a0", "files": {"checkpoint": {"sha256": "a" * 64}}}), encoding="utf-8")
     b_summary = {
         "status": "completed",
-        "terminal_controller": {
-            "budget_complete": True,
-            "clock_kind": "train_seconds",
-            "train_seconds": 12.5,
-            "post_handoff_optimizer_steps": 4,
-        },
+        "terminal_controller": {"post_handoff_optimizer_steps": 4},
+        "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+        "terminal_budget": _seconds_budget(10.0, 12.5),
         "terminal_epoch": 2,
         "best_epoch": 2,
         "best_checkpoint_sha256": "b" * 64,
@@ -140,7 +144,7 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
         parent_identity_sha256=record["parent_identity_sha256"],
         a0_handoff_sha256=common.serialization.file_sha256(manifest),
         b_config=configs["b"],
-        b_summary=b_summary,
+        finished_b={"summary": b_summary, "terminal_budget": artifact.learning.training.budget.StageBudget(**b_summary["terminal_budget"])},
     )
     matched_budget.publish_b_receipt(runs["b"], receipt)
     matched_budget.publish_b_receipt(runs["a1"], receipt)
@@ -151,13 +155,8 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
         controller = {
             "arm": arm.upper(),
             "stage": "stage_b_self_fed" if arm == "b" else "stage_a_teacher_forcing",
-            "budget_control": "train_seconds",
-            "clock_kind": "train_seconds",
             "teacher_handoff": parent,
-            "planned_train_seconds": planned,
-            "train_seconds": actual,
             "matched_receipt_sha256": receipt["receipt_sha256"] if arm == "a1" else None,
-            "budget_complete": True,
             "best_within_budget_epoch": 1,
         }
         completed[arm] = {
@@ -167,14 +166,16 @@ def _matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[d
             "summary": {
                 "run_identity": {"parent_label": "matched-parent"},
                 "terminal_controller": controller,
-                "terminal_curriculum": {"stage": 1},
+                # Only B draws rollout horizons, so only B records a terminal curriculum.
+                **({"terminal_curriculum": {"stage": 1}} if arm == "b" else {}),
+                "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
             },
-            "last_checkpoint": {"adapter_state_dict": {"controller": controller}},
+            "last_checkpoint": {"adapter_state_dict": {"controller": controller}, "budget_state_dict": _seconds_budget(planned, actual)},
             "selected_checkpoint_sha256": "b" * 64 if arm == "b" else "d" * 64,
             "selected_checkpoint_epoch": 2,
             "normalizer_sha256": "e" * 64,
             "effective_config_digest": "f" * 64,
-            "checkpoint_identity": {"resume_contract_digest": artifact.learning.training.checkpoint.resume_contract_digest(configs[arm])},
+            "checkpoint_identity": {"effective_config_digest": artifact.learning.training.checkpoint.config_digest(configs[arm])},
         }
     return completed, receipt
 
@@ -184,23 +185,23 @@ def test_current_parent_binds_semantic_digest_without_alias(tmp_path: Path, monk
     completed, receipt = _matched_context(tmp_path, monkeypatch)
     monkeypatch.setattr(
         artifact.learning.training.checkpoint,
-        "resume_contract_digest",
+        "config_digest",
         lambda _config: pytest.fail("Saved parent binding must not regenerate current Training identity"),
     )
     parent = artifact._parent_experiment_evidence(completed["a1"])
     assert parent["parent_identity_sha256"] == receipt["parent_identity_sha256"]
     assert parent["kind"] == "grouped"
     changed = deepcopy(completed["a1"])
-    changed["checkpoint_identity"]["resume_contract_digest"] = "0" * 64
+    changed["checkpoint_identity"]["effective_config_digest"] = "0" * 64
     with pytest.raises(ValueError, match="child identity"):
         artifact._parent_experiment_evidence(changed)
 
 
-@pytest.mark.parametrize("saved_identity", [{}, {"resume_contract_digest": None}, {"resume_contract_digest": "not-a-digest"}])
+@pytest.mark.parametrize("saved_identity", [{}, {"effective_config_digest": None}, {"effective_config_digest": "not-a-digest"}])
 def test_parent_rejects_missing_or_malformed_saved_identity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, saved_identity: dict[str, Any]) -> None:
     completed, _receipt = _matched_context(tmp_path, monkeypatch)
     completed["a1"]["checkpoint_identity"] = saved_identity
-    with pytest.raises(ValueError, match="valid saved resume identity"):
+    with pytest.raises(ValueError, match="valid saved config identity"):
         artifact._parent_experiment_evidence(completed["a1"])
 
 
@@ -211,6 +212,7 @@ def test_a1_lineage_preserves_distinct_arm_and_actual_b_receipt(tmp_path: Path, 
     a1 = artifact._lineage(completed["a1"])
     assert b["stage_identity"] == {"stage": "b", "comparison_arm": "b"}
     assert a1["stage_identity"] == {"stage": "a", "comparison_arm": "a1"}
+    assert (b["curriculum_identity"], a1["curriculum_identity"]) == ({"stage": 1}, None)
     assert b["matched_compute_manifest"]["b_train_budget_receipt"] == receipt
     assert a1["matched_compute_manifest"]["b_train_budget_receipt"] == receipt
     assert a1["training_strategy"] == "teacher_forced_matched_train_seconds"
@@ -298,7 +300,7 @@ def _portable_matched_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
             {
                 "status": "completed",
                 "config_sha256": common.serialization.file_sha256(run / "config.yaml"),
-                "checkpoint_identity": {"resume_contract_digest": artifact.learning.training.checkpoint.resume_contract_digest(config)},
+                "checkpoint_identity": {"effective_config_digest": artifact.learning.training.checkpoint.config_digest(config)},
             },
         )
     return completed, receipt, marker

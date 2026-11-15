@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     from matplotlib.figure import Figure
 
 _DEFAULT_CASE_LIMIT = 100
-_POSITIVE_FLOOR = np.finfo(float).tiny
 _RESIDUAL_COLORBAR_LABEL = rf"mean $\sqrt{{R_x^2+R_y^2}}/G$ [{field_labels.display_unit('1')}]"
 _RESIDUAL_LABELS = {
     "momentum_residual_mse": (r"MSE of Brinkman momentum residual $(R_x^2+R_y^2)/G^2$", "1"),
@@ -62,11 +61,18 @@ def _values(frame: pd.DataFrame, column: str, max_cases: int) -> np.ndarray:
     return values
 
 
+def _log_axis_values(values: np.ndarray) -> np.ndarray:
+    """Return the values for a log axis with non-positive entries as gaps, never raised to a fake positive value."""
+    values = np.asarray(values, dtype=float)
+    return np.where(values > 0.0, values, np.nan)
+
+
 def _cdf(axis: Axes, values: np.ndarray, *, label: str, color: object | None = None) -> Line2D:
-    """Draw one log-safe empirical CDF."""
-    ordered = np.maximum(np.sort(np.asarray(values, dtype=float)), _POSITIVE_FLOOR)
+    """Draw one empirical CDF on a log axis; exact zeros cannot be placed there, so they keep only their CDF share."""
+    ordered = np.sort(np.asarray(values, dtype=float))
     cumulative = np.linspace(0.0, 1.0, ordered.size)
-    (line,) = axis.plot(ordered, cumulative, linewidth=2, label=label, color=color)
+    positive = ordered > 0.0
+    (line,) = axis.plot(ordered[positive], cumulative[positive], linewidth=2, label=label, color=color)
     return line
 
 
@@ -153,13 +159,13 @@ def plot_flux_balance(
         heading = count_headings[label] or label
         _cdf(cdf_axis, _values(frame, "flux_balance_mse", max_cases), label=heading, color=colors[label])
         rows = summary.grid.coordinates[1, :, 0]
-        profile_axis.plot(np.maximum(cast("np.ndarray", summary.flux_balance_mean), _POSITIVE_FLOOR), rows, linewidth=2, color=colors[label])
+        profile_axis.plot(_log_axis_values(cast("np.ndarray", summary.flux_balance_mean)), rows, linewidth=2, color=colors[label])
     cdf_axis.set_xscale("log")
     cdf_axis.set_xlabel(f"{metric_label} [{unit}]")
     cdf_axis.set_ylabel("CDF")
     cdf_axis.set_title("Per-case distribution")
     profile_axis.set_xscale("log")
-    profile_axis.set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [1]")
+    profile_axis.set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [-]")
     profile_axis.set_ylabel(f"y [{summaries[id(next(iter(datasets.values())))].grid.coordinate_units[1]}]")
     profile_axis.set_title("Mean profile over the bed height")
     for axis in (cdf_axis, profile_axis):
@@ -191,7 +197,7 @@ def _pressure_drop_values(
     datasets: Mapping[str, pd.DataFrame],
     max_cases: int,
 ) -> dict[str, np.ndarray]:
-    """Return current absolute-relative pressure-drop mismatch per admitted case."""
+    """Return the pressure-drop mismatch relative to the declared drop per admitted case; a non-positive declared drop fails."""
     dataframe.validate_comparison(datasets, require_physics=True)
     with sessions.scoped_session(datasets) as active_session:
         summaries = {id(frame): active_session.full_summary(frame, max_cases).require_pressure() for frame in datasets.values()}
@@ -200,7 +206,10 @@ def _pressure_drop_values(
         summary = summaries[id(frame)]
         declared = cast("np.ndarray", summary.pressure_declared)
         absolute = cast("np.ndarray", summary.pressure_absolute_error)
-        result[label] = validity_contract.finite_case_values(absolute / (np.abs(declared) + 1e-12))
+        if not np.all(declared > 0.0):
+            msg = f"{label}: every declared pressure drop must be positive, got a minimum of {float(np.min(declared)):.3g} Pa."
+            raise ValueError(msg)
+        result[label] = validity_contract.finite_case_values(absolute / declared)
     return result
 
 
@@ -228,13 +237,13 @@ def plot_pressure_consistency(
             axes[0],
             pressure_drop,
             "Pressure-drop mismatch",
-            r"$|\Delta p_{pred}-\Delta p_{bc}|/(|\Delta p_{bc}|+\epsilon)$",
+            r"$|\Delta p_{pred}-\Delta p_{bc}|/\Delta p_{bc}$ [-]",
         ),
         (
             axes[1],
             pressure_boundary,
             "Pressure-boundary mismatch",
-            r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$ [1]",
+            r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$ [-]",
         ),
     )
     for axis, values, axis_title, xlabel in specifications:
@@ -335,7 +344,7 @@ def plot_physical_consistency_cdf_grid(
     specifications = (
         ("flux_balance_mse", r"$\mathrm{MSE}((q(y)-\bar{q})/Q)$", "Mass conservation (flux balance)"),
         ("momentum_residual_mse", r"$\mathrm{MSE}((R_x^2+R_y^2)/G^2)$", "Brinkman residual"),
-        (None, r"$|\Delta p_{pred}-\Delta p_{bc}|/(|\Delta p_{bc}|+\epsilon)$", "Pressure drop"),
+        (None, r"$|\Delta p_{pred}-\Delta p_{bc}|/\Delta p_{bc}$", "Pressure drop"),
         ("pressure_boundary_mse", r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$", "Pressure BC"),
     )
     figure = plt.figure(figsize=(15.5, 8.5))
@@ -390,10 +399,10 @@ def plot_spatial_residuals(
         axes[row, 0].set_ylabel(f"y [{summary.grid.coordinate_units[1]}]")
         layout.add_map_colorbar(figure, image, axes[row, 0], label=_RESIDUAL_COLORBAR_LABEL)
         rows = summary.grid.coordinates[1, :, 0]
-        axes[row, 1].plot(np.maximum(cast("np.ndarray", summary.flux_balance_mean), _POSITIVE_FLOOR), rows, linewidth=2)
+        axes[row, 1].plot(_log_axis_values(cast("np.ndarray", summary.flux_balance_mean)), rows, linewidth=2)
         axes[row, 1].set_xscale("log")
         axes[row, 1].set_title(f"{heading} — flux balance")
-        axes[row, 1].set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [1]")
+        axes[row, 1].set_xlabel(r"mean $|q(y)-\bar{q}|/Q$ [-]")
         axes[row, 1].set_ylabel(f"y [{summary.grid.coordinate_units[1]}]")
         axes[row, 1].grid(True, which="both", linestyle="--", alpha=0.3)
     figure.suptitle(figure_title)

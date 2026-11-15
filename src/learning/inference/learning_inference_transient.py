@@ -31,11 +31,10 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import torch
 from torch import nn
 
-from src import common, domain, experiments, learning
+from src import common, datasets, domain, experiments, learning
 from src.learning.models import learning_models_factory as model_factory
 from src.learning.transient import learning_transient_rollout as rollout
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
-from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
 from src.learning.transient.learning_transient_tensorizer import TransientTensorizer
 
 if TYPE_CHECKING:
@@ -56,7 +55,7 @@ class TransientInferenceContext:
 
     model: nn.Module
     tensorizer: TransientTensorizer
-    scaling: TransientScalingArtifact
+    scaling: datasets.preprocessing.normalization.TrainScaling
     device: torch.device
     model_kind: Literal["fno", "uno", "rno"]
     precision: Literal["float32"]
@@ -213,7 +212,6 @@ def _spatial_preflight_error(
     model_kind: object,
     training_shape: tuple[int, int],
     evaluation_shape: tuple[int, int],
-    training_stride: object,
     checkpoint_identity: object,
     reason: str,
 ) -> ValueError:
@@ -222,8 +220,7 @@ def _spatial_preflight_error(
         "Transient artifact Evaluation-grid preflight rejected the requested spatial representation: "
         f"architecture={model_kind!r}, checkpoint={checkpoint_identity!r}, "
         f"Training shape={training_shape}, Evaluation shape={evaluation_shape}, reason={reason}. "
-        f"Use the common supported --evaluation-spatial-stride {training_stride!r} "
-        "for compared models or choose another explicitly validated common grid."
+        "Artifacts are evaluated on the full canonical grid, which this architecture does not support."
     )
 
 
@@ -235,7 +232,6 @@ def _prove_cross_resolution_output_shape(
     device: torch.device,
     training_shape: tuple[int, int],
     evaluation_shape: tuple[int, int],
-    training_stride: object,
     checkpoint_identity: object,
 ) -> dict[str, Any]:
     """Execute one synthetic model step and require exact requested output shape."""
@@ -263,7 +259,6 @@ def _prove_cross_resolution_output_shape(
             model_kind=model_kind,
             training_shape=training_shape,
             evaluation_shape=evaluation_shape,
-            training_stride=training_stride,
             checkpoint_identity=checkpoint_identity,
             reason=f"synthetic requested-grid forward failed: {type(error).__name__}: {error}",
         ) from error
@@ -308,7 +303,7 @@ def build_transient_inference_context(
     if not isinstance(normalizer_state, Mapping):
         msg = "Completed transient run must provide one scaling-artifact mapping."
         raise TypeError(msg)
-    scaling = TransientScalingArtifact.from_state_dict(normalizer_state)
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(normalizer_state)
     resolved_device = _resolve_device(device)
     scaling = scaling.to(resolved_device)
     training_shape = scaling.spatial_shape
@@ -325,7 +320,6 @@ def build_transient_inference_context(
         raise TypeError(msg)
     kind = _require_model_kind(model_config.get("kind"))
     decision = architecture_compatibility.get("decision")
-    training_stride = config.get("data", {}).get("spatial_stride")
     checkpoint_identity = {
         "identity": completed.get("checkpoint_identity"),
         "best_checkpoint_sha256": completed.get("selected_checkpoint_sha256"),
@@ -336,7 +330,6 @@ def build_transient_inference_context(
             model_kind=kind,
             training_shape=training_shape,
             evaluation_shape=requested_shape,
-            training_stride=training_stride,
             checkpoint_identity=checkpoint_identity,
             reason=str(architecture_compatibility.get("reason", decision)),
         )
@@ -346,7 +339,7 @@ def build_transient_inference_context(
             "temporal_conditioning": config.get("temporal", {}).get("temporal_conditioning") if isinstance(config.get("temporal"), Mapping) else None,
         }
     )
-    if spec != scaling.tensorizer:
+    if spec.as_dict() != scaling.preprocessing.get("tensorizer"):
         msg = "Completed transient config tensorizer disagrees with admitted scaling artifact."
         raise RuntimeError(msg)
     model = model_factory.build_model(dict(config), device=resolved_device)
@@ -366,7 +359,6 @@ def build_transient_inference_context(
             device=resolved_device,
             training_shape=training_shape,
             evaluation_shape=requested_shape,
-            training_stride=training_stride,
             checkpoint_identity=checkpoint_identity,
         )
     return TransientInferenceContext(
@@ -579,7 +571,7 @@ def prepare_transient_request(
         external_airflow=external_airflow,
         airflow_source=resolved_airflow_source,
         spatial_shape=context.evaluation_spatial_shape,
-        horizon=context.scaling.horizon,
+        horizon=context.scaling.regular_horizon,
     )
     values = _owned_runtime_inputs(
         context=context,
@@ -1001,79 +993,34 @@ def rollout_prepared_transient_autonomous_diagnostic(
     initial_hidden: object | None = None,
 ) -> TransientRolloutResult:
     """
-    Preserve one computed prediction prefix and stop before invalid feedback.
+    Preserve each case's computed prediction prefix and stop that case before non-finite feedback.
 
+    The other cases of the request continue (see :func:`rollout.autonomous_rollout`).
     ``initial_hidden`` continues an RNO state built over the reference prefix
     of the same trajectory, for example by
     :func:`teacher_forced_prepared_transient_diagnostic`.
     """
     _require_prepared_request(context, request)
-    current = request.state
-    batch_size, channels, height, width = current.shape
-    output_shape = (batch_size, request.length, channels, height, width)
-    states = current.new_full(output_shape, float("nan"))
-    scaled_deltas = current.new_full(output_shape, float("nan"))
-    decoded_deltas = current.new_full(output_shape, float("nan"))
-    available = torch.zeros(
-        (batch_size, request.length),
-        dtype=torch.bool,
-        device=current.device,
-    )
-    if context.model_kind != "rno" and initial_hidden is not None:
-        msg = "Stateless transient models cannot start from a hidden state."
-        raise ValueError(msg)
-    hidden = initial_hidden
     timer = _ModelCallTimer(context.device)
-    model_calls = 0
     with torch.inference_mode():
-        for index in range(request.length):
-            step_input = context.tensorizer.assemble_step(
-                current,
-                request.static,
-                request.boundary[:, index],
-                request.scalars,
-                request.t_n[:, index],
-            )
-            scaled_delta, hidden = rollout.predict_step(
-                context.model,
-                step_input,
-                model_kind=context.model_kind,
-                hidden=hidden,
-                model_call=timer.measure,
-                require_finite_output=False,
-            )
-            scaled_delta = scaled_delta.to(
-                device=context.scaling.device,
-                dtype=torch.float32,
-            )
-            next_state, decoded_delta = context.tensorizer.reconstruct_next_state_diagnostic(
-                current,
-                scaled_delta,
-            )
-            scaled_deltas[:, index].copy_(scaled_delta)
-            decoded_deltas[:, index].copy_(decoded_delta)
-            states[:, index].copy_(next_state)
-            available[:, index] = True
-            model_calls += 1
-            if not (
-                bool(torch.isfinite(scaled_delta).all().item())
-                and bool(torch.isfinite(decoded_delta).all().item())
-                and bool(torch.isfinite(next_state).all().item())
-            ):
-                break
-            current = next_state
-    seconds = timer.finish()
+        result = rollout.autonomous_rollout(
+            context.model,
+            context.tensorizer,
+            state=request.state,
+            static=request.static,
+            boundary=request.boundary,
+            scalars=request.scalars,
+            t_n=request.t_n,
+            model_kind=context.model_kind,
+            initial_hidden=initial_hidden,
+            model_call=timer.measure,
+        )
     return TransientRolloutResult(
-        states=states,
-        scaled_deltas=scaled_deltas,
-        timing=_timing(
-            seconds=seconds,
-            context=context,
-            mode="autonomous_rollout",
-            calls=model_calls,
-        ),
-        decoded_deltas=decoded_deltas,
-        prediction_available=available,
+        states=result.physical_prediction,
+        scaled_deltas=result.scaled_delta,
+        timing=_timing(seconds=timer.finish(), context=context, mode="autonomous_rollout", calls=int(result.prediction_available.any(0).sum())),
+        decoded_deltas=result.decoded_delta,
+        prediction_available=result.prediction_available,
     )
 
 

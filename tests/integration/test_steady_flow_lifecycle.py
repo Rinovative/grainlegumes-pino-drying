@@ -19,6 +19,7 @@ import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -61,6 +62,16 @@ _MATERIAL_OOD_DATASET = datasets.contracts.identity.combined_dataset_id((_OOD_DA
 # Both axes hold at least the 10 points spectral Fourier continuation needs.
 _SHAPE = (12, 12)
 _ARTIFACT_CROP = 2
+_SOLVER_TIMING = SimpleNamespace(
+    stationary_airflow_solver_seconds=2.0, comsol_process_seconds=3.0, solver_hostname="solver-node", solver_requested_cores=8
+)
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_generation_timing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for the Generation campaign the synthetic Datasets lack: every member case has one recorded COMSOL clock."""
+    source = SimpleNamespace(load_timing=lambda: _SOLVER_TIMING)
+    monkeypatch.setattr(analysis.artifacts.plan, "generation_case_sources", lambda role, **_kwargs: dict.fromkeys(role.case_ids, source))
 
 
 @dataclass(frozen=True)
@@ -104,8 +115,9 @@ def _case_components(
     *,
     case_id: str,
     offset: float,
+    source: dict[str, Any],
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, Any], str]:
-    """Build deterministic in-memory case tensors and their scientific identity."""
+    """Build deterministic in-memory case tensors and their scientific identity; ``source`` is the case's provenance source."""
     y_axis = torch.linspace(0.0, 1.0, _SHAPE[0], dtype=torch.float32)
     x_axis = torch.linspace(0.0, 1.0, _SHAPE[1], dtype=torch.float32)
     y, x = torch.meshgrid(y_axis, x_axis, indexing="ij")
@@ -126,7 +138,14 @@ def _case_components(
     inputs = torch.stack([input_fields[name] for name in task.input_names])
     outputs = torch.stack([output_fields[name] for name in task.output_names])
     source_identity = {"generator": "synthetic-lifecycle", "case": case_id}
-    source_metadata = {"offset": offset, "case_id": case_id, "parameters": {"synthetic_parameter": 1.0}}
+    # Case-equal validation reads the simulation case and material of every item, as real packages carry them.
+    source_metadata = {
+        "offset": offset,
+        "case_id": case_id,
+        "simulation_case_id": source["simulation_case_id"],
+        "material_family": source["material_family"],
+        "parameters": {"synthetic_parameter": 1.0},
+    }
     fingerprint = datasets.contracts.identity.compute_case_fingerprint(
         task=task,
         case_id=case_id,
@@ -146,8 +165,12 @@ def _training_dataset_payload(
 ) -> dict[str, Any]:
     """Build one final synthetic dataset entirely in memory."""
     provenance = _PROVENANCES[dataset_id]
-    sample_ids = [entry["package_case_id"] for entry in provenance["source_case_identities"]]
-    cases = [_case_components(task, case_id=case_id, offset=offset) for case_id, offset in zip(sample_ids, offsets, strict=True)]
+    entries = provenance["source_case_identities"]
+    sample_ids = [entry["package_case_id"] for entry in entries]
+    cases = [
+        _case_components(task, case_id=entry["package_case_id"], offset=offset, source=entry["source"])
+        for entry, offset in zip(entries, offsets, strict=True)
+    ]
     return datasets.contracts.identity.build_training_dataset_payload(
         task=task,
         dataset_id=dataset_id,
@@ -219,7 +242,7 @@ def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
         {
             "train_dataset": _ID_DATASET,
             "material_ood_datasets": [_OOD_DATASET, _SECOND_OOD_DATASET],
-            "batch_size": 2,
+            "evaluation_batch_size": 2,
             "num_workers": 0,
             "pin_memory": False,
             "persistent_workers": False,
@@ -237,8 +260,7 @@ def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
     }
     raw["loss"]["data"].update(
         {
-            "kind": "relative_l2",
-            "space": "normalized",
+            "kind": "mse",
             "weight": 1.0,
         }
     )
@@ -251,13 +273,7 @@ def _tiny_request(*, workflow: str = "train") -> dict[str, Any]:
         }
     )
     raw["scheduler"] = None
-    raw["training"].update(
-        {
-            "epochs": 1,
-            "evaluation_interval": 1,
-            "ood_evaluation_interval": 1,
-        }
-    )
+    raw["training"]["budget_epochs"] = 1
     raw["tracking"]["wandb"]["mode"] = "disabled"
     return raw
 
@@ -377,7 +393,7 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
             config,
             run_dir=run_dir,
             persisted_config=config,
-            epoch_end_callback=lambda _epoch, metrics: epoch_metrics.append(dict(metrics)),
+            event_callback=lambda _step, metrics: epoch_metrics.append(dict(metrics)),
             device_resolution=learning.device.resolve_device("cpu"),
         )
     finally:
@@ -388,13 +404,24 @@ def completed_lifecycle(tmp_path_factory: pytest.TempPathFactory) -> CompletedLi
     _make_last_checkpoint_distinct(run_dir)
     completed = experiments.run.validate_completed_run(run_dir)
     summary = completed["summary"]
-    # One epoch of one two-sample optimizer group.
-    assert summary["training_work"] == {"optimizer_steps": 1, "gradient_predictions": 2}
+    # One epoch of one two-sample optimizer group: a budget of two units, so the group crosses all 20 points and validates once.
+    assert summary["training_work"] == {"optimizer_steps": 1, "gradient_predictions": 2, "units": 2, "update_distinct_cases": 2}
+    assert summary["terminal_budget"]["unit"] == "units"
+    assert summary["terminal_budget"]["total"] == summary["terminal_budget"]["units"] == 2
+    assert summary["terminal_budget"]["validated_point"] == 20
+    assert summary["validation_plan_deviation"] == {"skipped_points": list(range(1, 20))}
+    assert [metrics["validation/point"] for metrics in epoch_metrics if "validation/point" in metrics] == [20.0]
     assert summary["runtime_device"]["requested_policy"] == "cpu"
     assert summary["runtime_device"]["resolved_device"] == "cpu"
     assert len(summary["runtime_sessions"]) == 1
     assert summary["runtime_sessions"][0]["requested_policy"] == "cpu"
     assert summary["runtime_sessions"][0]["resolved_device"] == "cpu"
+    # The real run records its precision after the model build and ends its one attempt with the committed work.
+    attempt = summary["runtime_sessions"][0]["attempt"]
+    assert summary["runtime_sessions"][0]["precision"]["parameter_dtypes"]
+    assert attempt["work_at_end"] == {**summary["training_work"], "train_seconds": summary["terminal_budget"]["train_seconds"]}
+    assert (summary["duration_coverage"], summary["attempted_train_seconds"]) == ("complete", attempt["train_seconds"])
+    assert summary["training_units"]["seen_cases"] == summary["training_units"]["train_cases"] == 2
     assert not _state_dict_equal(
         completed["best_checkpoint"]["model_state_dict"],
         completed["last_checkpoint"]["model_state_dict"],
@@ -432,7 +459,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     """
     Execute the bounded synthetic lifecycle from training through artifact rebuild.
 
-    Saved splits and train-only normalizers must reconstruct exactly, inference must
+    Saved splits and the Train-only scaling must reconstruct exactly, inference must
     load ``best`` rather than the deliberately distinct ``last``, and ID/OOD artifacts
     must expose current metrics, physics arrays, provenance, and normalized evidence.
     Valid caches remain byte/time-identical. Corrupt provenance, Parquet, and NPZ
@@ -441,7 +468,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     """
     lifecycle = completed_lifecycle
     split = datasets.preprocessing.splits.admit_split(lifecycle.completed["split_indices"])
-    seed_plan = experiments.run.build_seed_plan(lifecycle.config["run"]["seed"])
+    seed_plan = experiments.run.build_seed_plan(lifecycle.config["run"]["seed"], stage=None)
     rebuilt = experiments.config.loader.create_dataloaders_from_config(
         lifecycle.config,
         seed_plan=seed_plan,
@@ -465,8 +492,13 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     # Only the material part is declared here; the empty parameter part produced no series.
     assert split.ood_roles == ("material_ood",)
     assert not any(key.startswith("parameter_ood/") for epoch in lifecycle.epoch_metrics for key in epoch)
-    assert {definition.source_key for definition in definitions} <= set().union(*lifecycle.epoch_metrics)
+    # Undefined on this tiny data only: every case's p, u and v reference RMS lies below its TaskSpec floor
+    # (domain_task_steady_flow.py: 1 Pa, 1e-4 m/s), so physical_relative_l2 has no finite value and is absent from
+    # the event. Its producer is covered by test_metric_spaces.py::test_validation_produces_the_curated_relative_l2_above_the_reference_floors.
+    undefined = {f"{role}/physical_relative_l2" for role in ("id", *split.ood_roles)}
+    assert {definition.source_key for definition in definitions} - undefined <= set().union(*lifecycle.epoch_metrics)
     projected_selected = {wandb_schema.selected_summary_key(definition.source_key) for definition in definitions} - {None}
+    projected_selected -= {wandb_schema.selected_summary_key(key) for key in undefined}
     assert projected_selected <= set(lifecycle.completed["summary"]["selected_metrics"])
 
     train_indices = split.train.indices
@@ -479,15 +511,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert scaling_identity["dataset"]["dataset_id"] == split.train.dataset_id
     assert scaling_identity["dataset"]["fingerprint"] == split.train.dataset["fingerprint"]
     assert scaling_identity["train_membership_digest"] == split.train.membership_digest
-    normalizer = normalizer_artifact["state"]
-    expected_input_mean = lifecycle.id_payload["inputs"][train_indices].mean(
-        dim=(0, 2, 3),
-        keepdim=True,
-    )
-    expected_output_mean = lifecycle.id_payload["outputs"][train_indices].mean(
-        dim=(0, 2, 3),
-        keepdim=True,
-    )
+    scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(normalizer_artifact["state"])
     task = domain.tasks.registry.get_task(str(lifecycle.config["task"]))
     output_units = tuple(field.unit for field in task.outputs)
     velocity_group = next(group for group in task.output_groups if group.id == "velocity")
@@ -495,20 +519,19 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     assert len(velocity_units) == 1
     speed_unit = next(iter(velocity_units))
     objective_id = str(lifecycle.config["evaluation"]["objective"]["id"])
-    train_standard_deviations = {field: float(normalizer["out_normalizer.std"][0, index, 0, 0]) for index, field in enumerate(task.output_names)}
-    assert torch.allclose(normalizer["in_normalizer.mean"], expected_input_mean)
-    assert torch.allclose(normalizer["out_normalizer.mean"], expected_output_mean)
-    full_input_mean = lifecycle.id_payload["inputs"].mean(
-        dim=(0, 2, 3),
-        keepdim=True,
-    )
-    eps_index = domain.tasks.registry.get_task("steady_flow").input_names.index("eps_bed")
-    assert not torch.isclose(
-        normalizer["in_normalizer.mean"][0, eps_index, 0, 0],
-        full_input_mean[0, eps_index, 0, 0],
-    )
+    train_scales = analysis.artifacts.contracts.output_scales(scaling, output_fields=task.output_names)
+    # Every steady case is one equal-size sample, so the case-equal Train means are the pooled Train means.
+    input_mean, _ = scaling.input_affine()
+    fitted_inputs = [index for index, name in enumerate(task.input_names) if name not in datasets.preprocessing.normalization.STEADY_BOUNDARY_STATES]
+    expected_input_mean = lifecycle.id_payload["inputs"][train_indices].mean(dim=(0, 2, 3))
+    expected_output_mean = lifecycle.id_payload["outputs"][train_indices].mean(dim=(0, 2, 3))
+    assert torch.allclose(input_mean[fitted_inputs], expected_input_mean[fitted_inputs])
+    assert torch.allclose(scaling.group("state").mean, expected_output_mean)
+    full_input_mean = lifecycle.id_payload["inputs"].mean(dim=(0, 2, 3))
+    eps_index = task.input_names.index("eps_bed")
+    assert not torch.isclose(input_mean[eps_index], full_input_mean[eps_index])
 
-    model, loader, processor, device = learning.inference.context.load_inference_context(
+    model, loader, restored_scaling, device = learning.inference.context.load_inference_context(
         run_dir=lifecycle.run_dir,
         dataset_root=lifecycle.dataset_root,
         split="id_test",
@@ -519,12 +542,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
     selected_dataset = loader.dataset
     assert isinstance(selected_dataset, learning.inference.context.IndexedSubset)
     assert torch.equal(selected_dataset.source_indices, split.id_test.indices)
-    in_normalizer = processor.in_normalizer
-    assert in_normalizer is not None
-    assert torch.equal(
-        in_normalizer.mean.cpu(),
-        normalizer["in_normalizer.mean"],
-    )
+    assert restored_scaling.digest == scaling.digest
     loaded_state = model.state_dict()
     best_state = lifecycle.completed["best_checkpoint"]["model_state_dict"]
     last_state = lifecycle.completed["last_checkpoint"]["model_state_dict"]
@@ -547,22 +565,16 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert frame["source_index"].tolist() == list(plan.role(role).source_indices)
         assert frame["source_dataset_id"].tolist() == [part.dataset_id for part in evidence for _ in part.case_ids]
         assert all(Path(path).is_file() for path in frame["npz_path"])
-        sufficient_statistics = {
-            f"{space}_{statistic}_{field}"
-            for field in task.output_names
-            for space in ("normalized", "physical")
-            for statistic in ("sse", "count", "rmse")
-        }
+        case_statistics = {column for field in task.output_names for column in analysis.artifacts.contracts.case_statistic_columns(field)}
         assert {
-            "rel_l2",
-            "rel_h1",
+            *analysis.artifacts.contracts.case_metric_columns(task.output_names),
             "physical_rmse_speed_magnitude",
             "momentum_residual_mse",
             "flux_balance_mse",
             "pressure_boundary_mse",
             "pressure_inlet_mse",
             "pressure_outlet_mean_square",
-            *sufficient_statistics,
+            *case_statistics,
         }.issubset(frame.columns)
         with np.load(Path(frame.iloc[0]["npz_path"]), allow_pickle=False) as payload:
             assert payload["output_fields"].tolist() == list(task.output_names)
@@ -575,9 +587,10 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         artifact_summary = analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
             frame,
             output_groups=task.output_groups,
-            train_standard_deviations=train_standard_deviations,
-            normalization_denominator_floor=float(artifact_provenance["normalizer"]["denominator_floor"]),
+            train_scales=train_scales,
+            reference_floors={field: task.reference_floor(field) for field in task.output_names},
         )
+        assert artifact_provenance["normalizer"]["output_scales"] == train_scales
         assert frame.attrs[objective_id] == artifact_summary
         if role == "eval":
             # ID artifacts evaluate ID-test membership; checkpoint selection used validation.
@@ -609,7 +622,7 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert stored_provenance["dataset"]["membership_digests"] == [part.membership_digest for part in role_evidence[role]]
         assert stored_provenance["dataset"]["source_identities"] == [dict(part.dataset) for part in role_evidence[role]]
         assert stored_provenance["normalizer"]["sha256"] == lifecycle.completed["summary"]["normalizer_sha256"]
-        assert stored_provenance["evaluator"]["group_objective_evidence"]["squared_error_accumulation_dtype"] == "float64"
+        assert stored_provenance["evaluator"]["metric_evidence"] == analysis.artifacts.contracts.metric_evidence_provenance(task)
         physics = stored_provenance["physics"]
         assert physics["task_contract_digest"] == domain.tasks.registry.get_task("steady_flow").contract_digest
         assert physics["derivatives"] == {
@@ -627,12 +640,14 @@ def test_real_steady_flow_lifecycle_and_artifacts(  # noqa: PLR0915
         assert runtime_comparison["split_role"] == role
         assert runtime_comparison["measurement"] == {
             "clock": "time.perf_counter_ns",
-            "batch_size": lifecycle.config["data"]["batch_size"],
+            "batch_size": lifecycle.config["data"]["evaluation_batch_size"],
             "case_duration_attribution": analysis.artifacts.timing.CASE_DURATION_ATTRIBUTION,
             "warmup_passes": 1,
             "cuda_synchronized": False,
         }
-        assert runtime_comparison["aggregates"]["batch_amortized_neural_operator_forward_s"]["count"] == len(frames[role])
+        assert len(runtime_comparison["cases"]) == len(frames[role])
+        assert runtime_comparison["speedups"]["solver_speedup"]["paired_case_count"] == len(frames[role])
+        assert runtime_comparison["solver_hardware"] == [{"hostname": "solver-node", "requested_cores": 8, "case_count": len(frames[role])}]
 
     id_provenance = json.loads((id_target / analysis.artifacts.contracts.ARTIFACT_PROVENANCE_FILENAME).read_text(encoding="utf-8"))
     assert id_provenance["selection"]["index_key"] == "id_test_indices"
@@ -853,7 +868,8 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
 
     with monkeypatch.context() as drift:
         drift.setattr(learning.inference.context, "load_inference_context_with_resolution", original_inference)
-        # Training code changed after the run: reading it stays admitted on its recorded evidence, continuing it is refused.
+        # Training code changed after the run: reading it stays admitted on its recorded evidence; continuing the
+        # completed run is refused as terminal before any code check.
         run_state.drift_training_code(drift, "steady_flow")
         before_drift = _artifact_inventory((moved,))
         experiments.run.validate_completed_run(moved)
@@ -866,7 +882,7 @@ def test_completed_bundle_is_portable_with_exact_relative_payload_paths(
         )
         assert analysis.evaluation.artifact_loader.load_run_artifacts(moved).selected_checkpoint_sha256 == checkpoint_digest
         # Exercise the same continuation service used by ordinary resolved launches.
-        with pytest.raises(ValueError, match=r"training_steady_flow implementation changed .*--revision <label>"):
+        with pytest.raises(ValueError, match="A completed run has spent its budget and is never extended"):
             experiments.run._run_resolved_experiment(
                 copy.deepcopy(completed_lifecycle.config),
                 config_path=common.paths.resolve_run_config_path(moved),
@@ -1033,12 +1049,12 @@ def _interrupted_copy(completed: CompletedLifecycle, destination: Path) -> Path:
 
 
 @pytest.mark.parametrize("status", ["interrupted", "completed"])
-def test_rerunning_an_authored_request_with_more_epochs_continues_the_run_in_place(
+def test_rerunning_an_authored_request_finishes_the_run_in_place(
     completed_lifecycle: CompletedLifecycle,
     tmp_path: Path,
     status: str,
 ) -> None:
-    """The same command continues an interrupted run, or extends a completed one, in its own directory."""
+    """The same command finalizes an interrupted run whose budget is spent, or returns a completed one, in its own directory."""
     output_root = tmp_path / "processed"
     destination = common.paths.resolve_config_run_dir(completed_lifecycle.config, output_root=output_root)
     if status == "interrupted":
@@ -1056,39 +1072,36 @@ def test_rerunning_an_authored_request_with_more_epochs_continues_the_run_in_pla
     raw["model"]["params"].pop("in_channels")
     raw["model"]["params"].pop("out_channels")
     raw["evaluation"] = {"objective": {"id": saved["evaluation"]["objective"]["id"]}}
-    continued_epoch = 2
-    raw["training"]["epochs"] = continued_epoch
     request_path = configs.write_config(tmp_path, raw, canonical_root=tmp_path)
 
     continued = experiments.run.run_experiment(request_path, device="cpu", output_root=output_root)
 
     assert continued["run_dir"] == destination.resolve()
+    assert continued.get("already_complete", False) is (status == "completed")
     assert [child.name for child in destination.parent.iterdir()] == [destination.name]
     completed = experiments.run.validate_completed_run(destination)
     assert completed["config"]["run"]["name"] == saved["run"]["name"]
-    assert completed["last_checkpoint"]["completed_epoch"] == continued_epoch
+    # The spent budget admits no further optimizer group.
+    assert completed["last_checkpoint"]["completed_epoch"] == 1
+    assert completed["summary"]["training_work"]["optimizer_steps"] == 1
 
 
 def test_saved_config_resume_continues_a_renamed_interrupted_bundle(
     completed_lifecycle: CompletedLifecycle,
     tmp_path: Path,
 ) -> None:
-    """Resume one interrupted bundle by its exact renamed path from its own saved config."""
+    """Resume one interrupted bundle by its exact renamed path from its own saved config; another budget is refused."""
     renamed = _interrupted_copy(completed_lifecycle, tmp_path / "renamed_resume_bundle")
     saved_name = experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(renamed))["run"]["name"]
-    resumed_epoch = 2
+    with pytest.raises(ValueError, match="cannot override scientific"):
+        experiments.run.run_experiment(common.paths.resolve_run_config_path(renamed), resume=renamed, device="cpu", epochs=2)
 
-    resumed = experiments.run.run_experiment(
-        common.paths.resolve_run_config_path(renamed),
-        resume=renamed,
-        device="cpu",
-        max_epochs=resumed_epoch,
-    )
+    resumed = experiments.run.run_experiment(common.paths.resolve_run_config_path(renamed), resume=renamed, device="cpu")
 
     assert resumed["run_dir"] == renamed.resolve()
     completed = experiments.run.validate_completed_run(renamed)
     assert completed["config"]["run"]["name"] == saved_name
-    assert completed["last_checkpoint"]["completed_epoch"] == resumed_epoch
+    assert completed["last_checkpoint"]["completed_epoch"] == 1
 
 
 def _mutate_task_identity(run_dir: Path, dataset_root: Path) -> None:
@@ -1292,7 +1305,7 @@ def test_saved_artifact_reader_rejects_normalizer_and_checkpoint_path_tampering(
     run_dir = _copy_without_analysis(completed_lifecycle.run_dir, tmp_path / "run")
     normalizer_path = common.paths.resolve_normalizer_path(run_dir)
     normalizer = torch.load(normalizer_path, map_location="cpu", weights_only=False)
-    normalizer["train_membership_digest"] = "0" * 64
+    normalizer["state"]["train_membership_digest"] = "0" * 64
     common.serialization.atomic_torch_save(normalizer, normalizer_path)
     _refresh_summary_digest(run_dir, summary_key="normalizer_sha256", artifact_path=normalizer_path)
     with pytest.raises((ValueError, RuntimeError)):

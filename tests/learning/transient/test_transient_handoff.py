@@ -39,7 +39,6 @@ def _config() -> dict[str, Any]:
         "loss": {},
         "optimizer": {},
         "scheduler": None,
-        "scaling": {},
         "run": {"deterministic": True, "seed": 1},
         "data": {"train_dataset": "train", "material_ood_datasets": []},
         "training": {},

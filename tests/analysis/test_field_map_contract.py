@@ -99,6 +99,19 @@ def test_locked_definition_reports_overflow_without_adding_visible_colors() -> N
     assert locked.normalizer.clip is False
 
 
+def test_locked_round_boundaries_keep_one_color_per_band_from_9_to_13_bands() -> None:
+    """A locked scale of 13 bands has 13 colors; a signed one needs an odd count with its neutral band around zero; 14 bands are refused."""
+    boundaries = 25.0 * np.arange(14)
+    locked = field_maps.build_field_map((10.0, 300.0), semantic="linear_positive", locked_boundaries=boundaries)
+    assert (locked.color_count, locked.boundaries.size) == (13, 14)
+    signed = field_maps.build_field_map((-0.3, 0.3), semantic="signed_error", locked_boundaries=(np.arange(10) - 4.5) * 0.1)
+    assert signed.color_count == 9
+    with pytest.raises(ValueError, match="finite strictly increasing"):
+        field_maps.build_field_map((10.0, 300.0), semantic="linear_positive", locked_boundaries=25.0 * np.arange(15))
+    with pytest.raises(ValueError, match="neutral center"):
+        field_maps.build_field_map((-0.3, 0.3), semantic="signed_error", locked_boundaries=(np.arange(11) - 5.0) * 0.1)
+
+
 def test_repeated_builds_return_isolated_definitions_without_sharing_mutable_renderers() -> None:
     first = field_maps.build_field_map((0.0, 1.0), semantic="linear_positive", field="phi", unit="1", comparison_scope="case-a")
     first.normalizer.clip = False

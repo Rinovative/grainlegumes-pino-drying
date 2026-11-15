@@ -5,6 +5,7 @@ Responsibilities:
 
 Design principles:
   - Values are small, exact, and test-owned so session and artifact tests share one fixture shape
+  - States are constant over the smallest grid with an H1 interior, so per-case errors equal the offsets
 
 This module does NOT:
   - Run inference, write artifacts, or represent production results
@@ -18,53 +19,26 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
-import torch
 
-from src import datasets, domain
+from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_transient_timing as timing
-from src.learning.transient.learning_transient_contracts import TemporalConditioningSpec, TransientTensorizerSpec
-from src.learning.transient.learning_transient_scaling import SCALE_FLOOR, TransientScalingArtifact
+from support.scaling import spatial_view, transient_scaling
 
 ANALYSIS_SHA256 = "9" * 64
+GRID_SHAPE = (5, 5)
+_STATIC_CONSTANTS = (1.0, 1.0, 101325.0, 0.4, 100.0)
 
 
-def scaling_state() -> dict[str, object]:
-    """Return one valid synthetic transient scaling state with a two-unit state scale."""
-    spec = TransientTensorizerSpec("canonical_physics_complete", TemporalConditioningSpec("none"))
-    contract = datasets.contracts.transient.TRANSIENT_STEP_CONTRACT
-    names = tuple(
-        tuple(field.name for field in group)
-        for group in (contract.dynamic_state, contract.static_spatial_conditioning, contract.step_boundary_conditioning, contract.scalar_conditioning)
-    )
-    artifact = TransientScalingArtifact(
-        task_contract_digest=domain.tasks.registry.get_task("transient_drying").contract_digest,
-        data_contract_digest=domain.tasks.registry.get_task("transient_drying").data_contract_digest,
-        tensorizer=spec,
-        dataset_identity={"synthetic": "session"},
-        train_membership_digest="a" * 64,
-        scale_mode="state_std",
-        numerical_floor=SCALE_FLOOR,
-        unique_train_state_count=1,
-        unique_transition_count=1,
-        transition_count=1,
-        spatial_shape=(1, 1),
-        state_names=names[0],
-        static_names=names[1],
-        boundary_names=names[2],
-        scalar_names=names[3],
-        state_mean=torch.zeros(4),
-        state_std=torch.full((4,), 2.0),
-        delta_rms=torch.ones(4),
-        increment_scale=torch.full((4,), 2.0),
-        static_mean=torch.zeros(7),
-        static_std=torch.ones(7),
-        scalar_mean=torch.zeros(8),
-        scalar_std=torch.ones(8),
-        omega_boundary_mean=torch.tensor(0.0),
-        omega_boundary_std=torch.tensor(1.0),
-        horizon=8.0,
-    )
-    return artifact.state_dict()
+def scaling_state(*, membership_digest: str = "a" * 64) -> dict[str, object]:
+    """Return one valid synthetic transient scaling state with a two-unit state scale and unit scales elsewhere."""
+    view = spatial_view(GRID_SHAPE)
+    return transient_scaling(view, state_std=2.0, membership_digest=membership_digest, dataset_identity={"synthetic": "session"}).state_dict()
+
+
+def static_conditioning() -> np.ndarray:
+    """Return static fields on a 4 cm by 8 cm grid with constant u, v, p, porosity and dry bulk density."""
+    y, x = np.meshgrid(np.linspace(0.0, 0.04, GRID_SHAPE[0]), np.linspace(0.0, 0.08, GRID_SHAPE[1]), indexing="ij")
+    return np.stack((x, y, *(np.full(GRID_SHAPE, value) for value in _STATIC_CONSTANTS))).astype(np.float32)
 
 
 def sequence_record(
@@ -74,10 +48,12 @@ def sequence_record(
     case_id: str = "case",
     offset: float = 2.0,
     material_family: str = "lentil",
+    length: int | None = None,
 ) -> SimpleNamespace:
-    """Return one synthetic four-channel sequence record with a constant prediction offset."""
-    length = 2 if horizon == 1 else 3
-    reference = np.zeros((length, 4, 1, 1), dtype=np.float32)
+    """Return one synthetic four-channel sequence record with a constant prediction offset after the stored origin."""
+    if length is None:
+        length = 2 if horizon == 1 else 3
+    reference = np.zeros((length, 4, *GRID_SHAPE), dtype=np.float32)
     prediction = reference.copy()
     prediction[1:] = offset
     full_reference = mode == "autonomous_full" and horizon == "full"
@@ -105,19 +81,7 @@ def sequence_record(
         physical_times=np.arange(length, dtype=np.float64),
         reference_states=reference,
         predicted_states=prediction,
-        spatial_mask=np.ones((1, 1), dtype=bool),
-        static_conditioning=np.asarray(
-            [
-                [[0.0]],
-                [[0.0]],
-                [[1.0]],
-                [[1.0]],
-                [[101325.0]],
-                [[0.4]],
-                [[100.0]],
-            ],
-            dtype=np.float32,
-        ),
+        static_conditioning=static_conditioning(),
         scalar_conditioning=np.asarray([0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0]),
         identity={
             "material_family": material_family,
@@ -127,6 +91,7 @@ def sequence_record(
             "timing_evidence_identity": "b" * 64,
             "scaling_identity": {"semantic_digest": "c" * 64},
             "evaluation_assignment": None,
+            "spatial_representation": {"grid_identity_sha256": "f" * 64},
         },
         target=target,
     )
@@ -154,7 +119,7 @@ def production_frame(
     dataset_name: str = "transient_dataset",
     dataset_role: str = "id",
 ) -> pd.DataFrame:
-    """Return a sequence frame with complete run, Dataset, timing, and lineage provenance."""
+    """Return a sequence frame with complete run, Dataset, timing, and lineage provenance and the completed run's summary."""
     frame = sequence_frame(records)
     report = timing.build_transient_timing_report(
         (
@@ -169,6 +134,8 @@ def production_frame(
                 precision="float32",
                 pt_payload_identity="a" * 64,
                 warmup_passes=1,
+                solver_hostname="solver-node",
+                solver_requested_cores=8,
                 cpu="test-cpu",
                 software_versions={"python": "test", "pytorch": "test", "numpy": "test"},
                 cold_timings={"drying_no_rollout_model_seconds": 0.05},
@@ -215,10 +182,26 @@ def production_frame(
                     "stage_identity": {"stage": "b", "comparison_arm": "b"},
                     "training_strategy": "rollout",
                     "matched_compute_manifest": {
-                        "planned": {"clock": "cuda_device_seconds"},
-                        "actual": {"budget_complete": True},
+                        "planned": None,
+                        "actual": {"arm": "B", "stage": "stage_b_self_fed"},
+                        "training_outcome": {"status": "completed", "budget_progress": 1.0, "eligible_points": 1, "divergence": None},
+                        "budget": {
+                            "unit": "train_seconds",
+                            "total": 1.0,
+                            "units": 4,
+                            "train_seconds": 1.0,
+                            "validated_point": 20,
+                            "skipped_points": [],
+                        },
                     },
                 },
+            },
+            # The loader attaches the completed run's summary; this one records only the run and its arm.
+            dataframe.COMPLETED_RUN_SUMMARY_ATTR: {
+                "task": "transient_drying",
+                "run_name": "transient-fixture",
+                "ended_at": "2026-11-11T00:00:00+00:00",
+                "terminal_controller": {"arm": "B"},
             },
         }
     )

@@ -1,8 +1,8 @@
 """Protect labeled subseeds and pre-construction process reproducibility controls.
 
 Responsibilities:
-  - Check stable labeled subseeds, process RNGs, deterministic controls, and model initialization
-    order
+  - Check stable labeled subseeds, the stage-specific seed plan (a curriculum seed for B only), process RNGs,
+    deterministic controls, and model initialization order
 
 Design principles:
   - CPU-safe fixtures test reproducibility within the current library/runtime boundary
@@ -35,29 +35,37 @@ def test_labeled_subseeds_are_stable_distinct_and_reproducible() -> None:
     Values must be identical and pairwise distinct, protecting component streams
     from accidental dependence on orchestration call sequence.
     """
-    first = experiments.run.build_seed_plan(19)
+    first = experiments.run.build_seed_plan(19, stage="b")
     reverse = {label: experiments.run.derive_subseed(19, label) for label in reversed(tuple(first))}
 
     assert first == reverse
     assert len(first) == len(set(first.values()))
 
 
-def test_curriculum_draws_follow_the_derived_seed_of_each_arm() -> None:
-    """
-    Draw rollout lengths from the seed plan's A0 and B curriculum seeds.
+@pytest.mark.parametrize("stage", [None, "a", "b"])
+def test_only_a_stage_b_seed_plan_carries_its_curriculum_seed(stage: str | None) -> None:
+    """Steady runs, A0 and A1 record the four component seeds; B adds its curriculum seed, derived from its own label."""
+    components = {label: experiments.run.derive_subseed(19, label) for label in ("process", "model_init", "loader", "worker")}
+    curriculum = {"curriculum_b": experiments.run.derive_subseed(19, "curriculum_b")} if stage == "b" else {}
 
-    The same run seed reproduces its draws, another run seed and the other arm draw
-    different sequences, so replicates do not share one rollout-length sequence.
+    assert experiments.run.build_seed_plan(19, stage=stage) == components | curriculum
+
+
+def test_curriculum_draws_follow_the_derived_seed_of_stage_b() -> None:
+    """
+    Draw rollout lengths from the seed plan's B curriculum seed, the only stage that draws horizons.
+
+    The same run seed reproduces its draws and another run seed draws a different
+    sequence, so replicates do not share one rollout-length sequence.
     """
     curriculum = RolloutCurriculum(lengths=(2, 4, 8, 16, 32), milestone_fractions=(0.0, 0.2, 0.4, 0.6, 0.8))
 
-    def draws(run_seed: int, label: str) -> list[int]:
-        state = RolloutCurriculumState.create(curriculum, seed=experiments.run.build_seed_plan(run_seed)[label])
-        return [state.select(progress=1.0, available_length=32, batch_size=1)[0] for _ in range(32)]
+    def draws(run_seed: int) -> list[int]:
+        state = RolloutCurriculumState.create(curriculum, seed=experiments.run.build_seed_plan(run_seed, stage="b")["curriculum_b"])
+        return [horizon for horizon, _origin in state.draw(progress=1.0, available_lengths=[32] * 32)]
 
-    assert draws(19, "curriculum_a0") == draws(19, "curriculum_a0")
-    assert draws(19, "curriculum_a0") != draws(19, "curriculum_b")
-    assert draws(19, "curriculum_a0") != draws(23, "curriculum_a0")
+    assert draws(19) == draws(19)
+    assert draws(19) != draws(23)
 
 
 def test_process_seed_reproduces_python_numpy_torch_and_model_init() -> None:
@@ -108,7 +116,7 @@ def test_run_deterministic_controls_torch_settings() -> None:
 
 
 class _Processor:
-    """Minimal serializable data processor for construction-order testing."""
+    """Minimal serializable scaling stand-in for construction-order testing."""
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Return a small serializable state."""
@@ -128,7 +136,7 @@ def test_model_subseed_is_applied_immediately_before_construction(
     config: dict[str, Any] = {
         "task": "synthetic",
         "run": {"name": "run", "seed": 23, "deterministic": True, "device": "cpu"},
-        "training": {"epochs": 1},
+        "training": {"epochs": 1, "memory_batch": 1},
         "tracking": {"wandb": {"mode": "disabled"}},
         "evaluation": {
             "objective": {
@@ -141,27 +149,28 @@ def test_model_subseed_is_applied_immediately_before_construction(
             }
         },
         "model": {"kind": "synthetic"},
+        "data": {"spatial_stride": 1},
         "paths": {"output_root": str(tmp_path)},
     }
     # The stub config has no resolved identity to register; this test only observes seeding order.
     monkeypatch.setattr(experiments.registry, "reserve", lambda *_args: nullcontext())
     run_dir = experiments.run.prepare_fresh_run(config, run_dir=tmp_path / "run")
     seed_calls: list[int] = []
-    expected = experiments.run.build_seed_plan(23)
+    expected = experiments.run.build_seed_plan(23, stage=None)
 
     def capture_seed(seed: int, *, device: torch.device) -> None:
         assert device == torch.device("cpu")
         seed_calls.append(seed)
 
     monkeypatch.setattr(experiments.run, "seed_process", capture_seed)
-    # The stub config carries no data, optimizer or loss sections for the start block, which consumes no randomness.
+    # The stub config carries only the data stride, no optimizer or loss sections, for the start block, which consumes no randomness.
     monkeypatch.setattr(experiments.run.console.ConsoleReporter, "startup", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         experiments.run.config_loader,
         "create_dataloaders_from_config",
         # The construction-order test stays isolated from Dataset identity: the loaders hand over an opaque scaling artifact.
         lambda *_args, **_kwargs: {
-            "data_processor": _Processor(),
+            "scaling": _Processor(),
             "scaling_artifact": {"state": _Processor().state_dict()},
             "split_indices": {},
         },

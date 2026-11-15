@@ -3,8 +3,9 @@
 Responsibilities:
   - Declare artifact, provenance, residual, and derivative contract constants
   - Own the steady-Brinkman residual diagnostic provenance contract
-  - Name physical and normalized sufficient-statistic columns
-  - Finalize the equal physical-output-group selection objective
+  - Name the per-case physical statistic and metric columns and derive the per-case metrics from the statistics
+  - Finalize the material-case selection objective and per-field metrics of one artifact role from its case statistics
+  - Read the output Train scales from the run's common scaling and validate saved scale mappings
   - Build ordered membership digests, completion paths, and payload manifests
   - Hash each file identity at most once per process
   - Recognize Optuna trial leaves from the validated layout recorded in a saved run config and refuse them with one wording
@@ -15,15 +16,15 @@ Responsibilities:
 
 Design principles:
   - Persisted names and schema values have one authoritative owner
-  - Objective aggregation delegates to the online group-metric finalizer
-  - Physical SSE, counts, and train-fitted scales remain explicit evidence
+  - Objective aggregation delegates to the one group objective of checkpoint selection
+  - Physical case statistics, counts, reference floors and train-fitted scales remain explicit evidence
   - Reading an artifact validates its recorded analysis digest as evidence; only reuse or continuation of a
     requested artifact compares it with the running projection
 
 This module does NOT:
   - Import Torch directly or run trained-model inference
   - Write artifact payloads or publish completion markers
-  - Admit, rebuild, lock, time, render, or upload artifact caches
+  - Admit, rebuild, lock, time, or render artifact caches
 """
 
 from __future__ import annotations
@@ -43,13 +44,13 @@ import numpy as np
 from src import common, domain, experiments, learning
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
 from src.domain.tasks.domain_task_spec import OutputGroupSpec
-from src.learning.metrics.learning_metrics import finalize_group_rmse_statistics
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     import pandas as pd
 
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
     from src.domain.tasks.domain_task_spec import TaskSpec
 
 
@@ -59,10 +60,11 @@ INFERENCE_PRECISION = "float32"
 _RUNTIME_REQUIRED_KEYS = frozenset(
     {"requested_policy", "resolved_device", "device_type", "pytorch_version", "precision", "inference_batch_size", "source_tree_id"}
 )
-_RUNTIME_OPTIONAL_KEYS = frozenset({"cuda_index", "cuda_device_name", "cuda_runtime_version"})
+_RUNTIME_OPTIONAL_KEYS = frozenset({"cuda_index", "cuda_device_name", "cuda_build_version"})
 NORMALIZED_OBJECTIVE_TOLERANCE = {"rtol": 1e-12, "atol": 1e-12}
-NORMALIZED_DIAGNOSTIC_TOLERANCE = {"rtol": 2e-5, "atol": 1e-12}
 EVAL_PAD = 2
+# Per-case group-weighted relative norms; NaN marks a reference below its floor, never an invalid prediction alone.
+RELATIVE_CASE_COLUMNS: Final = ("physical_relative_l2", "physical_relative_h1")
 # Artifact residuals use one fixed, most accurate reference operator for every
 # run, independent of the derivative a run was trained with.
 ARTIFACT_DERIVATIVE_KIND = "physical"
@@ -96,8 +98,6 @@ _ANALYSIS_FILES: Final = (
 _ANALYSIS_EXEMPTIONS: Final = {
     "analysis/artifacts/analysis_artifact_performance.py": "operational progress and performance reporting, outside scientific identity",
     "analysis/evaluation/evaluation_artifact_loader.py": "admission reads persisted artifacts and produces none",
-    "analysis/presentation/analysis_presentation_curated.py": "curated figures rendered for tracking upload, never persisted evidence",
-    "analysis/presentation/analysis_display_labels.py": "role labels of the curated tracking upload, never persisted evidence",
     "experiments/config/experiments_config_loader.py": "admission of the saved resolved config, whose recorded identities bind the run",
     "experiments/experiments_run.py": "admission of the completed run and its checkpoints, bound by their recorded identities",
     "learning/losses/learning_losses_factory.py": "training H1 loss constructor of the metric module, never reached by artifact metrics",
@@ -139,10 +139,12 @@ ANALYSIS_PROJECTIONS: Final[dict[str, common.code_identity.CodeProjection]] = {
         exemptions={
             **_ANALYSIS_EXEMPTIONS,
             "analysis/artifacts/analysis_artifact_generation.py": "steady artifact writer, reached through the service's task dispatch",
-            "analysis/evaluation/evaluation_transient_session.py": "summary of admitted artifacts for tracking, never persisted evidence",
             "domain/physics/domain_physics_brinkman.py": "steady Brinkman residual contract, reached only by steady artifacts",
             "domain/physics/domain_physics_contracts.py": "steady physics-kind vocabulary, reached only by the steady payload check",
             "learning/inference/learning_inference.py": "steady inference reconstruction, reached through the service's task dispatch",
+            "learning/training/learning_training_budget.py": (
+                "admission of a completed lineage from its recorded budget state, bound by the checkpoint and receipt digests"
+            ),
             "learning/transient/learning_transient_handoff.py": (
                 "training handoff publication; artifacts use only its directory name and bind the manifest bytes by digest"
             ),
@@ -238,9 +240,8 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
             fields=(
                 "sha256",
                 "fit_split",
-                "output_normalization",
-                "denominator_floor",
-                "output_standard_deviations",
+                "normalization",
+                "output_scales",
             ),
             label="normalizer",
         ),
@@ -255,8 +256,7 @@ def artifact_identity_payload(provenance: Mapping[str, Any]) -> dict[str, Any]:
                 "output_units",
                 "output_groups",
                 "physics_kind",
-                "group_objective_evidence",
-                "predictive_metrics",
+                "metric_evidence",
             ),
             label="evaluator",
         ),
@@ -403,7 +403,7 @@ def validate_runtime_provenance(value: object) -> int:
     if missing or unexpected:
         msg = f"Artifact runtime provenance schema mismatch: missing={missing}, unexpected={unexpected}."
         raise ValueError(msg)
-    texts = ("requested_policy", "resolved_device", "device_type", "pytorch_version", "cuda_device_name", "cuda_runtime_version")
+    texts = ("requested_policy", "resolved_device", "device_type", "pytorch_version", "cuda_device_name", "cuda_build_version")
     if any(key in value and (not isinstance(value[key], str) or not value[key]) for key in texts) or value["precision"] != INFERENCE_PRECISION:
         msg = f"Artifact runtime provenance needs non-empty device texts and precision {INFERENCE_PRECISION!r}."
         raise ValueError(msg)
@@ -464,9 +464,9 @@ def refuse_optuna_trial(config: object, *, label: str) -> None:
         raise ValueError(msg)
 
 
-def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:
+def case_statistic_columns(field_name: str) -> tuple[str, ...]:
     """
-    Return task-derived per-case normalized SSE, count, and RMSE columns.
+    Return the per-case physical statistic columns of one output field.
 
     Parameters
     ----------
@@ -475,8 +475,8 @@ def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:
 
     Returns
     -------
-    tuple[str, str, str]
-        Ordered sufficient-statistic and convenience-RMSE column names.
+    tuple[str, ...]
+        ``physical_<statistic>_<field>`` in :data:`learning.metrics.metrics.CASE_STATISTICS` order.
 
     Raises
     ------
@@ -487,46 +487,59 @@ def normalized_statistic_columns(field_name: str) -> tuple[str, str, str]:
     if not isinstance(field_name, str) or not field_name:
         msg = "Artifact output field names must be non-empty strings."
         raise ValueError(msg)
-    return (
-        f"normalized_sse_{field_name}",
-        f"normalized_count_{field_name}",
-        f"normalized_rmse_{field_name}",
-    )
-
-
-def physical_statistic_columns(field_name: str) -> tuple[str, str, str]:
-    """
-    Return task-derived per-case physical SSE, count, and RMSE columns.
-
-    Parameters
-    ----------
-    field_name : str
-        Exact non-empty TaskSpec output field name.
-
-    Returns
-    -------
-    tuple[str, str, str]
-        Ordered physical sufficient-statistic and convenience-RMSE columns.
-
-    Raises
-    ------
-    ValueError
-        If the field name is empty or not text.
-
-    """
-    if not isinstance(field_name, str) or not field_name:
-        msg = "Artifact output field names must be non-empty strings."
-        raise ValueError(msg)
-    return (
-        f"physical_sse_{field_name}",
-        f"physical_count_{field_name}",
-        f"physical_rmse_{field_name}",
-    )
+    return tuple(f"physical_{statistic}_{field_name}" for statistic in learning.metrics.metrics.CASE_STATISTICS)
 
 
 def element_count_columns(field_names: Iterable[str]) -> frozenset[str]:
-    """Return the physical and normalized per-case element-count columns of ``field_names``."""
-    return frozenset(columns(field)[1] for field in field_names for columns in (physical_statistic_columns, normalized_statistic_columns))
+    """Return the per-case full-grid and H1-interior element-count columns of ``field_names``."""
+    return frozenset(f"physical_{count}_{field}" for field in field_names for count in ("count", "h1_count"))
+
+
+def case_metric_columns(field_names: Iterable[str]) -> tuple[str, ...]:
+    """Return the per-case metric columns derived from the case statistics, in :func:`case_metric_values` order."""
+    return (*(f"{space}_rmse_{field}" for field in field_names for space in ("physical", "normalized")), *RELATIVE_CASE_COLUMNS)
+
+
+def case_metric_values(
+    sums: np.ndarray,
+    *,
+    fields: Sequence[str],
+    output_groups: Sequence[OutputGroupSpec],
+    train_scales: Mapping[str, float],
+    reference_floors: Mapping[str, float],
+) -> dict[str, float]:
+    """
+    Return the per-case metrics persisted beside one case's statistics.
+
+    ``physical_rmse_<field>`` and ``normalized_rmse_<field>`` are the case's RMSE in physical units and
+    divided by the Train scale. ``physical_relative_<norm>`` averages the case's per-field relative norms
+    with the output-group weights and is NaN when a field's reference falls below its floor.
+    """
+    metrics = learning.metrics.metrics
+    count, squared = (metrics.CASE_STATISTICS.index(name) for name in ("count", "squared_error"))
+    values: dict[str, float] = {}
+    for index, field in enumerate(fields):
+        rmse = math.sqrt(float(sums[index, squared] / sums[index, count]))
+        values.update({f"physical_rmse_{field}": rmse, f"normalized_rmse_{field}": rmse / train_scales[field]})
+    for norm in metrics.RELATIVE_NORMS:
+        per_field = {field: metrics.case_relative_norm(sums[index], norm=norm, floor=reference_floors[field]) for index, field in enumerate(fields)}
+        value = metrics.group_weighted_mean(per_field, output_groups)
+        values[f"physical_relative_{norm}"] = math.nan if value is None else value
+    return values
+
+
+def metric_evidence_provenance(task: TaskSpec) -> dict[str, Any]:
+    """Return the evaluator's per-case statistic, reduction and reference-floor contract of one steady task."""
+    metrics = learning.metrics.metrics
+    return {
+        "case_statistic_columns": {field: list(case_statistic_columns(field)) for field in task.output_names},
+        "accumulation_dtype": "float64",
+        "h1": {"length_scale_m": metrics.H1_LENGTH_SCALE_M, "interior_crop": metrics.H1_INTERIOR_CROP, "derivatives": "non-periodic, metres"},
+        "reference_floors": {field: task.reference_floor(field) for field in task.output_names},
+        "train_scale_source": "saved_run_normalizer.output_scales",
+        "reduction": "per case over its grid, equally over the cases of a material, then over the materials; "
+        "RMSE roots after the means, a relative norm divides within each case",
+    }
 
 
 def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
@@ -537,12 +550,13 @@ def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
     ----------
     output_groups : Iterable[Any]
         Task ``OutputGroupSpec`` objects or equivalent mappings containing
-        ``id`` and ``fields``.
+        ``id``, ``fields`` and ``vector``.
 
     Returns
     -------
     list[dict[str, Any]]
-        Ordered group identifiers and their ordered member fields.
+        Ordered group identifiers, their ordered member fields and whether
+        they form one vector error term.
 
     Raises
     ------
@@ -557,9 +571,14 @@ def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
         if isinstance(raw_group, Mapping):
             group_id = raw_group.get("id")
             raw_fields = raw_group.get("fields")
+            vector = raw_group.get("vector")
         else:
             group_id = getattr(raw_group, "id", None)
             raw_fields = getattr(raw_group, "fields", None)
+            vector = getattr(raw_group, "vector", None)
+        if not isinstance(vector, bool):
+            msg = f"Artifact output group {index} must declare a boolean vector flag."
+            raise TypeError(msg)
         if not isinstance(group_id, str) or not group_id:
             msg = f"Artifact output group {index} must have a non-empty string id."
             raise TypeError(msg)
@@ -579,7 +598,7 @@ def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
         if overlap:
             msg = f"Artifact output groups overlap on fields: {sorted(overlap)}."
             raise ValueError(msg)
-        payload.append({"id": group_id, "fields": list(fields)})
+        payload.append({"id": group_id, "fields": list(fields), "vector": vector})
         seen_group_ids.add(group_id)
         seen_fields.update(fields)
     if not payload:
@@ -588,162 +607,133 @@ def output_group_payload(output_groups: Iterable[Any]) -> list[dict[str, Any]]:
     return payload
 
 
-def output_standard_deviations_from_state(
-    normalizer_state: Mapping[str, Any],
+def output_scales(
+    scaling: TrainScaling,
     *,
     output_fields: Iterable[str],
 ) -> dict[str, float]:
     """
-    Extract positive train-fitted output scales from saved normalizer state.
+    Return the operational Train state scale of every output field.
 
     Parameters
     ----------
-    normalizer_state : collections.abc.Mapping[str, Any]
-        Persisted normalizer mapping containing ``out_normalizer.std`` with the
-        authoritative ``[1, channels, 1, 1]`` layout.
+    scaling : TrainScaling
+        The run's common Train-fitted scaling.
     output_fields : Iterable[str]
-        Ordered unique TaskSpec output names aligned with the channel axis.
+        Ordered unique TaskSpec output names; they must equal the scaling's state channels.
 
     Returns
     -------
     dict[str, float]
-        Output field to exact finite positive training standard deviation.
+        Output field to ``max(sigma, floor)``, the scale of the loss, the selection and this objective.
 
     Raises
     ------
-    KeyError, TypeError, ValueError
-        If state, layout, fields, or fitted scales are invalid.
+    ValueError
+        If the output fields do not equal the scaling's state channels in order.
 
     """
-    if not isinstance(normalizer_state, Mapping):
-        msg = "Artifact normalizer state must be a mapping."
-        raise TypeError(msg)
     fields = tuple(output_fields)
-    if not fields or len(fields) != len(set(fields)) or any(not isinstance(field, str) or not field for field in fields):
-        msg = "Artifact output fields must be unique non-empty strings."
+    state = scaling.group("state")
+    if state.names != fields:
+        msg = f"Saved scaling state channels {list(state.names)} do not equal the output fields {list(fields)}."
         raise ValueError(msg)
-    if "out_normalizer.std" not in normalizer_state:
-        msg = "Artifact normalizer state is missing 'out_normalizer.std'."
-        raise KeyError(msg)
-    raw_scales = normalizer_state["out_normalizer.std"]
-    detach = getattr(raw_scales, "detach", None)
-    if callable(detach):
-        raw_scales = detach()
-    cpu = getattr(raw_scales, "cpu", None)
-    if callable(cpu):
-        raw_scales = cpu()
-    to_numpy = getattr(raw_scales, "numpy", None)
-    if callable(to_numpy):
-        raw_scales = to_numpy()
-    array = np.asarray(raw_scales)
-    expected_shape = (1, len(fields), 1, 1)
-    if array.shape != expected_shape or not np.issubdtype(array.dtype, np.number) or np.issubdtype(array.dtype, np.bool_):
-        msg = f"Artifact output normalizer standard deviations must have real shape {expected_shape}, got {array.shape}."
-        raise TypeError(msg)
-    values = array.astype(np.float64, copy=False).reshape(-1)
-    if not np.isfinite(values).all() or (values <= 0.0).any():
-        msg = "Artifact output normalizer standard deviations must be finite and strictly positive."
-        raise ValueError(msg)
-    return {field: float(value) for field, value in zip(fields, values, strict=True)}
+    return dict(zip(fields, (float(value) for value in state.scale.double().tolist()), strict=True))
 
 
-def _validated_train_scales(
-    train_standard_deviations: Mapping[str, Any],
+def validated_train_scales(
+    train_scales: object,
     *,
     fields: tuple[str, ...],
+    label: str = "Train scale",
 ) -> dict[str, float]:
-    """Return an exact finite positive train-scale mapping for the fields."""
-    if not isinstance(train_standard_deviations, Mapping) or set(train_standard_deviations) != set(fields):
-        msg = "Artifact train standard deviations must map exactly the grouped output fields."
+    """Return an exact finite positive per-field mapping (Train scales or reference floors) for the fields."""
+    if not isinstance(train_scales, Mapping) or set(train_scales) != set(fields):
+        msg = f"Artifact {label}s must map exactly the grouped output fields."
         raise ValueError(msg)
     result: dict[str, float] = {}
     for field in fields:
-        raw_value = train_standard_deviations[field]
+        raw_value = train_scales[field]
         if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float, np.integer, np.floating)):
-            msg = f"Artifact train standard deviation for {field!r} must be a real scalar."
+            msg = f"Artifact {label} for {field!r} must be a real scalar."
             raise TypeError(msg)
         value = float(raw_value)
         if not math.isfinite(value) or value <= 0.0:
-            msg = f"Artifact train standard deviation for {field!r} must be finite and strictly positive."
+            msg = f"Artifact {label} for {field!r} must be finite and strictly positive."
             raise ValueError(msg)
         result[field] = value
     return result
 
 
-def _row_statistic(
-    *,
-    raw_sse: Any,
-    raw_count: Any,
-    raw_rmse: Any,
-    sse_column: str,
-    count_column: str,
-    rmse_column: str,
-    row_index: int,
-) -> tuple[float, int, float]:
-    """Validate one row-local SSE/count/RMSE triplet and return native values."""
-    if isinstance(raw_sse, bool) or not isinstance(raw_sse, (int, float, np.integer, np.floating)):
-        msg = f"{sse_column} row {row_index} must be a real scalar."
-        raise TypeError(msg)
-    if isinstance(raw_count, bool) or not isinstance(raw_count, (int, np.integer)) or int(raw_count) <= 0:
-        msg = f"{count_column} row {row_index} must be a positive integer."
-        raise TypeError(msg)
-    if isinstance(raw_rmse, bool) or not isinstance(raw_rmse, (int, float, np.integer, np.floating)):
-        msg = f"{rmse_column} row {row_index} must be a real scalar."
-        raise TypeError(msg)
-    sse_value = float(raw_sse)
-    count_value = int(raw_count)
-    rmse_value = float(raw_rmse)
-    if not math.isfinite(sse_value) or sse_value < 0.0 or not math.isfinite(rmse_value) or rmse_value < 0.0:
-        msg = f"Artifact evidence in {sse_column!r} row {row_index} must be finite and non-negative."
-        raise ValueError(msg)
-    expected_rmse = math.sqrt(sse_value / count_value)
-    if not math.isclose(
-        rmse_value,
-        expected_rmse,
-        rel_tol=NORMALIZED_OBJECTIVE_TOLERANCE["rtol"],
-        abs_tol=NORMALIZED_OBJECTIVE_TOLERANCE["atol"],
-    ):
-        msg = f"{rmse_column} row {row_index} does not match its SSE/count evidence."
-        raise ValueError(msg)
-    return sse_value, count_value, rmse_value
+def artifact_case_membership(frame: pd.DataFrame) -> tuple[tuple[str, str], ...]:
+    """
+    Return the ``(simulation_case_id, material_family)`` of every artifact row.
+
+    Raw Parquet tables carry both in their JSON ``meta`` column, as size-one
+    lists because each row keeps the collated batch rank; expanded analysis
+    frames carry them as flattened metadata columns.
+    """
+    if "meta" in frame.columns:
+        metadata = [json.loads(value) if isinstance(value, str) else value for value in frame["meta"].tolist()]
+    elif {"simulation_case_id", "material_family"} <= set(frame.columns):
+        metadata = frame[["simulation_case_id", "material_family"]].to_dict("records")
+    else:
+        msg = "Artifact rows must carry simulation_case_id and material_family metadata."
+        raise KeyError(msg)
+
+    def unwrap(value: object) -> object:
+        return value[0] if isinstance(value, list | tuple) and len(value) == 1 else value
+
+    memberships: list[tuple[str, str]] = []
+    for row_index, meta in enumerate(metadata):
+        case_id = unwrap(meta.get("simulation_case_id")) if isinstance(meta, Mapping) else None
+        material = unwrap(meta.get("material_family")) if isinstance(meta, Mapping) else None
+        if not isinstance(case_id, str) or not case_id or not isinstance(material, str) or not material:
+            msg = f"Artifact row {row_index} lacks a simulation_case_id or material_family."
+            raise ValueError(msg)
+        memberships.append((case_id, material))
+    return tuple(memberships)
 
 
 def aggregate_normalized_group_macro_rmse(
     frame: pd.DataFrame,
     *,
     output_groups: Iterable[Any],
-    train_standard_deviations: Mapping[str, Any],
-    normalization_denominator_floor: float,
+    train_scales: Mapping[str, Any],
+    reference_floors: Mapping[str, Any],
 ) -> dict[str, Any]:
     """
-    Finalize the global equal macro mean over physical output groups.
+    Finalize the selection objective and the per-field metrics of one artifact role from its case statistics.
 
-    Physical SSE and element counts are summed before any square root. Each
-    group's physical component MSEs are divided by the sum of its train-fitted
-    component variances, and finalized group errors receive equal macro weight.
-    Per-case or per-batch RMSE values never enter the objective reduction.
+    Every row is one case with its physical statistics per field. The reducers of
+    :mod:`learning.metrics.metrics` that training validation uses average them
+    equally over the cases of a material and then over the materials: the group
+    objective and the per-field RMSE take their root after the means, a relative
+    norm divides within each case first.
 
     Parameters
     ----------
     frame : pandas.DataFrame
-        Current-schema per-case table containing physical and normalized
-        sufficient-statistic columns.
+        Current-schema per-case table containing the case statistic and per-case
+        metric columns and each case's identity and material.
     output_groups : Iterable[Any]
         Ordered task-owned output groups covering the complete output contract.
-    train_standard_deviations : collections.abc.Mapping[str, Any]
-        Exact positive per-field standard deviations fitted on training data.
-    normalization_denominator_floor : float
-        Persisted non-negative denominator addition used only to verify retained
-        component-normalized diagnostics. It does not enter the objective.
+    train_scales : collections.abc.Mapping[str, Any]
+        Exact positive per-field Train state scales ``max(sigma, floor)``.
+    reference_floors : collections.abc.Mapping[str, Any]
+        Positive per-field reference-RMS floors of the relative norms.
 
     Returns
     -------
     dict[str, Any]
-        Objective semantics, global field and group statistics, equal group
-        weights, the dimensionless objective value, agreement tolerance, and the
-        complete-finite-support counts. When any prediction value is non-finite,
-        the objective is unavailable: value and statistics are ``None`` and the
-        counts explain why; it is never computed over the valid subset.
+        Objective semantics, ``field_metrics`` keyed by the training metric ids
+        (physical and normalized RMSE and MAE, relative L2 and H1 per field and
+        group-weighted, ``None`` when unavailable) with ``relative_unavailable_cases``,
+        group statistics and weights, the dimensionless objective value, agreement
+        tolerance, the population sizes, and the complete-finite-support counts.
+        When any prediction value is non-finite,
+        everything is unavailable: value and statistics are ``None`` and the counts
+        explain why; it is never computed over the valid subset.
 
     Raises
     ------
@@ -757,23 +747,15 @@ def aggregate_normalized_group_macro_rmse(
     """
     groups = output_group_payload(output_groups)
     fields = tuple(field for group in groups for field in group["fields"])
-    scales = _validated_train_scales(train_standard_deviations, fields=fields)
-    if (
-        isinstance(normalization_denominator_floor, bool)
-        or not isinstance(normalization_denominator_floor, (int, float, np.integer, np.floating))
-        or not math.isfinite(float(normalization_denominator_floor))
-        or float(normalization_denominator_floor) < 0.0
-    ):
-        msg = "Artifact normalization denominator floor must be finite and non-negative."
-        raise ValueError(msg)
-    denominator_floor = float(normalization_denominator_floor)
+    scales = validated_train_scales(train_scales, fields=fields)
+    floors = validated_train_scales(reference_floors, fields=fields, label="reference floor")
     if not frame.columns.is_unique:
         msg = "Artifact group macro RMSE cannot consume duplicate DataFrame columns."
         raise ValueError(msg)
     objective = {
         "objective_id": "normalized_group_macro_rmse",
         "kind": "group_macro_rmse",
-        "reduction": "group_macro_element_mean",
+        "reduction": "material_case_mean",
         "space": "physical",
         "groups": groups,
         "direction": "minimize",
@@ -784,109 +766,48 @@ def aggregate_normalized_group_macro_rmse(
         ),
     }
     if not objective["available"]:
-        return {**objective, "value": None, "field_statistics": None, "group_statistics": None}
+        return {**objective, "value": None, "field_metrics": None, "relative_unavailable_cases": None, "group_statistics": None}
 
-    field_summary: dict[str, dict[str, float | int]] = {}
-    for field_name in fields:
-        physical_columns = physical_statistic_columns(field_name)
-        normalized_columns = normalized_statistic_columns(field_name)
-        missing = [name for name in (*physical_columns, *normalized_columns) if name not in frame.columns]
-        if missing:
-            msg = f"Artifact group macro RMSE is missing sufficient-statistic columns: {missing}."
-            raise KeyError(msg)
-        physical_sse = 0.0
-        physical_count = 0
-        normalized_sse = 0.0
-        normalized_count = 0
-        for row_index, values in enumerate(
-            zip(
-                *(frame[column].tolist() for column in (*physical_columns, *normalized_columns)),
-                strict=True,
-            )
-        ):
-            row_physical_sse, row_physical_count, _ = _row_statistic(
-                raw_sse=values[0],
-                raw_count=values[1],
-                raw_rmse=values[2],
-                sse_column=physical_columns[0],
-                count_column=physical_columns[1],
-                rmse_column=physical_columns[2],
-                row_index=row_index,
-            )
-            row_normalized_sse, row_normalized_count, _ = _row_statistic(
-                raw_sse=values[3],
-                raw_count=values[4],
-                raw_rmse=values[5],
-                sse_column=normalized_columns[0],
-                count_column=normalized_columns[1],
-                rmse_column=normalized_columns[2],
-                row_index=row_index,
-            )
-            expected_normalized_sse = row_physical_sse / (scales[field_name] + denominator_floor) ** 2
-            if row_physical_count != row_normalized_count or not math.isclose(
-                row_normalized_sse,
-                expected_normalized_sse,
-                rel_tol=NORMALIZED_DIAGNOSTIC_TOLERANCE["rtol"],
-                abs_tol=NORMALIZED_DIAGNOSTIC_TOLERANCE["atol"],
-            ):
-                msg = (
-                    f"Normalized evidence for field {field_name!r}, row {row_index} contradicts physical evidence "
-                    "and the saved normalizer denominator."
-                )
-                raise ValueError(msg)
-            physical_sse += row_physical_sse
-            physical_count += row_physical_count
-            normalized_sse += row_normalized_sse
-            normalized_count += row_normalized_count
-        if physical_count <= 0 or normalized_count <= 0:
-            msg = f"Artifact group macro RMSE cannot finalize field {field_name!r} without elements."
-            raise RuntimeError(msg)
-        physical_mse = physical_sse / physical_count
-        normalized_rmse = math.sqrt(normalized_sse / normalized_count)
-        field_summary[field_name] = {
-            "physical_squared_error_sum": physical_sse,
-            "physical_element_count": physical_count,
-            "physical_rmse": math.sqrt(physical_mse),
-            "train_standard_deviation": scales[field_name],
-            "normalized_squared_error_sum": normalized_sse,
-            "normalized_element_count": normalized_count,
-            "normalized_rmse": normalized_rmse,
-        }
-
-    resolved_groups = tuple(OutputGroupSpec(id=str(group["id"]), fields=tuple(group["fields"])) for group in groups)
-    squared_error_sums = {field: float(field_summary[field]["physical_squared_error_sum"]) for field in fields}
-    element_counts = {field: int(field_summary[field]["physical_element_count"]) for field in fields}
-    finalized = finalize_group_rmse_statistics(
-        resolved_groups,
-        squared_error_sums=squared_error_sums,
-        element_counts=element_counts,
-        train_standard_deviations=scales,
-    )
-
+    metrics = learning.metrics.metrics
+    statistic_columns = [column for field in fields for column in case_statistic_columns(field)]
+    metric_columns = list(case_metric_columns(fields))
+    missing = [name for name in (*statistic_columns, *metric_columns) if name not in frame.columns]
+    if missing:
+        msg = f"Artifact role metrics are missing per-case columns: {missing}."
+        raise KeyError(msg)
+    sums = frame[statistic_columns].to_numpy(dtype=np.float64).reshape(len(frame), len(fields), len(metrics.CASE_STATISTICS))
+    memberships = artifact_case_membership(frame)
+    cases = tuple(metrics.CaseStatistics(case_id, material, fields, sums[row]) for row, (case_id, material) in enumerate(memberships))
+    specs = tuple(OutputGroupSpec(id=str(group["id"]), fields=tuple(group["fields"]), vector=bool(group["vector"])) for group in groups)
+    derived = (case_metric_values(case.sums, fields=fields, output_groups=specs, train_scales=scales, reference_floors=floors) for case in cases)
+    expected = [[values[column] for column in metric_columns] for values in derived]
+    if not np.allclose(frame[metric_columns].to_numpy(dtype=np.float64), expected, equal_nan=True, **NORMALIZED_OBJECTIVE_TOLERANCE):
+        msg = "Artifact per-case metrics contradict their case statistics, Train scales or reference floors."
+        raise ValueError(msg)
+    terms = domain.tasks.spec.error_terms(specs)
+    population = metrics.group_objective((case.errors() for case in cases), terms=terms, train_scales=scales)
+    field_metrics, unavailable_cases = metrics.field_metric_values(cases, train_scales=scales, reference_floors=floors, output_groups=specs)
     group_summary: dict[str, dict[str, Any]] = {}
-    group_weight = 1.0 / len(groups)
     for group in groups:
-        group_id = str(group["id"])
-        group_fields = tuple(group["fields"])
-        physical_mse_sum = sum(squared_error_sums[field] / element_counts[field] for field in group_fields)
-        train_variance_sum = sum(scales[field] ** 2 for field in group_fields)
-        normalized_group_rmse = finalized.normalized[group_id]
-        physical_group_rmse = finalized.physical[group_id]
-        group_summary[group_id] = {
-            "fields": list(group_fields),
-            "weight": group_weight,
-            "physical_component_mse_sum": physical_mse_sum,
-            "train_variance_sum": train_variance_sum,
-            "normalized_rmse": normalized_group_rmse,
-            "physical_rmse": physical_group_rmse,
-            "objective_contribution": group_weight * normalized_group_rmse,
+        members = [term for term in terms if set(term.fields) <= set(group["fields"])]
+        weight = sum(term.weight for term in members)
+        contribution = sum(term.weight * population.term_rmse[term.id] for term in members)
+        group_summary[str(group["id"])] = {
+            "fields": list(group["fields"]),
+            "weight": weight,
+            "normalized_rmse": contribution / weight,
+            "physical_rmse": math.sqrt(sum(population.field_mse[field] for field in group["fields"])),
+            "objective_contribution": contribution,
         }
-
-    value = finalized.normalized_macro
-    if not math.isfinite(value):
-        msg = "Artifact normalized_group_macro_rmse finalized to a non-finite value."
-        raise FloatingPointError(msg)
-    return {**objective, "value": value, "field_statistics": field_summary, "group_statistics": group_summary}
+    return {
+        **objective,
+        "value": population.value,
+        "case_count": population.case_count,
+        "material_count": population.material_count,
+        "field_metrics": field_metrics,
+        "relative_unavailable_cases": unavailable_cases,
+        "group_statistics": group_summary,
+    }
 
 
 def steady_physics_provenance(task: TaskSpec) -> dict[str, Any]:

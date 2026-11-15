@@ -17,26 +17,34 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
-import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+from matplotlib.collections import LineCollection
+from support.steady_evaluation import steady_frame
 
-from src import analysis, common, domain, experiments
+from src import analysis, common, domain
 from src.analysis.evaluation import evaluation_artifact_loader as artifact_loader
 from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
+from src.analysis.evaluation import evaluation_datasets as dataset_cuts
 from src.analysis.evaluation import evaluation_panel as panel
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_visual_semantics as visual_semantics
+from src.analysis.presentation import dataset_selection as selection
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    import ipywidgets as widgets
     from matplotlib.patches import Rectangle
 
 _CASE_COUNT = 2
@@ -48,57 +56,41 @@ def _numeric_array(values: Any) -> np.ndarray:
     return np.asarray(values, dtype=float)
 
 
-def _runtime_payload(frame: pd.DataFrame) -> dict[str, Any]:
-    """Build exact two-case steady runtime evidence for the fixture."""
-    provenance = frame.attrs["artifact_provenance"]
-    run = provenance["run"]
-    manifest_digest = "d" * 64
-    simulation = {
-        "schema_kind": analysis.artifacts.timing.SIMULATION_TIMING_SCHEMA_KIND,
-        "simulation_profile": "steady_flow",
-        "batch_id": "fixture-batch",
-        "batch_manifest_sha256": manifest_digest,
-        "cases": [
-            {"case_id": "case-a", "comsol_process_seconds": 10.0},
-            {"case_id": "case-b", "comsol_process_seconds": 40.0},
-        ],
-        "aggregates": {
-            "measured_case_count": 2,
-            "mean_s": 25.0,
-            "median_s": 25.0,
-            "p10_s": 13.0,
-            "p90_s": 37.0,
-        },
-    }
-    return analysis.artifacts.timing.build_runtime_comparison(
-        split_role="eval",
-        dataset_identity=analysis.artifacts.timing.runtime_dataset_identity(provenance),
-        model_identity={
-            "run_name": run["name"],
-            "effective_config_digest": run["effective_config_digest"],
-            "best_checkpoint_sha256": run["best_checkpoint_sha256"],
-        },
-        neural_runtime={
-            "requested_policy": "cpu",
-            "resolved_device": "cpu",
-            "device_type": "cpu",
-            "pytorch_version": "fixture",
-            "hostname": "fixture-host",
-            "platform": "fixture-platform",
-            "processor": "fixture-cpu",
-            "python_version": "3.11",
-            "inference_dtype": "float32",
-            "torch_num_threads": 1,
-        },
-        batch_size=2,
-        cases=[
-            {"case_id": "case-a", "source_index": 0, "batch_amortized_neural_operator_forward_s": 0.1},
-            {"case_id": "case-b", "source_index": 1, "batch_amortized_neural_operator_forward_s": 0.2},
-        ],
-        comsol_timing=simulation,
-        batch_manifest_sha256=manifest_digest,
-        unavailable_reason=None,
-    )
+def _contexts_of(datasets: Mapping[str, pd.DataFrame], *, comparison: bool) -> list[Any]:
+    """Return the contexts of ID-role frames: one labelled context per frame (single model) or one context of models (comparison)."""
+    if comparison:
+        return [panel.EvaluationContext(key="id", label="ID", datasets=dict(datasets))]
+    return [panel.EvaluationContext(key="id", label=label, datasets={label: frame}) for label, frame in datasets.items()]
+
+
+def _scope(datasets: Mapping[str, pd.DataFrame], *, comparison: bool, refused: Mapping[str, str] | None = None) -> Any:
+    """Return the dataset scope of a panel over ID-role frames."""
+    return panel._SteadyScope(_contexts_of(datasets, comparison=comparison), comparison=comparison, refused_roles=refused or {})
+
+
+def _widget_tree(widget: object) -> tuple[Any, ...]:
+    """Return one widget and every nested child in deterministic preorder."""
+    return (widget, *(item for child in getattr(widget, "children", ()) for item in _widget_tree(child)))
+
+
+def _record_shows(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record every item a plot slot shows, in order, while the slot still builds its elements."""
+    shown: list[object] = []
+    show = analysis.ui.panel.PlotSlot.show
+
+    def record(slot: Any, items: Sequence[object]) -> None:
+        shown.extend(items)
+        show(slot, items)
+
+    monkeypatch.setattr(analysis.ui.panel.PlotSlot, "show", record)
+    return shown
+
+
+def _taken(shown: list[object]) -> list[object]:
+    """Return the items shown since the last call and forget them."""
+    items = list(shown)
+    shown.clear()
+    return items
 
 
 def _record_payload(frame: pd.DataFrame, path: Path) -> None:
@@ -108,236 +100,12 @@ def _record_payload(frame: pd.DataFrame, path: Path) -> None:
     entries.append({"path": path.name, "sha256": common.serialization.cached_file_sha256(path)})
 
 
-def _steady_frame(tmp_path: Path) -> tuple[pd.DataFrame, np.ndarray]:
-    """Write two small exact steady cases with analytically simple fields."""
-    task = domain.tasks.steady_flow.STEADY_FLOW
-    height, width = 5, 6
-    y_values = np.linspace(0.0, 1.0, height)
-    x_values = np.linspace(0.0, 2.0, width)
-    y_grid, x_grid = np.meshgrid(y_values, x_values, indexing="ij")
-    coordinates = np.stack((x_grid, y_grid))
-    zero = np.zeros_like(x_grid)
-    kappa = np.stack((np.full_like(x_grid, 1.0e-4), zero, np.full_like(x_grid, 2.0e-4)))
-    kappa_encoded = np.stack((np.full_like(x_grid, -4.0), zero, np.full_like(x_grid, np.log10(2.0e-4))))
-    input_by_field = {
-        "x": x_grid,
-        "y": y_grid,
-        "Kxx": kappa_encoded[0],
-        "Kxy": kappa_encoded[1],
-        "Kyy": kappa_encoded[2],
-        "eps_bed": np.full_like(x_grid, 0.4),
-        "p_in_bc": zero,
-    }
-    inputs = np.stack([input_by_field[field] for field in task.input_names])
-    learned_units = tuple(field.unit for field in task.outputs)
-    artifact_fields = (*task.output_names, "U")
-    artifact_units = (*learned_units, "m/s")
-    rows: list[dict[str, Any]] = []
-    recorded_payloads: list[dict[str, str]] = []
-    for position, scale in enumerate((1.0, 2.0)):
-        reference = np.stack(
-            (
-                0.5 * scale * x_grid,
-                0.5 * scale * x_grid,
-                0.25 * scale * y_grid,
-            )
-        )
-        prediction = np.stack(
-            (
-                scale * x_grid,
-                scale * x_grid,
-                0.5 * scale * y_grid,
-            )
-        )
-        reference_speed = np.sqrt(reference[1] ** 2 + reference[2] ** 2)
-        prediction_speed = np.sqrt(prediction[1] ** 2 + prediction[2] ** 2)
-        prediction_all = np.concatenate((prediction, prediction_speed[None]), axis=0)
-        reference_all = np.concatenate((reference, reference_speed[None]), axis=0)
-        momentum_x = scale * np.ones_like(x_grid)
-        momentum_y = 2.0 * scale * np.ones_like(x_grid)
-        flux_balance = 0.1 * scale * np.ones(x_grid.shape[0])
-        path = tmp_path / f"steady_case_{position + 1}.npz"
-        np.savez_compressed(
-            path,
-            case_index=np.int64(position + 1),
-            source_index=np.int64(position),
-            split_local_index=np.int64(position),
-            pred=prediction_all,
-            gt=reference_all,
-            err=prediction_all - reference_all,
-            artifact_fields=np.asarray(artifact_fields),
-            artifact_units=np.asarray(artifact_units),
-            input_fields=np.asarray(task.input_names),
-            output_fields=np.asarray(task.output_names),
-            output_units=np.asarray(learned_units),
-            x_raw=inputs,
-            y_raw=reference,
-            meta=np.asarray(json.dumps({"sample_id": ("case-a", "case-b")[position]})),
-            kappa_encoded=kappa_encoded,
-            kappa=kappa,
-            kappa_names=np.asarray(("Kxx", "Kxy", "Kyy")),
-            p_in_bc=zero[None],
-            coordinates=coordinates,
-            Rx=momentum_x,
-            Ry=momentum_y,
-            flux_balance=flux_balance,
-        )
-        recorded_payloads.append({"path": path.name, "sha256": common.serialization.cached_file_sha256(path)})
-        row: dict[str, Any] = {
-            "case_index": position + 1,
-            "source_index": position,
-            "split_local_index": position,
-            "source_dataset_id": "steady-fixture-dataset",
-            "npz_path": str(path),
-            "rel_l2": 0.1 * (position + 1),
-            "rel_h1": 0.2 * (position + 1),
-            "normalized_velocity_vector_rmse": float(np.sqrt(np.mean((prediction_speed - reference_speed) ** 2))),
-            "physical_rmse_speed_magnitude": float(np.sqrt(np.mean((prediction_speed - reference_speed) ** 2))),
-            "momentum_residual_mse": 5.0 * scale**2,
-            "flux_balance_mse": (0.1 * scale) ** 2,
-            "pressure_boundary_mse": scale**2,
-            "parameters_bed.structure.coarse_len_rel": 0.1 * (position + 1),
-            "prediction_validity": json.dumps(validity_contract.build_field_prediction_validity(prediction, channels=task.output_names)),
-        }
-        for field_index, field in enumerate(task.output_names):
-            values = prediction[field_index] - reference[field_index]
-            squared_error = float(np.sum(values**2, dtype=np.float64))
-            count = int(values.size)
-            rmse = float(np.sqrt(squared_error / count))
-            for columns in (
-                analysis.artifacts.contracts.physical_statistic_columns(field),
-                analysis.artifacts.contracts.normalized_statistic_columns(field),
-            ):
-                row.update(dict(zip(columns, (squared_error, count, rmse), strict=True)))
-        rows.append(row)
-    frame = pd.DataFrame(rows)
-    groups = analysis.artifacts.contracts.output_group_payload(task.output_groups)
-    scales = dict.fromkeys(task.output_names, 1.0)
-    aggregate = analysis.artifacts.contracts.aggregate_normalized_group_macro_rmse(
-        frame,
-        output_groups=task.output_groups,
-        train_standard_deviations=scales,
-        normalization_denominator_floor=0.0,
-    )
-    table_path = tmp_path / "artifacts.parquet"
-    table_path.write_bytes(b"table")
-    membership_digest = analysis.artifacts.contracts.ordered_indices_sha256((0, 1))
-    objective = next(metric for metric in task.default_metrics if metric.kind == "group_macro_rmse").as_dict(all_fields=task.output_names)
-    provenance = {
-        "producer": {"analysis_sha256": "d" * 64},
-        "run": {
-            "name": "steady-fixture",
-            "task": task.id,
-            "task_contract_digest": task.contract_digest,
-            "effective_config_digest": "a" * 64,
-            "best_checkpoint_sha256": "b" * 64,
-            "best_checkpoint_epoch": 7,
-            "normalizer_sha256": "c" * 64,
-        },
-        "dataset": {
-            "name": "steady-fixture-dataset",
-            "role": "id",
-            "source_dataset_ids": ["steady-fixture-dataset"],
-            "source_identities": [{"dataset_id": "steady-fixture-dataset", "case_ids": ["case-a", "case-b"]}],
-            "case_ids_by_source": [["case-a", "case-b"]],
-            "membership_digests": [membership_digest],
-            "evaluation_assignments": [],
-        },
-        "selection": {
-            "effective_case_count": 2,
-            "effective_ordered_source_indices_sha256": membership_digest,
-        },
-        "split_role": "eval",
-        "runtime": {"inference_batch_size": 2},
-        "model": {
-            "kind": "fno",
-            "physics_enabled": False,
-            "parameter_counts": {"total": 8, "trainable": 8},
-            "architecture": {},
-        },
-        "normalizer": {
-            "denominator_floor": 0.0,
-            "output_standard_deviations": scales,
-        },
-        "evaluator": {
-            "objective": objective,
-            "metrics": [metric.as_dict(all_fields=task.output_names) for metric in task.default_metrics],
-            "input_fields": list(task.input_names),
-            "input_units": {field.name: field.unit for field in task.inputs},
-            "output_fields": list(task.output_names),
-            "output_units": {field.name: field.unit for field in task.outputs},
-            "output_groups": groups,
-            "predictive_metrics": {"rel_l2": "fixture", "rel_h1": "fixture"},
-        },
-        "physics": {
-            "equation_kind": task.physics.kind,
-            "continuity_kind": task.physics.continuity,
-            "boundary_condition_kind": task.physics.boundary,
-            "scales": {},
-            "derivatives": {"kind": "fixture"},
-            "interior_crop": analysis.artifacts.contracts.EVAL_PAD,
-            "scalar_definitions": {},
-            "array_definitions": {},
-            "residual_evaluation_region": {},
-        },
-        "aggregate": aggregate,
-        "evaluation": {"prediction_validity": validity_contract.table_role_prediction_validity(frame)},
-        "outputs": {"parquet": {"path": table_path.name, "sha256": common.serialization.cached_file_sha256(table_path)}, "npz": recorded_payloads},
-    }
-    frame.attrs.update(
-        {
-            "provenance_complete": True,
-            "artifact_provenance": provenance,
-            "artifact_root": str(tmp_path),
-            "task_id": task.id,
-            "output_fields": task.output_names,
-            "output_units": learned_units,
-            "input_fields": task.input_names,
-            "input_units": tuple(field.unit for field in task.inputs),
-            "output_groups": tuple((group.id, group.fields) for group in task.output_groups),
-            "train_standard_deviations": scales,
-            "normalization_denominator_floor": 0.0,
-            "dataset_role": "eval",
-            dataframe.PRIMARY_OBJECTIVE_ID: aggregate,
-        }
-    )
-    provenance["timing"] = {"report": _runtime_payload(frame)}
-    return frame, x_grid
-
-
-def test_steady_wandb_summary_uses_the_shared_bounded_vocabulary_and_omits_unavailable_values(tmp_path: Path) -> None:
-    """The steady upload reduces each role to the tracked vocabulary; an unavailable objective logs its counts, never a value."""
-    frame, _grid = _steady_frame(tmp_path)
-    aggregate = frame.attrs["artifact_provenance"]["aggregate"]
-    summary = analysis.artifacts.service._steady_wandb_summary({"id": frame})
-    assert all(experiments.tracking._validate_evaluation_summary_entry(key, value) == key for key, value in summary.items())
-    assert summary["evaluation/id/normalized_group_macro_rmse"] == aggregate["value"]
-    assert summary["evaluation/id/physical_rmse_u"] == aggregate["field_statistics"]["u"]["physical_rmse"]
-    assert (summary["evaluation/id/valid_case_count"], summary["evaluation/id/nonfinite_value_count"]) == (2, 0)
-    assert summary["evaluation/identity/checkpoint_epoch"] == 7
-    assert summary["evaluation/timing/component/batch_amortized_neural_operator_forward_seconds/available_count"] == 2
-
-    unavailable = frame.copy()
-    unavailable.attrs["artifact_provenance"] = copy.deepcopy(frame.attrs["artifact_provenance"])
-    unavailable.attrs["artifact_provenance"]["aggregate"].update(
-        available=False,
-        value=None,
-        field_statistics=None,
-        group_statistics=None,
-        finite_value_count=aggregate["required_value_count"] - 1,
-        nonfinite_value_count=1,
-    )
-    reduced = analysis.artifacts.service._steady_wandb_summary({"id": unavailable})
-    assert reduced["evaluation/id/nonfinite_value_count"] == 1
-    assert not any(key.endswith(("macro_rmse", "_rmse_p", "_rmse_u", "_rmse_v")) for key in reduced)
-
-
 def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_counts(tmp_path: Path) -> None:
     """Table cells, scoreboard ticks and the Pareto notice carry the counts; per-case statistics leave a non-finite case out."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     peer = _steady_peer(frame)
     aggregate = peer.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
-    aggregate.update(available=False, value=None, field_statistics=None, group_statistics=None, finite_value_count=0)
+    aggregate.update(available=False, value=None, field_metrics=None, relative_unavailable_cases=None, group_statistics=None, finite_value_count=0)
     aggregate["nonfinite_value_count"] = aggregate["required_value_count"]
     text = validity_contract.unavailable_text(aggregate)
     datasets = {"Model A": frame, "Model B": peer}
@@ -357,6 +125,9 @@ def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_cou
     pareto = plots.plot_accuracy_physics_pareto(datasets=datasets)
     assert [len(axis.collections) for axis in pareto.axes[:3]] == [1, 1, 1]
     assert any(text in item.get_text() for item in pareto.axes[3].texts)
+    for axis in pareto.axes[:3]:  # dimensionless units read [-], never [1]
+        assert axis.get_xlabel() == "Normalized task error [-]"
+        assert axis.get_ylabel().endswith(" [-]")
     plt.close(pareto)
 
     peer.loc[peer.index[0], "flux_balance_mse"] = np.nan
@@ -374,7 +145,7 @@ def test_steady_table_and_plots_show_an_unavailable_aggregate_by_its_support_cou
 
 def test_steady_comparison_checks_every_matched_case_grid_after_lazy_panel_admission(tmp_path: Path) -> None:
     """A later case's changed coordinates cannot enter scoreboards or Pareto."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     alternate = frame.copy(deep=True)
     original_path = Path(str(alternate.iloc[-1]["npz_path"]))
     with np.load(original_path, allow_pickle=False) as payload:
@@ -391,9 +162,32 @@ def test_steady_comparison_checks_every_matched_case_grid_after_lazy_panel_admis
         dataframe.validate_comparison(datasets)
 
 
+def test_comparison_cuts_of_models_with_different_split_positions_pass_the_grid_admission(tmp_path: Path) -> None:
+    """Cuts holding the same case are matched by case and source identity, whatever split-local position each model saved it at."""
+    frame, _grid = steady_frame(tmp_path)  # model A saves [case-a, case-b]
+    extra_path = tmp_path / "extra_case.npz"
+    shutil.copyfile(Path(str(frame.iloc[0]["npz_path"])), extra_path)
+    extra = frame.iloc[[0]].copy()
+    extra["simulation_case_id"], extra["source_index"], extra["case_index"], extra["npz_path"] = "case-c", 2, 3, str(extra_path)
+    peer = _steady_peer(frame)  # model B saves [case-b, case-c]
+    peer_table = pd.concat([frame.iloc[[1]], extra], ignore_index=True)
+    peer_table["split_local_index"] = [0, 1]
+    peer_table.attrs = peer.attrs
+    _record_payload(peer_table, extra_path)
+    models = {"A": frame, "B": peer_table}
+    inventory = dataset_cuts.comparison_inventory({"id": models}, refused={})
+    choice = selection.resolve_choices(inventory, [("lentil", "id")], pooled=False)[0]
+
+    cuts = dataset_cuts.comparison_frames(models, choice)
+
+    assert [cut["simulation_case_id"].tolist() for cut in cuts.values()] == [["case-b"], ["case-b"]]
+    assert [cut["split_local_index"].tolist() for cut in cuts.values()] == [[1], [0]]
+    dataframe.validate_comparison(cuts)
+
+
 def test_steady_comparison_refuses_runs_with_different_role_membership(tmp_path: Path) -> None:
     """Steady comparisons refuse disagreeing membership instead of intersecting it, as transient ones do."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     narrowed = frame.iloc[:-1].copy()
     narrowed.attrs = copy.deepcopy(frame.attrs)
     narrowed.attrs["artifact_provenance"]["dataset"]["case_ids_by_source"] = [["case-a"]]
@@ -425,7 +219,7 @@ def test_steady_comparison_requires_one_recorded_analysis_producer(
     message: str,
 ) -> None:
     """Frames of one comparison, within one role or across ID and OOD, must record the same valid analysis producer."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     peer = _steady_peer(frame)
     peer.attrs["artifact_provenance"]["split_role"] = peer_role
     dataframe.validate_comparison({"A": frame, "B": peer}, verify_grid=False)
@@ -440,7 +234,7 @@ def test_steady_comparison_requires_one_recorded_analysis_producer(
 
 def test_provenance_with_a_non_mapping_physics_section_is_refused(tmp_path: Path) -> None:
     """A present physics section must be a mapping, so a malformed one never passes as complete provenance."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     provenance = copy.deepcopy(frame.attrs["artifact_provenance"])
     arguments = {
         "task_id": frame.attrs["task_id"],
@@ -457,7 +251,7 @@ def test_provenance_with_a_non_mapping_physics_section_is_refused(tmp_path: Path
 
 def test_exact_grid_cache_rejects_changed_payload_witness(tmp_path: Path) -> None:
     """A saved grid digest never excuses a changed source payload."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     alternate = frame.copy(deep=True)
     datasets = {"A": frame, "B": alternate}
     dataframe.validate_comparison(datasets)
@@ -470,7 +264,7 @@ def test_exact_grid_cache_rejects_changed_payload_witness(tmp_path: Path) -> Non
 
 def test_steady_payload_changed_after_load_is_refused_by_digest_at_case_open_and_grid_admission(tmp_path: Path) -> None:
     """Payload bytes are verified against the recorded digest before any byte is parsed."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     path = Path(str(frame.iloc[0]["npz_path"]))
     path.write_bytes(path.read_bytes() + b"changed")
     with pytest.raises(ValueError, match="Steady case payload digest changed"):
@@ -481,7 +275,7 @@ def test_steady_payload_changed_after_load_is_refused_by_digest_at_case_open_and
 
 def test_mixed_case_grids_fail_single_and_identically_mixed_model_comparison(tmp_path: Path) -> None:
     """A scoreboard cannot accept a changing grid within one model's cases."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     mixed = frame.copy(deep=True)
     source = Path(str(mixed.iloc[-1]["npz_path"]))
     with np.load(source, allow_pickle=False) as payload:
@@ -521,7 +315,7 @@ def _steady_peer(frame: pd.DataFrame) -> pd.DataFrame:
 
 def test_steady_maps_metrics_timing_and_task_gating(tmp_path: Path) -> None:
     """Use exact fixture arrays for steady case, aggregate, timing, and gating checks."""
-    frame, x_grid = _steady_frame(tmp_path)
+    frame, x_grid = steady_frame(tmp_path)
     datasets = {"Steady fixture": frame}
     case = cases.load_case(frame, 0)
     fields = analysis.evaluation.presentation.display_fields(frame)
@@ -535,20 +329,6 @@ def test_steady_maps_metrics_timing_and_task_gating(tmp_path: Path) -> None:
         x_grid,
     )
     assert pressure.unit == "Pa"
-
-    case_figure = analysis.evaluation.plots.samples_outliers.plot_sample_prediction_overview(
-        datasets=datasets,
-        row_position=0,
-        error_mode="MAE",
-        scale_mode="Independent",
-    )
-    titles = tuple(axis.get_title() for axis in case_figure.axes)
-    assert any(title.endswith("pred") for title in titles)
-    assert any(title.endswith("true") for title in titles)
-    assert any(title.endswith("MAE") for title in titles)
-    assert not any("[" in title and "Pa" in title for title in titles)
-    assert [axis.get_ylabel() for axis in case_figure.axes].count("[Pa]") >= 3
-    plt.close(case_figure)
 
     with analysis.evaluation.session.EvaluationSession(datasets) as session:
         summary = session.full_summary(frame).require_spatial()
@@ -566,23 +346,349 @@ def test_steady_maps_metrics_timing_and_task_gating(tmp_path: Path) -> None:
 
     expected_pressure_rmse = float(np.sqrt(0.625 * np.mean(x_grid**2)))
     aggregate = frame.attrs[dataframe.PRIMARY_OBJECTIVE_ID]
-    assert aggregate["field_statistics"]["p"]["normalized_rmse"] == pytest.approx(expected_pressure_rmse)
+    assert aggregate["field_metrics"]["normalized_rmse_p"] == pytest.approx(expected_pressure_rmse)
 
-    registry = panel._build_sections(datasets, comparison=False)
-    assert "timing" not in registry
+    runtime = analysis.evaluation.plots.run_summary.build_runtime_table(datasets).iloc[0]
+    assert (runtime["solver_speedup [-]"], runtime["solver_speedup paired cases"], runtime["solver_speedup unavailable cases"]) == (
+        pytest.approx(4.0 / 0.1),
+        1,
+        1,
+    )
+    assert runtime["process_speedup [-]"] == pytest.approx(50.0 / 0.3)
+    registry = panel._build_sections(_scope(datasets, comparison=False), comparison=False)
+    assert "runtime" in registry
     assert not {"spatial", "rollout", "process", "outcomes"}.intersection(registry)
     titles = tuple(title.lower() for entries, _section_title in registry.values() for title, _factory, _stem in entries)
     assert not any(token in item for item in titles for token in ("trajectory", "rollout horizon", "physical time"))
 
 
+def _levels(axis: Any) -> np.ndarray:
+    """Return the discrete colour levels of the map drawn first on ``axis``."""
+    return np.asarray(axis.collections[0].norm.boundaries)
+
+
+def _round_steps(levels: np.ndarray) -> bool:
+    """Return whether ``levels`` are 9 to 13 equal steps of 1, 2, 2.5 or 5 times a power of ten."""
+    steps = np.diff(levels)
+    mantissa = steps[0] / 10.0 ** np.floor(np.log10(steps[0]))
+    return bool(np.allclose(steps, steps[0]) and np.isclose(mantissa, (1.0, 2.0, 2.5, 5.0)).any() and 9 <= steps.size <= 13)
+
+
+def test_the_steady_sample_overview_draws_every_learned_field_on_round_discrete_levels(tmp_path: Path) -> None:
+    """
+    Rows p, u, v by reference, prediction, error; every bar on round levels, each a tick, with its unit.
+
+    The state levels cover the reference's 5th to 95th percentile and the prediction takes them, with an arrow where it
+    passes them; the default error is signed on a symmetric blue-white-red scale; u and v are turbo while p keeps its
+    colormap; one note stands under the title and only the error maps carry a mean |e| line; the title names the model by its display
+    name, and only for a frame not keyed by its dataset label.
+    """
+    frame, _grid = steady_frame(tmp_path)
+    plot = analysis.evaluation.plots.samples_outliers.plot_sample_prediction_overview
+    case = cases.load_case(frame, 0)
+    fields = [field for field in analysis.evaluation.presentation.display_fields(frame) if not field.is_magnitude]
+    figure = plot(datasets={"lentil, ID": frame}, row_position=0)
+    maps, slots = (np.asarray(axes, dtype=object).reshape(3, 3) for axes in (figure.axes[:9], figure.axes[9:]))
+    assert [axis.get_title() for axis in maps[0, :2]] == ["Reference", "Prediction"]
+    assert maps[0, 2].get_title() == "Signed error"
+    row_labels = [text.get_text() for axis in maps[:, 0] for text in axis.texts if text.get_gid() == "channel-row-label"]
+    assert row_labels == [rf"$\mathbf{{{name}}}$" for name in ("p", "u", "v")]
+    assert [slot.get_ylabel() for slot in slots.flat] == [*("[Pa]",) * 3, *("[m/s]",) * 6]
+    for column in range(3):
+        for map_axis, slot in zip(maps[:, column], slots[:, column], strict=True):
+            levels = _levels(map_axis)
+            assert _round_steps(levels)
+            # Every bar labels its round boundaries; the signed one labels its band centres 0, +-w, +-2w ... instead.
+            np.testing.assert_allclose(slot._colorbar.get_ticks(), (levels[:-1] + levels[1:]) / 2.0 if column == 2 else levels, atol=1e-9)
+    for row, (reference_map, prediction_map, error_map) in enumerate(maps):
+        np.testing.assert_array_equal(_levels(prediction_map), _levels(reference_map))
+        low, high = np.percentile(analysis.evaluation.presentation.case_field(case, fields[row], source="reference"), (5.0, 95.0))
+        levels = _levels(reference_map)
+        assert levels[0] <= low < levels[1]
+        assert high <= levels[-1]
+        # The prediction passes the reference's top level exactly where its values do, and only there it gets an arrow.
+        prediction = analysis.evaluation.presentation.case_field(case, fields[row], source="prediction")
+        assert slots[row, 1]._colorbar.extend == ("max" if prediction.max() > levels[-1] else "neither")
+        error_levels = _levels(error_map)
+        assert error_levels[0] == pytest.approx(-error_levels[-1])
+        assert error_map.collections[0].get_cmap().name == visual_semantics.field_visual_semantics("error", role="signed_error").colormap
+    figure.canvas.draw()
+    for slot in slots.flat:  # exactly the decimals the tick step needs (none for a whole-number step)
+        step = float(np.min(np.diff(slot._colorbar.get_ticks())))
+        decimals = analysis.ui.plot_layout.step_decimals(step)
+        assert {len(text.get_text().partition(".")[2]) for text in slot.get_yticklabels()} == {decimals}
+    assert "0.0" in [text.get_text() for text in slots[0, 2].get_yticklabels()]  # the white band is centred on 0
+    assert [maps[row, 0].collections[0].get_cmap().name for row in range(3)] == [
+        visual_semantics.field_visual_semantics("p").colormap,
+        "turbo",
+        "turbo",
+    ]
+    # Only the three error maps carry text: one mean |e| line each, over the drawn finite error, in the unit of their bar.
+    assert not [text for axis in maps[:, :2].flat for text in axis.texts if text.get_gid() != "channel-row-label"]
+    for row in range(3):
+        (mean_line,) = (text.get_text() for text in maps[row, 2].texts if text.get_gid() != "channel-row-label")
+        drawn = np.ma.filled(maps[row, 2].collections[0].get_array().astype(float), np.nan)
+        assert mean_line == f"mean |e| = {np.nanmean(np.abs(drawn)):.3g} {slots[row, 2].get_ylabel().strip('[]')}"
+    (note,) = (text.get_text() for text in figure.texts if text.get_text() != figure.get_suptitle())
+    assert note == "Colour scales: 5th\N{EN DASH}95th percentile; prediction uses the reference scale; arrows mark values outside"
+    # No title carries a metric, whether or not the case has a relative L2.
+    assert figure.get_suptitle() == "Lentil · ID · case_0001"
+    plt.close(figure)
+    second = plot(datasets={"lentil, ID": frame}, row_position=1)
+    assert second.get_suptitle() == "Lentil · ID · case_0002"
+    plt.close(second)
+
+    named = plot(datasets={"uno_m64x64_h32_l7__fd": frame}, row_position=0)
+    assert named.get_suptitle() == "Lentil · ID · FNO · case_0001"
+    plt.close(named)
+    frame.attrs["artifact_provenance"]["model"].update(kind="uno", physics_enabled=True)
+    physics = plot(datasets={"uno_m64x64_h32_l7__fd": frame}, row_position=0)
+    assert physics.get_suptitle() == "Lentil · ID · PI-U-NO · case_0001"
+    plt.close(physics)
+
+    normalized = plot(datasets={"lentil, ID": frame}, row_position=0, error_mode=error_diagnostics.NORMALIZED_ABSOLUTE_ERROR)
+    assert normalized.axes[2].get_title().startswith("Absolute error / train std")
+    plt.close(normalized)
+
+
+def test_state_levels_cover_the_percentile_range_tightly_and_are_never_cut_short() -> None:
+    """The percentile range 0.05 to 0.95 gets ten bands of 0.1 from 0, reaching 0.95 with the last band; a tighter step beats a half-empty scale."""
+    boundaries = analysis.evaluation.plots.samples_outliers._state_boundaries(np.linspace(0.0, 1.0, 101))
+    assert boundaries is not None
+    np.testing.assert_allclose(boundaries, np.linspace(0.0, 1.0, 11))
+    # Case 42: p5 to p95 of p filled 52 % of a 0 to 550 Pa scale; now (step, bands, start, top) as below.
+    state_boundaries = analysis.evaluation.plots.layout.state_boundaries
+    for (lower, upper), (step, bands, start) in {
+        (16.25, 304.9): (25.0, 13, 0.0),
+        (-0.04119, 0.04502): (0.01, 10, -0.05),
+        (0.0745, 0.2338): (0.02, 9, 0.06),
+    }.items():
+        np.testing.assert_allclose(state_boundaries(lower, upper), start + step * np.arange(bands + 1), atol=1e-12)
+
+
+def test_exact_predictions_give_the_signed_and_normalized_mean_maps_a_round_band_scale_and_an_empty_pool_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All-zero mean errors draw the scale of reach 1; the normalized mean map filters non-finite values and states an empty pool."""
+    frame, _grid = steady_frame(tmp_path)
+    frame.attrs["artifact_provenance"]["normalizer"].update(normalization=domain.tasks.spec.TRAIN_SCALING_KIND, fit_split="train", sha256="f" * 64)
+    behavior = analysis.evaluation.plots.error_behavior
+    full_array = behavior._full_array
+    monkeypatch.setattr(behavior, "_full_array", lambda *args: np.zeros_like(full_array(*args)))
+    for mode in (error_diagnostics.SIGNED_ERROR, error_diagnostics.NORMALIZED_ABSOLUTE_ERROR):
+        figure = behavior.plot_mean_error_maps(datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT, error_mode=mode)
+        # Reach 1: signed w = 0.2 (11 bands, span 2.2), normalized step 0.1 (10 bands, span 1).
+        assert cast("Any", figure.axes[0].collections[0]).levels.size == (12 if mode == error_diagnostics.SIGNED_ERROR else 11)
+        plt.close(figure)
+    monkeypatch.setattr(behavior, "_full_array", lambda *args: np.full_like(full_array(*args), np.nan))
+    figure = behavior.plot_mean_error_maps(
+        datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT, error_mode=error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+    )
+    assert any("Unavailable" in text.get_text() for axis in figure.axes for text in axis.texts)
+    plt.close(figure)
+
+    def finite_with_one_nan(*args: Any) -> np.ndarray:
+        values = np.ones_like(full_array(*args))
+        values.flat[0] = np.nan  # finite and non-finite cells in one pool used to reach the map builder unfiltered
+        return values
+
+    monkeypatch.setattr(behavior, "_full_array", finite_with_one_nan)
+    figure = behavior.plot_mean_error_maps(
+        datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT, error_mode=error_diagnostics.NORMALIZED_ABSOLUTE_ERROR
+    )
+    assert 10 <= cast("Any", figure.axes[0].collections[0]).levels.size <= 14  # 9 to 13 round bands
+    plt.close(figure)
+
+
+def test_the_permeability_overlay_labels_its_signed_error_bar_at_band_centres_with_fixed_decimals(tmp_path: Path) -> None:
+    """The overlay's signed-error bar ticks at the band centres (a labelled 0) with one decimal, like the overview's."""
+    frame, _grid = steady_frame(tmp_path)
+    figure = analysis.evaluation.plots.samples_outliers.plot_permeability_error_overlay(datasets={"lentil, ID": frame}, row_position=0, channel="p")
+    figure.canvas.draw()
+    levels = next(
+        np.asarray(cast("Any", contours).levels)
+        for axis in figure.axes
+        for contours in axis.collections
+        if hasattr(contours, "levels") and error_diagnostics.SIGNED_ERROR in axis.get_title()
+    )
+    np.testing.assert_allclose(figure.axes[-1].get_yticks(), (levels[:-1] + levels[1:]) / 2.0)
+    labels = [text.get_text() for text in figure.axes[-1].get_yticklabels()]
+    assert "0.0" in labels or "0.00" in labels
+    assert len({len(text.partition(".")[2]) for text in labels}) == 1
+    plt.close(figure)
+
+
+def test_the_permeability_overlay_titles_follow_the_label_style_and_its_red_contours_mark_large_errors_of_either_sign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tensor panels read kappa symbols or names in the active style; the contour levels are quantiles of |error|, here dominated by negatives."""
+    frame, _grid = steady_frame(tmp_path)
+    samples = analysis.evaluation.plots.samples_outliers
+    real_error_values = samples._error_values
+
+    def negative_peak(*args: Any, **kwargs: Any) -> Any:
+        result = real_error_values(*args, **kwargs)
+        values = 0.01 * np.ones_like(result.map_values)
+        values.flat[:2] = -1.0  # two of the cells carry the largest errors, both negative
+        return replace(result, map_values=values)
+
+    monkeypatch.setattr(samples, "_error_values", negative_peak)
+    titles = {}
+    try:
+        for style in ("symbol", "name"):
+            analysis.presentation.field_labels.set_label_style(style)
+            figure = samples.plot_permeability_error_overlay(datasets={"lentil, ID": frame}, row_position=0, channel="p")
+            titles[style] = [figure.axes[index].get_title() for index in (0, 1, 3, 4)]  # the tensor panels Kxx, Kxy, Kyx, Kyy
+            if style == "symbol":
+                red = [cast("Any", item) for item in figure.axes[0].collections if hasattr(item, "levels") and not cast("Any", item).filled]
+                assert red
+                assert max(red[0].levels) > 0.1  # signed quantiles would sit at 0.01
+            plt.close(figure)
+    finally:
+        analysis.presentation.field_labels.set_label_style("symbol")
+    assert titles["symbol"] == [r"log10($\kappa_{xx}$ / 1 m²)", r"$\kappa_{xy}$", r"$\kappa_{yx}$", r"log10($\kappa_{yy}$ / 1 m²)"]
+    assert titles["name"] == ["log10(Permeability xx / 1 m²)", "Permeability xy", "Permeability yx", "log10(Permeability yy / 1 m²)"]
+
+
+def test_a_mean_error_map_without_finite_values_names_the_reference_floor_only_in_the_relative_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The below-the-reference-floor reason belongs to the relative mode; every other mode says that no finite values exist."""
+    frame, _grid = steady_frame(tmp_path)
+    behavior = analysis.evaluation.plots.error_behavior
+    full_array = behavior._full_array
+    monkeypatch.setattr(behavior, "_full_array", lambda *args: np.full_like(full_array(*args), np.nan))
+    texts = {}
+    for mode in (error_diagnostics.SIGNED_ERROR, "Relative [%]"):
+        figure = behavior.plot_mean_error_maps(datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT, error_mode=mode)
+        texts[mode] = {text.get_text() for axis in figure.axes for text in axis.texts if "Unavailable" in text.get_text()}
+        plt.close(figure)
+    assert texts[error_diagnostics.SIGNED_ERROR] == {"Unavailable: no finite values"}
+    assert texts["Relative [%]"] == {"Unavailable: every case lies below the reference floor"}
+
+
+def test_the_overview_bars_of_near_uniform_state_maps_keep_three_decimals_and_no_power_of_ten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state field of 26.85 ± 5e-5 is widened to bands of 0.001: its reference and prediction bars read three decimals and no factor."""
+    frame, _grid = steady_frame(tmp_path)
+    samples = analysis.evaluation.plots.samples_outliers
+    real_case_field = samples.presentation.case_field
+
+    def near_uniform(*args: Any, **kwargs: Any) -> np.ndarray:
+        values = np.asarray(real_case_field(*args, **kwargs), dtype=float)
+        return 26.85 + 1e-4 * ((values - values.min()) / max(np.ptp(values), 1e-12) - 0.5)
+
+    monkeypatch.setattr(samples.presentation, "case_field", near_uniform)
+    figure = samples.plot_sample_prediction_overview(datasets={"lentil, ID": frame}, row_position=0)
+    figure.canvas.draw()
+    slots = figure.axes[len(figure.axes) // 2 :]  # the colour-bar slots, row-major over reference, prediction, error
+    for slot in slots[0::3] + slots[1::3]:
+        assert "10" not in slot.get_ylabel()
+        assert {len(text.get_text().partition(".")[2]) for text in slot.get_yticklabels() if text.get_text()} == {3}
+    plt.close(figure)
+
+
+def test_the_overview_can_show_the_velocity_magnitude_with_streamlines_in_place_of_its_components(tmp_path: Path) -> None:
+    """fields=("p", "U") draws two rows; the U row shows the reference speed with the pair's streamlines and its own mean line."""
+    frame, _grid = steady_frame(tmp_path)
+    samples = analysis.evaluation.plots.samples_outliers
+    figure = samples.plot_sample_prediction_overview(datasets={"lentil, ID": frame}, row_position=0, fields=("p", "U"))
+    maps = figure.axes[:6]
+    assert len(figure.axes) == 12  # two rows of three maps and their colour-bar slots
+    speed = samples.presentation.case_field(samples.cases.load_case(frame, 0), samples._resolve_display_field(frame, "U"), source="reference")
+    drawn = np.ma.filled(cast("Any", maps[3].collections[0]).get_array().astype(float), np.nan)
+    assert np.nanmax(drawn) == pytest.approx(float(np.max(speed)))
+    assert any(isinstance(collection, LineCollection) for collection in maps[3].collections[1:])  # streamlines over the speed
+    labels = [text.get_text() for axis in maps for text in axis.texts if text.get_gid() == "channel-row-label"]
+    assert any(r"|\mathbf{u}|" in label for label in labels)  # the row label |u|, set bold like every row label
+    assert next(text.get_text() for text in maps[5].texts if text.get_gid() != "channel-row-label").startswith("mean |e| = ")
+    plt.close(figure)
+
+
+def test_the_sample_title_model_name_fails_on_an_untyped_physics_flag_like_the_run_summary(tmp_path: Path) -> None:
+    """A non-bool physics_enabled is no silent non-PI model: the title helper reads provenance through the run summary's validation."""
+    frame, _grid = steady_frame(tmp_path)
+    samples = analysis.evaluation.plots.samples_outliers
+    assert samples._model_display_name(frame)
+    frame.attrs["artifact_provenance"]["model"]["physics_enabled"] = "yes"
+    with pytest.raises(TypeError, match=r"boolean model\.physics_enabled"):
+        samples._model_display_name(frame)
+
+
+def test_the_mean_error_maps_show_the_signed_mean_on_a_symmetric_blue_white_red_scale_by_default(tmp_path: Path) -> None:
+    """The default mean error map is the mean of prediction minus reference over the selected cases, symmetric about 0."""
+    frame, x_grid = steady_frame(tmp_path)
+    figure = analysis.evaluation.plots.error_behavior.plot_mean_error_maps(datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT)
+    assert "Mean signed error maps" in figure.get_suptitle()
+    contours = figure.axes[0].collections[0]
+    levels = np.asarray(cast("Any", contours).levels)
+    assert levels[0] == pytest.approx(-levels[-1])
+    assert cast("Any", contours).get_cmap().name == visual_semantics.field_visual_semantics("error", role="signed_error").colormap
+    assert levels[-1] >= np.percentile(0.75 * x_grid, 95.0)  # the fixture predicts above the reference everywhere: the mean is 0.75 x
+    figure.canvas.draw()
+    labels = [text.get_text() for text in figure.axes[1].get_yticklabels()]  # the signed bar labels its band centres at fixed decimals
+    assert "0.0" in labels or "0.00" in labels
+    assert len({len(text.partition(".")[2]) for text in labels}) == 1
+    plt.close(figure)
+    for mode in ("MAE", error_diagnostics.NORMALIZED_ABSOLUTE_ERROR):  # the other modes tick on round boundaries from 0
+        other = analysis.evaluation.plots.error_behavior.plot_mean_error_maps(
+            datasets={"Steady fixture": frame}, max_cases=_CASE_COUNT, error_mode=mode
+        )
+        np.testing.assert_allclose(other.axes[1].get_yticks()[0], 0.0, atol=1e-12)
+        plt.close(other)
+
+
+def test_the_mae_overview_heads_its_error_column_absolute_error_on_round_levels_from_zero_in_difference_units(tmp_path: Path) -> None:
+    """The MAE column is "Absolute error"; its bars carry the fields' difference units and start at 0."""
+    frame, _grid = steady_frame(tmp_path)
+    figure = analysis.evaluation.plots.samples_outliers.plot_sample_prediction_overview(datasets={"lentil, ID": frame}, error_mode="MAE")
+    errors, bars = figure.axes[2:9:3], figure.axes[11::3]
+    assert errors[0].get_title() == "Absolute error"
+    assert [bar.get_ylabel() for bar in bars] == ["[Pa]", "[m/s]", "[m/s]"]
+    # |e| of p is 0.5 x over x in [0, 2] m: its 95th percentile of 0.95 Pa is reached by ten bands of 0.1 Pa.
+    np.testing.assert_allclose(_levels(errors[0]), np.linspace(0.0, 1.0, 11))
+    plt.close(figure)
+
+
+def test_a_nonfinite_prediction_overview_masks_and_notes_its_cells_and_takes_the_reference_levels(tmp_path: Path) -> None:
+    """The pressure prediction's NaN cell stays masked with the note; it draws on the reference's levels; its error states why it is missing."""
+    frame = _nonfinite_frame(tmp_path / "nonfinite", (0,))
+    figure = analysis.evaluation.plots.samples_outliers.plot_sample_prediction_overview(datasets={"lentil, ID": frame}, error_mode="MAE")
+    prediction = figure.axes[1]
+    drawn = cast("Any", prediction.collections[0]).get_array()
+    assert drawn is not None
+    assert int(np.ma.getmaskarray(drawn).sum()) == 1
+    assert [text.get_text() for text in prediction.texts] == ["Non-finite cells masked"]
+    np.testing.assert_array_equal(_levels(prediction), _levels(figure.axes[0]))
+    assert _levels(prediction)[[0, -1]] == pytest.approx((0.0, 1.0))
+    assert figure.axes[2].texts[0].get_text().startswith("Unavailable: Non-finite")
+    plt.close(figure)
+
+
+def test_the_steady_work_table_has_one_row_per_run(tmp_path: Path) -> None:
+    """Two labelled frames of one run give one row, named by the first; another run keeps its own row."""
+    frame, _grid = steady_frame(tmp_path)
+    frames = {"ID": frame, "Material OOD": frame.copy(), "Other run": frame.copy()}
+    for copied in ("Material OOD", "Other run"):
+        frames[copied].attrs = copy.deepcopy(frame.attrs)
+    frames["Other run"].attrs[dataframe.COMPLETED_RUN_SUMMARY_ATTR]["run_name"] = "steady-other"
+    run_summary = analysis.evaluation.plots.run_summary
+
+    table = run_summary.build_frame_work_table(frames, run_summary._steady_inference_seconds)
+
+    assert list(table.index) == ["ID", "Other run"]
+    assert list(table["run_name"]) == ["steady-fixture", "steady-other"]
+    assert table.loc["ID", "inference_seconds_per_case"] == pytest.approx(run_summary._steady_inference_seconds("ID", frame))
+
+
 def test_every_steady_registry_entry_builds_with_steady_fields_only(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Invoke each visible steady entry once and expose only steady output fields."""
-    frame, _x_grid = _steady_frame(tmp_path)
-    monkeypatch.setattr(analysis.ui.notebook, "display", lambda _value: None)
-    registry = panel._build_sections({"Steady fixture": frame}, comparison=False)
+    """Invoke each visible steady entry once, with no view failing, and expose only steady output fields."""
+    frame, _x_grid = steady_frame(tmp_path)
+    registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
     entries = [entry for section_entries, _section_title in registry.values() for entry in section_entries]
 
     assert entries
@@ -597,12 +703,49 @@ def test_every_steady_registry_entry_builds_with_steady_fields_only(
             )
     finally:
         plt.close("all")
+    assert not [record.getMessage() for record in caplog.records if "View failed" in record.getMessage()]
     assert {field.key for field in analysis.evaluation.presentation.display_fields(frame)} == {"p", "u", "v", "velocity_magnitude"}
+
+
+def test_the_pooling_switch_is_enabled_only_in_a_view_whose_reduction_is_material_balanced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The summary table pools; every other view of the panel shows the switch disabled with the reason."""
+    frame, _x_grid = steady_frame(tmp_path)
+    monkeypatch.setattr(analysis.ui.viewers, "render_view", lambda *_args, **_kwargs: True)
+    registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
+    enabled: dict[str, bool] = {}
+    for entries, _section_title in registry.values():
+        for title, factory, _stem in entries:
+            view = analysis.ui.notebook._invoke_dropdown_entry(factory, export_state=None, export_plot_name=title, export_title=title)
+            if isinstance(view, analysis.ui.panel.ViewPanel):
+                (toggle,) = [item for item in _widget_tree(view.widget) if getattr(item, "description", None) == analysis.ui.selectors.POOL_LABEL]
+                enabled[title] = not toggle.disabled
+                assert toggle.disabled == (toggle.tooltip == dataset_cuts.POOL_DISABLED_REASON)
+    assert {title for title, on in enabled.items() if on} == {"Summary table"}
+    assert len(enabled) > 5
+
+
+def test_a_comparison_draws_one_dataset_and_lists_a_refused_role_as_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The comparison selector offers the shared datasets one at a time and names why a role is not offered."""
+    frame, _x_grid = steady_frame(tmp_path)
+    models = {"A": frame, "B": frame.copy(deep=True)}
+    scope = _scope(models, comparison=True, refused={"parameter_ood": "disagreeing membership in B"})
+    drawn: list[Any] = []
+    monkeypatch.setattr(analysis.ui.viewers, "render_view", lambda _view, _plot, **kwargs: drawn.append(kwargs["kwargs"]["datasets"]) or True)
+
+    view = panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=None, export={})
+
+    assert [tuple(frames) for frames in drawn] == [("A", "B")]
+    assert all(len(cut) == _CASE_COUNT for cut in drawn[0].values())
+    texts = [str(getattr(item, "description", None) or getattr(item, "value", "")) for item in _widget_tree(view.widget)]
+    assert "<b>Nicht verfügbar</b>" in texts
+    unavailable = [item for item in _widget_tree(view.widget) if "disagreeing membership in B" in str(getattr(item, "description", ""))]
+    assert unavailable
+    assert all(item.disabled for item in unavailable)
 
 
 def test_steady_global_decomposition_capacity_and_map_values(tmp_path: Path) -> None:
     """Protect core global, spatial, architecture, and decomposition values."""
-    frame, x_grid = _steady_frame(tmp_path)
+    frame, x_grid = steady_frame(tmp_path)
     datasets = {"Steady fixture": frame}
     plots = analysis.evaluation.plots
     with analysis.evaluation.session.EvaluationSession(datasets) as session:
@@ -623,17 +766,20 @@ def test_steady_global_decomposition_capacity_and_map_values(tmp_path: Path) -> 
 
     global_figure = plots.error_behavior.plot_global_error_metrics(datasets=datasets)
     cdf_axes = {axis.get_title(): axis for axis in global_figure.axes if axis.get_title().endswith("CDF")}
-    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative L2 - CDF"].lines[0].get_xdata()), (0.1, 0.2))
-    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative L2 - CDF"].lines[0].get_ydata()), (0.5, 1.0))
-    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative H1 - CDF"].lines[0].get_xdata()), (0.2, 0.4))
+    # The first case's pressure reference (RMS about 0.6 Pa) is below its 1 Pa floor, so only the second case has relative values.
+    relative_l2, relative_h1 = (frame[column].dropna().to_numpy() for column in ("physical_relative_l2", "physical_relative_h1"))
+    assert (relative_l2.size, relative_h1.size) == (1, 1)
+    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative L2 - CDF"].lines[0].get_xdata()), relative_l2)
+    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative L2 - CDF"].lines[0].get_ydata()), (1.0,))
+    np.testing.assert_allclose(_numeric_array(cdf_axes["Relative H1 - CDF"].lines[0].get_xdata()), relative_h1)
     plt.close(global_figure)
 
     distribution = plots.error_behavior.plot_predictive_error_distributions(
         datasets=datasets,
         max_cases=_CASE_COUNT,
     )
-    np.testing.assert_allclose(_numeric_array(distribution.axes[0].lines[0].get_xdata()), (0.1, 0.2))
-    np.testing.assert_allclose(_numeric_array(distribution.axes[0].lines[0].get_ydata()), (0.5, 1.0))
+    np.testing.assert_allclose(_numeric_array(distribution.axes[0].lines[0].get_xdata()), relative_l2)
+    np.testing.assert_allclose(_numeric_array(distribution.axes[0].lines[0].get_ydata()), (1.0,))
     for line, field in zip(
         distribution.axes[1].lines,
         analysis.evaluation.presentation.display_fields(frame),
@@ -715,9 +861,72 @@ def test_steady_global_decomposition_capacity_and_map_values(tmp_path: Path) -> 
     plt.close(boundary)
 
 
+def test_steady_relative_errors_below_the_field_floor_are_unavailable_and_counted(tmp_path: Path) -> None:
+    """
+    A case whose reference RMS lies below the field's floor has no relative error in maps or distributions; it is counted.
+
+    The first fixture case has a pressure reference RMS of about 0.6 Pa, below the 1 Pa floor; the second case
+    (about 1.2 Pa) and every velocity reference lie above their floors.
+    """
+    frame, x_grid = steady_frame(tmp_path)
+    with analysis.evaluation.session.EvaluationSession({"fixture": frame}) as session:
+        full = session.full_summary(frame).require_spatial()
+        prefix = session.prefix_summary(frame, _CASE_COUNT)
+    pressure = prefix.local_relative_error["p"]
+    assert pressure.source_point_count == x_grid.size
+    assert pressure.unavailable_case_count == 1
+    assert prefix.local_relative_error["u"].unavailable_case_count == 0
+    assert prefix.magnitudes["velocity"].local_relative_error.unavailable_case_count == 0
+    unavailable_cases, relative_mean = full.local_relative_unavailable_cases, full.local_relative_error_mean
+    assert unavailable_cases is not None
+    assert relative_mean is not None
+    assert dict(zip(full.grid.fields, unavailable_cases.tolist(), strict=True)) == {"p": 1, "u": 0, "v": 0}
+    assert full.magnitudes["velocity"].local_relative_unavailable_cases == 0
+    np.testing.assert_allclose(relative_mean[full.grid.fields.index("p")], x_grid / np.sqrt(np.mean(x_grid**2)))
+
+    overview = analysis.evaluation.plots.samples_outliers.plot_sample_prediction_overview(
+        datasets={"fixture": frame}, row_position=0, error_mode="Relative [%]"
+    )
+    unavailable = [text.get_text() for axis in overview.axes for text in axis.texts if text.get_text().startswith("Unavailable")]
+    assert len(unavailable) == 1
+    assert "floor" in unavailable[0]
+    plt.close(overview)
+
+
+def test_relative_norm_distributions_name_their_available_and_unavailable_cases(tmp_path: Path) -> None:
+    """The per-case relative-norm distributions state how many cases they show and how many are unavailable."""
+    frame, _x_grid = steady_frame(tmp_path)
+    datasets = {"Steady fixture": frame}
+    plots = analysis.evaluation.plots.error_behavior
+    # The first case's pressure reference lies below its floor, so one of the two cases has a relative norm.
+    global_figure = plots.plot_global_error_metrics(datasets=datasets)
+    legend_texts = [text.get_text() for axis in global_figure.axes if (legend := axis.get_legend()) for text in legend.get_texts()]
+    for norm in ("Relative L2", "Relative H1"):
+        assert any(f"{norm}: 1 of {_CASE_COUNT} cases, 1 unavailable" in text for text in legend_texts), norm
+    plt.close(global_figure)
+    distribution = plots.plot_predictive_error_distributions(datasets=datasets, max_cases=_CASE_COUNT)
+    assert any(f"Relative L2: 1 of {_CASE_COUNT} cases, 1 unavailable" in text.get_text() for text in distribution.axes[0].texts)
+    plt.close(distribution)
+
+
+def test_pressure_drop_mismatch_divides_by_the_declared_drop_and_refuses_a_non_positive_one(tmp_path: Path) -> None:
+    """The relative pressure-drop mismatch divides by the positive declared drop; a non-positive drop fails closed."""
+    for name in ("positive", "flat"):
+        (tmp_path / name).mkdir()
+    frame, _x_grid = steady_frame(tmp_path / "positive")
+    pressure = analysis.evaluation.plots.physical_consistency.plot_pressure_consistency(datasets={"fixture": frame}, max_cases=_CASE_COUNT)
+    # Declared drop 1 Pa, predicted inlet and outlet rows share one mean: a mismatch of 1 Pa in both cases. The tolerance
+    # is below 1e-12, so a denominator stabilised with an epsilon would fail.
+    np.testing.assert_allclose(_numeric_array(pressure.axes[0].lines[0].get_xdata()), (1.0, 1.0), rtol=1e-14, atol=0.0)
+    plt.close(pressure)
+    flat, _x_grid = steady_frame(tmp_path / "flat", pressure_drop=0.0)
+    with pytest.raises(ValueError, match="declared pressure drop"):
+        analysis.evaluation.plots.physical_consistency.plot_pressure_consistency(datasets={"fixture": flat}, max_cases=_CASE_COUNT)
+
+
 def test_steady_physical_spectral_and_sensitivity_values(tmp_path: Path) -> None:
     """Protect steady-only physics, spectral transfer, and parameter evidence."""
-    frame, _x_grid = _steady_frame(tmp_path)
+    frame, _x_grid = steady_frame(tmp_path)
     datasets = {"Steady fixture": frame}
     plots = analysis.evaluation.plots
 
@@ -755,7 +964,7 @@ def test_steady_physical_spectral_and_sensitivity_values(tmp_path: Path) -> None
         max_cases=_CASE_COUNT,
     )
     np.testing.assert_allclose(_numeric_array(pressure.axes[1].lines[0].get_xdata()), (1.0, 4.0))
-    assert pressure.axes[1].get_xlabel() == r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$ [1]"
+    assert pressure.axes[1].get_xlabel() == r"$\mathrm{MSE}(p_\Gamma-p_{bc})/\Delta p^2$ [-]"
     plt.close(pressure)
 
     demand = plots.spectral_fidelity.plot_spectral_demand_prediction_error(
@@ -804,7 +1013,7 @@ def test_steady_physical_spectral_and_sensitivity_values(tmp_path: Path) -> None
 def _nonfinite_frame(tmp_path: Path, positions: Sequence[int]) -> pd.DataFrame:
     """Return the two-case steady fixture with the given rows rewritten as NONFINITE predictions."""
     tmp_path.mkdir()
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     channels = domain.tasks.steady_flow.STEADY_FLOW.output_names
     for position in positions:
         path = Path(str(frame.loc[position, "npz_path"]))
@@ -816,7 +1025,7 @@ def _nonfinite_frame(tmp_path: Path, positions: Sequence[int]) -> pd.DataFrame:
         _record_payload(frame, path)
         validity = validity_contract.build_field_prediction_validity(arrays["pred"][: len(channels)], channels=channels)
         frame.loc[position, "prediction_validity"] = json.dumps(validity)
-        frame.loc[position, ["rel_l2", "rel_h1"]] = np.nan
+        frame.loc[position, ["physical_relative_l2", "physical_relative_h1"]] = np.nan
     frame.attrs["artifact_provenance"]["evaluation"]["prediction_validity"] = validity_contract.table_role_prediction_validity(frame)
     return frame
 
@@ -870,15 +1079,15 @@ def test_prefix_plots_show_an_empty_prefix_instead_of_failing(tmp_path: Path) ->
         plt.close(render(datasets=mixed))
     figure = plots.error_behavior.plot_global_error_metrics(datasets=none)
     legend_texts = [text.get_text() for axis in figure.axes if (legend := axis.get_legend()) for text in legend.get_texts()]
-    assert any(f"unavailable (0 finite of {_CASE_COUNT} cases)" in text for text in legend_texts)
+    assert any(f"Relative L2: 0 of {_CASE_COUNT} cases, {_CASE_COUNT} unavailable" in text for text in legend_texts)
     plt.close(figure)
 
 
 def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> None:
     """Protect exact selected cases, Kappa evidence, rankings, and paired fields."""
-    frame, x_grid = _steady_frame(tmp_path)
+    frame, x_grid = steady_frame(tmp_path)
     peer = _steady_peer(frame)
-    datasets = {"Steady fixture": frame}
+    datasets = {"lentil, ID": frame}  # keyed by its dataset label as in a single-model panel
     plots = analysis.evaluation.plots.samples_outliers
     case = cases.load_case(frame, 0)
     assert case.permeability is not None
@@ -893,7 +1102,7 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
         selection_index=0,
         channel="p",
     )
-    assert linked_outlier.get_suptitle() == "p outlier field view — Case 2"
+    assert linked_outlier.get_suptitle() == "Lentil · ID · case_0002 · $p$ outlier field view"
     plt.close(linked_outlier)
 
     linked_extreme = plots.plot_linked_input_extreme_cases(
@@ -901,7 +1110,7 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
         selection_index=0,
         parameter="parameters_bed.structure.coarse_len_rel",
     )
-    assert linked_extreme.get_suptitle() == "Input extreme: Coarse correlation length minimum — Case 1"
+    assert linked_extreme.get_suptitle() == "Lentil · ID · case_0001 · Input extreme: Coarse correlation length minimum"
     plt.close(linked_extreme)
 
     comparison = plots.plot_pressure_velocity_comparison(
@@ -910,11 +1119,11 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
     )
     assert comparison.get_suptitle() == "Pressure and velocity comparison — Case 1"
     assert tuple(axis.get_title() for axis in comparison.axes if axis.get_title()) == (
-        "GT p",
+        "GT $p$",
         r"GT $|\mathbf{u}|$",
-        "Model A p",
+        "Model A $p$",
         r"Model A $|\mathbf{u}|$",
-        "Model B p",
+        "Model B $p$",
         r"Model B $|\mathbf{u}|$",
     )
     assert [axis.get_ylabel() for axis in comparison.axes if axis.get_ylabel().startswith("[")] == ["[Pa]", "[m/s]"] * 3
@@ -938,7 +1147,7 @@ def test_steady_sample_kappa_outlier_and_comparison_values(tmp_path: Path) -> No
 
 def test_steady_timing_binding_rejects_identity_drift(tmp_path: Path) -> None:
     """The required timing report must name the artifact's exact Dataset and checkpoint."""
-    frame, _x_grid = _steady_frame(tmp_path)
+    frame, _x_grid = steady_frame(tmp_path)
     provenance = frame.attrs["artifact_provenance"]
     payload = provenance["timing"]["report"]
     dataset = provenance["dataset"]
@@ -1005,7 +1214,7 @@ class _SharedSelection:
     """Record exact case/channel publications from steady cached viewers."""
 
     def __init__(self) -> None:
-        self.selection = SimpleNamespace(case_id="2", channels=("p",))
+        self.selection = SimpleNamespace(case_id="2", channels=("p",), datasets=None, pooled=False, focus_dataset=None)
         self.capabilities: Any = None
 
     def bind_capabilities(self, capabilities: Any) -> None:
@@ -1017,66 +1226,64 @@ class _SharedSelection:
     def select_channels(self, channels: tuple[str, ...]) -> None:
         self.selection.channels = channels
 
+    def select_datasets(self, keys: tuple[Any, ...], *, pooled: bool) -> None:
+        self.selection.datasets, self.selection.pooled = keys, pooled
+
+    def select_focus_dataset(self, key: Any) -> None:
+        self.selection.focus_dataset = key
+
 
 def test_steady_case_and_channel_controls_share_one_state_owner(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Synchronize exact case/channel state without transient-only controls."""
-    frame, _x_grid = _steady_frame(tmp_path)
-    datasets = {"Steady fixture": frame}
+    """Synchronize exact case, channel and dataset state without transient-only controls."""
+    frame, _x_grid = steady_frame(tmp_path)
     fields = analysis.evaluation.presentation.display_fields(frame)
     labels = tuple(field.label for field in fields)
     shared = _SharedSelection()
-    monkeypatch.setattr(analysis.ui.viewers, "render_figure", lambda **_kwargs: None)
+    scope = _scope({"Steady fixture": frame}, comparison=False)
 
-    def make_view() -> widgets.VBox:
-        channel = analysis.ui.components.ui_dropdown_channel(channels=labels)
-        view = panel._make_steady_indexed_viewer(
-            lambda **_kwargs: None,
-            datasets=datasets,
-            controls={"channel": channel},
+    def make_view() -> tuple[Any, Any, Any]:
+        view = panel._indexed_view(
+            scope,
+            plot_func=lambda **_kwargs: None,
+            controls={"channel": analysis.ui.controls.channel_dropdown(labels)},
             selection_state=shared,  # type: ignore[arg-type]
+            export={"export_state": None, "export_plot_name": "steady_case", "export_title": None},
+            single_model=True,
+            sync=True,
             channel_fields=fields,
-            export_plot_name="steady_case",
         )
-        assert type(view) is widgets.VBox
-        return view
+        case_navigator, channel = cast("widgets.Box", view.rows[1]).children
+        return view, case_navigator.children[0], channel
 
-    first = make_view()
-    first_header = first.children[0]
-    assert isinstance(first_header, widgets.HBox)
-    first_case = next(child for child in first_header.children if isinstance(child, widgets.BoundedIntText))
-    first_channel = next(child for child in first_header.children if isinstance(child, widgets.Dropdown))
+    first, first_case, first_channel = make_view()
     assert first_case.value == _CASE_COUNT
     assert first_channel.value == "p"
-
-    second = make_view()
-    second_header = second.children[0]
-    assert isinstance(second_header, widgets.HBox)
-    second_case = next(child for child in second_header.children if isinstance(child, widgets.BoundedIntText))
-    second_channel = next(child for child in second_header.children if isinstance(child, widgets.Dropdown))
+    assert first.status.text == ""
+    second, second_case, second_channel = make_view()
 
     first_case.value = 1
     first_channel.value = "|u|"
     assert shared.selection.case_id == "1"
     assert shared.selection.channels == ("velocity_magnitude",)
-    cast("Any", second).activate()
+    second.deactivate()
+    second.activate()
     assert second_case.value == 1
     assert second_channel.value == "|u|"
-    descriptions = {str(child.description) for child in (*first_header.children, *second_header.children) if hasattr(child, "description")}
+    descriptions = {str(child.description) for row in (*first.rows, *second.rows) for child in _widget_tree(row) if hasattr(child, "description")}
     assert not {"Time:", "Protocol:", "Horizon:"}.intersection(descriptions)
 
 
 def _tab_layout(view: widgets.Widget) -> tuple[tuple[str, ...], list[list[str]]]:
-    """Return the displayed tab titles and each tab's dropdown labels of one lazy panel."""
-    tabs = cast("Any", view).tabs
-    return tuple(tabs.titles), [[label for label, _index in section.children[0].options] for section in tabs.children]
+    """Return the displayed tab titles and each tab's view titles of one lazy panel."""
+    lazy = panel._LAZY_PANELS[view]
+    return tuple(cast("Any", lazy.tabs).titles), [list(section.titles) for section in lazy.sections]
 
 
 def test_steady_tabs_follow_the_decided_order_and_numbers_follow_the_position(tmp_path: Path) -> None:
     """Order the steady tabs per mode, move the configuration table and the capacity view with the mode, and number by position."""
-    frame, _grid = _steady_frame(tmp_path)
+    frame, _grid = steady_frame(tmp_path)
     titles = panel.EVALUATION_SECTION_TITLES
     single_keys = (
         "overview",
@@ -1087,6 +1294,7 @@ def test_steady_tabs_follow_the_decided_order_and_numbers_follow_the_position(tm
         "parameter_sensitivity",
         "sample_viewer",
         "outlier_analysis",
+        "runtime",
     )
     comparison_keys = (*single_keys[:2], "architecture", *single_keys[2:])
     layouts = {}
@@ -1094,7 +1302,7 @@ def test_steady_tabs_follow_the_decided_order_and_numbers_follow_the_position(tm
         (False, single_keys, {"A": frame}),
         (True, comparison_keys, {"A": frame, "B": frame.copy(deep=True)}),
     ):
-        tabs, views = _tab_layout(panel._build_panel(datasets=datasets, comparison=comparison, sections="all"))
+        tabs, views = _tab_layout(panel._build_panel(contexts=_contexts_of(datasets, comparison=comparison), comparison=comparison, sections="all"))
         assert tabs == tuple(f"{number}. {titles[key]}" for number, key in enumerate(keys, start=1))
         for number, labels in enumerate(views, start=1):
             assert all(label.startswith(f"{number}-{position}. ") for position, label in enumerate(labels, start=1))
@@ -1107,11 +1315,12 @@ def test_steady_tabs_follow_the_decided_order_and_numbers_follow_the_position(tm
     assert "Model-family configuration" in architecture[0]
     assert "Exact trainable parameters" in architecture[1]
 
-    sample_tabs, sample_views = _tab_layout(panel._build_panel(datasets={"A": frame}, comparison=False, sections=("sample_viewer",)))
+    single_context = _contexts_of({"A": frame}, comparison=False)
+    sample_tabs, sample_views = _tab_layout(panel._build_panel(contexts=single_context, comparison=False, sections=("sample_viewer",)))
     assert sample_tabs == (f"1. {titles['sample_viewer']}",)
     assert sample_views[0][0].startswith("1-1. ")
     with pytest.raises(ValueError, match="Unknown evaluation sections"):
-        panel._build_panel(datasets={"A": frame}, comparison=False, sections=("architecture",))
+        panel._build_panel(contexts=single_context, comparison=False, sections=("architecture",))
 
 
 def _loaded_artifact(frame: pd.DataFrame, root: Path) -> Any:
@@ -1128,7 +1337,7 @@ def _loaded_artifact(frame: pd.DataFrame, root: Path) -> Any:
 def _role_frame(directory: Path, case_ids: tuple[int, int], *, split_role: str = "eval") -> pd.DataFrame:
     """Return one two-case steady frame of a split role whose exact case identities are the given ones."""
     directory.mkdir()
-    frame, _grid = _steady_frame(directory)
+    frame, _grid = steady_frame(directory)
     frame["case_index"] = list(case_ids)
     frame.attrs["artifact_provenance"]["split_role"] = split_role
     frame.attrs["dataset_role"] = split_role
@@ -1188,3 +1397,202 @@ def test_steady_comparison_intersects_the_cases_within_each_role(tmp_path: Path)
     assert overlapping.capabilities.case_ids == ("2", "3", "4")
     with pytest.raises(ValueError, match="share no exact case identities"):
         bind({(first, "id"): id_frame, (second, "id"): ood_frame})
+
+
+def test_the_dataset_choice_of_one_view_reaches_the_others_through_the_selection_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deselecting a dataset in one view redraws it and is published; a view shown later takes it silently."""
+    contexts = [
+        panel.EvaluationContext(key="id", label="ID", datasets={"ID": _role_frame(tmp_path / "id", (1, 2))}),
+        panel.EvaluationContext(
+            key="material_ood", label="Material OOD", datasets={"Material OOD": _role_frame(tmp_path / "ood", (3, 4), split_role="material_ood")}
+        ),
+    ]
+    scope = panel._SteadyScope(contexts, comparison=False, refused_roles={})
+    shared = _SharedSelection()
+    drawn: list[tuple[str, ...]] = []
+    monkeypatch.setattr(analysis.ui.viewers, "render_view", lambda _view, _plot, **kwargs: drawn.append(tuple(kwargs["kwargs"]["datasets"])) or True)
+
+    def make_view() -> Any:
+        return panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=shared, export={})  # type: ignore[arg-type]
+
+    first, second = make_view(), make_view()
+    assert drawn == [("lentil, ID", "lentil, Material OOD")] * 2
+
+    ood = next(item for item in _widget_tree(first.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    ood.value = False
+    assert shared.selection.datasets == (("lentil", "id"),)
+    assert drawn[-1] == ("lentil, ID",)
+
+    second.deactivate()
+    second.activate()
+    assert drawn[-1] == ("lentil, ID",)
+    assert [item.value for item in _widget_tree(second.widget) if getattr(item, "description", None) == "lentil, Material OOD"] == [False]
+    assert shared.selection.datasets == (("lentil", "id"),)
+
+
+def test_a_case_count_viewer_rebuilt_for_other_datasets_resumes_the_count_it_showed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The count the user chose survives a dataset change, and the replaced viewer stops following the controls it shared."""
+    contexts = [
+        panel.EvaluationContext(key="id", label="ID", datasets={"ID": _role_frame(tmp_path / "id", (1, 2))}),
+        panel.EvaluationContext(
+            key="material_ood", label="Material OOD", datasets={"Material OOD": _role_frame(tmp_path / "ood", (3, 4), split_role="material_ood")}
+        ),
+    ]
+    scope = panel._SteadyScope(contexts, comparison=False, refused_roles={})
+    built: list[Any] = []
+    original = analysis.ui.viewers.case_count_view
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        built.append((kwargs.get("resume_cases"), original(*args, **kwargs)))
+        return built[-1][1]
+
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", recording)
+    view = panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=None, export={}, count=(50, 50), controls=None)
+    ((first_resume, first),) = built
+    assert first_resume is None
+    first.rows[0].children[0].children[0].value = 1
+    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    ood.value = False
+
+    assert [resume for resume, _viewer in built] == [None, 1]
+    assert not first.active
+    assert built[1][1].active
+
+
+@pytest.mark.parametrize("count", [None, (50, 50)], ids=["plain", "nested-count-viewer"])
+def test_a_view_hidden_from_inside_its_own_plot_publishes_nothing_and_draws_again_when_shown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: tuple[int, int] | None
+) -> None:
+    """A draw superseded by hiding the view leaves the plot untouched; showing the view draws the missing one, nested viewer included."""
+    contexts = [
+        panel.EvaluationContext(key="id", label="ID", datasets={"ID": _role_frame(tmp_path / "id", (1, 2))}),
+        panel.EvaluationContext(
+            key="material_ood", label="Material OOD", datasets={"Material OOD": _role_frame(tmp_path / "ood", (3, 4), split_role="material_ood")}
+        ),
+    ]
+    scope = panel._SteadyScope(contexts, comparison=False, refused_roles={})
+    hide: list[Any] = []
+
+    def plot(**_kwargs: object) -> str:
+        for view in hide:
+            view.deactivate()
+        hide.clear()
+        return "drawn"
+
+    shown = _record_shows(monkeypatch)
+    view = panel._dataset_view(scope, plot_func=plot, selection_state=None, export={}, count=count)
+    assert "drawn" in _taken(shown)
+    ood = next(item for item in _widget_tree(view.widget) if getattr(item, "description", None) == "lentil, Material OOD")
+    hide.append(view)
+    ood.value = False
+    assert "drawn" not in _taken(shown)
+    assert not view.active
+    view.activate()
+    assert "drawn" in _taken(shown)
+
+
+def _two_role_scope(tmp_path: Path) -> Any:
+    """Return the single-model scope of an ID and a material-OOD frame: two datasets (lentil, ID and lentil, Material OOD)."""
+    return panel._SteadyScope(
+        [
+            panel.EvaluationContext(key="id", label="ID", datasets={"ID": _role_frame(tmp_path / "id", (1, 2))}),
+            panel.EvaluationContext(
+                key="material_ood", label="Material OOD", datasets={"Material OOD": _role_frame(tmp_path / "ood", (3, 4), split_role="material_ood")}
+            ),
+        ],
+        comparison=False,
+        refused_roles={},
+    )
+
+
+def test_an_explicitly_empty_dataset_selection_is_shared_as_a_choice_not_as_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clearing every dataset in one view clears them in a view shown later, silently, instead of leaving its old selection."""
+    scope = _two_role_scope(tmp_path)
+    shared = _SharedSelection()
+    monkeypatch.setattr(analysis.ui.viewers, "render_view", lambda *_args, **_kwargs: True)
+
+    def make_view() -> Any:
+        return panel._dataset_view(scope, plot_func=lambda **_kwargs: None, selection_state=shared, export={})  # type: ignore[arg-type]
+
+    def boxes(view: Any) -> list[Any]:
+        return [item for item in _widget_tree(view.widget) if getattr(item, "description", None) in {"lentil, ID", "lentil, Material OOD"}]
+
+    first, second = make_view(), make_view()
+    assert shared.selection.datasets is None
+    for box in boxes(first):
+        box.value = False
+    assert shared.selection.datasets == ()
+
+    second.deactivate()
+    second.activate()
+    assert [box.value for box in boxes(second)] == [False, False]
+    assert shared.selection.datasets == ()
+
+
+def test_a_counted_view_hidden_and_shown_again_still_follows_its_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hiding the view supersedes its render; the viewer nested in it is bound to the render shown again and draws what changed meanwhile."""
+    scope = _two_role_scope(tmp_path)
+    built: list[Any] = []
+    original = analysis.ui.viewers.case_count_view
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        built.append(original(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(analysis.ui.viewers, "case_count_view", recording)
+    shown = _record_shows(monkeypatch)
+    view = panel._dataset_view(scope, plot_func=lambda **_kwargs: "drawn", selection_state=None, export={}, count=(50, 50))
+    (nested,) = built
+    _taken(shown)
+
+    view.deactivate()
+    nested.rows[0].children[0].children[0].value = 1  # a count change made while hidden is held back
+    assert "drawn" not in _taken(shown)
+    view.activate()
+    assert "drawn" in _taken(shown)
+    nested.rows[0].children[0].children[0].value = 2
+    assert "drawn" in _taken(shown)
+    assert len(built) == 1
+
+
+def test_the_outlier_view_offers_its_reference_and_names_the_export_by_the_selection_it_plots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With two cases the plot still offers the two worst and the reference; the file name says which one, not a frame row."""
+    frame, _grid = steady_frame(tmp_path)
+    monkeypatch.setattr(analysis.evaluation.plots.samples_outliers, "plot_linked_outlier_cases", lambda **_kwargs: None)
+    registry = panel._build_sections(_scope({"Steady fixture": frame}, comparison=False), comparison=False)
+    ((title, factory, _stem),) = [
+        entry for entries, _name in registry.values() for entry in entries if entry[0] == "Worst per-channel cases (field plots)"
+    ]
+    state: dict[str, Any] = {"fig": None}
+
+    view = analysis.ui.notebook._invoke_dropdown_entry(factory, export_state=state, export_plot_name=title, export_title=title)
+
+    case_field = view.rows[1].children[0].children[0]
+    assert "worst_1" in state["filename_stem"]
+    case_field.value = _CASE_COUNT + 1
+    assert case_field.value == _CASE_COUNT + 1
+    assert state["filename_stem"].split("__")[3] == "reference"
+    case_field.value = _CASE_COUNT
+    assert state["filename_stem"].split("__")[3] == f"worst_{_CASE_COUNT}"
+
+
+def test_a_steady_role_without_a_shared_case_is_refused_alone(tmp_path: Path) -> None:
+    """Both runs keep the ID role while their disjoint material-OOD cases refuse that role with its reason."""
+    id_frame = _role_frame(tmp_path / "id", (1, 2))
+    ood_frames = (
+        _role_frame(tmp_path / "ood_first", (3, 4), split_role="material_ood"),
+        _role_frame(tmp_path / "ood_second", (5, 6), split_role="material_ood"),
+    )
+
+    def loaded(ood_frame: pd.DataFrame, run_dir: Path) -> Any:
+        artifacts = {"id": SimpleNamespace(frame=id_frame), "material_ood": SimpleNamespace(frame=ood_frame)}
+        return SimpleNamespace(artifact=artifacts.get, run_dir=run_dir)
+
+    runs = (loaded(ood_frames[0], tmp_path / "first"), loaded(ood_frames[1], tmp_path / "second"))
+    roles, refused = analysis.evaluation.workflow._admit_roles(("id", "material_ood", "parameter_ood"), runs, task="steady_flow")
+
+    assert roles == ("id",)
+    assert set(refused) == {"material_ood"}
+    assert "share no exact case identities" in refused["material_ood"]

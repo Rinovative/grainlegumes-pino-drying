@@ -3,7 +3,8 @@
 Provides:
 - factory: semantic training-loss construction
 - pino: physics-informed loss composition
-- transient: transient drying loss computation
+- state: group-weighted MSE or absolute H1 state loss of both tasks
+- transient: transient drying loss composition
 """
 
 from __future__ import annotations
@@ -14,14 +15,16 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from . import learning_losses_factory as factory
     from . import learning_losses_pino as pino
+    from . import learning_losses_state as state
     from . import learning_losses_transient as transient
 
 _MODULES = {
     "factory": "learning_losses_factory",
     "pino": "learning_losses_pino",
+    "state": "learning_losses_state",
     "transient": "learning_losses_transient",
 }
-__all__ = ["factory", "pino", "transient"]
+__all__ = ["factory", "pino", "state", "transient"]
 
 
 def __getattr__(name: str) -> object:

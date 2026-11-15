@@ -29,7 +29,7 @@ from src.learning.transient import learning_transient_rollout as rollout
 def test_representative_semantic_identifiers_resolve() -> None:
     """Resolve one supported identifier through each public semantic registry."""
     assert learning.models.factory.resolve_model_kind("fno").kind == "fno"
-    assert learning.losses.factory.resolve_data_loss_kind("relative_h1").kind == "relative_h1"
+    assert learning.losses.factory.resolve_data_loss_kind("h1") == "h1"
     assert learning.metrics.metrics.resolve_metric_kind("rmse").direction == "minimize"
     assert domain.tasks.registry.resolve_physics("steady_2d_brinkman").kind == "steady_2d_brinkman"
 
@@ -442,7 +442,7 @@ def test_rno_production_step_carry_equals_the_full_sequence_recurrence() -> None
             hidden = rollout.detach_hidden(hidden)
             snapshots[step + 1] = hidden
     torch.testing.assert_close(prediction, full)
-    selected = rollout.select_hidden_per_sample(snapshots, torch.tensor([3, 5]))
+    selected = rollout.select_hidden_per_sample(snapshots, [3, 5])
     assert isinstance(selected, list)
     for carried, early, late in zip(selected, early_hidden, full_hidden, strict=True):
         torch.testing.assert_close(model.domain_padding.unpad(carried), torch.stack([early[0], late[1]]))

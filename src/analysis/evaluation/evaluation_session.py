@@ -12,6 +12,7 @@ Design principles:
   - ID, OOD, run, checkpoint, normalizer, and payload identities remain separate
   - Exact spatial quantiles use bounded session-owned scratch, not case retention
   - Local-error curves use one bounded empirical-quantile definition
+  - A case whose reference RMS lies below the field's floor has no local relative error; it is counted, never stabilised
   - Direct plot calls receive a scoped ephemeral session without global state
 
 This module does NOT:
@@ -21,7 +22,7 @@ This module does NOT:
 
 Notes:
   Session lifecycle:
-    - Bind provenance-complete frames directly or from strict loaded-run results.
+    - Bind provenance-complete frames directly or from strict loaded-run results; bind_cut binds a dataset cut of a bound frame once.
     - Use load_case for immutable selected cases, full_summary for full-membership or bounded all-field spatial reductions, and prefix_summary for
       deterministic saved-order prefix diagnostics.
     - Close explicitly or use context management to detach frames, release caches, and remove session scratch.
@@ -49,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Self, cast
 
 import numpy as np
 
+from src import common
 from src.analysis.evaluation import evaluation_case as cases
 from src.analysis.evaluation import evaluation_dataframe as dataframe
 from src.analysis.evaluation import evaluation_prediction_validity as validity_contract
@@ -95,11 +97,9 @@ __all__ = [
     "scoped_session",
 ]
 
-_LOCAL_DENOMINATOR_FLOOR = 1e-12
 _TARGET_BIN_COUNT = 12
 _BOUNDARY_BIN_COUNT = 10
 _BOUNDARY_REGION_EDGES = (0.0, 0.05, 0.10, 0.20, 0.40, 1.0)
-_REFERENCE_ENERGY_FLOOR = 1e-12
 _MIN_SPECTRAL_SIZE = 2
 
 
@@ -220,7 +220,13 @@ class GridDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class FullMagnitudeSummary:
-    """Store complete spatial reductions for one TaskSpec vector-group magnitude."""
+    """
+    Store complete spatial reductions for one TaskSpec vector-group magnitude.
+
+    ``local_relative_error_mean`` averages only the cases whose magnitude reference RMS
+    reaches the largest component floor (all NaN when none does);
+    ``local_relative_unavailable_cases`` counts the others.
+    """
 
     component_fields: tuple[str, ...]
     unit: str
@@ -229,6 +235,7 @@ class FullMagnitudeSummary:
     signed_error_mean: np.ndarray
     absolute_error_mean: np.ndarray
     local_relative_error_mean: np.ndarray
+    local_relative_unavailable_cases: int
     signed_error_std: np.ndarray
     absolute_error_q90: np.ndarray
     case_reference_means: np.ndarray
@@ -250,6 +257,11 @@ class FullEvaluationSummary:
         Pointwise complete-membership learned-field means.
     signed_error_mean, absolute_error_mean : numpy.ndarray | None
         Pointwise signed and absolute error means.
+    local_relative_error_mean : numpy.ndarray | None
+        Pointwise mean of ``|error|`` over the case's reference RMS of the field, over only
+        the cases whose reference RMS reaches the field's floor; all NaN for a field without one.
+    local_relative_unavailable_cases : numpy.ndarray | None
+        Per-field number of cases below the field's reference floor.
     signed_error_std, absolute_error_q90 : numpy.ndarray | None
         Pointwise signed-error standard deviation and exact q90 absolute error.
     case_reference_means, case_prediction_means : numpy.ndarray
@@ -272,6 +284,7 @@ class FullEvaluationSummary:
     signed_error_mean: np.ndarray | None
     absolute_error_mean: np.ndarray | None
     local_relative_error_mean: np.ndarray | None
+    local_relative_unavailable_cases: np.ndarray | None
     signed_error_std: np.ndarray | None
     absolute_error_q90: np.ndarray | None
     case_reference_means: np.ndarray
@@ -354,11 +367,13 @@ class EmpiricalQuantileSummary:
     definition : str
         Stable named numerical definition.
     probabilities, quantiles : numpy.ndarray
-        Fixed probability grid and aligned linear empirical quantiles.
+        Fixed probability grid and aligned linear empirical quantiles; NaN without a point.
     source_point_count : int
         Exact number of grid points represented.
     exact_minimum, exact_maximum : float
-        Exact empirical endpoints retained independently for disclosure.
+        Exact empirical endpoints retained independently for disclosure; NaN without a point.
+    unavailable_case_count : int
+        Cases left out because their reference RMS lies below the field's floor.
 
     """
 
@@ -368,6 +383,7 @@ class EmpiricalQuantileSummary:
     source_point_count: int
     exact_minimum: float
     exact_maximum: float
+    unavailable_case_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -667,6 +683,29 @@ def _artifact_key(frame: pd.DataFrame) -> ArtifactKey:
         manifest_digest=manifest_digest,
         frame_digest=frame_digest,
     )
+
+
+def _require_unchanged_cut(registered: pd.DataFrame, fresh: pd.DataFrame) -> None:
+    """
+    Refuse a registered dataset cut whose rows or any attr of the freshly built cut changed after binding.
+
+    Attrs the fresh cut lacks (the session reference and caches consumers add) are ignored. Attr values are compared
+    through one canonical digest, so NaN and nested containers compare stably.
+
+    Raises
+    ------
+    EvaluationArtifactChangedError
+        If the rows differ, or an attr of the fresh cut is missing or different on the registered cut.
+
+    """
+    canonical = common.serialization.canonical_json_sha256
+    if (
+        not registered.equals(fresh)
+        or not fresh.attrs.keys() <= registered.attrs.keys()
+        or canonical(_jsonable({key: registered.attrs[key] for key in fresh.attrs})) != canonical(_jsonable(fresh.attrs))
+    ):
+        msg = "A bound dataset cut changed after binding. Reload the run into a new session."
+        raise EvaluationArtifactChangedError(msg)
 
 
 def _payload_paths(frame: pd.DataFrame) -> tuple[Path, ...]:
@@ -1141,37 +1180,39 @@ def _binned_median(x_values: np.ndarray, y_values: np.ndarray, *, bins: int) -> 
     )
 
 
-def _empirical_quantiles(values: np.ndarray) -> EmpiricalQuantileSummary:
+def _empirical_quantiles(values: np.ndarray, *, unavailable_case_count: int) -> EmpiricalQuantileSummary:
     """
     Build the bounded local-error quantile representation.
 
     Parameters
     ----------
     values : numpy.ndarray
-        Finite non-empty local relative-error population.
+        Finite local relative-error population of the cases at or above the field's floor.
+    unavailable_case_count : int
+        Cases left out below the field's floor.
 
     Returns
     -------
     EmpiricalQuantileSummary
-        Fixed-grid linear quantiles plus exact population size and endpoints.
+        Fixed-grid linear quantiles plus exact population size and endpoints; NaN
+        quantiles and endpoints when no case reaches the floor.
 
     Raises
     ------
     ValueError
-        If the supplied population is empty or contains non-finite values.
+        If the supplied population contains non-finite values.
 
     """
     numeric = np.asarray(values, dtype=float).ravel()
-    if numeric.size == 0 or not np.isfinite(numeric).all():
-        msg = "Local relative-error values must be finite and non-empty."
+    if not np.isfinite(numeric).all():
+        msg = "Local relative-error values must be finite."
         raise ValueError(msg)
-    quantiles = np.quantile(
-        numeric,
-        LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES,
-        method="linear",
-    )
-    quantiles[0] = float(np.min(numeric))
-    quantiles[-1] = float(np.max(numeric))
+    if numeric.size:
+        quantiles = np.quantile(numeric, LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES, method="linear")
+        quantiles[0] = float(np.min(numeric))
+        quantiles[-1] = float(np.max(numeric))
+    else:
+        quantiles = np.full(LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES.shape, np.nan, dtype=np.float64)
     return EmpiricalQuantileSummary(
         definition=LOCAL_EMPIRICAL_QUANTILE_DEFINITION,
         probabilities=LOCAL_EMPIRICAL_QUANTILE_PROBABILITIES,
@@ -1179,6 +1220,7 @@ def _empirical_quantiles(values: np.ndarray) -> EmpiricalQuantileSummary:
         source_point_count=int(numeric.size),
         exact_minimum=float(quantiles[0]),
         exact_maximum=float(quantiles[-1]),
+        unavailable_case_count=unavailable_case_count,
     )
 
 
@@ -1267,6 +1309,8 @@ class EvaluationSession:
         self._closed = False
         self._bindings: dict[int, _Binding] = {}
         self._canonical_frames: dict[tuple[str, str], pd.DataFrame] = {}
+        # Dataset cuts of bound frames, apart from the canonical frames: a pooled cut has the membership of its source.
+        self._cuts: dict[ArtifactKey, pd.DataFrame] = {}
         self._case_cache: OrderedDict[tuple[ArtifactKey, int], _CacheEntry] = OrderedDict()
         self._aggregate_cache: OrderedDict[tuple[Any, ...], _CacheEntry] = OrderedDict()
         self._case_bytes = 0
@@ -1294,7 +1338,12 @@ class EvaluationSession:
             "spill_bytes_peak": 0,
         }
         if datasets is not None:
-            self.bind(datasets)
+            try:
+                self.bind(datasets)
+            except Exception:
+                # Release the frames bound so far and the scratch directory; nobody else holds this session.
+                self.close()
+                raise
 
     @classmethod
     def from_loaded_runs(
@@ -1403,7 +1452,7 @@ class EvaluationSession:
         Returns
         -------
         collections.abc.Mapping
-            Exact ``(run_name, split_role)`` bindings. Display labels are absent.
+            Exact ``(run_name, split_role)`` bindings. Display labels and dataset cuts are absent.
 
         Raises
         ------
@@ -1569,24 +1618,70 @@ class EvaluationSession:
 
         """
         with self._lock:
-            self._require_open()
-            existing = frame.attrs.get(SESSION_ATTR)
-            if existing is not None and existing is not self and not getattr(existing, "closed", False):
-                msg = "Evaluation frame is already bound to another live session."
-                raise ValueError(msg)
-            key = _artifact_key(frame)
-            token = _digest(_frame_identity_payload(frame))
-            binding = _Binding(frame=frame, key=key, frame_token=token, witnesses=_witnesses(frame))
+            key = self._attach(frame)
             canonical_key = (key.run_name, key.split_role)
             existing_frame = self._canonical_frames.get(canonical_key)
             if existing_frame is not None and existing_frame is not frame:
                 msg = f"Canonical evaluation run-role key is already bound: {canonical_key!r}."
                 raise ValueError(msg)
-            self._bindings[id(frame)] = binding
+            self._register(frame, key)
             self._canonical_frames[canonical_key] = frame
-            frame.attrs[SESSION_ATTR] = self
-            frame.attrs[SESSION_KEY_ATTR] = key.token
             return key
+
+    def bind_cut(self, source: pd.DataFrame, cut: pd.DataFrame) -> pd.DataFrame:
+        """
+        Bind one dataset cut of a frame this session owns, once per exact artifact key.
+
+        Parameters
+        ----------
+        source : pandas.DataFrame
+            Frame bound to this session that the cut was taken from.
+        cut : pandas.DataFrame
+            Provenance-complete cut of ``source`` that no session owns yet.
+
+        Returns
+        -------
+        pandas.DataFrame
+            The cut already registered under an equal artifact key, else ``cut`` itself, now bound.
+
+        Raises
+        ------
+        EvaluationSessionClosedError
+            If the session is closed.
+        ValueError
+            If ``source`` is not bound to this session or another live session owns ``cut``.
+        EvaluationArtifactChangedError
+            If the source identity or one of its payload witnesses changed, or the registered cut changed after binding.
+        TypeError, ComparisonCompatibilityError
+            If the cut lacks complete completed-run provenance.
+
+        """
+        with self._lock:
+            self._binding(source)
+            registered = self._cuts.get(_artifact_key(cut))
+            if registered is not None:
+                _require_unchanged_cut(registered, cut)
+                return registered
+            key = self._attach(cut)
+            self._register(cut, key)
+            self._cuts[key] = cut
+            return cut
+
+    def _attach(self, frame: pd.DataFrame) -> ArtifactKey:
+        """Return the artifact key of a frame no other live session owns, while this session is open."""
+        self._require_open()
+        existing = frame.attrs.get(SESSION_ATTR)
+        if existing is not None and existing is not self and not getattr(existing, "closed", False):
+            msg = "Evaluation frame is already bound to another live session."
+            raise ValueError(msg)
+        return _artifact_key(frame)
+
+    def _register(self, frame: pd.DataFrame, key: ArtifactKey) -> None:
+        """Record the binding of one frame under its key and attach this session to its attrs."""
+        token = _digest(_frame_identity_payload(frame))
+        self._bindings[id(frame)] = _Binding(frame=frame, key=key, frame_token=token, witnesses=_witnesses(frame))
+        frame.attrs[SESSION_ATTR] = self
+        frame.attrs[SESSION_KEY_ATTR] = key.token
 
     def _binding(self, frame: pd.DataFrame) -> _Binding:
         """
@@ -1874,6 +1969,13 @@ class EvaluationSession:
         magnitude_reference_sum = np.zeros((magnitude_count, height, width), dtype=np.float64)
         magnitude_prediction_sum = np.zeros((magnitude_count, height, width), dtype=np.float64)
         local_relative_error_sum = np.zeros((summary_field_count, height, width), dtype=np.float64)
+        local_relative_supported = np.zeros(summary_field_count, dtype=np.int64)
+        # A case below a field's reference floor has no relative error for it: left out of the mean and counted.
+        reference_floors = np.asarray(
+            [dataframe.reference_floor(frame, (field,)) for field in first.fields]
+            + [dataframe.reference_floor(frame, component_fields) for _group_id, component_fields, _indices, _unit in magnitude_specs],
+            dtype=np.float64,
+        )
         case_reference_means = np.empty((count, field_count), dtype=np.float64)
         case_prediction_means = np.empty((count, field_count), dtype=np.float64)
         case_magnitude_reference_means = np.empty((count, magnitude_count), dtype=np.float64)
@@ -1915,15 +2017,12 @@ class EvaluationSession:
                 prediction_sum[:] += case.prediction
                 magnitude_reference_sum[:] += magnitude_reference
                 magnitude_prediction_sum[:] += magnitude_prediction
-                error_store[position, :field_count] = case.error
-                error_store[position, field_count:] = magnitude_prediction - magnitude_reference
-                field_rms = np.sqrt(np.mean(case.reference**2, axis=(1, 2)))
-                local_relative_error_sum[:field_count] += np.abs(case.error) / (field_rms[:, None, None] + _LOCAL_DENOMINATOR_FLOOR)
-                if magnitude_count:
-                    magnitude_rms = np.sqrt(np.mean(magnitude_reference**2, axis=(1, 2)))
-                    local_relative_error_sum[field_count:] += np.abs(magnitude_prediction - magnitude_reference) / (
-                        magnitude_rms[:, None, None] + _LOCAL_DENOMINATOR_FLOOR
-                    )
+                case_error = np.concatenate((case.error, magnitude_prediction - magnitude_reference))
+                error_store[position] = case_error
+                reference_rms = np.sqrt(np.mean(np.concatenate((case.reference, magnitude_reference)) ** 2, axis=(1, 2)))
+                supported = reference_rms >= reference_floors
+                local_relative_error_sum[supported] += np.abs(case_error[supported]) / reference_rms[supported, None, None]
+                local_relative_supported[:] += supported
             if residual_error is None:
                 if set(case.residuals) != required_residuals or not compatible:
                     residual_error = "Spatial residual aggregation requires identical full grids and array semantics."
@@ -1966,7 +2065,12 @@ class EvaluationSession:
                     all_absolute_q90.reshape(summary_field_count, -1)[:, block_start:block_stop] = np.quantile(absolute, 0.9, axis=0)
                 signed_mean: np.ndarray | None = all_signed_mean[:field_count]
                 absolute_mean: np.ndarray | None = all_absolute_mean[:field_count]
-                local_relative_mean: np.ndarray | None = local_relative_error_sum[:field_count] / count
+                all_local_relative_mean = np.full_like(local_relative_error_sum, np.nan)
+                with_support = local_relative_supported > 0
+                all_local_relative_mean[with_support] = local_relative_error_sum[with_support] / local_relative_supported[with_support, None, None]
+                local_relative_unavailable = count - local_relative_supported
+                local_relative_mean: np.ndarray | None = all_local_relative_mean[:field_count]
+                local_relative_unavailable_fields: np.ndarray | None = local_relative_unavailable[:field_count]
                 signed_std: np.ndarray | None = all_signed_std[:field_count]
                 absolute_q90: np.ndarray | None = all_absolute_q90[:field_count]
                 magnitude_reference_mean = magnitude_reference_sum / count
@@ -1979,7 +2083,8 @@ class EvaluationSession:
                         prediction_mean=_readonly(magnitude_prediction_mean[index]),
                         signed_error_mean=_readonly(all_signed_mean[field_count + index]),
                         absolute_error_mean=_readonly(all_absolute_mean[field_count + index]),
-                        local_relative_error_mean=_readonly(local_relative_error_sum[field_count + index] / count),
+                        local_relative_error_mean=_readonly(all_local_relative_mean[field_count + index]),
+                        local_relative_unavailable_cases=int(local_relative_unavailable[field_count + index]),
                         signed_error_std=_readonly(all_signed_std[field_count + index]),
                         absolute_error_q90=_readonly(all_absolute_q90[field_count + index]),
                         case_reference_means=_readonly(case_magnitude_reference_means[:, index]),
@@ -1989,6 +2094,7 @@ class EvaluationSession:
                 }
             else:
                 reference_mean = prediction_mean = signed_mean = absolute_mean = local_relative_mean = signed_std = absolute_q90 = None
+                local_relative_unavailable_fields = None
                 magnitude_summaries = {}
         finally:
             error_store.flush()
@@ -2019,6 +2125,7 @@ class EvaluationSession:
             signed_error_mean=None if signed_mean is None else _readonly(signed_mean),
             absolute_error_mean=None if absolute_mean is None else _readonly(absolute_mean),
             local_relative_error_mean=None if local_relative_mean is None else _readonly(local_relative_mean),
+            local_relative_unavailable_cases=None if local_relative_unavailable_fields is None else _readonly(local_relative_unavailable_fields),
             signed_error_std=None if signed_std is None else _readonly(signed_std),
             absolute_error_q90=None if absolute_q90 is None else _readonly(absolute_q90),
             case_reference_means=_readonly(case_reference_means),
@@ -2173,6 +2280,7 @@ class EvaluationSession:
             def reduce_field(
                 reference: np.ndarray,
                 error: np.ndarray,
+                reference_floor: float,
             ) -> tuple[
                 EmpiricalQuantileSummary,
                 BinnedMedianSummary,
@@ -2180,10 +2288,11 @@ class EvaluationSession:
                 BinnedMeanSummary,
                 SpectralFieldSummary,
             ]:
-                """Reduce one learned field or canonical vector magnitude."""
+                """Reduce one learned field or canonical vector magnitude; local relative errors only at or above its floor."""
                 reference_rms = np.sqrt(np.mean(reference**2, axis=(1, 2)))
-                local_values = np.abs(error) / (reference_rms[:, None, None] + _LOCAL_DENOMINATOR_FLOOR)
-                local_summary = _empirical_quantiles(local_values)
+                supported = reference_rms >= reference_floor
+                local_values = np.abs(error[supported]) / reference_rms[supported, None, None]
+                local_summary = _empirical_quantiles(local_values, unavailable_case_count=int(np.count_nonzero(~supported)))
                 target_summary = _binned_median(np.abs(reference), np.abs(error), bins=_TARGET_BIN_COUNT)
                 boundary_summary = _binned_median(distances, np.abs(error), bins=_BOUNDARY_BIN_COUNT)
                 boundary_region_summary = _boundary_region_mean(boundary_fractions, np.abs(error))
@@ -2215,6 +2324,7 @@ class EvaluationSession:
                 reductions = reduce_field(
                     np.asarray(references[:, field_index]),
                     np.asarray(errors[:, field_index]),
+                    dataframe.reference_floor(frame, (field,)),
                 )
                 local[field], target[field], boundary[field], boundary_regions[field], spectra[field] = reductions
 
@@ -2224,7 +2334,9 @@ class EvaluationSession:
                 magnitude_reference = np.sqrt(np.sum(np.asarray(references[:, component_indices]) ** 2, axis=1))
                 component_prediction = np.asarray(references[:, component_indices]) + np.asarray(errors[:, component_indices])
                 magnitude_prediction = np.sqrt(np.sum(component_prediction**2, axis=1))
-                reductions = reduce_field(magnitude_reference, magnitude_prediction - magnitude_reference)
+                reductions = reduce_field(
+                    magnitude_reference, magnitude_prediction - magnitude_reference, dataframe.reference_floor(frame, component_fields)
+                )
                 magnitude_summaries[group_id] = PrefixMagnitudeSummary(
                     component_fields=component_fields,
                     unit=unit,
@@ -2279,6 +2391,7 @@ class EvaluationSession:
             self._spill_bytes = 0
             self._bindings.clear()
             self._canonical_frames.clear()
+            self._cuts.clear()
             self._temporary.cleanup()
             self._closed = True
 

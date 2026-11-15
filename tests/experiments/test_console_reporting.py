@@ -1,7 +1,7 @@
 """Protect the information content and redaction of the console reporting.
 
 Responsibilities:
-  - Check the run start block, the epoch line, the end line, the startup line and the Optuna lines
+  - Check the run start block, the event line, the end line, the startup line and the Optuna lines
   - Check that paths are relative to the storage root and credentials never reach diagnostics
 
 Design principles:
@@ -39,9 +39,9 @@ def test_run_lines_carry_progress_information_with_storage_relative_paths(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Show start block, epoch lines, and the end line without absolute paths."""
+    """Show start block, event lines with budget progress and point, and the end line without absolute paths."""
     reporter = _reporter(tmp_path, monkeypatch)
-    target = reporter.config["training"]["epochs"]
+    budget_epochs = reporter.config["training"]["budget_epochs"]
     reporter.startup(resolved_device="cpu")
     start_lines = capsys.readouterr().out.splitlines()
     assert len(start_lines) <= 4
@@ -49,31 +49,38 @@ def test_run_lines_carry_progress_information_with_storage_relative_paths(
     assert "cpu" in start_lines[0]
     assert "new run" in start_lines[0]
     assert f"seed {reporter.config['run']['seed']}" in start_lines[0]
+    assert any(f"budget {budget_epochs} epochs" in line for line in start_lines)
 
-    reporter.epoch(
-        2,
+    reporter.event(
+        7,
         {
+            "epoch": 2.0,
+            "budget/progress": 0.5,
+            "validation/point": 10.0,
             "train/loss_total": 0.03215,
             "train/loss_data": 0.03215,
             f"id/{reporter.objective_id}": 0.01234,
             "checkpoint/new_best": 1.0,
             "optimization/learning_rate": 3.88e-4,
-            "system/epoch_duration_seconds": 12.8,
+            "system/event_duration_seconds": 12.8,
             "system/train_duration_seconds": 10.0,
             "system/id_evaluation_duration_seconds": 2.0,
             "system/train_samples_per_second": 45.0,
         },
     )
-    reporter.epoch(3, {"train/loss_total": 0.03, "train/loss_data": 0.03, "optimization/learning_rate": 3.88e-4})
-    reporter.startup_phase("training_start", {"batches_per_epoch": 1})
-    reporter.final({"best_epoch": 2, "completed_epoch": 3, "best_metric": 0.01234}, total_wall_seconds=125.0)
+    plain_event = {"epoch": 3.0, "budget/progress": 0.55, "train/loss_total": 0.03, "train/loss_data": 0.03, "optimization/learning_rate": 3.88e-4}
+    reporter.event(8, plain_event)
+    reporter.startup_phase("training_start", {"updates_per_epoch": 1})
+    budget = {"unit": "units", "total": 40, "units": 40, "train_seconds": 9.5, "validated_point": 20, "skipped_points": []}
+    reporter.final({"best_epoch": 2, "completed_epoch": 3, "best_metric": 0.01234, "budget": budget}, total_wall_seconds=125.0)
     evaluated, plain, _startup, end = capsys.readouterr().out.splitlines()
-    for expected in (f"2/{target}", "loss 3.215e-02", "val 1.234e-02 *best", "lr 3.88e-04", "13 s", "45.0 samples/s"):
+    for expected in ("epoch 2", "step 7", "50.0%", "point 10/20", "loss 3.215e-02", "val 1.234e-02 *best", "lr 3.88e-04", "13 s", "45.0 units/s"):
         assert expected in evaluated
     assert "val" not in plain
+    assert "point" not in plain
     assert "[" not in evaluated  # a single loss term is not repeated as a component
     for expected in (
-        f"completed after 3 of {target} epochs (epoch budget)",
+        "completed after 3 epochs (40 of 40 units)",
         "best epoch 2",
         reporter.objective_id,
         "total 2 min 05 s (startup 0 s, training 10 s, validation 2 s, other 1 min 53 s)",
@@ -100,13 +107,13 @@ def test_end_line_names_a_measured_train_seconds_budget_as_the_stop_reason(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A matched stage that stops on its measured budget says so, with the epochs it ran of those it could run."""
+    """A matched stage that stops on its measured budget says so, with the optimisation seconds it spent of its budget."""
     reporter = _reporter(tmp_path, monkeypatch)
-    target = reporter.config["training"]["epochs"]
+    budget = {"unit": "train_seconds", "total": 10.0, "units": 12, "train_seconds": 10.2, "validated_point": 20, "skipped_points": []}
 
-    reporter.final({"best_epoch": 3, "completed_epoch": 3, "best_metric": 0.5, "target_train_seconds": 10.0}, total_wall_seconds=30.0)
+    reporter.final({"best_epoch": 3, "completed_epoch": 3, "best_metric": 0.5, "budget": budget}, total_wall_seconds=30.0)
 
-    assert f"completed after 3 of {target} epochs (train_seconds budget 10 s)" in capsys.readouterr().out
+    assert "completed after 3 epochs (10 s of 10 s train_seconds)" in capsys.readouterr().out
 
 
 def test_loss_components_share_the_epoch_line_only_when_several_remain(
@@ -116,7 +123,7 @@ def test_loss_components_share_the_epoch_line_only_when_several_remain(
 ) -> None:
     """Append compact components when more than the total loss exists."""
     reporter = _reporter(tmp_path, monkeypatch)
-    reporter.epoch(1, {"train/loss_total": 0.03, "train/loss_data": 0.03, "train/loss_data_T": 0.0168, "train/loss_data_phi": 0.015})
+    reporter.event(1, {"train/loss_total": 0.03, "train/loss_data": 0.03, "train/loss_data_T": 0.0168, "train/loss_data_phi": 0.015})
 
     line = capsys.readouterr().out
     assert len(line.splitlines()) == 1
@@ -139,10 +146,10 @@ def test_startup_phases_print_one_line_and_failures_name_the_last_phase(
     assert "scaler_cache" in stopped
     assert "boom" in stopped
 
-    reporter.startup_phase("training_start", {"batches_per_epoch": 76})
+    reporter.startup_phase("training_start", {"updates_per_epoch": 76})
     line = capsys.readouterr().out
     assert len(line.splitlines()) == 1
-    for expected in ("startup", "2 Train cases", "152 items", "126x201", "scaler hit", "76 batches/epoch"):
+    for expected in ("startup", "2 Train cases", "152 items", "126x201", "scaler hit", "76 updates/epoch"):
         assert expected in line
 
 
@@ -181,22 +188,25 @@ def test_optuna_lines_report_each_finished_trial_and_the_study_end(capsys: pytes
     assert "pruned@5" in pruned
     assert captured.err == ""
 
+    experiments.console.optuna_trial_event("diverged", trial=4, sampled=sampled, duration_seconds=1.0, objective=0.9, step=3)
     experiments.console.optuna_trial_event("failed", trial=3, sampled=sampled, duration_seconds=1.0)
-    assert "trial   3  failed" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "diverged@3" in captured.out
+    assert "trial   3  failed" in captured.err
 
     experiments.console.optuna_study_event(
         "completed",
         study="fno_search",
-        attempted_trials=3,
-        completed_trials=1,
-        pruned_trials=1,
-        failed_trials=1,
+        attempted_trials=4,
+        trial_counts={"completed": 1, "pruned": 1, "diverged": 1, "no_eligible_checkpoint": 0, "failed": 1},
         best_trial=1,
         best_objective=1.379134,
         best_parameters=sampled,
         duration_seconds=590.0,
+        study_seconds=1200.0,
         storage="sqlite://<configured>",
     )
     study = capsys.readouterr().out
-    for expected in ("fno_search", "3 trials", "1 pruned", "best trial 1", "batch=16"):
+    for expected in ("fno_search", "4 trials", "1 pruned, 1 diverged, 1 failed", "best trial 1", "study 20 min", "batch=16"):
         assert expected in study
+    assert "no_eligible_checkpoint" not in study

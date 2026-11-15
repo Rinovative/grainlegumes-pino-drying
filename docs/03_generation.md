@@ -54,7 +54,7 @@ Options of `run`: `--materials`, `--duration-hours`, `--revision`, `--max-admiss
 | `--duration-hours` | Physical horizon; regular output intervals must stay exact | none: the `time` horizon of `configs/01_generation/physical_model/common.yaml` applies |
 | `--revision LABEL` | Source campaigns only: names the Source `SOURCE_NAME__rev-LABEL` beside the existing one when its science changed ([Revision rule](07_reproducibility_and_validation.md#revision-rule)) | none: no revision (unless the campaign config authors `revision`) |
 | `--max-admission-cases` | Distinct fresh solver candidates, recorded and fixed; input preparation still covers the full design ([Replacements](#replacements)) | none: a campaign without a plan records `run.max_admission_cases` of `execution.yaml` (4); a Dataset plan run derives it from the plan rates; a value below 1 is refused |
-| `--node-jobs` | Node-job slots the run may use (1 to 4; a per-user cap on the five shared 32-core nodes, so use 3 or 4 only when they are quiet); with `--cores-per-case` k it caps the concurrent cases at slots × floor(32/k) | `run.node_jobs` of `execution.yaml` (2) |
+| `--node-jobs` | Node-job slots the run may use (1 to 4; a per-user cap on the shared `standard` nodes); with `--cores-per-case` k it caps the concurrent cases at slots × floor(`site.cores_per_node`/k) | `run.node_jobs` of `execution.yaml` (4) |
 | `--cores-per-case` | CPUs per case (k) | `run.cores_per_case` of `execution.yaml` (4) |
 | `--case-timeout-seconds` | Solver runtime limit | `run.timeout_seconds` of `execution.yaml` (3600) |
 | `--no-retry` | No licence retries (neither the node wait nor the retry within an allocation) | off: `rules.license_wait.enabled` of `execution.yaml` (`true`) applies |
@@ -111,12 +111,13 @@ stateDiagram-v2
 | --- | --- | --- |
 | Case timeout | 3600 s | The orderly stop starts 300 s earlier (after 55 minutes); each case has an outer time limit of the timeout plus 600 s for publication |
 | Stall rule `rules.stall_stop` | `minimum_simulated_seconds` 3600 s, `check_after_seconds` 900 s | Stops a transient case whose COMSOL simulated time is still below the minimum after 900 s of solving |
-| `run.cores_per_case` k | 4 | Eight cases run at a time per node |
-| `run.node_jobs` | 2, at most 4 | Per-user cap on the five shared 32-core `standard` nodes that leaves one node free; the batch licence counts once per user and does not limit it (see [Retention and licence](#retention-and-licence)) |
+| `site.cores_per_node` | 16 | CPUs of one node job; a 16-core job fits into the gaps that other users' small jobs leave on the shared `standard` nodes, where a whole free 32-core node took more than a day on 12 November 2026 |
+| `run.cores_per_case` k | 4 | Four cases run at a time per node job |
+| `run.node_jobs` | 4, at most 4 | Per-user cap across all Generation runs, 64 cores in total; the batch licence counts once per user and does not limit it (see [Retention and licence](#retention-and-licence)) |
 | `node_job.memory_per_case` | 20G, provisional | The largest observed transient case peak was 15.8 GB |
 | `node_job.node_job_wall_time` | see file | Wall limit of a node job |
-| Derived `concurrent_cases_per_node` | floor(32/k) | Computed by the loader |
-| Derived `node_job_memory` | floor(32/k) × `memory_per_case` + `node_memory_overhead` | A configuration that would exceed `node_memory_limit` is rejected instead of lowering the concurrency; k = 2 needs 328G and therefore runs only on the 514 GB nodes |
+| Derived `concurrent_cases_per_node` | floor(`site.cores_per_node`/k) | Computed by the loader |
+| Derived `node_job_memory` | floor(`site.cores_per_node`/k) × `memory_per_case` + `node_memory_overhead` | A configuration that would exceed `node_memory_limit` is rejected instead of lowering the concurrency; at 16 cores, k = 4 needs 88G and k = 2 needs 168G |
 
 `--mem`, `--dependency`, `--comment`, `--exclude`, GPU and node-selection options are owned by the pipeline and rejected in `scheduler_options`. Without `stall_stop` only the timeout applies. The admission cap counts candidates, not allocations: continuations can request further allocations.
 
@@ -315,7 +316,7 @@ Sources live under `storage/01_generation/TASK/SOURCE_NAME/`. A campaign holds e
     materials/
       MATERIAL/
         case_NNNN/
-          inputs/             # case.json, fields.csv, scalars.csv, schedule.csv, input_reference.json
+          inputs/             # case.json, inputs.h5 (spatial maps; transient: scalars and schedule), input_reference.json
           result/             # case.h5, provenance.json, _SUCCESS
           result/evidence/    # execution_provenance, processing_provenance, status, timing, solver.log
           _record/
@@ -351,6 +352,8 @@ Each design's seed derives from the seed base, the material and the design kind 
 <details>
 <summary><strong>Layout rules, locks and atomic publication</strong></summary>
 
+Each case stores its COMSOL inputs as one HDF5 file `inputs/inputs.h5`: one float64 map per spatial column under `fields/` (column order in its `columns` attribute), and for transient drying the `scalars` (name, value, unit) and `schedule` tables. COMSOL gets `fields.csv`, `scalars.csv` and `schedule.csv` rendered from it into its work directory; each rendered file must match the sha256 and size that `case.json` records under `input_files` before COMSOL starts, and these CSV hashes, not the HDF5 bytes, are the case identity. The sha256 and size of `inputs.h5` itself are storage integrity in `input_generation_manifest.json`. Open `inputs.h5` in VS Code with the H5Web extension to view the maps and tables. A case directory with CSV files instead of `inputs.h5` predates this layout and is refused; regenerate its inputs. The stored `inputs.h5` is the authoritative input: campaigns, Datasets and resumes reuse it, and regenerating the same case is bit-identical only on the same CPU type ([Reproducibility](07_reproducibility_and_validation.md#source-snapshots-and-frozen-trees)).
+
 Human files come first: a campaign holds exactly three entries, the derived `cases.csv` view, `materials/` (each material with its cases, each case with its `inputs/` and `result/`) and `_record/`. Machine records sit in the reserved `_record/` folders at campaign, material and case level (a material's `_record/` stays with it below `materials/MATERIAL/`), and the campaign's job logs in `_record/logs/`. A material holds only its case directories and its `_record/`: every reader recognizes `_record` explicitly and still rejects any other entry beside the cases, a symbolic link, a missing case number or an incomplete case. Controller and scheduler logs live under `runtime/logs/` with hard links in the campaign's `_record/logs/` (see [Logs](#logs)).
 
 A lock file name joins its identity with `~`, which no task, Source, material or regime name contains, so names cannot collide: `TASK~SOURCE_NAME~controller.lock` and `TASK~SOURCE_NAME~submission.lock` per campaign, `TASK~SOURCE_NAME~MATERIAL~REGIME~inputs.lock` per input batch and `TASK~SOURCE_NAME~MATERIAL~REGIME~case_NNNN.lock` per case. A name that would exceed the 255-byte path-component limit is refused, never shortened. A deleted campaign leaves only empty anchors behind.
@@ -382,7 +385,7 @@ Each atomic publication is one rename of a complete directory: a case appears wi
 | `_record/execution/interruptions/` | Worker-interruption receipts per dispatch (`JOB-SUBMISSION_INDEX.json`) |
 | `_record/execution/license/` | Per case below `MATERIAL-REGIME/case_NNNN/`: the licence wait `wait.json`, checkout windows `windows/DISPATCH.json` and status recoveries `status_recoveries/` |
 | `01_generation/.state/` (stage level, outside every campaign) | Lock anchors in `locks/` and staging in `staging/TASK~SOURCE_NAME/` (reservations, publications, input transactions, quarantine), named by task, Source, material and regime |
-| `case_NNNN/inputs/` | Case definition, sampled and derived parameters, spatial and schedule inputs, seeds, rejection evidence, input reference and hashes |
+| `case_NNNN/inputs/` | Case definition, sampled and derived parameters, seeds, rejection evidence, input reference and hashes in `case.json`; the spatial, scalar and schedule inputs in `inputs.h5` |
 | `case_NNNN/_record/attempts/attempt_NNNN.json`, `case_NNNN/_record/decision.json` | Append-only classified attempts (a solver attempt's `reason_code` is `stalled`, `timed_out`, `solver_error` or `unclassified`) and immutable terminal decisions |
 | `case_NNNN/_record/attempts/run_NNNN/` | Evidence bundle of one failed execution: receipt, retained payload and predecessor hashes |
 | `result/evidence/status.json`, `timing.json` | Execution outcome and measured timing boundaries |

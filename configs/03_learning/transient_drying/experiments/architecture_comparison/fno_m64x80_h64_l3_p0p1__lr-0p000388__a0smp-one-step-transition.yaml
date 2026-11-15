@@ -13,7 +13,7 @@ optimizer:
 training:
   a0:
     sampling:
-      mode: one_step_transition  # Teacher-forced single-transition training examples; A0's curriculum stays the one-step default.
+      mode: one_step_transition  # Teacher-forced single-transition training examples; A0 draws no rollout horizon.
   b:
     sampling:
       mode: rollout_window  # Self-fed rollout windows of the base rollout_length.

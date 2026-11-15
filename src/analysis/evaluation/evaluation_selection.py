@@ -2,6 +2,7 @@
 
 Responsibilities:
   - Retain selected experiments, child runs, artifact role, and analysis scope
+  - Retain the chosen datasets, their pooling per role, and the focus dataset of single-choice views
   - Bind exact artifact channels, cases, physical times, protocols, and horizons
   - Notify dependent views with the precise fields changed
   - Reject task-incompatible or artifact-unsupported selections
@@ -20,7 +21,7 @@ This module does NOT:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from numbers import Real
@@ -106,6 +107,9 @@ class EvaluationSelection:
     physical_time: float | None
     protocol: EvaluationProtocol | None
     horizon: int | str | None
+    datasets: tuple[Hashable, ...] | None = None  # None: no view chose yet; an empty tuple: the user cleared every dataset
+    pooled: bool = False
+    focus_dataset: Hashable | None = None
 
 
 class EvaluationSelectionState:
@@ -287,6 +291,17 @@ class EvaluationSelectionState:
             raise ValueError(message)
         self._install(replace(self._selection, scope=scope))
 
+    def select_datasets(self, keys: Sequence[Hashable], *, pooled: bool) -> None:
+        """Retain the datasets a view with several datasets draws and whether their materials are pooled per role."""
+        if not isinstance(pooled, bool):
+            message = "The pooled flag of a dataset selection must be boolean."
+            raise TypeError(message)
+        self._install(replace(self._selection, datasets=tuple(dict.fromkeys(keys)), pooled=pooled))
+
+    def select_focus_dataset(self, key: Hashable) -> None:
+        """Retain the one dataset a single-choice view draws; each view admits only keys it offers."""
+        self._install(replace(self._selection, focus_dataset=key))
+
     def bind_capabilities(
         self,
         capabilities: EvaluationViewCapabilities,
@@ -396,6 +411,9 @@ class EvaluationSelectionState:
                 "physical_time",
                 "protocol",
                 "horizon",
+                "datasets",
+                "pooled",
+                "focus_dataset",
             )
             if getattr(previous, field) != getattr(current, field)
         )

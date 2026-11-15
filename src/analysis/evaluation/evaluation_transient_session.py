@@ -4,13 +4,19 @@ Responsibilities:
   - Admit transient-sequence frames and their persisted scaling evidence
   - Refuse frames that do not record one common valid analysis producer
   - Aggregate complete-dataset endpoint and cumulative error statistics
-  - Expose bounded case, dataset, and flat tracking-summary views
+  - Rank frames by the selection objective of their complete autonomous rollouts
+  - Reduce the relative norms of complete rollouts per physical time with their supported case counts
+  - Expose bounded case and dataset views
 
 Design principles:
   - Persisted scaling is reconstructed exactly and never refitted
   - Origin states are excluded from every error reduction
   - Fixed horizons remain exact semantic values, not display labels
   - A group with any non-finite prediction value reports support counts instead of error metrics
+  - The objective and the per-field RMSE, MAE and relative norms of every table, ranking, and B/A pipeline error come from
+    learning.metrics.metrics and weigh the cases of a material and the materials equally, as checkpoint selection does;
+    a horizon relative norm sums each case's energies over its states first; grain-water and bulk errors follow the
+    same case-equal rule
 
 This module does NOT:
   - Load files, run inference, mutate frames, or publish artifacts
@@ -19,8 +25,9 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
@@ -28,12 +35,9 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-import torch
 
-from src import common
+from src import common, datasets, domain, learning
 from src.analysis.artifacts import contracts
-from src.analysis.presentation import analysis_display_grid as display_grid
-from src.learning.transient import learning_transient_scaling as scaling
 
 from . import evaluation_prediction_validity as validity_contract
 from . import evaluation_transient_artifact as sequence_artifact
@@ -42,16 +46,10 @@ from . import evaluation_transient_metrics as metrics
 from . import evaluation_transient_timing as timing
 
 _DEFAULT_MODES = ("teacher_forced_one_step", "autonomous_full", "rolling_origin")
-_MAX_TRACKING_SUMMARY_ENTRIES = 470
-_MAX_PUBLICATION_METADATA_ENTRIES = 42
-_MAX_PUBLICATION_SUMMARY_ENTRIES = 512
-_MAX_TRACKING_TEXT_LENGTH = 512
-_PUBLICATION_TIMING_COMPONENTS = (
-    "comsol_transient_drying_seconds",
-    "drying_no_rollout_model_seconds",
-)
+_FIELD_METRIC_IDS = tuple(spec.id for spec in domain.tasks.spec.field_metric_specs(sequence_artifact.STATE_ORDER))
+_RELATIVE_METRIC_IDS = tuple(metric_id for metric_id in _FIELD_METRIC_IDS if metric_id.startswith("physical_relative_"))
+_NORMALIZED_COLUMNS = (metrics.NORMALIZED_DRYING_GROUP_MACRO_RMSE, *_FIELD_METRIC_IDS)
 _SUMMARY_METRIC_COLUMNS = (
-    "normalized_drying_group_macro_rmse",
     "physical_w_gr_rmse",
     "physical_w_gr_mae",
     "bulk_dry_basis_rmse",
@@ -66,9 +64,6 @@ _SUMMARY_METRIC_COLUMNS = (
     "bulk_moisture_unavailable_count",
 )
 _ORIGIN_PLUS_TRANSITION_COUNT = 2
-_SPATIAL_MASK_RANK = 2
-_STATE_ARRAY_RANK = 4
-_STATE_CHANNEL_COUNT = len(sequence_artifact.STATE_ORDER)
 _RHO_BULK_DENSITY_INDEX = sequence_artifact.STATIC_ORDER.index("rho_bu_dry")
 _REQUIRED_FRAME_ATTRS = frozenset(
     {
@@ -88,12 +83,19 @@ class TransientSessionSummary:
     """Store one complete-dataset frame/material/mode/horizon/scope reduction."""
 
     frame: str
-    material_family: str | None
+    material_family: str
     mode: str
     requested_horizon: int | str
     scope: str
     # ``None`` when any contributing value is non-finite: never reduced over the finite subset.
     metrics: _TransientMetricSummary | None
+    # Physical field statistics of every case, summed over its records and states; empty with ``metrics`` ``None``.
+    case_statistics: tuple[learning.metrics.metrics.CaseStatistics, ...]
+    # The drying objective and every field metric id over ``case_statistics``, each case weighing equally; an unavailable
+    # relative norm is ``None``. ``None`` with ``metrics``.
+    field_metrics: Mapping[str, float | None] | None
+    # Cases below the reference floor of every relative metric id; ``None`` with ``metrics``.
+    relative_unavailable_cases: Mapping[str, int] | None
     metric_support: Mapping[str, Any]
     contributing_record_count: int
     contributing_case_count: int
@@ -200,10 +202,10 @@ def _validate_sequence_source(frame: pd.DataFrame) -> None:
     raise ValueError(msg)
 
 
-def _scale(frame: pd.DataFrame) -> scaling.TransientScalingArtifact:
+def _scale(frame: pd.DataFrame) -> datasets.preprocessing.normalization.TrainScaling:
     """Reconstruct one persisted train-only scale artifact on CPU."""
     state = _require_mapping(frame.attrs["transient_scaling_state"], label="transient_scaling_state")
-    return scaling.TransientScalingArtifact.from_state_dict(state)
+    return datasets.preprocessing.normalization.TrainScaling.from_state_dict(state)
 
 
 def _requested_horizon(record: Any) -> int | str:
@@ -217,37 +219,13 @@ def _requested_horizon(record: Any) -> int | str:
     return value
 
 
-def _spatial_mask(record: Any, *, count: int) -> np.ndarray:
-    """Expand one persisted spatial mask across reconstructed state channels."""
-    mask = np.asarray(_record_value(record, "spatial_mask"))
-    if mask.dtype != np.bool_ or mask.ndim != _SPATIAL_MASK_RANK or not bool(mask.any()):
-        msg = "Transient record spatial_mask must be non-empty boolean [Y,X]."
-        raise ValueError(msg)
-    return np.broadcast_to(mask[None, None], (count, _STATE_CHANNEL_COUNT, *mask.shape)).copy()
-
-
-def _bulk_moisture_inputs(record: Any) -> tuple[np.ndarray, np.ndarray]:
-    """Return canonical dry density and masked trapezoidal cell weights."""
-    mask = _spatial_mask(record, count=1)[0, 0]
+def _static_conditioning(record: Any, *, grid_shape: tuple[int, ...]) -> np.ndarray:
+    """Return the record's finite canonical static fields on its state grid."""
     static = np.asarray(_record_value(record, "static_conditioning"), dtype=np.float64)
-    expected_shape = (len(sequence_artifact.STATIC_ORDER), *mask.shape)
-    if static.shape != expected_shape or not np.isfinite(static).all():
+    if static.shape != (len(sequence_artifact.STATIC_ORDER), *grid_shape) or not np.isfinite(static).all():
         msg = "Transient record static_conditioning must match the canonical finite Dataset fields."
         raise ValueError(msg)
-    return static[_RHO_BULK_DENSITY_INDEX], metrics.trapezoidal_cell_weights(mask)
-
-
-def _normalized_states(
-    artifact: scaling.TransientScalingArtifact,
-    states: np.ndarray,
-) -> np.ndarray:
-    """Encode physical absolute states with admitted saved scaling only."""
-    raw = np.asarray(states, dtype=np.float32)
-    if raw.ndim != _STATE_ARRAY_RANK or raw.shape[1] != _STATE_CHANNEL_COUNT or not np.isfinite(raw).all():
-        msg = "Transient record states must be finite [time,4,Y,X] arrays."
-        raise ValueError(msg)
-    encoded = artifact.encode_state(torch.from_numpy(np.ascontiguousarray(raw)))
-    return encoded.detach().cpu().numpy()
+    return static
 
 
 def _required_pipeline_metric(values: Mapping[str, Any], name: str) -> float:
@@ -353,35 +331,6 @@ def _persisted_diagnostics(
     )
 
 
-def _add_optional_tracking_value(
-    values: dict[str, float | int],
-    key: str,
-    value: float | None,
-) -> None:
-    """Append one available finite aggregate without inventing missing evidence."""
-    if value is not None:
-        values[key] = value
-
-
-def _metric_tracking_values(summary: TransientSessionSummary, *, prefix: str) -> dict[str, float | int]:
-    """Return the tracked error metrics of one summary, or its support counts when they are unavailable."""
-    result = summary.metrics
-    if result is None:
-        return {f"{prefix}/{name}": summary.metric_support[name] for name in validity_contract.SUPPORT_COUNT_FIELDS}
-    values: dict[str, float | int] = {f"{prefix}/normalized_drying_group_macro_rmse": result.normalized_drying_group_macro_rmse}
-    values.update({f"{prefix}/normalized_rmse_{field}": value for field, value in result.normalized_rmse.items()})
-    if summary.mode == "autonomous_full" and summary.scope == "cumulative":
-        values.update({f"{prefix}/physical_rmse_{field}": value for field, value in result.physical_rmse.items()})
-        values.update({f"{prefix}/physical_mae_{field}": value for field, value in result.physical_mae.items()})
-        values[f"{prefix}/physical_w_gr_rmse"] = result.physical_w_gr_rmse
-        values[f"{prefix}/physical_w_gr_mae"] = result.physical_w_gr_mae
-        _add_optional_tracking_value(values, f"{prefix}/bulk_dry_basis_rmse", result.bulk_dry_basis_rmse)
-        _add_optional_tracking_value(values, f"{prefix}/bulk_wet_basis_rmse", result.bulk_wet_basis_rmse)
-        values[f"{prefix}/bulk_moisture_valid_count"] = result.bulk_moisture_valid_count
-        values[f"{prefix}/bulk_moisture_unavailable_count"] = result.bulk_moisture_unavailable_count
-    return values
-
-
 def _summary_row(summary: TransientSessionSummary) -> dict[str, Any]:
     """Flatten one summary into bounded scalar columns; unavailable error metrics keep only their support counts."""
     row: dict[str, Any] = {
@@ -420,31 +369,14 @@ def _summary_row(summary: TransientSessionSummary) -> dict[str, Any]:
         "oscillatory_increment_count": summary.stability.oscillatory_increment_count,
         "abnormal_increment_growth_count": summary.stability.abnormal_growth_count,
     }
+    for name in _NORMALIZED_COLUMNS:
+        row[name] = None if summary.field_metrics is None else summary.field_metrics[name]
+    for name in _RELATIVE_METRIC_IDS:
+        row[f"{name}_unavailable_cases"] = None if summary.relative_unavailable_cases is None else summary.relative_unavailable_cases[name]
     result = None if summary.metrics is None else asdict(summary.metrics)
     for name in _SUMMARY_METRIC_COLUMNS:
         row[name] = None if result is None else result[name]
-    for statistic in ("normalized_rmse", "physical_rmse", "physical_mae", "relative_l2"):
-        for field in sequence_artifact.STATE_ORDER:
-            row[f"{statistic}_{field}"] = None if result is None else result[statistic][field]
     return row
-
-
-def _tracking_text(values: Sequence[Any], *, label: str) -> str:
-    """Return one bounded stable text identity from non-empty scalar evidence."""
-    admitted: set[str] = set()
-    for value in values:
-        if not isinstance(value, str) or not value:
-            msg = f"{label} must contain non-empty text identities."
-            raise TypeError(msg)
-        admitted.add(value)
-    if not admitted:
-        msg = f"{label} must contain at least one identity."
-        raise ValueError(msg)
-    result = "|".join(sorted(admitted))
-    if len(result) > _MAX_TRACKING_TEXT_LENGTH:
-        msg = f"{label} exceeds the bounded tracking text contract."
-        raise ValueError(msg)
-    return result
 
 
 def _record_identity(record: Any) -> Mapping[str, Any]:
@@ -459,48 +391,6 @@ def _material_family(record: Any) -> str:
         msg = "Transient sequence record identity requires material_family."
         raise ValueError(msg)
     return material
-
-
-def _add_publication_timing_metadata(
-    metadata: dict[str, bool | float | int | str],
-    *,
-    timing_cases: Sequence[timing.TransientTimingCase],
-    materialization_seconds: Sequence[float],
-    hardware_evidence: Sequence[Mapping[str, Any]],
-) -> None:
-    """Append bounded cross-case timing aggregates without case-level payloads."""
-    combined_report = timing.build_transient_timing_report(timing_cases)
-    metadata["evaluation/timing/device"] = _tracking_text(
-        [case.device for case in combined_report.cases],
-        label="timing device identity",
-    )
-    metadata["evaluation/timing/precision"] = _tracking_text(
-        [case.precision for case in combined_report.cases],
-        label="timing precision identity",
-    )
-    warmup_passes = {case.warmup_passes for case in combined_report.cases}
-    if len(warmup_passes) != 1:
-        msg = "Transient publication timing cases must share one warm-up contract."
-        raise ValueError(msg)
-    metadata["evaluation/timing/warmup_passes"] = next(iter(warmup_passes))
-    metadata["evaluation/timing/hardware_identity_sha256"] = common.serialization.canonical_json_sha256(hardware_evidence)
-    metadata["evaluation/timing/component_composed"] = combined_report.component_composed
-
-    for name, summary in combined_report.speedups.items():
-        prefix = f"evaluation/timing/speedup/{name}"
-        metadata[f"{prefix}/available_count"] = summary.available_count
-        metadata[f"{prefix}/unavailable_count"] = summary.unavailable_count
-        if summary.ratio_of_sums is not None:
-            metadata[f"{prefix}/ratio_of_sums"] = summary.ratio_of_sums
-    for component in _PUBLICATION_TIMING_COMPONENTS:
-        case_medians = timing.component_case_medians(combined_report, component)
-        prefix = f"evaluation/timing/component/{component}"
-        metadata[f"{prefix}/available_count"] = len(case_medians)
-        if case_medians:
-            metadata[f"{prefix}/median_seconds"] = float(np.median(np.asarray(tuple(case_medians.values()), dtype=np.float64)))
-    materialization = np.asarray(materialization_seconds, dtype=np.float64)
-    metadata["evaluation/timing/component/dataset_materialization_seconds/available_count"] = int(materialization.size)
-    metadata["evaluation/timing/component/dataset_materialization_seconds/median_seconds"] = float(np.median(materialization))
 
 
 class TransientEvaluationSession:
@@ -520,7 +410,7 @@ class TransientEvaluationSession:
         if not isinstance(frames, Mapping) or not frames:
             msg = "Transient evaluation session requires one non-empty frame mapping."
             raise ValueError(msg)
-        admitted: dict[str, tuple[pd.DataFrame, scaling.TransientScalingArtifact]] = {}
+        admitted: dict[str, tuple[pd.DataFrame, datasets.preprocessing.normalization.TrainScaling]] = {}
         for name, frame in frames.items():
             if not isinstance(name, str) or not name:
                 msg = "Transient session frame names must be non-empty text."
@@ -564,10 +454,7 @@ class TransientEvaluationSession:
                 raise ValueError(msg)
             for key, spatial in grids.items():
                 if spatial != baseline[key]:
-                    msg = (
-                        f"Transient models {baseline_name!r} and {name!r} have incompatible Evaluation grids for case {key!r}. "
-                        f"Build both on one common grid with: {display_grid.COMMON_GRID_ARTIFACT_COMMAND}"
-                    )
+                    msg = f"Transient models {baseline_name!r} and {name!r} have incompatible Evaluation grids for case {key!r}."
                     raise ValueError(msg)
 
     @property
@@ -982,22 +869,18 @@ class TransientEvaluationSession:
         return timing.admit_transient_timing_report(_require_mapping(timing_block.get("report"), label="artifact_provenance.timing.report"))
 
     def pipeline_degradation(self) -> tuple[comparison.AirflowDegradationMetrics, ...]:
-        """Return B/A evidence and truthful available or unavailable C evidence per frame whose B/A error is available."""
-        full_cumulative = {
-            summary.frame: summary
-            for summary in self._all_material_summaries(modes=("autonomous_full",))
-            if summary.scope == "cumulative" and summary.requested_horizon == "full"
-        }
+        """
+        Return B/A evidence and truthful available or unavailable C evidence per frame whose B/A error is available.
+
+        The B/A drying-surrogate error is the frame's :meth:`selection_objective`, so it
+        reduces cases exactly as checkpoint selection and the comparison ranking do.
+        """
         results: list[comparison.AirflowDegradationMetrics] = []
         metric_id = metrics.NORMALIZED_DRYING_GROUP_MACRO_RMSE
         for frame_name, (frame, _artifact) in self._frames.items():
-            summary = full_cumulative.get(frame_name)
-            if summary is None:
-                msg = f"Transient frame {frame_name!r} lacks full autonomous cumulative evidence."
-                raise RuntimeError(msg)
-            if summary.metrics is None:
+            surrogate_error = self.selection_objective(frame_name)
+            if not math.isfinite(surrogate_error):
                 continue
-            surrogate_error = summary.metrics.normalized_drying_group_macro_rmse
             provenance = _require_mapping(frame.attrs.get("artifact_provenance"), label="artifact_provenance")
             evaluation = _require_mapping(provenance.get("evaluation"), label="artifact_provenance.evaluation")
             pipeline = _require_mapping(evaluation.get("pipeline_analysis"), label="evaluation.pipeline_analysis")
@@ -1092,33 +975,105 @@ class TransientEvaluationSession:
         self._case_dataframe_cache[selected] = result
         return result.copy(deep=True)
 
-    def _reduce_summaries(
-        self,
-        *,
-        modes: tuple[str, ...],
-        group_by_material: bool,
-    ) -> tuple[TransientSessionSummary, ...]:
-        """Reduce exact record groups either per material or over full frame membership."""
+    def selection_objective(self, frame_name: str) -> float:
+        """Return the selection objective of one frame's complete autonomous rollouts, NaN when any case is unavailable."""
+        return self.selection_errors(frame_name)[metrics.NORMALIZED_DRYING_GROUP_MACRO_RMSE]
+
+    def selection_errors(self, frame_name: str) -> dict[str, float]:
+        """
+        Return the selection objective and every field metric of one frame's complete autonomous rollouts.
+
+        Each case enters with its physical field statistics summed over its
+        cumulative full rollout, as its material summary holds them; the errors
+        average equally over the cases of a material and over the materials, as
+        checkpoint selection does. A frame with any unavailable case returns NaN
+        everywhere, so partial evidence never ranks; an unavailable relative norm is NaN.
+        """
+        _frame, artifact = self._frames[frame_name]
+        materials = [
+            summary
+            for summary in self.summaries(modes=("autonomous_full",))
+            if summary.frame == frame_name and summary.requested_horizon == "full" and summary.scope == "cumulative"
+        ]
+        if not materials or any(summary.field_metrics is None for summary in materials):
+            return dict.fromkeys(_NORMALIZED_COLUMNS, math.nan)
+        values, _unavailable = _population_metrics([case for summary in materials for case in summary.case_statistics], artifact)
+        return {name: math.nan if value is None else value for name, value in values.items()}
+
+    def relative_norm_curve(self, frame_name: str) -> pd.DataFrame:
+        """
+        Return the relative L2 and H1 of one frame's complete autonomous rollouts at every exact physical time.
+
+        At each post-origin time every case present enters the material-case mean of its
+        per-case norm, as the horizon value does. A case whose predicted state at that time
+        is non-finite, or whose reference lies below the field's floor, stays in ``cases``
+        and only lowers ``supported_cases``; its other times count. Columns:
+        ``physical_time``, ``metric_id``, ``value`` (NaN when a material has no supported
+        case), ``cases`` and ``supported_cases``.
+        """
+        reduction = learning.metrics.metrics
+        floors = {field: domain.tasks.registry.get_task("transient_drying").reference_floor(field) for field in sequence_artifact.STATE_ORDER}
+        # Per exact time: (material, field statistics of the state, or None when the predicted state is non-finite).
+        by_time: dict[float, list[tuple[str, np.ndarray | None]]] = {}
+        # Loaded artifacts hold array-free summaries; the full records carry the states.
+        for record in self.full_autonomous_records(frame_name):
+            prediction = np.asarray(_record_value(record, "predicted_states"), dtype=np.float64)[1:]
+            reference = np.asarray(_record_value(record, "reference_states"), dtype=np.float64)[1:]
+            spacing = metrics.grid_spacing(_static_conditioning(record, grid_shape=reference.shape[-2:]))
+            rows = metrics.state_field_statistics(prediction, reference, spacing=spacing)
+            times = np.asarray(_record_value(record, "physical_times"), dtype=np.float64)[1:]
+            material = _material_family(record)
+            for time, state, sums in zip(times, prediction, rows, strict=True):
+                by_time.setdefault(float(time), []).append((material, sums if np.isfinite(state).all() else None))
+        result: list[dict[str, Any]] = []
+        for time, cases in sorted(by_time.items()):
+            for norm in reduction.RELATIVE_NORMS:
+                for index, field in enumerate(sequence_artifact.STATE_ORDER):
+                    per_case = [
+                        (material, None if sums is None else reduction.case_relative_norm(sums[index], norm=norm, floor=floors[field]))
+                        for material, sums in cases
+                    ]
+                    value = reduction.material_case_mean(per_case)
+                    result.append(
+                        {
+                            "physical_time": time,
+                            "metric_id": f"physical_relative_{norm}_{field}",
+                            "value": math.nan if value is None else value,
+                            "cases": len(cases),
+                            "supported_cases": sum(case_value is not None for _material, case_value in per_case),
+                        }
+                    )
+        return pd.DataFrame.from_records(result, columns=["physical_time", "metric_id", "value", "cases", "supported_cases"])
+
+    def _reduce_summaries(self, *, modes: tuple[str, ...]) -> tuple[TransientSessionSummary, ...]:
+        """Reduce exact record groups per material, mode, and horizon."""
         results: list[TransientSessionSummary] = []
         for frame_name, (frame, artifact) in self._frames.items():
             records = _sequence_records(frame)
-            groups: dict[tuple[str | None, str, int | str], list[Any]] = {}
+            groups: dict[tuple[str, str, int | str], list[Any]] = {}
             for record in records:
                 mode = _record_value(record, "mode")
                 if mode in modes:
-                    material = _material_family(record) if group_by_material else None
-                    groups.setdefault((material, mode, _requested_horizon(record)), []).append(record)
+                    groups.setdefault((_material_family(record), mode, _requested_horizon(record)), []).append(record)
             unavailable = frame.attrs["transient_unavailable_horizons"]
             if not isinstance(unavailable, tuple):
                 msg = "transient_unavailable_horizons must be one tuple."
                 raise TypeError(msg)
+            if "rolling_origin" in modes:
+                # Every material shows each rolling horizon that any case reaches or requests, so its missing cases stay visible.
+                requested = {_require_mapping(item, label="transient unavailable horizon").get("requested_horizon") for item in unavailable}
+                horizons = {horizon for _material, mode, horizon in groups if mode == "rolling_origin"} | {
+                    value for value in requested if isinstance(value, int) and not isinstance(value, bool)
+                }
+                for material in {_material_family(record) for record in records}:
+                    for horizon in horizons:
+                        groups.setdefault((material, "rolling_origin", horizon), [])
             for (material, mode, horizon), grouped in groups.items():
-                case_ids = {str(_record_value(record, "case_id")) for record in grouped}
                 unavailable_cases = _unavailable_cases(
                     unavailable,
                     mode=mode,
                     horizon=horizon,
-                    case_ids=case_ids,
+                    case_ids=set(self.case_ids(frame_name, material_family=material)),
                 )
                 results.extend(
                     _summarize_group(
@@ -1135,27 +1090,13 @@ class TransientEvaluationSession:
                 )
         return tuple(results)
 
-    def _all_material_summaries(
-        self,
-        *,
-        modes: Sequence[str] = _DEFAULT_MODES,
-    ) -> tuple[TransientSessionSummary, ...]:
-        """Return full-frame reductions reserved for frame-level provenance consumers."""
-        return self._reduce_summaries(
-            modes=_validate_modes(modes),
-            group_by_material=False,
-        )
-
     def summaries(self, *, modes: Sequence[str] = _DEFAULT_MODES) -> tuple[TransientSessionSummary, ...]:
         """Return cached reductions for each material, mode, and horizon group."""
         selected = _validate_modes(modes)
         cached = self._summary_cache.get(selected)
         if cached is not None:
             return cached
-        resolved = self._reduce_summaries(
-            modes=selected,
-            group_by_material=True,
-        )
+        resolved = self._reduce_summaries(modes=selected)
         self._summary_cache[selected] = resolved
         return resolved
 
@@ -1172,168 +1113,6 @@ class TransientEvaluationSession:
                 result[column] = result["frame"].map(lambda frame_name, key=column: provenance_by_frame[str(frame_name)][key])
         self._dataset_dataframe_cache[selected] = result
         return result.copy(deep=True)
-
-    def wandb_summary(self, *, modes: Sequence[str] = _DEFAULT_MODES) -> dict[str, float | int]:
-        """Return bounded aggregate tracking evidence without arrays or W&B imports."""
-        selected_modes = _validate_modes(modes)
-        values: dict[str, float | int] = {}
-        for index, summary in enumerate(self._all_material_summaries(modes=selected_modes)):
-            prefix = f"evaluation/{index}/{summary.frame}/{summary.mode}/{summary.requested_horizon}/{summary.scope}"
-            values.update(_metric_tracking_values(summary, prefix=prefix))
-            values[f"{prefix}/contributing_record_count"] = summary.contributing_record_count
-            values[f"{prefix}/contributing_case_count"] = summary.contributing_case_count
-            values[f"{prefix}/unavailable_case_count"] = summary.unavailable_case_count
-            values[f"{prefix}/elapsed_physical_time_median"] = summary.elapsed_physical_time_median
-            if summary.mode == "autonomous_full" and summary.scope == "cumulative":
-                values[f"{prefix}/target_available_count"] = summary.target.available_count
-                values[f"{prefix}/predicted_right_censored_count"] = summary.target.predicted_right_censored_count
-                values[f"{prefix}/target_time_error_count"] = summary.target_time_error_count
-                if summary.target_time_error_mean is not None:
-                    values[f"{prefix}/target_time_error_mean"] = summary.target_time_error_mean
-                if summary.target_time_error_mae is not None:
-                    values[f"{prefix}/target_time_error_mae"] = summary.target_time_error_mae
-                values[f"{prefix}/target_gap_count"] = summary.target_gap_count
-                if summary.predicted_final_target_gap_mean is not None:
-                    values[f"{prefix}/predicted_final_target_gap_mean"] = summary.predicted_final_target_gap_mean
-                if summary.reference_final_target_gap_mean is not None:
-                    values[f"{prefix}/reference_final_target_gap_mean"] = summary.reference_final_target_gap_mean
-                if summary.target_final_gap_error_mean is not None:
-                    values[f"{prefix}/target_final_gap_error_mean"] = summary.target_final_gap_error_mean
-                if summary.target_final_gap_error_mae is not None:
-                    values[f"{prefix}/target_final_gap_error_mae"] = summary.target_final_gap_error_mae
-                values[f"{prefix}/nonfinite_values"] = summary.plausibility.nonfinite_values
-                values[f"{prefix}/negative_moisture_values"] = summary.plausibility.negative_moisture_values
-                values[f"{prefix}/abnormal_increment_growth_count"] = summary.stability.abnormal_growth_count
-        if "autonomous_full" in selected_modes:
-            for index, pipeline in enumerate(self.pipeline_degradation()):
-                prefix = f"evaluation/pipeline/{index}"
-                values[f"{prefix}/drying_surrogate_error"] = pipeline.drying_surrogate_error
-                values[f"{prefix}/c_available"] = int(pipeline.c_available)
-                if pipeline.complete_pipeline_error is not None:
-                    values[f"{prefix}/complete_pipeline_error"] = pipeline.complete_pipeline_error
-                if pipeline.airflow_substitution_discrepancy is not None:
-                    values[f"{prefix}/airflow_substitution_discrepancy"] = pipeline.airflow_substitution_discrepancy
-                if pipeline.signed_airflow_degradation is not None:
-                    values[f"{prefix}/signed_airflow_degradation"] = pipeline.signed_airflow_degradation
-                if pipeline.airflow_degradation_ratio is not None:
-                    values[f"{prefix}/airflow_degradation_ratio"] = pipeline.airflow_degradation_ratio
-                if pipeline.upstream_airflow_error is not None:
-                    values[f"{prefix}/upstream_airflow_error"] = pipeline.upstream_airflow_error
-        if len(values) > _MAX_TRACKING_SUMMARY_ENTRIES:
-            msg = "Transient Evaluation tracking summary exceeds its bounded scalar inventory."
-            raise RuntimeError(msg)
-        return values
-
-    def wandb_publication_summary(self) -> dict[str, bool | float | int | str]:
-        """Return bounded aggregate and identity evidence for opt-in publication."""
-        values: dict[str, bool | float | int | str] = dict(self.wandb_summary())
-        metadata = self._wandb_publication_metadata()
-        overlap = set(values).intersection(metadata)
-        if overlap:
-            msg = f"Transient Evaluation publication summary contains duplicate keys: {sorted(overlap)}."
-            raise RuntimeError(msg)
-        if len(metadata) > _MAX_PUBLICATION_METADATA_ENTRIES:
-            msg = "Transient Evaluation publication metadata exceeds its bounded inventory."
-            raise RuntimeError(msg)
-        values.update(metadata)
-        if len(values) > _MAX_PUBLICATION_SUMMARY_ENTRIES:
-            msg = "Transient Evaluation publication summary exceeds the W&B scalar inventory."
-            raise RuntimeError(msg)
-        return values
-
-    def _wandb_publication_metadata(self) -> dict[str, bool | float | int | str]:
-        """Reduce validated role provenance and raw clocks to bounded identities."""
-        if "id" not in self._frames or set(self._frames).difference(sequence_artifact.DATASET_ROLES):
-            msg = "Transient W&B publication requires an ID frame and at most one material-OOD and one parameter-OOD frame."
-            raise ValueError(msg)
-
-        run_evidence: list[Mapping[str, Any]] = []
-        lineage_evidence: list[Mapping[str, Any]] = []
-        record_identities: list[Mapping[str, Any]] = []
-        timing_cases: list[timing.TransientTimingCase] = []
-        materialization_seconds: list[float] = []
-        hardware_evidence: list[dict[str, Any]] = []
-        dataset_evidence: dict[str, Mapping[str, Any]] = {}
-        metadata: dict[str, bool | float | int | str] = {}
-
-        for frame_name, (frame, _artifact) in self._frames.items():
-            provenance = _require_mapping(frame.attrs.get("artifact_provenance"), label="artifact_provenance")
-            run = _require_mapping(provenance.get("run"), label="artifact_provenance.run")
-            dataset = _require_mapping(provenance.get("dataset"), label="artifact_provenance.dataset")
-            timing_block = _require_mapping(provenance.get("timing"), label="artifact_provenance.timing")
-            lineage = _require_mapping(provenance.get("lineage"), label="artifact_provenance.lineage")
-            dataset_name = dataset.get("name")
-            if dataset.get("role") != frame_name or not isinstance(dataset_name, str) or not dataset_name:
-                msg = f"Transient publication frame {frame_name!r} contradicts its Dataset identity."
-                raise ValueError(msg)
-            metadata[f"evaluation/identity/dataset/{frame_name}/name"] = dataset_name
-            dataset_evidence[frame_name] = dataset
-            run_evidence.append(run)
-            lineage_evidence.append(lineage)
-
-            full_records = self.full_autonomous_records(frame_name)
-            case_ids = {_record_value(record, "case_id") for record in full_records}
-            if any(not isinstance(case_id, str) or not case_id for case_id in case_ids):
-                msg = "Transient publication requires non-empty full-autonomous case identities."
-                raise ValueError(msg)
-            identities = [_record_identity(record) for record in full_records]
-            record_identities.extend(identities)
-
-            for case in self.timing_report(frame_name).cases:
-                timing_cases.append(replace(case, case_id=f"{frame_name}:{case.case_id}"))
-                hardware_evidence.append(
-                    {
-                        "device": case.device,
-                        "cpu": case.cpu,
-                        "gpu": case.gpu,
-                        "precision": case.precision,
-                        "batch_size": case.batch_size,
-                        "software_versions": dict(case.software_versions),
-                    }
-                )
-
-            component_evidence = _require_mapping(
-                timing_block.get("component_availability"),
-                label="artifact_provenance.timing.component_availability",
-            )
-            # Role admission already bound membership, durations and payload identities of this timing evidence.
-            materialization_seconds.extend(float(component_evidence[case_id]["dataset_materialization_seconds"]) for case_id in sorted(case_ids))
-
-        run_digests = {common.serialization.canonical_json_sha256(value) for value in run_evidence}
-        lineage_digests = {common.serialization.canonical_json_sha256(value) for value in lineage_evidence}
-        if len(run_digests) != 1 or len(lineage_digests) != 1:
-            msg = "Transient ID/OOD publication evidence must share one run and Training lineage."
-            raise ValueError(msg)
-        run = run_evidence[0]
-        checkpoint_epoch = run.get("best_checkpoint_epoch")
-        if isinstance(checkpoint_epoch, bool) or not isinstance(checkpoint_epoch, int) or checkpoint_epoch < 0:
-            msg = "Transient publication checkpoint epoch must be a non-negative integer."
-            raise TypeError(msg)
-        metadata["evaluation/identity/checkpoint_sha256"] = _tracking_text(
-            [run.get("best_checkpoint_sha256")],
-            label="checkpoint identity",
-        )
-        metadata["evaluation/identity/checkpoint_epoch"] = checkpoint_epoch
-        metadata["evaluation/identity/input_profile"] = _tracking_text(
-            [identity.get("input_profile") for identity in record_identities],
-            label="input-profile identity",
-        )
-        metadata["evaluation/identity/model_kind"] = _tracking_text(
-            [identity.get("model_kind") for identity in record_identities],
-            label="model identity",
-        )
-        metadata["evaluation/identity/timing_evidence_sha256"] = common.serialization.canonical_json_sha256(
-            sorted(_tracking_text([identity.get("timing_evidence_identity")], label="timing evidence identity") for identity in record_identities)
-        )
-        metadata["evaluation/identity/dataset_sha256"] = common.serialization.canonical_json_sha256(dataset_evidence)
-
-        _add_publication_timing_metadata(
-            metadata,
-            timing_cases=timing_cases,
-            materialization_seconds=materialization_seconds,
-            hardware_evidence=hardware_evidence,
-        )
-        return metadata
 
 
 def _validate_modes(modes: Sequence[str]) -> tuple[str, ...]:
@@ -1352,7 +1131,7 @@ def _unavailable_cases(
     horizon: int | str,
     case_ids: set[str],
 ) -> int:
-    """Count group-local cases with explicit unsupported fixed rolling horizons."""
+    """Count the material's cases, whatever records exist at the horizon, with explicit unsupported fixed rolling horizons."""
     if mode != "rolling_origin" or not isinstance(horizon, int):
         return 0
     cases: set[str] = set()
@@ -1365,20 +1144,93 @@ def _unavailable_cases(
     return len(cases)
 
 
+def _train_scales(artifact: datasets.preprocessing.normalization.TrainScaling) -> dict[str, float]:
+    """Return the run's Train state scale of every canonical state field."""
+    return contracts.output_scales(artifact, output_fields=sequence_artifact.STATE_ORDER)
+
+
+def _population_metrics(
+    cases: Sequence[learning.metrics.metrics.CaseStatistics],
+    artifact: datasets.preprocessing.normalization.TrainScaling,
+) -> tuple[dict[str, float | None], dict[str, int]]:
+    """
+    Return the drying objective and every field metric of one case population, with the unavailable counts.
+
+    :mod:`learning.metrics.metrics` averages each case's statistics equally over the cases
+    of a material and over the materials, as checkpoint selection does: RMSE takes its root
+    after the means, a relative norm divides within each case first.
+    """
+    task = domain.tasks.registry.get_task("transient_drying")
+    scales = _train_scales(artifact)
+    reduction = learning.metrics.metrics
+    objective = reduction.group_objective((case.errors() for case in cases), terms=task.error_terms, train_scales=scales)
+    floors = {field: task.reference_floor(field) for field in sequence_artifact.STATE_ORDER}
+    values, unavailable = reduction.field_metric_values(cases, train_scales=scales, reference_floors=floors, output_groups=task.output_groups)
+    return {metrics.NORMALIZED_DRYING_GROUP_MACRO_RMSE: objective.value, **values}, unavailable
+
+
+def _group_errors(
+    case_states: Mapping[str, Sequence[Mapping[str, object]]],
+    *,
+    material_family: str,
+    artifact: datasets.preprocessing.normalization.TrainScaling,
+) -> tuple[_TransientMetricSummary, tuple[learning.metrics.metrics.CaseStatistics, ...], dict[str, float | None], dict[str, int]]:
+    """Return the moisture metrics, per-case field statistics, and field metrics of one material group, each case weighing equally."""
+    merged = {case_id: metrics.TransientMetricAccumulator.merged(states) for case_id, states in case_states.items()}
+    moisture = metrics.summarize_moisture((material_family, accumulator.case_moisture()) for accumulator in merged.values())
+    cases = tuple(accumulator.case_statistics(case_id, material_family) for case_id, accumulator in merged.items())
+    values, unavailable = _population_metrics(cases, artifact)
+    return moisture, cases, values, unavailable
+
+
 def _summarize_group(
     records: Sequence[Any],
     *,
     frame: str,
-    material_family: str | None,
-    artifact: scaling.TransientScalingArtifact,
+    material_family: str,
+    artifact: datasets.preprocessing.normalization.TrainScaling,
     mode: str,
     horizon: int | str,
     scope: str,
     unavailable_case_count: int,
 ) -> TransientSessionSummary:
-    """Accumulate one exact material/mode/horizon/scope sufficient-statistic group."""
+    """Accumulate one exact material/mode/horizon/scope sufficient-statistic group; a group without records is unavailable."""
+    if not records:
+        none_support = validity_contract.support_evidence(required=0, computed=0, finite=0)
+        no_values = np.empty(0)
+        return TransientSessionSummary(
+            frame=frame,
+            material_family=material_family,
+            mode=mode,
+            requested_horizon=horizon,
+            scope=scope,
+            metrics=None,
+            case_statistics=(),
+            field_metrics=None,
+            relative_unavailable_cases=None,
+            metric_support={**none_support, "available": False, "unavailable_reason": "no_records_at_horizon"},
+            contributing_record_count=0,
+            contributing_case_count=0,
+            unavailable_case_count=unavailable_case_count,
+            elapsed_physical_time_min=math.nan,
+            elapsed_physical_time_median=math.nan,
+            elapsed_physical_time_max=math.nan,
+            origin_time_min=math.nan,
+            origin_time_max=math.nan,
+            target=metrics.derive_target_censoring_diagnostics(predicted_reached=no_values, reference_reached=no_values),
+            target_time_error_count=0,
+            target_time_error_mean=None,
+            target_time_error_mae=None,
+            target_gap_count=0,
+            predicted_final_target_gap_mean=None,
+            reference_final_target_gap_mean=None,
+            target_final_gap_error_mean=None,
+            target_final_gap_error_mae=None,
+            plausibility=_empty_plausibility(),
+            stability=_empty_stability(),
+        )
     materials = {_material_family(record) for record in records}
-    if material_family is not None and materials != {material_family}:
+    if materials != {material_family}:
         msg = "Transient summary group mixes material identities."
         raise ValueError(msg)
     if records and isinstance(
@@ -1389,7 +1241,7 @@ def _summarize_group(
             "Sequence[sequence_artifact.TransientSequenceRecordSummary]",
             records,
         )
-        states: list[Mapping[str, object]] = []
+        case_states: dict[str, list[Mapping[str, object]]] = {}
         support = dict.fromkeys(("required", "computed", "finite"), 0)
         plausibility = _empty_plausibility()
         stability = _empty_stability()
@@ -1405,7 +1257,9 @@ def _summarize_group(
             for name in support:
                 support[name] += int(metric_evidence[f"{name}_value_count"])
             if metric_evidence.get("available") is True:
-                states.append(_require_mapping(metric_evidence.get("statistics"), label=f"metric_statistics.{scope}.statistics"))
+                case_states.setdefault(record.case_id, []).append(
+                    _require_mapping(metric_evidence.get("statistics"), label=f"metric_statistics.{scope}.statistics")
+                )
             current_plausibility, current_stability = _persisted_diagnostics(statistics["diagnostics"])
             plausibility = metrics.PlausibilityDiagnostics(
                 plausibility.inspected_values + current_plausibility.inspected_values,
@@ -1445,13 +1299,19 @@ def _summarize_group(
             [record.origin_time for record in summaries],
             dtype=np.float64,
         )
+        moisture, case_statistics, field_metrics, unavailable = (
+            _group_errors(case_states, material_family=material_family, artifact=artifact) if metric_support["available"] else (None, (), None, None)
+        )
         return TransientSessionSummary(
             frame=frame,
             material_family=material_family,
             mode=mode,
             requested_horizon=horizon,
             scope=scope,
-            metrics=metrics.TransientMetricAccumulator.merged(states).finalize() if metric_support["available"] else None,
+            metrics=moisture,
+            case_statistics=case_statistics,
+            field_metrics=field_metrics,
+            relative_unavailable_cases=unavailable,
             metric_support=metric_support,
             contributing_record_count=len(summaries),
             contributing_case_count=len({record.case_id for record in summaries}),
@@ -1473,7 +1333,7 @@ def _summarize_group(
             plausibility=plausibility,
             stability=stability,
         )
-    accumulator = metrics.TransientMetricAccumulator(scope=scope)
+    accumulators: dict[str, metrics.TransientMetricAccumulator] = {}
     required_count = finite_count = 0
     elapsed: list[float] = []
     origins: list[float] = []
@@ -1491,19 +1351,17 @@ def _summarize_group(
         if scalar.shape != (len(sequence_artifact.SCALAR_ORDER),):
             msg = "Transient record scalar_conditioning must retain the canonical Dataset scalar fields."
             raise ValueError(msg)
-        dry_density, cell_weights = _bulk_moisture_inputs(record)
+        static = _static_conditioning(record, grid_shape=prediction.shape[-2:])
         required_count += selected_prediction.size
         finite_count += int(np.isfinite(selected_prediction).sum())
         if finite_count == required_count:
-            accumulator.update(
-                normalized_prediction=_normalized_states(artifact, selected_prediction),
-                normalized_reference=_normalized_states(artifact, selected_reference),
+            case_id = str(_record_value(record, "case_id"))
+            accumulators.setdefault(case_id, metrics.TransientMetricAccumulator(scope=scope)).update(
                 physical_prediction=selected_prediction,
                 physical_reference=selected_reference,
                 f_surf=np.asarray(scalar[2]),
-                rho_bu_dry=dry_density,
-                cell_weights=cell_weights,
-                valid_mask=_spatial_mask(record, count=selected_prediction.shape[0]),
+                rho_bu_dry=static[_RHO_BULK_DENSITY_INDEX],
+                spacing=metrics.grid_spacing(static),
             )
         times = np.asarray(_record_value(record, "physical_times"), dtype=np.float64)
         elapsed.append(float(times[-1] - times[0]))
@@ -1533,13 +1391,25 @@ def _summarize_group(
     reference_gap_array = np.asarray(reference_gaps, dtype=np.float64)
     gap_error_array = np.asarray(gap_errors, dtype=np.float64)
     metric_support = validity_contract.support_evidence(required=required_count, computed=required_count, finite=finite_count)
+    moisture, case_statistics, field_metrics, unavailable = (
+        _group_errors(
+            {case_id: [accumulator.state_dict()] for case_id, accumulator in accumulators.items()},
+            material_family=material_family,
+            artifact=artifact,
+        )
+        if metric_support["available"]
+        else (None, (), None, None)
+    )
     return TransientSessionSummary(
         frame=frame,
         material_family=material_family,
         mode=mode,
         requested_horizon=horizon,
         scope=scope,
-        metrics=accumulator.finalize() if metric_support["available"] else None,
+        metrics=moisture,
+        case_statistics=case_statistics,
+        field_metrics=field_metrics,
+        relative_unavailable_cases=unavailable,
         metric_support=metric_support,
         contributing_record_count=len(records),
         contributing_case_count=len({_record_value(record, "case_id") for record in records}),

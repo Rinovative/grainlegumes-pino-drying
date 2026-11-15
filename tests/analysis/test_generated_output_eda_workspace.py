@@ -139,6 +139,7 @@ def test_workspace_uses_role_neutral_labels_and_lazy_exact_source_admission(monk
     prepared = workspace.prepare_generated_output_eda_workspace(storage_root=tmp_path, max_cases=1)
     assert calls == []
     assert "campaign=campaign-1" in prepared.summary_text
+    assert "Map display stride: auto" in prepared.summary_text
     assert "material_role" not in prepared.summary_text
     view = prepared.catalog.views[0]
     assert isinstance(view, selection.GeneratedOutputEDAView)
@@ -234,13 +235,13 @@ def test_published_transient_eda_uses_actual_inputs_targets_and_bounded_cases(tr
         "static",
         "boundary",
         "scalars",
-        "target",
+        "next_state",
     }
     state_trajectories = frame.loc[view.case_ids[0], "state_trajectories"]
     assert isinstance(state_trajectories, dict)
     states = cast("dict[str, np.ndarray]", state_trajectories)["T"]
-    np.testing.assert_allclose(values["target", "delta_T"].array, states[1] - states[0], rtol=0.0, atol=2.0e-5)
-    assert values["target", "delta_T"].unit == "K"
+    np.testing.assert_array_equal(values["next_state", "T"].array, states[1])
+    assert values["next_state", "T"].unit == "K"
     static_fields = frame.loc[view.case_ids[0], "static_fields"]
     assert isinstance(static_fields, dict)
     np.testing.assert_array_equal(
@@ -352,6 +353,10 @@ def test_published_steady_eda_preserves_encoded_inputs_and_boundary_support(
     assert values["p"].unit == "Pa"
     assert values["p_in_bc"].array.ndim == 1
     assert values["p_in_bc"].support == "inlet boundary"
+    stored = frame.iloc[0]
+    inlet = np.asarray(stored["y"]) == np.min(stored["y"])
+    assert values["p_in_bc"].array.shape == (np.asarray(stored["x"]).shape[1],)
+    np.testing.assert_array_equal(values["p_in_bc"].array, np.asarray(stored["p_in_bc"])[inlet])
     figure = transient_plots.plot_spatial_field_comparison(
         datasets={"Published": frame},
         case_ids={"Published": view.case_ids[0]},

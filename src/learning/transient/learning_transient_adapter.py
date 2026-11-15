@@ -2,13 +2,17 @@
 
 Responsibilities:
   - Tensorize physical transient evidence on a caller-selected device
-  - Run teacher-forced Stage A and self-fed Stage B differentiable rollouts
-  - Train the RNO on consecutive trajectory windows with a carried, detached hidden state
+  - Compute every unit's loss share from teacher-forced Stage A and self-fed Stage B differentiable rollouts
+  - Fix each update group's windows and Stage-B horizon and origin draws before its microbatches load
+  - Train the RNO on whole trajectories window by window with a carried, detached hidden state
   - Select continuous Stage-B windows without padding or detached feedback
-  - Persist curriculum and stage-budget continuation evidence
+  - Persist compute-accounting and, in Stage B, curriculum continuation evidence; Stage A has no curriculum
+  - Validate with per-case stops before non-finite feedback and count finite physical-bound violations per channel
 
 Design principles:
   - Tensorizer and scaling artifacts remain the channel and reconstruction owners
+  - A unit's loss averages its supervised transitions, in Stage B each window's and then its windows equally;
+    the generic loop owns weights, grouping and steps
   - Every stage is validated by the same autonomous rollout of whole trajectories, so A0, A1, and B select checkpoints alike
   - Controller work advances only after generic-loop optimizer confirmation
 
@@ -19,23 +23,22 @@ This module does NOT:
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
-from collections.abc import Iterator, Mapping
-from typing import Any
+from collections.abc import Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from torch import nn
 
 from src import datasets
+from src.domain.tasks import domain_task_transient_drying as drying
 from src.learning.training import learning_training_adapter as training_adapter
 
 from .learning_transient_contracts import TransientTensorizerSpec
 from .learning_transient_curriculum import (
-    BudgetControl,
-    ClockKind,
     ComparisonArm,
     MatchedComputeController,
     RolloutCurriculum,
@@ -46,12 +49,17 @@ from .learning_transient_curriculum import (
 )
 from .learning_transient_rollout import (
     TransientRollout,
+    autonomous_rollout,
     detach_hidden,
+    encode_finite_cases,
     select_hidden_per_sample,
     self_fed_rollout,
     teacher_forced_rollout,
 )
 from .learning_transient_tensorizer import TransientBatch, TransientTensorizer
+
+if TYPE_CHECKING:
+    from src.datasets.runtime.dataset_runtime_units import UnitGroup
 
 
 class TransientTrainingAdapter:
@@ -67,28 +75,14 @@ class TransientTrainingAdapter:
             raise TypeError(msg)
         self.tensorizer = tensorizer
         self.spec = spec
-        self.curriculum_state = RolloutCurriculumState.create(spec.curriculum, seed=spec.curriculum_seed)
-        self._epoch_index = 0
-        self._optimizer_events = 0
+        # Only Stage B draws rollout horizons, so only Stage B has curriculum state.
+        self.curriculum_state = None if spec.curriculum is None else RolloutCurriculumState.create(spec.curriculum, seed=_seed(spec))
         self._last_origin_min: int | None = None
         self._last_origin_max: int | None = None
-
-    @property
-    def gradient_accumulation_steps(self) -> int:
-        """Return the configured microbatch accumulation factor."""
-        return self.spec.gradient_accumulation_steps
-
-    def begin_epoch(self, *, epoch_index: int, total_epochs: int) -> None:
-        """Bind one epoch index without deriving curriculum progress from epochs."""
-        if isinstance(epoch_index, bool) or not isinstance(epoch_index, int) or epoch_index < 0:
-            msg = "epoch_index must be a non-negative integer."
-            raise ValueError(msg)
-        if isinstance(total_epochs, bool) or not isinstance(total_epochs, int) or total_epochs < 1:
-            msg = "total_epochs must be a positive integer."
-            raise ValueError(msg)
-        self.spec.controller.begin_epoch(epoch_index=epoch_index, total_epochs=total_epochs)
-        self._epoch_index = epoch_index
-        self._optimizer_events = 0
+        # Windows and Stage-B draws of the current update group, by group position; never persisted,
+        # because checkpoints fall on group boundaries.
+        self._group_windows: tuple[tuple[tuple[int, int], ...], ...] = ()
+        self._group_draws: tuple[tuple[tuple[int, int], ...], ...] = ()
 
     def prepare_batch(self, raw_batch: Any, *, device: torch.device, training: bool) -> TransientBatch:
         """Recursively move physical evidence and tensorize it on the scaler device."""
@@ -105,101 +99,151 @@ class TransientTrainingAdapter:
             raise TypeError(msg)
         return self.tensorizer.tensorize(moved)
 
-    def training_steps(self, model: nn.Module, batch: TransientBatch, loss: nn.Module) -> Iterator[training_adapter.AdapterTrainingStep]:
+    def _windows(self, transition_count: int) -> tuple[tuple[int, int], ...]:
         """
-        Yield the differentiable Stage-A or Stage-B microbatches of one loader batch.
+        Return the ``(start, length)`` windows one unit is trained on.
 
-        Stateless models train on the batch as one microbatch. The RNO receives
-        whole trajectories and trains on their consecutive windows in temporal
-        order (truncated backpropagation through time): each window starts from
-        the hidden state the preceding window reached at this window's start
-        (earlier than its end for the overlapping last window), detached so
-        gradients stop at the window boundary. The state is carried from the
-        reference trajectory, so Stage-B self-feeding never leaks into it.
+        A stateless unit (a transition or a window item) is one window. The RNO cuts
+        its trajectory into consecutive windows with a shorter rest window in Stage A,
+        so every transition counts once, and into end-aligned windows in Stage B, so
+        every curriculum horizon fits its window.
         """
         window = self.spec.trajectory_window
         if window is None:
-            yield self._window_step(model, batch, loss, hidden=None, carry_to=None, consumed_items=batch.batch_size)[0]
-            return
-        starts = _window_starts(batch.rollout_length, window)
-        hidden: object | None = None
-        for position, start in enumerate(starts):
-            last = position == len(starts) - 1
-            step, hidden = self._window_step(
-                model,
-                _slice_window(batch, start=start, length=window),
-                loss,
-                hidden=hidden,
-                carry_to=None if last else starts[position + 1] - start,
-                consumed_items=batch.batch_size if last else 0,
-            )
-            yield step
-
-    def _window_step(
-        self,
-        model: nn.Module,
-        window: TransientBatch,
-        loss: nn.Module,
-        *,
-        hidden: object | None,
-        carry_to: int | None,
-        consumed_items: int,
-    ) -> tuple[training_adapter.AdapterTrainingStep, object | None]:
-        """Return one window's loss and the detached RNO state at the next window start."""
-        kind = self.spec.model_kind
-        carried: object | None = None
-        warm_transitions = 0
+            return ((0, transition_count),)
         if self.spec.stage == "stage_a_teacher_forcing":
-            target_batch = window
+            return datasets.contracts.transient.consecutive_windows(transition_count, window=window)
+        return datasets.contracts.transient.rollout_windows(transition_count, rollout_length=window, window_stride=window, window_offset=0)
+
+    def begin_group(self, group: UnitGroup, *, progress: float) -> None:
+        """
+        Fix the windows of every unit of one update group and, in Stage B, one horizon and origin per window.
+
+        The draws follow the group's unit order and each unit's window order at the
+        stage budget fraction ``progress`` committed before the group, so the memory
+        microbatch split cannot change them. A horizon longer than a short window is
+        capped at its length.
+        """
+        lengths = tuple(_transition_count(key) for key in group.keys)
+        self._group_windows = tuple(self._windows(length) for length in lengths)
+        if self.curriculum_state is None:
+            self._group_draws = ()
+            return
+        flat = iter(
+            self.curriculum_state.draw(
+                progress=progress,
+                available_lengths=[length for windows in self._group_windows for _, length in windows],
+            )
+        )
+        self._group_draws = tuple(tuple(next(flat) for _ in windows) for windows in self._group_windows)
+        origins = [origin for draws in self._group_draws for _, origin in draws]
+        self._last_origin_min, self._last_origin_max = min(origins), max(origins)
+
+    def unit_losses(self, model: nn.Module, raw_batch: Any, loss: nn.Module, *, positions: tuple[int, ...]) -> Iterator[training_adapter.UnitLosses]:
+        """
+        Yield the Stage-A or Stage-B loss shares of the units at ``positions`` of the current group.
+
+        Every unit's loss averages its supervised transitions: Stage A every transition
+        of its windows; Stage B each window's drawn horizon, and its windows equally, so
+        a longer horizon adds no weight. The RNO trains on its
+        windows in temporal order (truncated backpropagation through time): each window
+        starts from the hidden state built by teacher forcing from hour 0 with the
+        current weights, detached so gradients stop at the window start, and one result
+        per window releases its graph before the next window. Stage-B self-feeding
+        never leaks into the carried state.
+        """
+        batch = self.prepare_batch(raw_batch, device=self.tensorizer.scaling.device, training=True)
+        unit_windows = {self._group_windows[position] for position in positions} if self._group_windows else set()
+        if len(unit_windows) != 1 or batch.batch_size != len(positions):
+            msg = "A transient microbatch must hold units of one trajectory length from the current update group."
+            raise ValueError(msg)
+        windows = unit_windows.pop()
+        if windows[-1][0] + windows[-1][1] != batch.rollout_length:
+            msg = "Transient microbatch length disagrees with the windows fixed for its units."
+            raise ValueError(msg)
+        if self.spec.stage == "stage_a_teacher_forcing":
+            yield from self._teacher_forced_losses(model, batch, loss, windows)
+        else:
+            yield from self._self_fed_losses(model, batch, loss, windows, tuple(self._group_draws[position] for position in positions))
+
+    def _teacher_forced_losses(
+        self, model: nn.Module, batch: TransientBatch, loss: nn.Module, windows: tuple[tuple[int, int], ...]
+    ) -> Iterator[training_adapter.UnitLosses]:
+        """Yield one teacher-forced share per window, carrying the detached RNO state to the next window."""
+        hidden: object | None = None
+        units = batch.batch_size
+        for index, (start, length) in enumerate(windows):
+            carry_to = None if index == len(windows) - 1 else windows[index + 1][0] - start
             rollout = teacher_forced_rollout(
-                model, window, self.tensorizer, model_kind=kind, initial_hidden=hidden, capture=() if carry_to is None else (carry_to,)
+                model,
+                _slice_window(batch, start=start, length=length),
+                self.tensorizer,
+                model_kind=self.spec.model_kind,
+                initial_hidden=hidden,
+                capture=() if carry_to is None else (carry_to,),
             )
             if carry_to is not None:
-                carried = detach_hidden(rollout.captured_hidden[carry_to])
-        elif self.spec.stage == "stage_b_self_fed":
-            horizon, origins = self.curriculum_state.select(
-                progress=self.spec.controller.progress,
-                available_length=window.rollout_length,
-                batch_size=window.batch_size,
+                hidden = detach_hidden(rollout.captured_hidden[carry_to])
+            share = length / batch.rollout_length
+            components = loss.unit_components(rollout.normalized_prediction, y=rollout.normalized_target)
+            yield training_adapter.UnitLosses(
+                components={name: value * share for name, value in components.items()},
+                supervised_transitions=units * length,
+                forward_transitions=units * length,
             )
-            origins = origins.to(device=window.state.device)
-            self._last_origin_min = int(origins.min().item())
-            self._last_origin_max = int(origins.max().item())
-            target_batch = _select_window(window, tensorizer=self.tensorizer, horizon=horizon, origins=origins)
+
+    def _self_fed_losses(
+        self,
+        model: nn.Module,
+        batch: TransientBatch,
+        loss: nn.Module,
+        windows: tuple[tuple[int, int], ...],
+        draws: tuple[tuple[tuple[int, int], ...], ...],
+    ) -> Iterator[training_adapter.UnitLosses]:
+        """Yield one self-fed share per window and drawn horizon; the RNO starts each origin from its teacher-forced state."""
+        kind = self.spec.model_kind
+        recurrent = self.spec.trajectory_window is not None
+        units = batch.batch_size
+        device = batch.state.device
+        # Each window's loss is its mean over its own horizon; the unit averages its windows equally.
+        share = 1.0 / len(windows)
+        hidden: object | None = None
+        for index, (start, length) in enumerate(windows):
+            window = _slice_window(batch, start=start, length=length)
+            # Horizons, origins and rows stay Python integers: the decisions below never wait for the device.
+            horizons = [unit[index][0] for unit in draws]
+            origins = [unit[index][1] for unit in draws]
             snapshots: Mapping[int, object | None] = {}
-            if self.spec.trajectory_window is not None:
-                # Teacher-forced warm-up over the reference window yields the state at every origin and at the next window.
-                capture = {int(value) for value in origins.tolist()} | (set() if carry_to is None else {carry_to})
+            warm_transitions = 0
+            if recurrent:
+                # The teacher-forced pass over the reference window yields the state at every origin and at the next window.
+                carry_to = None if index == len(windows) - 1 else windows[index + 1][0] - start
+                capture = set(origins) | (set() if carry_to is None else {carry_to})
                 with torch.no_grad():
                     warm = teacher_forced_rollout(model, window, self.tensorizer, model_kind=kind, initial_hidden=hidden, capture=capture)
                 snapshots = warm.captured_hidden
-                carried = None if carry_to is None else snapshots[carry_to]
-                warm_transitions = window.batch_size * window.rollout_length
-            rollout = (
-                self_fed_rollout(model, target_batch, self.tensorizer, model_kind=kind)
-                if self.spec.trajectory_window is None
-                else _self_fed_from_snapshots(model, target_batch, self.tensorizer, model_kind=kind, snapshots=snapshots, origins=origins)
-            )
-        else:
-            msg = "Transient training specification has an unsupported stage."
-            raise RuntimeError(msg)
-        components = _loss_components(
-            loss, rollout.scaled_delta, target_batch.scaled_target, rollout.normalized_prediction, rollout.normalized_target
-        )
-        total = components["total"]
-        if not bool(torch.isfinite(total).all().item()):
-            msg = "Transient training loss is non-finite."
-            raise FloatingPointError(msg)
-        transitions = target_batch.batch_size * target_batch.rollout_length
-        step = training_adapter.AdapterTrainingStep(
-            loss=total,
-            components=components,
-            sample_count=target_batch.batch_size,
-            processed_target_transitions=transitions,
-            forward_transitions=transitions + warm_transitions,
-            consumed_items=consumed_items,
-        )
-        return step, carried
+                hidden = None if carry_to is None else snapshots[carry_to]
+                warm_transitions = units * length
+            for horizon in sorted(set(horizons)):
+                rows = [row for row, value in enumerate(horizons) if value == horizon]
+                row_index = torch.tensor(rows, dtype=torch.long, device=device)
+                target = _select_window(
+                    _index_batch(window, row_index), tensorizer=self.tensorizer, horizon=horizon, origins=[origins[row] for row in rows]
+                )
+                rollout = (
+                    _self_fed_from_snapshots(model, target, self.tensorizer, model_kind=kind, snapshots=snapshots, origins=origins, rows=rows)
+                    if recurrent
+                    else self_fed_rollout(model, target, self.tensorizer, model_kind=kind)
+                )
+                components = loss.unit_components(rollout.normalized_prediction, y=rollout.normalized_target)
+                # Units outside this horizon get a zero share, so every result keeps the microbatch's unit order.
+                scattered = {name: value.new_zeros(units).index_copy(0, row_index, value * share) for name, value in components.items()}
+                yield training_adapter.UnitLosses(
+                    components=scattered,
+                    supervised_transitions=len(rows) * horizon,
+                    forward_transitions=len(rows) * horizon + warm_transitions,
+                )
+                warm_transitions = 0
 
     def evaluation_step(self, model: nn.Module, batch: TransientBatch) -> training_adapter.AdapterEvaluationViews:
         """
@@ -207,24 +251,38 @@ class TransientTrainingAdapter:
 
         Every model starts from the reference state at the trajectory start and
         rolls out the complete trajectory from its own predictions; the RNO
-        carries only its own hidden state. The teacher-forced one-step view
-        predicts every transition from its reference state, the RNO with the
+        carries only its own hidden state. A case stops before its first
+        non-finite state and the other cases continue. The teacher-forced one-step
+        view predicts every transition from its reference state, the RNO with the
         state built over the reference transitions before it.
         """
         kind = self.spec.model_kind
         with torch.no_grad():
-            rollout = self_fed_rollout(model, batch, self.tensorizer, model_kind=kind)
+            rollout = autonomous_rollout(
+                model,
+                self.tensorizer,
+                state=batch.state,
+                static=batch.static,
+                boundary=batch.boundary,
+                scalars=batch.scalars,
+                t_n=batch.t_n,
+                model_kind=kind,
+            )
             one_step_normalized, one_step_physical = _teacher_forced_in_chunks(model, batch, self.tensorizer, model_kind=kind)
         length = batch.rollout_length
+        # Completeness is the autonomous trajectory's alone; the one-step view is a diagnostic.
+        complete = rollout.physical_prediction.flatten(1).isfinite().all(1)
         return training_adapter.AdapterEvaluationViews(
-            normalized_prediction=rollout.normalized_prediction,
-            normalized_target=rollout.normalized_target,
+            normalized_prediction=encode_finite_cases(self.tensorizer.scaling, rollout.physical_prediction, reference=batch.next_state),
+            normalized_target=self.tensorizer.scaling.encode_state(batch.next_state),
             physical_prediction=rollout.physical_prediction,
-            physical_target=rollout.physical_target,
+            physical_target=batch.next_state,
             one_step_normalized_prediction=one_step_normalized,
             one_step_physical_prediction=one_step_physical,
             sample_count=batch.batch_size,
             processed_target_transitions=batch.batch_size * length,
+            case_complete=complete,
+            bound_violations=_bound_violations(rollout.physical_prediction, batch.t_n_plus_1),
             f_surf=batch.scalars[:, 2].view(batch.batch_size, 1).expand(-1, length),
         )
 
@@ -234,42 +292,19 @@ class TransientTrainingAdapter:
             msg = "work must be an OptimizerWork."
             raise TypeError(msg)
         self.spec.controller.record_completed_work(
-            optimizer_device_seconds=work.optimizer_device_seconds,
             microbatches=work.microbatches,
             processed_target_transitions=work.processed_target_transitions,
             forward_transitions=work.forward_transitions,
-            wall_seconds=work.wall_seconds,
-            epoch_index=self._epoch_index,
-            microbatch_index=self._optimizer_events,
             peak_cuda_memory_bytes=work.peak_cuda_memory_bytes,
-            train_seconds=work.train_seconds,
-            batch_cursor=work.batch_cursor,
         )
-        self._optimizer_events += 1
 
     def record_validation_work(self, seconds: float) -> None:
-        """Record completed validation time excluded from matched-compute progress."""
+        """Record completed validation time, which stays outside the optimisation clock."""
         self.spec.controller.record_validation_work(seconds)
 
-    def budget_state(self) -> dict[str, Any]:
-        """Return strict stage-budget evidence for loop stop decisions."""
+    def controller_state(self) -> dict[str, Any]:
+        """Return the strict controller evidence a terminal summary mirrors."""
         return self.spec.controller.state_dict()
-
-    def should_stop(self) -> bool:
-        """Return the controller's sticky completion state."""
-        return self.spec.controller.budget_complete
-
-    def evaluates_at_budget_points(self) -> bool:
-        """Return whether selection waits for equally spaced points of a measured budget."""
-        return self.spec.controller.evaluation_points is not None
-
-    def budget_evaluation_due(self) -> bool:
-        """Return whether a new budget point was crossed since the last selection evaluation."""
-        return self.spec.controller.budget_evaluation_due
-
-    def record_budget_evaluation(self) -> None:
-        """Mark the budget points reached so far as evaluated."""
-        self.spec.controller.record_budget_evaluation()
 
     def record_within_budget_evaluation(self, metric: float, *, epoch_index: int) -> None:
         """Record one eligible finite selection metric."""
@@ -279,11 +314,8 @@ class TransientTrainingAdapter:
         self.spec.controller.record_within_budget_evaluation(float(metric), epoch_index=epoch_index)
 
     def validate_terminal_state(self, *, best_metric: float | None, best_epoch: int | None) -> None:
-        """Require a completed budget and exact budget-boundary checkpoint selection."""
+        """Require the selected checkpoint to be the best validation within the completed stage budget."""
         controller = self.spec.controller
-        if not controller.budget_complete:
-            msg = "Transient training ended before its configured budget completed."
-            raise RuntimeError(msg)
         if controller.best_within_budget_metric is None or controller.best_within_budget_epoch is None:
             msg = "Transient training has no selected metric at or before its budget boundary."
             raise RuntimeError(msg)
@@ -292,62 +324,52 @@ class TransientTrainingAdapter:
             raise RuntimeError(msg)
 
     def telemetry_state(self) -> dict[str, float | int | bool | None]:
-        """Return compact stage, curriculum, and stage-budget telemetry."""
+        """Return compact stage, stage-budget and, in Stage B, curriculum telemetry."""
         controller = self.spec.controller
+        curriculum = self.curriculum_state
         return {
-            "curriculum_progress": controller.progress,
-            "curriculum_active_stage": self.curriculum_state.active_stage,
-            "curriculum_max_horizon": self.curriculum_state.max_horizon,
-            "curriculum_draw_index": self.curriculum_state.draw_index,
-            "selected_rollout_horizon": self.curriculum_state.max_horizon,
+            **(
+                {}
+                if curriculum is None
+                else {
+                    "curriculum_progress": curriculum.progress,
+                    "curriculum_active_stage": curriculum.active_stage,
+                    "curriculum_max_horizon": curriculum.max_horizon,
+                    "curriculum_draw_index": curriculum.draw_index,
+                    "selected_rollout_horizon": curriculum.max_horizon,
+                }
+            ),
             "last_origin_min": getattr(self, "_last_origin_min", None),
             "last_origin_max": getattr(self, "_last_origin_max", None),
             "self_fed_stage": int(self.spec.stage == "stage_b_self_fed"),
-            "planned_stage_epochs": controller.planned_stage_epochs,
-            "completed_stage_epochs": controller.completed_stage_epochs,
-            "post_handoff_optimizer_device_seconds": controller.post_handoff_optimizer_device_seconds,
             "post_handoff_optimizer_steps": controller.post_handoff_optimizer_steps,
             "processed_target_transitions": controller.processed_target_transitions,
             "forward_transitions": controller.forward_transitions,
-            "wall_seconds": controller.wall_seconds,
             "validation_seconds": controller.validation_seconds,
             "peak_cuda_memory_bytes": controller.peak_cuda_memory_bytes,
             "best_within_budget_metric": controller.best_within_budget_metric,
             "best_within_budget_epoch": controller.best_within_budget_epoch,
-            "budget_complete": controller.budget_complete,
-            "budget_crossing_epoch": controller.crossing_epoch,
-            "budget_crossing_microbatch": controller.crossing_microbatch,
         }
 
     def state_dict(self) -> dict[str, Any]:
-        """Return exact adapter continuation state with immutable semantic digest."""
+        """Return exact adapter continuation state with immutable semantic digest; only Stage B saves curriculum state."""
         return {
             "spec_digest": self.spec.digest,
             "controller": self.spec.controller.state_dict(),
-            "curriculum": self.curriculum_state.state_dict(),
-            "epoch_index": self._epoch_index,
-            "optimizer_events": self._optimizer_events,
+            **({} if self.curriculum_state is None else {"curriculum": self.curriculum_state.state_dict()}),
             "last_origin_min": getattr(self, "_last_origin_min", None),
             "last_origin_max": getattr(self, "_last_origin_max", None),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        """Restore exact matching adapter continuation state."""
-        required = {"spec_digest", "controller", "curriculum", "epoch_index", "optimizer_events", "last_origin_min", "last_origin_max"}
+        """Restore exact matching adapter continuation state; a Stage-A state with curriculum state is refused."""
+        required = {"spec_digest", "controller", "last_origin_min", "last_origin_max", *(() if self.curriculum_state is None else ("curriculum",))}
         if not isinstance(state, dict) or set(state) != required or state["spec_digest"] != self.spec.digest:
             msg = "Saved transient adapter state conflicts with the configured semantic specification."
             raise ValueError(msg)
-        if not isinstance(state["controller"], Mapping) or not isinstance(state["curriculum"], Mapping):
+        if not isinstance(state["controller"], Mapping) or not isinstance(state.get("curriculum", {}), Mapping):
             message = "Saved transient adapter controller and curriculum state must be mappings."
             raise TypeError(message)
-        epoch_index = state["epoch_index"]
-        optimizer_events = state["optimizer_events"]
-        if isinstance(epoch_index, bool) or not isinstance(epoch_index, int) or epoch_index < 0:
-            message = "Saved epoch_index must be non-negative."
-            raise ValueError(message)
-        if isinstance(optimizer_events, bool) or not isinstance(optimizer_events, int) or optimizer_events < 0:
-            message = "Saved optimizer_events must be non-negative."
-            raise ValueError(message)
         origin_values = (state["last_origin_min"], state["last_origin_max"])
         if any(value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0) for value in origin_values):
             msg = "Saved transient origin evidence must be null or non-negative integers."
@@ -356,16 +378,23 @@ class TransientTrainingAdapter:
             msg = "Saved transient origin evidence is inconsistent."
             raise ValueError(msg)
         controller_clone = _clone_controller(self.spec.controller)
-        curriculum_clone = RolloutCurriculumState.create(self.spec.curriculum, seed=self.spec.curriculum_seed)
-        curriculum_clone.load_state_dict(self.curriculum_state.state_dict())
         controller_clone.load_state_dict(state["controller"])
-        curriculum_clone.load_state_dict(state["curriculum"])
+        if self.curriculum_state is not None and self.spec.curriculum is not None:
+            curriculum_clone = RolloutCurriculumState.create(self.spec.curriculum, seed=_seed(self.spec))
+            curriculum_clone.load_state_dict(self.curriculum_state.state_dict())
+            curriculum_clone.load_state_dict(state["curriculum"])
+            self.curriculum_state.load_state_dict(curriculum_clone.state_dict())
         self.spec.controller.load_state_dict(controller_clone.state_dict())
-        self.curriculum_state.load_state_dict(curriculum_clone.state_dict())
-        self._epoch_index = epoch_index
-        self._optimizer_events = optimizer_events
         self._last_origin_min = state["last_origin_min"]
         self._last_origin_max = state["last_origin_max"]
+
+
+def _seed(spec: TransientTrainingSpec) -> int:
+    """Return the curriculum seed a Stage-B specification carries beside its curriculum."""
+    if spec.curriculum_seed is None:
+        msg = "A transient curriculum needs its seed."
+        raise ValueError(msg)
+    return spec.curriculum_seed
 
 
 def _clone_controller(controller: MatchedComputeController) -> MatchedComputeController:
@@ -393,6 +422,7 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
 
 # Bounds the memory of batched teacher-forced inference over long trajectories.
 _TEACHER_FORCED_CHUNK = 32
+_STATE_FIELDS = tuple(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.dynamic_state)
 
 
 def _teacher_forced_in_chunks(
@@ -405,16 +435,38 @@ def _teacher_forced_in_chunks(
         length = min(_TEACHER_FORCED_CHUNK, batch.rollout_length - start)
         capture = (length,) if model_kind == "rno" else ()
         part = teacher_forced_rollout(
-            model, _slice_window(batch, start=start, length=length), tensorizer, model_kind=model_kind, initial_hidden=hidden, capture=capture
+            model,
+            _slice_window(batch, start=start, length=length),
+            tensorizer,
+            model_kind=model_kind,
+            initial_hidden=hidden,
+            capture=capture,
+            require_finite=False,
         )
         hidden = part.captured_hidden.get(length)
         parts.append(part)
     return torch.cat([part.normalized_prediction for part in parts], dim=1), torch.cat([part.physical_prediction for part in parts], dim=1)
 
 
-def _window_starts(transition_count: int, window: int) -> tuple[int, ...]:
-    """Return the Dataset-owned starts of consecutive windows covering one trajectory."""
-    return datasets.contracts.transient.rollout_window_starts(transition_count, rollout_length=window, window_stride=window, window_offset=0)
+def _bound_violations(prediction: torch.Tensor, times: torch.Tensor) -> dict[str, tuple[float | None, ...]]:
+    """Return per state channel and batch row the physical time of the first finite autonomous state outside the bounds, ``None`` without one."""
+    invalid = drying.physical_invalid_mask(prediction.detach().cpu().numpy())
+    state_times = times.detach().cpu().numpy()
+    result: dict[str, tuple[float | None, ...]] = {}
+    for index, name in enumerate(_STATE_FIELDS):
+        steps: np.ndarray = np.any(invalid[:, :, index], axis=(-2, -1))
+        first = state_times[np.arange(len(steps)), steps.argmax(axis=1)].tolist()
+        violated: np.ndarray = np.any(steps, axis=1)
+        result[name] = tuple(hours if hit else None for hours, hit in zip(first, violated, strict=True))
+    return result
+
+
+def _transition_count(key: object) -> int:
+    """Return one unit's transition count from its sampler key."""
+    if isinstance(key, bool) or not isinstance(key, int) or key < 1:
+        msg = f"A transient unit key must be its positive transition count, got {key!r}."
+        raise ValueError(msg)
+    return key
 
 
 def _slice_window(batch: TransientBatch, *, start: int, length: int) -> TransientBatch:
@@ -423,11 +475,11 @@ def _slice_window(batch: TransientBatch, *, start: int, length: int) -> Transien
         msg = "Transient trajectory window must lie inside the batch."
         raise ValueError(msg)
     stop = start + length
-    state = batch.state if start == 0 else batch.state + batch.target[:, :start].sum(dim=1)
+    state = batch.state if start == 0 else batch.next_state[:, start - 1]
     sequence_input = batch.sequence_input[:, start:stop]
     return TransientBatch(
         state=state,
-        target=batch.target[:, start:stop],
+        next_state=batch.next_state[:, start:stop],
         static=batch.static,
         boundary=batch.boundary[:, start:stop],
         scalars=batch.scalars,
@@ -436,7 +488,6 @@ def _slice_window(batch: TransientBatch, *, start: int, length: int) -> Transien
         dt=batch.dt[:, start:stop],
         step_input=sequence_input[:, 0],
         sequence_input=sequence_input,
-        scaled_target=batch.scaled_target[:, start:stop],
     )
 
 
@@ -444,7 +495,7 @@ def _index_batch(batch: TransientBatch, rows: torch.Tensor) -> TransientBatch:
     """Return the selected samples of one batch in the given order."""
     return TransientBatch(
         state=batch.state[rows],
-        target=batch.target[rows],
+        next_state=batch.next_state[rows],
         static=batch.static[rows],
         boundary=batch.boundary[rows],
         scalars=batch.scalars[rows],
@@ -453,7 +504,6 @@ def _index_batch(batch: TransientBatch, rows: torch.Tensor) -> TransientBatch:
         dt=batch.dt[rows],
         step_input=batch.step_input[rows],
         sequence_input=batch.sequence_input[rows],
-        scaled_target=batch.scaled_target[rows],
     )
 
 
@@ -464,30 +514,38 @@ def _self_fed_from_snapshots(
     *,
     model_kind: str,
     snapshots: Mapping[int, object | None],
-    origins: torch.Tensor,
+    origins: Sequence[int],
+    rows: Sequence[int],
 ) -> TransientRollout:
     """
-    Roll every sample out from the RNO state captured at its own origin.
+    Roll every sample of ``batch`` out from the RNO state captured at its own origin.
 
-    Samples whose origin is still the trajectory start keep the model's own
-    initial state, which one batched call cannot mix with captured states, so
-    those samples run as a separate group and are restored to batch order.
+    ``batch`` holds the microbatch samples ``rows``, whose snapshots and ``origins``
+    cover the whole microbatch. Samples whose origin is still the trajectory start
+    keep the model's own initial state, which one batched call cannot mix with
+    captured states, so those samples run as a separate group and are restored to
+    batch order. The split is decided on Python integers, without device reads.
     """
-    initial = torch.tensor([snapshots[int(value)] is None for value in origins.tolist()], device=origins.device)
-    if bool(initial.all().item()) or not bool(initial.any().item()):
-        return self_fed_rollout(model, batch, tensorizer, model_kind=model_kind, initial_hidden=select_hidden_per_sample(snapshots, origins))
-    groups = (torch.nonzero(initial).flatten(), torch.nonzero(~initial).flatten())
+    initial = [snapshots[origins[row]] is None for row in rows]
+    if all(initial) or not any(initial):
+        return self_fed_rollout(model, batch, tensorizer, model_kind=model_kind, initial_hidden=select_hidden_per_sample(snapshots, origins, rows))
+    groups = (
+        [local for local, flag in enumerate(initial) if flag],
+        [local for local, flag in enumerate(initial) if not flag],
+    )
+    device = batch.state.device
     parts = [
         self_fed_rollout(
             model,
-            _index_batch(batch, rows),
+            _index_batch(batch, torch.tensor(local, dtype=torch.long, device=device)),
             tensorizer,
             model_kind=model_kind,
-            initial_hidden=select_hidden_per_sample(snapshots, origins, rows),
+            initial_hidden=select_hidden_per_sample(snapshots, origins, [rows[position] for position in local]),
         )
-        for rows in groups
+        for local in groups
     ]
-    order = torch.argsort(torch.cat(groups))
+    concatenated = [*groups[0], *groups[1]]
+    order = torch.tensor(sorted(range(len(concatenated)), key=concatenated.__getitem__), dtype=torch.long, device=device)
     return TransientRollout(
         scaled_delta=torch.cat([part.scaled_delta for part in parts])[order],
         physical_prediction=torch.cat([part.physical_prediction for part in parts])[order],
@@ -497,38 +555,36 @@ def _self_fed_from_snapshots(
     )
 
 
-def _select_window(batch: TransientBatch, *, tensorizer: TransientTensorizer, horizon: int, origins: torch.Tensor) -> TransientBatch:
-    """Select one valid unpadded physical window per sample and reassemble inputs."""
+def _select_window(batch: TransientBatch, *, tensorizer: TransientTensorizer, horizon: int, origins: Sequence[int]) -> TransientBatch:
+    """Select one valid unpadded physical window per sample and reassemble inputs; origins are validated as Python integers."""
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1 or horizon > batch.rollout_length:
         msg = "Transient window horizon must fit the tensorized rollout length."
         raise ValueError(msg)
-    if (
-        origins.shape != (batch.batch_size,)
-        or origins.dtype != torch.long
-        or bool((origins < 0).any().item())
-        or bool((origins + horizon > batch.rollout_length).any().item())
+    if len(origins) != batch.batch_size or any(
+        isinstance(origin, bool) or not isinstance(origin, int) or origin < 0 or origin + horizon > batch.rollout_length for origin in origins
     ):
         msg = "Transient window origins must be valid per-sample integer starts."
         raise ValueError(msg)
-    indices = origins[:, None] + torch.arange(horizon, device=origins.device)[None, :]
-    gather_target = indices[:, :, None, None, None].expand(-1, -1, 4, batch.target.shape[-2], batch.target.shape[-1])
-    target = batch.target.gather(1, gather_target)
+    starts = torch.tensor(origins, dtype=torch.long, device=batch.state.device)
+    indices = starts[:, None] + torch.arange(horizon, device=starts.device)[None, :]
+    stored = torch.cat((batch.state.unsqueeze(1), batch.next_state), dim=1)
+    gather_states = indices[:, :, None, None, None].expand(-1, -1, *batch.next_state.shape[2:])
+    next_state = batch.next_state.gather(1, gather_states)
+    current_states = stored.gather(1, gather_states)
     boundary = batch.boundary.gather(1, indices[:, :, None].expand(-1, -1, batch.boundary.shape[-1]))
     t_n = batch.t_n.gather(1, indices)
     t_next = batch.t_n_plus_1.gather(1, indices)
     dt = batch.dt.gather(1, indices)
-    preceding = torch.cat((torch.zeros_like(batch.target[:, :1]), batch.target), dim=1).cumsum(dim=1)
-    initial = batch.state + preceding[torch.arange(batch.batch_size, device=origins.device), origins]
     inputs = torch.stack(
         [
-            tensorizer.assemble_step(initial + target[:, :index].sum(dim=1), batch.static, boundary[:, index], batch.scalars, t_n[:, index])
+            tensorizer.assemble_step(current_states[:, index], batch.static, boundary[:, index], batch.scalars, t_n[:, index])
             for index in range(horizon)
         ],
         dim=1,
     )
     return TransientBatch(
-        state=initial,
-        target=target,
+        state=current_states[:, 0],
+        next_state=next_state,
         static=batch.static,
         boundary=boundary,
         scalars=batch.scalars,
@@ -537,22 +593,7 @@ def _select_window(batch: TransientBatch, *, tensorizer: TransientTensorizer, ho
         dt=dt,
         step_input=inputs[:, 0],
         sequence_input=inputs,
-        scaled_target=tensorizer.scaling.encode_delta(target),
     )
-
-
-def _loss_components(
-    loss: nn.Module, prediction: torch.Tensor, target: torch.Tensor, predicted_state: torch.Tensor, target_state: torch.Tensor
-) -> dict[str, torch.Tensor]:
-    """Compute transient loss components through its semantic public contract."""
-    if hasattr(loss, "compute_components"):
-        components = loss.compute_components(prediction, y=target, predicted_state=predicted_state, target_state=target_state)
-        if not isinstance(components, Mapping) or "total" not in components:
-            msg = "Transient loss compute_components must return a mapping containing total."
-            raise TypeError(msg)
-        return dict(components)
-    total = loss(prediction, target)
-    return {"total": total, "data": total}
 
 
 def build_transient_training_adapter(
@@ -560,12 +601,11 @@ def build_transient_training_adapter(
     *,
     scaling: Any,
     device: torch.device,
-    curriculum_seed: int,
+    curriculum_seed: int | None,
     teacher_handoff: TeacherHandoffIdentity | None = None,
-    matched_train_seconds: float | None = None,
     matched_receipt_sha256: str | None = None,
 ) -> TransientTrainingAdapter:
-    """Build one fresh task adapter from resolved transient runtime semantics and the arm's derived curriculum seed."""
+    """Build one fresh task adapter from resolved transient runtime semantics; only Stage B takes a curriculum and its seed."""
     training = config.get("training")
     temporal = config.get("temporal")
     profile = config.get("input_profile")
@@ -580,57 +620,43 @@ def build_transient_training_adapter(
     except KeyError as error:
         msg = "Transient comparison arm is invalid."
         raise ValueError(msg) from error
-    protocol = training.get("matched_a1_b")
-    matched_time = protocol is not None and arm in {"B", "A1"}
-    clock_kind: ClockKind = "train_seconds" if matched_time else "cuda_device_seconds" if device.type == "cuda" else "optimizer_steps"
-    curriculum_data = training["curriculum"]
-    if not isinstance(curriculum_data, Mapping):
-        msg = "Transient curriculum must be a mapping."
-        raise TypeError(msg)
-    curriculum = RolloutCurriculum(
-        lengths=tuple(curriculum_data["lengths"]),
-        milestone_fractions=tuple(curriculum_data["milestone_fractions"]),
-    )
+    curriculum: RolloutCurriculum | None = None
+    if stage == "stage_b_self_fed":
+        curriculum_data = training["curriculum"]
+        if not isinstance(curriculum_data, Mapping):
+            msg = "Transient curriculum must be a mapping."
+            raise TypeError(msg)
+        curriculum = RolloutCurriculum(
+            lengths=tuple(curriculum_data["lengths"]),
+            milestone_fractions=tuple(curriculum_data["milestone_fractions"]),
+        )
     sampling = temporal.get("sampling")
     if not isinstance(sampling, Mapping):
         msg = "Resolved transient adapter config lacks its temporal sampling."
         raise TypeError(msg)
     trajectory_window = int(sampling["rollout_length"]) if sampling.get("mode") == "trajectory" else None
+    # The stage's budget belongs to its controller identity like every other setting: a run is never extended.
     semantic_config = {key: value for key, value in config.items() if key not in {"paths", "_transient_tensorizer"}}
-    if protocol is not None:
-        semantic_config = copy.deepcopy(semantic_config)
-        semantic_config["training"].pop("epochs")
-        for cap in ("a0_max_epochs", "b_max_epochs", "a1_max_epochs"):
-            semantic_config["training"]["stage_schedule"].pop(cap)
     try:
         encoded_config = json.dumps(semantic_config, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
     except (TypeError, ValueError) as error:
         msg = "Resolved transient adapter semantics must be canonical JSON."
         raise ValueError(msg) from error
     config_digest = hashlib.sha256(encoded_config).hexdigest()
-    budget_control: BudgetControl = "train_seconds" if matched_time else "stage_epochs"
-    if protocol is not None and arm == "B":
-        matched_train_seconds = float(protocol["train_seconds"])
-    if protocol is not None and arm == "A1" and (matched_train_seconds is None or matched_receipt_sha256 is None):
-        msg = "A1 requires an admitted exact B time receipt before adapter construction."
+    if (arm == "A1") != (matched_receipt_sha256 is not None):
+        msg = "Exactly A1 is built with an admitted exact B time receipt."
         raise ValueError(msg)
     controller = MatchedComputeController(
         arm=arm,
         stage=stage,
-        clock_kind=clock_kind,
         config_digest=config_digest,
-        budget_control=budget_control,
-        planned_stage_epochs=int(training["epochs"]) if budget_control == "stage_epochs" else None,
         teacher_handoff=teacher_handoff,
-        planned_train_seconds=matched_train_seconds if matched_time else None,
-        matched_receipt_sha256=matched_receipt_sha256 if matched_time else None,
-        evaluation_points=int(protocol["evaluation_points"]) if protocol is not None and matched_time else None,
+        matched_receipt_sha256=matched_receipt_sha256,
     )
     spec = TransientTrainingSpec(
         stage=stage,
         model_kind=str(config["model"]["kind"]),
         controller=controller,
-        gradient_accumulation_steps=int(training["gradient_accumulation_steps"]),
         curriculum=curriculum,
         curriculum_seed=curriculum_seed,
         trajectory_window=trajectory_window,

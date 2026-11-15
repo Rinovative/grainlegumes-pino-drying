@@ -1,28 +1,44 @@
-"""Create deterministic scientific inputs and isolated COMSOL work directories.
+"""Create deterministic scientific inputs, store them in one HDF5 container, and render their COMSOL CSVs.
 
 Responsibilities:
-  - Resolve one typed sample into spatial, scalar, and schedule adapter tables
-  - Derive exact adapter-input and profile-bound simulation identities
-  - Copy one immutable template into a fresh disposable work directory
+  - Resolve one typed sample into spatial, scalar, and schedule inputs stored atomically in one HDF5 input container
+  - Read the stored container through one fail-closed reader: inventory, dtype, shape, finite values, and coordinate order
+  - Render the canonical COMSOL CSV bytes and derive exact adapter-input and profile-bound simulation identities from them
+  - Materialize identity-verified CSVs into a COMSOL work directory and measure the container's storage integrity
 
 Design principles:
-  - Adapter bytes are deterministic, case-local, and identity-bound
+  - Rendered adapter bytes are deterministic, case-local, and identity-bound; the container's own bytes are storage integrity only
+  - One formatter and one renderer serve generation, admission, and runtime materialization
+  - Column order comes from the case input contract and is recorded in the file, never taken from HDF5 member order
   - Every stochastic stream and block row is explicit in case provenance
-  - Source templates are read and copied but never opened as output targets
 
 This module does NOT:
   - Run COMSOL, infer template mappings, or publish canonical HDF5 results
-  - Treat CSV as a canonical learning-view artifact
+  - Store CSV files, read CSV-only case directories, or treat CSV as a canonical learning-view artifact
+
+Notes:
+  Input container layout (format version 1, no timestamps):
+    - Root attribute ``format_version``.
+    - ``fields/``: one float64 ``(ny, nx)`` dataset per spatial column, ordered by the group attribute ``columns``;
+      ``ravel(order="F")`` reproduces the CSV row order.
+    - ``scalars`` (transient): compound table ``name, value, unit`` in handoff order.
+    - ``schedule`` (transient): compound table with one float64 member per schedule column, in row order.
+    - VS Code with the H5Web extension opens the container without code.
+
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
+
+import h5py
+import numpy as np
 
 from src import common
 from src.generation.contracts import generation_contracts_materials as materials
@@ -38,7 +54,15 @@ from . import generation_cases_sampling as sampling_service
 from . import generation_cases_schedule as schedule_service
 from . import generation_cases_seeding as seeding
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
 CASE_SCHEMA_KIND = "generation_source_case"
+INPUT_STORE_FORMAT_VERSION: Final = 1
+_FORMAT_ATTRIBUTE: Final = "format_version"
+_COLUMNS_ATTRIBUTE: Final = "columns"
+_INPUT_TABLES: Final = {"spatial": "fields", "scalar": "scalars", "schedule": "schedule"}
+_SCALAR_COLUMNS: Final = ("name", "value", "unit")
 _TABLE_RANK = 2
 
 
@@ -163,15 +187,45 @@ def compute_simulation_case_id(payload: dict[str, Any]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class CaseBundle:
-    """One generated case input bundle and its two canonical identities."""
+    """One generated case input bundle and its two canonical identities.
+
+    ``scalar_handoff`` binds the transient scalar CSV that COMSOL reads; its source path is the case-local
+    filename for a stored bundle and the rendered file for a prepared work directory.
+    """
 
     directory: Path
     case_id: str
     case_input_id: str
     simulation_case_id: str
     case_payload: dict[str, Any]
-    input_paths: tuple[Path, ...]
     scalar_handoff: scalar_handoff_contract.ScalarHandoffAdmission | None
+
+
+@dataclass(frozen=True, slots=True)
+class InputStoreIdentity:
+    """Storage-integrity evidence of one stored input container, outside every scientific identity."""
+
+    sha256: str
+    size_bytes: int
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the persisted manifest representation."""
+        return {"sha256": self.sha256, "size_bytes": self.size_bytes}
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCaseInputs:
+    """Validated stored case inputs in contract order; arrays are read-only."""
+
+    fields: Mapping[str, np.ndarray]
+    scalars: tuple[tuple[str, float, str], ...]
+    schedule: np.ndarray | None
+
+
+def _require(condition: bool, message: str) -> None:
+    """Fail closed with one input-store contract message."""
+    if not condition:
+        raise ValueError(message)
 
 
 def _format_number(value: float) -> str:
@@ -187,47 +241,317 @@ def _table_text(rows: list[list[str]], *, delimiter: str) -> str:
     return stream.getvalue()
 
 
-def _write_spatial_file(destination: Path, fields: fields_service.SpatialFields, spec: dict[str, Any]) -> Path:
-    """Write the exact spatial adapter in deterministic column-major order."""
-    columns = list(spec["columns"])
-    missing = [name for name in columns if name not in fields.columns]
-    if missing:
-        msg = f"Spatial adapter requests unknown generated fields: {missing}."
-        raise ValueError(msg)
-    flattened = [fields.columns[name].ravel(order="F") for name in columns]
+def require_input_store(directory: Path) -> Path:
+    """Return the regular stored input container or refuse a directory without one, naming the regeneration fix."""
+    name = common.paths.GENERATION_INPUT_STORE_FILENAME
+    path = directory / name
+    if path.is_symlink() or not path.is_file():
+        message = f"Case inputs have no regular {name}: {directory}. Inputs stored as CSV files predate the HDF5 input store; regenerate them."
+        raise FileNotFoundError(message)
+    return path
+
+
+def measure_input_store(directory: Path) -> InputStoreIdentity:
+    """Return the sha256 and size of one directory's stored input container."""
+    data = require_input_store(directory).read_bytes()
+    return InputStoreIdentity(sha256=hashlib.sha256(data).hexdigest(), size_bytes=len(data))
+
+
+def _validate_inputs(content: StoredCaseInputs, input_contract: Mapping[str, Any]) -> None:
+    """Require the contract inventory, float64 dtype, shared shape, finite values, and Cartesian F-order grid."""
+    columns = list(input_contract["spatial"]["columns"])
+    _require(list(content.fields) == columns and {"x", "y"}.issubset(columns), "Stored spatial inputs do not match the contract columns.")
+    _require(
+        len({values.shape for values in content.fields.values()}) == 1
+        and all(values.dtype == np.float64 and values.ndim == _TABLE_RANK and values.size > 0 for values in content.fields.values())
+        and all(np.isfinite(values).all() for values in content.fields.values()),
+        "Stored spatial inputs must be finite non-empty float64 maps of one shared two-dimensional shape.",
+    )
+    x_values, y_values = content.fields["x"], content.fields["y"]
+    ny, nx = x_values.shape
+    # Physical coordinates need not ascend; x is constant down each column and y along each row, with distinct axis values.
+    _require(
+        bool(np.all(x_values == x_values[:1, :]))
+        and bool(np.all(y_values == y_values[:, :1]))
+        and np.unique(x_values[0]).size == nx
+        and np.unique(y_values[:, 0]).size == ny,
+        "Stored spatial coordinates are not one Cartesian grid in canonical F-order.",
+    )
+    transient = "scalar" in input_contract
+    _require(
+        ("schedule" in input_contract) == transient and bool(content.scalars) == transient and (content.schedule is None) != transient,
+        "Stored scalar and schedule inputs do not match the case input contract.",
+    )
+    if content.schedule is None:
+        return
+    _require(tuple(input_contract["scalar"]["columns"]) == _SCALAR_COLUMNS, "Scalar input contract must name the columns name, value, and unit.")
+    names = [name for name, _value, _unit in content.scalars]
+    _require(
+        all(names) and len(set(names)) == len(names) and all(math.isfinite(value) for _name, value, _unit in content.scalars),
+        "Stored scalar inputs need unique non-empty names and finite values.",
+    )
+    schedule = content.schedule
+    _require(
+        schedule.dtype == np.float64
+        and schedule.ndim == _TABLE_RANK
+        and schedule.shape[0] > 0
+        and schedule.shape[1] == len(input_contract["schedule"]["columns"])
+        and bool(np.isfinite(schedule).all()),
+        "Stored schedule must be a finite non-empty float64 table with one column per contract column.",
+    )
+
+
+def _text_dtype(values: Sequence[str]) -> np.dtype[Any]:
+    """Return one fixed-length UTF-8 string type wide enough for every value."""
+    return h5py.string_dtype("utf-8", max([1, *(len(value.encode("utf-8")) for value in values)]))
+
+
+def _write_container(path: Path, content: StoredCaseInputs, input_contract: Mapping[str, Any]) -> None:
+    """Write one complete input container to a fresh temporary path."""
+    with h5py.File(path, "w") as handle:
+        handle.attrs[_FORMAT_ATTRIBUTE] = INPUT_STORE_FORMAT_VERSION
+        fields = handle.create_group(_INPUT_TABLES["spatial"])
+        fields.attrs.create(_COLUMNS_ATTRIBUTE, list(content.fields), dtype=h5py.string_dtype())
+        for name, values in content.fields.items():
+            fields.create_dataset(name, data=values)
+        if content.schedule is None:
+            return
+        scalar_type = np.dtype(
+            [
+                ("name", _text_dtype([name for name, _value, _unit in content.scalars])),
+                ("value", np.float64),
+                ("unit", _text_dtype([unit for _name, _value, unit in content.scalars])),
+            ]
+        )
+        scalars = np.array([(name.encode(), value, unit.encode()) for name, value, unit in content.scalars], dtype=scalar_type)
+        handle.create_dataset(_INPUT_TABLES["scalar"], data=scalars)
+        columns = list(input_contract["schedule"]["columns"])
+        schedule = np.empty(content.schedule.shape[0], dtype=np.dtype([(name, np.float64) for name in columns]))
+        for index, name in enumerate(columns):
+            schedule[name] = content.schedule[:, index]
+        handle.create_dataset(_INPUT_TABLES["schedule"], data=schedule)
+
+
+def _read_only(values: np.ndarray) -> np.ndarray:
+    """Return one independent read-only float64 array."""
+    result = np.array(values, dtype=np.float64, copy=True)
+    result.setflags(write=False)
+    return result
+
+
+def _member(parent: h5py.Group, name: str, kind: type[h5py.Group | h5py.Dataset]) -> Any:
+    """Return one named container member of the required HDF5 kind."""
+    member = parent.get(name)
+    _require(isinstance(member, kind), f"Stored case-input member {name!r} must be an HDF5 {kind.__name__}.")
+    return member
+
+
+def _read_container(handle: h5py.File, input_contract: Mapping[str, Any]) -> StoredCaseInputs:
+    """Read one opened input container after checking its exact inventory and member types."""
+    expected = {table for kind, table in _INPUT_TABLES.items() if kind in input_contract}
+    version = handle.attrs.get(_FORMAT_ATTRIBUTE)
+    _require(
+        set(handle.attrs) == {_FORMAT_ATTRIBUTE} and isinstance(version, np.integer) and int(version) == INPUT_STORE_FORMAT_VERSION,
+        f"Stored case inputs must carry format_version {INPUT_STORE_FORMAT_VERSION} and no other root attribute.",
+    )
+    _require(set(handle) == expected, f"Stored case inputs must contain exactly {sorted(expected)}.")
+    group = _member(handle, _INPUT_TABLES["spatial"], h5py.Group)
+    columns = list(input_contract["spatial"]["columns"])
+    _require(
+        set(group.attrs) == {_COLUMNS_ATTRIBUTE} and np.asarray(group.attrs[_COLUMNS_ATTRIBUTE]).tolist() == columns and set(group) == set(columns),
+        "Stored spatial maps or their recorded column order do not match the contract columns.",
+    )
+    datasets = {name: _member(group, name, h5py.Dataset) for name in columns}
+    _require(all(dataset.dtype == np.float64 for dataset in datasets.values()), "Stored spatial maps must be float64 datasets.")
+    fields = {name: _read_only(dataset[()]) for name, dataset in datasets.items()}
+    if _INPUT_TABLES["scalar"] not in expected:
+        return StoredCaseInputs(fields=fields, scalars=(), schedule=None)
+    scalar_table = _member(handle, _INPUT_TABLES["scalar"], h5py.Dataset)
+    schedule_table = _member(handle, _INPUT_TABLES["schedule"], h5py.Dataset)
+    schedule_columns = tuple(input_contract["schedule"]["columns"])
+    _require(
+        scalar_table.ndim == 1
+        and scalar_table.dtype.names == _SCALAR_COLUMNS
+        and scalar_table.dtype["value"] == np.float64
+        and scalar_table.dtype["name"].kind == scalar_table.dtype["unit"].kind == "S",
+        "Stored scalars must be one name, value, unit table with fixed-length text and float64 values.",
+    )
+    _require(
+        schedule_table.ndim == 1
+        and schedule_table.dtype.names == schedule_columns
+        and all(schedule_table.dtype[name] == np.float64 for name in schedule_columns),
+        "Stored schedule must be one table with one float64 member per contract column.",
+    )
+    scalar_rows = np.asarray(scalar_table[()])
+    scalars = tuple((bytes(row["name"]).decode("utf-8"), float(row["value"]), bytes(row["unit"]).decode("utf-8")) for row in scalar_rows)
+    rows = np.asarray(schedule_table[()])
+    schedule = _read_only(np.column_stack([rows[name] for name in schedule_columns]).reshape(len(rows), len(schedule_columns)))
+    return StoredCaseInputs(fields=fields, scalars=scalars, schedule=schedule)
+
+
+def _load_inputs(directory: Path, input_contract: Mapping[str, Any], store_identity: InputStoreIdentity | None) -> StoredCaseInputs:
+    """Read and validate one stored container from one byte snapshot, optionally against its recorded integrity."""
+    path = require_input_store(directory)
+    data = path.read_bytes()
+    if store_identity is not None and (len(data) != store_identity.size_bytes or hashlib.sha256(data).hexdigest() != store_identity.sha256):
+        message = f"Stored case inputs disagree with their recorded storage integrity: {path}"
+        raise ValueError(message)
+    try:
+        with h5py.File(io.BytesIO(data), "r") as handle:
+            content = _read_container(handle, input_contract)
+    except OSError as error:
+        message = f"Stored case inputs are not a readable HDF5 container: {path}"
+        raise ValueError(message) from error
+    _validate_inputs(content, input_contract)
+    return content
+
+
+def render_input_files(content: StoredCaseInputs, input_contract: Mapping[str, Any]) -> dict[str, bytes]:
+    """
+    Render the canonical COMSOL CSV bytes of one stored case; this is the sole CSV renderer.
+
+    Parameters
+    ----------
+    content : StoredCaseInputs
+        Validated stored inputs.
+    input_contract : Mapping[str, Any]
+        Case input contract owning filenames, delimiters, and column order.
+
+    Returns
+    -------
+    dict[str, bytes]
+        UTF-8 LF CSV bytes keyed by COMSOL filename, sorted by filename.
+
+    """
+    spatial = input_contract["spatial"]
+    columns = list(spatial["columns"])
+    flattened = [content.fields[name].ravel(order="F") for name in columns]
     rows = [columns]
     rows.extend([_format_number(float(value)) for value in values] for values in zip(*flattened, strict=True))
-    path = destination / spec["filename"]
-    common.serialization.atomic_write_text(path, _table_text(rows, delimiter=spec["delimiter"]))
-    return path
+    rendered = {spatial["filename"]: _table_text(rows, delimiter=spatial["delimiter"])}
+    if content.schedule is not None:
+        scalar, schedule = input_contract["scalar"], input_contract["schedule"]
+        scalar_rows = [list(scalar["columns"]), *([name, _format_number(value), unit] for name, value, unit in content.scalars)]
+        rendered[scalar["filename"]] = _table_text(scalar_rows, delimiter=scalar["delimiter"])
+        schedule_rows = [list(schedule["columns"]), *([_format_number(float(value)) for value in row] for row in content.schedule)]
+        rendered[schedule["filename"]] = _table_text(schedule_rows, delimiter=schedule["delimiter"])
+    return {filename: rendered[filename].encode("utf-8") for filename in sorted(rendered)}
 
 
-def _write_scalar_file(
-    destination: Path,
-    spec: dict[str, Any],
-    values: dict[str, Any],
-    units: dict[str, str],
-) -> tuple[Path, tuple[scalar_handoff_contract.ScalarHandoffEntry, ...]]:
-    """Write the sole profile-owned long-form scalar handoff."""
-    entries = scalar_handoff_contract.build_transient_scalar_entries(values, units)
-    rows = [["name", "value", "unit"]]
-    rows.extend([[entry.name, scalar_handoff_contract.format_scalar_number(entry.value), entry.unit] for entry in entries])
-    path = destination / spec["filename"]
-    common.serialization.atomic_write_text(path, _table_text(rows, delimiter=spec["delimiter"]))
-    return path, entries
+def _input_file_identities(rendered: Mapping[str, bytes]) -> dict[str, dict[str, Any]]:
+    """Return the canonical ``input_files`` record of rendered CSV bytes."""
+    return {filename: {"sha256": hashlib.sha256(data).hexdigest(), "size_bytes": len(data)} for filename, data in sorted(rendered.items())}
 
 
-def _write_schedule_file(destination: Path, spec: dict[str, Any], schedule: schedule_service.ComsolBoundarySchedule) -> Path:
-    """Write the exact primitive COMSOL boundary interpolation table."""
-    columns = list(spec["columns"])
-    if tuple(columns) != profiles.SCHEDULE_FIELDS or schedule.values.ndim != _TABLE_RANK or schedule.values.shape[1] != len(columns):
-        msg = "Generated schedule does not satisfy the configured adapter field contract."
-        raise ValueError(msg)
-    rows = [columns]
-    rows.extend([_format_number(float(value)) for value in row] for row in schedule.values)
-    path = destination / spec["filename"]
-    common.serialization.atomic_write_text(path, _table_text(rows, delimiter=spec["delimiter"]))
-    return path
+def _require_rendered_identities(rendered: Mapping[str, bytes], case_payload: Mapping[str, Any], *, location: Path) -> None:
+    """Require rendered CSV bytes to reproduce the case's canonical input identities."""
+    if _input_file_identities(rendered) != case_payload["input_files"]:
+        message = f"Stored case inputs do not render the canonical input identities of case.json: {location}"
+        raise ValueError(message)
+
+
+def _write_case_inputs(
+    directory: Path,
+    input_contract: Mapping[str, Any],
+    *,
+    fields: Mapping[str, np.ndarray],
+    scalars: Sequence[tuple[str, float, str]],
+    schedule: np.ndarray | None,
+) -> dict[str, dict[str, Any]]:
+    """Atomically store one case's inputs and return the ``input_files`` identities rendered from the file read back."""
+    columns = list(input_contract["spatial"]["columns"])
+    missing = [name for name in columns if name not in fields]
+    _require(not missing, f"Spatial adapter requests unknown generated fields: {missing}.")
+    content = StoredCaseInputs(
+        fields={name: np.asarray(fields[name], dtype=np.float64) for name in columns},
+        scalars=tuple((str(name), float(value), str(unit)) for name, value, unit in scalars),
+        schedule=None if schedule is None else np.asarray(schedule, dtype=np.float64),
+    )
+    _validate_inputs(content, input_contract)
+    common.serialization.atomic_path_write(
+        directory / common.paths.GENERATION_INPUT_STORE_FILENAME,
+        lambda path: _write_container(path, content, input_contract),
+    )
+    return _input_file_identities(render_input_files(_load_inputs(directory, input_contract, None), input_contract))
+
+
+def read_case_inputs(directory: Path, case_payload: Mapping[str, Any], *, store_identity: InputStoreIdentity | None = None) -> StoredCaseInputs:
+    """
+    Read one case's stored inputs after proving that they render its canonical identities.
+
+    Parameters
+    ----------
+    directory : Path
+        Case input directory holding the stored input container.
+    case_payload : Mapping[str, Any]
+        Validated case payload with ``input_contract`` and ``input_files``.
+    store_identity : InputStoreIdentity | None, optional
+        Recorded storage integrity; the container bytes must match it when supplied.
+
+    Returns
+    -------
+    StoredCaseInputs
+        Validated read-only stored content.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the directory has no container, for example CSV-only inputs that must be regenerated.
+    ValueError
+        If integrity, layout, dtype, shape, finiteness, grid order, or rendered identities disagree.
+
+    """
+    content = _load_inputs(directory, case_payload["input_contract"], store_identity)
+    _require_rendered_identities(render_input_files(content, case_payload["input_contract"]), case_payload, location=directory)
+    return content
+
+
+def materialize_case_inputs(
+    source_directory: Path,
+    work_directory: Path,
+    case_payload: Mapping[str, Any],
+    *,
+    store_identity: InputStoreIdentity,
+) -> tuple[Path, ...]:
+    """
+    Render one integrity-verified stored case into its COMSOL CSV files before execution.
+
+    Parameters
+    ----------
+    source_directory : Path
+        Canonical case input directory holding the stored input container.
+    work_directory : Path
+        Isolated COMSOL work directory that receives the CSV files.
+    case_payload : Mapping[str, Any]
+        Validated case payload with ``input_contract`` and ``input_files``.
+    store_identity : InputStoreIdentity
+        Recorded storage integrity of the container.
+
+    Returns
+    -------
+    tuple[Path, ...]
+        Written CSV paths, sorted by filename.
+
+    Raises
+    ------
+    ValueError
+        If the container or its rendered identities disagree with the recorded evidence.
+    RuntimeError
+        If a written file does not hold its canonical identity bytes.
+
+    """
+    contract = case_payload["input_contract"]
+    rendered = render_input_files(_load_inputs(source_directory, contract, store_identity), contract)
+    _require_rendered_identities(rendered, case_payload, location=source_directory)
+    paths = []
+    for filename, data in rendered.items():
+        path = common.serialization.atomic_write_bytes(work_directory / filename, data)
+        identity = case_payload["input_files"][filename]
+        if path.stat().st_size != identity["size_bytes"] or common.serialization.file_sha256(path) != identity["sha256"]:
+            message = f"Rendered COMSOL input disagrees with its case identity: {path}"
+            raise RuntimeError(message)
+        paths.append(path)
+    return tuple(paths)
 
 
 def _require_empty_destination(
@@ -378,29 +702,19 @@ def generate_case_input_bundle(
         )
 
     input_contract = config.scientific_values["input_contract"]
-    input_directory = bundle_dir
-    spatial_path = _write_spatial_file(input_directory, fields, input_contract["spatial"])
-    input_paths_list = [spatial_path]
-    scalar_path: Path | None = None
     scalar_entries: tuple[scalar_handoff_contract.ScalarHandoffEntry, ...] | None = None
     if config.profile.id == profiles.TRANSIENT_DRYING_PROFILE:
-        scalar_path, scalar_entries = _write_scalar_file(
-            input_directory,
-            input_contract["scalar"],
-            values,
-            units,
-        )
-        input_paths_list.append(scalar_path)
-    if boundary_schedule is not None:
-        input_paths_list.append(_write_schedule_file(input_directory, input_contract["schedule"], boundary_schedule))
-    input_paths = tuple(sorted(input_paths_list, key=lambda item: item.name))
-    input_files = {
-        path.name: {
-            "sha256": common.serialization.file_sha256(path),
-            "size_bytes": path.stat().st_size,
-        }
-        for path in input_paths
-    }
+        scalar_entries = scalar_handoff_contract.build_transient_scalar_entries(values, units)
+    if boundary_schedule is not None and tuple(input_contract["schedule"]["columns"]) != profiles.SCHEDULE_FIELDS:
+        msg = "Generated schedule does not satisfy the configured adapter field contract."
+        raise ValueError(msg)
+    input_files = _write_case_inputs(
+        bundle_dir,
+        input_contract,
+        fields=fields.columns,
+        scalars=[(entry.name, entry.value, entry.unit) for entry in scalar_entries or ()],
+        schedule=None if boundary_schedule is None else boundary_schedule.values,
+    )
     export_contract_sha256 = common.serialization.canonical_json_sha256(config.scientific_values["output_contract"])
     steady_flow_conditioning = config.scientific_values["steady_flow_conditioning"]
     steady_flow_conditioning_digest = common.serialization.canonical_json_sha256(steady_flow_conditioning)
@@ -455,26 +769,27 @@ def generate_case_input_bundle(
         "export_contract_sha256": export_contract_sha256,
         "input_files": input_files,
     }
-    if scalar_path is not None and scalar_entries is not None:
+    scalar_admission: scalar_handoff_contract.ScalarHandoffAdmission | None = None
+    if scalar_entries is not None:
+        scalar_filename = input_contract["scalar"]["filename"]
         scalar_entries_payload = [entry.as_dict() for entry in scalar_entries]
         case_payload["scalar_handoff"] = {
             "mechanism": "case_local_long_form_csv",
-            "filename": scalar_path.name,
+            "filename": scalar_filename,
             "fresh_per_case": True,
             "runtime_validation": "required",
             "entries": scalar_entries_payload,
         }
         case_payload["scalars"] = scalar_entries_payload
+        scalar_admission = scalar_handoff_contract.admit_transient_scalar_handoff(
+            scalar_entries,
+            source_path=Path(scalar_filename),
+            source_filename=scalar_filename,
+            sha256=input_files[scalar_filename]["sha256"],
+            size_bytes=input_files[scalar_filename]["size_bytes"],
+        )
     if boundary_schedule is not None:
         case_payload["schedule_diagnostics"] = boundary_schedule.metadata
-    scalar_admission = (
-        None
-        if scalar_path is None
-        else scalar_handoff_contract.admit_case_scalar_handoff(
-            case_payload,
-            input_directory,
-        )
-    )
     case_payload["case_input_id"] = compute_case_input_id(case_payload)
     case_payload["simulation_case_id"] = compute_simulation_case_id(case_payload)
     validate_case_payload_schema(case_payload)
@@ -485,6 +800,5 @@ def generate_case_input_bundle(
         case_input_id=case_payload["case_input_id"],
         simulation_case_id=case_payload["simulation_case_id"],
         case_payload=case_payload,
-        input_paths=input_paths,
         scalar_handoff=scalar_admission,
     )

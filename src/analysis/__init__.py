@@ -7,7 +7,7 @@ Provides:
 - eda: exploratory generated-data analysis and visualization
 - evaluation: persisted prediction evaluation and scientific plots
 - generation_inputs: production generation-input discovery and EDA
-- presentation: ordered and curated scientific presentation services
+- presentation: ordered scientific presentation services
 - ui: reusable notebook controls, panels, and viewers
 """
 

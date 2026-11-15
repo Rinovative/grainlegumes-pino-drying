@@ -28,7 +28,7 @@ from . import cli_device
 def _build_parser() -> argparse.ArgumentParser:
     """Build the Optuna CLI argument parser."""
     parser = argparse.ArgumentParser(
-        description=("Run additional fresh Optuna trials with held-out objective reports at every actual completed epoch")
+        description=("Run additional fresh Optuna trials with held-out objective reports at the eligible budget validation points")
     )
     parser.add_argument(
         "config_path",
@@ -49,7 +49,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         type=int,
-        help="Override the total epoch budget for every trial (names the study directory: another budget is another study)",
+        help=(
+            "Override the budget K (steady training.budget_epochs, transient training.a0.budget_epochs); every trial trains"
+            " study.budget_fraction of it, which names the study directory: another budget is another study"
+        ),
     )
     parser.add_argument("--train-dataset", help="Override the exact training Dataset ID (changes study identity)")
     cli_device.add_device_argument(parser, default=None, help_prefix="Override experiment run.device for all trials")

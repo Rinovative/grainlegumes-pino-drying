@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from src import common, datasets
+from src import common, datasets, learning
 
 from .config import experiments_config_loader as config_loader
 from .config import experiments_config_naming as config_naming
@@ -290,7 +290,7 @@ def prepare_protocol_table(context: NotebookContext) -> NotebookTable:
             (
                 training.get("comparison_arm", "direct"),
                 config["run"]["name"],
-                training["epochs"],
+                training.get("budget_epochs"),
                 teacher["source_run_name"] if teacher else "none",
                 matched.get("train_seconds"),
                 matched.get("receipt_source_run_name"),
@@ -298,7 +298,7 @@ def prepare_protocol_table(context: NotebookContext) -> NotebookTable:
         )
     return _table(
         title=f"Training protocol: {context.protocol}",
-        columns=("Arm", "Run name", "Epoch cap", "Teacher source", "B train seconds", "Measured budget source"),
+        columns=("Arm", "Run name", "Budget epochs", "Teacher source", "B train seconds", "Measured budget source"),
         rows=rows,
     )
 
@@ -384,8 +384,8 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Case partition", "Dataset manifest", "Fixed case membership independent of training seed"),
                 ("Material-OOD datasets", data["material_ood_datasets"], "Optional explicitly assigned scientific roles"),
                 ("Input profile", config["input_profile"], "Resolved transient input semantics"),
-                ("Output fields", context.task.output_names, "Ordered physical state channels"),
-                ("Spatial stride", data["spatial_stride"], "Declared model spatial support"),
+                ("Output fields", context.task.output_names, "Ordered predicted increment channels"),
+                ("Spatial stride", data["spatial_stride"], "Endpoint-preserving training grid stride; 1 is the full grid"),
             ),
         ),
         _settings_table(
@@ -403,12 +403,19 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Arm", training["comparison_arm"], "Selected child configuration"),
                 ("Sampling", config["temporal"]["sampling"], "Authoritative transition or rollout sampling"),
                 ("Time conditioning", config["temporal"]["temporal_conditioning"], "Configured temporal features"),
-                ("Epoch cap", training["epochs"], "Operational cap; does not establish measured budget completion"),
-                ("Curriculum", training["curriculum"], "Configured rollout lengths and milestones"),
+                (
+                    "Budget epochs",
+                    training.get("budget_epochs"),
+                    "A0 budget in passes over the full Train set, counted in units; B and A1 train measured seconds",
+                ),
+                ("Curriculum", training.get("curriculum"), "Stage-B rollout lengths and milestones; teacher-forced Stage A has none"),
                 ("Teacher handoff", training["teacher_handoff"], "Common Stage-A checkpoint dependency"),
                 ("Matched protocol", training.get("matched_a1_b"), "A1 consumes B measured train-time receipt"),
-                ("ID evaluation interval", training["evaluation_interval"], "Validation cadence for model selection"),
-                ("OOD evaluation interval", training["ood_evaluation_interval"], "Diagnostic cadence"),
+                (
+                    "Validation points",
+                    learning.training.budget.VALIDATION_POINTS,
+                    "Validation at each 1/20 of the budget selects the checkpoint; OOD and physics follow",
+                ),
             ),
         ),
         _settings_table(
@@ -417,13 +424,13 @@ def _prepare_transient_configuration_tables(context: NotebookContext) -> tuple[N
                 ("Device policy", config["run"]["device"], "Resolved policy; no device probe"),
                 ("Seed", config["run"]["seed"], "Saved deterministic seed"),
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
-                ("Batch size", data["batch_size"], "Training batch size"),
+                ("Units per update", training["units_per_update"], "k: transitions, windows or trajectories per optimizer step"),
+                ("Memory batch", training["memory_batch"], "Units computed at once; accumulation up to k"),
+                ("Evaluation batch", data["evaluation_batch_size"], "Whole trajectories per evaluation batch"),
                 ("Workers", data["num_workers"], "Dataloader worker count"),
-                ("Gradient accumulation", training["gradient_accumulation_steps"], "Batches per optimizer step"),
                 ("Optimizer", config["optimizer"], "Production optimization settings"),
-                ("Scheduler", config["scheduler"], "Validation-objective learning-rate policy"),
-                ("Scaling", config["scaling"], "Training-only fitted scaling contract"),
-                ("Data loss", config["loss"]["data"], "Saved increment and auxiliary state objective"),
+                ("Scheduler", config["scheduler"], "Learning-rate schedule over the stage budget; null is a constant rate"),
+                ("Data loss", config["loss"]["data"], "Group-weighted error of the Train-scaled reconstructed states"),
                 ("Physics loss", config["loss"]["physics"], "Resolved transient physics selection"),
             ),
         ),
@@ -554,20 +561,18 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
             "Runtime and training",
             (
                 ("Device policy", config["run"]["device"], "YAML policy used when the CLI has no override"),
-                ("Batch size", data["batch_size"], "Samples per optimization batch"),
+                ("Units per update", config["training"]["units_per_update"], "k: Train cases per optimizer step"),
+                ("Memory batch", config["training"]["memory_batch"], "Cases computed at once; accumulation up to k"),
+                ("Evaluation batch", data["evaluation_batch_size"], "Cases per evaluation batch"),
+                ("Spatial stride", data["spatial_stride"], "Endpoint-preserving training grid stride; 1 is the full grid"),
                 ("Workers", data["num_workers"], "Dataloader worker processes"),
                 ("Pin memory", data["pin_memory"], "Host-memory transfer policy"),
                 ("Persistent workers", data["persistent_workers"], "Worker lifetime policy"),
-                ("Epochs", training["epochs"], "Official target duration"),
+                ("Budget epochs", training["budget_epochs"], "Passes over the full Train set, counted in seen units"),
                 (
-                    "ID evaluation interval",
-                    training["evaluation_interval"],
-                    "Completed-epoch cadence for objective, scheduler, and checkpoint selection",
-                ),
-                (
-                    "OOD evaluation interval",
-                    training["ood_evaluation_interval"],
-                    "Completed-epoch cadence for material-OOD and parameter-OOD evaluation",
+                    "Validation points",
+                    learning.training.budget.VALIDATION_POINTS,
+                    "Validation at each 1/20 of the budget for objective and checkpoint selection; OOD and physics follow",
                 ),
                 ("Seed", config["run"]["seed"], "Root deterministic seed"),
                 ("Deterministic", config["run"]["deterministic"], "Deterministic runtime policy"),
@@ -580,15 +585,8 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 ("Learning rate", optimizer["lr"], "Initial learning rate"),
                 ("Weight decay", optimizer["weight_decay"], "AdamW regularization"),
                 ("Betas", optimizer["betas"], "First and second moment factors"),
-                ("Scheduler", scheduler["kind"], "ID-objective scheduler"),
-                ("Scheduler factor", scheduler["factor"], "Learning-rate reduction factor"),
-                ("Scheduler patience", scheduler["patience"], "ID evaluations before reduction"),
-                ("Minimum learning rate", scheduler["min_lr"], "Scheduler floor"),
-                (
-                    "Data loss",
-                    f"{loss_data['kind']} in {loss_data['space']} space",
-                    "Supervised training objective",
-                ),
+                ("Scheduler", "constant" if scheduler is None else scheduler["kind"], "Learning-rate schedule over the stage budget"),
+                ("Data loss", loss_data["kind"], "Group-weighted error of the Train-scaled states"),
                 ("Data-loss weight", loss_data["weight"], "Supervised contribution weight"),
                 *physics_rows,
             ),
@@ -599,7 +597,7 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 (
                     "Primary objective",
                     context.objective["id"],
-                    "ID metric used for scheduling and checkpoint selection",
+                    "ID metric used for checkpoint selection (and the plateau comparison schedule)",
                 ),
                 ("Objective direction", context.objective["direction"], "Selection direction"),
                 (
@@ -624,13 +622,8 @@ def prepare_configuration_tables(context: NotebookContext) -> tuple[NotebookTabl
                 ),
                 (
                     "Monitor policy",
-                    f"every {wandb['monitor']['interval']} epochs, at most {wandb['monitor']['max_cases']} cases",
-                    "Terminal-inclusive completed-epoch cadence. No epoch-zero history",
-                ),
-                (
-                    "Evaluation artifact upload",
-                    wandb["upload"]["evaluation_artifacts"],
-                    "Curated artifact upload remains opt-in",
+                    f"at the validation points, at most {wandb['monitor']['max_cases']} cases",
+                    "Physics monitor at every validation point. No step-zero history",
                 ),
             ),
         ),
@@ -689,7 +682,11 @@ def prepare_run_preview_table(
         ("Deterministic run name", config["run"]["name"], "Generated by the production config loader"),
         ("Device policy", config["run"]["device"], "Used when the CLI has no override"),
         ("W&B mode", wandb["mode"], "Production observer mode"),
-        ("Target epochs", config["training"]["epochs"], "Official training duration"),
+        (
+            "Budget epochs",
+            config["training"].get("budget_epochs"),
+            "Steady and A0: passes over the full Train set, counted in seen units; B and A1 train measured seconds",
+        ),
         ("ID dataset", config["data"]["train_dataset"], "Train and evaluation source"),
         (
             "Material-OOD datasets",

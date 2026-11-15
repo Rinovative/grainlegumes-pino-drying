@@ -21,10 +21,13 @@ This module does NOT:
   - Own checkpoint, resume, run-directory, or artifact lifecycle
 
 Notes:
-  Transient epoch allocation:
-    - ``stage_a_only`` trains A0 alone; ``training.epochs`` equals the schedule's ``total_epochs``.
-    - ``matched_a1_b`` preserves independent positive per-stage maximum epochs with ``budget_unit: train_seconds``; A0's cap is its epoch
-      budget, B stops at its measured seconds and A1 at B's receipt.
+  Stage budgets:
+    - Steady and A0 state ``training.budget_epochs``, epochs of the full Train set that the run converts to seen units.
+    - ``stage_a_only`` trains A0 alone; ``training.budget_epochs`` equals the schedule's ``budget_epochs``.
+    - ``matched_a1_b`` keeps A0's budget epochs with ``budget_unit: train_seconds``: B stops at its measured
+      seconds and A1 at B's receipt; neither has an epoch cap.
+  Run layout:
+    - Budget epochs, units per update and schedule name every run's seed group, so another value is another run.
 
 """
 
@@ -76,7 +79,6 @@ CANONICAL_EXPERIMENT_SECTION_ORDER = (
     "tracking",
     "input_profile",
     "temporal",
-    "scaling",
     "evaluation",
 )
 _LAST_SECTIONS = ("task_contract", "evaluation")
@@ -101,11 +103,22 @@ _TASK_FIXED_KEYS = frozenset(
 _PRODUCER_KEY = "producer"
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _ADAM_BETA_COUNT = 2
-_STEADY_DATA_KEYS = frozenset(
-    {"train_dataset", "material_ood_datasets", "train_subset", "batch_size", "num_workers", "pin_memory", "persistent_workers"}
+_DATA_LOSS_KEYS = frozenset({"kind", "weight"})
+_DATA_KEYS = frozenset(
+    {
+        "train_dataset",
+        "material_ood_datasets",
+        "train_subset",
+        "evaluation_batch_size",
+        "num_workers",
+        "pin_memory",
+        "persistent_workers",
+        "spatial_stride",
+    }
 )
-_REQUIRED_TRAINING_KEYS = ("epochs", "evaluation_interval", "ood_evaluation_interval")
-_REQUIRED_SCHEDULER_KEYS = frozenset({"factor", "patience", "min_lr"})
+_REQUIRED_TRAINING_KEYS = ("units_per_update", "memory_batch")
+# The cosine is the standard schedule; the plateau variant exists only until the scheduler comparison.
+_SCHEDULER_KEYS_BY_KIND = {"cosine": frozenset({"kind"}), "reduce_on_plateau": frozenset({"kind", "factor", "patience"})}
 _PHYSICS_WEIGHT_NAMES = ("momentum_weight", "continuity_weight", "boundary_weight")
 _RESOLVED_PATH_KEYS = frozenset(
     {
@@ -117,32 +130,20 @@ _RESOLVED_PATH_KEYS = frozenset(
 )
 _SECTION_KEYS = {
     "run": frozenset({"seed", "revision", "deterministic", "device", "name", "layout"}),
-    "data": frozenset(
-        {
-            "train_dataset",
-            "material_ood_datasets",
-            "train_subset",
-            "batch_size",
-            "num_workers",
-            "pin_memory",
-            "persistent_workers",
-            "spatial_stride",
-        }
-    ),
+    "data": _DATA_KEYS,
     "model": frozenset({"kind", "params"}),
     "loss": frozenset({"data", "physics"}),
     "evaluation": frozenset({"metrics", "objective"}),
     "optimizer": frozenset({"kind", "lr", "weight_decay", "betas", "second_moment_floor"}),
-    "scheduler": frozenset({"kind", "factor", "patience", "min_lr"}),
+    "scheduler": frozenset({"kind", "factor", "patience"}),
     "training": frozenset(
         {
-            "epochs",
+            "budget_epochs",
             "stage_schedule",
-            "evaluation_interval",
-            "ood_evaluation_interval",
             "stage",
             "comparison_arm",
-            "gradient_accumulation_steps",
+            "units_per_update",
+            "memory_batch",
             "curriculum",
             "teacher_handoff",
             "matched_a1_b",
@@ -230,7 +231,7 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
         loss = _as_mapping(user_config["loss"], path="loss")
         if "data" in loss:
             data_loss = _as_mapping(loss["data"], path="loss.data")
-            _reject_unknown(data_loss, frozenset({"kind", "space", "weight", "beta", "channel_weights", "state_aux_weight"}), path="loss.data")
+            _reject_unknown(data_loss, _DATA_LOSS_KEYS, path="loss.data")
         if "physics" in loss:
             physics = _as_mapping(loss["physics"], path="loss.physics")
             _reject_unknown(
@@ -283,7 +284,6 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                         "workflow",
                         "study",
                         "monitor",
-                        "upload",
                     }
                 ),
                 path="tracking.wandb",
@@ -295,18 +295,8 @@ def _validate_input_schema(user_config: Mapping[str, Any]) -> None:  # noqa: C90
                 )
                 _reject_unknown(
                     monitor,
-                    frozenset({"enabled", "interval", "max_cases"}),
+                    frozenset({"enabled", "max_cases"}),
                     path="tracking.wandb.monitor",
-                )
-            if "upload" in wandb:
-                upload = _as_mapping(
-                    wandb["upload"],
-                    path="tracking.wandb.upload",
-                )
-                _reject_unknown(
-                    upload,
-                    frozenset({"evaluation_artifacts"}),
-                    path="tracking.wandb.upload",
                 )
 
     if "evaluation" not in user_config:
@@ -490,26 +480,34 @@ def deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, A
     return result
 
 
+def _validated_data_loss(loss: Mapping[str, Any], *, task: domain.tasks.spec.TaskSpec) -> dict[str, Any]:
+    """
+    Return the canonical data-loss mapping of either task: exactly ``kind`` and ``weight``.
+
+    Any other key is rejected, and ``kind`` must be a task-admitted state loss.
+    """
+    data_loss = _as_mapping(loss["data"], path="loss.data")
+    if set(data_loss) != _DATA_LOSS_KEYS:
+        msg = f"loss.data must state exactly {sorted(_DATA_LOSS_KEYS)}, got {sorted(data_loss)}."
+        raise ConfigError(msg)
+    kind = data_loss["kind"]
+    if kind not in task.data_losses:
+        msg = f"loss.data.kind {kind!r} is not allowed by task {task.id!r}: {list(task.data_losses)}."
+        raise ConfigError(msg)
+    loss_factory.resolve_data_loss_kind(kind)
+    return {"kind": kind, "weight": _non_negative_number(data_loss["weight"], path="loss.data.weight")}
+
+
 def _validate_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
     """
     Resolve loss semantics against the registered task contract in place.
 
-    The helper validates supervised space/weight, the derivative kind, crop
+    The helper validates the data loss, the derivative kind, crop
     size, and the three physics-term linear warmup schedules. Canonical numeric values are written back into ``config`` only
     after their path-qualified constraints have been checked.
     """
     loss = _as_mapping(config["loss"], path="loss")
-    data_loss = _as_mapping(loss["data"], path="loss.data")
-    kind = str(data_loss["kind"])
-    if kind not in task.data_losses:
-        msg = f"loss.data.kind {kind!r} is not allowed by task {task.id!r}: {list(task.data_losses)}."
-        raise ConfigError(msg)
-    try:
-        loss_factory.validate_data_loss_semantics(kind, space=str(data_loss["space"]))
-    except ValueError as error:
-        msg = f"loss.data: {error}"
-        raise ConfigError(msg) from error
-    data_loss["weight"] = _non_negative_number(data_loss["weight"], path="loss.data.weight")
+    data_loss = _validated_data_loss(loss, task=task)
 
     physics = _as_mapping(loss["physics"], path="loss.physics")
     if not isinstance(physics["enabled"], bool):
@@ -640,29 +638,11 @@ def _validate_evaluation(config: dict[str, Any], *, task: domain.tasks.spec.Task
             msg = f"{path}: {error}"
             raise ConfigError(msg) from error
         fields = _metric_fields(metric, task=task, path=path)
-        group_kinds = {"group_macro_rmse", "group_rmse", "vector_rmse"}
-        if kind == "group_macro_rmse":
-            if not task.output_groups or fields != task.output_names:
-                msg = f"{path} group_macro_rmse must select every grouped TaskSpec output in declared order: {list(task.output_names)}."
-                raise ConfigError(msg)
-        elif kind in {"group_rmse", "vector_rmse"}:
-            matches = [group for group in task.output_groups if group.fields == fields]
-            if len(matches) != 1:
-                available = {group.id: list(group.fields) for group in task.output_groups}
-                msg = f"{path} fields must match one complete TaskSpec output group. Available groups: {available}."
-                raise ConfigError(msg)
-        if space == "physical" and len(fields) != 1 and kind not in group_kinds:
-            units = {task.field(field).unit for field in fields}
-            if len(units) > 1:
-                msg = f"{path} cannot aggregate physical fields with incompatible units: {sorted(units)}."
-                raise ConfigError(msg)
-            msg = f"{path} physical metrics must select exactly one output field."
-            raise ConfigError(msg)
-        if kind == "vector_rmse":
-            units = {task.field(field).unit for field in fields}
-            if len(units) != 1:
-                msg = f"{path} vector_rmse fields must share one physical unit, got {sorted(units)}."
-                raise ConfigError(msg)
+        try:
+            metric_registry.resolve_metric_groups(task, kind=kind, fields=fields, metric_id=metric_id)
+        except ValueError as error:
+            msg = f"{path}: {error}"
+            raise ConfigError(msg) from error
         requested_direction = metric.get("direction", metric_kind.direction)
         if requested_direction != metric_kind.direction:
             msg = f"{path}.direction {requested_direction!r} contradicts metric {kind!r} direction {metric_kind.direction!r}."
@@ -832,7 +812,6 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
                 "entity",
                 "tags",
                 "monitor",
-                "upload",
             }
         ),
         path="tracking.wandb",
@@ -844,20 +823,13 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
         raise ConfigError(msg)
 
     monitor = _as_mapping(wandb.get("monitor"), path="tracking.wandb.monitor")
-    _reject_unknown(monitor, frozenset({"enabled", "interval", "max_cases"}), path="tracking.wandb.monitor")
+    _reject_unknown(monitor, frozenset({"enabled", "max_cases"}), path="tracking.wandb.monitor")
     if type(monitor.get("enabled")) is not bool:
         msg = "tracking.wandb.monitor.enabled must be boolean."
         raise ConfigError(msg)
-    for key in ("interval", "max_cases"):
-        value = monitor.get(key)
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            msg = f"tracking.wandb.monitor.{key} must be a positive integer."
-            raise ConfigError(msg)
-
-    upload = _as_mapping(wandb.get("upload"), path="tracking.wandb.upload")
-    _reject_unknown(upload, frozenset({"evaluation_artifacts"}), path="tracking.wandb.upload")
-    if type(upload.get("evaluation_artifacts")) is not bool:
-        msg = "tracking.wandb.upload.evaluation_artifacts must be boolean."
+    value = monitor.get("max_cases")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        msg = "tracking.wandb.monitor.max_cases must be a positive integer."
         raise ConfigError(msg)
 
     expected = derive_wandb_organization({**config, "tracking": {"wandb": wandb}})
@@ -869,7 +841,6 @@ def _validate_tracking(config: dict[str, Any], *, require_derived: bool) -> None
     else:
         wandb.update(expected)
     wandb["monitor"] = monitor
-    wandb["upload"] = upload
     tracking["wandb"] = wandb
     config["tracking"] = tracking
 
@@ -895,6 +866,59 @@ def _validate_train_subset(data: Mapping[str, Any]) -> None:
         raise ConfigError(msg)
 
 
+def _validate_data_section(data: dict[str, Any]) -> None:
+    """Validate the data section both tasks share, the grid stride of training, scaling fit and selection included."""
+    batch_size = data.get("evaluation_batch_size")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
+        msg = "data.evaluation_batch_size must be a positive integer."
+        raise ConfigError(msg)
+    num_workers = data.get("num_workers")
+    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0:
+        msg = "data.num_workers must be an integer >= 0."
+        raise ConfigError(msg)
+    if type(data.get("pin_memory")) is not bool or type(data.get("persistent_workers")) is not bool:
+        msg = "data.pin_memory and data.persistent_workers must be boolean."
+        raise ConfigError(msg)
+    if num_workers == 0 and data["persistent_workers"]:
+        msg = "data.persistent_workers requires data.num_workers > 0."
+        raise ConfigError(msg)
+    try:
+        common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    _configured_dataset_list(data, path="data", key="material_ood_datasets", allow_empty=True)
+    _validate_train_subset(data)
+    if "spatial_stride" not in data:
+        msg = "data.spatial_stride is required; the task's base config owns it (1 trains on the full grid)."
+        raise ConfigError(msg)
+    try:
+        data["spatial_stride"] = datasets.contracts.grid.validate_spatial_stride(data["spatial_stride"])
+    except (TypeError, ValueError) as error:
+        msg = f"data.spatial_stride: {error}"
+        raise ConfigError(msg) from error
+    if set(data) != _DATA_KEYS:
+        msg = f"Data keys must be exactly {sorted(_DATA_KEYS)}; membership comes from the Dataset partition."
+        raise ConfigError(msg)
+
+
+def _validate_scheduler(scheduler: Mapping[str, Any]) -> None:
+    """Admit the cosine without parameters, or the plateau comparison variant with its factor and patience."""
+    kind = scheduler.get("kind")
+    if kind not in _SCHEDULER_KEYS_BY_KIND:
+        msg = f"Unknown scheduler kind {kind!r}. Available: {sorted(_SCHEDULER_KEYS_BY_KIND)}, or scheduler: null for a constant rate."
+        raise ConfigError(msg)
+    expected = _SCHEDULER_KEYS_BY_KIND[kind]
+    if set(scheduler) != expected:
+        msg = f"scheduler kind {kind!r} takes exactly {sorted(expected)}, got {sorted(scheduler)}."
+        raise ConfigError(msg)
+    if kind == "reduce_on_plateau":
+        factor, patience = scheduler["factor"], scheduler["patience"]
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not 0 < factor < 1:
+            msg = f"scheduler.factor must lie in (0, 1), got {factor!r}."
+            raise ConfigError(msg)
+        _non_negative_integer(patience, path="scheduler.patience")
+
+
 def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracking: bool) -> None:
     """
     Validate all generic runtime sections after semantic resolution.
@@ -918,49 +942,30 @@ def _validate_runtime_sections(config: dict[str, Any], *, require_derived_tracki
 
     scheduler = config.get("scheduler")
     if scheduler is not None:
-        scheduler_mapping = _as_mapping(scheduler, path="scheduler")
-        if scheduler_mapping["kind"] != "reduce_on_plateau":
-            msg = f"Unknown scheduler identifier {scheduler_mapping['kind']!r}. Available schedulers: reduce_on_plateau."
-            raise ConfigError(msg)
-        missing_scheduler = sorted(_REQUIRED_SCHEDULER_KEYS.difference(scheduler_mapping))
-        if missing_scheduler:
-            missing_paths = ", ".join(f"scheduler.{key}" for key in missing_scheduler)
-            msg = f"scheduler must state {missing_paths} for reduce_on_plateau; the task's base config owns these values."
-            raise ConfigError(msg)
+        _validate_scheduler(_as_mapping(scheduler, path="scheduler"))
 
     training = _as_mapping(config["training"], path="training")
     missing_training = [key for key in _REQUIRED_TRAINING_KEYS if key not in training]
     if missing_training:
         msg = f"training must state {', '.join(f'training.{key}' for key in missing_training)}; the task's base config owns these values."
         raise ConfigError(msg)
-    for key in ("epochs", "evaluation_interval", "ood_evaluation_interval"):
-        if int(training[key]) <= 0:
-            msg = f"training.{key} must be positive."
+    # Steady and A0 state a budget in epochs of the full Train set; a matched B or A1 trains measured seconds and states none.
+    continuation = config["task"] == "transient_drying" and training.get("comparison_arm") in {"b", "a1"}
+    if continuation:
+        if "budget_epochs" in training:
+            msg = "training.budget_epochs does not apply to a matched B or A1; it trains measured seconds."
             raise ConfigError(msg)
-    data = _as_mapping(config["data"], path="data")
-    batch_size = data.get("batch_size")
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
-        msg = "data.batch_size must be a positive integer."
-        raise ConfigError(msg)
-    num_workers = data.get("num_workers")
-    if isinstance(num_workers, bool) or not isinstance(num_workers, int) or num_workers < 0:
-        msg = "data.num_workers must be an integer >= 0."
-        raise ConfigError(msg)
-    if type(data.get("pin_memory")) is not bool or type(data.get("persistent_workers")) is not bool:
-        msg = "data.pin_memory and data.persistent_workers must be boolean."
-        raise ConfigError(msg)
-    if num_workers == 0 and data["persistent_workers"]:
-        msg = "data.persistent_workers requires data.num_workers > 0."
-        raise ConfigError(msg)
-    try:
-        common.paths.validate_logical_name(data["train_dataset"], label="data.train_dataset")
-    except ValueError as error:
-        raise ConfigError(str(error)) from error
-    _configured_dataset_list(data, path="data", key="material_ood_datasets", allow_empty=True)
-    _validate_train_subset(data)
-    if config.get("task") == "steady_flow" and set(data) != _STEADY_DATA_KEYS:
-        msg = f"Steady data keys must be exactly {sorted(_STEADY_DATA_KEYS)}; membership comes from the Dataset partition."
-        raise ConfigError(msg)
+    else:
+        duration = training.get("budget_epochs")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+            msg = f"training.budget_epochs must be a positive integer, got {duration!r}."
+            raise ConfigError(msg)
+    for key in ("units_per_update", "memory_batch"):
+        value = training[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            msg = f"training.{key} must be a positive integer, got {value!r}."
+            raise ConfigError(msg)
+    _validate_data_section(_as_mapping(config["data"], path="data"))
 
     _validate_tracking(config, require_derived=require_derived_tracking)
 
@@ -988,45 +993,35 @@ MATCHED_TRAINING_FLAGS_MESSAGE = "--rollout-length, --train-seconds and --lr-sca
 _EXACT_DATASET_DIGEST_TOKEN = re.compile(r"[0-9a-f]{16,64}\Z")
 
 
-def allocation_includes_epochs(config: Mapping[str, Any]) -> bool:
-    """Return whether the epoch budget is part of a run's experiment identity.
+def layout_run_terms(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the budget, units per update and schedule that name a run's seed group (``run.layout``).
 
-    A transient A0 (also as a stage-A-only Optuna trial) schedules its rollout
-    curriculum and budget controller over its epoch budget, so another budget is
-    another experiment. Every Optuna trial (``run.layout.trial`` is set) belongs to
-    a study of one fixed trial budget and never extends it, so its budget is part
-    of its identity too. Every other run treats epochs as training progress that a
-    rerun may extend.
+    The budget is the epochs of the full Train set of a steady run, an Optuna trial and
+    A0; every stage of a transient seed group (A0, B and A1) carries A0's, because B and
+    A1 start from that A0 and name their own seconds budget in the pair key. The schedule
+    is the scheduler kind, ``constant`` without one. A run never changes these terms, so
+    another value is another run.
     """
-    is_trial = config["run"]["layout"]["trial"] is not None
-    return is_trial or (config["task"] == "transient_drying" and config["training"].get("comparison_arm") == "a0")
-
-
-def layout_budget_epochs(config: Mapping[str, Any], *, family: str) -> int | None:
-    """Return the epoch budget that names a config's output unit, else ``None``.
-
-    An Optuna trial lives in a study directory named after the study's trial epoch
-    budget. Every stage of a transient seed group (A0, B and A1) carries the A0
-    epoch budget, because the A0's curriculum and controller identity depend on it.
-    A steady run has none: its epochs extend the run in place.
-    """
-    if family == common.paths.OPTUNA_FAMILY:
-        return config["training"]["epochs"]
-    if config["task"] != "transient_drying":
-        return None
-    schedule = config["training"]["stage_schedule"]
-    return schedule["a0_max_epochs"] if schedule["mode"] == "matched_a1_b" else schedule["total_epochs"]
+    training = config["training"]
+    schedule = training.get("stage_schedule")
+    matched = isinstance(schedule, Mapping) and schedule.get("mode") == "matched_a1_b"
+    scheduler = config.get("scheduler")
+    return {
+        "budget_epochs": schedule["a0_budget_epochs"] if matched else training["budget_epochs"],
+        "units_per_update": training["units_per_update"],
+        "schedule": common.names.text_token("constant" if scheduler is None else scheduler["kind"]),
+    }
 
 
 def allocation_digest(config: Mapping[str, Any], *, stage: str | None = None) -> str:
-    """Identify one experiment independently of labels, paths and, where allowed, epochs.
+    """Identify one experiment independently of labels and paths.
 
-    Equal digests mean the same experiment: a later start may only continue or
-    extend the run that owns it. The first 16 characters are the layout's
-    ``a0_id`` of single runs and A0. An A0 excludes the branch-planning metadata
-    of the B/A1 pairs that may follow it and keeps its epoch budget
-    (:func:`allocation_includes_epochs`); B and A1 include the ``a0_id`` they
-    start from.
+    Equal digests mean the same experiment: a later start may only continue the
+    run that owns it after an interruption. The digest binds the budget, k and
+    the schedule, so another budget is another experiment. The first 16
+    characters are the layout's ``a0_id`` of single runs and A0. An A0 excludes
+    the branch-planning metadata of the B/A1 pairs that may follow it; B and A1
+    include the ``a0_id`` they start from.
 
     Parameters
     ----------
@@ -1042,15 +1037,12 @@ def allocation_digest(config: Mapping[str, Any], *, stage: str | None = None) ->
 
     """
     stage = config["run"]["layout"]["stage"] if stage is None else stage
-    payload = learning.training.checkpoint.effective_config_identity_payload(config, include_epochs=allocation_includes_epochs(config))
+    payload = learning.training.checkpoint.effective_config_identity_payload(config)
     if stage == "a0":
         training = payload["training"]
         training.pop("stage_schedule", None)
         training.pop("teacher_handoff", None)
         training.pop("matched_a1_b", None)
-    elif stage in {"b", "a1"}:
-        # A continuation is only the same experiment when it starts from the same A0.
-        payload["a0_id"] = config["run"]["layout"]["a0_id"]
     return common.serialization.canonical_json_sha256(payload)
 
 
@@ -1086,7 +1078,7 @@ def _derive_layout(
         "model_label": config_naming.model_label(resolved),
         "seed": run["seed"],
         "revision": run.get("revision"),
-        "budget_epochs": layout_budget_epochs(resolved, family=source.family),
+        **layout_run_terms(resolved),
         "stage": stage,
         "pair": pair,
         "trial": trial,
@@ -1120,7 +1112,7 @@ def finalize_run_layout(
         Resolved config whose ``run.layout`` already names its source (task, family
         and config name), as produced by :func:`resolve_config`.
     a0_id, branch_id : str | None, optional
-        Exact A0 and branch identities. ``a0_id`` defaults to the epoch-free allocation digest.
+        Exact A0 and branch identities. ``a0_id`` defaults to the allocation digest.
     stage : str | None, optional
         ``single`` (default), ``a0``, ``b`` or ``a1``.
     pair : str | None, optional
@@ -1153,9 +1145,9 @@ def _validate_run_layout(config: Mapping[str, Any], *, verify_identity: bool) ->
         or layout["dataset"] != layout_dataset(config)
         or layout["seed"] != run["seed"]
         or layout["revision"] != run.get("revision")
-        or layout["budget_epochs"] != layout_budget_epochs(config, family=layout["family"])
+        or any(layout[key] != value for key, value in layout_run_terms(config).items())
     ):
-        msg = "Run layout task, dataset, seed, revision and epoch budget must match its saved configuration."
+        msg = "Run layout task, dataset, seed, revision, epoch budget, units per update and schedule must match its saved configuration."
         raise ConfigError(msg)
     if verify_identity:
         if layout["model_label"] != config_naming.model_label(config):
@@ -1169,56 +1161,19 @@ def _validate_run_layout(config: Mapping[str, Any], *, verify_identity: bool) ->
     return layout
 
 
-_TRANSIENT_STATE_CHANNELS = 4
-
-
 def _raise_config_error(message: str) -> NoReturn:
     """Raise one path-owned configuration violation from a constructed message."""
     raise ConfigError(message)
 
 
-def _validate_transient_loss(config: dict[str, Any]) -> None:
-    """Validate the data-only scaled-increment loss branch."""
+def _validate_transient_loss(config: dict[str, Any], *, task: domain.tasks.spec.TaskSpec) -> None:
+    """Validate the data-only transient loss: the shared data-loss mapping and exactly disabled physics."""
     loss = _as_mapping(config["loss"], path="loss")
-    data = _as_mapping(loss["data"], path="loss.data")
-    required = {"kind", "space", "weight", "beta", "channel_weights", "state_aux_weight"}
-    if set(data) != required or data["kind"] not in {"huber", "mse"} or data["space"] != "scaled_increment":
-        _raise_config_error("Transient loss.data must be the complete scaled-increment huber/mse mapping.")
-    if any(
-        isinstance(data[key], bool) or not isinstance(data[key], (int, float)) or not math.isfinite(float(data[key])) or float(data[key]) < 0
-        for key in ("weight", "state_aux_weight")
-    ):
-        _raise_config_error("Transient loss weights must be non-negative finite numbers.")
-    if (
-        isinstance(data["beta"], bool)
-        or not isinstance(data["beta"], (int, float))
-        or not math.isfinite(float(data["beta"]))
-        or float(data["beta"]) <= 0
-    ):
-        _raise_config_error("Transient loss.data.beta must be positive and finite.")
-    weights = data["channel_weights"]
-    if (
-        not isinstance(weights, list)
-        or len(weights) != _TRANSIENT_STATE_CHANNELS
-        or any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or float(value) < 0 for value in weights
-        )
-        or sum(float(value) for value in weights) <= 0
-    ):
-        _raise_config_error("Transient loss.data.channel_weights must contain four non-negative finite values with positive sum.")
+    data = _validated_data_loss(loss, task=task)
     physics = _as_mapping(loss["physics"], path="loss.physics")
     if physics != {"enabled": False}:
         _raise_config_error("Transient physics must be exactly disabled.")
-    config["loss"] = {
-        "data": {
-            **data,
-            "weight": float(data["weight"]),
-            "beta": float(data["beta"]),
-            "channel_weights": [float(value) for value in weights],
-            "state_aux_weight": float(data["state_aux_weight"]),
-        },
-        "physics": physics,
-    }
+    config["loss"] = {"data": data, "physics": physics}
 
 
 def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, Any]:
@@ -1226,17 +1181,16 @@ def resolve_transient_stage_schedule(schedule: Mapping[str, Any]) -> dict[str, A
     raw = _as_mapping(schedule, path="training.stage_schedule")
     mode = raw.get("mode")
     if mode == "matched_a1_b":
-        expected_keys = {"mode", "budget_unit", "a0_max_epochs", "b_max_epochs", "a1_max_epochs"}
-        if set(raw) != expected_keys or raw.get("budget_unit") != "train_seconds":
-            _raise_config_error("matched_a1_b stage_schedule requires exact train_seconds and per-stage max epochs.")
-        if any(type(raw[key]) is not int or raw[key] < 1 for key in ("a0_max_epochs", "b_max_epochs", "a1_max_epochs")):
-            _raise_config_error("matched_a1_b max epochs must be positive integers.")
+        if set(raw) != {"mode", "budget_unit", "a0_budget_epochs"} or raw.get("budget_unit") != "train_seconds":
+            _raise_config_error("matched_a1_b stage_schedule must be exactly {mode, budget_unit: train_seconds, a0_budget_epochs}.")
+        if type(raw["a0_budget_epochs"]) is not int or raw["a0_budget_epochs"] < 1:
+            _raise_config_error("matched_a1_b a0_budget_epochs must be a positive integer.")
         return dict(raw)
-    if mode != "stage_a_only" or set(raw) != {"mode", "budget_unit", "total_epochs"} or raw.get("budget_unit") != "epochs":
-        _raise_config_error("training.stage_schedule must be matched_a1_b or exactly {mode: stage_a_only, budget_unit: epochs, total_epochs}.")
-    total = raw.get("total_epochs")
+    if mode != "stage_a_only" or set(raw) != {"mode", "budget_unit", "budget_epochs"} or raw.get("budget_unit") != "units":
+        _raise_config_error("training.stage_schedule must be matched_a1_b or exactly {mode: stage_a_only, budget_unit: units, budget_epochs}.")
+    total = raw.get("budget_epochs")
     if type(total) is not int or total < 1:
-        _raise_config_error("training.stage_schedule.total_epochs must be a positive integer.")
+        _raise_config_error("training.stage_schedule.budget_epochs must be a positive integer.")
     return dict(raw)
 
 
@@ -1252,81 +1206,9 @@ def _resolve_temporal_config(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _validate_transient_extensions(  # noqa: C901, PLR0912
-    config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
-) -> None:
-    """Resolve strict transient-only temporal, loader, and curriculum semantics."""
-    if authored is not None:
-        for key in ("input_profile", "temporal", "scaling"):
-            if key not in authored:
-                _raise_config_error(f"Transient config requires top-level {key!r}.")
-    task = domain.tasks.registry.get_task("transient_drying")
-    profile = config.get("input_profile")
-    if not isinstance(profile, str):
-        _raise_config_error("input_profile must be a registered transient profile identifier.")
-    try:
-        task.input_profile(profile)
-        temporal = _resolve_temporal_config(_as_mapping(config["temporal"], path="temporal"))
-    except (TypeError, ValueError) as error:
-        msg = f"temporal/input_profile: {error}"
-        raise ConfigError(msg) from error
-    scaling = _as_mapping(config.get("scaling"), path="scaling")
-    if set(scaling) != {"mode"} or scaling["mode"] not in {"state_std", "delta_rms"}:
-        _raise_config_error("scaling must be exactly {'mode': 'state_std' | 'delta_rms'}.")
-    tensorizer = TransientTensorizerSpec.from_mapping({"input_profile": profile, "temporal_conditioning": temporal["temporal_conditioning"]})
-    config["input_profile"] = profile
-    config["temporal"] = temporal
-    config["scaling"] = {"mode": scaling["mode"]}
-    data = _as_mapping(config["data"], path="data")
-    if "spatial_stride" not in data:
-        _raise_config_error("data.spatial_stride is required for transient configs; the task's base config owns it.")
-    required_data = {
-        "train_dataset",
-        "material_ood_datasets",
-        "train_subset",
-        "batch_size",
-        "num_workers",
-        "pin_memory",
-        "persistent_workers",
-        "spatial_stride",
-    }
-    if set(data) != required_data:
-        missing = sorted(f"data.{key}" for key in required_data - set(data))
-        _raise_config_error(f"Transient data keys do not match the loader contract; missing {missing}, unknown {sorted(set(data) - required_data)}.")
-    try:
-        data["spatial_stride"] = datasets.contracts.transient.validate_spatial_stride(data["spatial_stride"])
-    except (TypeError, ValueError) as error:
-        message = f"data.spatial_stride: {error}"
-        raise ConfigError(message) from error
-    config["data"] = data
-    training = _as_mapping(config["training"], path="training")
-    required_training = {
-        "epochs",
-        "stage_schedule",
-        "evaluation_interval",
-        "ood_evaluation_interval",
-        "stage",
-        "comparison_arm",
-        "gradient_accumulation_steps",
-        "curriculum",
-        "teacher_handoff",
-    }
-    if set(training) not in (required_training, required_training | {"matched_a1_b"}):
-        _raise_config_error("Transient training keys do not match the curriculum contract.")
-    schedule = resolve_transient_stage_schedule(_as_mapping(training["stage_schedule"], path="training.stage_schedule"))
-    stage, arm = training["stage"], training["comparison_arm"]
-    if stage not in {"a", "b"} or arm not in {"a0", "a1", "b"} or (stage == "a" and arm not in {"a0", "a1"}) or (stage == "b" and arm != "b"):
-        _raise_config_error("Transient training stage and comparison_arm are inconsistent.")
-    matched_protocol = schedule["mode"] == "matched_a1_b"
-    expected_epochs = (
-        schedule[{"a0": "a0_max_epochs", "b": "b_max_epochs", "a1": "a1_max_epochs"}[arm]] if matched_protocol else schedule["total_epochs"]
-    )
-    if training["epochs"] != expected_epochs:
-        _raise_config_error("training.epochs must equal the resolved stage_schedule allocation.")
-    accumulation = training["gradient_accumulation_steps"]
-    if isinstance(accumulation, bool) or not isinstance(accumulation, int) or accumulation <= 0:
-        _raise_config_error("training.gradient_accumulation_steps must be a positive integer.")
-    curriculum = _as_mapping(training["curriculum"], path="training.curriculum")
+def _resolve_curriculum(value: object, *, rollout_length: int) -> dict[str, Any]:
+    """Return a Stage-B curriculum in canonical form; its horizons must fit the rollout window."""
+    curriculum = _as_mapping(value, path="training.curriculum")
     if (
         set(curriculum) != {"lengths", "milestone_fractions"}
         or not isinstance(curriculum["lengths"], list)
@@ -1344,13 +1226,60 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
     ):
         _raise_config_error("training.curriculum.milestone_fractions must align with lengths and be ascending in [0, 1].")
     try:
-        resolved_curriculum = RolloutCurriculum(
-            lengths=tuple(curriculum["lengths"]),
-            milestone_fractions=tuple(float(item) for item in fractions),
-        )
+        resolved = RolloutCurriculum(lengths=tuple(curriculum["lengths"]), milestone_fractions=tuple(float(item) for item in fractions))
     except (TypeError, ValueError) as error:
         message = f"training.curriculum: {error}"
         raise ConfigError(message) from error
+    if resolved.lengths[-1] > rollout_length:
+        _raise_config_error("training.curriculum lengths must fit the temporal.sampling rollout length.")
+    return resolved.as_dict()
+
+
+def _validate_transient_extensions(  # noqa: C901, PLR0912
+    config: dict[str, Any], *, authored: Mapping[str, Any] | None = None
+) -> None:
+    """Resolve strict transient-only temporal, loader, and curriculum semantics."""
+    if authored is not None:
+        for key in ("input_profile", "temporal"):
+            if key not in authored:
+                _raise_config_error(f"Transient config requires top-level {key!r}.")
+    task = domain.tasks.registry.get_task("transient_drying")
+    profile = config.get("input_profile")
+    if not isinstance(profile, str):
+        _raise_config_error("input_profile must be a registered transient profile identifier.")
+    try:
+        task.input_profile(profile)
+        temporal = _resolve_temporal_config(_as_mapping(config["temporal"], path="temporal"))
+    except (TypeError, ValueError) as error:
+        msg = f"temporal/input_profile: {error}"
+        raise ConfigError(msg) from error
+    tensorizer = TransientTensorizerSpec.from_mapping({"input_profile": profile, "temporal_conditioning": temporal["temporal_conditioning"]})
+    config["input_profile"] = profile
+    config["temporal"] = temporal
+    training = _as_mapping(config["training"], path="training")
+    stage, arm = training.get("stage"), training.get("comparison_arm")
+    if stage not in {"a", "b"} or arm not in {"a0", "a1", "b"} or (stage == "a" and arm not in {"a0", "a1"}) or (stage == "b" and arm != "b"):
+        _raise_config_error("Transient training stage and comparison_arm are inconsistent.")
+    # Only Stage B draws rollout horizons, so only Stage B has a curriculum.
+    if stage == "a" and "curriculum" in training:
+        _raise_config_error("Stage A trains teacher-forced and draws no rollout horizon; only Stage B sets training.curriculum.")
+    # A0 trains for its budget in epochs of the full Train set; B and A1 for measured seconds without an epoch cap.
+    required_training = {
+        *(("budget_epochs",) if arm == "a0" else ()),
+        "stage_schedule",
+        "stage",
+        "comparison_arm",
+        "units_per_update",
+        "memory_batch",
+        *(("curriculum",) if stage == "b" else ()),
+        "teacher_handoff",
+    }
+    if set(training) not in (required_training, required_training | {"matched_a1_b"}):
+        _raise_config_error("Transient training keys do not match the curriculum contract.")
+    schedule = resolve_transient_stage_schedule(_as_mapping(training["stage_schedule"], path="training.stage_schedule"))
+    matched_protocol = schedule["mode"] == "matched_a1_b"
+    if arm == "a0" and training["budget_epochs"] != schedule["a0_budget_epochs" if matched_protocol else "budget_epochs"]:
+        _raise_config_error("training.budget_epochs must equal the resolved stage_schedule allocation.")
     sampling = temporal["sampling"]
     recurrent = config["model"]["kind"] == "rno"
     if recurrent != (sampling["mode"] == "trajectory"):
@@ -1362,9 +1291,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         _raise_config_error("Stage B self-feeds rollout windows and cannot use one-step sampling.")
     if recurrent and sampling.get("rollout_length") is None:
         _raise_config_error("RNO trajectory sampling requires rollout_length, the window across which its hidden state is carried.")
-    rollout_length = 1 if sampling["mode"] == "one_step_transition" else sampling["rollout_length"]
-    if resolved_curriculum.lengths[-1] > rollout_length:
-        _raise_config_error("training.curriculum lengths must fit the temporal.sampling rollout length.")
+    curriculum = None if stage == "a" else _resolve_curriculum(training["curriculum"], rollout_length=sampling["rollout_length"])
     handoff = training["teacher_handoff"]
     if handoff is not None and (
         not isinstance(handoff, Mapping)
@@ -1381,7 +1308,7 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
         if (
             arm not in {"a0", "b", "a1"}
             or not isinstance(protocol, Mapping)
-            or set(protocol) != {"role", "train_seconds", "receipt_source_run_name", "initialization", "lr_scale", "evaluation_points"}
+            or set(protocol) != {"role", "train_seconds", "receipt_source_run_name", "initialization", "lr_scale"}
         ):
             _raise_config_error("matched_a1_b requires its exact stage-owned protocol mapping.")
         if protocol["role"] != arm or protocol["initialization"] != "a0_best_full_common_fresh_controller":
@@ -1393,17 +1320,11 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
             _raise_config_error("matched_a1_b A1 must name its B receipt source, other stages must not.")
         if (arm != "a0") != _is_positive_finite(protocol["lr_scale"]):
             _raise_config_error("matched_a1_b B and A1 require a positive continuation lr_scale; A0 must not declare one.")
-        points = protocol["evaluation_points"]
-        if (arm != "a0") != (type(points) is int and points >= 1):
-            _raise_config_error("matched_a1_b B and A1 require positive budget evaluation_points; A0 must not declare them.")
     elif protocol is not None or arm != "a0":
         _raise_config_error("Outside matched_a1_b, transient training is the stage-A-only A0 protocol.")
     config["training"] = {
         **training,
-        "curriculum": {
-            "lengths": list(curriculum["lengths"]),
-            "milestone_fractions": [float(item) for item in fractions],
-        },
+        **({} if curriculum is None else {"curriculum": curriculum}),
         "teacher_handoff": None if handoff is None else {"source_run_name": handoff["source_run_name"]},
     }
     config["_transient_tensorizer"] = tensorizer
@@ -1411,18 +1332,18 @@ def _validate_transient_extensions(  # noqa: C901, PLR0912
 
 def _reject_transient_roots_for_steady(config: Mapping[str, Any]) -> None:
     """Keep the steady configuration schema byte-for-byte semantic compatible."""
-    unexpected = sorted({"input_profile", "temporal", "scaling"}.intersection(config))
+    unexpected = sorted({"input_profile", "temporal"}.intersection(config))
     if unexpected:
         _raise_config_error(f"Steady-flow config does not admit transient root key(s): {unexpected}.")
 
 
 def apply_epoch_budget(raw: Mapping[str, Any], epochs: int | None) -> dict[str, Any]:
-    """Copy an authored request and apply an explicit epoch budget.
+    """Copy an authored request and apply an explicit budget in epochs of the full Train set.
 
-    Steady single-stage training uses ``training.epochs``. A stage-A-only A0 run
-    sets ``training.epochs`` and its schedule total together. A matched plan sets
-    A0's epoch budget ``training.a0.max_epochs``; B stops at its measured
-    seconds and A1 at B's receipt, so their caps stay operational bounds.
+    Steady single-stage training uses ``training.budget_epochs``. A stage-A-only A0 run
+    sets ``training.budget_epochs`` and its schedule's together. A matched plan sets
+    A0's ``training.a0.budget_epochs``; B stops at its measured seconds and A1 at B's
+    receipt. The budget names the run, so another budget is another run.
     """
     requested = copy.deepcopy(dict(raw))
     if epochs is None:
@@ -1433,12 +1354,12 @@ def apply_epoch_budget(raw: Mapping[str, Any], epochs: int | None) -> dict[str, 
     training = _as_mapping(requested.get("training"), path="training")
     schedule = training.get("stage_schedule")
     if training.get("mode") == "matched_a1_b":
-        training["a0"] = {**_as_mapping(training.get("a0"), path="training.a0"), "max_epochs": epochs}
+        training["a0"] = {**_as_mapping(training.get("a0"), path="training.a0"), "budget_epochs": epochs}
     elif isinstance(schedule, Mapping):
-        training["stage_schedule"] = {**schedule, "total_epochs": epochs}
-        training["epochs"] = epochs
+        training["stage_schedule"] = {**schedule, "budget_epochs": epochs}
+        training["budget_epochs"] = epochs
     else:
-        training["epochs"] = epochs
+        training["budget_epochs"] = epochs
     requested["training"] = training
     return requested
 
@@ -1635,7 +1556,7 @@ def resolve_config(
     effective["model"] = model
 
     if is_transient:
-        _validate_transient_loss(effective)
+        _validate_transient_loss(effective, task=task)
     else:
         _validate_loss(effective, task=task)
     _validate_evaluation(effective, task=task)
@@ -1741,7 +1662,7 @@ def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identi
         raise ConfigError(msg)
     effective = copy.deepcopy(dict(config))
     task_id = effective.get("task")
-    transient_roots = frozenset({"input_profile", "temporal", "scaling"})
+    transient_roots = frozenset({"input_profile", "temporal"})
     roots = _ROOT_KEYS if task_id == "transient_drying" else _ROOT_KEYS.difference(transient_roots)
     allowed = roots.union({"task_contract", "paths", _PRODUCER_KEY})
     missing = sorted(allowed.difference(effective))
@@ -1795,7 +1716,7 @@ def _validate_resolved_config(config: Mapping[str, Any], *, verify_layout_identi
     effective["model"] = model
 
     if is_transient:
-        _validate_transient_loss(effective)
+        _validate_transient_loss(effective, task=task)
     else:
         _validate_loss(effective, task=task)
     _validate_resolved_metric_keys(effective)
@@ -1874,8 +1795,8 @@ def create_dataloaders_from_config(
     scaling_artifact : Mapping[str, Any] or None, optional
         Restored scaling artifact (``normalizer.pt``), admitted under the run's scaling identity.
     seed_plan : Mapping[str, int]
-        The run's seed plan; its labeled ``loader`` and ``worker`` seeds
-        drive sampling order and worker randomness.
+        The run's seed plan; its labeled ``loader`` seed drives the unit sampler's order
+        and its ``worker`` seed the worker randomness.
     startup_callback : Callable or None, optional
         Presentation-owned receiver for bounded semantic startup events.
     split_persist_callback : Callable or None, optional
@@ -1884,7 +1805,7 @@ def create_dataloaders_from_config(
     Returns
     -------
     dict[str, Any]
-        Train/evaluation loaders, data processor, scaling artifact, and resolved split membership.
+        Train/evaluation loaders, the admitted Train scaling, its artifact, and resolved split membership.
 
     Raises
     ------
@@ -1895,7 +1816,7 @@ def create_dataloaders_from_config(
     -----
     The shared task dataset factory validates schema and fingerprint before
     splitting. Loader construction may read dataset files, fit preprocessing
-    state for a fresh run, or reuse caller-supplied split and processor state.
+    state for a fresh run, or reuse caller-supplied split and scaling state.
     The scaling cache is keyed by the config's recorded ``producer.model_sha256``
     in addition to the scaling identity. Persistence remains the run lifecycle's
     responsibility.
@@ -1910,7 +1831,7 @@ def create_dataloaders_from_config(
             {"input_profile": config["input_profile"], "temporal_conditioning": config["temporal"]["temporal_conditioning"]}
         )
         settings = datasets.runtime.factory.LoaderSettings(
-            batch_size=data_cfg["batch_size"],
+            batch_size=data_cfg["evaluation_batch_size"],
             num_workers=num_workers,
             pin_memory=data_cfg["pin_memory"],
             persistent_workers=data_cfg["persistent_workers"],
@@ -1922,10 +1843,11 @@ def create_dataloaders_from_config(
             tensorizer=tensorizer,
             train_sampling=datasets.contracts.transient.TransientSamplingSpec.from_mapping(config["temporal"]["sampling"]),
             loader_settings=settings,
+            units_per_update=config["training"]["units_per_update"],
+            memory_batch=config["training"]["memory_batch"],
             model_sha256=model_sha256,
             storage_root=config["paths"]["storage_root"],
             spatial_stride=data_cfg["spatial_stride"],
-            scale_mode=config["scaling"]["mode"],
             loader_seed=seed_plan["loader"],
             worker_seed=seed_plan["worker"],
             saved_split=split_indices,
@@ -1939,20 +1861,23 @@ def create_dataloaders_from_config(
             "material_ood": loaders.material_ood,
             "parameter_ood": loaders.parameter_ood,
             "id_test": loaders.id_test,
-            "data_processor": loaders.data_processor,
+            "scaling": loaders.scaling,
             "scaling_artifact": loaders.scaling_artifact,
             "split_indices": loaders.split,
             "spatial_view": loaders.spatial_view,
             "tensorizer": tensorizer,
         }
-    train_loader, evaluation_loaders, normalizer, split_indices, envelope = datasets.runtime.training.create_dataloaders(
+    train_loader, evaluation_loaders, train_scaling, split_indices, envelope = datasets.runtime.training.create_dataloaders(
         train_dataset_id=common.paths.validate_logical_name(data_cfg["train_dataset"], label="data.train_dataset"),
         material_ood_dataset_ids=tuple(data_cfg["material_ood_datasets"]),
         train_subset=data_cfg["train_subset"],
         task=task,
         model_sha256=model_sha256,
         storage_root=common.paths.storage_root_for_datasets_root(config["paths"]["dataset_root"]),
-        batch_size=data_cfg["batch_size"],
+        spatial_stride=data_cfg["spatial_stride"],
+        units_per_update=config["training"]["units_per_update"],
+        memory_batch=config["training"]["memory_batch"],
+        evaluation_batch_size=data_cfg["evaluation_batch_size"],
         num_workers=num_workers,
         pin_memory=data_cfg["pin_memory"],
         persistent_workers=data_cfg["persistent_workers"],
@@ -1969,7 +1894,7 @@ def create_dataloaders_from_config(
         "id_test": evaluation_loaders["id_test"],
         "material_ood": evaluation_loaders["material_ood"],
         "parameter_ood": evaluation_loaders["parameter_ood"],
-        "data_processor": normalizer,
+        "scaling": train_scaling,
         "scaling_artifact": envelope,
         "split_indices": split_indices,
     }

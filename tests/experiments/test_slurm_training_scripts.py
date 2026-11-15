@@ -414,18 +414,14 @@ def test_resume_only_submission_binds_the_run_owned_config(harness: _Harness) ->
         "train",
         "--resume",
         str(run_dir),
-        "--max-epochs",
-        "9",
     )
 
     assert result.returncode == 0, result.stderr
     arguments = _args(harness.sbatch_capture)
-    assert arguments[-7:] == [
+    assert arguments[-5:] == [
         "/workspace/storage/saved run with spaces/config.yaml",
         "--resume",
         "/workspace/storage/saved run with spaces",
-        "--max-epochs",
-        "9",
         "--device",
         "cpu",
     ]
@@ -447,8 +443,6 @@ def test_resume_only_submission_binds_the_run_owned_config(harness: _Harness) ->
         "/workspace/storage/saved run with spaces/config.yaml",
         "--resume",
         "/workspace/storage/saved run with spaces",
-        "--max-epochs",
-        "9",
         "--device",
         "cpu",
     ]
@@ -535,8 +529,6 @@ def test_artifact_submission_preserves_arguments_and_worker_dispatch(harness: _H
         "--run-dir",
         str(harness.storage / "second"),
         "--rebuild",
-        "--evaluation-spatial-stride",
-        "2",
     )
     assert result.returncode == 0, result.stderr
     arguments = _args(harness.sbatch_capture)
@@ -556,8 +548,6 @@ def test_artifact_submission_preserves_arguments_and_worker_dispatch(harness: _H
         "--run-dir",
         "/workspace/storage/second",
         "--rebuild",
-        "--evaluation-spatial-stride",
-        "2",
         "--device",
         "cpu" if mode == "cpu" else "cuda",
     ]

@@ -98,6 +98,8 @@ def _write_sidecars(
         "export_conversion_seconds": 3.0,
         "complete_execution_s": 16.0,
         "license_wait_seconds": 2.0,
+        "hostname": "solver-node",
+        "requested_cores": 8,
     }
     if stall_progress is not _NOT_PERSISTED:
         timing_payload["stall_progress"] = stall_progress
@@ -147,6 +149,7 @@ def test_load_case_timing_separates_physical_and_runtime_evidence(tmp_path: Path
     assert (result.stationary_airflow_solver_seconds, result.transient_drying_solver_seconds) == (3.0, 4.0)
     assert result.scientific_solver_seconds == 7.0
     assert result.comsol_process_seconds != result.scientific_solver_seconds
+    assert (result.solver_hostname, result.solver_requested_cores) == ("solver-node", 8)
     payload = result.as_dict()
     assert payload["comsol_solver_timing"]["status"] == "complete"
     assert payload["component_timing_availability"]["scientific_solver_seconds"] == "available"

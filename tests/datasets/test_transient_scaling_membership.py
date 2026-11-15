@@ -2,13 +2,13 @@
 
 Responsibilities:
   - Fit the scaler through ``create_transient_training_loaders`` on the compact published transient package
-  - Compare the fitted state moments, increment RMS and counts with Train-only values recomputed from the published PT shards
+  - Compare the fitted case-equal state moments and case count with Train-only values recomputed from the published PT shards
   - Require an identity-bound scaler cache hit to restore the identical fitted evidence
   - Fit a ``train_subset`` run on its Train prefix only and record the subset in the split
 
 Design principles:
   - The package's held-out cases move the state moments away from the Train-only values, so fitting on any other membership is visible
-  - Expected statistics use the documented definition on test-read tensors and never call scaler code
+  - Expected statistics use the documented case-equal definition on test-read tensors and never call scaler code
   - Both Train sampling branches (direct one-step items and a separately selected one-step fitting Dataset) must give the same Train-only fit
 
 This module does NOT:
@@ -28,7 +28,7 @@ from src.learning.learning_temporal import TemporalConditioningSpec
 from src.learning.transient.learning_transient_contracts import TransientTensorizerSpec
 
 if TYPE_CHECKING:
-    from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
 
 _STATE_TOLERANCE = 1.0e-4
 _SAMPLING = {
@@ -51,15 +51,11 @@ def _published_states(package: dict[str, Any]) -> dict[str, torch.Tensor]:
 
 
 def _channel_moments(states: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return population mean and standard deviation per channel over all states of the given cases."""
-    pooled = torch.cat([sequence.to(torch.float64).transpose(0, 1).reshape(sequence.shape[1], -1) for sequence in states], dim=1)
-    return pooled.mean(dim=1), pooled.std(dim=1, correction=0)
-
-
-def _increment_rms(states: list[torch.Tensor]) -> torch.Tensor:
-    """Return the per-channel RMS of float32 one-step increments over the given cases."""
-    increments = [(sequence[1:] - sequence[:-1]).to(torch.float64).transpose(0, 1).reshape(sequence.shape[1], -1) for sequence in states]
-    return torch.cat(increments, dim=1).square().mean(dim=1).sqrt()
+    """Return the per-channel mean and population std in which every case weighs one and its states weigh equally."""
+    blocks = [sequence.to(torch.float64).transpose(0, 1).reshape(sequence.shape[1], -1) for sequence in states]
+    mean = torch.stack([block.mean(dim=1) for block in blocks]).mean(dim=0)
+    variance = torch.stack([(block - mean[:, None]).square().mean(dim=1) for block in blocks]).mean(dim=0)
+    return mean, variance.sqrt()
 
 
 def _create(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None, **extra: Any) -> Any:
@@ -71,6 +67,8 @@ def _create(package: dict[str, Any], sampling: Any, *, train_subset: int | None 
         tensorizer=TransientTensorizerSpec(input_profile="canonical_physics_complete", temporal_conditioning=TemporalConditioningSpec("none")),
         train_sampling=sampling,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        units_per_update=2,
+        memory_batch=1,
         model_sha256="a" * 64,
         storage_root=str(package["root"]),
         **extra,
@@ -85,7 +83,7 @@ def _close(loaders: Any) -> None:
             loader.dataset.close()
 
 
-def _fit(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None) -> tuple[TransientScalingArtifact, dict[str, Any], list[str]]:
+def _fit(package: dict[str, Any], sampling: Any, *, train_subset: int | None = None) -> tuple[TrainScaling, dict[str, Any], list[str]]:
     """Create the public loaders once and return the fitted scaler, split evidence and scaler cache outcomes."""
     cache_outcomes: list[str] = []
 
@@ -95,16 +93,16 @@ def _fit(package: dict[str, Any], sampling: Any, *, train_subset: int | None = N
 
     loaders = _create(package, sampling, train_subset=train_subset, startup_callback=record)
     try:
-        return loaders.data_processor, loaders.split, cache_outcomes
+        return loaders.scaling, loaders.split, cache_outcomes
     finally:
         _close(loaders)
 
 
 @pytest.mark.parametrize("sampling", list(_SAMPLING.values()), ids=list(_SAMPLING))
 def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[str, Any], sampling: Any) -> None:
-    """Fit state moments and increment RMS on Train cases only, and restore them identically from the cache.
+    """Fit case-equal state moments on Train cases only, and restore them identically from the cache.
 
-    The held-out cases move the pooled state mean by more than 1 % in at least one channel, so a fit that admits
+    The held-out cases move the case-equal state mean by more than 1 % in at least one channel, so a fit that admits
     validation or ID-test evidence changes the statistics beyond tolerance.
     """
     partition = transient_package["case_partition"]
@@ -121,20 +119,19 @@ def test_scaler_statistics_come_from_train_cases_only(transient_package: dict[st
 
     artifact, split, first_cache = _fit(transient_package, sampling)
 
-    torch.testing.assert_close(artifact.state_mean.to(torch.float64), train_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
-    torch.testing.assert_close(artifact.state_std.to(torch.float64), train_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
-    torch.testing.assert_close(artifact.delta_rms.to(torch.float64), _increment_rms(train), rtol=1.0e-5, atol=1.0e-6)
+    torch.testing.assert_close(artifact.group("state").mean.to(torch.float64), train_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    torch.testing.assert_close(artifact.group("state").std.to(torch.float64), train_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
     assert split["roles"]["train"]["case_ids"] == partition["train"]
-    assert artifact.unique_train_state_count == sum(sequence.shape[0] for sequence in train)
-    assert artifact.unique_transition_count == artifact.transition_count == sum(sequence.shape[0] - 1 for sequence in train)
+    assert artifact.train_case_count == len(train)
 
     restored, _, second_cache = _fit(transient_package, sampling)
 
     assert first_cache == ["miss"]
     assert second_cache == ["hit"]
     assert restored.digest == artifact.digest
-    for name in ("state_mean", "state_std", "delta_rms", "increment_scale"):
-        assert torch.equal(getattr(restored, name), getattr(artifact, name))
+    for name, statistics in artifact.groups.items():
+        assert torch.equal(restored.group(name).mean, statistics.mean)
+        assert torch.equal(restored.group(name).std, statistics.std)
 
 
 def test_a_train_subset_fits_its_scaler_on_the_train_prefix_only(transient_package: dict[str, Any]) -> None:
@@ -151,9 +148,9 @@ def test_a_train_subset_fits_its_scaler_on_the_train_prefix_only(transient_packa
 
     assert split["train_subset"] == 1
     assert split["roles"]["train"]["case_ids"] == partition["train"][:1]
-    torch.testing.assert_close(artifact.state_mean.to(torch.float64), prefix_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
-    torch.testing.assert_close(artifact.state_std.to(torch.float64), prefix_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
-    assert artifact.unique_train_state_count == prefix[0].shape[0]
+    torch.testing.assert_close(artifact.group("state").mean.to(torch.float64), prefix_mean, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    torch.testing.assert_close(artifact.group("state").std.to(torch.float64), prefix_std, rtol=_STATE_TOLERANCE, atol=_STATE_TOLERANCE)
+    assert artifact.train_case_count == 1
     with pytest.raises(ValueError, match=r"data.train_subset 4 exceeds the Train cases of \['lentil'\]"):
         _fit(transient_package, _SAMPLING["one_step"], train_subset=4)
 

@@ -3,7 +3,7 @@
 Responsibilities:
   - Validate and normalize one-step and rollout batch shapes
   - Assemble exact profile channels and optional normalized time
-  - Build teacher-forced sequence inputs from reference increments
+  - Build teacher-forced sequence inputs from the stored reference states
   - Reconstruct absolute physical state from predicted increments
 
 Design principles:
@@ -11,6 +11,7 @@ Design principles:
   - Both boundary endpoints remain independent model features
   - Absent startup support becomes an exact neutral encoded triple
   - Physical evidence remains available beside scaled model tensors
+  - Reference and teacher states are the stored states, never a cumulative sum of increments
 
 This module does NOT:
   - Fit preprocessing statistics or invoke neuraloperator models
@@ -26,10 +27,10 @@ from typing import Any
 
 import torch
 
+from src import datasets
 from src.learning.learning_temporal import apply_temporal_conditioning
 
 from .learning_transient_contracts import TransientTensorizerSpec
-from .learning_transient_scaling import TransientScalingArtifact
 
 _STATE_CHANNELS = 4
 _STATIC_CHANNELS = 7
@@ -45,7 +46,7 @@ class TransientBatch:
     """Hold validated physical evidence and model-ready transient tensors."""
 
     state: torch.Tensor
-    target: torch.Tensor
+    next_state: torch.Tensor
     static: torch.Tensor
     boundary: torch.Tensor
     scalars: torch.Tensor
@@ -54,7 +55,6 @@ class TransientBatch:
     dt: torch.Tensor
     step_input: torch.Tensor
     sequence_input: torch.Tensor
-    scaled_target: torch.Tensor
 
     @property
     def batch_size(self) -> int:
@@ -64,7 +64,7 @@ class TransientBatch:
     @property
     def rollout_length(self) -> int:
         """Return the normalized transition-window length."""
-        return int(self.target.shape[1])
+        return int(self.next_state.shape[1])
 
 
 def _real_tensor(value: Any, *, label: str) -> torch.Tensor:
@@ -103,16 +103,16 @@ class TransientTensorizer:
     def __init__(
         self,
         spec: TransientTensorizerSpec,
-        scaling: TransientScalingArtifact,
+        scaling: datasets.preprocessing.normalization.TrainScaling,
     ) -> None:
         """Bind a task-owned profile to matching Train-only scaling evidence."""
         if not isinstance(spec, TransientTensorizerSpec):
             message = "spec must be a TransientTensorizerSpec."
             raise TypeError(message)
-        if not isinstance(scaling, TransientScalingArtifact):
-            message = "scaling must be a TransientScalingArtifact."
+        if not isinstance(scaling, datasets.preprocessing.normalization.TrainScaling) or scaling.task != "transient_drying":
+            message = "scaling must be the transient Train scaling."
             raise TypeError(message)
-        if scaling.tensorizer != spec:
+        if scaling.preprocessing.get("tensorizer") != spec.as_dict():
             message = "Tensorizer and scaling artifact identities disagree."
             raise ValueError(message)
         self.spec = spec
@@ -124,7 +124,7 @@ class TransientTensorizer:
             message = "Transient batch must be a mapping."
             raise TypeError(message)
         state = _finite_tensor(raw.get("state"), label="state")
-        target = _finite_tensor(raw.get("target"), label="target")
+        next_state = _finite_tensor(raw.get("next_state"), label="next_state")
         static = _finite_tensor(raw.get("static"), label="static")
         boundary = _finite_tensor(raw.get("boundary"), label="boundary")
         scalars = _finite_tensor(raw.get("scalars"), label="scalars")
@@ -158,22 +158,22 @@ class TransientTensorizer:
             message = "Transient scalar conditioning must have shape [B,8]."
             raise ValueError(message)
 
-        if target.ndim == _SPATIAL_BATCH_RANK:
-            target = target.unsqueeze(1)
+        if next_state.ndim == _SPATIAL_BATCH_RANK:
+            next_state = next_state.unsqueeze(1)
         if boundary.ndim == _VECTOR_BATCH_RANK:
             boundary = boundary.unsqueeze(1)
-        if target.ndim != _SEQUENCE_BATCH_RANK:
-            message = "Transient target must have shape [B,L,4,Y,X]."
+        if next_state.ndim != _SEQUENCE_BATCH_RANK:
+            message = "Transient next_state must have shape [B,L,4,Y,X]."
             raise ValueError(message)
-        rollout_length = int(target.shape[1])
-        if target.shape != (
+        rollout_length = int(next_state.shape[1])
+        if next_state.shape != (
             batch_size,
             rollout_length,
             _STATE_CHANNELS,
             height,
             width,
         ):
-            message = "Transient target channel or spatial shape is invalid."
+            message = "Transient next_state channel or spatial shape is invalid."
             raise ValueError(message)
         if boundary.shape != (
             batch_size,
@@ -183,7 +183,7 @@ class TransientTensorizer:
             message = "Transient boundary conditioning must have shape [B,L,9]."
             raise ValueError(message)
         if rollout_length < 1:
-            message = "Transient target rollout length must be positive."
+            message = "Transient rollout length must be positive."
             raise ValueError(message)
 
         t_n = self._time_values(
@@ -206,7 +206,7 @@ class TransientTensorizer:
         )
         placements = (
             ("state", state),
-            ("target", target),
+            ("next_state", next_state),
             ("static", static),
             ("boundary", boundary),
             ("scalars", scalars),
@@ -234,17 +234,15 @@ class TransientTensorizer:
             raise ValueError(message)
 
         sequence_input = self._teacher_forced_sequence_inputs(
-            initial_state=state,
+            current_states=torch.cat((state.unsqueeze(1), next_state[:, :-1]), dim=1),
             static=static,
             boundary=boundary,
             scalars=scalars,
             t_n=t_n,
-            target=target,
         )
-        scaled_target = self.scaling.encode_delta(target)
         return TransientBatch(
             state=state,
-            target=target,
+            next_state=next_state,
             static=static,
             boundary=boundary,
             scalars=scalars,
@@ -253,7 +251,6 @@ class TransientTensorizer:
             dt=dt,
             step_input=sequence_input[:, 0],
             sequence_input=sequence_input,
-            scaled_target=scaled_target,
         )
 
     @staticmethod
@@ -276,17 +273,13 @@ class TransientTensorizer:
     def _teacher_forced_sequence_inputs(
         self,
         *,
-        initial_state: torch.Tensor,
+        current_states: torch.Tensor,
         static: torch.Tensor,
         boundary: torch.Tensor,
         scalars: torch.Tensor,
         t_n: torch.Tensor,
-        target: torch.Tensor,
     ) -> torch.Tensor:
-        """Assemble every transition from its reference physical current state."""
-        zero_increment = torch.zeros_like(target[:, :1])
-        preceding = torch.cat((zero_increment, target[:, :-1]), dim=1)
-        current_states = initial_state.unsqueeze(1) + preceding.cumsum(dim=1)
+        """Assemble every transition from its stored physical current state."""
         inputs = [
             self.assemble_step(
                 current_state=current_states[:, step],
@@ -295,7 +288,7 @@ class TransientTensorizer:
                 scalars=scalars,
                 t_n=t_n[:, step],
             )
-            for step in range(target.shape[1])
+            for step in range(current_states.shape[1])
         ]
         return torch.stack(inputs, dim=1)
 
@@ -354,11 +347,11 @@ class TransientTensorizer:
         scalar_encoded = self.scaling.encode_scalars(scalars)
         boundary_encoded = self.scaling.encode_boundary(boundary)
         named: dict[str, torch.Tensor] = {}
-        for index, name in enumerate(self.scaling.state_names):
+        for index, name in enumerate(self.scaling.group("state").names):
             named[name] = state_encoded[:, index]
-        for index, name in enumerate(self.scaling.static_names):
+        for index, name in enumerate(self.scaling.group("static").names):
             named[name] = static_encoded[:, index]
-        for index, name in enumerate(self.scaling.boundary_names):
+        for index, name in enumerate(field.name for field in datasets.contracts.transient.TRANSIENT_STEP_CONTRACT.step_boundary_conditioning):
             named[name] = (
                 boundary_encoded[:, index]
                 .view(
@@ -368,7 +361,7 @@ class TransientTensorizer:
                 )
                 .expand(batch_size, height, width)
             )
-        for index, name in enumerate(self.scaling.scalar_names):
+        for index, name in enumerate(self.scaling.group("scalar").names):
             named[name] = (
                 scalar_encoded[:, index]
                 .view(
@@ -382,7 +375,7 @@ class TransientTensorizer:
         normalized_time = apply_temporal_conditioning(
             t_n,
             self.spec.temporal_conditioning,
-            configured_regular_horizon=self.scaling.horizon,
+            configured_regular_horizon=self.scaling.regular_horizon,
         )
         if normalized_time is not None:
             named["normalized_current_time"] = normalized_time.view(

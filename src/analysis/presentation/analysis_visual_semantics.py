@@ -1,29 +1,35 @@
-"""Define shared semantic colormaps and deterministic dataset colors for analysis views.
+"""Define shared semantic colormaps, dataset colors, and one fixed series style per entity for analysis views.
 
 Responsibilities:
   - Resolve a field's semantic colormap and centered-scale requirement
   - Keep plot normalization separate from semantic color selection
   - Describe dataset identities used for deterministic presentation colors
   - Assign colorblind-friendly colors independently of selected dataset order
+  - Fix one color per material and per architecture, one line style per evaluation role, and one marker per material
+  - Resolve the color, line style, and marker of one plotted series from its architecture, material, and role
 
 Design principles:
   - Explicit semantic roles take precedence over field-name inference
   - Canonical identities provide stable color assignment across EDA and evaluation
   - Colormap selection communicates field semantics rather than plot ownership
+  - Color encodes the architecture where architectures are compared, else the material, else the pooled role, never several at once
+  - A pooled role color is chosen far from every material color and is not grey, so it reads as a different entity
 
 This module does NOT:
   - Construct Matplotlib normalizers, colorbars, axes, or legends
   - Load scientific arrays or derive numerical error fields
+  - Decide which entity a plot shows; plot owners pass the entity they draw
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import TYPE_CHECKING, Literal
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final, Literal
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
 FieldSemanticRole = Literal[
     "temperature",
@@ -68,6 +74,54 @@ class DatasetVisualIdentity:
         """Require separately preserved identity and non-empty presentation text."""
         _require_text(self.canonical_identity, label="canonical_identity")
         _require_text(self.label, label="label")
+
+
+@dataclass(frozen=True, slots=True)
+class ArchitectureSpec:
+    """Bind one saved model family to its display label and fixed color."""
+
+    family: str
+    label: str
+    color: str
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesStyle:
+    """Hold the Matplotlib color, line style, and optional marker of one plotted series."""
+
+    color: str
+    linestyle: str
+    marker: str | None
+
+
+# Architectures in run-selector order; a physics-informed variant takes a lighter sibling of its network's hue.
+# Hues shared with the material colors are safe because no plot colors architecture and material at once.
+ARCHITECTURES: Final = (
+    ArchitectureSpec("fno", "FNO", "#0072B2"),
+    ArchitectureSpec("uno", "U-NO", "#D55E00"),
+    ArchitectureSpec("rno", "RNO", "#009E73"),
+    ArchitectureSpec("pi-fno", "PI-FNO", "#56B4E9"),
+    ArchitectureSpec("pi-uno", "PI-U-NO", "#E69F00"),
+)
+# Okabe-Ito colors for the registered materials; the first three match the Generation demo.
+MATERIAL_COLORS: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "lentil": "#0072B2",
+        "chickpea": "#D55E00",
+        "kidney_bean": "#009E73",
+        "field_pea": "#E69F00",
+        "rapeseed": "#CC79A7",
+        "sunflower_seed": "#56B4E9",
+    }
+)
+# Line style is the evaluation role in both color modes, so the material marker carries the material next to an architecture color.
+ROLE_LINESTYLES: Final[Mapping[str, str]] = MappingProxyType({"id": "-", "parameter_ood": "--", "material_ood": ":"})
+# Pooled role colors keep a CIELAB distance of at least 39 to every material color and a chroma well above grey.
+ROLE_COLORS: Final[Mapping[str, str]] = MappingProxyType({"id": "#5E3C99", "parameter_ood": "#7A7A00", "material_ood": "#9E0142"})
+MATERIAL_MARKERS: Final[Mapping[str, str]] = MappingProxyType(
+    {"lentil": "o", "chickpea": "s", "kidney_bean": "^", "field_pea": "D", "rapeseed": "v", "sunflower_seed": "P"}
+)
+_DEFAULT_LINESTYLE: Final = "-"
 
 
 def field_visual_semantics(
@@ -150,6 +204,87 @@ def dataset_colors(datasets: Iterable[DatasetVisualIdentity]) -> dict[str, str]:
         occupied.add(index)
         assigned[dataset.canonical_identity] = _DATASET_COLOR_PALETTE[index]
     return assigned
+
+
+def material_color(material: str) -> str:
+    """Return the fixed color of one registered material; unknown materials raise ``ValueError``."""
+    return _lookup(MATERIAL_COLORS, material, kind="material")
+
+
+def architecture_color(family: str) -> str:
+    """Return the fixed color of one model family (``fno``, ``uno``, ``rno``, ``pi-fno``, ``pi-uno``)."""
+    return _architecture(family).color
+
+
+def architecture_label(family: str) -> str:
+    """Return the display label of one model family, for example ``U-NO`` for ``uno``."""
+    return _architecture(family).label
+
+
+def series_style(
+    *,
+    architecture: str | None = None,
+    material: str | None = None,
+    role: str | None = None,
+    pooled: bool = False,
+) -> SeriesStyle:
+    """
+    Resolve the color, line style, and marker of one plotted series.
+
+    Parameters
+    ----------
+    architecture : str, optional
+        Model family when architectures are compared; it owns the color.
+    material : str, optional
+        Registered material; it owns the color without an architecture and the marker with one.
+    role : str, optional
+        Evaluation role (``id``, ``parameter_ood``, ``material_ood``); it owns the line style.
+    pooled : bool, default False
+        Series that pools the materials of ``role``; without an architecture it takes the role color.
+
+    Returns
+    -------
+    SeriesStyle
+        Color (architecture, else material, else pooled role), line style (role, solid without one),
+        and marker (material, only next to an architecture color).
+
+    Raises
+    ------
+    ValueError
+        If an entity is unknown, a pooled series names a material, or nothing determines a color.
+
+    """
+    if pooled and material is not None:
+        message = "A pooled series merges materials and cannot name one."
+        raise ValueError(message)
+    linestyle = _DEFAULT_LINESTYLE if role is None else _lookup(ROLE_LINESTYLES, role, kind="role")
+    if architecture is not None:
+        marker = None if material is None else _lookup(MATERIAL_MARKERS, material, kind="material")
+        return SeriesStyle(architecture_color(architecture), linestyle, marker)
+    if material is not None:
+        return SeriesStyle(material_color(material), linestyle, None)
+    if pooled and role is not None:
+        return SeriesStyle(_lookup(ROLE_COLORS, role, kind="role"), linestyle, None)
+    message = "A series needs an architecture, a material, or a pooled role to pick its color."
+    raise ValueError(message)
+
+
+def _lookup(table: Mapping[str, str], key: str, *, kind: str) -> str:
+    """Return one fixed presentation value or name the known keys."""
+    try:
+        return table[key]
+    except KeyError:
+        message = f"Unknown {kind} {key!r}; expected one of {sorted(table)}."
+        raise ValueError(message) from None
+
+
+def _architecture(family: str) -> ArchitectureSpec:
+    """Return the specification of one model family or name the known families."""
+    for spec in ARCHITECTURES:
+        if spec.family == family:
+            return spec
+    message = f"Unknown architecture family {family!r}; expected one of {[spec.family for spec in ARCHITECTURES]}."
+    raise ValueError(message)
 
 
 def _resolve_role(field_name: str, role: FieldSemanticRole | None) -> FieldSemanticRole:

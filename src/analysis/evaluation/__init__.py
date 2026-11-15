@@ -8,7 +8,7 @@ Provides:
 - panel: interactive evaluation notebook panel
 - presentation: current-native field, grid, and metadata presentation data
 - plots: scientific evaluation visualizations
-- run_discovery: read-only persisted-run and artifact discovery
+- run_discovery: read-only persisted-run and artifact discovery, and completed-stage work rows
 - selection: synchronized task-aware notebook selection state
 - session: bounded steady evaluation-case and numerical-summary reuse
 - transient_artifact: strict sequence-artifact persistence and admission

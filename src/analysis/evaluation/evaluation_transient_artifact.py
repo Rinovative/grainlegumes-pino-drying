@@ -40,6 +40,7 @@ from src import common
 from src.analysis.artifacts import contracts
 from src.analysis.evaluation import evaluation_transient_metrics as transient_metrics
 from src.analysis.evaluation import evaluation_transient_validity as transient_validity
+from src.datasets.contracts import dataset_contracts_grid as grid_contract
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 TRANSIENT_SEQUENCE_SCHEMA_KIND: Final = "evaluation_transient_sequence"
@@ -123,15 +124,14 @@ _TARGET_KEYS: Final = {
     "predicted_final_time",
 }
 _EXCLUSION_KEYS: Final = {"excluded", "reason"}
+_FULL_GRID_STRIDE: Final = 1
 _SPATIAL_IDENTITY_KEYS: Final = {
     "source_shape",
-    "evaluation_spatial_stride",
     "evaluation_shape",
     "axis_indices",
     "index_identity_sha256",
     "coordinate_identity",
     "physical_extent",
-    "spatial_mask_identity",
     "field_order",
     "representation_transformation",
     "grid_identity_sha256",
@@ -290,14 +290,18 @@ def _validate_array_identity(
     return identity
 
 
+def full_grid_representation(source_shape: tuple[int, int]) -> grid_contract.SpatialRepresentation:
+    """Return the canonical full grid every artifact is built and read on."""
+    return grid_contract.resolve_spatial_representation(source_shape, _FULL_GRID_STRIDE)
+
+
 def _validate_spatial_representation_identity(
     value: Any,
     *,
     expected_shape: tuple[int, int] | None = None,
     static_conditioning: np.ndarray | None = None,
-    spatial_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Admit exact source indices, coordinates, mask, and shared ref/pred grid."""
+    """Admit exact source indices, coordinates, and shared ref/pred grid."""
     if not isinstance(value, Mapping) or set(value) != _SPATIAL_IDENTITY_KEYS:
         message = "Sequence spatial representation fields do not match the schema."
         raise TransientSequenceArtifactError(message)
@@ -314,10 +318,7 @@ def _validate_spatial_representation_identity(
         message = "Sequence spatial source and Evaluation shapes must contain two exact integers."
         raise TransientSequenceArtifactError(message)
     try:
-        representation = transient_contract.resolve_spatial_representation(
-            cast("tuple[int, int]", tuple(source)),
-            transient_contract.validate_spatial_stride(result["evaluation_spatial_stride"]),
-        )
+        representation = full_grid_representation(cast("tuple[int, int]", tuple(source)))
     except (TypeError, ValueError) as error:
         message = f"Sequence spatial index representation is invalid: {error}"
         raise TransientSequenceArtifactError(message) from error
@@ -374,14 +375,6 @@ def _validate_spatial_representation_identity(
         if extent != expected_extent:
             message = "Sequence physical extent contradicts persisted coordinate fields."
             raise TransientSequenceArtifactError(message)
-    mask_identity = _validate_array_identity(
-        result["spatial_mask_identity"],
-        label="sequence spatial mask",
-        observed=spatial_mask,
-    )
-    if mask_identity["shape"] != evaluation:
-        message = "Sequence spatial-mask identity contradicts the Evaluation shape."
-        raise TransientSequenceArtifactError(message)
     core = {key: result[key] for key in _SPATIAL_IDENTITY_KEYS if not key.endswith("grid_identity_sha256")}
     grid_digest = common.serialization.canonical_json_sha256(core)
     if (
@@ -395,28 +388,20 @@ def _validate_spatial_representation_identity(
 
 
 def build_transient_spatial_identity(
-    representation: transient_contract.TransientSpatialRepresentation,
+    representation: grid_contract.SpatialRepresentation,
     *,
     reference_states: np.ndarray,
     static_conditioning: np.ndarray,
-    spatial_mask: np.ndarray,
 ) -> dict[str, Any]:
     """Build exact per-case Evaluation-grid identity from persisted scientific arrays."""
-    if not isinstance(representation, transient_contract.TransientSpatialRepresentation):
+    if not isinstance(representation, grid_contract.SpatialRepresentation):
         message = "representation must be one admitted transient spatial representation."
         raise TypeError(message)
     reference = np.asarray(reference_states)
     static = np.asarray(static_conditioning)
-    mask = np.asarray(spatial_mask)
     shape = representation.represented_shape
-    if (
-        reference.ndim != _SPATIAL_STATE_RANK
-        or reference.shape[1:] != (len(STATE_ORDER), *shape)
-        or static.shape != (len(STATIC_ORDER), *shape)
-        or mask.dtype != np.bool_
-        or mask.shape != shape
-    ):
-        message = "Transient spatial identity inputs must share the represented dynamic/static/mask grid."
+    if reference.ndim != _SPATIAL_STATE_RANK or reference.shape[1:] != (len(STATE_ORDER), *shape) or static.shape != (len(STATIC_ORDER), *shape):
+        message = "Transient spatial identity inputs must share the represented dynamic/static grid."
         raise ValueError(message)
     x_coordinates = static[STATIC_ORDER.index("x")]
     y_coordinates = static[STATIC_ORDER.index("y")]
@@ -428,7 +413,6 @@ def build_transient_spatial_identity(
     serialized = representation.as_dict()
     core = {
         "source_shape": serialized["source_shape"],
-        "evaluation_spatial_stride": serialized["spatial_stride"],
         "evaluation_shape": serialized["represented_shape"],
         "axis_indices": serialized["axis_indices"],
         "index_identity_sha256": serialized["index_identity_sha256"],
@@ -440,7 +424,6 @@ def build_transient_spatial_identity(
             "x": [float(np.min(x_coordinates)), float(np.max(x_coordinates))],
             "y": [float(np.min(y_coordinates)), float(np.max(y_coordinates))],
         },
-        "spatial_mask_identity": _array_identity(mask, label="spatial mask"),
         "field_order": {"dynamic": list(STATE_ORDER), "static": list(STATIC_ORDER)},
         "representation_transformation": serialized["representation_transformation"],
     }
@@ -455,7 +438,6 @@ def build_transient_spatial_identity(
         result,
         expected_shape=shape,
         static_conditioning=static,
-        spatial_mask=mask,
     )
 
 
@@ -526,7 +508,6 @@ def validate_sequence_identity(value: Mapping[str, Any], *, case_id: str, datase
         "scaling_identity",
         "spatial_representation",
         "stage_identity",
-        "curriculum_identity",
         "parent_checkpoint",
         "stage_a_handoff",
         "matched_compute_manifest",
@@ -534,6 +515,11 @@ def validate_sequence_identity(value: Mapping[str, Any], *, case_id: str, datase
         if not isinstance(identity[key], dict) or not identity[key]:
             message = f"Sequence identity.{key} must be a non-empty mapping."
             raise TransientSequenceArtifactError(message)
+    # Only Stage B draws rollout horizons: its curriculum identity is a non-empty mapping, a Stage A's is null.
+    curriculum = identity["curriculum_identity"]
+    if not (isinstance(curriculum, dict) and bool(curriculum) if identity["stage_identity"].get("stage") == "b" else curriculum is None):
+        message = "Sequence identity.curriculum_identity must be Stage B's non-empty mapping and null for Stage A."
+        raise TransientSequenceArtifactError(message)
     _validate_spatial_representation_identity(identity["spatial_representation"])
     if identity["parent_checkpoint"] != identity["stage_a_handoff"]:
         message = "Sequence parent checkpoint and Stage-A handoff identity disagree."
@@ -687,7 +673,6 @@ class TransientSequenceRecord:
     prediction_nonfinite_mask: np.ndarray
     prediction_physical_invalid_mask: np.ndarray
     prediction_validity: Mapping[str, Any]
-    spatial_mask: np.ndarray
     temporal_mask: np.ndarray
     static_conditioning: np.ndarray
     boundary_conditioning: np.ndarray
@@ -771,13 +756,9 @@ class TransientSequenceRecord:
         if min(height, width) < 1:
             message = "Sequence state grids must be non-empty."
             raise TransientSequenceArtifactError(message)
-        spatial_mask = _mask_array(self.spatial_mask, label="spatial_mask", ndim=2)
         temporal_mask = _mask_array(self.temporal_mask, label="temporal_mask", ndim=1)
-        if spatial_mask.shape != (height, width) or temporal_mask.shape != (available + 1,):
-            message = "Spatial and temporal masks do not match the sequence axes."
-            raise TransientSequenceArtifactError(message)
-        if not spatial_mask.any() or not temporal_mask.all():
-            message = "Persisted available sequences require a non-empty spatial mask and fully valid temporal axis."
+        if temporal_mask.shape != (available + 1,) or not temporal_mask.all():
+            message = "Persisted available sequences require a fully valid temporal axis."
             raise TransientSequenceArtifactError(message)
 
         static = _finite_array(self.static_conditioning, label="static_conditioning", dtype=np.dtype(np.float32), ndim=3)
@@ -898,7 +879,6 @@ class TransientSequenceRecord:
             identity["spatial_representation"],
             expected_shape=(height, width),
             static_conditioning=static,
-            spatial_mask=spatial_mask,
         )
         target = _validate_target(self.target)
         _validate_record_target_scope(
@@ -931,7 +911,6 @@ class TransientSequenceRecord:
             prediction_nonfinite_mask=prediction_nonfinite,
             prediction_physical_invalid_mask=prediction_physical_invalid,
             prediction_validity=prediction_validity,
-            spatial_mask=spatial_mask,
             temporal_mask=temporal_mask,
             static_conditioning=static,
             boundary_conditioning=boundary,
@@ -1189,7 +1168,6 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
     covered_states = np.zeros(trajectory_length, dtype=bool)
     covered_transitions = np.zeros(trajectory_length - 1, dtype=bool)
     payload: dict[str, np.ndarray] = {
-        "spatial_mask": exemplar.spatial_mask,
         "static_conditioning": exemplar.static_conditioning,
         "scalar_conditioning": exemplar.scalar_conditioning,
         "state_order": np.asarray(STATE_ORDER, dtype="U16"),
@@ -1204,7 +1182,6 @@ def _write_case_bundle(path: Path, records: Sequence[TransientSequenceRecord]) -
         if (
             record.case_id != exemplar.case_id
             or record.trajectory_length != trajectory_length
-            or not np.array_equal(record.spatial_mask, exemplar.spatial_mask)
             or not np.array_equal(record.static_conditioning, exemplar.static_conditioning)
             or not np.array_equal(record.scalar_conditioning, exemplar.scalar_conditioning)
         ):
@@ -1868,7 +1845,6 @@ def _record_from_row(row: Mapping[str, Any], payload: _TransientCasePayload) -> 
         "reference_states",
         "temporal_mask",
         "boundary_conditioning",
-        "spatial_mask",
         "static_conditioning",
         "scalar_conditioning",
         "state_order",
@@ -1926,7 +1902,6 @@ def _record_from_row(row: Mapping[str, Any], payload: _TransientCasePayload) -> 
             prediction_nonfinite_mask=(~np.isfinite(predicted_states[1:])) & computed_mask,
             prediction_physical_invalid_mask=transient_validity.prediction_physical_invalid_mask(predicted_states[1:]) & computed_mask,
             prediction_validity=json.loads(str(row["prediction_validity_json"])),
-            spatial_mask=payload["spatial_mask"],
             temporal_mask=payload["temporal_mask"][int(row["origin_index"]) : int(row["origin_index"]) + state_count],
             static_conditioning=payload["static_conditioning"],
             boundary_conditioning=payload["boundary_conditioning"][int(row["origin_index"]) : int(row["origin_index"]) + available],
@@ -2325,7 +2300,6 @@ def validate_transient_sequence_payload_inventory(
         "reference_states",
         "temporal_mask",
         "boundary_conditioning",
-        "spatial_mask",
         "static_conditioning",
         "scalar_conditioning",
         "state_order",

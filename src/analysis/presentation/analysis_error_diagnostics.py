@@ -4,10 +4,13 @@ Responsibilities:
   - Admit saved steady or transient train-only physical-state reference scales
   - Build the selected signed, absolute, relative or normalized error map
   - Reject incompatible comparison scales
+  - Name the normalized error once for every plot: its symbol and its error-map column header
 
 Design principles:
-  - Transient normalization uses saved state_std, and for w_gr the saved grain_moisture_std, independently of increment scale mode
+  - Normalization divides by the saved Train scale max(sigma, floor) that training and selection use; transient w_gr uses
+    its grain-moisture group
   - Missing or invalid scale provenance yields explicit unavailability
+  - A relative map whose reference RMS lies below the field's floor is unavailable, never stabilised
   - All required support remains finite before an error map is admitted
 
 This module does NOT:
@@ -17,8 +20,6 @@ This module does NOT:
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Real
@@ -26,15 +27,19 @@ from typing import Any, Literal
 
 import numpy as np
 
-SteadyErrorMode = Literal["MAE", "Relative [%]", "Normalized absolute error"]
+from src import datasets
+
+SteadyErrorMode = Literal["Signed error", "MAE", "Relative [%]", "Normalized absolute error"]
 TransientErrorMode = Literal["Signed error", "Absolute error", "Normalized absolute error"]
 ErrorMode = SteadyErrorMode | TransientErrorMode
 
 NORMALIZED_ABSOLUTE_ERROR: Literal["Normalized absolute error"] = "Normalized absolute error"
-STEADY_ERROR_MODES: tuple[SteadyErrorMode, ...] = ("MAE", "Relative [%]", NORMALIZED_ABSOLUTE_ERROR)
-TRANSIENT_ERROR_MODES: tuple[TransientErrorMode, ...] = ("Signed error", "Absolute error", NORMALIZED_ABSOLUTE_ERROR)
-DEFAULT_ERROR_MODE = NORMALIZED_ABSOLUTE_ERROR
-_RELATIVE_DENOMINATOR_FLOOR = 1e-12
+SIGNED_ERROR: Literal["Signed error"] = "Signed error"
+NORMALIZED_ERROR_SYMBOL = r"$|e|/\sigma_\mathrm{train}$"  # plot label: absolute error over the saved Train scale max(sigma, floor)
+NORMALIZED_ERROR_HEADER = f"Absolute error / train std {NORMALIZED_ERROR_SYMBOL}"  # error-map column header
+STEADY_ERROR_MODES: tuple[SteadyErrorMode, ...] = (SIGNED_ERROR, "MAE", "Relative [%]", NORMALIZED_ABSOLUTE_ERROR)
+TRANSIENT_ERROR_MODES: tuple[TransientErrorMode, ...] = (SIGNED_ERROR, "Absolute error", NORMALIZED_ABSOLUTE_ERROR)
+DEFAULT_ERROR_MODE = SIGNED_ERROR  # owner 14.11.: error maps show the signed error unless another kind is chosen
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,11 +99,11 @@ def steady_reference_scale(provenance: Mapping[str, Any], *, field: str, unit: s
     dataset = provenance.get("dataset")
     if not isinstance(normalizer, Mapping) or not isinstance(dataset, Mapping):
         return "Admitted artifact has no normalizer or Dataset provenance."
-    scales = normalizer.get("output_standard_deviations")
+    scales = normalizer.get("output_scales")
     if not isinstance(scales, Mapping) or field not in scales:
         return f"No persisted physical output scale exists for {field}."
-    if normalizer.get("output_normalization") != "train_fitted_per_channel_standardization":
-        return f"Saved normalization for {field} is not a physical-difference standard deviation."
+    if normalizer.get("normalization") != datasets.preprocessing.normalization.PREPROCESSING_KIND:
+        return f"Saved normalization for {field} is not the shared Train-only scaling."
     fit_split = normalizer.get("fit_split")
     identity = dataset.get("name")
     scaler_identity = normalizer.get("sha256")
@@ -106,7 +111,7 @@ def steady_reference_scale(provenance: Mapping[str, Any], *, field: str, unit: s
         return "Train-only scale provenance or Dataset identity is missing."
     if not isinstance(scaler_identity, str) or not scaler_identity:
         return "Saved output scale has no scaler identity."
-    return _positive_scale(field, unit, scales[field], "saved_run_normalizer.output_standard_deviations", fit_split, identity, scaler_identity)
+    return _positive_scale(field, unit, scales[field], "saved_run_normalizer.output_scales", fit_split, identity, scaler_identity)
 
 
 def transient_reference_scale(
@@ -114,51 +119,26 @@ def transient_reference_scale(
     *,
     field: str,
     unit: str,
-    state_order: Sequence[str],
     dataset_identity: str,
     expected_scaler_identity: str | None = None,
 ) -> ReferenceScale | str:
-    """Use persisted state_std (or grain_moisture_std for w_gr), regardless of the increment training scale mode."""
-    shape: tuple[int, ...]
-    if field == "w_gr":
-        raw = scaling_state.get("grain_moisture_std")
-        if raw is None:
-            return "This run's scaling predates the persisted w_gr train scale; normalized w_gr errors are unavailable."
-        shape, source, mismatch = (), "saved_run_normalizer.grain_moisture_std", "Saved transient grain_moisture_std is not one scalar."
-    elif field not in state_order:
+    """Use the saved Train scale max(sigma, floor) of the state group, or of the grain-moisture group for w_gr."""
+    try:
+        scaling = datasets.preprocessing.normalization.TrainScaling.from_state_dict(scaling_state)
+    except (TypeError, ValueError) as error:
+        return f"Saved transient scaling cannot be admitted: {error}"
+    group_name = "grain_moisture" if field == "w_gr" else "state"
+    group = scaling.group(group_name)
+    if field not in group.names:
         return f"No persisted physical-state scale exists for derived field {field}."
-    else:
-        raw = scaling_state.get("state_std")
-        if raw is None:
-            return "Saved transient scaling has no state_std."
-        shape, source = (len(state_order),), "saved_run_normalizer.state_std"
-        mismatch = "Saved transient state_std does not match the state field order."
-    values = np.asarray(raw.detach().cpu().numpy() if hasattr(raw, "detach") else raw)
-    if values.shape != shape:
-        return mismatch
     if not dataset_identity:
         return "Transient Dataset scale identity is missing."
-    if scaling_state.get("train_membership_digest") != dataset_identity:
+    if scaling.train_membership_digest != dataset_identity:
         return "Transient train membership does not match the declared Dataset scale identity."
-    declared_order = scaling_state.get("state_names")
-    if declared_order is not None and tuple(declared_order) != tuple(state_order):
-        return "Saved transient state scale field order is incompatible."
-    try:
-        serialized = json.dumps(
-            scaling_state,
-            ensure_ascii=True,
-            sort_keys=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            default=lambda value: value.detach().cpu().tolist() if hasattr(value, "detach") else value.tolist(),
-        )
-    except (TypeError, ValueError, AttributeError):
-        return "Saved transient scaler provenance cannot be identified exactly."
-    scaler_identity = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    if expected_scaler_identity is not None and scaler_identity != expected_scaler_identity:
+    if expected_scaler_identity is not None and scaling.digest != expected_scaler_identity:
         return "Saved transient state scale contradicts the evaluated artifact's scaler identity."
-    value = values.item() if field == "w_gr" else values[state_order.index(field)].item()
-    return _positive_scale(field, unit, value, source, "train", dataset_identity, scaler_identity)
+    value = float(group.scale[group.names.index(field)].item())
+    return _positive_scale(field, unit, value, f"saved_run_normalizer.groups.{group_name}", "train", dataset_identity, scaling.digest)
 
 
 def require_common_reference_scale(scales: Sequence[ReferenceScale]) -> ReferenceScale:
@@ -183,8 +163,15 @@ def selected_error_map(
     physical_unit: str,
     scale: ReferenceScale | str | None = None,
     support: np.ndarray | None = None,
+    reference_floor: float | None = None,
 ) -> SelectedErrorMap:
-    """Compute only the chosen physical error representation on full support."""
+    """
+    Compute only the chosen physical error representation on full support.
+
+    ``Relative [%]`` divides by the map's reference RMS over the support and needs the
+    field's ``reference_floor``: below it the map is unavailable with its reason, never
+    stabilised.
+    """
     if mode not in (*STEADY_ERROR_MODES, *TRANSIENT_ERROR_MODES):
         msg = f"Unknown field error mode {mode!r}."
         raise ValueError(msg)
@@ -220,11 +207,17 @@ def selected_error_map(
     elif mode == "Signed error":
         values = difference
     elif mode == "Relative [%]":
+        if isinstance(reference_floor, bool) or not isinstance(reference_floor, Real) or not float(reference_floor) > 0.0:
+            msg = "Relative error maps require the field's positive reference floor."
+            raise ValueError(msg)
         required = np.asarray(actual[admitted], dtype=np.float64)
         maximum = float(np.max(np.abs(required)))
-        denominator = (maximum * float(np.sqrt(np.mean(np.square(required / maximum)))) if maximum else 0.0) + _RELATIVE_DENOMINATOR_FLOOR
+        reference_rms = maximum * float(np.sqrt(np.mean(np.square(required / maximum)))) if maximum else 0.0
+        if reference_rms < float(reference_floor):
+            reason = f"Reference RMS {reference_rms:.3g} {physical_unit} lies below the {field} floor {float(reference_floor):g} {physical_unit}."
+            return SelectedErrorMap(None, mode, unit, reason, None)
         with np.errstate(over="ignore", invalid="ignore"):
-            values = np.abs(difference) / denominator * 100.0
+            values = np.abs(difference) / reference_rms * 100.0
     else:
         values = np.abs(difference)
     if not np.isfinite(values[admitted]).all():

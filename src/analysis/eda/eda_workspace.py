@@ -121,6 +121,11 @@ def _summary(catalog: selection.GeneratedOutputEDACatalog, *, storage_root: Path
     )
 
 
+def _stride_note(display_spatial_stride: display_grid.DisplayStride) -> str:
+    """Return the summary line that names how maps are sampled."""
+    return f"Map display stride: {display_spatial_stride}; statistics and scale limits use complete source grids."
+
+
 def _view_loader(
     batch: sources.GeneratedOutputEDABatch,
     *,
@@ -216,7 +221,7 @@ def prepare_generated_output_eda_workspace(
         catalog=catalog, selection_state=selection_state, title=title, display_spatial_stride=display_spatial_stride
     )
     return GeneratedOutputEDAWorkspace(
-        summary_text=summary,
+        summary_text=f"{summary}\n\n{_stride_note(display_spatial_stride)}",
         panel=interactive_panel,
         catalog=catalog,
         selection_state=selection_state,
@@ -272,4 +277,4 @@ def prepare_published_dataset_eda_workspace(
     state = selection.GeneratedOutputSelectionState(catalog)
     state.select_datasets((views[0].key,))
     interactive_panel = panel.build_eda_panel(catalog=catalog, selection_state=state, title=title, display_spatial_stride=display_spatial_stride)
-    return GeneratedOutputEDAWorkspace(summary, interactive_panel, catalog, state)
+    return GeneratedOutputEDAWorkspace(f"{summary}\n{_stride_note(display_spatial_stride)}", interactive_panel, catalog, state)

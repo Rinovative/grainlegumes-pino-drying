@@ -2,11 +2,14 @@
 
 Responsibilities:
   - Define the current checkpoint schema and run-identity binding
-  - Capture model, optimizer, scheduler, loss, RNG, loader, and optional adapter state
+  - Capture model, optimizer, schedule, loss, RNG, unit sampler, stage budget, and optional adapter state
   - Decide from the admitted config whether a run's best keeps the full training state
-  - Validate matched-comparison batch progress and its exact sampler continuation
+  - Keep schedule state out of a teacher handoff source, so a continuation inherits only optimizer state
+  - Validate the unit sampler's epoch order and committed group position as the exact continuation point
   - Validate checkpoint identity before mutating runtime objects
   - Carry the committed training-work counts across resume
+  - Validate the objective history: a finite value exactly at eligible validation points, the best among them
+  - Record a stage's divergence in its terminal last checkpoint, so a resume finalizes it instead of training on
   - Publish best and last checkpoints through atomic replacement, a new best together with its last
   - Declare the per-task model projection and the training projection that includes it
   - Bind run identity to the producer digests a resolved config records, never to the running code
@@ -15,7 +18,7 @@ Design principles:
   - ``last_checkpoint.pt`` is the only continuation source and always carries the full state
   - ``best_checkpoint.pt`` is the inference and artifact source; it carries the full state only
     as the matched-A0 teacher handoff source and evaluation state otherwise
-  - Ordinary resume uses completed epochs; matched comparisons may persist validated batch boundaries
+  - Resume continues at the saved update-group boundary, an epoch end or inside an epoch
   - Missing, extra, or mismatched state fails closed before runtime restoration
 
 This module does NOT:
@@ -45,9 +48,13 @@ from torch import nn
 
 from src import common, datasets
 
+from . import learning_training_budget as budget_state
+
 if TYPE_CHECKING:
     from torch.optim.optimizer import Optimizer
     from torch.utils.data import DataLoader
+
+    from .learning_training_budget import StageBudget
 
 CheckpointRole = Literal["best", "last"]
 CheckpointPayloadKind = Literal["full", "evaluation"]
@@ -59,7 +66,6 @@ _CHECKPOINT_IDENTITY_KEYS: Final = frozenset(
         "task",
         "task_contract_digest",
         "effective_config_digest",
-        "resume_contract_digest",
         "dataset_ids",
         "dataset_fingerprints",
         "split_contract_digest",
@@ -73,7 +79,8 @@ _TRAINING_IDENTITY_CONTRACT: Final = {
     "schema_kind": "training_semantic_identity",
     "model_construction": "resolved_model_kind_and_parameters",
     "loss_construction": "resolved_data_and_physics_loss",
-    "optimization": "resolved_optimizer_scheduler_and_training",
+    # The budget belongs to the identity: a run is never extended, so resume and identity are one digest.
+    "optimization": "resolved_optimizer_scheduler_and_training_including_budget",
     "preprocessing": "fitted_normalizer_artifact_sha256",
     "selection": "resolved_evaluation_objective_and_ordered_split",
 }
@@ -96,8 +103,9 @@ _CONFIG_SEMANTIC_ROOT_KEYS: Final = frozenset(
 _CONFIG_PROVENANCE_ROOT_KEYS: Final = frozenset({"paths", "tracking"})
 _RUN_SEMANTIC_KEYS: Final = frozenset({"seed", "deterministic"})
 _RUN_PROVENANCE_KEYS: Final = frozenset({"device", "name", "revision", "layout"})
-_DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "train_subset", "material_ood_datasets", "batch_size"})
-_DATA_EXECUTION_KEYS: Final = frozenset({"num_workers", "pin_memory", "persistent_workers"})
+_DATA_SEMANTIC_KEYS: Final = frozenset({"train_dataset", "train_subset", "material_ood_datasets", "spatial_stride"})
+# Evaluation accumulates sufficient statistics over the whole role, so its batch size changes no selected value.
+_DATA_EXECUTION_KEYS: Final = frozenset({"evaluation_batch_size", "num_workers", "pin_memory", "persistent_workers"})
 PRODUCER_KEYS: Final = frozenset({"training_sha256", "model_sha256"})
 _MODEL_DIRECTORIES: Final = ("datasets/contracts", "datasets/preprocessing", "datasets/runtime")
 _MODEL_FILES: Final = (
@@ -220,12 +228,18 @@ _CHECKPOINT_KEYS = frozenset(
         "numpy_rng_state",
         "torch_cpu_rng_state",
         "torch_cuda_rng_states",
-        "train_loader_generator_state",
         "train_sampler_state_dict",
         "training_work",
+        "update_work",
+        "budget_state_dict",
+        "divergence",
     }
 )
-TRAINING_WORK_KEYS: Final = frozenset({"optimizer_steps", "gradient_predictions"})
+# Committed optimizer groups, supervised predictions with a gradient, units, and distinct cases summed over updates.
+TRAINING_WORK_KEYS: Final = frozenset({"optimizer_steps", "gradient_predictions", "units", "update_distinct_cases"})
+# One row per committed update, in order; its columns sum to the matching training_work counts.
+UPDATE_WORK_COLUMNS: Final = ("units", "distinct_cases", "supervised_transitions")
+_UPDATE_WORK_TOTALS: Final = (("units", "units"), ("distinct_cases", "update_distinct_cases"), ("supervised_transitions", "gradient_predictions"))
 # Only a full payload continues optimization. An evaluation payload keeps the remaining keys:
 # completed_epoch and global_step are then the epoch (possibly a budget-ended partial one) and
 # the optimizer step at which its best was evaluated, never a continuation boundary.
@@ -238,8 +252,8 @@ _CONTINUATION_KEYS: Final = frozenset(
         "numpy_rng_state",
         "torch_cpu_rng_state",
         "torch_cuda_rng_states",
-        "train_loader_generator_state",
         "train_sampler_state_dict",
+        "divergence",
     }
 )
 
@@ -310,15 +324,16 @@ def model_implementation_digest(task_id: str) -> str:
     return projection.sha256()
 
 
-def effective_config_identity_payload(
-    config: Mapping[str, Any],
-    *,
-    include_epochs: bool = True,
-) -> dict[str, Any]:
+def effective_config_identity_payload(config: Mapping[str, Any]) -> dict[str, Any]:
     """Return positive model-training dependencies without paths or reporting.
 
     The implementation identity is the config's recorded ``producer`` evidence, never
     the running code, so a persisted config keeps its identity under later code changes.
+    The budget, k and the schedule belong to it, so a resume continues exactly this
+    identity and another budget is another run. A matched B or A1 also binds the
+    ``a0_id`` of the A0 it starts from. Execution settings that change no
+    selected value (loader workers, evaluation batch, ``training.memory_batch``) stay
+    outside it, so a resume may change them.
     """
     keys = set(config)
     if keys == {"task", "temporal"}:
@@ -329,7 +344,7 @@ def effective_config_identity_payload(
             "temporal": copy.deepcopy(dict(temporal)),
         }
     is_transient = config.get("task") == "transient_drying"
-    transient_roots = frozenset({"input_profile", "temporal", "scaling"}) if is_transient else frozenset()
+    transient_roots = frozenset({"input_profile", "temporal"}) if is_transient else frozenset()
     allowed_roots = _CONFIG_SEMANTIC_ROOT_KEYS | _CONFIG_PROVENANCE_ROOT_KEYS | transient_roots
     required_roots = _CONFIG_SEMANTIC_ROOT_KEYS | transient_roots
     unknown = sorted(keys.difference(allowed_roots))
@@ -343,24 +358,7 @@ def effective_config_identity_payload(
         ignored_keys=_RUN_PROVENANCE_KEYS,
         label="run",
     )
-    data = _selected_config_mapping(
-        config["data"],
-        semantic_keys=(
-            frozenset(
-                {
-                    "train_dataset",
-                    "train_subset",
-                    "material_ood_datasets",
-                    "batch_size",
-                    "spatial_stride",
-                }
-            )
-            if is_transient
-            else _DATA_SEMANTIC_KEYS
-        ),
-        ignored_keys=(frozenset({"num_workers", "pin_memory", "persistent_workers"}) if is_transient else _DATA_EXECUTION_KEYS),
-        label="data",
-    )
+    data = _selected_config_mapping(config["data"], semantic_keys=_DATA_SEMANTIC_KEYS, ignored_keys=_DATA_EXECUTION_KEYS, label="data")
     task_contract = _required_mapping(config["task_contract"], label="config task_contract")
     required_task_contract = {"task", "digest", "data_contract_digest"}
     missing_contract = sorted(required_task_contract.difference(task_contract))
@@ -368,17 +366,13 @@ def effective_config_identity_payload(
         message = f"Training task contract is missing identity fields {missing_contract}."
         raise ValueError(message)
     training = copy.deepcopy(dict(_required_mapping(config["training"], label="config training")))
+    # The memory split of an update changes only floating-point rounding, so it is execution, not science.
+    training.pop("memory_batch", None)
     if is_transient and training.get("stage") == "a" and training.get("comparison_arm") == "a0":
         # A0 optimization is independent of which self-fed/teacher-forced branch follows it.
         training.pop("stage_schedule", None)
         training.pop("matched_a1_b", None)
         training.pop("teacher_handoff", None)
-    if not include_epochs:
-        training.pop("epochs", None)
-        schedule = training.get("stage_schedule")
-        if isinstance(schedule, dict) and schedule.get("mode") == "matched_a1_b":
-            for key in ("a0_max_epochs", "b_max_epochs", "a1_max_epochs"):
-                schedule.pop(key, None)
     payload = {
         "identity_contract_sha256": TRAINING_IDENTITY_CONTRACT_DIGEST,
         "task": copy.deepcopy(config["task"]),
@@ -396,18 +390,16 @@ def effective_config_identity_payload(
     if is_transient:
         payload["input_profile"] = copy.deepcopy(config["input_profile"])
         payload["temporal"] = copy.deepcopy(config["temporal"])
-        payload["scaling"] = copy.deepcopy(config["scaling"])
+        layout = _required_mapping(config["run"], label="config run").get("layout")
+        if isinstance(layout, Mapping) and layout.get("stage") in {"b", "a1"}:
+            # A continuation is only the same run when it starts from the same A0 lineage.
+            payload["a0_id"] = layout["a0_id"]
     return payload
 
 
 def config_digest(config: Mapping[str, Any]) -> str:
-    """Return the dependency-scoped identity of a completed training config."""
+    """Return the dependency-scoped identity of a training config, the one contract of resume and admission."""
     return common.serialization.canonical_json_sha256(effective_config_identity_payload(config))
-
-
-def resume_contract_digest(config: Mapping[str, Any]) -> str:
-    """Return training semantics fixed across exact resume, excluding duration."""
-    return common.serialization.canonical_json_sha256(effective_config_identity_payload(config, include_epochs=False))
 
 
 def _required_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
@@ -426,8 +418,32 @@ def _required_sha256(value: Any, *, label: str) -> str:
     return value
 
 
+def _require_divergence(value: object, *, role: str) -> None:
+    """Admit a divergence record: none, or the non-empty message only a last checkpoint carries."""
+    if value is not None and (role != "last" or not isinstance(value, str) or not value):
+        msg = "Checkpoint divergence must be None, or the non-empty message of a terminal last checkpoint."
+        raise ValueError(msg)
+
+
+def _validate_bound_violations(value: object) -> None:
+    """Admit one point's per-case bound evidence: state channel to simulation case id to the finite hours of its first violation."""
+    if not isinstance(value, Mapping) or not all(
+        isinstance(channel, str)
+        and channel
+        and isinstance(cases, Mapping)
+        and cases
+        and all(
+            isinstance(case_id, str) and case_id and not isinstance(hours, bool) and isinstance(hours, (int, float)) and math.isfinite(float(hours))
+            for case_id, hours in cases.items()
+        )
+        for channel, cases in value.items()
+    ):
+        msg = "Checkpoint objective_history bound_violations must map non-empty channels to non-empty case ids with finite hours."
+        raise ValueError(msg)
+
+
 def _validate_training_work(value: Any) -> dict[str, int]:
-    """Return an isolated copy of the two non-negative committed training-work counts."""
+    """Return an isolated copy of the non-negative committed training-work counts."""
     if (
         not isinstance(value, Mapping)
         or set(value) != TRAINING_WORK_KEYS
@@ -436,6 +452,38 @@ def _validate_training_work(value: Any) -> dict[str, int]:
         message = f"Checkpoint training_work must hold exactly the non-negative integers {sorted(TRAINING_WORK_KEYS)}."
         raise ValueError(message)
     return {key: int(value[key]) for key in sorted(TRAINING_WORK_KEYS)}
+
+
+def validate_update_work(value: Any, *, training_work: Mapping[str, int]) -> list[list[int]]:
+    """
+    Return an isolated copy of the per-update :data:`UPDATE_WORK_COLUMNS` rows.
+
+    Every committed update has one row of a positive unit count, a distinct-case count
+    between one and its units, and non-negative supervised transitions; the rows number
+    ``training_work["optimizer_steps"]`` and their columns sum to the matching counts.
+
+    Raises
+    ------
+    ValueError
+        If a row is malformed or the rows disagree with ``training_work``.
+
+    """
+    rows = value if isinstance(value, list) else None
+    if rows is None or any(
+        not isinstance(row, list)
+        or len(row) != len(UPDATE_WORK_COLUMNS)
+        or any(type(item) is not int for item in row)
+        or not 1 <= row[1] <= row[0]
+        or row[2] < 0
+        for row in rows
+    ):
+        message = f"Checkpoint update_work must hold one {list(UPDATE_WORK_COLUMNS)} integer row per committed update."
+        raise ValueError(message)
+    totals = {column: sum(row[index] for row in rows) for index, column in enumerate(UPDATE_WORK_COLUMNS)}
+    if len(rows) != training_work["optimizer_steps"] or any(totals[column] != training_work[key] for column, key in _UPDATE_WORK_TOTALS):
+        message = "Checkpoint update_work disagrees with its training_work counts."
+        raise ValueError(message)
+    return [list(row) for row in rows]
 
 
 _OBJECTIVE_KEYS = frozenset({"id", "kind", "space", "fields", "reduction", "direction"})
@@ -484,7 +532,7 @@ def _validate_checkpoint_identity(value: Any, *, label: str) -> dict[str, Any]:
     if not isinstance(identity["task"], str) or not identity["task"]:
         message = f"Checkpoint {label}.task must be a non-empty string."
         raise TypeError(message)
-    for key in ("task_contract_digest", "effective_config_digest", "resume_contract_digest"):
+    for key in ("task_contract_digest", "effective_config_digest"):
         _required_sha256(identity[key], label=f"{label}.{key}")
     environment = _required_mapping(identity["numerical_environment"], label=f"{label}.numerical_environment")
     if set(environment) != {
@@ -601,7 +649,6 @@ def build_checkpoint_identity(
             "task": task,
             "task_contract_digest": task_digest,
             "effective_config_digest": config_digest(persisted),
-            "resume_contract_digest": resume_contract_digest(persisted),
             "dataset_ids": {
                 "train": split.train.dataset_id,
                 **{role: digest([part.dataset_id for part in split.ood_parts(role)]) for role in ood_roles},
@@ -620,36 +667,13 @@ def build_checkpoint_identity(
     )
 
 
-def _train_loader_generator(train_loader: DataLoader[Any]) -> torch.Generator:
-    """Return the explicit generator controlling shuffled train membership."""
-    generator = getattr(train_loader, "generator", None)
-    if not isinstance(generator, torch.Generator):
-        sampler = getattr(train_loader, "sampler", None)
-        generator = getattr(sampler, "generator", None)
-    if not isinstance(generator, torch.Generator):
-        msg = "Exact resume requires an explicit torch.Generator on the training DataLoader."
+def _unit_sampler(train_loader: DataLoader[Any]) -> datasets.runtime.units.UnitSampler:
+    """Return the resumable unit sampler whose order, position and generator a full checkpoint carries."""
+    sampler = getattr(train_loader, "batch_sampler", None)
+    if not isinstance(sampler, datasets.runtime.units.UnitSampler):
+        msg = "Exact resume requires a training DataLoader driven by a UnitSampler."
         raise TypeError(msg)
-    return generator
-
-
-def _stateful_sampler(train_loader: DataLoader[Any]) -> Any | None:
-    """Return the loader's state-carrying batch or item sampler, if it has one."""
-    for sampler in (getattr(train_loader, "batch_sampler", None), getattr(train_loader, "sampler", None)):
-        if callable(getattr(sampler, "state_dict", None)):
-            return sampler
-    return None
-
-
-def _sampler_state(train_loader: DataLoader[Any]) -> Mapping[str, Any] | None:
-    """Return optional explicit sampler state without inventing sampler state."""
-    sampler = _stateful_sampler(train_loader)
-    if sampler is None:
-        return None
-    state = sampler.state_dict()
-    if not isinstance(state, Mapping):
-        msg = "Training sampler state_dict() must return a mapping."
-        raise TypeError(msg)
-    return dict(state)
+    return sampler
 
 
 def _cuda_device_index(device: torch.device) -> int:
@@ -752,8 +776,10 @@ def make_checkpoint(
     train_loader: DataLoader[Any],
     runtime_device: torch.device,
     training_work: Mapping[str, int],
+    update_work: list[list[int]],
+    budget: StageBudget,
     adapter: Any | None = None,
-    batch_progress: Mapping[str, Any] | None = None,
+    divergence: str | None = None,
 ) -> dict[str, Any]:
     """
     Capture a full continuation or an evaluation-only checkpoint payload.
@@ -765,11 +791,13 @@ def make_checkpoint(
     payload_kind : {"full", "evaluation"}
         ``"full"`` for every last checkpoint and the best of
         :func:`is_teacher_handoff_source` runs; ``"evaluation"`` omits optimizer,
-        scheduler, RNG, loader, ``next_epoch``, and batch progress.
+        schedule, RNG, unit sampler and ``next_epoch``. Only a last checkpoint
+        carries schedule state: a full best is a teacher handoff source, whose
+        continuation starts its own schedule.
     identity : Mapping[str, Any]
         Immutable run identity from :func:`build_checkpoint_identity`.
     completed_epoch : int
-        Positive one-based epoch that completed fully.
+        Positive one-based epoch in which the checkpoint is captured, fully or at a committed group inside it.
     global_step : int
         Number of completed optimizer steps.
     model, optimizer, scheduler, loss : Any
@@ -779,20 +807,24 @@ def make_checkpoint(
     best_epoch : int | None
         One-based epoch owning ``best_metric``.
     objective_history : list[dict[str, Any]]
-        Ordered finite evaluation history.
+        Ordered finite evaluation history, one entry per validation point.
     train_loader : DataLoader
-        Shuffled loader whose generator state controls the next epoch.
+        Loader whose unit sampler's epoch order, committed position and generator continue training;
+        a position inside its epoch makes ``next_epoch`` that same epoch.
     runtime_device : torch.device
         Active concrete execution device. CUDA RNG is captured only for this device and
         any CUDA devices that actually own model parameters or buffers.
     training_work : Mapping[str, int]
-        Committed ``optimizer_steps`` and ``gradient_predictions`` of this run so far.
-
+        Committed :data:`TRAINING_WORK_KEYS` counts of this run so far.
+    update_work : list[list[int]]
+        One :data:`UPDATE_WORK_COLUMNS` row per committed update of this run so far.
+    budget : StageBudget
+        The stage budget with its committed units, optimisation seconds and validation points.
     adapter : Any | None, optional
-        Task-owned batch and continuation-state adapter; mutually exclusive with data_processor where accepted.
-    batch_progress : Mapping[str, Any] | None, optional
-        Exact completed optimizer and partial-epoch progress for adapter
-        continuation; only a full payload records it.
+        Task-owned batch and continuation-state adapter; mutually exclusive with a loop scaling where accepted.
+    divergence : str | None, optional
+        The non-finite training loss that ended the stage; only the terminal last checkpoint of a
+        diverged stage carries it, so a resume finalizes the stage instead of training on.
 
     Returns
     -------
@@ -805,9 +837,6 @@ def make_checkpoint(
         raise ValueError(msg)
     if payload_kind not in {"full", "evaluation"} or (role == "last" and payload_kind != "full"):
         msg = f"Checkpoint payload kind {payload_kind!r} is invalid for role {role!r}; a last checkpoint is always full."
-        raise ValueError(msg)
-    if payload_kind == "evaluation" and batch_progress is not None:
-        msg = "An evaluation checkpoint records no batch continuation progress."
         raise ValueError(msg)
     if completed_epoch <= 0:
         msg = f"completed_epoch must be positive, got {completed_epoch}."
@@ -824,6 +853,7 @@ def make_checkpoint(
     if role == "best" and best_metric is None:
         msg = "A best checkpoint requires a finite best objective."
         raise ValueError(msg)
+    _require_divergence(divergence, role=role)
     if not isinstance(runtime_device, torch.device) or runtime_device.type not in {"cpu", "cuda"}:
         msg = f"Checkpoint capture requires one concrete CPU or CUDA torch.device, got {runtime_device!r}."
         raise TypeError(msg)
@@ -849,38 +879,43 @@ def make_checkpoint(
         "best_epoch": best_epoch,
         "objective_history": copy.deepcopy(objective_history),
         "training_work": _validate_training_work(training_work),
+        "update_work": validate_update_work(update_work, training_work=training_work),
+        "budget_state_dict": budget.state_dict(),
     }
     if payload_kind == "full":
-        generator = _train_loader_generator(train_loader)
+        sampler = _unit_sampler(train_loader)
         active_cuda_devices = _active_cuda_devices(model, runtime_device=runtime_device)
         payload |= {
-            "next_epoch": completed_epoch + (1 if batch_progress is None or batch_progress["complete"] else 0),
+            "divergence": divergence,
+            "next_epoch": completed_epoch + (1 if sampler.epoch_complete else 0),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None and role == "last" else None,
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),  # noqa: NPY002 -- exact process-global RNG state
             "torch_cpu_rng_state": torch.get_rng_state(),
             "torch_cuda_rng_states": _capture_cuda_rng_states(active_cuda_devices),
-            "train_loader_generator_state": generator.get_state(),
-            "train_sampler_state_dict": _sampler_state(train_loader),
+            "train_sampler_state_dict": sampler.state_dict(),
         }
     if adapter_state is not None:
         payload["adapter_state_dict"] = copy.deepcopy(adapter_state)
-    if batch_progress is not None:
-        payload["batch_progress"] = copy.deepcopy(dict(batch_progress))
     return payload
+
+
+def _partial_epoch(payload: Mapping[str, Any]) -> bool:
+    """Return whether a full checkpoint stops inside its epoch's unit order."""
+    state = payload["train_sampler_state_dict"]
+    return bool(state["cursor"] != state["size"])
 
 
 def records_completed_budget(payload: Mapping[str, Any]) -> bool:
     """
-    Return whether a checkpoint's adapter controller records a completed stage budget.
+    Return whether a validated checkpoint records a completed stage budget.
 
     A completed budget is terminal: such a checkpoint finalizes its run and
     never continues optimization.
     """
-    adapter_state = payload.get("adapter_state_dict")
-    controller = adapter_state.get("controller") if isinstance(adapter_state, Mapping) else None
-    return isinstance(controller, Mapping) and controller.get("budget_complete") is True
+    state = budget_state.validate_state(payload["budget_state_dict"])
+    return budget_state.StageBudget(**state).complete
 
 
 def recorded_history_epochs(payload: Mapping[str, Any]) -> int:
@@ -888,11 +923,11 @@ def recorded_history_epochs(payload: Mapping[str, Any]) -> int:
     Return how many epoch history records precede one validated last checkpoint.
 
     An operational partial epoch publishes its checkpoint before any history
-    record; a terminal budget epoch records its history before its checkpoints.
+    record; a terminal epoch, ended by its budget or a divergence, records its
+    history before its checkpoints.
     """
     completed_epoch = int(payload["completed_epoch"])
-    progress = payload.get("batch_progress")
-    if progress is not None and not progress["complete"] and not records_completed_budget(payload):
+    if _partial_epoch(payload) and payload["divergence"] is None and not records_completed_budget(payload):
         return completed_epoch - 1
     return completed_epoch
 
@@ -967,12 +1002,7 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         msg = f"Checkpoint payload_kind mismatch: expected {payload_kind!r}, got {payload.get('payload_kind')!r}."
         raise ValueError(msg)
     full = payload_kind == "full"
-    has_batch_progress = full and "batch_progress" in payload
-    expected_keys = (
-        (_CHECKPOINT_KEYS if full else _CHECKPOINT_KEYS - _CONTINUATION_KEYS)
-        | ({"adapter_state_dict"} if adapter_expected else set())
-        | ({"batch_progress"} if has_batch_progress else set())
-    )
+    expected_keys = (_CHECKPOINT_KEYS if full else _CHECKPOINT_KEYS - _CONTINUATION_KEYS) | ({"adapter_state_dict"} if adapter_expected else set())
     missing = sorted(expected_keys.difference(payload))
     unknown = sorted(set(payload).difference(expected_keys))
     if missing or unknown:
@@ -998,38 +1028,30 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     global_step = payload["global_step"]
     integer_fields = [("completed_epoch", completed_epoch, 1), ("global_step", global_step, 0)]
     if full:
-        integer_fields.append(("next_epoch", payload["next_epoch"], 1 if has_batch_progress else 2))
+        integer_fields.append(("next_epoch", payload["next_epoch"], 1))
     for label, value, minimum in integer_fields:
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             msg = f"Checkpoint {label} must be an integer >= {minimum}."
             raise TypeError(msg)
-    _validate_training_work(payload["training_work"])
-    progress = payload.get("batch_progress")
-    if has_batch_progress:
-        if not isinstance(progress, Mapping) or set(progress) != {"epoch", "cursor", "size", "complete"}:
-            msg_0 = "Matched batch progress schema is invalid."
-            raise ValueError(msg_0)
-        # Windowed trajectories consume their loader items only after the last window, so a
-        # budget crossing inside the epoch's first loader batch leaves a terminal zero cursor.
-        cursor_floor = 0 if records_completed_budget(payload) else 1
-        if (
-            progress["epoch"] != completed_epoch
-            or type(progress["cursor"]) is not int
-            or type(progress["size"]) is not int
-            or not cursor_floor <= progress["cursor"] <= progress["size"]
-            or type(progress["complete"]) is not bool
-            or progress["complete"] != (progress["cursor"] == progress["size"])
-        ):
-            msg_0 = "Matched batch progress does not describe one valid epoch cursor."
-            raise ValueError(msg_0)
-    if full and payload["next_epoch"] != completed_epoch + (1 if progress is None or progress["complete"] else 0):
-        msg = "Checkpoint next_epoch conflicts with its completed or partial batch boundary."
-        raise ValueError(msg)
+    validate_update_work(payload["update_work"], training_work=_validate_training_work(payload["training_work"]))
+    budget = budget_state.validate_state(payload["budget_state_dict"])
+    if full:
+        _require_divergence(payload["divergence"], role=expected_role)
+        sampler_state = payload["train_sampler_state_dict"]
+        datasets.runtime.units.validate_state(sampler_state)
+        # A checkpoint follows at least one committed group of its epoch, at the epoch's end or inside it.
+        if sampler_state["epoch"] != completed_epoch - 1 or sampler_state["cursor"] < 1:
+            msg = "Checkpoint unit sampler state does not belong to a committed group of its completed epoch."
+            raise ValueError(msg)
+        if payload["next_epoch"] != completed_epoch + (0 if _partial_epoch(payload) else 1):
+            msg = "Checkpoint next_epoch conflicts with its completed or partial unit-sampler epoch."
+            raise ValueError(msg)
 
     for key in ("model_state_dict", "loss_state_dict", *(("optimizer_state_dict",) if full else ())):
         _required_mapping(payload[key], label=key)
-    if full and scheduler_expected != isinstance(payload["scheduler_state_dict"], Mapping):
-        msg = "Checkpoint scheduler state is absent or present inconsistently with the resolved config."
+    # A full best is a teacher handoff source: its continuation starts its own schedule, so it carries none.
+    if full and (scheduler_expected and expected_role == "last") != isinstance(payload["scheduler_state_dict"], Mapping):
+        msg = "Checkpoint schedule state is absent or present inconsistently with the resolved config and role."
         raise ValueError(msg)
 
     best_metric = payload["best_metric"]
@@ -1053,24 +1075,36 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
         msg = "Checkpoint objective_history must be a list."
         raise TypeError(msg)
     history_values: list[tuple[int, float]] = []
-    previous_epoch = 0
+    previous_epoch = previous_point = 0
     for entry in history:
-        if not isinstance(entry, Mapping) or set(entry) != {"epoch", "objective_id", "value"}:
-            msg = "Checkpoint objective_history entries must contain exactly epoch, objective_id, and value."
+        if not isinstance(entry, Mapping) or set(entry) != {"point", "epoch", "objective_id", "value", "bound_violations"}:
+            msg = "Checkpoint objective_history entries must contain exactly point, epoch, objective_id, value, and bound_violations."
             raise ValueError(msg)
+        _validate_bound_violations(entry["bound_violations"])
         value = entry["value"]
         epoch = entry["epoch"]
-        if isinstance(epoch, bool) or not isinstance(epoch, int) or not previous_epoch < epoch <= completed_epoch:
-            msg = "Checkpoint objective_history epochs must be strictly increasing completed epochs."
+        point = entry["point"]
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or not max(1, previous_epoch) <= epoch <= completed_epoch:
+            msg = "Checkpoint objective_history epochs must be non-decreasing epochs up to the captured one."
             raise ValueError(msg)
+        if isinstance(point, bool) or not isinstance(point, int) or not previous_point < point <= budget["validated_point"]:
+            msg = "Checkpoint objective_history points must be strictly increasing validated budget points."
+            raise ValueError(msg)
+        previous_point = point
         if entry["objective_id"] != identity["objective"]["id"]:
             msg = "Checkpoint objective_history id does not match checkpoint identity."
             raise ValueError(msg)
+        previous_epoch = epoch
+        # Only an eligible validation holds a value, always finite; a non-eligible point holds none.
+        if value is None:
+            continue
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
             msg = "Checkpoint objective_history values must be finite."
             raise ValueError(msg)
         history_values.append((epoch, float(value)))
-        previous_epoch = epoch
+    if sorted([entry["point"] for entry in history] + budget["skipped_points"]) != list(range(1, budget["validated_point"] + 1)):
+        msg = "Checkpoint objective_history and skipped budget points do not cover exactly the validated points."
+        raise ValueError(msg)
     if (best_metric is None) != (not history_values):
         msg = "Checkpoint best state and objective_history presence are inconsistent."
         raise ValueError(msg)
@@ -1103,35 +1137,21 @@ def validate_checkpoint(  # noqa: C901, PLR0912, PLR0915
     except (TypeError, ValueError) as error:
         msg = "Checkpoint Python or NumPy RNG state is invalid."
         raise ValueError(msg) from error
-    for key in ("torch_cpu_rng_state", "train_loader_generator_state"):
-        value = payload[key]
-        if not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.dtype != torch.uint8 or value.ndim != 1:
-            msg = f"Checkpoint {key} must be a one-dimensional CPU byte tensor."
-            raise TypeError(msg)
-        try:
-            torch.Generator().set_state(value)
-        except RuntimeError as error:
-            msg = f"Checkpoint {key} is not a valid Torch generator state."
-            raise ValueError(msg) from error
+    value = payload["torch_cpu_rng_state"]
+    if not isinstance(value, torch.Tensor) or value.device.type != "cpu" or value.dtype != torch.uint8 or value.ndim != 1:
+        msg = "Checkpoint torch_cpu_rng_state must be a one-dimensional CPU byte tensor."
+        raise TypeError(msg)
+    try:
+        torch.Generator().set_state(value)
+    except RuntimeError as error:
+        msg = "Checkpoint torch_cpu_rng_state is not a valid Torch generator state."
+        raise ValueError(msg) from error
     cuda_states = payload["torch_cuda_rng_states"]
     if not isinstance(cuda_states, list) or not all(
         isinstance(state, torch.Tensor) and state.device.type == "cpu" and state.dtype == torch.uint8 and state.ndim == 1 for state in cuda_states
     ):
         msg = "Checkpoint CUDA RNG states must be one-dimensional CPU byte tensors."
         raise TypeError(msg)
-    sampler_state = payload["train_sampler_state_dict"]
-    if sampler_state is not None and not isinstance(sampler_state, Mapping):
-        msg = "Checkpoint train_sampler_state_dict must be a mapping or None."
-        raise TypeError(msg)
-    if has_batch_progress and (
-        not isinstance(progress, Mapping)
-        or not isinstance(sampler_state, Mapping)
-        or sampler_state.get("cursor") != progress["cursor"]
-        or sampler_state.get("size") != progress["size"]
-        or sampler_state.get("epoch") != completed_epoch - 1
-    ):
-        msg_0 = "Matched checkpoint batch progress disagrees with its exact sampler cursor."
-        raise ValueError(msg_0)
     return dict(payload)
 
 
@@ -1259,8 +1279,10 @@ def restore_checkpoint(
     scheduler: Any | None,
     loss: nn.Module,
     train_loader: DataLoader[Any],
+    budget: StageBudget | None,
     adapter: Any | None = None,
     adapter_expected: bool = False,
+    continue_sampler_generator: bool = False,
 ) -> dict[str, Any]:
     """
     Restore a validated last checkpoint transactionally.
@@ -1279,12 +1301,18 @@ def restore_checkpoint(
     model, optimizer, scheduler, loss : Any
         Current runtime components whose state may be replaced.
     train_loader : DataLoader
-        Loader owning the explicit shuffle generator and optional sampler state.
+        Loader whose unit sampler receives the saved epoch order, position and generator.
+    budget : StageBudget | None
+        The resumed stage's budget, which receives the saved progress; ``None`` for a
+        teacher handoff, whose target starts its own budget.
 
     adapter : Any | None, optional
-        Task-owned batch and continuation-state adapter; mutually exclusive with data_processor where accepted.
+        Task-owned batch and continuation-state adapter; mutually exclusive with a loop scaling where accepted.
     adapter_expected : bool, optional
         Require task-owned adapter continuation evidence in the checkpoint.
+    continue_sampler_generator : bool, optional
+        Adopt only the saved sampler generator at a fresh epoch, for a teacher handoff whose
+        target trains on its own units.
 
     Returns
     -------
@@ -1321,18 +1349,8 @@ def restore_checkpoint(
     if adapter_expected and adapter is None:
         msg = "Transient checkpoint restoration requires an adapter."
         raise ValueError(msg)
-    generator = _train_loader_generator(train_loader)
+    sampler = _unit_sampler(train_loader)
     sampler_state = checkpoint["train_sampler_state_dict"]
-    sampler = _stateful_sampler(train_loader)
-    sampler_load_state = getattr(sampler, "load_state_dict", None)
-    current_sampler_state = _sampler_state(train_loader)
-    if sampler_state is not None:
-        if not callable(sampler_load_state):
-            msg = "Checkpoint contains sampler state but the current sampler cannot restore it."
-            raise TypeError(msg)
-        if current_sampler_state is None:
-            msg = "Checkpoint sampler restore requires a snapshot-capable current sampler."
-            raise TypeError(msg)
 
     active_cuda_devices = _active_cuda_devices(model)
     cuda_states = checkpoint["torch_cuda_rng_states"]
@@ -1346,8 +1364,8 @@ def restore_checkpoint(
         "scheduler_state_dict": copy.deepcopy(scheduler.state_dict()) if scheduler is not None else None,
         "loss_state_dict": copy.deepcopy(loss.state_dict()),
         "adapter_state_dict": copy.deepcopy(adapter.state_dict()) if adapter is not None else None,
-        "train_loader_generator_state": generator.get_state().clone(),
-        "train_sampler_state_dict": copy.deepcopy(current_sampler_state),
+        "train_sampler_state_dict": sampler.state_dict(),
+        "budget_state_dict": budget.state_dict() if budget is not None else None,
         "python_rng_state": random.getstate(),
         "numpy_rng_state": copy.deepcopy(np.random.get_state()),  # noqa: NPY002 -- transactional process RNG snapshot
         "torch_cpu_rng_state": torch.get_rng_state().clone(),
@@ -1362,10 +1380,13 @@ def restore_checkpoint(
         loss.load_state_dict(checkpoint["loss_state_dict"], strict=True)
         if adapter_expected and adapter is not None:
             adapter.load_state_dict(dict(checkpoint["adapter_state_dict"]))
+        if budget is not None:
+            budget.load_state_dict(checkpoint["budget_state_dict"])
 
-        generator.set_state(checkpoint["train_loader_generator_state"])
-        if sampler_state is not None and callable(sampler_load_state):
-            sampler_load_state(sampler_state)
+        if continue_sampler_generator:
+            sampler.continue_generator(sampler_state)
+        else:
+            sampler.load_state_dict(sampler_state)
 
         random.setstate(cast("tuple[Any, ...]", checkpoint["python_rng_state"]))
         np.random.set_state(  # noqa: NPY002 -- restore the exact process-global RNG state
@@ -1404,14 +1425,14 @@ def restore_checkpoint(
                 rollback_errors,
             )
         _attempt_rollback(
-            "train loader generator",
-            lambda: generator.set_state(snapshot["train_loader_generator_state"]),
+            "train unit sampler",
+            lambda: sampler.load_state_dict(cast("dict[str, Any]", snapshot["train_sampler_state_dict"])),
             rollback_errors,
         )
-        if current_sampler_state is not None and callable(sampler_load_state):
+        if budget is not None:
             _attempt_rollback(
-                "train sampler",
-                lambda: sampler_load_state(snapshot["train_sampler_state_dict"]),
+                "stage budget",
+                lambda: budget.load_state_dict(cast("dict[str, Any]", snapshot["budget_state_dict"])),
                 rollback_errors,
             )
         _attempt_rollback(
@@ -1449,8 +1470,9 @@ def restore_checkpoint(
         "best_metric": checkpoint["best_metric"],
         "best_epoch": checkpoint["best_epoch"],
         "objective_history": copy.deepcopy(checkpoint["objective_history"]),
-        "batch_progress": copy.deepcopy(checkpoint.get("batch_progress")),
         "training_work": _validate_training_work(checkpoint["training_work"]),
+        "update_work": validate_update_work(checkpoint["update_work"], training_work=checkpoint["training_work"]),
+        "divergence": checkpoint["divergence"],
     }
 
 
@@ -1460,7 +1482,6 @@ def restore_handoff_checkpoint(
     expected_source_identity: Mapping[str, Any],
     model: nn.Module,
     optimizer: Optimizer,
-    scheduler: Any | None,
     loss: nn.Module,
     train_loader: DataLoader[Any],
 ) -> dict[str, Any]:
@@ -1468,8 +1489,12 @@ def restore_handoff_checkpoint(
     Restore the common state from an immutable transient teacher best checkpoint.
 
     The source is the best of an :func:`is_teacher_handoff_source` run, so it must
-    be a full payload. The source adapter state is required and validated but
-    deliberately not applied: the target arm owns a fresh controller and curriculum.
+    be a full payload without schedule state; a source with schedule state is
+    rejected. The target inherits the model, loss and optimizer state (AdamW moments
+    and step counters) and builds its own schedule and budget. The source adapter
+    state is required and validated but deliberately not applied: the target arm owns
+    a fresh controller and curriculum. The target's unit sampler continues only the
+    source's generator stream at a fresh epoch, because the target trains on its own units.
     """
     runtime_source_identity = copy.deepcopy(dict(expected_source_identity))
     runtime_source_identity["numerical_environment"] = numerical_environment_identity()
@@ -1478,24 +1503,25 @@ def restore_handoff_checkpoint(
         expected_identity=runtime_source_identity,
         expected_role="best",
         payload_kind="full",
-        scheduler_expected=scheduler is not None,
+        scheduler_expected=False,
         require_best=True,
         adapter_expected=True,
     )
     common_payload = dict(source)
     common_payload.pop("adapter_state_dict")
-    common_payload.pop("batch_progress", None)
     common_payload["checkpoint_role"] = "last"
     restored = restore_checkpoint(
         common_payload,
         expected_identity=runtime_source_identity,
         model=model,
         optimizer=optimizer,
-        scheduler=scheduler,
+        scheduler=None,
         loss=loss,
         train_loader=train_loader,
+        budget=None,
         adapter=None,
         adapter_expected=False,
+        continue_sampler_generator=True,
     )
     return {
         "source_completed_epoch": source["completed_epoch"],

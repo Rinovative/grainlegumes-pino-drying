@@ -16,9 +16,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src import domain
 from src.analysis.eda import eda_capabilities as capabilities
 from src.analysis.eda.plots import eda_plot_case_statistics as case_statistics
-from src.analysis.presentation import channel_semantics, display_labels, field_labels, visual_semantics
+from src.analysis.presentation import channel_semantics, display_labels, field_labels, moisture_display, visual_semantics
 
 
 def _label_metadata(*, identity: str, material: str = "red_lentil") -> display_labels.DatasetDisplayMetadata:
@@ -74,8 +75,8 @@ def test_unique_labels_keep_unique_bases_and_pick_facets_in_order() -> None:
 
 
 def test_unique_labels_show_only_tokens_that_differ_even_in_the_middle() -> None:
-    first = "exp/fno_h64__lr-1__seed-9__a0ep-2__b-a1__rollout-4"
-    second = "exp/fno_h64__lr-1__seed-9__a0ep-2__rev-wandb-pages__b-a1__rollout-4"
+    first = "exp/fno_h64__lr-1__seed-9__ep-2__k-4__sch-cosine__b-a1__rollout-4"
+    second = "exp/fno_h64__lr-1__seed-9__ep-2__k-4__sch-cosine__rev-wandb-pages__b-a1__rollout-4"
     labels = display_labels.unique_display_labels(["m", "m"], [(first,), (second,)])
     assert labels[1] == "m · rev-wandb-pages"
     labels = display_labels.unique_display_labels(["m", "m"], [("exp/a__seed-1__x",), ("exp/a__seed-2__x",)])
@@ -133,6 +134,56 @@ def test_duplicate_canonical_dataset_identity_is_rejected() -> None:
         visual_semantics.dataset_colors((first, second))
 
 
+def _cielab(color: str) -> np.ndarray:
+    """Convert one sRGB hex color to CIELAB (D65)."""
+    rgb = np.array([int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)])
+    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    matrix = np.array([[0.4124564, 0.3575761, 0.1804375], [0.2126729, 0.7151522, 0.0721750], [0.0193339, 0.1191920, 0.9503041]])
+    xyz = matrix @ linear / np.array([0.95047, 1.0, 1.08883])
+    f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+    return np.array([116 * f[1] - 16, 500 * (f[0] - f[1]), 200 * (f[1] - f[2])])
+
+
+def test_fixed_palettes_are_distinct_and_pooled_role_colors_stand_apart_from_every_material() -> None:
+    assert len(set(visual_semantics.MATERIAL_COLORS.values())) == len(visual_semantics.MATERIAL_COLORS)
+    assert [spec.family for spec in visual_semantics.ARCHITECTURES] == ["fno", "uno", "rno", "pi-fno", "pi-uno"]
+    assert len({spec.color for spec in visual_semantics.ARCHITECTURES}) == len(visual_semantics.ARCHITECTURES)
+    assert visual_semantics.architecture_label("pi-uno") == "PI-U-NO"
+    assert visual_semantics.material_color("lentil") == visual_semantics.series_style(material="lentil").color
+    assert set(visual_semantics.MATERIAL_MARKERS) == set(visual_semantics.MATERIAL_COLORS)
+    assert len(set(visual_semantics.ROLE_LINESTYLES.values())) == len(visual_semantics.ROLE_LINESTYLES)
+    for role_color in visual_semantics.ROLE_COLORS.values():
+        lab = _cielab(role_color)
+        assert float(np.hypot(*lab[1:])) > 30.0  # not grey
+        assert min(float(np.linalg.norm(lab - _cielab(material))) for material in visual_semantics.MATERIAL_COLORS.values()) >= 39.0
+
+
+def test_series_style_takes_the_color_from_the_architecture_else_the_material_else_the_pooled_role() -> None:
+    style = visual_semantics.series_style
+
+    assert style(architecture="uno", material="chickpea", role="parameter_ood") == visual_semantics.SeriesStyle("#D55E00", "--", "s")
+    assert style(material="kidney_bean", role="material_ood") == visual_semantics.SeriesStyle("#009E73", ":", None)
+    assert style(role="id", pooled=True) == visual_semantics.SeriesStyle(visual_semantics.ROLE_COLORS["id"], "-", None)
+    assert style(architecture="fno", role="id", pooled=True).color == visual_semantics.architecture_color("fno")
+    assert style(material="lentil").linestyle == "-"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"architecture": "gru"},
+        {"material": "quinoa"},
+        {"material": "lentil", "role": "test"},
+        {"role": "id", "pooled": True, "material": "lentil"},
+        {"role": "id"},
+        {"pooled": True},
+    ],
+)
+def test_series_style_refuses_unknown_entities_and_a_missing_color_source(arguments: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"Unknown|pooled|needs"):
+        visual_semantics.series_style(**arguments)  # type: ignore[arg-type]
+
+
 def test_meta_statistics_keep_all_discovered_fields_except_exact_denylist() -> None:
     discovered = (
         "varying_draw",
@@ -179,9 +230,10 @@ def test_field_labels_use_authoritative_display_units() -> None:
 
     assert capabilities.field_quantity_label(frame, "Kxx").endswith("[-]")
     assert capabilities.field_quantity_label(frame, "p_in_bc").endswith("[Pa]")
-    assert capabilities.field_quantity_label(frame, "phi").endswith("[-]")
-    assert capabilities.field_quantity_label(frame, "w_surf").endswith("[kg/m³]")
-    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True).endswith("[kg/m³]")
+    assert capabilities.field_quantity_label(frame, "phi") == "φ [%]"
+    assert capabilities.field_quantity_label(frame, "phi", control=True) == "φ [% RH]"
+    assert capabilities.field_quantity_label(frame, "w_surf", mathtext=True) == r"$X_{\mathrm{wb,surf}}$ [%]"
+    assert capabilities.field_quantity_label(frame, "w_surf", control=True) == "Surface moisture [% w.b.]"
 
 
 def test_meta_statistics_use_parameter_union_without_fit_or_variation_filters() -> None:
@@ -253,9 +305,9 @@ def test_temperature_display_conversion_preserves_source_and_difference_values()
     kelvin = np.asarray((273.15, 300.0), dtype=np.float64)
     original = kelvin.copy()
 
-    celsius = field_labels.display_values(kelvin, "K")
-    already_celsius = field_labels.display_values(celsius, "°C")
-    difference = field_labels.display_values((2.5, -1.0), "K", quantity_kind="difference")
+    celsius = field_labels.display_values(kelvin, "K", field="T")
+    already_celsius = field_labels.display_values(celsius, "°C", field="T")
+    difference = field_labels.display_values((2.5, -1.0), "K", field="T", quantity_kind="difference")
 
     np.testing.assert_allclose(celsius, (0.0, 26.85), rtol=0.0, atol=1.0e-12)
     np.testing.assert_allclose(already_celsius, celsius, rtol=0.0, atol=0.0)
@@ -263,3 +315,46 @@ def test_temperature_display_conversion_preserves_source_and_difference_values()
     np.testing.assert_array_equal(kelvin, original)
     assert field_labels.display_unit("K") == "°C"
     assert field_labels.display_unit("K", quantity_kind="difference") == "°C"
+
+
+def test_relative_humidity_displays_in_percent_while_other_dimensionless_quantities_stay_unchanged() -> None:
+    """Only a named humidity fraction becomes % RH (differences pp); unit "1" alone never selects percent."""
+    stored = np.asarray((0.20, 0.01), dtype=np.float64)
+
+    np.testing.assert_allclose(field_labels.display_values(stored[:1], "1", field="phi"), (20.0,))
+    np.testing.assert_allclose(field_labels.display_values(stored[1:], "1", field="phi", quantity_kind="difference"), (1.0,))
+    np.testing.assert_array_equal(field_labels.display_values(stored, "1", field="eps_bed"), stored)
+    np.testing.assert_array_equal(stored, (0.20, 0.01))
+    assert field_labels.display_unit("1", field="phi") == "%"
+    assert field_labels.display_unit("1", field="phi", control=True) == "% RH"
+    assert field_labels.display_unit("1", field="phi", quantity_kind="difference") == "pp"
+    assert field_labels.display_unit("1", field="eps_bed") == field_labels.display_unit("1") == "-"
+    with pytest.raises(ValueError, match="fraction"):
+        field_labels.display_unit("%", field="phi")
+
+
+def test_eda_water_shows_as_wet_basis_percent_with_bulk_means_over_the_case_density() -> None:
+    """Each cell converts with its own dry bulk density; a mean is 100 Σw/(Σρ+Σw), never the mean of cell percentages."""
+    water = np.asarray([[[100.0, 100.0]], [[50.0, 150.0]]])  # [time, y, x]
+    density = np.asarray([[400.0, 900.0]])
+    frame = pd.DataFrame(
+        [{"state_trajectories": {"w_surf": water}, "static_fields": {"rho_bu_dry": density}, "time": {"regular_state_hours": [0.0, 1.0]}}]
+    )
+    frame.attrs.update(field_categories={"dynamic_state": ["w_surf"]}, field_units={"w_surf": "kg/m^3", "rho_bu_dry": "kg/m^3"})
+
+    times, means, lower, upper = capabilities.field_display_trajectory(frame, frame.iloc[0], "w_surf")
+
+    cells = 100.0 * water / (density + water)
+    np.testing.assert_allclose(times, (0.0, 1.0))
+    np.testing.assert_allclose(means, [100.0 * domain.moisture.bulk_wet_basis_moisture(state, density) for state in water])
+    assert means[0] != pytest.approx(cells[0].mean())
+    np.testing.assert_allclose((lower, upper), (cells.min(axis=(1, 2)), cells.max(axis=(1, 2))))
+    assert capabilities.field_quantity_label(frame, "w_surf") == "X_wb,surf [%]"
+
+
+def test_channel_controls_name_the_displayed_units() -> None:
+    """Channel controls read the units the plots show: moisture in words and % w.b., phi in % RH, T in °C."""
+    assert moisture_display.channel_label("w_surf", "w_surf", "kg/m^3") == "Surface moisture [% w.b.]"
+    assert moisture_display.channel_label("phi", "φ", "1") == "φ [% RH]"
+    assert moisture_display.channel_label("T", "T", "K") == "T [°C]"
+    assert moisture_display.field_display_unit("w_gr", "kg/m^3", difference=True) == "pp"

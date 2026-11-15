@@ -13,7 +13,7 @@ Design principles:
 
 This module does NOT:
   - Allocate, seed, persist, resume, or train runs. ``experiments.run`` owns lifecycle
-  - Discover artifact roles, rebuild incompatible targets, or upload to W&B
+  - Discover artifact roles or rebuild incompatible targets
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "config_path",
         nargs="?",
         type=str,
-        help="Experiment YAML. Rerunning it continues an existing run automatically; omit it with --resume",
+        help="Experiment YAML. Rerunning it continues an interrupted run automatically; omit it with --resume",
     )
     parser.add_argument(
         "--resume",
@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         type=int,
-        help="Set the single-stage epoch budget, or A0's epoch budget in a matched plan",
+        help="Set the single-stage epoch budget, or A0's in a matched plan; it names the run, so another budget is another run",
     )
     parser.add_argument(
         "--train-dataset",
@@ -83,9 +83,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="selected",
         help="Post-training artifacts: selected (default) or none; matched plans also accept all or comma-separated a0,b,a1",
     )
-    parser.add_argument(
-        "--max-epochs", type=int, help="Operational epoch cap for one selected matched B or A1 stage; with --resume also a steady run"
-    )
     return parser
 
 
@@ -115,7 +112,7 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
     print(f"Run admission rejected: {report.get('reason')}", file=sys.stderr)
     print(
         f"  existing run {experiments_console.display_path(report.get('run_dir'))}: status {report.get('status')},"
-        f" saved {completed if completed is not None else 'unknown'} epochs, requested {report.get('target_epoch')},"
+        f" saved {completed if completed is not None else 'unknown'} epochs,"
         f" last checkpoint {'ok' if report.get('last_checkpoint_available') else 'missing'},"
         f" best checkpoint {'ok' if report.get('best_checkpoint_available') else 'missing'}, {state_label or 'state unavailable'},"
         f" lock {'present' if active is True else 'absent' if active is False else 'unknown'}, resume {report.get('resume_compatibility')}",
@@ -123,7 +120,7 @@ def _print_existing_run_admission(report: dict[str, object]) -> None:
     )
 
 
-def _append_cli_overrides(command: list[str], args: argparse.Namespace, *, include_limits: bool) -> None:
+def _append_cli_overrides(command: list[str], args: argparse.Namespace) -> None:
     """Append explicit invocation overrides to a reproducible continuation."""
     if args.device is not None:
         command.extend(("--device", shlex.quote(args.device)))
@@ -138,8 +135,6 @@ def _append_cli_overrides(command: list[str], args: argparse.Namespace, *, inclu
     ):
         if value is not None:
             command.extend((option, shlex.quote(str(value))))
-    if include_limits and args.max_epochs is not None:
-        command.extend(("--max-epochs", str(args.max_epochs)))
 
 
 def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> None:
@@ -158,7 +153,7 @@ def _print_matched_stage_failure(error: object, args: argparse.Namespace) -> Non
         error.stage,
     ]
     command.extend(("--artifacts", "none"))
-    _append_cli_overrides(command, args, include_limits=True)
+    _append_cli_overrides(command, args)
     if error.resumable:
         print(f"Saved checkpoint can continue: {error.recovery_reason}", file=sys.stderr)
         print(f"Rerun the same command inside a matching Slurm allocation; it continues this stage: {' '.join(command)}", file=sys.stderr)
@@ -191,6 +186,14 @@ def _validity_label(label: str, note: str | None) -> str:
     return label if note is None else f"completed with invalid predictions ({note})"
 
 
+def _end_status(result: dict[str, Any]) -> str:
+    """Return one stage's end status, naming the budget share at which a diverged stage ended."""
+    if result["status"] != "diverged":
+        return str(result["status"])
+    budget_progress = float((result.get("training_outcome") or {})["budget_progress"])
+    return f"diverged at {100.0 * budget_progress:.1f} % of the budget"
+
+
 def _phase_seconds(outcome: dict[str, Any]) -> dict[str, float]:
     """Sum the training duration parts over the trained stages of one outcome."""
     stages = outcome.get("stage_outcomes")
@@ -204,7 +207,7 @@ def _phase_seconds(outcome: dict[str, Any]) -> dict[str, float]:
 
 def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     """
-    Start, continue or extend a run and return its process result.
+    Start a run, or continue an interrupted one, and return its process result.
 
     Parameters
     ----------
@@ -253,9 +256,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
         if isinstance(train_stages, str):
             msg = "Training stage parser returned an artifact policy."
             raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
-        if args.max_epochs is not None and args.max_epochs < 1:
-            msg = "--max-epochs must be positive."
-            raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
         if args.epochs is not None and args.epochs < 1:
             msg = "--epochs must be positive."
             raise ValueError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
@@ -271,7 +271,6 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
             resume=args.resume,
             device=args.device,
             train_stages=train_stages,
-            max_epochs=args.max_epochs,
             epochs=args.epochs,
             train_dataset=args.train_dataset,
             seed=args.seed,
@@ -313,45 +312,33 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
     result = outcome["result"]
     run_dir = outcome["run_dir"]
     device_resolution = outcome["device_resolution"]
-    best = (
-        f" after {result['completed_epoch']} epochs (operational cap)"
-        if result["status"] == "budget_unmet"
-        else f" | best epoch {result['best_epoch']} | best metric {result['best_metric']:.3e}"
-    )
+    outcome_record = result.get("training_outcome") or {}
+    # The terminal stage decides the exit code, matched or not: 2 without a result (no eligible checkpoint),
+    # and 2 when a matched plan stopped before a selected stage (an A0 without an eligible checkpoint).
+    exit_code = 2 if result.get("best_epoch") is None or outcome.get("unrun_stages") else 0
+    if result.get("best_epoch") is None:
+        best = f" | unsuccessful: no eligible checkpoint ({outcome_record.get('eligible_points', 0)} eligible validation points)"
+    else:
+        best = f" | best epoch {result['best_epoch']} | best metric {result['best_metric']:.3e}"
+    if result["status"] == "diverged":
+        best += f" | {_end_status(result)}"
     print(f"Training status: {result['status']}{best} | run {console.display_path(run_dir)}")
     stage_runs = outcome.get("stage_runs")
+    stage_outcomes = outcome.get("stage_outcomes") or {}
     if isinstance(stage_runs, dict):
         for name, stage_dir in stage_runs.items():
             display_name = name.upper() if "stage_outcomes" not in outcome else name
-            print(f"Stage {display_name} run directory: {console.display_path(stage_dir)}")
-    if result["status"] == "budget_unmet":
-        committed = result.get("train_seconds")
-        target = result.get("target_train_seconds")
-        if isinstance(committed, (int, float)) and isinstance(target, (int, float)):
-            print(f"Committed train seconds: {committed:.6f} / {target:.6f}")
-        else:
-            print("Committed/target train seconds: unavailable in this result.")
-        print("Increase the reached operational cap, or the selected stage max_epochs, then resume this exact run leaf.")
-        from src import common  # noqa: PLC0415
-
-        saved_config = experiments_config_loader.load_yaml(common.paths.resolve_run_config_path(run_dir))
-        saved_epochs = int(saved_config["training"]["epochs"])
-        continuation_epochs = max(saved_epochs, int(result["completed_epoch"]) + 1)
-        continuation = [
-            "python -m src.experiments.cli.cli_train",
-            "--resume",
-            shlex.quote(str(run_dir)),
-            "--artifacts",
-            "none",
-            "--max-epochs",
-            str(continuation_epochs),
-        ]
-        print(f"Continuation inside a matching Slurm allocation: {' '.join(continuation)}")
+            # The status line names only the last stage; each trained stage names its own end, so a diverged A0 stays visible.
+            end = f" | {_end_status(stage_outcomes[name]['result'])}" if name in stage_outcomes else ""
+            print(f"Stage {display_name} run directory: {console.display_path(stage_dir)}{end}")
+    if result.get("best_epoch") is None and "stage_outcomes" not in outcome:
+        print("Post-training artifacts: none, the run has no eligible checkpoint")
+        return exit_code
     if artifact_stages == "none":
         print(
             f"Post-training artifacts: skipped by --artifacts none | {console.duration_summary(time.monotonic() - started, _phase_seconds(outcome))}"
         )
-        return 2 if result["status"] == "budget_unmet" else 0
+        return exit_code
     active_artifact_stage: str | None = None
     active_artifact_dir = run_dir
     artifacts_started = time.monotonic()
@@ -364,7 +351,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                 msg = "Matched outcome lacks stage run directories."
                 raise TypeError(msg)  # noqa: TRY301 -- thin CLI boundary translates argument-contract failures to process status
             if artifact_stages == "selected":
-                requested = tuple(name for name, stage_outcome in stage_outcomes.items() if stage_outcome["result"]["status"] == "completed")
+                requested = tuple(
+                    name
+                    for name, stage_outcome in stage_outcomes.items()
+                    if stage_outcome["result"]["status"] in {"completed", "diverged"} and stage_outcome["result"].get("best_epoch") is not None
+                )
             elif artifact_stages == "all":
                 requested = tuple(stage_runs)
             elif isinstance(artifact_stages, tuple):
@@ -381,9 +372,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                 try:
                     experiments_run.validate_completed_run(active_artifact_dir)
                 except (FileNotFoundError, experiments_run.RunLifecycleError):
-                    if result["status"] != "budget_unmet":
-                        raise
-                    if active_artifact_dir.exists() and experiments_run.read_run_summary(active_artifact_dir).get("status") == "completed":
+                    stage_status = experiments_run.read_run_summary(active_artifact_dir).get("status") if active_artifact_dir.exists() else None
+                    # A stage without an eligible checkpoint, or one a stopped plan never started, has no artifacts; every other must.
+                    if stage_status != "unsuccessful" and name not in outcome.get("unrun_stages", ()):
                         raise
                     unavailable.append(name)
                 else:
@@ -404,7 +395,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
                 label = _artifact_action_label(prepared.role_actions)
                 print(f"Stage {name} artifacts: {_validity_label(label, analysis.artifacts.service.invalid_prediction_note(prepared))}")
             for name in unavailable:
-                print(f"Stage {name} artifacts: unavailable until training completes ({stage_runs[name]})")
+                reason = "was not trained" if name in outcome.get("unrun_stages", ()) else "has no eligible checkpoint"
+                print(f"Stage {name} artifacts: unavailable, the stage {reason} ({stage_runs[name]})")
             artifact_status = (
                 "partial"
                 if unavailable
@@ -445,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915
 
     durations = console.duration_summary(time.monotonic() - started, {**_phase_seconds(outcome), "artifacts": time.monotonic() - artifacts_started})
     print(f"Post-training artifacts: {artifact_status} ({device_resolution.device}) | {durations}")
-    return 2 if result["status"] == "budget_unmet" else 0
+    return exit_code
 
 
 if __name__ == "__main__":

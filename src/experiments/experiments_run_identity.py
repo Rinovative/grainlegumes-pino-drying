@@ -287,8 +287,8 @@ def _parent_record_payload(
         raise ValueError(msg)
     a_name = common.paths.validate_logical_name(run_a["name"], label="Stage A run name")
     b_name = common.paths.validate_logical_name(run_b["name"], label="Stage B run name")
-    a_digest = training_checkpoint.resume_contract_digest(stage_a)
-    b_digest = training_checkpoint.resume_contract_digest(stage_b)
+    a_digest = training_checkpoint.config_digest(stage_a)
+    b_digest = training_checkpoint.config_digest(stage_b)
     return {
         "schema_kind": EXPERIMENT_RECORD_SCHEMA_KIND,
         "topology": "a0_to_b",
@@ -345,11 +345,8 @@ def build_transient_experiment_record(
     payload["children"][f"stage_{continuation}"] = {
         "run_name": a1_name,
         "path": continuation,
-        "semantic_config_sha256": training_checkpoint.resume_contract_digest(stage_a1),
+        "semantic_config_sha256": training_checkpoint.config_digest(stage_a1),
     }
-    for key, config in (("stage_a0", stage_a), ("stage_b", stage_b)):
-        payload["children"][key].pop("semantic_config_sha256")
-        payload["children"][key]["semantic_config_sha256"] = training_checkpoint.resume_contract_digest(config)
     payload["handoff"] = {
         "source_run_name": stage_a["run"]["name"],
         "target_run_names": [stage_b["run"]["name"], a1_name],
@@ -497,9 +494,9 @@ def resolve_readonly_experiment_child(
                 msg = "Parent child config bytes disagree with its saved summary."
                 raise ValueError(msg)
             identity = summary.get("checkpoint_identity")
-            saved_digest = identity.get("resume_contract_digest") if isinstance(identity, Mapping) else None
+            saved_digest = identity.get("effective_config_digest") if isinstance(identity, Mapping) else None
             if not isinstance(saved_digest, str) or re.fullmatch(r"[0-9a-f]{64}", saved_digest) is None:
-                msg = "Completed parent child requires a valid saved resume identity."
+                msg = "Completed parent child requires a valid saved config identity."
                 raise ValueError(msg)
             if saved_digest != child["semantic_config_sha256"]:
                 msg = "Parent child scientific identity disagrees with its immutable parent."

@@ -7,6 +7,7 @@ Provides:
 - training: split and training DataLoader orchestration
 - transient_training: transient split, scaling, and DataLoader orchestration
 - transient: lazy physical-unit transient Dataset runtime
+- units: resumable per-update unit groups, case weights and memory microbatches
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
     from . import dataset_runtime_training as training
     from . import dataset_runtime_transient as transient
     from . import dataset_runtime_transient_training as transient_training
+    from . import dataset_runtime_units as units
 
 _MODULES = {
     "factory": "dataset_runtime_factory",
@@ -27,8 +29,9 @@ _MODULES = {
     "training": "dataset_runtime_training",
     "transient_training": "dataset_runtime_transient_training",
     "transient": "dataset_runtime_transient",
+    "units": "dataset_runtime_units",
 }
-__all__ = ["factory", "steady", "training", "transient", "transient_training"]
+__all__ = ["factory", "steady", "training", "transient", "transient_training", "units"]
 
 
 def __getattr__(name: str) -> object:

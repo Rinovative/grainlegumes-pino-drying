@@ -35,10 +35,13 @@ from src.learning.transient.learning_transient_contracts import TransientTensori
 from src.learning.transient.learning_transient_curriculum import RolloutCurriculum, RolloutCurriculumState
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 pytestmark = pytest.mark.integration
 _LR_SCALE = 0.5
+# Long enough that B's first group never spends it, short enough that the resumed B finishes in seconds.
+_INTERRUPTED_B_SECONDS = 2.0
 _CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA integration lifecycle requires an available CUDA device.",
@@ -184,12 +187,12 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
         _assert_item_equal(sampled_hdf5_item, sampled_pt_item)
         assert sampled_hdf5_item["state"].shape[-2:] == (6, 6)
         assert sampled_hdf5_item["static"].shape[-2:] == (6, 6)
-        assert sampled_hdf5_item["target"].shape[-2:] == (6, 6)
+        assert sampled_hdf5_item["next_state"].shape[-2:] == (6, 6)
         assert sampled_hdf5_item["metadata"]["spatial_y_indices"] == (0, 3, 6, 9, 12, 15)
         assert sampled_hdf5_item["metadata"]["spatial_x_indices"] == (0, 3, 6, 9, 12, 15)
         assert sampled_hdf5_item["metadata"]["spatial_index_identity_sha256"] == sampled_pt_item["metadata"]["spatial_index_identity_sha256"]
         assert sharded.storage_backend == "pt_shards"
-        assert window[0]["target"].shape[0] == 2
+        assert window[0]["next_state"].shape[0] == 2
     finally:
         canonical.close()
         sharded.close()
@@ -218,12 +221,14 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
         tensorizer=tensorizer,
         train_sampling=one_step,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        units_per_update=2,
+        memory_batch=1,
         model_sha256="a" * 64,
         storage_root=str(root),
         train_subset=None,
     )
     try:
-        assert loaders.data_processor.spatial_shape == (16, 16)
+        assert loaders.scaling.spatial_shape == (16, 16)
         assert loaders.split["roles"]["train"]["case_ids"] == transient_package["case_partition"]["train"]
         assert loaders.split["roles"]["id_test"]["case_ids"] == transient_package["case_partition"]["id_test"]
         assert loaders.material_ood is None
@@ -234,9 +239,9 @@ def test_transient_package_pt_runtime_and_scaling_lifecycle(
                 _close_loader_dataset(value)
     curriculum = RolloutCurriculum(lengths=(2, 4), milestone_fractions=(0.0, 0.2))
     curriculum_state = RolloutCurriculumState.create(curriculum, seed=9)
-    horizon, origins = curriculum_state.select(progress=0.2, available_length=4, batch_size=2)
-    assert horizon in (2, 4)
-    assert origins.shape == (2,)
+    draws = curriculum_state.draw(progress=0.2, available_lengths=(4, 4))
+    assert len(draws) == 2
+    assert all(horizon in (2, 4) and 0 <= origin <= 4 - horizon for horizon, origin in draws)
     assert curriculum_state.active_stage == 1
     assert curriculum_state.max_horizon == 4
     assert domain.tasks.registry.get_task("transient_drying").id == "transient_drying"
@@ -294,24 +299,23 @@ def _authored_fno_plan(
         {
             "train_dataset": train_dataset,
             "material_ood_datasets": [],
-            "batch_size": 2,
         }
     )
+    raw["training"]["units_per_update"] = 2
     raw["model"]["params"].update({"n_modes": [8, 8], "hidden_channels": 8, "n_layers": 1, "lifting_channel_ratio": 1, "projection_channel_ratio": 1})
     if not scheduler:
         raw["scheduler"] = None
     raw["tracking"]["wandb"]["mode"] = "disabled"
-    raw["training"]["a0"]["max_epochs"] = 1
+    raw["training"]["a0"]["budget_epochs"] = 1
     raw["training"]["b"].update(
         {
-            "max_epochs": 2,
             "train_seconds": train_seconds,
             "lr_scale": lr_scale,
             "sampling": {"mode": "rollout_window", "rollout_length": 2, "window_stride": 1, "window_offset": 0},
             "curriculum": {"lengths": [2], "milestone_fractions": [0.0]},
         }
     )
-    raw["training"]["a1"].update({"max_epochs": 64, "lr_scale": lr_scale})
+    raw["training"]["a1"].update({"lr_scale": lr_scale})
     return configs.write_config(destination.parent / destination.stem, raw)  # a canonical tree below the destination stem
 
 
@@ -326,8 +330,8 @@ def _assert_curated_series_are_produced(run_dir: Path, *, cuda: bool) -> None:
         physics_monitor_enabled=False,
         cuda_enabled=cuda,
         task_id="transient_drying",
-        state_aux_enabled=float(config["loss"]["data"].get("state_aux_weight", 0.0)) > 0.0,
         ood_roles=datasets.preprocessing.splits.read_saved_split(run_dir).ood_roles,
+        rollout_curriculum="curriculum" in config["training"],  # only the self-fed Stage B fills the curriculum series
     )
     records = json.loads((run_dir / "history.json").read_text(encoding="utf-8"))["epochs"]
     produced = set().union(*records)
@@ -376,12 +380,20 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     )
     assert manifest["model_kind"] == "fno"
     assert b_summary["status"] == "completed"
-    assert a_summary["seed_plan"] == b_summary["seed_plan"] == a1_summary["seed_plan"]
-    assert a_summary["seed_plan"]["curriculum_a0"] != a_summary["seed_plan"]["curriculum_b"]
-    assert b_summary["terminal_controller"]["budget_control"] == "train_seconds"
-    assert b_summary["terminal_controller"]["budget_complete"] is True
-    assert b_summary["terminal_controller"]["train_seconds"] > 0
-    assert b_summary["terminal_controller"]["train_seconds"] >= b_summary["terminal_controller"]["planned_train_seconds"]
+    # Only B draws rollout horizons, so only B derives a curriculum seed and records a terminal curriculum.
+    assert a_summary["seed_plan"] == a1_summary["seed_plan"] == {key: value for key, value in b_summary["seed_plan"].items() if key != "curriculum_b"}
+    assert "curriculum_b" in b_summary["seed_plan"]
+    assert "terminal_curriculum" not in a_summary
+    assert "terminal_curriculum" not in a1_summary
+    # A0 trains its unit budget; B its seconds on the optimisation clock, and A1 exactly B's receipt; each ends at point 20.
+    a0_budget, b_budget, a1_budget = (summary["terminal_budget"] for summary in (a_summary, b_summary, a1_summary))
+    assert a0_budget["unit"] == "units"
+    assert a0_budget["units"] >= a0_budget["total"]
+    assert b_budget["unit"] == a1_budget["unit"] == "train_seconds"
+    assert b_budget["train_seconds"] >= b_budget["total"] > 0
+    assert a1_budget["total"] == b_budget["train_seconds"]
+    assert a1_budget["train_seconds"] >= a1_budget["total"]
+    assert a0_budget["validated_point"] == b_budget["validated_point"] == a1_budget["validated_point"] == 20
     assert b_summary["terminal_controller"]["post_handoff_optimizer_steps"] == 1
     assert b_summary["terminal_controller"]["best_within_budget_metric"] == b_summary["best_metric"]
     assert b_summary["terminal_controller"]["best_within_budget_epoch"] + 1 == b_summary["best_epoch"]
@@ -394,9 +406,6 @@ def test_transient_a0_b_a1_lifecycle(transient_package: dict[str, Any], monkeypa
     assert (b_dir / "teacher_handoff_manifest.json").is_file()
     assert (b_dir / "b_train_budget_receipt.json").is_file()
     assert a1_summary["status"] == "completed"
-    assert a1_summary["terminal_controller"]["budget_control"] == "train_seconds"
-    assert a1_summary["terminal_controller"]["budget_complete"] is True
-    assert a1_summary["terminal_controller"]["train_seconds"] >= b_summary["terminal_controller"]["train_seconds"]
     assert a1_summary["terminal_controller"]["matched_receipt_sha256"] is not None
     for stage_dir in (a0_dir, b_dir, a1_dir):
         _assert_curated_series_are_produced(stage_dir, cuda=True)
@@ -420,8 +429,7 @@ def test_a0_optuna_trial_records_the_dry_run_signature_and_validates_its_history
     request = configs.optuna_transient_a0_config()
     request["study"].update(n_trials=1, pruner={"kind": "none"})
     request["experiment"]["data"]["train_dataset"] = transient_package["train_dataset"]
-    request["experiment"]["training"]["epochs"] = 1
-    request["experiment"]["training"]["stage_schedule"]["total_epochs"] = 1
+    request["experiment"]["training"]["a0"]["budget_epochs"] = 1
     request["search_space"] = {"optimizer.lr": {"name": "learning_rate", "kind": "float", "low": 1.0e-3, "high": 2.0e-3, "log": True}}
 
     completed = optuna_trials.run_one_trial_study(request, directory=tmp_path)
@@ -432,9 +440,15 @@ def test_a0_optuna_trial_records_the_dry_run_signature_and_validates_its_history
 
 
 def _saved_learning_rates(run_dir: Path) -> tuple[float, float]:
-    """Return the optimizer group rate and the scheduler's last-rate record saved in one leaf's last checkpoint."""
+    """Return the optimizer group rate and the schedule's start rate saved in one leaf's last checkpoint."""
     checkpoint = torch.load(run_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
-    return float(checkpoint["optimizer_state_dict"]["param_groups"][0]["lr"]), float(checkpoint["scheduler_state_dict"]["_last_lr"][0])
+    assert checkpoint["scheduler_state_dict"]["kind"] == "cosine"
+    return float(checkpoint["optimizer_state_dict"]["param_groups"][0]["lr"]), float(checkpoint["scheduler_state_dict"]["start_rate"])
+
+
+def _adam_steps(optimizer_state: Mapping[str, Any]) -> set[float]:
+    """Return the distinct AdamW step counters of one optimizer state."""
+    return {float(parameter_state["step"]) for parameter_state in optimizer_state["state"].values()}
 
 
 def _assert_evaluation_refused(run_dir: Path, status: str) -> None:
@@ -453,13 +467,13 @@ def _interrupt_training(*_args: Any, **_kwargs: Any) -> Any:
     raise KeyboardInterrupt(message)
 
 
-def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_matched_b_restarts_its_schedule_at_the_scaled_a0_start_rate(transient_package: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    A fresh B starts from A0's restored learning rate times lr_scale; resuming that B never scales it again.
+    A fresh B starts its own cosine at lr_scale times A0's start rate and keeps A0's Adam step counters; a resume continues it.
 
-    The matched A0 handoff best keeps full training state. B reaches its epoch cap
-    without its train-time budget and publishes an evaluation-only best; the
-    interrupted and the budget_unmet publication of B are both refused for evaluation.
+    The matched A0 handoff best keeps full training state without schedule state. B is
+    interrupted after its first committed group, refused for evaluation while interrupted,
+    resumed on its full identity to the end of its budget, and then never extended.
     """
     root = transient_package["root"]
     monkeypatch.setenv("STORAGE_ROOT", str(root))
@@ -467,7 +481,7 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
         train_dataset=transient_package["train_dataset"],
         destination=root / "scaled_fno.yaml",
         device="cpu",
-        train_seconds=3600.0,
+        train_seconds=_INTERRUPTED_B_SECONDS,
         lr_scale=_LR_SCALE,
         scheduler=True,
     )
@@ -475,15 +489,33 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
     a0_dir = experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("a0",))["run_dir"]
     teacher = torch.load(a0_dir / handoff.HANDOFF_DIRECTORY / "best_checkpoint.pt", map_location="cpu", weights_only=False)
     assert teacher["payload_kind"] == "full"
-    restored_rate = float(teacher["optimizer_state_dict"]["param_groups"][0]["lr"])
+    assert teacher["scheduler_state_dict"] is None
+    start_rate = float(experiments.config.loader.load_yaml(common.paths.resolve_run_config_path(a0_dir))["optimizer"]["lr"])
     _assert_curated_series_are_produced(a0_dir, cuda=False)  # the CPU run of a real A0 checks the producers where no GPU is needed
 
-    first = experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("b",), max_steps=1)
-    b_dir = first["run_dir"]
+    real_groups = learning.training.loop.train_update_groups
+    calls = [0]
 
-    assert first["result"]["status"] == "budget_unmet"
-    assert first["result"]["global_step"] == 1
-    assert _saved_learning_rates(b_dir) == pytest.approx((restored_rate * _LR_SCALE,) * 2)
+    def interrupt_the_second_group(*args: Any, **kwargs: Any) -> Any:
+        # One batch per epoch: each call trains one group, and the first event publishes the last checkpoint.
+        calls[0] += 1
+        if calls[0] == 2:
+            message = "synthetic interruption after the first committed group"
+            raise KeyboardInterrupt(message)
+        return real_groups(*args, **kwargs)
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(learning.training.loop, "train_update_groups", interrupt_the_second_group)
+        with pytest.raises(experiments.run.MatchedStageInterrupted) as interrupted:
+            experiments.run.run_experiment(plan_path, device="cpu", output_root=output_root, train_stages=("b",))
+    b_dir = interrupted.value.run_dir
+    assert interrupted.value.resumable
+    _assert_evaluation_refused(b_dir, "interrupted")
+    # The first group runs at the stage start rate p = 0, whatever rate A0's cosine had reached at its best.
+    assert _saved_learning_rates(b_dir) == pytest.approx((start_rate * _LR_SCALE,) * 2, rel=1e-3)
+    b_last = torch.load(b_dir / "last_checkpoint.pt", map_location="cpu", weights_only=False)
+    assert b_last["global_step"] == 1
+    assert _adam_steps(b_last["optimizer_state_dict"]) == {step + 1 for step in _adam_steps(teacher["optimizer_state_dict"])}
     # B counts its own work from zero; A0's committed groups are not carried across the handoff.
     first_work = experiments.run.read_run_summary(b_dir)["training_work"]
     assert first_work["optimizer_steps"] == 1
@@ -493,28 +525,26 @@ def test_matched_b_scales_the_restored_learning_rate_once(transient_package: dic
         run_state.drift_training_code(drift, "transient_drying")
         before_drift = {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()}
         with pytest.raises(ValueError, match=r"A0 .*: training_transient_drying implementation changed"):
-            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir, max_steps=2)
+            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
         assert {path: path.read_bytes() for path in sorted(b_dir.rglob("*")) if path.is_file()} == before_drift
     with monkeypatch.context() as interruption:
         interruption.setattr(learning.training.loop, "train_loop", _interrupt_training)
         with pytest.raises(KeyboardInterrupt):
-            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir, max_steps=2)
+            experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
     _assert_evaluation_refused(b_dir, "interrupted")
-    resumed = experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir, max_steps=2)
+    resumed = experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
 
-    assert resumed["result"]["status"] == "budget_unmet"
-    assert resumed["result"]["global_step"] == 2
-    resumed_work = experiments.run.read_run_summary(b_dir)["training_work"]
-    assert resumed_work["optimizer_steps"] == 2
-    assert resumed_work["gradient_predictions"] > first_work["gradient_predictions"]
-    assert _saved_learning_rates(b_dir) == pytest.approx((restored_rate * _LR_SCALE,) * 2)
-    # One batch per epoch: the resumed second step ends at B's epoch cap, which validates and selects a best.
-    assert resumed["result"]["best_epoch"] == 2
-    best = torch.load(b_dir / "best_checkpoint.pt", map_location="cpu", weights_only=False)
-    assert best["payload_kind"] == "evaluation"
-    assert "adapter_state_dict" in best
-    assert "optimizer_state_dict" not in best
-    _assert_evaluation_refused(b_dir, "budget_unmet")
+    assert resumed["result"]["status"] == "completed"
+    summary = experiments.run.read_run_summary(b_dir)
+    assert summary["training_outcome"]["status"] == "completed"
+    assert summary["terminal_budget"]["train_seconds"] >= summary["terminal_budget"]["total"] == _INTERRUPTED_B_SECONDS
+    assert summary["training_work"]["optimizer_steps"] > first_work["optimizer_steps"]
+    # The resume continues B's own cosine from its saved start rate and never rescales it.
+    assert _saved_learning_rates(b_dir)[1] == pytest.approx(start_rate * _LR_SCALE)
+    experiments.run.validate_completed_run(b_dir)
+    # The finished B has spent its budget: it is never extended.
+    with pytest.raises(ValueError, match="never extended"):
+        experiments.run.run_experiment(b_dir / "config.yaml", resume=b_dir)
 
 
 def _resolved_direct_model_config(
@@ -525,16 +555,17 @@ def _resolved_direct_model_config(
 ) -> dict[str, Any]:
     """Derive and shrink a test-owned architecture-specific single-stage A0 config for one update."""
     raw = configs.transient_stage_a_only_config(model_kind=model_kind, seed=9)
-    raw["training"]["epochs"] = raw["training"]["stage_schedule"]["total_epochs"] = 1
+    raw["training"]["budget_epochs"] = raw["training"]["stage_schedule"]["budget_epochs"] = 1
     resolved = configs.resolve(raw)
     resolved["run"].update({"device": "cuda", "deterministic": False})
     resolved["data"].update(
         {
             "train_dataset": train_dataset,
             "material_ood_datasets": [],
-            "batch_size": 1,
+            "evaluation_batch_size": 1,
         }
     )
+    resolved["training"].update({"units_per_update": 2, "memory_batch": 1})
     resolved["scheduler"] = None
     resolved["tracking"]["wandb"]["mode"] = "disabled"
     if model_kind == "uno":
@@ -549,11 +580,6 @@ def _resolved_direct_model_config(
         )
     elif model_kind == "rno":
         resolved["temporal"]["sampling"] = {"mode": "trajectory", "rollout_length": 2}
-        resolved["training"].update(
-            {
-                "curriculum": {"lengths": [2], "milestone_fractions": [0.0]},
-            }
-        )
         resolved["model"]["params"].update({"n_modes": [8, 8], "hidden_channels": 4, "n_layers": 1})
     else:
         msg = f"Unsupported direct lifecycle model kind {model_kind!r}."
@@ -581,6 +607,8 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
         tensorizer=tensorizer,
         train_sampling=sampling,
         loader_settings=datasets.runtime.factory.LoaderSettings(batch_size=1, num_workers=0),
+        units_per_update=config["training"]["units_per_update"],
+        memory_batch=config["training"]["memory_batch"],
         model_sha256="a" * 64,
         storage_root=str(root),
     )
@@ -588,23 +616,33 @@ def _run_direct_cuda_update(config: dict[str, Any], *, root: Path) -> torch.nn.M
     try:
         adapter = transient_adapter.build_transient_training_adapter(
             config,
-            scaling=loaders.data_processor,
+            scaling=loaders.scaling,
             device=device,
-            curriculum_seed=9,
+            curriculum_seed=None,  # a teacher-forced A0 draws no rollout horizon
         )
-        raw_batch = next(iter(loaders.train))
-        batch = adapter.prepare_batch(raw_batch, device=device, training=True)
         model = learning.models.factory.build_model(config, device=device)
         loss = learning.losses.factory.build_training_loss(config, device=device)
         optimizer = AdamW(model.parameters(), lr=1.0e-3)
         before = [parameter.detach().clone() for parameter in model.parameters() if parameter.requires_grad]
-        step = next(adapter.training_steps(model, batch, loss))
-        optimizer.zero_grad(set_to_none=True)
-        step.loss.backward()
-        optimizer.step()
-        window = batch.rollout_length if adapter.spec.trajectory_window is None else adapter.spec.trajectory_window
-        assert torch.isfinite(step.loss).item()
-        assert step.processed_target_transitions == batch.batch_size * window
+        # The same epoch setup and update path the training loop runs; a 20-unit budget puts a validation point after every unit,
+        # so the stretch returns after its first update group.
+        learning.training.loop.train_unit_sampler(loaders.train).begin_epoch(0)
+        metrics = learning.training.loop.train_update_groups(
+            model,
+            loaders.train,
+            optimizer,
+            loss,
+            device,
+            adapter,
+            budget=learning.training.budget.StageBudget(unit="units", total=20),
+            adapter=adapter,
+        )
+        assert metrics["optimizer_steps"] == 1
+        # One group of at most k=2 units, split into memory microbatches of one.
+        assert 1 <= metrics["units"] <= 2
+        assert metrics["train/microbatches"] == metrics["units"]
+        assert metrics["gradient_predictions"] >= metrics["units"]
+        assert torch.isfinite(torch.tensor(metrics["train/loss_total"])).item()
         assert any(not torch.equal(previous, current.detach()) for previous, current in zip(before, model.parameters(), strict=False))
         return model
     finally:
@@ -661,7 +699,7 @@ def _assert_completed_inference_and_tracking_lifecycle(
 
     monkeypatch.setattr(experiments.tracking.importlib, "import_module", lambda _name: pytest.fail("disabled observer imported SDK"))
     disabled = experiments.tracking.initialize_wandb(config, run_dir=root / "disabled_tracking", ood_roles=())
-    disabled.log_epoch(1, {"train/loss_total": 1.0})
+    disabled.log_event(1, {"train/loss_total": 1.0, "budget/train_seconds": 1.0})
     assert not disabled.enabled
     assert not (root / "disabled_tracking").exists()
 
@@ -669,8 +707,9 @@ def _assert_completed_inference_and_tracking_lifecycle(
         def __init__(self) -> None:
             self.logged: list[tuple[dict[str, float | int], int]] = []
 
-        def log(self, values: dict[str, float | int], *, step: int) -> None:
-            self.logged.append((dict(values), step))
+        def log(self, values: dict[str, float | int]) -> None:
+            # History is logged without W&B's own step; the payload carries both axes.
+            self.logged.append((dict(values), int(values["global_step"])))
 
     definitions = experiments.tracking.automatic_history_metric_definitions(
         config["evaluation"]["metrics"],
@@ -679,11 +718,11 @@ def _assert_completed_inference_and_tracking_lifecycle(
         physics_monitor_enabled=False,
         cuda_enabled=True,
         task_id="transient_drying",
+        rollout_curriculum=True,  # map a self-fed run's curriculum series through the observer
     )
     fake_run: Any = FakeRun()
     observer = experiments.tracking.WandbSession(
         fake_run,
-        None,
         "normalized_drying_group_macro_rmse",
         "minimize",
         frozenset(),
@@ -691,13 +730,13 @@ def _assert_completed_inference_and_tracking_lifecycle(
         "fake",
         root,
         "fake",
-        "transient_drying",
-        {},
         history_metric_definitions=definitions,
     )
-    observer.log_epoch(1, {"train/loss_total": 1.25, "transient/curriculum_max_horizon": 4.0, "ignored": 9.0})
-    payload, epoch = fake_run.logged[0]
-    assert epoch == 1
+    observer.log_event(1, {"train/loss_total": 1.25, "budget/train_seconds": 2.0, "transient/curriculum_max_horizon": 4.0, "ignored": 9.0})
+    payload, step = fake_run.logged[0]
+    assert step == 1
+    assert payload["global_step"] == 1
+    assert payload["train_seconds"] == 2.0
     assert payload["Overview/train-loss_total"] == 1.25
     assert payload["Training/curriculum-horizon"] == 4.0
     assert "ignored" not in payload

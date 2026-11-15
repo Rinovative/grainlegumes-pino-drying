@@ -39,7 +39,7 @@ def write_lightweight_run_state(
     completed_epoch: int,
     include_best: bool = True,
 ) -> None:
-    """Publish only metadata and placeholder state needed by read-only admission inspection."""
+    """Publish only metadata and placeholder state needed by read-only admission inspection; the attempt history is a fresh run's."""
     run_dir.mkdir(parents=True)
     experiments.config.loader.save_yaml(config, common.paths.resolve_run_config_path(run_dir))
     common.serialization.atomic_write_json(
@@ -47,6 +47,8 @@ def write_lightweight_run_state(
         {
             "status": status,
             "completed_epoch": completed_epoch,
+            "runtime_sessions": [],
+            "duration_contract": experiments.run.RUN_DURATION_CONTRACT,
         },
     )
     common.paths.resolve_split_indices_path(run_dir).touch()

@@ -1,10 +1,10 @@
 """Protect transient Evaluation metrics, timing, lineage, and pipeline semantics.
 
 Responsibilities:
-  - Check masked macro metrics, target mass fractions, timing formulas, and matched lineage
+  - Check per-case horizon norms, per-case grain-water metrics, target mass fractions, timing formulas, and matched lineage
 
 Design principles:
-  - Matched evidence and unavailable pipeline terms remain explicit
+  - Matched evidence, unavailable states and unavailable pipeline terms remain explicit
 
 This module does NOT:
   - Publish sequence payloads or run solver comparisons
@@ -13,6 +13,7 @@ This module does NOT:
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -20,6 +21,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
+from src import domain, learning
 from src.analysis.artifacts import analysis_artifact_transient as artifact_generator
 from src.analysis.evaluation import evaluation_transient_artifact as transient_artifact
 from src.analysis.evaluation import evaluation_transient_comparison as comparison
@@ -28,61 +30,73 @@ from src.analysis.evaluation import evaluation_transient_rollout as rollout
 from src.analysis.evaluation import evaluation_transient_timing as timing
 from src.learning.inference import learning_inference_transient as inference
 
-
-def _states(*, offset: float = 0.0) -> np.ndarray:
-    values = np.zeros((2, 4, 1, 1), dtype=np.float64)
-    values[:, 0] = 300.0 + offset
-    values[:, 1] = 0.5 + offset
-    values[:, 2] = 2.0 + offset
-    values[:, 3] = 4.0 + offset
-    return values
+_GRID = (5, 5)
+_SPACING = (0.01, 0.02)
 
 
-def test_metrics_use_central_macro_float64_masks_and_granular_water() -> None:
-    """Use central Drying weights, sufficient statistics, masks, and physical water."""
-    reference = _states()
-    prediction = reference + np.asarray([1.0, 2.0, 3.0, 6.0], dtype=np.float64)[None, :, None, None]
-    mask = np.ones_like(reference, dtype=bool)
-    mask[1, :, :, :] = False
-    accumulator = transient_metrics.TransientMetricAccumulator(scope="cumulative")
+def _constant_states(values: list[list[float]]) -> np.ndarray:
+    """Return ``(states, 4, 5, 5)`` fields that are constant per state and field."""
+    array = np.asarray(values, dtype=np.float64)[:, :, None, None]
+    return np.broadcast_to(array, (*array.shape[:2], *_GRID)).copy()
+
+
+def _accumulate(prediction: np.ndarray, reference: np.ndarray, *, scope: str = "cumulative") -> transient_metrics.TransientMetricAccumulator:
+    accumulator = transient_metrics.TransientMetricAccumulator(scope=scope)
     accumulator.update(
-        normalized_prediction=prediction,
-        normalized_reference=reference,
         physical_prediction=prediction,
         physical_reference=reference,
         f_surf=np.asarray([[[0.25]]]),
-        rho_bu_dry=np.asarray([[10.0]]),
-        cell_weights=np.asarray([[1.0]]),
-        valid_mask=mask,
+        rho_bu_dry=np.full(_GRID, 10.0),
+        spacing=_SPACING,
     )
-    summary = accumulator.finalize()
+    return accumulator
+
+
+def test_horizon_norms_sum_case_energies_and_keep_temporarily_unavailable_states() -> None:
+    """
+    Sum one case's error and reference energies over its states before the relative norm.
+
+    The temperature reference changes between the states, so the horizon norm differs from the
+    mean of the per-state norms. The relative-humidity reference vanishes in the second state:
+    that state's norm is unavailable, yet its error stays in the horizon energies.
+    """
+    task = domain.tasks.registry.get_task("transient_drying")
+    floors = {field: task.reference_floor(field) for field in transient_artifact.STATE_ORDER}
+    reduction = learning.metrics.metrics
+    reference = _constant_states([[300.0, 0.5, 2.0, 4.0], [400.0, 0.0, 2.0, 4.0]])
+    prediction = reference + _constant_states([[1.0, 0.1, 3.0, 6.0], [3.0, 0.1, 3.0, 6.0]])
+    accumulator = _accumulate(prediction, reference)
+
+    horizon = reduction.relative_norms([accumulator.case_statistics("case", "material")], norm="l2", floors=floors)
+    per_state = transient_metrics.state_field_statistics(prediction, reference, spacing=_SPACING)
+    temperature, humidity = (transient_artifact.STATE_ORDER.index(field) for field in ("T", "phi"))
+    state_norms = [reduction.case_relative_norm(per_state[index, temperature], norm="l2", floor=floors["T"]) for index in range(2)]
+    assert horizon.by_field["T"] == pytest.approx(math.sqrt(10.0 / 250_000.0))
+    assert horizon.by_field["T"] != pytest.approx(np.mean(cast("list[float]", state_norms)))
+    assert reduction.case_relative_norm(per_state[1, humidity], norm="l2", floor=floors["phi"]) is None
+    assert horizon.by_field["phi"] == pytest.approx(math.sqrt(2.0 * 0.01 / 0.25))
+    assert horizon.unavailable["phi"] == 0
+
+
+def test_granular_water_and_bulk_moisture_of_one_case_merge_exactly_across_partitions() -> None:
+    """One case's grain-water and bulk-moisture errors; its persisted per-state partitions merge to the same statistics."""
+    reference = _constant_states([[300.0, 0.5, 2.0, 4.0], [400.0, 0.5, 2.0, 4.0]])
+    prediction = reference + _constant_states([[1.0, 0.1, 3.0, 6.0], [3.0, 0.1, 3.0, 6.0]])
+    accumulator = _accumulate(prediction, reference)
+    summary = transient_metrics.summarize_moisture([("m", accumulator.case_moisture())])
     assert summary.scope == "cumulative"
-    assert summary.normalized_drying_group_macro_rmse == pytest.approx(2.5)
     assert summary.physical_w_gr_rmse == pytest.approx(5.25)
     assert summary.bulk_dry_basis_rmse == pytest.approx(0.525)
     assert summary.bulk_wet_basis_rmse == pytest.approx((8.75 / 18.75) - (3.5 / 13.5))
-    assert (summary.bulk_moisture_valid_count, summary.bulk_moisture_unavailable_count) == (1, 1)
-    assert summary.valid_counts == {"T": 1, "phi": 1, "w_surf": 1, "w_int": 1}
+    assert (summary.bulk_moisture_valid_count, summary.bulk_moisture_unavailable_count) == (2, 0)
 
-    partitioned = transient_metrics.TransientMetricAccumulator(scope="cumulative")
-    for index in range(2):
-        partitioned.update(
-            normalized_prediction=prediction[index : index + 1],
-            normalized_reference=reference[index : index + 1],
-            physical_prediction=prediction[index : index + 1],
-            physical_reference=reference[index : index + 1],
-            f_surf=np.asarray([[[0.25]]]),
-            rho_bu_dry=np.asarray([[10.0]]),
-            cell_weights=np.asarray([[1.0]]),
-            valid_mask=np.ones_like(reference[index : index + 1], dtype=bool),
-        )
-    partitioned_summary = partitioned.finalize()
-    assert partitioned_summary.normalized_drying_group_macro_rmse == pytest.approx(summary.normalized_drying_group_macro_rmse)
-    assert partitioned_summary.bulk_dry_basis_rmse == pytest.approx(summary.bulk_dry_basis_rmse)
-    assert transient_metrics.trapezoidal_cell_weights(np.ones((2, 2), dtype=bool)).tolist() == [
-        [0.25, 0.25],
-        [0.25, 0.25],
-    ]
+    parts = [_accumulate(prediction[index : index + 1], reference[index : index + 1]).state_dict() for index in range(2)]
+    merged = transient_metrics.TransientMetricAccumulator.merged(parts)
+    np.testing.assert_allclose(merged.case_statistics("case", "m").sums, accumulator.case_statistics("case", "m").sums, rtol=1e-14)
+    assert merged.case_moisture() == accumulator.case_moisture()
+    negative = transient_metrics.summarize_moisture([("m", _accumulate(-prediction[:1], reference[:1], scope="endpoint").case_moisture())])
+    assert (negative.bulk_dry_basis_rmse, negative.bulk_moisture_valid_count, negative.bulk_moisture_unavailable_count) == (None, 0, 1)
+    assert transient_metrics.trapezoidal_cell_weights((2, 2)).tolist() == [[0.25, 0.25], [0.25, 0.25]]
 
 
 def test_target_fraction_uses_canonical_masked_trapezoidal_mass_weighting() -> None:
@@ -99,7 +113,6 @@ def test_target_fraction_uses_canonical_masked_trapezoidal_mass_weighting() -> N
         states,
         static=static,
         scalars=scalars,
-        mask=np.ones((3, 3), dtype=bool),
         target_wet_basis=0.25,
     )
     assert fraction.tolist() == pytest.approx([0.25])
@@ -145,6 +158,8 @@ def _case(case_id: str, *, omit: str | None = None) -> timing.TransientTimingCas
         "float32",
         "a" * 64,
         1,
+        "solver-node",
+        8,
         cold_timings={"drying_no_rollout_model_seconds": 1_000.0},
         unavailable_reasons=({"comsol_process_seconds": "persisted process timing unavailable"} if omit == "comsol_process_seconds" else {}),
     )
@@ -211,6 +226,8 @@ def test_timing_adapter_preserves_measured_boundaries_and_unavailable_pipeline()
             "scientific_solver_seconds": 315.0,
             "comsol_process_seconds": 338.74,
             "complete_execution_seconds": 370.12,
+            "solver_hostname": "solver-node",
+            "solver_requested_cores": 8,
             "component_timing_availability": {"generation_compute_end_to_end_seconds": "queue_wait_not_measured"},
         },
         pt_identity="a" * 64,
@@ -256,7 +273,6 @@ def test_prepared_rollout_wall_clock_excludes_case_and_request_preparation(monke
         static_conditioning=np.zeros((1, 1, 1)),
         boundary_conditioning=np.zeros((2, 1)),
         scalar_conditioning=np.zeros((2, 1)),
-        spatial_mask=np.ones((1, 1)),
         metadata={},
     )
 
@@ -314,7 +330,8 @@ def _arm(
         admitted_actual - admitted_planned,
         parent_experiment_sha256=None if name == "A0" else "p" * 64,
         receipt_sha256=None if name == "A0" else "r" * 64,
-        a0_handoff_sha256=None if name == "A0" else "h" * 64,
+        # A0 carries the digest of its own handoff manifest; B and A1 name it through their receipt.
+        a0_handoff_sha256="h" * 64,
     )
 
 
@@ -347,6 +364,74 @@ def test_matched_a1_b_lineage_uses_common_origin_and_receipt_backed_time() -> No
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, planned_post_handoff_compute=12.0, safe_boundary_overrun=1.0))
     with pytest.raises(ValueError, match="immutable lineage"):
         comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=replace(a1, parent_id="other"))
+    with pytest.raises(ValueError, match="completed or diverged"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(b, budget_complete=False), a1=a1)
+
+
+def _matched_pair(*, b_actual: float, b_planned: float, a1_actual: float) -> tuple[comparison.TrainingArmEvidence, ...]:
+    """Return A0 and the B and A1 arms of one receipt, B with its own measured seconds and A1 planned at them."""
+    shared = {"parent_experiment_sha256": "p" * 64, "clock_kind": "train_seconds", "receipt_sha256": "r" * 64, "a0_handoff_sha256": "h" * 64}
+    b = replace(_arm("B", "rollout", actual=b_actual, planned=b_planned), **shared)
+    a1 = replace(_arm("A1", "teacher_forced_matched_train_seconds", actual=a1_actual, planned=b_actual), **shared)
+    return _arm("A0", "stage_a"), b, a1
+
+
+def test_a_diverged_b_is_admitted_with_its_signed_shortfall_and_reported_by_its_status() -> None:
+    """B diverged at 30 % of 10 s: actual - planned is -7 s, admitted only for a divergence."""
+    a0, b, a1 = _matched_pair(b_actual=3.0, b_planned=10.0, a1_actual=3.1)
+    diverged = replace(b, budget_complete=False, training_status="diverged", budget_progress=0.3)
+
+    admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=diverged, a1=a1)
+
+    assert isinstance(admitted.b, comparison.TrainingArmEvidence)
+    assert admitted.b.training_status == "diverged"
+    assert admitted.b.safe_boundary_overrun == pytest.approx(-7.0)
+    with pytest.raises(ValueError, match="completed or diverged"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(diverged, training_status="completed"), a1=a1)
+
+
+def test_a_diverged_a0_is_the_common_handoff_and_reported_by_its_status() -> None:
+    """A0 diverged at 40 % of its budget with its best eligible checkpoint: it keeps zero post-handoff compute and its handoff."""
+    a0, b, a1 = _matched_pair(b_actual=10.2, b_planned=10.0, a1_actual=10.3)
+    diverged = replace(a0, budget_complete=False, training_status="diverged", budget_progress=0.4)
+
+    admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=diverged, b=b, a1=a1)
+
+    assert (admitted.a0.training_status, admitted.a0.budget_progress) == ("diverged", 0.4)
+    with pytest.raises(ValueError, match="common handoff"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=replace(diverged, training_status="completed"), b=b, a1=a1)
+
+
+def test_an_arm_without_an_eligible_checkpoint_enters_the_comparison_with_its_status_and_no_result() -> None:
+    """A B without an eligible checkpoint enters from the shared receipt; its result is unavailable, never a refusal."""
+    a0, _b, a1 = _matched_pair(b_actual=10.2, b_planned=10.0, a1_actual=10.3)
+    b = comparison.UnavailableArm(
+        arm="B", training_status="no_eligible_checkpoint", budget_progress=1.0, eligible_points=0, receipt_sha256="r" * 64, a0_handoff_sha256="h" * 64
+    )
+
+    admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=a1)
+
+    assert admitted.b == b
+    assert admitted.primary_comparison == "B_vs_A1"
+    with pytest.raises(ValueError, match="receipt"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(b, receipt_sha256="x" * 64), a1=a1)
+    with pytest.raises(ValueError, match="no eligible checkpoint"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=replace(b, training_status="completed"), a1=a1)
+
+
+def test_b_diverging_in_its_first_group_reports_both_statuses_without_results() -> None:
+    """B's receipt holds 0 s; A1 trained none of them and ended without an eligible checkpoint."""
+    a0 = _arm("A0", "stage_a")
+    shared = {"receipt_sha256": "r" * 64, "a0_handoff_sha256": "h" * 64}
+    b = comparison.UnavailableArm(arm="B", training_status="diverged", budget_progress=0.0, eligible_points=0, **shared)
+    a1 = comparison.UnavailableArm(arm="A1", training_status="no_eligible_checkpoint", budget_progress=1.0, eligible_points=0, **shared)
+
+    admitted = comparison.validate_matched_a1_b_lineage_comparison(a0=a0, b=b, a1=a1)
+
+    assert (admitted.b.training_status, admitted.a1.training_status) == ("diverged", "no_eligible_checkpoint")
+    # Two unavailable arms bind to the selected A0 by the handoff their shared receipt names, never to another A0.
+    with pytest.raises(ValueError, match="selected A0's handoff"):
+        comparison.validate_matched_a1_b_lineage_comparison(a0=replace(a0, a0_handoff_sha256="f" * 64), b=b, a1=a1)
 
 
 def test_pipeline_degradation_retains_truthful_absence() -> None:

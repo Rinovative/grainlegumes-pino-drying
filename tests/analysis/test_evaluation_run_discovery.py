@@ -24,7 +24,7 @@ import pytest
 import yaml
 from support.synthetic_task import synthetic_split_payload
 
-from src import common
+from src import analysis, common
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.analysis.evaluation import evaluation_run_discovery as discovery
 from src.analysis.evaluation import evaluation_selection as selection
@@ -36,7 +36,25 @@ from src.experiments import experiments_run_identity as identity
 def _metadata_config_admission(monkeypatch: pytest.MonkeyPatch) -> None:
     """Use compact saved metadata while retaining exact parent content checks."""
     monkeypatch.setattr(identity.config_loader, "validate_resolved_config", lambda config: config)
-    monkeypatch.setattr(identity.training_checkpoint, "resume_contract_digest", identity.resolved_config_digest)
+    monkeypatch.setattr(identity.training_checkpoint, "config_digest", identity.resolved_config_digest)
+
+
+@pytest.fixture
+def published(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record what each publication into a workspace panel shows: the prepared panel, or ``None`` for a cleared panel."""
+    results: list[object] = []
+    real = analysis.ui.viewers.render_view
+
+    def record(view: Any, plot_func: Any, **kwargs: Any) -> bool:
+        def recorded(*args: Any, **plot_kwargs: Any) -> Any:
+            result = plot_func(*args, **plot_kwargs)
+            results.append(result)
+            return result
+
+        return real(view, recorded, **kwargs)
+
+    monkeypatch.setattr(analysis.ui.viewers, "render_view", record)
+    return results
 
 
 def _write_run(
@@ -56,6 +74,8 @@ def _write_run(
     trial: str | None = None,
     seed: int = 17,
     split: bool = True,
+    physics: bool | None = False,
+    model_kind: str | None = "fno",
 ) -> Path:
     """Write one compact persisted leaf; its saved split holds the ID Dataset plus one additional OOD part unless ``split`` is false."""
     stage_id = comparison_arm if comparison_arm in {"a0", "b", "a1"} else "a0" if stage == "a" else "b" if stage == "b" else "single"
@@ -67,7 +87,9 @@ def _write_run(
         "model_label": "fno_m2x2_h4_l1",
         "seed": seed,
         "revision": None,
-        "budget_epochs": 3 if trial is not None else None,
+        "budget_epochs": 3,
+        "units_per_update": 2,
+        "schedule": "cosine",
         "stage": stage_id,
         "pair": f"pair-{(branch_id or 'b' * 16)[:4]}" if stage_id in {"b", "a1"} else None,
         "trial": trial,
@@ -81,15 +103,18 @@ def _write_run(
         "task": task,
         "run": {"name": name, "seed": seed, "layout": layout},
         "paths": {"output_root": str(root)},
-        "model": {
-            "kind": "fno",
-            "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1, "positional_embedding": None, "domain_padding": 0.1},
-        },
         "data": {
             "train_dataset": "dataset-id",
             "material_ood_datasets": [],  # The OOD roles come from the saved split, never from these ids.
         },
     }
+    if model_kind is not None:  # None leaves the model block out, as an incomplete saved config does.
+        config["model"] = {
+            "kind": model_kind,
+            "params": {"n_modes": [2, 2], "hidden_channels": 4, "n_layers": 1, "positional_embedding": None, "domain_padding": 0.1},
+        }
+    if physics is not None:  # None leaves the loss block out, as an incomplete saved config does.
+        config["loss"] = {"physics": {"enabled": physics}}
     if evaluation is not None:
         config["evaluation"] = evaluation
     if stage is not None or comparison_arm is not None:
@@ -109,7 +134,7 @@ def _write_run(
                 "effective_config_digest": "e" * 64,
                 "best_checkpoint_sha256": hashlib.sha256(b"best").hexdigest(),
                 "config_sha256": common.serialization.file_sha256(run_dir / "config.yaml"),
-                "checkpoint_identity": {"resume_contract_digest": identity.resolved_config_digest(config)},
+                "checkpoint_identity": {"effective_config_digest": identity.resolved_config_digest(config)},
                 "run_identity": {"resolved_config_sha256": identity.resolved_config_digest(config)},
             }
         ),
@@ -521,9 +546,9 @@ def test_scoped_partial_is_exactly_associated_and_single_case_gated(
     assert controller is not None
     assert calls[-1]["artifact_roots"] == {"id": scoped}
     assert calls[-1]["sections"] == ("sample_viewer",)
-    assert "ID · scoped partial (1 case)" in controller.status.value
-    assert "Generate full artifact coverage" in controller.status.value
-    assert "--one-case" not in controller.status.value
+    assert "ID · scoped partial (1 case)" in controller._details
+    assert "Generate full artifact coverage" in controller._details
+    assert "--one-case" not in controller._details
     prepared.close()
 
 
@@ -559,20 +584,22 @@ def test_workspace_discovers_once_and_renders_missing_artifacts_without_inferenc
     assert "Artifact roles: missing=2" in prepared.summary_text
     controller = prepared._controller
     assert controller is not None
-    controller.run.value = controller.run.value
+    controller.runs.select(controller.runs.selected())
     assert len(scans) == 1
-    assert controller.run.options
-    assert "ID · missing; Material OOD · missing" in controller.status.value
-    assert "slurm_ml.sh" in controller.status.value
-    assert "artifacts --run-dir" in controller.status.value
-    assert "--one-case" not in controller.status.value
+    assert controller.runs.boxes
+    assert "ID · missing; Material OOD · missing" in controller._details
+    assert "slurm_ml.sh" in controller._details
+    assert "artifacts --run-dir" in controller._details
+    assert "--one-case" not in controller._details
+    assert controller.view.status.level == "warning"
     prepared.close()
 
     compared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=experiments_root)
     assert len(scans) == 2
     comparison_controller = compared._controller
     assert comparison_controller is not None
-    assert "Select at least two runs" in comparison_controller.status.value
+    assert "Select at least two runs" in comparison_controller.view.status.text
+    assert "Select at least two runs" in comparison_controller._details
     compared.close()
 
 
@@ -615,6 +642,7 @@ def test_comparison_workspace_admits_exact_a0_a1_b_stage_semantics(
     class FakeWorkflow:
         def __init__(self) -> None:
             self.panel = widgets.Label("three-arm")
+            self.refused_roles: dict[str, str] = {}
             self.closed = False
 
         def close(self) -> None:
@@ -636,12 +664,13 @@ def test_comparison_workspace_admits_exact_a0_a1_b_stage_semantics(
     controller = prepared._controller
     assert controller is not None
 
-    controller.run_filter.value = tuple(str(path.resolve()) for path in run_dirs)
+    controller.runs.select([str(path.resolve()) for path in run_dirs])
 
     assert calls[-1] == tuple(path.resolve() for path in run_dirs)
     assert prepared.selection_state is not None
     assert prepared.selection_state.selection.run_dirs == calls[-1]
-    assert "incompatible stage" not in controller.status.value
+    assert "incompatible stage" not in controller._details
+    assert controller.view.status.level == "normal"
     prepared.close()
 
 
@@ -731,6 +760,7 @@ def test_two_matched_branches_share_one_independent_a0_without_parent_conflicts(
 def test_single_workspace_switches_transient_steady_transient_without_state_leakage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    published: list[object],
 ) -> None:
     """Rebuild task-owned workflows from run metadata within one live notebook."""
     experiments_root = tmp_path / "03_experiments"
@@ -792,13 +822,13 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     controller = prepared._controller
     assert controller is not None
 
-    controller.run.value = str(transient_run.resolve())
+    controller.runs.select([str(transient_run.resolve())])
     calls.clear()
     controller._render_single()
     transient_first = controller._workflow
     assert isinstance(transient_first, FakeWorkflow)
     assert calls == [(transient_run.resolve(), "transient_drying")]
-    assert controller.analysis.children == (transient_first.panel,)
+    assert published[-1] is transient_first.panel
     assert prepared.selection_state is not None
     assert prepared.selection_state.selection.task == "transient_drying"
     assert prepared.selection_state.selection.channels == ("T", "phi", "w_surf", "w_int")
@@ -806,23 +836,23 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     assert prepared.selection_state.selection.protocol == "autonomous_full"
     assert prepared.selection_state.selection.horizon == "full"
 
-    controller.run.value = str(steady_run.resolve())
+    controller.runs.select([str(steady_run.resolve())])
     steady = controller._workflow
     assert isinstance(steady, FakeWorkflow)
     assert transient_first.close_count == 1
-    assert controller.analysis.children == (steady.panel,)
+    assert published[-1] is steady.panel
     assert prepared.selection_state.selection.task == "steady_flow"
     assert prepared.selection_state.selection.channels == ("p", "u", "v")
     assert prepared.selection_state.selection.physical_time is None
     assert prepared.selection_state.selection.protocol is None
     assert prepared.selection_state.selection.horizon is None
 
-    controller.run.value = str(transient_run.resolve())
+    controller.runs.select([str(transient_run.resolve())])
     transient_second = controller._workflow
     assert isinstance(transient_second, FakeWorkflow)
     assert transient_second is not transient_first
     assert steady.close_count == 1
-    assert controller.analysis.children == (transient_second.panel,)
+    assert published[-1] is transient_second.panel
     assert prepared.selection_state.selection.task == "transient_drying"
     assert prepared.selection_state.selection.channels == ("T", "phi", "w_surf", "w_int")
     assert prepared.selection_state.selection.physical_time == 1.0
@@ -835,9 +865,136 @@ def test_single_workspace_switches_transient_steady_transient_without_state_leak
     assert transient_second.close_count == 1
 
 
+@pytest.mark.parametrize("older_load_fails", [False, True], ids=["older-load-finishes", "older-load-fails"])
+def test_a_selection_made_while_another_loads_is_the_one_that_stays(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, older_load_fails: bool) -> None:
+    """The older load can neither replace the newer panel and its summary nor, by failing, clear them."""
+    experiments_root = tmp_path / "03_experiments"
+    transient_run = _write_run(experiments_root, leaf="older", task="transient_drying", run_name="older-run", artifact=True)
+    steady_run = _write_run(experiments_root, leaf="newer", task="steady_flow", run_name="newer-run", artifact=True)
+    workflows: dict[str, Any] = {}
+    interrupt: list[bool] = []
+
+    class FakeWorkflow:
+        def __init__(self, task: str) -> None:
+            self.task = task
+            self.panel = widgets.Label(f"{task}-panel")
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    def prepare(_run_dir: Path, **kwargs: Any) -> FakeWorkflow:
+        task = kwargs["expected_task"]
+        kwargs["selection_state"].bind_capabilities(
+            selection.EvaluationViewCapabilities(task="steady_flow", channels=("p",), case_ids=("case",))
+            if task == "steady_flow"
+            else selection.EvaluationViewCapabilities(task="transient_drying", channels=("T",), case_ids=("case",), physical_times=(0.0,))
+        )
+        loaded = workflows.setdefault(task, FakeWorkflow(task))
+        if interrupt and task == "transient_drying":
+            interrupt.clear()
+            assert controller is not None
+            controller.runs.select([str(steady_run.resolve())])  # the user chooses another run while this one loads
+            if older_load_fails:
+                message = "the older load failed"
+                raise RuntimeError(message)
+        return loaded
+
+    monkeypatch.setattr(workspace.workflow, "prepare_single_model_evaluation_workspace", prepare)
+    prepared = workspace.prepare_single_model_evaluation_workspace(experiments_root=experiments_root)
+    controller = prepared._controller
+    assert controller is not None
+    workflows.clear()
+
+    interrupt.append(True)
+    controller.runs.select([str(transient_run.resolve())])
+
+    newer, older = workflows["steady_flow"], workflows["transient_drying"]
+    assert controller._workflow is newer
+    assert "newer-run" in controller.view.status.text
+    assert controller.view.status.level == "normal"
+    assert "older load failed" not in controller._details
+    assert older.close_count == (0 if older_load_fails else 1)
+    assert newer.close_count == 0
+    prepared.close()
+
+
+def test_a_workflow_prepared_for_a_single_run_load_that_then_fails_is_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inventory that raises after preparation closes the prepared session and the panel shows the failure."""
+    experiments_root = tmp_path / "03_experiments"
+    _write_run(experiments_root, leaf="late-failure", task="steady_flow", artifact=True)
+    prepared_workflows: list[Any] = []
+
+    class FakeSession:
+        def partitioned_case_inventory(self) -> tuple[()]:
+            message = "inventory failed"
+            raise RuntimeError(message)
+
+    class FakeWorkflow:
+        def __init__(self) -> None:
+            self.panel = widgets.Label("late-failure")
+            self.session = FakeSession()
+            self.close_count = 0
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    def prepare(_run_dir: Path, **_kwargs: Any) -> FakeWorkflow:
+        prepared_workflows.append(FakeWorkflow())
+        return prepared_workflows[-1]
+
+    monkeypatch.setattr(workspace.workflow, "prepare_single_model_evaluation_workspace", prepare)
+    prepared = workspace.prepare_single_model_evaluation_workspace(experiments_root=experiments_root)
+    controller = prepared._controller
+    assert controller is not None
+
+    (workflow,) = prepared_workflows
+    assert workflow.close_count == 1
+    assert controller._workflow is None
+    assert controller.view.failure.shown
+    assert controller.view.status.level == "error"
+    prepared.close()
+
+
+def test_a_workflow_prepared_for_a_comparison_load_that_then_fails_is_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reading the refused roles of a prepared comparison may fail; the prepared session is closed all the same."""
+    for name in ("first-experiment", "second-experiment"):
+        _write_run(tmp_path, leaf=name, family=name, artifact=True)
+    prepared_workflows: list[Any] = []
+
+    class FakeWorkflow:
+        def __init__(self) -> None:
+            self.panel = widgets.Label("comparison")
+            self.close_count = 0
+
+        @property
+        def refused_roles(self) -> dict[str, str]:
+            message = "refused roles unreadable"
+            raise RuntimeError(message)
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    def prepare(_run_dirs: tuple[Path, ...], **_kwargs: Any) -> FakeWorkflow:
+        prepared_workflows.append(FakeWorkflow())
+        return prepared_workflows[-1]
+
+    monkeypatch.setattr(workspace.workflow, "prepare_model_comparison_evaluation_workspace", prepare)
+    prepared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=tmp_path)
+    controller = prepared._controller
+    assert controller is not None
+
+    (workflow,) = prepared_workflows
+    assert workflow.close_count == 1
+    assert controller._workflow is None
+    assert controller.view.failure.shown
+    prepared.close()
+
+
 def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    published: list[object],
 ) -> None:
     """Dispatch compatible task pairs separately and clear mixed-task panels."""
     experiments_root = tmp_path / "03_experiments"
@@ -865,6 +1022,7 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
         def __init__(self, task: str) -> None:
             self.task = task
             self.panel = widgets.Label(f"{task}-comparison-panel")
+            self.refused_roles: dict[str, str] = {}
             self.close_count = 0
 
         def close(self) -> None:
@@ -905,21 +1063,23 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
     controller = prepared._controller
     assert controller is not None
 
-    steady_values = tuple(str(path.resolve()) for path in steady_runs)
-    controller.run_filter.value = steady_values
+    steady_values = [str(path.resolve()) for path in steady_runs]
+    controller.runs.select(steady_values)
     calls.clear()
     controller._render_comparison()
     steady = controller._workflow
     assert isinstance(steady, FakeWorkflow)
+    assert published[-1] is steady.panel
     assert calls == [(tuple(path.resolve() for path in steady_runs), "steady_flow")]
     assert prepared.selection_state is not None
     assert prepared.selection_state.selection.task == "steady_flow"
     assert prepared.selection_state.selection.channels == ("p", "u", "v")
     assert prepared.selection_state.selection.physical_time is None
 
-    controller.run_filter.value = tuple(str(path.resolve()) for path in transient_runs)
+    controller.runs.select([str(path.resolve()) for path in transient_runs])
     transient = controller._workflow
     assert isinstance(transient, FakeWorkflow)
+    assert published[-1] is transient.panel
     assert steady.close_count == 1
     assert prepared.selection_state.selection.task == "transient_drying"
     assert prepared.selection_state.selection.channels == ("T", "phi", "w_surf", "w_int")
@@ -929,14 +1089,12 @@ def test_comparison_workspace_switches_tasks_and_rejects_mixed_task_hybrids(
         "transient_drying",
     )
 
-    controller.run_filter.value = (
-        str(steady_runs[0].resolve()),
-        str(transient_runs[0].resolve()),
-    )
+    controller.runs.select([str(steady_runs[0].resolve()), str(transient_runs[0].resolve())])
     assert controller._workflow is None
     assert transient.close_count == 1
-    assert controller.analysis.children == ()
-    assert "incompatible task" in controller.status.value
+    assert published[-1] is None
+    assert controller.view.status.level == "warning"
+    assert "incompatible task" in controller._details
     assert tuple(task for _run_dirs, task in calls) == (
         "steady_flow",
         "transient_drying",
@@ -986,6 +1144,11 @@ def test_comparison_metadata_rejects_incompatible_scientific_contracts(tmp_path:
         assert expected_label in issues[0]
 
 
+def _widget_tree(widget: widgets.Widget) -> tuple[widgets.Widget, ...]:
+    """Return one widget tree in depth-first order."""
+    return (widget, *(item for child in getattr(widget, "children", ()) for item in _widget_tree(child)))
+
+
 def test_evaluation_notebooks_execute_without_hardcoded_run_lists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1020,19 +1183,22 @@ def test_evaluation_notebooks_execute_without_hardcoded_run_lists(
         exec(compile(source, relative, "exec"), namespace)  # noqa: S102
         prepared = namespace["workspace"]
         assert isinstance(prepared, workspace.PreparedEvaluationWorkspace)
+        # No output widget in the shell: VS Code's Jupyter extension stalls on output-capture updates (item 177).
+        assert prepared.panel is not None
+        assert not any(isinstance(item, widgets.Output) for item in _widget_tree(prepared.panel))
         controller = prepared._controller
         assert controller is not None
         if prepared.kind == "single":
-            options = tuple(value for _label, value in controller.run.options)
-            selected_value = controller.run.value
+            options = tuple(str(key) for key in controller.runs.boxes)
+            (selected_value,) = controller.runs.selected()
             assert isinstance(selected_value, (str, Path))
             selected_run = controller._run_by_path(selected_value)
             switched = next(value for value in options if controller._run_by_path(value).task != selected_run.task)
-            controller.run.value = switched
+            controller.runs.select([switched])
             assert prepared.selection_state is not None
             assert prepared.selection_state.selection.task == controller._run_by_path(switched).task
         else:
-            assert len(controller.run_filter.options) == 4
+            assert len(controller.runs.boxes) == 4
         prepared.close()
 
 
@@ -1118,7 +1284,7 @@ def test_comparison_labels_carry_seed(tmp_path: Path) -> None:
     shared = tuple(run for run in runs if shared_dir in run.run_dir.parents)
     assert len(shared) == 2
     assert {run.seed for run in shared} == {17, 18}
-    labels = workspace._run_labels(shared)
+    labels = workspace._model_labels(shared)
     assert all("seed " in label for label in labels)
     assert len(set(labels)) == 2
 
@@ -1161,6 +1327,42 @@ def test_unreadable_saved_split_remains_visible_and_disables_actions(tmp_path: P
     assert any("Saved split unavailable" in issue.reason for issue in catalog.issues)
 
 
+def test_model_family_comes_from_the_saved_config_and_a_missing_physics_block_keeps_the_run_listed(tmp_path: Path) -> None:
+    """Resolve the plain and physics-informed family; an unresolvable one stays visible as None with an issue."""
+    plain = _write_run(tmp_path, leaf="plain", artifact=True, physics=False)
+    informed = _write_run(tmp_path, leaf="informed", artifact=True, physics=True)
+    incomplete = _write_run(tmp_path, leaf="incomplete", artifact=True, physics=None)
+
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+
+    by_dir = {run.run_dir: run for run in catalog.runs}
+    assert (by_dir[plain.resolve()].model_family, by_dir[informed.resolve()].model_family) == ("fno", "pi-fno")
+    assert by_dir[plain.resolve()].action_enabled
+    unresolved = by_dir[incomplete.resolve()]
+    assert unresolved.model_family is None
+    assert unresolved.model_kind == "fno"
+    assert unresolved.metadata_issues[0].startswith("Model family unavailable: KeyError")
+    assert not unresolved.action_enabled
+    assert [issue.path for issue in catalog.issues] == [unresolved.run_dir]
+
+
+def test_a_missing_or_unregistered_model_block_keeps_the_run_listed_disabled_with_a_fallback_label(tmp_path: Path) -> None:
+    """Resolve neither family nor label from such a block, yet list the run with a metadata issue and its action disabled."""
+    missing = _write_run(tmp_path, leaf="no-model", artifact=True, model_kind=None)
+    unregistered = _write_run(tmp_path, leaf="odd-model", artifact=True, model_kind="bogus")
+
+    catalog = discovery.discover_evaluation_runs(tmp_path)
+
+    by_dir = {run.run_dir: run for run in catalog.runs}
+    for path, name in ((missing, "scientific-no-model"), (unregistered, "scientific-odd-model")):
+        run = by_dir[path.resolve()]
+        assert run.model_label == run.label == name
+        assert any(issue.startswith("Model label unavailable:") for issue in run.metadata_issues)
+        assert not run.action_enabled
+    assert by_dir[missing.resolve()].model_family is None
+    assert by_dir[unregistered.resolve()].model_family == "bogus"
+
+
 def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Open compatible cross-experiment models with distinct readable presentation labels."""
     paths = tuple(_write_run(tmp_path, leaf=name, family=name, artifact=True) for name in ("first-experiment", "second-experiment"))
@@ -1170,7 +1372,7 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
         labels = kwargs["labels"]
         assert len(set(labels)) == len(labels) == 2
         calls.append((run_dirs, labels))
-        return type("SavedComparison", (), {"panel": widgets.Label("saved comparison"), "close": lambda _self: None})()
+        return type("SavedComparison", (), {"panel": widgets.Label("saved comparison"), "refused_roles": {}, "close": lambda _self: None})()
 
     monkeypatch.setattr(workspace.workflow, "prepare_model_comparison_evaluation_workspace", prepare)
     prepared = workspace.prepare_model_comparison_evaluation_workspace(experiments_root=tmp_path)
@@ -1183,8 +1385,8 @@ def test_colliding_model_labels_are_distinct_at_actual_controller_handoff(tmp_pa
         assert "seed 17" in label
     controller = prepared._controller
     assert controller is not None
-    option_labels = tuple(label for label, _value in controller.run_filter.options)
-    assert len(set(option_labels)) == 2
+    listed_names = tuple(str(box.description) for box in controller.runs.boxes.values())
+    assert len(set(listed_names)) == len(listed_names) == 2
     prepared.close()
 
 

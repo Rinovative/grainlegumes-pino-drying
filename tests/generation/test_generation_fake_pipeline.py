@@ -226,7 +226,7 @@ def test_source_publication_admits_exact_success_and_excludes_failed_candidate(
         "test_replacement_0001/input_generation_manifest.json",
         "test_replacement_0001/resolved_generation_config.json",
     }
-    inputs_tree = {"inputs", "inputs/case.json", "inputs/fields.csv", "inputs/input_reference.json"}
+    inputs_tree = {"inputs", "inputs/case.json", "inputs/inputs.h5", "inputs/input_reference.json"}
     records = {"_record", "_record/reservation.json", "_record/decision.json"}
     bundle = "_record/attempts/run_0001"
     failed_runtime = ("execution_provenance.json", "solver_steps.csv", "stderr.log", "stdout.log", "timing.json")

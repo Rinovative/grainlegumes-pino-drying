@@ -8,7 +8,8 @@ Responsibilities:
 Design principles:
   - Statistics are aggregated per case from an explicit ordered prefix
   - Incremental caches extend monotonically as notebook case limits increase
-  - Dataset values remain on their stored scales and are labelled independently
+  - Dataset values show on their shared display scales (°C, %, water as wet-basis moisture with bulk case means) and are
+    labelled independently in the active label style
 
 This module does NOT:
   - Compute frequency-domain EDA or model-evaluation diagnostics
@@ -19,7 +20,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -33,21 +34,19 @@ from src.analysis.eda.plots import eda_plot_transient as transient_plots
 from src.analysis.presentation import analysis_display_grid as display_grid
 from src.analysis.presentation import analysis_field_labels as field_labels
 from src.analysis.presentation import analysis_histograms as histograms
+from src.analysis.presentation import analysis_moisture_display as moisture_display
 from src.analysis.presentation import analysis_visual_semantics as visual_semantics
 from src.analysis.ui import analysis_ui_plot_layout as plot_layout
 from src.datasets.contracts import dataset_contracts_transient as transient_contract
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Hashable, Sequence
 
-    import ipywidgets as widgets
     import pandas as pd
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
     from src.analysis.eda.eda_dataframe import PublishedTensorValue
-
-    CheckboxGroup = analysis.ui.components.CheckboxGroup
 
 _STATISTICS_EXCLUDED_PARAMETER_KEYS = frozenset(
     {
@@ -65,10 +64,30 @@ _SPATIAL_DIMENSIONS = 2
 
 @plot_layout.eda_typography()
 def plot_published_tensor(
-    value: PublishedTensorValue, *, x: np.ndarray, y: np.ndarray, display_spatial_stride: display_grid.DisplayStride = "auto"
+    value: PublishedTensorValue,
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    display_spatial_stride: display_grid.DisplayStride = "auto",
+    case_label: str | None = None,
+    transition: tuple[float, float] | None = None,
+    rho_bu_dry: np.ndarray | None = None,
 ) -> Figure:
-    """Show a stored tensor on its actual support and summarize its full grid."""
-    values = value.array
+    """
+    Show a stored tensor on its actual support and summarize its full grid; the title names the case and the transition in hours.
+
+    Every support shows its values on their display scale (°C, % RH); a water density becomes % w.b. with the case's dry
+    bulk density ``rho_bu_dry``, which it therefore requires.
+    """
+    unit = moisture_display.field_display_unit(value.name, value.unit)
+    label = moisture_display.display_name(value.name, mathtext=True)
+    if moisture_display.is_moisture_field(value.name):
+        if rho_bu_dry is None:
+            message = f"Showing {value.name} as wet-basis moisture requires the case's dry bulk density."
+            raise ValueError(message)
+        values = moisture_display.wet_basis_percent(value.array, rho_bu_dry)
+    else:
+        values = field_labels.display_values(value.array, value.unit, field=value.name)
     figure, axis = plt.subplots(figsize=(7.0, 4.8))
     if values.ndim == _SPATIAL_DIMENSIONS:
         scale = transient_plots.spatial_field_scale(value.name, value.unit, value.representation, values)
@@ -84,21 +103,23 @@ def plot_published_tensor(
         axis.set_xlabel("x [m]")
         axis.set_ylabel("y [m]")
         colorbar = figure.colorbar(image, ax=axis, **scale.colorbar_kwargs())
-        colorbar.set_label(f"[{field_labels.display_unit(value.unit)}]")
+        colorbar.set_label(f"{label} [{unit}]")
     elif values.ndim == 1 and value.support == "inlet boundary":
-        boundary_y = y[x == np.min(x)]
-        order = np.argsort(boundary_y)
-        axis.plot(boundary_y[order], values[order])
-        axis.set_xlabel("Boundary y [m]")
-        axis.set_ylabel(f"{value.name} [{value.unit}]")
+        inlet_x = x[y == np.min(y)]
+        order = np.argsort(inlet_x)
+        axis.plot(inlet_x[order], values[order])
+        axis.set_xlabel("Inlet x [m]")
+        axis.set_ylabel(f"{label} [{unit}]")
     elif values.ndim == 0:
         axis.set_axis_off()
-        axis.text(0.5, 0.5, f"{float(values):g} [{value.unit}]\n{value.support}", ha="center", va="center", transform=axis.transAxes)
+        axis.text(0.5, 0.5, f"{label} = {float(values):g} [{unit}]\n{value.support}", ha="center", va="center", transform=axis.transAxes)
     else:
         plt.close(figure)
         message = f"Unsupported published tensor support for {value.name}: {values.shape}."
         raise ValueError(message)
-    axis.set_title(f"{value.group}: {value.name}")
+    context = " · ".join(part for part in (case_label, None if transition is None else f"{transition[0]:g} h → {transition[1]:g} h") if part)
+    heading = f"{value.group}: {label}"
+    axis.set_title(f"{context}\n{heading}" if context else heading)
     figure.text(0.02, 0.02, f"{value.representation}; full support min={float(np.min(values)):g}, max={float(np.max(values)):g}")
     return figure
 
@@ -305,33 +326,6 @@ def _scalar_material_parameter_keys(keys: Sequence[str]) -> list[str]:
     """Return available schema-declared material scalars in contract order."""
     available = set(keys)
     return [field.name for field in _SCALAR_MATERIAL_FIELDS if field.name in available]
-
-
-def _selected_datasets(dataset_selector: CheckboxGroup) -> list[str]:
-    """
-    Get list of selected dataset names from the dataset selector widget.
-
-    Parameters
-    ----------
-    dataset_selector : CheckboxGroup
-        Dataset selector widget.
-
-    Returns
-    -------
-    list[str]
-        List of selected dataset names.
-
-    Raises
-    ------
-    ValueError
-        If no dataset is selected.
-
-    """
-    active = [n for n, cb in dataset_selector.boxes.items() if cb.value]
-    if not active:
-        msg = "Select at least one dataset."
-        raise ValueError(msg)
-    return active
 
 
 def _clip_for_plot(vals: np.ndarray, *, q_low: float = 1.0, q_high: float = 99.0) -> np.ndarray:
@@ -582,11 +576,12 @@ def _hist_grid(
 def plot_meta_statistics(
     *,
     datasets: dict[str, pd.DataFrame],
-    allow_dataset_selection: bool = True,
+    resume_cases: int | None = None,
+    host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
-) -> widgets.VBox:
+) -> analysis.ui.panel.ViewPanel:
     """
     Build sampled generated-case parameter distributions.
 
@@ -595,8 +590,10 @@ def plot_meta_statistics(
     datasets : dict[str, pandas.DataFrame]
         Labelled EDA frames whose authoritative case metadata contains sampled
         parameter leaves. Frame order defines dataset display order.
-    allow_dataset_selection : bool, optional
-        Show the maintained dataset-checkbox group inside this viewer.
+    resume_cases : int | None, optional
+        Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
+    host : ViewPanel | None, optional
+        View whose render builds this viewer; the viewer publishes only while that render is current and the host is shown.
     export_state : dict[str, Any] | None, optional
         Explicit panel-local current-figure state.
     export_plot_name, export_title : str | None, optional
@@ -604,14 +601,14 @@ def plot_meta_statistics(
 
     Returns
     -------
-    ipywidgets.VBox
-        Case-count controls, dataset checkboxes, and incrementally cached
-        histograms for the selected dataset set.
+    ViewPanel
+        Case-count control and incrementally cached histograms for the given
+        dataset set.
 
     Raises
     ------
     ValueError
-        If no dataset is available or the user disables every dataset.
+        If no dataset is available.
 
     Notes
     -----
@@ -679,6 +676,7 @@ def plot_meta_statistics(
                 key: field_labels.display_values(
                     [value for value in cache[name]["cols"].get(key, []) if isinstance(value, (int, float, np.floating))],
                     units_by_column.get(key, "1"),
+                    field=key,
                 )
                 for key in keys
             }
@@ -694,12 +692,13 @@ def plot_meta_statistics(
             row_spacing=0.425,
         )
 
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
+    return analysis.ui.viewers.case_count_view(
+        _plot,
+        datasets=cast("Mapping[Hashable, pd.DataFrame]", datasets),
         start_cases=100,
+        resume_cases=resume_cases,
+        host=host,
         step_size=50,
-        allow_dataset_selection=allow_dataset_selection,
         export_state=export_state,
         export_plot_name=export_plot_name,
         export_title=export_title,
@@ -714,11 +713,12 @@ def plot_meta_statistics(
 def plot_meta_parameters(
     *,
     datasets: dict[str, pd.DataFrame],
-    allow_dataset_selection: bool = True,
+    resume_cases: int | None = None,
+    host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
-) -> widgets.VBox:
+) -> analysis.ui.panel.ViewPanel:
     """
     Build schema-declared scalar material-conditioning distributions.
 
@@ -727,8 +727,10 @@ def plot_meta_parameters(
     datasets : dict[str, pandas.DataFrame]
         Labelled transient EDA frames whose ``scalar_conditioning`` mappings
         contain schema-declared case-global material inputs.
-    allow_dataset_selection : bool, optional
-        Show the maintained dataset-checkbox group inside this viewer.
+    resume_cases : int | None, optional
+        Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
+    host : ViewPanel | None, optional
+        View whose render builds this viewer; the viewer publishes only while that render is current and the host is shown.
     export_state : dict[str, Any] | None, optional
         Explicit panel-local current-figure state.
     export_plot_name, export_title : str | None, optional
@@ -736,14 +738,14 @@ def plot_meta_parameters(
 
     Returns
     -------
-    ipywidgets.VBox
-        Case-count controls, dataset checkboxes, and material-scalar histograms
-        on display units derived from authoritative stored units.
+    ViewPanel
+        Case-count control and material-scalar histograms on display units
+        derived from authoritative stored units.
 
     Raises
     ------
     ValueError
-        If no dataset is available or the user disables every dataset.
+        If no dataset is available.
 
     Notes
     -----
@@ -798,6 +800,7 @@ def plot_meta_parameters(
                 key: field_labels.display_values(
                     [value for value in cache[name]["cols"].get(key, []) if isinstance(value, (int, float, np.floating))],
                     _SCALAR_MATERIAL_UNITS[key],
+                    field=key,
                 )
                 for key in keys
             }
@@ -813,12 +816,13 @@ def plot_meta_parameters(
             row_spacing=0.50,
         )
 
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
+    return analysis.ui.viewers.case_count_view(
+        _plot,
+        datasets=cast("Mapping[Hashable, pd.DataFrame]", datasets),
         start_cases=100,
+        resume_cases=resume_cases,
+        host=host,
         step_size=50,
-        allow_dataset_selection=allow_dataset_selection,
         export_state=export_state,
         export_plot_name=export_plot_name,
         export_title=export_title,
@@ -833,11 +837,12 @@ def plot_meta_parameters(
 def plot_field_value_distributions(
     *,
     datasets: dict[str, pd.DataFrame],
-    allow_dataset_selection: bool = True,
+    resume_cases: int | None = None,
+    host: analysis.ui.panel.ViewPanel | None = None,
     export_state: dict[str, Any] | None = None,
     export_plot_name: str | None = None,
     export_title: str | None = None,
-) -> widgets.VBox:
+) -> analysis.ui.panel.ViewPanel:
     """
     Build per-field distributions of case minima, means, and maxima.
 
@@ -846,8 +851,10 @@ def plot_field_value_distributions(
     datasets : dict[str, pandas.DataFrame]
         Non-empty labelled EDA frames. Every column except ``meta``, ``x``, and
         ``y`` in the first frame is treated as a comparable field array.
-    allow_dataset_selection : bool, optional
-        Show the maintained dataset-checkbox group inside this viewer.
+    resume_cases : int | None, optional
+        Case count a former viewer of the same datasets showed; it is kept up to the largest dataset.
+    host : ViewPanel | None, optional
+        View whose render builds this viewer; the viewer publishes only while that render is current and the host is shown.
     export_state : dict[str, Any] | None, optional
         Explicit panel-local current-figure state.
     export_plot_name, export_title : str | None, optional
@@ -855,14 +862,14 @@ def plot_field_value_distributions(
 
     Returns
     -------
-    ipywidgets.VBox
-        Case-count controls, dataset checkboxes, and a field-by-statistic
-        histogram grid backed by monotonic ordered-prefix caches.
+    ViewPanel
+        Case-count control and a field-by-statistic histogram grid backed by
+        monotonic ordered-prefix caches.
 
     Raises
     ------
     ValueError
-        If datasets are empty or no dataset remains selected.
+        If datasets are empty.
 
     Notes
     -----
@@ -911,15 +918,12 @@ def plot_field_value_distributions(
 
             for _, row in df.iloc[entry["loaded"] : max_cases].iterrows():
                 for field in entry["data"]:
-                    array = capabilities.field_display_values(
-                        df,
-                        field,
-                        capabilities.field_values(df, row, field),
-                    )
+                    raw = capabilities.field_values(df, row, field)
+                    array = capabilities.field_display_values(df, row, field, raw)
                     if array.size == 0:
                         continue
                     entry["data"][field]["min"].append(float(np.nanmin(array)))
-                    entry["data"][field]["mean"].append(float(np.nanmean(array)))
+                    entry["data"][field]["mean"].append(capabilities.field_display_mean(df, row, field, raw))
                     entry["data"][field]["max"].append(float(np.nanmax(array)))
 
             entry["loaded"] = max_cases
@@ -1007,12 +1011,13 @@ def plot_field_value_distributions(
 
         return fig
 
-    return analysis.ui.viewers.make_casecount_viewer(
-        plot_func=_plot,
-        datasets=datasets,
+    return analysis.ui.viewers.case_count_view(
+        _plot,
+        datasets=cast("Mapping[Hashable, pd.DataFrame]", datasets),
         start_cases=100,
+        resume_cases=resume_cases,
+        host=host,
         step_size=50,
-        allow_dataset_selection=allow_dataset_selection,
         export_state=export_state,
         export_plot_name=export_plot_name,
         export_title=export_title,

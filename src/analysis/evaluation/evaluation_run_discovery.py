@@ -6,11 +6,14 @@ Responsibilities:
   - Inspect checkpoint and analysis-artifact availability without mutation, taking the recorded best digest without opening checkpoints
   - Admit available artifacts through exact run, Dataset, and payload evidence
   - Return deterministic catalog evidence and bounded per-candidate issues
+  - Resolve each run's model family from its saved config, or record an issue and keep the run listed without one
+  - Read one completed stage's work quantities (time, runtime, work, units, budget) from its summary
 
 Design principles:
   - Persisted config, summary, saved split, and parent records remain authoritative; current Dataset manifests are never consulted
   - Discovery never contacts tracking services or infers scientific identity
   - One malformed candidate cannot prevent inspection of unrelated runs
+  - A work quantity the summary does not record is ``None``, never zero
 
 This module does NOT:
   - Load models, source datasets, numerical arrays, widgets, plots, or notebooks
@@ -23,17 +26,19 @@ from __future__ import annotations
 import json
 import shlex
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 import yaml
 
 from src import common, datasets
 from src.analysis.artifacts import analysis_artifact_contracts as artifact_contracts
 from src.experiments import experiments_run_identity as run_identity
+from src.experiments.config import experiments_config_naming as config_naming
 from src.learning.models import naming
+from src.learning.training import learning_training_budget as stage_budget
 
 from . import evaluation_transient_artifact as transient_artifact
 
@@ -41,6 +46,8 @@ ArtifactState = Literal["ready", "generating", "scoped_partial", "missing", "inv
 RunAvailability = Literal["available", "unavailable"]
 
 _SHA256_HEX_LENGTH = 64
+# The text of a work quantity a run did not record, also inside a value joined over its attempts.
+UNAVAILABLE: Final = "unavailable"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +92,7 @@ class EvaluationRunDiscovery:
     run_identity_sha256: str | None
     model_label: str
     model_kind: str | None
+    model_family: str | None  # Network and physics-loss family (fno, uno, rno, pi-fno, pi-uno); None when the saved config does not resolve it.
     architecture: tuple[tuple[str, str], ...]
     seed: int | None
     stage: str | None
@@ -495,6 +503,16 @@ def _run_from_leaf(
                 ood_dataset_ids[ood_role] = tuple(part.dataset_id for part in split.ood_parts(ood_role))
                 assignments[ood_role] = split.evaluation_assignments[ood_role]
                 ood_names[ood_role] = str(split.ood_name(ood_role))
+    model_family: str | None = None
+    try:
+        model_family = config_naming.model_family(config)
+    except (KeyError, TypeError) as error:  # The run stays listed without an architecture group; only its actions are withheld.
+        metadata_issues = (*metadata_issues, f"Model family unavailable: {type(error).__name__}: {error}")
+    model_label = run_name  # The run name labels a run whose model block does not resolve.
+    try:
+        model_label = _model_label(config)
+    except (KeyError, TypeError, ValueError) as error:
+        metadata_issues = (*metadata_issues, f"Model label unavailable: {type(error).__name__}: {error}")
     training_mapping = _optional_mapping(config.get("training"))
     model_mapping = _optional_mapping(config.get("model"))
     parameter_mapping = _optional_mapping(model_mapping.get("params"))
@@ -547,8 +565,9 @@ def _run_from_leaf(
         task=task,
         run_name=run_name,
         run_identity_sha256=run_digest,
-        model_label=_model_label(config),
+        model_label=model_label,
         model_kind=_text(model_mapping.get("kind")),
+        model_family=model_family,
         architecture=tuple(sorted((str(key), str(value)) for key, value in parameter_mapping.items())),
         seed=run.get("seed") if isinstance(run.get("seed"), int) and not isinstance(run.get("seed"), bool) else None,
         stage=stage,
@@ -565,7 +584,7 @@ def _run_from_leaf(
         parent_identity_sha256=None,
         parent_label=None,
         identity_format="independent",
-        label=_model_label(config),
+        label=model_label,
         availability="available" if action_enabled else "unavailable",
         evaluable=evaluable,
         action_enabled=action_enabled,
@@ -703,3 +722,93 @@ def discover_evaluation_runs(experiments_root: Path | str) -> EvaluationRunCatal
         dict(Counter(record.parent_identity_sha256 or _independent_group_identity(record) for record in runs)),
         dict(artifact_counts),
     )
+
+
+def _distinct(values: Iterable[object]) -> str | None:
+    """Join the distinct values a run's attempts recorded, in order, or ``None`` when no attempt recorded one."""
+    return "; ".join(dict.fromkeys(str(value) for value in values if value is not None)) or None
+
+
+def _attempt_evidence(sessions: Iterable[Mapping[str, Any]], read: Callable[[Mapping[str, Any]], object]) -> str | None:
+    """
+    Join one runtime fact over the attempts that computed optimisation seconds or may have (no end entry).
+
+    An attempt that computed none is skipped. A counted attempt that did not record the fact
+    contributes ``unavailable``, so another attempt's value never reads as the run's complete evidence.
+    """
+    counted = (session for session in sessions if _optional_mapping(session.get("attempt")).get("train_seconds") != 0.0)
+    return _distinct(UNAVAILABLE if (value := read(session)) is None else value for session in counted)
+
+
+def _precision_text(precision: object) -> str | None:
+    """Describe one attempt's recorded precision, or ``None`` when it ended before its model existed."""
+    if not isinstance(precision, Mapping):
+        return None
+    flags = "/".join("on" if precision[f"tf32_{kind}"] else "off" for kind in ("matmul", "cudnn"))
+    return f"{'+'.join(precision['parameter_dtypes'])}, autocast {precision['autocast_dtype'] or 'off'}, TF32 matmul/cuDNN {flags}"
+
+
+def stage_work_row(summary: Mapping[str, Any], *, inference_seconds_per_case: float | None = None) -> dict[str, Any]:
+    """
+    Return one finished training stage's end status and work quantities from its persisted summary.
+
+    Parameters
+    ----------
+    summary : Mapping[str, Any]
+        ``summary.json`` of one finished run, which is one stage (steady, A0, B or A1).
+    inference_seconds_per_case : float | None, optional
+        Mean inference seconds per case of the run's evaluation artifact, when it has a timing report.
+
+    Returns
+    -------
+    dict[str, Any]
+        End status (the training outcome's), optimisation, total and attempted seconds with their coverage, device, driver, CUDA
+        build, precision, trainable parameters, optimizer steps, supervised and forward transitions,
+        units and cases, k and memory batch, budget, overrun and inference time. A value the summary
+        does not record is ``None``; device, driver, CUDA build and precision join the attempts that
+        computed optimisation seconds, each without its value as ``unavailable``.
+
+    Notes
+    -----
+    A steady unit is one case whose single forward pass is its supervised prediction, so its forward
+    transitions are its supervised ones; a transient stage counts them in its terminal controller.
+
+    """
+    sessions = [session for session in summary.get("runtime_sessions", []) if isinstance(session, Mapping)]
+    work = _optional_mapping(summary.get("training_work"))
+    units = _optional_mapping(summary.get("training_units"))
+    controller = _optional_mapping(summary.get("terminal_controller"))
+    raw_budget = summary.get("terminal_budget")
+    budget = None if raw_budget is None else stage_budget.StageBudget(**stage_budget.validate_state(raw_budget))
+    steady = summary.get("task") == "steady_flow"
+    return {
+        "run_name": summary.get("run_name"),
+        "stage": "steady" if steady else controller.get("arm"),
+        # The training outcome is the one persisted end: completed, diverged or no_eligible_checkpoint.
+        "status": _optional_mapping(summary.get("training_outcome")).get("status"),
+        "model_kind": summary.get("model_kind"),
+        "trainable_parameters": _optional_mapping(summary.get("model_parameter_counts")).get("trainable"),
+        "optimisation_seconds": None if budget is None else budget.train_seconds,
+        "total_seconds": summary.get("elapsed_seconds"),
+        "attempted_seconds": summary.get("attempted_train_seconds"),
+        "time_coverage": summary.get("duration_coverage"),
+        "device": _attempt_evidence(sessions, lambda session: session.get("cuda_device_name") or session.get("device_type")),
+        "driver": _attempt_evidence(sessions, lambda session: session.get("cuda_driver_version")),
+        "cuda_build": _attempt_evidence(sessions, lambda session: session.get("cuda_build_version")),
+        "precision": _attempt_evidence(sessions, lambda session: _precision_text(session.get("precision"))),
+        "optimizer_steps": work.get("optimizer_steps"),
+        "supervised_transitions": work.get("gradient_predictions"),
+        "forward_transitions": work.get("gradient_predictions") if steady else controller.get("forward_transitions"),
+        "unit_kind": units.get("unit_kind"),
+        "seen_units": None if budget is None else budget.units,
+        "train_units": units.get("train_units"),
+        "full_set_units": units.get("full_set_units"),
+        "seen_cases": units.get("seen_cases"),
+        "train_cases": units.get("train_cases"),
+        "units_per_update": units.get("units_per_update"),
+        "memory_batch": _distinct(session.get("memory_batch") for session in sessions),
+        "budget": None if budget is None else budget.total,
+        "budget_unit": None if budget is None else budget.unit,
+        "overrun": None if budget is None else budget.overrun,
+        "inference_seconds_per_case": inference_seconds_per_case,
+    }

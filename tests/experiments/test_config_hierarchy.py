@@ -53,17 +53,17 @@ def _authored_path(root: Path, full: dict[str, Any], authored: dict[str, Any]) -
 
 
 def _split_request(root: Path) -> tuple[dict[str, Any], dict[str, Any], Path]:
-    """Write all but model and rate as the task base (with a batch size the file overrides); return the request, the file's mapping and path."""
+    """Write all but model and rate as the task base (with a units-per-update the file overrides); return the request, the file's mapping and path."""
     full = configs.direct_config()
     shared = {key: value for key, value in full.items() if key not in {"task", "model"}}
     shared["optimizer"] = {key: value for key, value in full["optimizer"].items() if key != "lr"}
-    shared["data"] = {**full["data"], "batch_size": 99}
+    shared["training"] = {**full["training"], "units_per_update": 99}
     configs.write_yaml(root / "configs/03_learning/steady_flow/base.yaml", shared)
     authored = {
         "task": "steady_flow",
         "model": full["model"],
         "optimizer": {"lr": full["optimizer"]["lr"]},
-        "data": {"batch_size": full["data"]["batch_size"]},
+        "training": {"units_per_update": full["training"]["units_per_update"]},
     }
     return full, authored, _authored_path(root, full, {key: value for key, value in authored.items() if key != "task"})
 

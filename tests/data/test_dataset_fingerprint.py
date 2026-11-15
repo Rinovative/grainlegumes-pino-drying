@@ -1,7 +1,7 @@
 """Protect deterministic, content-bound dataset and saved-membership identity.
 
 Responsibilities:
-  - Check content fingerprints, ordered membership, saved splits, material-OOD parts, normalizer state, and partial batches
+  - Check content fingerprints, ordered membership, saved splits, material-OOD parts, the grid stride of the loader, and partial batches
 
 Design principles:
   - Operational provenance cannot replace scientific content identity
@@ -231,7 +231,9 @@ def _publish(root: Path, payload: dict[str, Any]) -> Path:
     return save_steady_package(root / "02_datasets", payload)
 
 
-def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additional: tuple[str, ...], **kwargs: Any) -> tuple[Any, ...]:
+def _loaders(
+    root: Path, task: domain.tasks.spec.TaskSpec, train: str, additional: tuple[str, ...], *, units_per_update: int = 2, **kwargs: Any
+) -> tuple[Any, ...]:
     """Build steady loaders from published Dataset partitions."""
     return datasets.runtime.training.create_dataloaders(
         train_dataset_id=train,
@@ -240,6 +242,9 @@ def _loaders(root: Path, task: domain.tasks.spec.TaskSpec, train: str, additiona
         model_sha256="a" * 64,
         storage_root=root,
         train_subset=None,
+        units_per_update=units_per_update,
+        memory_batch=units_per_update,
+        evaluation_batch_size=2,
         num_workers=0,
         pin_memory=False,
         persistent_workers=False,
@@ -256,12 +261,11 @@ def test_two_material_ood_datasets_keep_their_own_identity_membership_and_assign
     _publish(tmp_path, training_dataset_payload_factory("combined_train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("chickpea_ood", material_family="chickpea", material_role="ood"))
     _publish(tmp_path, training_dataset_payload_factory("family_ood", material_family="kidney_bean", material_role="ood"))
-    _train_loader, loaders, _processor, split_info, _scaling = _loaders(
+    _train_loader, loaders, _scaling, split_info, _artifact = _loaders(
         tmp_path,
         steady_task,
         "combined_train",
         ("chickpea_ood", "family_ood"),
-        batch_size=2,
     )
 
     split = datasets.preprocessing.splits.admit_split(split_info)
@@ -289,7 +293,7 @@ def test_family_holdout_must_not_reuse_a_training_material(
     _publish(tmp_path, training_dataset_payload_factory("holdout_train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("same_family_ood", material_role="ood"))
     with pytest.raises(ValueError, match="reuses a training material"):
-        _loaders(tmp_path, steady_task, "holdout_train", ("same_family_ood",), batch_size=2)
+        _loaders(tmp_path, steady_task, "holdout_train", ("same_family_ood",))
 
 
 def test_steady_training_requires_a_dataset_partition(
@@ -300,7 +304,7 @@ def test_steady_training_requires_a_dataset_partition(
     """Refuse a role-neutral steady Dataset instead of drawing a run-seeded split."""
     _publish(tmp_path, training_dataset_payload_factory("unpartitioned_train"))
     with pytest.raises(ValueError, match="no fixed case partition"):
-        _loaders(tmp_path, steady_task, "unpartitioned_train", (), batch_size=2)
+        _loaders(tmp_path, steady_task, "unpartitioned_train", ())
 
 
 def test_saved_split_rejects_replaced_same_name_count_dataset(
@@ -316,7 +320,7 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     """
     train_path = _publish(tmp_path, training_dataset_payload_factory("train", material_role="id"))
     _publish(tmp_path, training_dataset_payload_factory("ood", material_family="chickpea", material_role="ood"))
-    *_, split_info, _scaling = _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1)
+    *_, split_info, _artifact = _loaders(tmp_path, steady_task, "train", ("ood",))
     assert split_info["task_contract_digest"] == steady_task.contract_digest
     stale_header = copy.deepcopy(split_info)
     stale_header["task_contract_digest"] = "8cdaf4de22d945e08783f118d5fa8374e37521f91b20b12c913230ba015ca91a"
@@ -331,95 +335,38 @@ def test_saved_split_rejects_replaced_same_name_count_dataset(
     train_path.unlink()
     save_steady_package(tmp_path / "02_datasets", replaced)
     with pytest.raises(ValueError, match="Saved split does not match the current Dataset manifests"):
-        _loaders(tmp_path, steady_task, "train", ("ood",), batch_size=1, split_indices=split_info)
+        _loaders(tmp_path, steady_task, "train", ("ood",), split_indices=split_info)
 
 
-def _valid_normalizer_state() -> dict[str, torch.Tensor]:
-    """Return one strict current 2D saved-normalizer state."""
-    return {
-        "in_normalizer.mean": torch.zeros(1, 2, 1, 1),
-        "in_normalizer.std": torch.ones(1, 2, 1, 1),
-        "out_normalizer.mean": torch.zeros(1, 3, 1, 1),
-        "out_normalizer.std": torch.ones(1, 3, 1, 1),
-    }
-
-
-@pytest.mark.parametrize(
-    ("key", "replacement", "error_type", "match"),
-    [
-        ("out_normalizer.std", -torch.ones(1, 3, 1, 1), ValueError, "non-negative"),
-        ("out_normalizer.mean", torch.full((1, 3, 1, 1), float("inf")), ValueError, "non-finite"),
-        ("in_normalizer.mean", torch.zeros(1, 2, 1, dtype=torch.complex64), TypeError, "real floating-point"),
-        ("in_normalizer.mean", torch.zeros(1, 2, 1), ValueError, "must have shape"),
-    ],
-    ids=("negative-std", "non-finite", "complex", "wrong-rank"),
-)
-def test_saved_normalizer_state_fails_closed(
-    key: str,
-    replacement: torch.Tensor,
-    error_type: type[Exception],
-    match: str,
+def test_steady_loader_refuses_a_stride_that_does_not_tile_the_grid(
+    tmp_path: Path,
+    steady_task: domain.tasks.spec.TaskSpec,
+    training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
-    """
-    Vary one saved statistic across negative, non-finite, complex, and wrong-rank forms.
-
-    Each parameter family must fail with its type/domain-specific error while
-    valid BCHW keys remain fixed, protecting preprocessing reconstruction.
-    """
-    state = _valid_normalizer_state()
-    state[key] = replacement
-
-    with pytest.raises(error_type, match=match):
-        datasets.preprocessing.normalization.data_processor_from_state(state)
+    """Stride 2 cannot keep both boundaries of the 2 x 3 fixture grid, so the loader refuses it before fitting a scaling."""
+    _publish(tmp_path, training_dataset_payload_factory("stride_train", material_role="id"))
+    with pytest.raises(ValueError, match="does not tile"):
+        _loaders(tmp_path, steady_task, "stride_train", (), spatial_stride=2)
 
 
-def test_zero_variance_normalizer_uses_a_positive_denominator_floor() -> None:
-    """
-    Restore zero standard deviations and normalize constant BCHW tensors.
-
-    Results must remain finite and zero through a positive denominator floor,
-    protecting legitimate constant channels without falsifying saved statistics.
-    """
-    state = _valid_normalizer_state()
-    state["in_normalizer.std"][0, 0] = 0.0
-    state["out_normalizer.std"].zero_()
-
-    processor = datasets.preprocessing.normalization.data_processor_from_state(state)
-    in_normalizer = processor.in_normalizer
-    out_normalizer = processor.out_normalizer
-    assert in_normalizer is not None
-    assert out_normalizer is not None
-    inputs = torch.zeros(2, 2, 3, 4)
-    outputs = torch.zeros(2, 3, 3, 4)
-    normalized_inputs = in_normalizer.transform(inputs)
-    normalized_outputs = out_normalizer.transform(outputs)
-
-    assert in_normalizer.eps > 0.0
-    assert out_normalizer.eps > 0.0
-    assert in_normalizer.std[0, 0, 0, 0] == 0.0
-    assert torch.isfinite(normalized_inputs).all()
-    assert torch.isfinite(normalized_outputs).all()
-    assert torch.equal(normalized_inputs, torch.zeros_like(normalized_inputs))
-    assert torch.equal(normalized_outputs, torch.zeros_like(normalized_outputs))
-
-
-def test_training_loader_retains_a_partial_batch(
+def test_training_loader_retains_a_partial_update_group(
     tmp_path: Path,
     steady_task: domain.tasks.spec.TaskSpec,
     training_dataset_payload_factory: Callable[..., dict[str, Any]],
 ) -> None:
     """
-    Request a batch larger than the small valid training split.
+    Request more units per update than the small valid training split holds.
 
-    The loader must retain one partial batch. Dropping it would turn a valid
+    The loader must retain one partial group. Dropping it would turn a valid
     dataset into an empty training lifecycle.
     """
     _publish(tmp_path, training_dataset_payload_factory("partial_train", material_role="id"))
 
-    train_loader, *_rest = _loaders(tmp_path, steady_task, "partial_train", (), batch_size=8)
+    train_loader, *_rest = _loaders(tmp_path, steady_task, "partial_train", (), units_per_update=8)
 
+    train_loader.batch_sampler.begin_epoch(0)
     batch = next(iter(train_loader))
-    assert 0 < batch["x"].shape[0] < train_loader.batch_size
+    assert 0 < batch["x"].shape[0] < 8
     assert len(train_loader) == 1
 
 

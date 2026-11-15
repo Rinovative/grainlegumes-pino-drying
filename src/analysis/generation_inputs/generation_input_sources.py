@@ -3,7 +3,7 @@
 Responsibilities:
   - Discover manifest-admitted input batches without exposing completed raw
   - Group sources by canonical batch identity and deduplicate exact cases
-  - Fail closed when one case-input identity binds conflicting persisted bytes
+  - Fail closed when one case-input identity binds conflicting case.json bytes or COMSOL input identities
   - Admit selected cases lazily and cache empirical dataset diagnostics
 
 Design principles:
@@ -36,6 +36,7 @@ import pandas as pd
 
 from src import common
 from src.generation.cases import generation_cases_admission as admission
+from src.generation.cases import generation_cases_case as case_service
 from src.generation.contracts import generation_contracts_profiles as profiles
 from src.generation.publication import generation_publication_catalog as campaign_catalog
 
@@ -119,7 +120,12 @@ def _metadata_fingerprint(
 def _persisted_case_fingerprint(
     reference: admission.InputCaseReference,
 ) -> tuple[str, tuple[tuple[str, int, str], ...]]:
-    """Hash exact duplicate-case payload and adapter bytes."""
+    """Fingerprint one duplicate case by its payload bytes and canonical COMSOL input identities, never by stored-container bytes."""
+    # Each duplicate is hashed against its own recorded store integrity, so a corrupt copy can never be discarded unread;
+    # the kept copy is fully admitted when it is read.
+    if case_service.measure_input_store(reference.case_directory) != reference.store_identity:
+        msg = f"Duplicate input-generated case disagrees with its recorded storage integrity: {reference.case_directory}"
+        raise ValueError(msg)
     payload_path = reference.case_directory / "case.json"
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     declared = payload.get("input_files")
@@ -128,19 +134,10 @@ def _persisted_case_fingerprint(
         raise TypeError(msg)
     files = []
     for filename, identity in sorted(declared.items()):
-        if not isinstance(filename, str) or not isinstance(identity, dict):
+        if not isinstance(filename, str) or not isinstance(identity, dict) or set(identity) != {"sha256", "size_bytes"}:
             msg = "Duplicate input-generated file identity is malformed."
             raise TypeError(msg)
-        source = reference.case_directory / filename
-        if not source.is_file():
-            msg = f"Duplicate input-generated file is missing: {source}"
-            raise ValueError(msg)
-        size = source.stat().st_size
-        digest = common.serialization.file_sha256(source)
-        if identity.get("size_bytes") != size or identity.get("sha256") != digest:
-            msg = "Duplicate input-generated adapter bytes disagree with case.json."
-            raise ValueError(msg)
-        files.append((filename, size, digest))
+        files.append((filename, identity["size_bytes"], identity["sha256"]))
     return common.serialization.file_sha256(payload_path), tuple(files)
 
 

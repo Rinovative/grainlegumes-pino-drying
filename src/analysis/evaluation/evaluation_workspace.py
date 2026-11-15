@@ -2,9 +2,9 @@
 
 Responsibilities:
   - Discover persisted experiments once and retain the normalized catalog
-  - Build one concise exact-run selector or compatible multi-run selector
+  - Offer the runs as one collapsed selector grouped by architecture, one run (single) or several compatible runs (comparison)
   - Load validated artifacts read-only only for artifact-ready selections
-  - Present lifecycle, provenance, compatibility, and recovery status without tracebacks
+  - Present lifecycle, provenance, compatibility, and recovery status without tracebacks, as one summary line with details on demand
   - Delegate task-aware scientific panels to maintained Evaluation sessions
 
 Design principles:
@@ -12,17 +12,21 @@ Design principles:
   - Human labels remain separate from exact run, Dataset, and checkpoint evidence
   - EDA's Aggregate and Single case values select task-appropriate section sets
   - Widget changes reuse the catalog and close superseded artifact sessions
+  - Preparation and its outcome run inside the publication into the workspace panel's plot place, so a newer selection supersedes an older one
+    and an older failure cannot clear a newer panel
 
 This module does NOT:
-  - Generate, rebuild, upload, or delete Evaluation artifacts
+  - Generate, rebuild, or delete Evaluation artifacts
   - Infer task, stage, Dataset, or protocol identity from directory names
   - Reimplement scientific metrics, plotting, or artifact admission
+  - Choose among the datasets of a run; the views of the panel do
 
 Notes:
   Workspace modes:
     - Single-run mode admits every available role for one selected run and keeps missing, partial, or invalid artifact states visible without building
       artifacts.
-    - Comparison mode offers only exact role and Dataset bindings shared by all selected runs, then loads the selected shared role.
+    - Comparison mode requests every role whose exact Dataset binding all selected runs share; the workflow admits each role on its own, and a role it
+      or the metadata refused is listed as unavailable with its reason instead of failing the others.
   Selection lifecycle:
     - Run discovery is retained across widget changes; replacing a prepared workflow closes its previous session.
 
@@ -36,7 +40,7 @@ from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-import ipywidgets as widgets
+from IPython.display import HTML
 
 from src import analysis, common
 from src.analysis.presentation import analysis_compute as compute
@@ -47,13 +51,16 @@ from . import evaluation_transient_artifact as transient_artifact
 from . import evaluation_workflow as workflow
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+
+    import ipywidgets as widgets
 
 WorkspaceKind = Literal["single", "comparison"]
 
 _MINIMUM_COMPARISON_RUNS = 2
 ArtifactRole = transient_artifact.DatasetRole
 _ARTIFACT_ROLES: tuple[ArtifactRole, ...] = transient_artifact.DATASET_ROLES
+_GPU_NOTE = "GPU work is limited to transient aggregate error reductions under a Slurm GPU allocation; other views use CPU."
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,24 +80,14 @@ class PreparedEvaluationWorkspace:
             self._controller.close()
 
 
-def _dropdown(
-    options: Sequence[str] | Sequence[tuple[str, Any]],
-    *,
-    description: str,
-) -> widgets.Dropdown:
-    """Build one compact Evaluation selector in the maintained widget style."""
-    resolved = tuple(options)
-    if not resolved:
-        message = f"{description.rstrip(':')} options must not be empty."
-        raise ValueError(message)
-    first = resolved[0][1] if isinstance(resolved[0], tuple) else resolved[0]
-    return widgets.Dropdown(
-        options=resolved,
-        value=first,
-        description=description,
-        style={"description_width": "initial"},
-        layout=widgets.Layout(width="auto"),
-    )
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    """What loading one selection came to: the prepared workflow or none, the summary line, its level, and the details."""
+
+    prepared: workflow.PreparedEvaluationWorkflow | None
+    summary: str
+    level: analysis.ui.controls.Level
+    details: str
 
 
 def _artifact_for_role(
@@ -111,8 +108,8 @@ def _role_label(role: str) -> str:
     return analysis.presentation.display_labels.evaluation_role_display_label(role)
 
 
-def _run_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
-    """Return short unique run labels; the full identity is shown in the status block and tooltip."""
+def _model_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[str, ...]:
+    """Return short unique model labels for the panel's frames; the selector shows the full run names."""
     bases = []
     for run in runs:
         parts = [run.model_label, f"seed {run.seed}" if run.seed is not None else "seed unavailable"]
@@ -121,11 +118,6 @@ def _run_labels(runs: Sequence[run_discovery.EvaluationRunDiscovery]) -> tuple[s
         bases.append(" · ".join(parts))
     facets = tuple((run.pair_label, run.config_label, run.dataset_id, run.run_name, str(run.run_dir)) for run in runs)
     return analysis.presentation.display_labels.unique_display_labels(bases, facets)
-
-
-def _run_identity(run: run_discovery.EvaluationRunDiscovery) -> str:
-    """Return the full run identity shown once next to the selector."""
-    return f"{run.run_name} · {run.dataset_id or 'dataset unavailable'} · {run.run_dir}"
 
 
 def _artifact_state_label(
@@ -165,6 +157,11 @@ def _compatibility_issues(
     return tuple(issues)
 
 
+def _compute_text(requested: str) -> str:
+    """Return the HTML paragraph that states the analysis compute route."""
+    return f"<p><b>Analysis compute:</b> {escape(compute.selection_status(requested))}. {_GPU_NOTE}</p>"
+
+
 def _dispose_workflow(prepared: workflow.PreparedEvaluationWorkflow) -> None:
     """Close the panel and its rendered views before the session they read from."""
     analysis.evaluation.panel.close_panel(prepared.panel)
@@ -183,70 +180,73 @@ class _EvaluationWorkspaceController:
         evaluation_compute_device: str,
     ) -> None:
         """Create one run explorer without loading numerical payloads."""
+        ui = analysis.ui
         self.catalog = catalog
         self.kind = kind
         self.title = title
+        self.widths = ui.notebook.WidthScope()
         self.compute_preference = compute.AnalysisComputePreference(evaluation_compute_device)
-        self.compute_status = widgets.HTML(
-            f"<p><b>Analysis compute:</b> {escape(compute.selection_status(self.compute_preference.requested))}. "
-            "GPU work is limited to transient aggregate error reductions under a Slurm GPU allocation; other views use CPU.</p>"
-        )
+        self._compute_text = _compute_text(self.compute_preference.requested)
+        self._details = ""
         self._updating_compute = False
         compute_options = tuple(dict.fromkeys((evaluation_compute_device, "auto", "cpu", "cuda", *compute.visible_cuda_options())))
-        self.compute_selector = widgets.Dropdown(
-            options=compute_options,
-            value=evaluation_compute_device,
-            description="Evaluation compute:",
-            style={"description_width": "initial"},
-            layout=widgets.Layout(width="auto"),
-        )
+        self.compute_selector = ui.controls.dropdown(compute_options, description="Evaluation compute", value=evaluation_compute_device)
         self.compute_selector.observe(self._compute_device_changed, names="value")
         self.state = selection.EvaluationSelectionState(
             catalog,
             comparison=kind == "comparison",
         )
         self._workflow: workflow.PreparedEvaluationWorkflow | None = None
-        self._updating = False
-        self.status = widgets.HTML(layout=widgets.Layout(width="100%"))
-        self.analysis = widgets.VBox()
-        options = tuple(zip(_run_labels(catalog.runs), (str(run.run_dir) for run in catalog.runs), strict=True))
-        if kind == "single":
-            self.run = _dropdown(
-                options,
-                description="Run:",
+        self.detail_slot = ui.panel.PlotSlot()
+        options = [
+            ui.selectors.RunOption(
+                name=run.run_name,
+                family=run.model_family,
+                key=str(run.run_dir),
+                issue="; ".join(run.metadata_issues) or None,
             )
-            controls: tuple[widgets.Widget, ...] = (self.run, self.compute_selector)
-            self.run.observe(self._single_run_changed, names="value")
-            self._render_single()
-        else:
-            self.run_filter = widgets.SelectMultiple(
-                options=options,
-                description="Runs:",
-                style={"description_width": "initial"},
-                layout=widgets.Layout(width="420px", height="100px"),
-            )
-            self.dataset_filter = _dropdown(
-                (("Select compatible runs", None),),
-                description="Material/Dataset:",
-            )
-            controls = (self.run_filter, self.dataset_filter, self.compute_selector)
-            self.run_filter.observe(self._comparison_runs_changed, names="value")
-            self.dataset_filter.observe(self._comparison_dataset_changed, names="value")
-            self._select_initial_comparison()
-        self.panel = widgets.VBox(
-            (
-                widgets.HTML(f"<h2>{escape(title)}</h2>"),
-                widgets.VBox(controls),
-                self.compute_status,
-                self.status,
-                self.analysis,
-            ),
-            layout=widgets.Layout(width="100%"),
+            for run in catalog.runs
+        ]
+        self.runs = ui.selectors.RunSelector(options, multiple=kind == "comparison", selected=self._initial_runs())
+        self.runs.observe(self._render)
+        details_header, details_body = ui.panel.disclosure("Details", self.detail_slot.widget)
+        self.view = ui.panel.ViewPanel(
+            [ui.panel.row(self.runs.header, self.compute_selector, details_header)],
+            slot=ui.panel.PlotSlot(),
+            popovers=[(self.runs.header, self.runs.body), (details_header, details_body)],
         )
+        self.view.widget.children = (ui.style.stylesheet_widget(), *self.view.widget.children)
+        self.panel = self.view.widget
+        self._render()
 
     def close(self) -> None:
-        """Close the current task session and clear its panel reference."""
-        self._clear_workflow()
+        """Release the loaded artifact state and clear the panel, retaining the cached run catalog."""
+        previous, self._workflow = self._workflow, None
+        analysis.ui.viewers.render_view(self.view, lambda: None)
+        if previous is not None:
+            _dispose_workflow(previous)
+
+    def _initial_runs(self) -> tuple[str, ...]:
+        """Return the run (single) or the first compatible ready pair (comparison) the selector starts on."""
+        known = {spec.family for spec in analysis.presentation.visual_semantics.ARCHITECTURES}
+        runs = tuple(run for run in self.catalog.runs if run.model_family in known)
+        if self.kind == "single":
+            return tuple(str(run.run_dir) for run in runs[:1])
+        for left_index, left in enumerate(runs):
+            for right in runs[left_index + 1 :]:
+                candidate = (left, right)
+                if not _compatibility_issues(candidate) and self._common_dataset_bindings(candidate):
+                    return tuple(str(run.run_dir) for run in candidate)
+        return ()
+
+    def _say(self, summary: str, level: analysis.ui.controls.Level, details: str) -> None:
+        """Show the one-line summary under the selectors and the details behind the «Details» disclosure."""
+        self.view.status.set(summary, level)
+        self._details = details
+        self._show_details()
+
+    def _show_details(self) -> None:
+        self.detail_slot.show((HTML(f"{self._compute_text}{self._details}"),))
 
     def _compute_device_changed(self, change: Mapping[str, object]) -> None:
         """Update the one shared route while retaining mounted field choices."""
@@ -263,12 +263,10 @@ class _EvaluationWorkspaceController:
                 self.compute_selector.value = self.compute_preference.requested
             finally:
                 self._updating_compute = False
-            self.compute_status.value = f"<p><b>Analysis compute unavailable:</b> {escape(str(error))}</p>"
+            self.view.status.set(f"Analysis compute unavailable: {error}", "warning")
             return
-        self.compute_status.value = (
-            f"<p><b>Analysis compute:</b> {escape(compute.selection_status(requested))}. "
-            "GPU work is limited to transient aggregate error reductions under a Slurm GPU allocation; other views use CPU.</p>"
-        )
+        self._compute_text = _compute_text(requested)
+        self._show_details()
 
     def _run_by_path(self, path: str | Path) -> run_discovery.EvaluationRunDiscovery:
         """Return one exact catalog run by resolved current path."""
@@ -366,6 +364,21 @@ class _EvaluationWorkspaceController:
                 result[key] = next(iter(values))
         return result
 
+    def _unshared_roles(
+        self,
+        runs: Sequence[run_discovery.EvaluationRunDiscovery],
+        shared: Sequence[ArtifactRole],
+    ) -> dict[str, str]:
+        """Return why each role some selected run holds is not offered: a run without it ready, or another Dataset binding."""
+        refused: dict[str, str] = {}
+        for role in _ARTIFACT_ROLES:
+            if role in shared:
+                continue
+            lacking = [run.label for run in runs if (artifact := _artifact_for_role(run, role)) is None or artifact.state != "ready"]
+            if len(lacking) < len(runs):
+                refused[role] = f"nicht bereit in {', '.join(lacking)}" if lacking else "andere Datensatzbindung je Lauf"
+        return refused
+
     def _status_html(
         self,
         run: run_discovery.EvaluationRunDiscovery,
@@ -424,48 +437,61 @@ class _EvaluationWorkspaceController:
         extra = "" if detail is None else f"<p>{escape(detail)}</p>"
         return f"<h3>Run overview</h3><table style='overflow-wrap:anywhere'>{table}</table>{extra}{command}"
 
-    def _replace_workflow(
-        self,
-        prepared: workflow.PreparedEvaluationWorkflow,
-    ) -> None:
-        """Install one newly prepared panel after closing its predecessor."""
-        previous = self._workflow
-        self._workflow = prepared
-        self.analysis.children = (prepared.panel,)
+    def _publish(self, load: Callable[[], _Outcome]) -> None:
+        """
+        Load one selection inside the publication of the panel, so only the newest selection shows or reports its outcome.
+
+        A selection made while ``load`` runs, or while its panel is displayed, supersedes it: its prepared panel is closed
+        unshown and its summary, details and failure are dropped. The panel it replaces is closed after the new one is shown.
+        """
+        outcomes: list[_Outcome] = []
+        requested: list[int] = []
+
+        def plot() -> widgets.Widget | None:
+            requested.append(self.view.generation)  # ``render_view`` superseded before calling this: the generation of this request
+            outcomes.append(load())
+            return None if outcomes[0].prepared is None else outcomes[0].prepared.panel
+
+        published = analysis.ui.viewers.render_view(self.view, plot)
+        outcome = outcomes[0] if outcomes else None
+        if not published or requested[0] != self.view.generation:
+            if outcome is not None and outcome.prepared is not None:
+                _dispose_workflow(outcome.prepared)
+            return
+        previous, self._workflow = self._workflow, None if outcome is None else outcome.prepared
+        if outcome is None:  # the load itself failed; the panel shows the failure in the plot's place
+            self._say("Loading the Evaluation failed; the failure is shown below.", "error", "")
+        else:
+            self._say(outcome.summary, outcome.level, outcome.details)
         if previous is not None:
             _dispose_workflow(previous)
 
-    def _clear_workflow(self) -> None:
-        """Release loaded artifact state while retaining the cached run catalog."""
-        previous = self._workflow
-        self._workflow = None
-        self.analysis.children = ()
-        if previous is not None:
-            _dispose_workflow(previous)
-
-    def _single_run_changed(self, _change: Mapping[str, object]) -> None:
-        """Dispatch the newly selected run through its persisted task metadata."""
-        if not self._updating:
+    def _render(self) -> None:
+        """Dispatch the selected runs through their persisted task metadata."""
+        if self.kind == "single":
             self._render_single()
+        else:
+            self._render_comparison()
 
     def _render_single(self) -> None:
         """Render every available Dataset role for one exact selected run."""
-        run = self._run_by_path(str(self.run.value))
-        self.run.tooltip = _run_identity(run)
+        keys = self.runs.selected()
+        if not keys:
+            self._publish(lambda: _Outcome(None, "Select a run.", "warning", "<p>No run with architecture metadata is selected.</p>"))
+            return
+        run = self._run_by_path(str(keys[0]))
         group = self._group_for_run(run)
         self.state.select_experiment(group.identity_sha256, run_dirs=(run.run_dir,))
         selected_roles = self._available_roles(run)
         self.state.select_artifact_role(self._artifact_role(selected_roles))
+        self._publish(lambda: self._load_single(run, selected_roles))
+
+    def _load_single(self, run: run_discovery.EvaluationRunDiscovery, selected_roles: tuple[ArtifactRole, ...]) -> _Outcome:
+        """Prepare the workflow of one run, or say why none is prepared; the caller publishes the outcome."""
         if not run.evaluable:
-            self._clear_workflow()
-            self.status.value = self._status_html(
-                run,
-                selected_roles=selected_roles,
-                detail="This run is not terminal and checkpoint-admitted for Evaluation.",
-            )
-            return
+            detail = "This run is not terminal and checkpoint-admitted for Evaluation."
+            return _Outcome(None, detail, "warning", self._status_html(run, selected_roles=selected_roles, detail=detail))
         if not selected_roles:
-            self._clear_workflow()
             states = {artifact.state for artifact in run.artifacts()}
             if "generating" in states:
                 detail = "Artifact generation is active; completed staging payloads remain hidden until atomic publication."
@@ -473,12 +499,7 @@ class _EvaluationWorkspaceController:
                 detail = "Artifact evidence is invalid or stale and was not admitted."
             else:
                 detail = "No completed artifact is available; generation remains an explicit host workflow."
-            self.status.value = self._status_html(
-                run,
-                selected_roles=(),
-                detail=detail,
-            )
-            return
+            return _Outcome(None, detail, "warning", self._status_html(run, selected_roles=(), detail=detail))
         scoped_roles: tuple[ArtifactRole, ...] = tuple(
             role for role in selected_roles if (artifact := _artifact_for_role(run, role)) is not None and artifact.state == "scoped_partial"
         )
@@ -498,15 +519,25 @@ class _EvaluationWorkspaceController:
                 sections=sections,
                 selection_state=self.state,
                 evaluation_compute_device=self.compute_preference,
+                widths=self.widths,
             )
         except Exception as error:  # noqa: BLE001 -- bounded notebook status
-            self._clear_workflow()
-            self.status.value = self._status_html(
-                run,
-                selected_roles=selected_roles,
-                detail=f"Artifact admission failed ({type(error).__name__}): {error}",
-            )
-            return
+            detail = f"Artifact admission failed ({type(error).__name__}): {error}"
+            return _Outcome(None, detail, "error", self._status_html(run, selected_roles=selected_roles, detail=detail))
+        try:
+            return self._single_outcome(run, selected_roles, scoped_roles, prepared)
+        except BaseException:
+            _dispose_workflow(prepared)  # nothing publishes it: its session must not stay open
+            raise
+
+    def _single_outcome(
+        self,
+        run: run_discovery.EvaluationRunDiscovery,
+        selected_roles: tuple[ArtifactRole, ...],
+        scoped_roles: tuple[ArtifactRole, ...],
+        prepared: workflow.PreparedEvaluationWorkflow,
+    ) -> _Outcome:
+        """Return the outcome of one prepared single-run workflow: its summary and the run overview with the material coverage."""
         unavailable = tuple(role for role in _ARTIFACT_ROLES if role not in selected_roles)
         availability_detail: str | None = None
         if scoped_roles:
@@ -546,112 +577,74 @@ class _EvaluationWorkspaceController:
                     key=lambda item: (*item[1], item[0][0]),
                 )
             )
-        self.status.value = self._status_html(
-            run,
-            selected_roles=selected_roles,
-            detail=availability_detail,
-            material_coverage=material_coverage,
+        return _Outcome(
+            prepared,
+            f"{run.run_name}: {len(selected_roles)} of {len(_ARTIFACT_ROLES)} dataset roles loaded.",
+            "normal",
+            self._status_html(run, selected_roles=selected_roles, detail=availability_detail, material_coverage=material_coverage),
         )
-        self._replace_workflow(prepared)
-
-    def _select_initial_comparison(self) -> None:
-        """Select the first compatible ready pair without task or seed filters."""
-        runs = self.catalog.runs
-        selected: tuple[run_discovery.EvaluationRunDiscovery, ...] = ()
-        for left_index, left in enumerate(runs):
-            for right in runs[left_index + 1 :]:
-                candidate = (left, right)
-                if not _compatibility_issues(candidate) and self._common_dataset_bindings(candidate):
-                    selected = candidate
-                    break
-            if selected:
-                break
-        self._updating = True
-        try:
-            self.run_filter.value = tuple(str(run.run_dir) for run in selected)
-            self._sync_dataset_filter(selected)
-        finally:
-            self._updating = False
-        self._render_comparison()
-
-    def _sync_dataset_filter(
-        self,
-        runs: Sequence[run_discovery.EvaluationRunDiscovery],
-    ) -> None:
-        """Rebind concrete Material/Dataset choices from selected-run intersection."""
-        previous = self.dataset_filter.value
-        bindings = self._common_dataset_bindings(runs)
-        if not bindings:
-            self.dataset_filter.options = (("No compatible available Dataset", None),)
-            self.dataset_filter.value = None
-            return
-        short = analysis.presentation.display_labels.unique_display_labels(
-            tuple(_role_label(role) for _label, role in bindings.values()),
-            tuple((label,) for label, _role in bindings.values()),
-        )
-        options = tuple(zip(short, bindings, strict=True))
-        self.dataset_filter.options = options
-        values = {value for _label, value in options}
-        self.dataset_filter.value = previous if previous in values else options[0][1]
-
-    def _comparison_runs_changed(self, _change: Mapping[str, object]) -> None:
-        """Recompute Dataset compatibility after an exact run selection."""
-        if self._updating:
-            return
-        selected = tuple(self._run_by_path(value) for value in self.run_filter.value)
-        self._updating = True
-        try:
-            self._sync_dataset_filter(selected)
-        finally:
-            self._updating = False
-        self._render_comparison()
-
-    def _comparison_dataset_changed(self, _change: Mapping[str, object]) -> None:
-        """Render the selected concrete Dataset without changing run discovery."""
-        if not self._updating:
-            self._render_comparison()
 
     def _render_comparison(self) -> None:
-        """Render one task-compatible comparison on a concrete shared Dataset."""
-        selected = tuple(self._run_by_path(value) for value in self.run_filter.value)
+        """Render one task-compatible comparison over every dataset role the selected runs share."""
+        selected = tuple(self._run_by_path(str(key)) for key in self.runs.selected())
         issues = list(_compatibility_issues(selected))
         bindings = self._common_dataset_bindings(selected)
-        dataset_key = self.dataset_filter.value
         if selected and not bindings:
             issues.append("Selected runs share no available Material/Dataset artifact.")
-        if bindings and dataset_key not in bindings:
-            issues.append("Select one compatible Material/Dataset.")
         if issues:
-            self._clear_workflow()
             items = "".join(f"<li>{escape(issue)}</li>" for issue in dict.fromkeys(issues))
-            self.status.value = (
-                f"<h3>Compatible selected runs</h3><ul>{items}</ul>"
-                "<p>All discovered runs remain visible; incompatible artifacts are capability-gated.</p>"
-            )
+            note = "All discovered runs remain visible; incompatible artifacts are capability-gated."
+            html = f"<h3>Compatible selected runs</h3><ul>{items}</ul><p>{note}</p>"
+            self._publish(lambda: _Outcome(None, issues[0], "warning", html))
             return
-        dataset_label, role = bindings[cast("str", dataset_key)]
+        shared = {role for _label, role in bindings.values()}
+        roles: tuple[ArtifactRole, ...] = tuple(role for role in _ARTIFACT_ROLES if role in shared)
         self.state.select_catalog_runs(tuple(run.run_dir for run in selected))
-        self.state.select_artifact_role(role)
+        self.state.select_artifact_role(self._artifact_role(roles))
+        self._publish(lambda: self._load_comparison(selected, roles))
+
+    def _load_comparison(self, selected: tuple[run_discovery.EvaluationRunDiscovery, ...], roles: tuple[ArtifactRole, ...]) -> _Outcome:
+        """Prepare the comparison of the selected runs over ``roles``, or say why none is prepared; the caller publishes the outcome."""
         try:
             prepared = workflow.prepare_model_comparison_evaluation_workspace(
                 tuple(run.run_dir for run in selected),
-                labels=_run_labels(selected),
+                labels=_model_labels(selected),
                 expected_task=selected[0].task,
-                artifact_roles=(role,),
+                artifact_roles=roles,
                 auto_build_missing=False,
                 rebuild_incompatible=False,
                 sections="all",
                 selection_state=self.state,
                 evaluation_compute_device=self.compute_preference,
+                widths=self.widths,
+                refused_roles=self._unshared_roles(selected, roles),
             )
         except Exception as error:  # noqa: BLE001 -- bounded notebook status
-            self._clear_workflow()
-            self.status.value = f"<h3>Compatibility warning</h3><p>{escape(type(error).__name__)}: {escape(str(error))}</p>"
-            return
-        self.status.value = (
-            f"<h3>Compatible selected runs</h3><p>{len(selected)} artifacts admitted for {escape(dataset_label)} using exact persisted metadata.</p>"
+            detail = f"{type(error).__name__}: {error}"
+            return _Outcome(None, f"Compatibility warning ({detail})", "error", f"<h3>Compatibility warning</h3><p>{escape(detail)}</p>")
+        try:
+            return self._comparison_outcome(selected, roles, prepared)
+        except BaseException:
+            _dispose_workflow(prepared)  # nothing publishes it: its session must not stay open
+            raise
+
+    @staticmethod
+    def _comparison_outcome(
+        selected: tuple[run_discovery.EvaluationRunDiscovery, ...],
+        roles: tuple[ArtifactRole, ...],
+        prepared: workflow.PreparedEvaluationWorkflow,
+    ) -> _Outcome:
+        """Return the outcome of one prepared comparison: its summary and the roles it admitted and refused."""
+        admitted = [role for role in roles if role not in prepared.refused_roles]
+        refused = "".join(f"<li>{escape(_role_label(role))}: {escape(reason)}</li>" for role, reason in prepared.refused_roles.items())
+        names = escape(", ".join(_role_label(role) for role in admitted))
+        return _Outcome(
+            prepared,
+            f"{len(selected)} runs compared on {len(admitted)} of {len(_ARTIFACT_ROLES)} dataset roles.",
+            "normal",
+            f"<h3>Compatible selected runs</h3><p>{len(selected)} artifacts admitted for {names} using exact persisted metadata.</p>"
+            + (f"<p>Not available:</p><ul>{refused}</ul>" if refused else ""),
         )
-        self._replace_workflow(prepared)
 
 
 def _summary(
@@ -706,11 +699,11 @@ def prepare_evaluation_workspace(
             catalog.counts_by_identity,
             catalog.counts_by_artifact_state,
         )
-        placeholder = widgets.HTML(f"<p>{escape(message)}</p>")
+        placeholder = analysis.ui.panel.ViewPanel((), status=analysis.ui.controls.StatusLine(message, "warning"))
         return PreparedEvaluationWorkspace(
             catalog=empty_catalog,
             selection_state=None,
-            panel=placeholder,
+            panel=placeholder.widget,
             summary_text=_summary(empty_catalog, kind=kind) + f"\nAnalysis compute: {compute_status}",
             kind=kind,
             _controller=None,

@@ -7,6 +7,9 @@ Responsibilities:
   - Size composite line-and-map figures without plot-local magic numbers
   - Center figure titles over data axes when a right-side column is present
   - Mark panels whose bounded prefix has no finite case as unavailable
+  - Choose the round error bands over a percentile reach, label colour-bar ticks at fixed decimals (a finer
+    step as a multiple of a power of ten in the unit) and write the one colour-scale note and the mean-error line
+    above each error map of a fixed-inch map grid
 
 Design principles:
   - Layout is presentation-only and never changes scientific values
@@ -21,16 +24,21 @@ This module does NOT:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from numbers import Integral
 from typing import TYPE_CHECKING, Any
 
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.ticker import FuncFormatter
 
+from src.analysis.presentation import analysis_error_diagnostics as error_diagnostics
+from src.analysis.presentation import analysis_field_maps as field_maps
 from src.analysis.ui import analysis_ui_plot_layout as shared_layout
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sized
+    from collections.abc import Iterable, Mapping, Sequence, Sized
 
     from matplotlib.axes import Axes
     from matplotlib.cm import ScalarMappable
@@ -72,6 +80,169 @@ class MapLayoutContract:
 
 
 MAP_LAYOUT = MapLayoutContract()
+_NOTE_FROM_TOP_IN = 0.36  # the scale note's top below the figure top: under the 12 pt title of a fixed-inch map grid
+_NOTE_SIZE_PT = 9.0
+_NOTE_COLOUR = "0.20"
+_MINIMUM_TICKS = 2
+MAX_TICK_DECIMALS = 3  # an error bar's finer step moves its power of ten into the unit; a state bar never does (owner 14.11.)
+
+
+def error_boundaries(values: np.ndarray, *, signed: bool) -> np.ndarray:
+    """
+    Return the round error bands of the finite error ``values``: from 0 to the round top over their reach, or symmetric about 0 if signed.
+
+    The reach is the 95th percentile (signed: the larger absolute one of the 5th and 95th). The bands are
+    the round bands of ``shared_layout.rounded_boundaries`` (9 to 13 of m times a power of ten, m in 1, 2, 2.5, 5); a signed
+    scale has an odd count with the neutral band centred on 0 (``shared_layout.symmetric_boundaries``).
+    A map without any error (reach 0) gets the scale of reach 1, so it never degenerates to one colour.
+    """
+    scale = field_maps.percentile_scale(values, "signed" if signed else "magnitude")
+    if scale is None:
+        msg = "No round error bands exist for values without a finite error."
+        raise ValueError(msg)
+    reach = scale[1] if scale[1] > 0.0 else 1.0
+    boundaries = shared_layout.symmetric_boundaries(reach) if signed else shared_layout.rounded_boundaries(0.0, reach)
+    if boundaries is None:
+        msg = f"No round error bands exist for a reach of {reach!r}."
+        raise ValueError(msg)
+    # BoundaryNorm sends a value equal to its last boundary to the over colour; an error exactly at the round top belongs to the scale.
+    boundaries[-1] = np.nextafter(boundaries[-1], np.inf)
+    return boundaries
+
+
+def state_boundaries(lower: float, upper: float) -> np.ndarray:
+    """
+    Return the round state boundaries (9 to 13 bands) from ``lower`` that reach ``upper``, never cut short.
+
+    A constant value spans its magnitude (at least 1) upward, so it fills the lowest band of a readable bar. A near-uniform
+    range whose round step is finer than the three decimals a state bar may show is widened to 11 bands of 0.001 about its centre.
+    """
+    top = upper if upper > lower else lower + max(abs(lower), 1.0)
+    boundaries = shared_layout.rounded_boundaries(lower, top, max_decimals=MAX_TICK_DECIMALS)
+    if boundaries is None:
+        return np.linspace(*widened_range(lower, top, MAX_TICK_DECIMALS), field_maps.N_COLOR_BINS + 1)
+    return boundaries
+
+
+def error_ticks(boundaries: np.ndarray, *, signed: bool) -> np.ndarray:
+    """Return the labelled ticks of an error bar: the band boundaries, or for a signed scale the band centres 0, ±w, ±2w ... (w the band width)."""
+    return (boundaries[:-1] + boundaries[1:]) / 2.0 if signed else boundaries
+
+
+@dataclass(frozen=True, slots=True)
+class TickFormat:
+    """The labels of a colour bar: ``decimals`` after the point, the ticks written divided by 10**``exponent`` (the factor stands in the unit)."""
+
+    decimals: int = 1
+    exponent: int = 0
+
+
+def tick_step(ticks: np.ndarray) -> float | None:
+    """Return the smallest step between the ticks (``None`` for fewer than two or equal ones)."""
+    step = float(np.min(np.diff(ticks))) if ticks.size >= _MINIMUM_TICKS else 0.0
+    return step if step > 0.0 else None
+
+
+def tick_format(step: float | None) -> TickFormat:
+    """
+    Return the labels of an error bar whose smallest round tick step is ``step``: exactly the decimals the step needs.
+
+    A step that would need more than three decimals is written as a multiple of its power of ten instead, which the unit
+    names. The error bars are centred on 0; a state bar uses ``state_format`` and never gets a factor.
+    """
+    if step is None:
+        return TickFormat()
+    decimals = shared_layout.step_decimals(step)
+    if decimals <= MAX_TICK_DECIMALS:
+        return TickFormat(decimals)
+    exponent = math.floor(math.log10(step) + 1e-9)
+    return TickFormat(shared_layout.step_decimals(step / 10.0**exponent), exponent)
+
+
+def state_format(steps: Iterable[float | None]) -> TickFormat:
+    """
+    Return the labels of a state bar, which never carries a power of ten: the decimals its frames' round tick steps need, at most three.
+
+    A frame whose step would need more decimals is near-uniform and does not set them (``widened_range`` serves it);
+    ``None`` steps (constant frames) are ignored. Without any frame that fits, the bar gets the three decimals.
+    """
+    needed = [shared_layout.step_decimals(step) for step in steps if step is not None]
+    fitting = [decimals for decimals in needed if decimals <= MAX_TICK_DECIMALS]
+    return TickFormat(max(fitting) if fitting else MAX_TICK_DECIMALS if needed else 1)
+
+
+def is_finer_than_decimals(step: float | None, decimals: int) -> bool:
+    """Return whether a round tick ``step`` is below the unit of the last decimal ``decimals``."""
+    return step is not None and step < 10.0**-decimals * (1.0 - 1e-9)
+
+
+def widened_range(lower: float, upper: float, decimals: int) -> tuple[float, float]:
+    """Return a range widened symmetrically about its centre to 11 steps of 10**-``decimals``, starting on a whole step."""
+    unit = 10.0**-decimals
+    start = round(((lower + upper) / 2.0 - 5.5 * unit) / unit) * unit
+    return start, start + 11.0 * unit
+
+
+def set_fixed_decimal_ticks(colorbar: Colorbar, ticks: np.ndarray, fixed: TickFormat | None = None) -> None:
+    """
+    Label ``colorbar`` at ``ticks`` in the format ``fixed`` (default: the one its own ticks need), with the true minus sign and no "-0".
+
+    A power of ten is written into the unit bracket of the bar's label. A caller that draws several frames passes the format
+    that fits all of them, so the labels and the unit never change between frames.
+    """
+    shown = tick_format(tick_step(ticks)) if fixed is None else fixed
+    colorbar.set_ticks(ticks.tolist())
+    if shown.exponent:
+        colorbar.set_label(shared_layout.label_with_exponent(colorbar.ax.get_ylabel(), shown.exponent))
+    # Rounding first turns a small negative value into +0.0, so no label reads "-0.0".
+    colorbar.ax.yaxis.set_major_formatter(
+        FuncFormatter(
+            lambda value, _position: f"{round(value / 10.0**shown.exponent, shown.decimals) + 0.0:.{shown.decimals}f}".replace("-", "\N{MINUS SIGN}")
+        )
+    )
+
+
+def add_scale_note(figure: Figure, *, shared: bool = True) -> None:
+    """Write the one colour-scale note under the title of a fixed-inch map grid (``shared``: reference scale)."""
+    reference = "prediction uses the reference scale; " if shared else ""
+    figure.text(
+        0.5,
+        1.0 - _NOTE_FROM_TOP_IN / figure.get_figheight(),
+        f"Colour scales: 5th\N{EN DASH}95th percentile; {reference}arrows mark values outside",
+        ha="center",
+        va="top",
+        fontsize=_NOTE_SIZE_PT,
+        color=_NOTE_COLOUR,
+    )
+
+
+def error_format(boundaries: np.ndarray | None, *, signed: bool) -> TickFormat:
+    """Return the label format of an error bar over ``boundaries``, the one ``set_fixed_decimal_ticks`` derives from its ticks."""
+    return TickFormat() if boundaries is None else tick_format(tick_step(error_ticks(boundaries, signed=signed)))
+
+
+def mean_error_text(values: np.ndarray | None, *, unit: str | None, exponent: int = 0) -> str:
+    """
+    Return the mean-error line of one error map: mean |e| of its finite ``values`` in ``unit`` (``None``: normalized), else "n/a".
+
+    The mean runs over every finite cell of the field, independent of the display sampling. A bar that writes its labels as
+    multiples of a power of ten (``exponent``, from ``error_format``) gets the mean as a multiple of that same power. The
+    mean keeps three significant digits and is always written positionally, never in e-notation.
+    """
+    finite = None if values is None else np.asarray(values, dtype=np.float64)[np.isfinite(values)]
+    if finite is None or finite.size == 0:
+        return "mean |e| n/a"
+    power = f" \N{MULTIPLICATION SIGN} {shared_layout.power_of_ten(exponent)}" if exponent else ""
+    digits = np.format_float_positional(float(np.mean(np.abs(finite))) / 10.0**exponent, precision=3, unique=False, fractional=False, trim="-")
+    mean = f"{digits}{power}"
+    return f"mean |e| = {mean} {unit}" if unit is not None else f"mean {error_diagnostics.NORMALIZED_ERROR_SYMBOL} = {mean}"
+
+
+def set_error_headers(axes: np.ndarray, titles: Sequence[str], error_texts: Sequence[str]) -> None:
+    """Write the column headers and, above each row's error map (last column), its mean-error line; the top row's stands under its header."""
+    shared_layout.set_column_headers(axes, titles, ("",) * (len(titles) - 1) + (error_texts[0],))
+    for row in range(1, len(error_texts)):
+        shared_layout.add_map_note(axes[row, -1], error_texts[row])
 
 
 def case_title(
@@ -216,91 +387,6 @@ def apply_map_grid_axis_labels(
             axis.set_ylabel(y_label if is_left else "")
             axis.tick_params(axis="x", labelbottom=is_bottom)
             axis.tick_params(axis="y", labelleft=is_left)
-
-
-def add_shortened_column_x_decorations(
-    axes: Iterable[Iterable[Axes]],
-    *,
-    x_label: str,
-) -> tuple[Text, ...]:
-    """
-    Add layout-excluded x decorations beneath shortened map-grid columns.
-
-    Parameters
-    ----------
-    axes : Iterable[Iterable[Axes]]
-        Rectangular rows of map axes. Invisible or disabled axes are ignored.
-    x_label : str
-        Visual coordinate label for each shortened column.
-
-    Returns
-    -------
-    tuple[Text, ...]
-        Manual tick-number and axis-label artists attached to shortened columns.
-
-    Notes
-    -----
-    Tick numbers come from each axis's settled locator and formatter. All
-    artists are excluded from layout, so they do not alter GridSpec spacing,
-    map geometry, or normal tick-label visibility.
-
-    """
-    rows = _map_axis_grid(axes)
-    bottom_row = len(rows) - 1
-    figure = rows[0][0].figure
-    figure.canvas.draw()
-    active = tuple(tuple(axis.get_visible() and axis.axison for axis in row) for row in rows)
-    visible_bottom_tick_labels = [
-        tick_label
-        for column, axis in enumerate(rows[bottom_row])
-        if active[bottom_row][column]
-        for tick_label in axis.get_xticklabels()
-        if tick_label.get_visible()
-    ]
-    tick_style = visible_bottom_tick_labels[0] if visible_bottom_tick_labels else None
-    artists: list[Text] = []
-    for column in range(len(rows[0])):
-        active_rows = [row for row in range(len(rows)) if active[row][column]]
-        if not active_rows:
-            continue
-        last_active_row = max(active_rows)
-        if last_active_row == bottom_row:
-            continue
-        axis = rows[last_active_row][column]
-        tick_locations = [float(location) for location in axis.get_xticks()]
-        tick_labels = axis.xaxis.get_major_formatter().format_ticks(tick_locations)
-        x_limits = sorted(axis.get_xlim())
-        tolerance = max(x_limits[1] - x_limits[0], 1.0) * 1e-9
-        for location, tick_label in zip(tick_locations, tick_labels, strict=True):
-            if not tick_label or not x_limits[0] - tolerance <= location <= x_limits[1] + tolerance:
-                continue
-            tick_artist = axis.text(
-                location,
-                -0.035,
-                tick_label,
-                transform=axis.get_xaxis_transform(),
-                ha="center",
-                va="top",
-                clip_on=False,
-                fontproperties=(tick_style.get_fontproperties() if tick_style is not None else axis.xaxis.label.get_fontproperties()),
-                color=(tick_style.get_color() if tick_style is not None else axis.xaxis.label.get_color()),
-            )
-            tick_artist.set_in_layout(False)
-            artists.append(tick_artist)
-        label_artist = axis.text(
-            0.5,
-            -0.11,
-            x_label,
-            transform=axis.transAxes,
-            ha="center",
-            va="top",
-            clip_on=False,
-            fontproperties=axis.xaxis.label.get_fontproperties(),
-            color=axis.xaxis.label.get_color(),
-        )
-        label_artist.set_in_layout(False)
-        artists.append(label_artist)
-    return tuple(artists)
 
 
 def _center_text_artist(figure: Figure, artist: Text, plot_axes: tuple[Axes, ...]) -> None:

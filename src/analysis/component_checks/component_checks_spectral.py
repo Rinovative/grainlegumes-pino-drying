@@ -33,14 +33,14 @@ Notes:
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.nn import functional
 
-from src import datasets, domain
+from src import common, datasets
 from src.learning.models import learning_models_factory as model_factory
 
 from . import component_checks_sources as sources
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
-    from src.learning.transient.learning_transient_scaling import TransientScalingArtifact
+    from src.datasets.preprocessing.dataset_preprocessing_normalization import TrainScaling
 
     from .component_checks_sources import SteadyReference, TransientReferenceCase
 
@@ -212,12 +212,18 @@ def steady_truncation_errors(reference: SteadyReference, settings: pd.DataFrame)
     """
     Return :func:`truncation_errors` of every steady output field, per case, with the maintained mode pairs.
 
-    The outputs pass through the training out-normaliser fitted on the reference membership.
+    The outputs pass through the state encoding of the training scaling, fitted case-equal on the reference membership.
     """
-    task = domain.tasks.registry.get_task("steady_flow")
-    processor = datasets.preprocessing.normalization.fit_data_processor([{"x": reference.inputs, "y": reference.outputs}], task=task)
-    # fit_data_processor always sets the output normaliser; neuralop types it as optional.
-    outputs = cast("Any", processor.out_normalizer).transform(reference.outputs)
+    normalization = datasets.preprocessing.normalization
+    grid_shape = (int(reference.outputs.shape[-2]), int(reference.outputs.shape[-1]))
+    spatial_view = datasets.contracts.grid.resolve_spatial_representation(grid_shape, 1).view_evidence()
+    scaling = normalization.fit_steady_scaling(
+        ({"x": inputs, "y": outputs} for inputs, outputs in zip(reference.inputs, reference.outputs, strict=True)),
+        preprocessing=normalization.preprocessing_spec(normalization.STEADY_TASK, spatial_view=spatial_view),
+        dataset_identity={"dataset_id": reference.dataset_id, "membership": reference.membership},
+        train_membership_digest=common.serialization.canonical_json_sha256(list(reference.case_ids)),
+    )
+    outputs = scaling.encode_state(reference.outputs.to(scaling.dtype))
     frames = [
         truncation_errors(outputs[index : index + 1], reference.output_fields, mode_pairs=_mode_pairs(settings)).assign(case=label)
         for index, label in enumerate(reference.case_labels)
@@ -227,7 +233,7 @@ def steady_truncation_errors(reference: SteadyReference, settings: pd.DataFrame)
 
 def stride_view(field: Tensor, stride: int) -> Tensor:
     """Return the endpoint-preserving ``[..., y, x]`` view the transient runtime builds for ``spatial_stride``."""
-    representation = datasets.contracts.transient.resolve_spatial_representation((field.shape[-2], field.shape[-1]), stride)
+    representation = datasets.contracts.grid.resolve_spatial_representation((field.shape[-2], field.shape[-1]), stride)
     return field[..., list(representation.y_indices), :][..., list(representation.x_indices)]
 
 
@@ -236,9 +242,7 @@ def strided_states(case: TransientReferenceCase, spatial_stride: int) -> Tensor:
     return torch.stack([stride_view(torch.from_numpy(case.states[name]), spatial_stride) for name in case.states], dim=1).to(torch.float32)
 
 
-def transient_truncation_errors(
-    case: TransientReferenceCase, *, scaling: TransientScalingArtifact, spatial_stride: int, settings: pd.DataFrame
-) -> pd.DataFrame:
+def transient_truncation_errors(case: TransientReferenceCase, *, scaling: TrainScaling, spatial_stride: int, settings: pd.DataFrame) -> pd.DataFrame:
     """
     Return :func:`truncation_errors` of states and increments at the training stride for one case.
 
@@ -270,8 +274,8 @@ def stride_floor(case: TransientReferenceCase) -> pd.DataFrame:
     pandas.DataFrame
         Rows with ``case``, ``stride``, ``quantity`` (``state`` or
         ``increment``), ``field``, ``status`` and ``max_normalized_rmse``, the
-        maximum over stored times. A stride whose view would drop a grid
-        endpoint is refused by the Dataset contract and reported with NaN.
+        maximum over stored times. A stride that does not tile the grid
+        exactly is refused by the grid contract and reported with NaN.
 
     Notes
     -----
@@ -283,7 +287,7 @@ def stride_floor(case: TransientReferenceCase) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for stride in STRIDES:
         try:
-            representation = datasets.contracts.transient.resolve_spatial_representation((shape[0], shape[1]), stride)
+            representation = datasets.contracts.grid.resolve_spatial_representation((shape[0], shape[1]), stride)
         except ValueError as error:
             refused = {"case": case.label, "stride": stride, "status": f"refused: {error}", "max_normalized_rmse": math.nan}
             rows.extend({**refused, "quantity": quantity, "field": name} for quantity in quantities for name in case.states)

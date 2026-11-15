@@ -2,7 +2,7 @@
 Identity-bound Dataset splitting and train-only scaling services.
 
 Provides:
-- normalization: steady normalizer fitting, reconstruction, and preprocessing specification
+- normalization: the one Train-fitted channel scaling of both tasks, its case-equal fit and encodings
 - scaling: shared scaling identity, fit-or-load cache, and persisted scaling artifact admission
 - splits: the one persisted split schema of both tasks and its admission
 """

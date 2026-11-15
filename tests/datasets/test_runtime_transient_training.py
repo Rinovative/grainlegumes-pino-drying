@@ -1,6 +1,7 @@
 """Protect transient training Dataset assembly and case-role boundaries.
 
 Responsibilities:
+  - Check that the persisted Dataset contract names the tensors a runtime item carries
   - Check design-kind partitions, Train subsets, exact source membership, spatial views, loaders, and declared OOD assignments
 
 Design principles:
@@ -23,7 +24,9 @@ from torch.utils.data import ConcatDataset, TensorDataset
 
 from src.datasets.contracts import dataset_contracts_identity as identity
 from src.datasets.contracts import dataset_contracts_partition as partition
-from src.datasets.contracts.dataset_contracts_transient import EVALUATION_SAMPLING, TransientSamplingSpec, rollout_window_starts
+from src.datasets.contracts import dataset_contracts_transient as transient_contract
+from src.datasets.contracts import dataset_contracts_views as views
+from src.datasets.contracts.dataset_contracts_transient import EVALUATION_SAMPLING, TransientSamplingSpec, consecutive_windows, rollout_windows
 from src.datasets.runtime import dataset_runtime_transient as transient
 from src.datasets.runtime import dataset_runtime_transient_training as training
 from src.learning.learning_temporal import TemporalConditioningSpec
@@ -50,6 +53,19 @@ _CASES = {
 _MATERIALS = {case_id: material for case_id, (material, _kind) in _CASES.items()}
 _KINDS = {case_id: kind for case_id, (_material, kind) in _CASES.items()}
 _ROLES = {"lentil": "id", "chickpea": "id", "wheat": "ood"}
+
+
+def test_the_persisted_contract_names_exactly_the_tensors_a_runtime_item_carries() -> None:
+    """The Dataset contract lists every field group of a runtime item; the reference is the stored next state over the state fields."""
+    payload = transient_contract.transient_contract_payload()
+    field_groups = {name for name, value in payload.items() if isinstance(value, list)}
+    assert field_groups | {"time", "metadata"} == set(transient.TransientItem.__annotations__)
+    assert payload["next_state"] == payload["state"]
+    inspection = views.inspect_contract("transient_drying")
+    reference = inspection.group("next_state")
+    assert reference.purpose == "target"
+    assert [(field.name, field.unit) for field in reference.fields] == [(field["name"], field["unit"]) for field in payload["state"]]
+    assert inspection.target_semantics == "stored_next_state"
 
 
 def test_partition_follows_the_design_kinds_in_source_order() -> None:
@@ -206,7 +222,8 @@ def test_pt_dataset_keeps_every_opened_shard_mapped(monkeypatch: pytest.MonkeyPa
 
     def load_payload(_dataset_id: str, shard_index: int, **_kwargs: Any) -> dict[str, Any]:
         loads.append(shard_index)
-        case = {"case_index": shard_index, "case_record": cases[shard_index], "states": torch.zeros(1, 1, 1, 1), "static": torch.zeros(1, 1, 1)}
+        states = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1, 1) + 10.0 * shard_index
+        case = {"case_index": shard_index, "case_record": cases[shard_index], "states": states, "static": torch.zeros(1, 1, 1)}
         return {"shard": shard_index, "cases": [case]}
 
     monkeypatch.setattr(transient.transient_shards, "load_transient_shard_payload", load_payload)
@@ -224,8 +241,10 @@ def test_pt_dataset_keeps_every_opened_shard_mapped(monkeypatch: pytest.MonkeyPa
     dataset.spatial_stride = 1
     dataset._item_references = cast("Any", (SimpleNamespace(case_index=0), SimpleNamespace(case_index=1)))
     monkeypatch.setattr(dataset, "_admit_spatial_view", lambda _payload: None)
-    monkeypatch.setattr(dataset, "_materialize_shard_reference", lambda reference, *_args, **_kwargs: reference)
-    assert len(list(dataset.iter_scaling_items())) == 2
+    monkeypatch.setattr(dataset, "_materialize_shard_reference", lambda _reference, shard, **kwargs: {"shard": shard["shard"], **kwargs})
+    # Each item is materialized from its own case's stored states, without reloading a shard.
+    items = [cast("dict[str, Any]", item) for item in dataset.iter_scaling_items()]
+    assert [(item["shard"], float(item["spatial_states"][-1])) for item in items] == [(0, 2.0), (1, 12.0)]
     assert loads == [0, 1]
     dataset.__setstate__(dataset.__getstate__())
     dataset._load_shard(0)
@@ -259,14 +278,14 @@ def test_case_selection_reconstructs_same_backend_before_closing_source() -> Non
 def test_spatial_stride_contract_rejects_invalid_values(value: object, error: type[Exception]) -> None:
     """Reject implicit coercion while keeping the stride surface exact."""
     with pytest.raises(error):
-        training.transient_contract.validate_spatial_stride(value)
+        training.grid_contract.validate_spatial_stride(value)
 
 
 def test_boundary_preserving_spatial_view_resolves_canonical_grid() -> None:
     """Keep both physical boundaries when subsampling 251x401 by two."""
-    assert training.transient_contract.resolve_spatial_view((251, 401), 1) == (251, 401)
-    assert training.transient_contract.resolve_spatial_view((251, 401), 2) == (126, 201)
-    representation = training.transient_contract.resolve_spatial_representation((251, 401), 2)
+    assert training.grid_contract.resolve_spatial_view((251, 401), 1) == (251, 401)
+    assert training.grid_contract.resolve_spatial_view((251, 401), 2) == (126, 201)
+    representation = training.grid_contract.resolve_spatial_representation((251, 401), 2)
     assert representation.source_shape == (251, 401)
     assert representation.represented_shape == (126, 201)
     assert representation.y_indices == tuple(range(0, 251, 2))
@@ -275,9 +294,9 @@ def test_boundary_preserving_spatial_view_resolves_canonical_grid() -> None:
     assert representation.x_indices[-1] == 400
     assert representation.as_dict()["index_identity_sha256"] == representation.index_identity_sha256
     assert len(representation.index_identity_sha256) == 64
-    assert training.transient_contract.resolve_spatial_representation((251, 401), 1).index_identity_sha256 != representation.index_identity_sha256
-    with pytest.raises(ValueError, match="preserve both boundaries"):
-        training.transient_contract.resolve_spatial_view((250, 401), 2)
+    assert training.grid_contract.resolve_spatial_representation((251, 401), 1).index_identity_sha256 != representation.index_identity_sha256
+    with pytest.raises(ValueError, match="does not tile the canonical 251 x 401 grid"):
+        training.grid_contract.resolve_spatial_view((251, 401), 4)
 
 
 @pytest.mark.parametrize("workers", [0, 1, 2])
@@ -292,7 +311,7 @@ def test_transient_loader_workers_preserve_order_and_runtime_flags(workers: int)
     loader = training._loader(
         TensorDataset(torch.arange(6)),
         settings,
-        shuffle=False,
+        batches=None,
         loader_seed=11,
         worker_seed=12,
     )
@@ -330,6 +349,7 @@ def test_runtime_uses_shared_declared_assignments_before_ood_payload_loading(mon
         case_partition=partition.build_fixed_partition(
             ("a", "b", "c"), material_by_case=materials, design_kind_by_case=kinds, material_roles={"lentil": "id"}
         ),
+        grid_axes_sha256="3" * 64,
     )
     loaded: list[str] = []
 
@@ -357,6 +377,8 @@ def test_runtime_uses_shared_declared_assignments_before_ood_payload_loading(mon
             ),
             train_sampling=TransientSamplingSpec(mode="one_step_transition"),
             loader_settings=training.factory.LoaderSettings(),
+            units_per_update=2,
+            memory_batch=1,
             model_sha256="a" * 64,
             storage_root="metadata-only",
         )
@@ -380,35 +402,37 @@ def _trajectory_dataset(sampling: TransientSamplingSpec, *, lengths: tuple[int, 
     return dataset
 
 
-def test_rollout_windows_cover_the_trajectory_end_and_trajectories_stay_whole() -> None:
-    """Add one end-aligned window when the stride stops short; trajectory items keep every transition."""
-    assert rollout_window_starts(168, rollout_length=32, window_stride=32, window_offset=0) == (0, 32, 64, 96, 128, 136)
-    assert rollout_window_starts(64, rollout_length=32, window_stride=32, window_offset=0) == (0, 32)
-    assert rollout_window_starts(20, rollout_length=32, window_stride=32, window_offset=0) == ()
+def test_windows_cover_every_case_and_trajectories_stay_whole() -> None:
+    """
+    Place end-aligned B windows, consecutive rest windows, and one window for a short case.
 
-    windows = _trajectory_dataset(
-        TransientSamplingSpec(mode="rollout_window", rollout_length=4, window_stride=4, window_offset=0), lengths=(6, 6)
-    )._build_item_references()
-    assert [reference.sample_positions for reference in windows] == [(0, 1, 2, 3), (2, 3, 4, 5), (6, 7, 8, 9), (8, 9, 10, 11)]
+    The end-aligned window that closes a trajectory overlaps its predecessor; a case
+    shorter than the window forms one window over its whole trajectory, so every Train
+    case keeps at least one item. Trajectory items keep every transition.
+    """
+    assert rollout_windows(168, rollout_length=32, window_stride=32, window_offset=0) == (
+        (0, 32), (32, 32), (64, 32), (96, 32), (128, 32), (136, 32),
+    )  # fmt: skip
+    assert rollout_windows(64, rollout_length=32, window_stride=32, window_offset=0) == ((0, 32), (32, 32))
+    assert rollout_windows(20, rollout_length=32, window_stride=32, window_offset=0) == ((0, 20),)
+    assert consecutive_windows(70, window=32) == ((0, 32), (32, 32), (64, 6))
+    assert consecutive_windows(20, window=32) == ((0, 20),)
 
-    trajectories = _trajectory_dataset(TransientSamplingSpec(mode="trajectory", rollout_length=4), lengths=(6, 6))._build_item_references()
-    assert [reference.sample_positions for reference in trajectories] == [tuple(range(6)), tuple(range(6, 12))]
-    # Cases stop at their own drying target, so whole trajectories of one selection may differ in length.
-    unequal = _trajectory_dataset(TransientSamplingSpec(mode="trajectory", rollout_length=4), lengths=(6, 5))
-    assert unequal.item_transition_counts() == (6, 5)
-    assert unequal.cases_without_items() == ()
-    # A case shorter than the training window yields no item; the training loaders reject such a Train membership.
-    short = _trajectory_dataset(TransientSamplingSpec(mode="rollout_window", rollout_length=4, window_stride=4, window_offset=0), lengths=(6, 3))
-    assert short.cases_without_items() == ("case_1",)
+    window_sampling = TransientSamplingSpec(mode="rollout_window", rollout_length=4, window_stride=4, window_offset=0)
+    windows = _trajectory_dataset(window_sampling, lengths=(6, 3))
+    assert [reference.sample_positions for reference in windows._build_item_references()] == [(0, 1, 2, 3), (2, 3, 4, 5), (6, 7, 8)]
+    assert windows.item_case_indices() == (0, 0, 1)
+    assert windows.item_transition_counts() == (4, 4, 3)
+
+    # Cases stop at their own drying target, so whole trajectories of one selection may differ in length; a short one stays whole.
+    trajectories = _trajectory_dataset(TransientSamplingSpec(mode="trajectory", rollout_length=4), lengths=(6, 3))
+    assert [reference.sample_positions for reference in trajectories._build_item_references()] == [tuple(range(6)), (6, 7, 8)]
+    assert trajectories.item_transition_counts() == (6, 3)
 
     # Evaluation sets no trainer window, so even a trajectory shorter than any window stays one item.
     assert EVALUATION_SAMPLING.as_dict() == {"mode": "trajectory"}
-    short = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(3, 3))._build_item_references()
-    assert [reference.sample_positions for reference in short] == [(0, 1, 2), (3, 4, 5)]
-    with pytest.raises(ValueError, match="no complete rollout window"):
-        _trajectory_dataset(TransientSamplingSpec(mode="trajectory", rollout_length=4), lengths=(3, 3))._build_item_references()
-    with pytest.raises(ValueError, match="no rollout windows"):
-        EVALUATION_SAMPLING.window_starts(6)
+    with pytest.raises(ValueError, match="place no rollout windows"):
+        EVALUATION_SAMPLING.windows(6)
     with pytest.raises(ValueError, match="accepts only rollout_length"):
         TransientSamplingSpec(mode="trajectory", rollout_length=4, window_stride=4)
 
@@ -424,29 +448,38 @@ def test_trajectory_batches_never_mix_lengths_or_evaluation_parts() -> None:
     Batch whole trajectories that stop at different drying times.
 
     Evaluation batches keep their item order within one length of one Dataset
-    part; shuffled Train batches hold one length, cover every item once per
-    epoch and replay from the loader seed. Equal-length windows keep the
-    ordinary DataLoader batching.
+    part; Train microbatches of the unit sampler hold one length, cover every
+    item once per epoch and replay from the sampler seed. The sampler names the
+    unit kind of the sampling mode.
     """
     settings = training.factory.LoaderSettings(batch_size=2)
     first = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(6, 5, 6, 6))
     second = _trajectory_dataset(EVALUATION_SAMPLING, lengths=(6,))
-    evaluation = training._loader(ConcatDataset([first, second]), settings, shuffle=False, loader_seed=0, worker_seed=0)
+    evaluation = training._loader(ConcatDataset([first, second]), settings, batches=None, loader_seed=0, worker_seed=0)
     assert _batches(evaluation) == [[0, 2], [1], [3], [4]]
 
     train_sampling = TransientSamplingSpec(mode="trajectory", rollout_length=2)
     lengths = (6, 5, 6, 5, 6)
 
     def train_epochs(seed: int) -> list[list[list[int]]]:
-        loader = training._loader(_trajectory_dataset(train_sampling, lengths=lengths), settings, shuffle=True, loader_seed=seed, worker_seed=0)
-        return [_batches(loader) for _ in range(2)]
+        sampler = training._unit_sampler(
+            _trajectory_dataset(train_sampling, lengths=lengths), full_set_units=len(lengths), units_per_update=4, memory_batch=2, seed=seed
+        )
+        epochs = []
+        for epoch in range(2):
+            sampler.begin_epoch(epoch)
+            epochs.append([list(batch) for batch in sampler])
+            for group in sampler.groups():
+                sampler.advance(len(group.items))
+        return epochs
 
     epochs = train_epochs(5)
     for batches in epochs:
         assert sorted(item for batch in batches for item in batch) == list(range(5))
         assert all(len({lengths[item] for item in batch}) == 1 and len(batch) <= 2 for batch in batches)
     assert train_epochs(5) == epochs
-
+    trajectories = _trajectory_dataset(train_sampling, lengths=lengths)
+    sampler = training._unit_sampler(trajectories, full_set_units=len(trajectories), units_per_update=4, memory_batch=2, seed=0)
+    assert sampler.unit_kind == "trajectory"
     windows = _trajectory_dataset(TransientSamplingSpec(mode="rollout_window", rollout_length=2, window_stride=2, window_offset=0), lengths=(6, 5))
-    plain = training._loader(windows, settings, shuffle=True, loader_seed=0, worker_seed=0)
-    assert plain.batch_size == 2
+    assert training._unit_sampler(windows, full_set_units=len(windows), units_per_update=4, memory_batch=2, seed=0).unit_kind == "window"

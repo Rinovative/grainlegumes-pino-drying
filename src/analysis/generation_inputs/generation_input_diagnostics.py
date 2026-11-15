@@ -4,7 +4,8 @@ Responsibilities:
   - Preserve exact sampled, scalar, schedule, spatial, and provenance evidence
   - Derive shared permeability and transient moisture diagnostics canonically
   - Preserve exact persisted supports and evaluate display-only boundary curves
-  - Provide Celsius-aware A/B comparisons and empirical dataset summaries
+  - Provide Celsius- and percent-aware A/B comparisons and empirical dataset summaries: relative humidity in % RH,
+    wet-basis targets in % w.b., their startup changes in pp
 
 Design principles:
   - Generation, profile, and domain owners define every scientific semantic
@@ -30,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 from src import domain
+from src.analysis.presentation import analysis_field_labels as field_labels
 from src.generation.cases import generation_cases_admission as admission
 from src.generation.cases import generation_cases_schedule as schedule_service
 from src.generation.contracts import generation_contracts_profiles as profiles
@@ -49,22 +51,15 @@ SPATIAL_OVERVIEW_FIELD_NAMES: Final = ("eps_bed", "p_in_bc")
 MOISTURE_FIELD_NAMES: Final = ("X_0_db_field", "phi_eq")
 MOISTURE_DISTRIBUTION_NAMES: Final = ("X_0_db_field", "phi_eq", "eps_bed")
 
-FIELD_LABELS: Final = MappingProxyType(
+# Concise names of the quantities the shared field table does not declare (no symbols are invented for them).
+_UNDECLARED_NAMES: Final = MappingProxyType(
     {
         "x": "Horizontal coordinate",
         "y": "Vertical coordinate",
-        "Kxx": "Permeability xx component",
-        "Kxy": "Permeability xy component",
-        "Kyy": "Permeability yy component",
-        "eps_bed": "Bed porosity",
-        "p_in_bc": "Inlet pressure boundary",
-        "X_0_db_field": "Initial dry-basis moisture",
         "K_min": "Minimum principal permeability",
         "K_max": "Maximum principal permeability",
-        "K_anisotropy": "Principal permeability anisotropy",
-        "rho_bu_dry": "Dry bulk density",
-        "w_gr0": "Initial granular water content",
-        "phi_eq": "Initial equilibrium relative humidity",
+        "K_anisotropy": "Anisotropy ratio",
+        "w_gr0": "Initial water content",
     }
 )
 FIELD_UNITS: Final = MappingProxyType(
@@ -102,17 +97,18 @@ _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES: Final = frozenset(
         "T_in_bc startup end",
     )
 )
+_STARTUP_DELTA: Final = "startup delta"
 _MINIMUM_SCHEDULE_NODES: Final = 2
 _SCHEDULE_TABLE_RANK: Final = 2
 _SPATIAL_DIMENSIONS: Final = 2
-if set(FIELD_UNITS) != set(FIELD_LABELS):
-    msg = "Generation-input field labels and units must cover the same inventory."
-    raise RuntimeError(msg)
 if set(profiles.TRANSIENT_SPATIAL_INPUT_FIELDS).union(
     COMMON_DERIVED_FIELD_NAMES,
     TRANSIENT_DERIVED_FIELD_NAMES,
-) != set(FIELD_LABELS):
-    msg = "Generation-input field metadata must cover all maintained raw and derived fields."
+) != set(FIELD_UNITS):
+    msg = "Generation-input field units must cover all maintained raw and derived fields."
+    raise RuntimeError(msg)
+if any(not field_labels.has_declared_field_metadata(name) and name not in _UNDECLARED_NAMES for name in FIELD_UNITS):
+    msg = "Every generation-input field needs a name in the shared field table or the undeclared names."
     raise RuntimeError(msg)
 
 
@@ -688,7 +684,7 @@ def field_statistics(record: GenerationInputDiagnostics) -> pd.DataFrame:
         rows.append(
             {
                 "quantity": name,
-                "physical meaning": FIELD_LABELS[name],
+                "physical meaning": field_name(name),
                 "unit": FIELD_UNITS[name],
                 **_field_statistics(values),
             }
@@ -873,13 +869,33 @@ def build_dataset_diagnostics(
     )
 
 
-def display_unit(name: str, unit: str) -> str:
-    """Return the EDA display unit without changing persisted physical units."""
+def _percent_quantity(name: str) -> tuple[str, field_labels.QuantityKind] | None:
+    """Return the quantity and absolute-or-difference kind of a row shown in percent (% RH, % w.b.), else ``None``."""
+    quantity, _separator, statistic = name.partition(" ")
+    if not field_labels.shown_in_percent(quantity):
+        return None
+    return quantity, "difference" if statistic == _STARTUP_DELTA else "absolute"
+
+
+def field_name(name: str) -> str:
+    """Return the name of one generation-input quantity: the shared field table's, else its concise name."""
+    return field_labels.field_display_metadata(name).name if field_labels.has_declared_field_metadata(name) else _UNDECLARED_NAMES[name]
+
+
+def display_unit(name: str, unit: str, *, control: bool = False) -> str:
+    """Return the EDA display unit without changing persisted physical units; humidity and wet-basis rows read in percent (``% RH``: ``control``)."""
+    percent = _percent_quantity(name)
+    if percent is not None:
+        return field_labels.display_unit(unit, field=percent[0], quantity_kind=percent[1], control=control)
     return "°C" if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES and unit == "K" else unit
 
 
 def display_value(name: str, value: Any, unit: str) -> Any:
     """Return one EDA display value without mutating persisted source evidence."""
+    percent = _percent_quantity(name)
+    if percent is not None and isinstance(value, (Real, np.ndarray)):
+        displayed = field_labels.display_values(np.asarray(value, dtype=np.float64), unit, field=percent[0], quantity_kind=percent[1])
+        return displayed if isinstance(value, np.ndarray) else float(displayed)
     if name in _ABSOLUTE_TEMPERATURE_DISPLAY_NAMES and unit == "K":
         return value - 273.15
     return value
@@ -993,26 +1009,26 @@ def _parameter_mean(dataset: DatasetDiagnostics, name: str) -> float | str:
 def _parameter_row_index(name: str, unit: str) -> tuple[str, str, str]:
     """Return one grouped and EDA-display-unit-bearing parameter index."""
     spec = table_schema.parameter_row_spec(name)
-    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit))
+    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit, control=True))
 
 
 def _field_row_index(
     quantity: str,
     statistic: str,
 ) -> tuple[str, str, str]:
-    """Return one grouped and unit-bearing field-summary index."""
+    """Return one grouped and EDA-display-unit-bearing field-summary index."""
     spec = table_schema.field_summary_row_spec(quantity, statistic)
     return (
         spec.section,
         spec.category,
-        _unit_label(spec.label, FIELD_UNITS[quantity]),
+        _unit_label(spec.label, display_unit(quantity, FIELD_UNITS[quantity], control=True)),
     )
 
 
 def _boundary_row_index(name: str, unit: str) -> tuple[str, str, str]:
     """Return one grouped and EDA-display-unit-bearing boundary-summary index."""
     spec = table_schema.boundary_row_spec(name)
-    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit))
+    return spec.section, spec.category, _unit_label(spec.label, display_unit(name, unit, control=True))
 
 
 def case_context_table(
@@ -1069,7 +1085,7 @@ def case_context_table(
             first.case.payload["git_commit"],
             second.case.payload["git_commit"],
         ),
-        "available files": (
+        "COMSOL input files": (
             ", ".join(first.case.payload["input_files"]),
             ", ".join(second.case.payload["input_files"]),
         ),
@@ -1146,12 +1162,13 @@ def field_summary_comparison_table(
     rows = [
         (
             _field_row_index(quantity, statistic),
-            _finite_real_scalar(first_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case A"),
-            mean_a.field_summary_means[(quantity, statistic)],
-            _finite_real_scalar(second_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case B"),
-            mean_b.field_summary_means[(quantity, statistic)],
+            display_value(quantity, _finite_real_scalar(first_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case A"), unit),
+            display_value(quantity, mean_a.field_summary_means[(quantity, statistic)], unit),
+            display_value(quantity, _finite_real_scalar(second_stats.loc[quantity, statistic], label=f"{quantity} {statistic} Case B"), unit),
+            display_value(quantity, mean_b.field_summary_means[(quantity, statistic)], unit),
         )
         for quantity, statistic in specs
+        for unit in (FIELD_UNITS[quantity],)
     ]
     frame = _comparison_frame(rows, index_name="Field / statistic")
     frame.attrs["mean_case_counts"] = (
@@ -1279,9 +1296,10 @@ def dataset_field_summary_table(
     columns = tuple(f"Case {record.case.case_index}" for record in dataset.records)
     values = tuple(
         tuple(
-            _finite_real_scalar(
-                summary.loc[quantity, statistic],
-                label=f"{quantity} {statistic}",
+            display_value(
+                quantity,
+                _finite_real_scalar(summary.loc[quantity, statistic], label=f"{quantity} {statistic}"),
+                FIELD_UNITS[quantity],
             )
             for summary in summaries
         )
